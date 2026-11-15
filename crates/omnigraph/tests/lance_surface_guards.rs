@@ -4765,6 +4765,148 @@ async fn nearest_scan_stats_report_partitions_searched_and_ranked() {
     );
 }
 
+// --- Guard: IVF_FLAT and the flat kNN honour the declared distance --------
+//
+// A field's declared distance (`Vector(n, distance = ...)`) is the metric its
+// index is built with and every `nearest` scan sets (`ScanTuning::nearest`).
+// Lance's `cosine` is `1 - dot / (norm * norm)` and its `dot` is `1 - dot`,
+// the RFC's values; an IVF_FLAT index built for either returns them exactly
+// (a cosine index normalizes the stored and query vectors, so powers of two
+// keep every value exact). A zero vector leaves cosine undefined: the cosine
+// index leaves it out (`KeepFiniteVectors` after normalizing) and the flat
+// kNN drops its NaN distance, so the index and the scan agree. An explicit
+// metric other than the index's makes the scan flat (`Scanner::create_plan`),
+// so an index built for another distance is never used.
+
+#[tokio::test]
+async fn ivf_flat_and_flat_knn_score_cosine_and_dot_exactly() {
+    use arrow_array::FixedSizeListArray;
+    use arrow_array::types::{Float32Type, Int32Type};
+    use lance::index::vector::VectorIndexParams;
+    use lance_datafusion::exec::ExecutionSummaryCounts;
+    use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
+    use lance_linalg::distance::MetricType;
+    use std::sync::Mutex;
+
+    let vectors: [[f32; 4]; 6] = [
+        [1.0, 1.0, 1.0, 1.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [-2.0, -2.0, -2.0, -2.0],
+        [0.0, 0.0, 0.0, -4.0],
+        [2.0, 2.0, 2.0, 2.0],
+    ];
+    let query = Float32Array::from(vec![1.0_f32; 4]);
+    let cases = [
+        (
+            MetricType::Cosine,
+            vec![(0, 0.0), (1, 0.5), (3, 2.0), (4, 1.5), (5, 0.0)],
+        ),
+        (
+            MetricType::Dot,
+            vec![(0, -3.0), (1, 0.0), (2, 1.0), (3, 9.0), (4, 5.0), (5, -7.0)],
+        ),
+    ];
+    for (metric, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("distances.lance");
+        let uri = uri.to_str().unwrap();
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("vector", DataType::FixedSizeList(item.clone(), 4), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..vectors.len() as i32)),
+                Arc::new(FixedSizeListArray::new(
+                    item,
+                    4,
+                    Arc::new(Float32Array::from(vectors.concat())),
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index_builder(
+                &["vector"],
+                IndexType::Vector,
+                &VectorIndexParams::ivf_flat(1, metric),
+            )
+            .name("vector_idx".to_string())
+            .replace(true)
+            .await
+            .unwrap();
+
+        // The `(id, _distance)` rows of one kNN and whether it searched an
+        // IVF partition.
+        let knn = |metric: MetricType, use_index: bool| {
+            let dataset = &dataset;
+            let query = &query;
+            async move {
+                let summary: Arc<Mutex<Option<ExecutionSummaryCounts>>> =
+                    Arc::new(Mutex::new(None));
+                let sink = summary.clone();
+                let mut scanner = dataset.scan();
+                scanner.nearest("vector", query, vectors.len()).unwrap();
+                scanner.distance_metric(metric);
+                scanner.use_index(use_index);
+                scanner.scan_stats_callback(Arc::new(move |counts| {
+                    *sink.lock().unwrap() = Some(counts.clone());
+                }));
+                let batch = scanner.try_into_batch().await.unwrap();
+                let ids = batch["id"].as_primitive::<Int32Type>();
+                let distances = batch["_distance"].as_primitive::<Float32Type>();
+                let mut rows = (0..batch.num_rows())
+                    .map(|row| (ids.value(row), distances.value(row)))
+                    .collect::<Vec<_>>();
+                rows.sort_by_key(|(id, _)| *id);
+                let searched = summary.lock().unwrap().as_ref().is_some_and(|summary| {
+                    summary.all_counts.contains_key(PARTITIONS_SEARCHED_METRIC)
+                });
+                (rows, searched)
+            }
+        };
+        assert_eq!(
+            knn(metric, true).await,
+            (expected.clone(), true),
+            "{metric:?}: the index scores exactly by its metric"
+        );
+        assert_eq!(
+            knn(metric, false).await,
+            (expected.clone(), false),
+            "{metric:?}: the flat kNN scores the same rows exactly"
+        );
+        // Another explicit metric never uses the index: the scan is flat and
+        // scores by the metric it was asked for.
+        let (l2, searched) = knn(MetricType::L2, true).await;
+        assert!(
+            !searched,
+            "{metric:?}: an L2 scan must not search a {metric:?} index"
+        );
+        assert_eq!(
+            l2,
+            vec![(0, 0.0), (1, 3.0), (2, 4.0), (3, 36.0), (4, 28.0), (5, 4.0)],
+            "{metric:?}"
+        );
+    }
+}
+
 // --- Guard: an explicit projection may name `_distance` before `nearest` ---
 //
 // Lance 13 resolves the scoring columns (`_distance`, `_score`) in

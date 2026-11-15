@@ -4423,3 +4423,204 @@ async fn issue_721_edge_property_promotes_to_required() {
     .await
     .expect_err("an edge without why is refused");
 }
+
+// A vector field's distance changes in place (docs/rfcs/2026-11-07-gq-3.md
+// section 4, Schema: Vectors): the apply is metadata-only, reads score and
+// rank by the new distance from the exact scan while the index on disk was
+// built for the old one, which is never used, and the reconciler rebuilds the
+// index with the new distance. A zero vector stored while the field was `l2`
+// drops its row from `distance` and `nearest` alike once the field is
+// `cosine`, before and after the rebuild, and new zero vectors are refused.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn vector_distance_change_is_applied_in_place_and_serves_exactly_until_the_rebuild() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+
+    const QUERIES: &str = r#"
+query scored($q: Vector(4)) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from distance($pop, $d.embedding, $q) as $distance,
+    }
+    return { $d.slug, $distance as distance }
+    order { $distance }
+}
+query ranked($q: Vector(4)) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from nearest($pop, $d.embedding, $q, k: 2) as $distance,
+    }
+    return { $d.slug, $distance as distance }
+    order { $distance }
+}
+query ranked_all($q: Vector(4)) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from nearest($pop, $d.embedding, $q, k: 5) as $distance,
+    }
+    return { $d.slug, $distance as distance }
+    order { $distance }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema =
+        |ty: &str| format!("node Doc {{\n    slug: String @key\n    embedding: {ty}? @index\n}}\n");
+    let db = helpers::session(Omnigraph::init(uri, &schema("Vector(4)")).await.unwrap());
+    // Every norm is a power of two, so each path is exact in F32; `c` is a
+    // zero vector, which `l2` admits.
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"a","embedding":[1.0,1.0,1.0,1.0]}}
+{"type":"Doc","data":{"slug":"b","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d","embedding":[-2.0,-2.0,-2.0,-2.0]}}
+{"type":"Doc","data":{"slug":"e","embedding":[0.0,0.0,0.0,-4.0]}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+
+    // The vector indexes on `embedding`, by the metric their statistics name.
+    let index_metrics = || {
+        let db = &db;
+        async move {
+            let ds = open_pinned_dataset_for_test(db, "main", "node:Doc").await;
+            let field = ds.schema().field("embedding").unwrap().id;
+            let mut metrics = Vec::new();
+            for index in ds.load_indices().await.unwrap().iter() {
+                if index.fields != [field] {
+                    continue;
+                }
+                fn metric(value: &serde_json::Value) -> Option<String> {
+                    match value {
+                        serde_json::Value::Object(map) => map
+                            .get("metric_type")
+                            .and_then(|metric| metric.as_str())
+                            .map(str::to_ascii_lowercase)
+                            .or_else(|| map.values().find_map(metric)),
+                        serde_json::Value::Array(items) => items.iter().find_map(metric),
+                        _ => None,
+                    }
+                }
+                let stats: serde_json::Value =
+                    serde_json::from_str(&ds.index_statistics(&index.name).await.unwrap()).unwrap();
+                metrics.push(metric(&stats).unwrap_or_else(|| panic!("{stats}")));
+            }
+            (ds.version().version, metrics)
+        }
+    };
+    // The rows of `name` and whether its scan searched an IVF partition.
+    let run = |name: &'static str| {
+        let db = &db;
+        async move {
+            let probes = QueryIoProbes::default();
+            let result = with_query_io_probes(probes.clone(), async {
+                query_main(db, QUERIES, name, &vector_param("$q", &[1.0; 4])).await
+            })
+            .await
+            .unwrap();
+            let batch = result.concat_batches().unwrap();
+            let slugs = batch
+                .column_by_name("d.slug")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap()
+                .clone();
+            let distances = batch
+                .column_by_name("distance")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap()
+                .clone();
+            let rows = (0..batch.num_rows())
+                .map(|row| (slugs.value(row).to_string(), distances.value(row)))
+                .collect::<Vec<_>>();
+            let indexed = !probes
+                .ann_rung_partitions_searched
+                .lock()
+                .unwrap()
+                .is_empty();
+            (rows, indexed)
+        }
+    };
+    let rows = |expected: &[(&str, f32)]| {
+        expected
+            .iter()
+            .map(|(slug, distance)| (slug.to_string(), *distance))
+            .collect::<Vec<_>>()
+    };
+
+    // `l2`: the sum of squared differences, the zero vector included; the
+    // index is built for `l2` and `nearest` searches it.
+    let l2 = rows(&[("a", 0.0), ("b", 3.0), ("c", 4.0), ("e", 28.0), ("d", 36.0)]);
+    let (l2_version, metrics) = index_metrics().await;
+    assert_eq!(metrics, ["l2"]);
+    assert_eq!(run("scored").await.0, l2);
+    assert_eq!(run("ranked").await, (l2[..2].to_vec(), true));
+
+    // The apply is one in-place step that writes no table: the dataset keeps
+    // its version and its `l2` index.
+    let result = db
+        .apply_schema(&schema(r#"Vector(4, distance = "cosine")"#))
+        .await
+        .unwrap();
+    assert!(result.applied);
+    assert_eq!(
+        result.steps,
+        vec![SchemaMigrationStep::ChangeVectorDistance {
+            type_kind: SchemaTypeKind::Node,
+            type_name: "Doc".to_string(),
+            property_name: "embedding".to_string(),
+            from: omnigraph_compiler::schema::vector::VectorDistance::L2,
+            to: omnigraph_compiler::schema::vector::VectorDistance::Cosine,
+        }]
+    );
+    assert_eq!(index_metrics().await, (l2_version, vec!["l2".to_string()]));
+
+    // `cosine` from the exact scan: the `l2` index is never used, and the
+    // zero vector stored under `l2` drops from `distance` and `nearest`.
+    let cosine = rows(&[("a", 0.0), ("b", 0.5), ("e", 1.5), ("d", 2.0)]);
+    assert_eq!(run("scored").await.0, cosine);
+    assert_eq!(run("ranked").await, (cosine[..2].to_vec(), false));
+    assert_eq!(run("ranked_all").await, (cosine.clone(), false));
+
+    // The reconciler replaces the index with one built for `cosine`, which
+    // `nearest` then searches; the answers do not change.
+    db.ensure_indices_as(None).await.unwrap();
+    assert_eq!(index_metrics().await.1, ["cosine"]);
+    assert_eq!(run("scored").await.0, cosine);
+    assert_eq!(run("ranked").await, (cosine[..2].to_vec(), true));
+    assert_eq!(run("ranked_all").await.0, cosine);
+    // Nothing is left to build.
+    let (_, metrics_before) = index_metrics().await;
+    db.ensure_indices_as(None).await.unwrap();
+    assert_eq!(index_metrics().await.1, metrics_before);
+
+    // A new zero vector is refused on every write path; nothing changes.
+    let (version, _) = index_metrics().await;
+    let refused = db
+        .load_jsonl(
+            r#"{"type":"Doc","data":{"slug":"z","embedding":[0.0,-0.0,0.0,0.0]}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("Doc.embedding declares the cosine distance"),
+        "{refused}"
+    );
+    assert_eq!(index_metrics().await.0, version);
+    assert_eq!(run("scored").await.0, cosine);
+
+    // Back to `l2`: the zero vector scores again, exactly, until the rebuild.
+    db.apply_schema(&schema("Vector(4)")).await.unwrap();
+    assert_eq!(run("scored").await.0, l2);
+    assert_eq!(run("ranked").await, (l2[..2].to_vec(), false));
+    db.ensure_indices_as(None).await.unwrap();
+    assert_eq!(index_metrics().await.1, ["l2"]);
+    assert_eq!(run("ranked").await, (l2[..2].to_vec(), true));
+}

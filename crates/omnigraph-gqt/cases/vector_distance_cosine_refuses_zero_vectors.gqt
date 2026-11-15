@@ -1,0 +1,141 @@
+# issue: none
+# notes: Cosine is undefined at a zero vector, so a `cosine` field refuses
+# notes: one: a write storing a zero vector there (`-0.0` included) fails
+# notes: validation and changes nothing, on a node and on an edge, by insert
+# notes: and by update; a zero query vector is refused before the read runs,
+# notes: under `distance` and `nearest` alike. A `dot` field takes a zero
+# notes: vector, stored or queried. A null is not a vector and passes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(2, distance = "cosine")? @index
+    raw: Vector(2, distance = "dot")?
+}
+edge Cites: Doc -> Doc {
+    signal: Vector(2, distance = "cosine")?
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","embedding":[1.0,0.0],"raw":[0.0,0.0]}}
+{"type":"Doc","data":{"slug":"b","embedding":[0.0,2.0],"raw":[1.0,1.0]}}
+{"type":"Doc","data":{"slug":"c"}}
+{"edge":"Cites","from":"a","to":"b","data":{"signal":[1.0,1.0]}}
+
+--- mutate
+query add($s: String, $e: Vector(2)) { insert Doc { slug: $s, embedding: $e } }
+
+--- params
+{"s": "z", "e": [0.0, 0.0]}
+
+--- expect error: Doc.embedding declares the cosine distance, which a zero vector leaves undefined
+
+--- mutate
+query add($s: String, $e: Vector(2)) { insert Doc { slug: $s, embedding: $e } }
+
+--- params
+{"s": "z", "e": [-0.0, 0.0]}
+
+--- expect error: Doc.embedding declares the cosine distance, which a zero vector leaves undefined
+
+--- mutate
+query zero($s: String, $e: Vector(2)) {
+    match { $x: Doc } where $x.slug = $s
+    update $x set { embedding: $e }
+}
+
+--- params
+{"s": "a", "e": [0.0, 0.0]}
+
+--- expect error: Doc.embedding declares the cosine distance, which a zero vector leaves undefined
+
+--- mutate
+query cite($e: Vector(2)) { insert Cites { from: "b", to: "a", signal: $e } }
+
+--- params
+{"e": [0.0, 0.0]}
+
+--- expect error: Cites.signal declares the cosine distance, which a zero vector leaves undefined
+
+--- mutate
+query add_null($s: String, $r: Vector(2)) { insert Doc { slug: $s, raw: $r } }
+
+--- params
+{"s": "y", "r": [0.0, 0.0]}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query stored() {
+    match { $d: Doc }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"b"}
+{"d.slug":"c"}
+{"d.slug":"y"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query scored($q: Vector(2)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    return { $x.slug, $distance }
+}
+
+--- params
+{"q": [0.0, 0.0]}
+
+--- expect error: the query vector for 'Doc.embedding' is a zero vector
+
+--- query
+query ranked($q: Vector(2)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from nearest($pop, $x.embedding, $q, k: 2) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [0.0, -0.0]}
+
+--- expect error: the query vector for 'Doc.embedding' is a zero vector
+
+--- query
+query scored_dot($q: Vector(2)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.raw, $q) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $x.slug }
+}
+
+--- params
+{"q": [0.0, 0.0]}
+
+--- expect ordered
+{"distance":1.0,"x.slug":"a"}
+{"distance":1.0,"x.slug":"b"}
+{"distance":1.0,"x.slug":"y"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- expect same as reference

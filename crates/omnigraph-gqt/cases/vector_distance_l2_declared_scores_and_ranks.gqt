@@ -1,0 +1,283 @@
+# issue: none
+# notes: `Vector(n, distance = "l2")` declares what `Vector(n)` means: the sum of
+# notes: squared component differences with no square root, ascending, under
+# notes: `distance` and `nearest` alike, and a returned distance is always that
+# notes: exact value: `Doc` is indexed, `Raw` carries no index, and the two rows
+# notes: inserted after the index was built leave `Doc` partially indexed. Every
+# notes: state answers the same rows; ties go to the smaller identity.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(4, distance = "l2")? @index
+}
+node Raw {
+    slug: String @key
+    embedding: Vector(4, distance = "l2")?
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","embedding":[1.0,1.0,1.0,1.0]}}
+{"type":"Doc","data":{"slug":"b","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d","embedding":[-1.0,-1.0,-1.0,-1.0]}}
+{"type":"Doc","data":{"slug":"e","embedding":[3.0,1.0,1.0,1.0]}}
+{"type":"Doc","data":{"slug":"f"}}
+{"type":"Raw","data":{"slug":"a","embedding":[1.0,1.0,1.0,1.0]}}
+{"type":"Raw","data":{"slug":"b","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Raw","data":{"slug":"c","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Raw","data":{"slug":"d","embedding":[-1.0,-1.0,-1.0,-1.0]}}
+{"type":"Raw","data":{"slug":"e","embedding":[3.0,1.0,1.0,1.0]}}
+{"type":"Raw","data":{"slug":"f"}}
+
+--- query
+query scored_indexed($q: Vector(4)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [1.0, 1.0, 1.0, 1.0]}
+
+--- expect ordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":3.0,"x.slug":"b"}
+{"distance":4.0,"x.slug":"c"}
+{"distance":4.0,"x.slug":"e"}
+{"distance":16.0,"x.slug":"d"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- expect same as reference
+
+--- query
+query nearest_indexed($q: Vector(4)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from nearest($pop, $x.embedding, $q, k: 5) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [1.0, 1.0, 1.0, 1.0]}
+
+--- expect ordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":3.0,"x.slug":"b"}
+{"distance":4.0,"x.slug":"c"}
+{"distance":4.0,"x.slug":"e"}
+{"distance":16.0,"x.slug":"d"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- expect same as reference
+
+--- query
+query nearest_indexed_window($q: Vector(4)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from nearest($pop, $x.embedding, $q, k: 2) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [1.0, 1.0, 1.0, 1.0]}
+
+--- expect ordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":3.0,"x.slug":"b"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- expect same as reference
+
+--- query
+query scored_unindexed($q: Vector(4)) {
+    match {
+        let $pop = { match { $x: Raw } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [1.0, 1.0, 1.0, 1.0]}
+
+--- expect ordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":3.0,"x.slug":"b"}
+{"distance":4.0,"x.slug":"c"}
+{"distance":4.0,"x.slug":"e"}
+{"distance":16.0,"x.slug":"d"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- expect same as reference
+
+--- query
+query nearest_unindexed($q: Vector(4)) {
+    match {
+        let $pop = { match { $x: Raw } return { $x } },
+        from nearest($pop, $x.embedding, $q, k: 5) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [1.0, 1.0, 1.0, 1.0]}
+
+--- expect ordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":3.0,"x.slug":"b"}
+{"distance":4.0,"x.slug":"c"}
+{"distance":4.0,"x.slug":"e"}
+{"distance":16.0,"x.slug":"d"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- expect same as reference
+
+--- query
+query nearest_unindexed_window($q: Vector(4)) {
+    match {
+        let $pop = { match { $x: Raw } return { $x } },
+        from nearest($pop, $x.embedding, $q, k: 2) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [1.0, 1.0, 1.0, 1.0]}
+
+--- expect ordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":3.0,"x.slug":"b"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- expect same as reference
+
+--- mutate
+query add($s: String, $e: Vector(4)) { insert Doc { slug: $s, embedding: $e } }
+
+--- params
+{"s": "g", "e": [1.0, 1.0, 1.0, 2.0]}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query add($s: String, $e: Vector(4)) { insert Doc { slug: $s, embedding: $e } }
+
+--- params
+{"s": "h", "e": [1.0, 1.0, 1.0, -1.0]}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query scored_partially_indexed($q: Vector(4)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [1.0, 1.0, 1.0, 1.0]}
+
+--- expect ordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":1.0,"x.slug":"g"}
+{"distance":3.0,"x.slug":"b"}
+{"distance":4.0,"x.slug":"c"}
+{"distance":4.0,"x.slug":"e"}
+{"distance":4.0,"x.slug":"h"}
+{"distance":16.0,"x.slug":"d"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- expect same as reference
+
+--- query
+query nearest_partially_indexed($q: Vector(4)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from nearest($pop, $x.embedding, $q, k: 7) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [1.0, 1.0, 1.0, 1.0]}
+
+--- expect ordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":1.0,"x.slug":"g"}
+{"distance":3.0,"x.slug":"b"}
+{"distance":4.0,"x.slug":"c"}
+{"distance":4.0,"x.slug":"e"}
+{"distance":4.0,"x.slug":"h"}
+{"distance":16.0,"x.slug":"d"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- expect same as reference
+
+--- query
+query nearest_partially_indexed_window($q: Vector(4)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from nearest($pop, $x.embedding, $q, k: 3) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [1.0, 1.0, 1.0, 1.0]}
+
+--- expect ordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":1.0,"x.slug":"g"}
+{"distance":3.0,"x.slug":"b"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- expect same as reference
