@@ -795,8 +795,8 @@ impl IRExpr {
                     validate_leaf_type(ty)?;
                 }
                 Self::Variable(_, ty) => {
-                    if !matches!(ty, ExprType::Node { .. }) {
-                        return Err(bad("node variable carries a value type"));
+                    if !matches!(ty, ExprType::Node { .. } | ExprType::Edge { .. }) {
+                        return Err(bad("a reference variable carries a value type"));
                     }
                     validate_leaf_type(ty)?;
                 }
@@ -1687,9 +1687,9 @@ fn validate_leaf_type(ty: &ExprType) -> Result<()> {
         } if *list || *dim == 0 || *dim > i32::MAX as u32 => Err(CompilerError::Plan(
             "invalid vector type on expression leaf".into(),
         )),
-        ExprType::Node { type_name } if type_name.is_empty() => Err(CompilerError::Plan(
-            "node leaf has an empty type name".into(),
-        )),
+        ExprType::Node { type_name } | ExprType::Edge { type_name } if type_name.is_empty() => Err(
+            CompilerError::Plan("reference leaf has an empty type name".into()),
+        ),
         _ => Ok(()),
     }
 }

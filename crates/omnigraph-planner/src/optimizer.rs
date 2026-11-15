@@ -14,7 +14,7 @@ use omnigraph_compiler::query::file::LoadStmtMode;
 use omnigraph_compiler::query::value::{AggFunc, CompOp, Literal};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
-use omnigraph_compiler::types::Direction;
+use omnigraph_compiler::types::{Direction, ExprType};
 
 use crate::cost::{
     AccessPath, AntiJoinStrategy, CoverageProvenance, EndpointProbe, ExpandCostInputs, ExpandMode,
@@ -1837,7 +1837,12 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
             }
         }
         IRExpr::Aggregate { func, arg, .. } => match (func, arg.as_ref()) {
-            (AggFunc::Count, IRExpr::Variable(variable, _)) => {
+            (AggFunc::Count, IRExpr::Variable(variable, ty)) => {
+                // An edge over several types is identified by its type and
+                // its id together.
+                if matches!(ty, ExprType::Edge { type_name } if type_name.contains('|')) {
+                    out.push(ColumnRef::property(variable, EDGE_TYPE_MEMBER));
+                }
                 out.push(ColumnRef::property(variable, IDENTITY_MEMBER));
             }
             _ => reads_of_expr(arg, out),

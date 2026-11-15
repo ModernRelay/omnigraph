@@ -376,7 +376,8 @@ query friend_counts() {
 ```
 
 Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggregated return fields.
-`count(distinct $f)` counts distinct nodes and `count(distinct $f.city)`
+`count(distinct $f)` counts distinct nodes (distinct edges over an edge
+binding `$k`) and `count(distinct $f.city)`
 distinct non-null values; `distinct` under another aggregate is refused
 (`T57`). `return distinct { … }` keeps one row per distinct projected tuple
 before `order`/`limit` (with aggregates: `T56`). A comparison in `return`

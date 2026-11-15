@@ -207,8 +207,8 @@ dates chronologically). With no matches, an aggregate-only return gives one row
 
 A bare node returns one object with `@id` and every property except `Blob` and
 `Vector`: `$p` produces column `p`; project a property for one field. `count($p)`
-counts rows and `count(distinct $p)` distinct nodes; `count(distinct $p.city)`
-counts distinct non-null values, so a node reached by several paths counts once.
+counts rows, `count(distinct $p)` distinct nodes (or edges) and `count(distinct $p.city)`
+distinct non-null values, so a node reached by several paths counts once.
 Other aggregates require a property (`T8`) and refuse `distinct` (`T57`).
 
 A comparison or Boolean expression requires an alias (`T43`), such as

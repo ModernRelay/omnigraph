@@ -748,6 +748,14 @@ fn expression_type(text: &str) -> Option<String> {
     if base == "exact_integer" || base == "[exact_integer]" {
         return Some(text.to_string());
     }
+    // An edge reference, as `count($k)` reads it: `edge` and its selector's
+    // types.
+    if let Some(types) = text.strip_prefix("edge ") {
+        return types
+            .split('|')
+            .all(crate::shape::is_type_name)
+            .then(|| text.to_string());
+    }
     aggregate_type(text)
 }
 

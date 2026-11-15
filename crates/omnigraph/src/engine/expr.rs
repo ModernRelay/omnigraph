@@ -724,23 +724,45 @@ pub(super) fn evaluate_projection(
 
 /// What `count($var)` counts: the binding's identity column, one per row and
 /// never null, under the bare `$var` projection's name. The scan behind the
-/// binding is pruned to it (`projection_pushdown`, #704), so no node struct is built.
+/// binding is pruned to it (`projection_pushdown`), so no node struct is
+/// built. A node binding's identity is its id; an edge binding's is its id
+/// too, and for an edge over several types, whose rows carry the edge type,
+/// its type and id together, joined by a NUL that no type name holds, so
+/// `count(distinct $k)` tells two types' equal ids apart.
 pub(super) fn identity_column(
     wide_batch: &RecordBatch,
     variable: &str,
     ctx: &ProjectionContext,
 ) -> Result<(String, ArrayRef)> {
-    if ctx.node_type(variable).is_none() {
-        return Err(OmniError::manifest(format!(
-            "variable '{}' is not a node binding",
-            variable
-        )));
-    }
     let col_name = format!("{}.{}", variable, ctx.catalog.system_columns.id);
     let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
         OmniError::manifest(format!("column '{}' not found in wide batch", col_name))
     })?;
-    Ok((variable.to_string(), col.clone()))
+    if ctx.node_type(variable).is_some() {
+        return Ok((variable.to_string(), col.clone()));
+    }
+    let type_name = format!(
+        "{variable}.{}",
+        omnigraph_compiler::traversal::EDGE_TYPE_COLUMN
+    );
+    let Some(types) = wide_batch.column_by_name(&type_name) else {
+        return Ok((variable.to_string(), col.clone()));
+    };
+    let as_strings = |array: &ArrayRef, name: &str| {
+        array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .cloned()
+            .ok_or_else(|| OmniError::manifest_internal(format!("column '{name}' is not a String")))
+    };
+    let (ids, types) = (as_strings(col, &col_name)?, as_strings(types, &type_name)?);
+    let identities: StringArray = (0..ids.len())
+        .map(|row| {
+            (ids.is_valid(row) && types.is_valid(row))
+                .then(|| format!("{}\0{}", types.value(row), ids.value(row)))
+        })
+        .collect();
+    Ok((variable.to_string(), Arc::new(identities)))
 }
 
 #[cfg(test)]

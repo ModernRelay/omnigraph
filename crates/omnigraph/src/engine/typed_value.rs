@@ -890,9 +890,16 @@ pub(super) fn validate_plan_values(
                         )));
                     }
                 }
+                IRExpr::Variable(variable, ExprType::Edge { .. }) => {
+                    if !edge_bindings.contains_key(variable.as_str()) {
+                        return Err(OmniError::manifest_internal(format!(
+                            "edge leaf {variable} has no edge binding owner"
+                        )));
+                    }
+                }
                 IRExpr::Variable(_, _) => {
                     return Err(OmniError::manifest_internal(
-                        "node leaf carries a value type",
+                        "a reference leaf carries a value type",
                     ));
                 }
                 IRExpr::AliasRef(alias, ty) => {
