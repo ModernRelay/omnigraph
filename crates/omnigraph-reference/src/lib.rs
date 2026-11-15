@@ -965,10 +965,9 @@ impl<'a> Interpreter<'a> {
             _ if values.is_empty() => Value::Null,
             // An integer sum is exact, rounded to `F64` once.
             AggFunc::Sum => Value::Float(exact_sum(&values)),
-            // A mean sums in `F64`, as the plan's `float64` leaf names.
-            AggFunc::Avg => Value::Float(
-                values.iter().filter_map(Value::as_f64).sum::<f64>() / values.len() as f64,
-            ),
+            // An integer mean divides the exact total once; a float mean
+            // sums in `F64`, as the plan's `float64` leaf names.
+            AggFunc::Avg => Value::Float(exact_sum(&values) / values.len() as f64),
             AggFunc::Min => values.into_iter().min_by(cmp_values).unwrap(),
             AggFunc::Max => values.into_iter().max_by(cmp_values).unwrap(),
         })

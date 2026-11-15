@@ -279,8 +279,8 @@ query's memory budget, so these rows can differ between runs of one plan.
 An `Aggregate` node's `aggregates` array aligns with `exprs`, with `null` for
 group keys. Each aggregate records its result `column`, `func`, declared `input`
 and `result` types, `accumulator`, and `overflow` conversion. A type's `?` marks
-declared nullability. Integer `sum` uses `exact_integer` and `round_to_nearest`;
-floating-point `sum` and `avg` use `float64`.
+declared nullability. Integer `sum` and `avg` use `exact_integer` and
+`round_to_nearest`; floating-point `sum` and `avg` use `float64`.
 
 Aggregate, Projection and MetadataCount also print `columns`, an ordered list
 such as `["total: F64?", "person: Person"]`. Names match executed result columns;

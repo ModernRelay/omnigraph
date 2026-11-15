@@ -396,7 +396,7 @@ needs an alias (`T43`): `$p.age > 30 as adult`, or over aggregates
 `count($f) > 0 as any`. Beside aggregates, an item that reads no aggregate
 (`$p.age > 30 as adult` included) is a group key.
 Return-clause integer `sum` accumulates exactly in 128 bits and rounds the total
-once to `F64`; `avg` uses a floating-point accumulator.
+once to `F64`; integer `avg` divides that exact total once, float `avg` accumulates in `F64`.
 
 - `min`/`max` accept numeric, String, Bool (`false` before `true`), Date, and
   DateTime values and return the column's own type; lists, vectors, and Blobs

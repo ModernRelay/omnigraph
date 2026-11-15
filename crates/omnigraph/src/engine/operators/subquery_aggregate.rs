@@ -66,7 +66,9 @@ impl ValueAccumulator {
     fn for_spec(func: AggFunc, spec: AggregateSpec) -> Result<Option<Self>> {
         Ok(match (func, spec.accumulator) {
             (AggFunc::Count, Accumulator::Count) => None,
-            (AggFunc::Sum, Accumulator::ExactInteger) => Some(Self::Sum(Number::Exact(0))),
+            (AggFunc::Sum | AggFunc::Avg, Accumulator::ExactInteger) => {
+                Some(Self::Sum(Number::Exact(0)))
+            }
             (AggFunc::Sum | AggFunc::Avg, Accumulator::Float64) => {
                 Some(Self::Sum(Number::Float(0.0)))
             }
@@ -77,10 +79,7 @@ impl ValueAccumulator {
                 Accumulator::ExactInteger | Accumulator::Float64 | Accumulator::Extremum,
             )
             | (AggFunc::Sum, Accumulator::Count | Accumulator::Extremum)
-            | (
-                AggFunc::Avg,
-                Accumulator::Count | Accumulator::ExactInteger | Accumulator::Extremum,
-            )
+            | (AggFunc::Avg, Accumulator::Count | Accumulator::Extremum)
             | (
                 AggFunc::Min | AggFunc::Max,
                 Accumulator::Count | Accumulator::ExactInteger | Accumulator::Float64,
@@ -415,6 +414,19 @@ impl SubqueryAggregate {
                     null()?
                 } else {
                     ScalarValue::Float64(Some(sum / count as f64))
+                }
+            }
+            // An integer mean: the exact total divided once.
+            (
+                BlockAggregateExpr::Aggregate {
+                    func: AggFunc::Avg, ..
+                },
+                Some(ValueAccumulator::Sum(Number::Exact(sum))),
+            ) => {
+                if count == 0 {
+                    null()?
+                } else {
+                    ScalarValue::Float64(Some(*sum as f64 / count as f64))
                 }
             }
             (

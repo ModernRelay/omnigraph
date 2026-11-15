@@ -118,8 +118,8 @@ per outer row. Its argument is a scalar expression in the block's scope: numeric
 Integer block `sum` accumulates exactly in 128 bits, refuses overflow of that
 range, and rounds the total once to `F64` before comparison: `9007199254740993`
 and `-9007199254740992` sum to `1`, while `9007199254740993` alone rounds to
-`9007199254740992`. As in `return`, `avg` converts each non-null input to `F64`
-before summing, so those two values average `0`. `min` and `max` retain
+`9007199254740992`. As in `return`, integer `avg` divides that exact total
+once by the row count, so those two values average `0.5`. `min` and `max` retain
 the column's declared type, including the full `U64` range; comparing a `U64`
 extremum with an `I64` parameter preserves both integer ranges. Row count and
 column `count` use `I64` and refuse a count beyond its range; column `count`

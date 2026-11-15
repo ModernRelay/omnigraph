@@ -204,9 +204,9 @@ no cast $bound
 --- expect same as reference
 
 --- query
-query integer_avg_uses_float_accumulation() {
+query integer_avg_divides_an_exact_total() {
     match { $g: Group }
-    where $g.name = "cancel" and avg($c.signed) { $c: Cell, $c inGroup $g } = 0
+    where $g.name = "cancel" and avg($c.signed) { $c: Cell, $c inGroup $g } = 0.5
     return { $g.name as group_name }
 }
 --- expect unordered
@@ -214,9 +214,9 @@ query integer_avg_uses_float_accumulation() {
 --- expect shape
 group_name: String
 --- expect plan
-block aggregate avg($c.signed): avg(I64?) float64 round_to_nearest -> F64?
+block aggregate avg($c.signed): avg(I64?) exact_integer round_to_nearest -> F64?
 type avg($c.signed): F64?
-cast 0: I64 -> F64
+no cast 0.5
 
 --- expect same as reference
 

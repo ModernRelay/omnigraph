@@ -36,7 +36,7 @@ use omnigraph_planner::{
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
-use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerUdaf};
+use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerAvgUdaf, ExactIntegerUdaf};
 use super::operators::{
     AntiJoinMaskExec, ArmOrder, CatalogueExec, ContainsJoinExec, CorrelateExec, CorrelateGroup,
     CorrelateOuter, CorrelateRead, CrossJoinExec, CsvSourceExec, ExpandExec, ExpandExecution,
@@ -535,6 +535,12 @@ impl<'l, 'a> Walk<'l, 'a> {
                     ExactIntegerUdaf::new(result.clone()),
                 ))
             }
+            (AggFunc::Avg, Accumulator::ExactInteger) => {
+                argument = Arc::new(CastExpr::new(argument, EXACT_CARRIER, None));
+                Arc::new(datafusion::logical_expr::AggregateUDF::from(
+                    ExactIntegerAvgUdaf::new(result.clone()),
+                ))
+            }
             (AggFunc::Sum | AggFunc::Avg, Accumulator::Float64) => {
                 argument = Arc::new(CastExpr::new(argument, DataType::Float64, None));
                 if *func == AggFunc::Sum {
@@ -550,10 +556,7 @@ impl<'l, 'a> Walk<'l, 'a> {
                 Accumulator::ExactInteger | Accumulator::Float64 | Accumulator::Extremum,
             )
             | (AggFunc::Sum, Accumulator::Count | Accumulator::Extremum)
-            | (
-                AggFunc::Avg,
-                Accumulator::Count | Accumulator::ExactInteger | Accumulator::Extremum,
-            )
+            | (AggFunc::Avg, Accumulator::Count | Accumulator::Extremum)
             | (
                 AggFunc::Min | AggFunc::Max,
                 Accumulator::Count | Accumulator::ExactInteger | Accumulator::Float64,

@@ -77,7 +77,15 @@ pub fn plan_aggregate(func: AggFunc, signature: &AggSignature) -> Result<Aggrega
                 return Err(PlanError::Internal("sum requires numeric input".into()));
             }
         },
-        AggFunc::Avg => (Accumulator::Float64, Overflow::RoundToNearest),
+        // An integer mean divides an exact total once; a float mean
+        // accumulates in `F64` as `sum` does.
+        AggFunc::Avg => match &signature.arg {
+            ExprType::Value {
+                scalar: ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64,
+                ..
+            } => (Accumulator::ExactInteger, Overflow::RoundToNearest),
+            _ => (Accumulator::Float64, Overflow::RoundToNearest),
+        },
         AggFunc::Min | AggFunc::Max => (Accumulator::Extremum, Overflow::Error),
     };
     Ok(AggregateSpec {

@@ -443,6 +443,17 @@ fn expand_returns_its_source_only_through_a_self_loop() {
 }
 
 #[test]
+fn an_integer_mean_divides_the_exact_total_once() {
+    // In F64 the two weights cancel to 0; exactly they sum to 1, over 2.
+    let (out, _) = rows_over(
+        LOOPS,
+        LOOP_DATA,
+        "query q() { match { $p: P, $p $e:knows $q } return { avg($e.w) as mean } }",
+    );
+    assert_eq!(out, vec![json!({"mean": 0.5})]);
+}
+
+#[test]
 fn an_integer_sum_is_exact_and_rounds_once() {
     // In F64 the two weights cancel to 0; exactly they sum to 1.
     let (out, _) = rows_over(

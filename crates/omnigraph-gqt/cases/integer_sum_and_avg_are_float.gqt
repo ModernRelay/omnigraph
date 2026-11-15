@@ -46,7 +46,7 @@ teams: I64
 
 --- expect plan
 aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
-aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate mean: avg(I64?) exact_integer round_to_nearest -> F64?
 aggregate n: count(Person) count error -> I64?
 aggregate distinct_n: count(distinct Person) count error -> I64?
 aggregate teams: count(distinct String) count error -> I64?
@@ -71,7 +71,7 @@ n: I64
 
 --- expect plan
 aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
-aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate mean: avg(I64?) exact_integer round_to_nearest -> F64?
 aggregate n: count(Person) count error -> I64?
 
 --- expect same as reference
@@ -93,7 +93,7 @@ mean: F64?
 
 --- expect plan
 aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
-aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate mean: avg(I64?) exact_integer round_to_nearest -> F64?
 aggregate n: count(Person) count error -> I64?
 
 --- expect same as reference
