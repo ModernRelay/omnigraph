@@ -4360,6 +4360,13 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "request"
             ),
             show_row(
+                "read_work_limit",
+                "100000000",
+                "100000000",
+                "default",
+                "request"
+            ),
+            show_row(
                 "write_max_bytes",
                 "33554432",
                 "33554432",

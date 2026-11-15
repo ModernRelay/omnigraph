@@ -170,6 +170,7 @@ binary's rows.
 | load_source_max_bytes | integer(1..) | 33554432 | request |
 | merge_lineage | enum(off, on, verify) | on | request |
 | query_memory_bytes | integer(1..) | 157286400 | request |
+| read_work_limit | integer(1..=9223372036854775807) | 100000000 | request |
 | rrf_plan | enum(auto, force_prefilter, force_postfilter) | auto | process |
 | stage_write_concurrency | integer(1..=64) | 8 | process |
 | traversal_work_limit | integer(1..=9223372036854775807) | 1000000 | request |

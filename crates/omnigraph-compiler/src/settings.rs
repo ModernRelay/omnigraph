@@ -121,6 +121,17 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         doc: "the finite work budget shared by edge selections in one query; exhaustion terminates the query with an error",
     },
     SettingSpec {
+        name: "read_work_limit",
+        kind: SettingKind::Integer {
+            min: 1,
+            max: Some(i64::MAX),
+        },
+        default: "100000000",
+        scope: SettingScope::Request,
+        env: "OMNIGRAPH_READ_WORK_LIMIT",
+        doc: "how many results the expansions of one read may produce, every hop of every traversal together; exhaustion fails the read with an error naming it, never a partial result",
+    },
+    SettingSpec {
         name: "write_max_bytes",
         kind: SettingKind::Integer { min: 1, max: None },
         default: "33554432",
@@ -175,6 +186,7 @@ pub enum SettingId {
     AnnNprobes,
     StageWriteConcurrency,
     TraversalWorkLimit,
+    ReadWorkLimit,
     WriteMaxBytes,
     LoadSourceMaxBytes,
     QueryMemoryBytes,
@@ -192,6 +204,7 @@ impl SettingId {
         SettingId::AnnNprobes,
         SettingId::StageWriteConcurrency,
         SettingId::TraversalWorkLimit,
+        SettingId::ReadWorkLimit,
         SettingId::WriteMaxBytes,
         SettingId::LoadSourceMaxBytes,
         SettingId::QueryMemoryBytes,
@@ -423,6 +436,7 @@ pub struct SessionSettings {
     ann_nprobes: Option<usize>,
     stage_write_concurrency: usize,
     traversal_work_limit: u64,
+    read_work_limit: u64,
     write_max_bytes: u64,
     load_source_max_bytes: u64,
     query_memory_bytes: u64,
@@ -443,6 +457,7 @@ impl Default for SessionSettings {
             ann_nprobes: None,
             stage_write_concurrency: 1,
             traversal_work_limit: 1,
+            read_work_limit: 1,
             write_max_bytes: 1,
             load_source_max_bytes: 1,
             query_memory_bytes: 1,
@@ -512,6 +527,10 @@ impl SessionSettings {
                 self.traversal_work_limit = u64::try_from(parse_integer(id, value)?)
                     .expect("invariant: the row's range is 1..=i64::MAX");
             }
+            SettingId::ReadWorkLimit => {
+                self.read_work_limit = u64::try_from(parse_integer(id, value)?)
+                    .expect("invariant: the row's range is 1..=i64::MAX");
+            }
             SettingId::StageWriteConcurrency => {
                 let width = parse_integer(id, value)?;
                 self.stage_write_concurrency =
@@ -548,6 +567,7 @@ impl SessionSettings {
             SettingId::ChangeLineage => self.change_lineage = from.change_lineage,
             SettingId::AnnNprobes => self.ann_nprobes = from.ann_nprobes,
             SettingId::TraversalWorkLimit => self.traversal_work_limit = from.traversal_work_limit,
+            SettingId::ReadWorkLimit => self.read_work_limit = from.read_work_limit,
             SettingId::StageWriteConcurrency => {
                 self.stage_write_concurrency = from.stage_write_concurrency;
             }
@@ -577,6 +597,7 @@ impl SessionSettings {
             SettingId::AnnNprobes => self.ann_nprobes.unwrap_or(0).to_string(),
             SettingId::StageWriteConcurrency => self.stage_write_concurrency.to_string(),
             SettingId::TraversalWorkLimit => self.traversal_work_limit.to_string(),
+            SettingId::ReadWorkLimit => self.read_work_limit.to_string(),
             SettingId::WriteMaxBytes => self.write_max_bytes.to_string(),
             SettingId::LoadSourceMaxBytes => self.load_source_max_bytes.to_string(),
             SettingId::QueryMemoryBytes => self.query_memory_bytes.to_string(),
@@ -632,6 +653,11 @@ impl SessionSettings {
 
     pub fn traversal_work_limit(&self) -> u64 {
         self.traversal_work_limit
+    }
+
+    /// The rows one read's expansions may produce, all together.
+    pub fn read_work_limit(&self) -> u64 {
+        self.read_work_limit
     }
 
     pub fn stage_write_concurrency(&self) -> usize {
@@ -1098,7 +1124,7 @@ mod tests {
         let err = SettingId::parse("merge_linage").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, change_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir"
+            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, change_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, read_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir"
         );
         let err = SessionSettings::default().with("engine", "v1").unwrap_err();
         assert_eq!(

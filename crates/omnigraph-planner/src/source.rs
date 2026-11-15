@@ -264,6 +264,12 @@ pub trait PlanSource {
         None
     }
 
+    /// The rows the expansions of one read may produce, every hop together;
+    /// `None` is no budget. The plan records the value it read.
+    fn read_work_limit(&self) -> Option<u64> {
+        None
+    }
+
     /// The session's `ann_nprobes` setting, the probe cap a `nearest` scan
     /// carries; `None` is no cap. The plan records the value it read.
     fn ann_nprobes(&self) -> Option<usize> {

@@ -1,0 +1,1 @@
+- Every read runs under `read_work_limit` (default 100,000,000): the rows its expansions produce, all hops together. A chain of hops whose rows multiply fails with a typed error.

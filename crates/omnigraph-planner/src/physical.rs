@@ -134,6 +134,10 @@ pub struct Assumptions {
     /// One shared traversal-work allowance, present for statements using edge selections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traversal_work_limit: Option<u64>,
+    /// The rows the read's expansions may produce, every hop together,
+    /// captured from the session for every read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_work_limit: Option<u64>,
     /// Retained even when rewrites remove an expansion, for historical replay admission.
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_wildcard_traversal: bool,

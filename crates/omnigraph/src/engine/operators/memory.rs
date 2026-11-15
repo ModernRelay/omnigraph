@@ -35,6 +35,9 @@ pub(in crate::engine) struct QueryResources {
     buffers: Mutex<BufferRegistry>,
     registry_memory: MemoryReservation,
     traversal: TraversalWork,
+    /// The rows every expansion of the read produced, against
+    /// `read_work_limit`.
+    read: TraversalWork,
     work: QueryWorkScope,
     /// A csv load's shares of this pool, carved per run by `ValidateExec`.
     load_budget: Mutex<Option<Arc<LoadBudget>>>,
@@ -44,13 +47,20 @@ pub(in crate::engine) struct QueryResources {
 /// search passes share this counter; releasing memory never refunds work.
 #[derive(Debug)]
 struct TraversalWork {
+    /// The setting the limit came from, which a refusal names.
+    resource: &'static str,
     limit: Option<NonZeroU64>,
     used: AtomicU64,
 }
 
 impl TraversalWork {
     fn new(limit: Option<NonZeroU64>) -> Self {
+        Self::named("traversal_work_limit", limit)
+    }
+
+    fn named(resource: &'static str, limit: Option<NonZeroU64>) -> Self {
         Self {
+            resource,
             limit,
             used: AtomicU64::new(0),
         }
@@ -68,7 +78,7 @@ impl TraversalWork {
             .map(|_| ())
             .map_err(|used| {
                 super::external(OmniError::resource_limit(
-                    "traversal_work_limit",
+                    self.resource,
                     limit.get(),
                     used.saturating_add(additional),
                 ))
@@ -198,10 +208,21 @@ impl QueryResources {
         Self::with_traversal_limit(pool, limit, None, QueryWorkScope::default())
     }
 
+    #[cfg(test)]
     pub(in crate::engine) fn with_traversal_limit(
         pool: Arc<dyn MemoryPool>,
         limit: u64,
         traversal_limit: Option<NonZeroU64>,
+        work: QueryWorkScope,
+    ) -> Self {
+        Self::with_work_limits(pool, limit, traversal_limit, None, work)
+    }
+
+    pub(in crate::engine) fn with_work_limits(
+        pool: Arc<dyn MemoryPool>,
+        limit: u64,
+        traversal_limit: Option<NonZeroU64>,
+        read_limit: Option<NonZeroU64>,
         work: QueryWorkScope,
     ) -> Self {
         crate::instrumentation::record_query_memory_pool(&pool);
@@ -214,6 +235,7 @@ impl QueryResources {
             read_seams: crate::instrumentation::capture_external_read_seams(),
             buffers: Mutex::new(BufferRegistry::default()),
             traversal: TraversalWork::new(traversal_limit),
+            read: TraversalWork::named("read_work_limit", read_limit),
             work,
             load_budget: Mutex::new(None),
         }
@@ -674,6 +696,11 @@ impl WorkMemory {
     pub(in crate::engine) fn charge_traversal(&self, additional: u64) -> DfResult<()> {
         self.check()?;
         self.resources.traversal.charge(additional)
+    }
+
+    /// Charge rows an expansion produced against the read's work budget.
+    pub(in crate::engine) fn charge_produced(&self, rows: u64) -> DfResult<()> {
+        self.resources.read.charge(rows)
     }
 
     pub(in crate::engine) fn cancel_on_drop(&self) -> CancelOnDrop {

@@ -360,6 +360,10 @@ impl PlanSource for QuerySource<'_> {
             .then(|| self.settings.traversal_work_limit())
     }
 
+    fn read_work_limit(&self) -> Option<u64> {
+        Some(self.settings.read_work_limit())
+    }
+
     fn schema(&self, side: SideId) -> std::result::Result<SchemaRef, PlanError> {
         Err(PlanError::Unresolved {
             detail: format!("a query plan names its scans by type, not by side {side:?}"),

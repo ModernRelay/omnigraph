@@ -196,7 +196,27 @@ impl QueryContext {
         memory_limit: u64,
         traversal_limit: Option<NonZeroU64>,
     ) -> Result<Self> {
-        Self::with_limits(memory_limit, traversal_limit, ORDERED_SCAN_SCRATCH_BYTES)
+        Self::with_limits(
+            memory_limit,
+            traversal_limit,
+            None,
+            ORDERED_SCAN_SCRATCH_BYTES,
+        )
+    }
+
+    /// The context a read plan runs in: its captured memory, traversal and
+    /// read-work limits.
+    pub(super) fn for_read(
+        memory_limit: u64,
+        traversal_limit: Option<NonZeroU64>,
+        read_limit: Option<NonZeroU64>,
+    ) -> Result<Self> {
+        Self::with_limits(
+            memory_limit,
+            traversal_limit,
+            read_limit,
+            ORDERED_SCAN_SCRATCH_BYTES,
+        )
     }
 
     #[cfg(test)]
@@ -205,12 +225,13 @@ impl QueryContext {
         traversal_limit: Option<NonZeroU64>,
         scratch_limit: u64,
     ) -> Result<Self> {
-        Self::with_limits(memory_limit, traversal_limit, scratch_limit)
+        Self::with_limits(memory_limit, traversal_limit, None, scratch_limit)
     }
 
     fn with_limits(
         memory_limit: u64,
         traversal_limit: Option<NonZeroU64>,
+        read_limit: Option<NonZeroU64>,
         scratch_limit: u64,
     ) -> Result<Self> {
         let config = SessionConfig::new()
@@ -229,10 +250,11 @@ impl QueryContext {
             .map_err(OmniError::datafusion_internal)?;
         Ok(Self {
             session: SessionContext::new_with_config_rt(
-                config.with_extension(Arc::new(QueryResources::with_traversal_limit(
+                config.with_extension(Arc::new(QueryResources::with_work_limits(
                     Arc::clone(&runtime.memory_pool),
                     memory_limit,
                     traversal_limit,
+                    read_limit,
                     work.clone(),
                 ))),
                 runtime,

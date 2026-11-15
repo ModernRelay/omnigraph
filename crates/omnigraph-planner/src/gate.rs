@@ -59,6 +59,7 @@ impl<'s> Recorded<'s> {
         let mut assumptions = self.read.borrow().clone();
         assumptions.gate_policy = self.source.gate_policy();
         assumptions.memory_limit = bounds.query_memory_pool_bytes;
+        assumptions.read_work_limit = self.source.read_work_limit();
         assumptions
     }
 

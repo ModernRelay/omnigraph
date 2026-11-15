@@ -541,8 +541,16 @@ pub(crate) async fn execute(
     let traversal_limit = validate_traversal_admission(&bound.plan)?;
     let ranking = omnigraph_planner::planned_ranking(&bound.plan)
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-    let ctx =
-        QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
+    let read_limit = bound
+        .plan
+        .assumptions()
+        .read_work_limit
+        .and_then(std::num::NonZeroU64::new);
+    let ctx = QueryContext::for_read(
+        bound.plan.assumptions().memory_limit,
+        traversal_limit,
+        read_limit,
+    )?;
     let (mut run, scans) = ctx
         .run_owned(execute_with_context(bound, evidence, context, &ctx))
         .await?;
