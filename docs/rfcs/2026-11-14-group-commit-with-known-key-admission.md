@@ -7,16 +7,18 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-11-14
-updated: 2026-11-14
+updated: 2026-11-15
 discussion: "https://github.com/ModernRelay/omnigraph/pull/1405"
 supersedes: []
 superseded_by: []
 blocked_on:
   - "Engine half of the composition guard: a composed commit keeps only the markers every component carries, and the change feed's one-transaction fast path and the branch merge's pure-insert proof accept it; `lance_surface_guards.rs` pins a Blob v2 column through composition before tables with a Blob column are eligible. The Lance half is `lance_surface_guards.rs::group_commit_composes_inserts_staged_against_older_pins_onto_a_later_pin`, carried over from PR #785 and passing on Lance 13.0.0."
+  - "The batch path's seams (Failure checkpoints) exist before step 6, so the failure suites can reach it at all. The stress study ran `failpoints.rs`, `detached_commit_matrix.rs` and DST with batching forced on, and every failure left was a seam the batch path never crossed."
   - "Admission and failure evidence: the admission matrix (Evidence and tests), `failpoints.rs` and `detached_commit_matrix.rs` windows for the batch path, and the DST concurrent universe with batching on: every acknowledged write visible exactly once, one actor per commit, the collector oracle with batches in flight."
-  - "Batching forced on across the existing gates: the GQT corpus, the engine `integration`, `writes` and `failpoints` binaries, and the configured RustFS and Azurite suites."
-  - "Soak: the throughput instrument at 64 writers on one branch, RustFS behind toxiproxy at +30 ms, for 30 minutes with `optimize` every 5 minutes and `index build` every minute. Every acknowledged write verified, every maintenance run published, writes/s over the last 5 minutes at least 80% of the first 5, peak RSS at 30 minutes within 1.5x of the 10-minute mark."
-  - "Instrument gate on the production build, same backend: at 16 and 64 writers on one branch at least 10x the baseline's writes/s with p99 under 1 s, one writer within 10% of the ordinary path, per-writer counts within 2x of each other (#784)."
+  - "Batching forced on across the existing gates: the GQT corpus, the engine `integration`, `writes` and `failpoints` binaries, the DST suite, and the configured RustFS and Azurite suites."
+  - "Server maintenance admission: a served `optimize` is admitted while 64 or more writes are in flight. Today every recorded operation counts against `DEFAULT_WRITE_OBSERVERS` (64, no override) and is refused with 429 at that load. This is a server fix of its own and lands before the soak."
+  - "Soak: the throughput instrument at 64 writers on one branch, RustFS behind toxiproxy at +30 ms, for 60 minutes, with a served `optimize` every minute and an embedded `index build` from a second process every minute. Every acknowledged write verified, every maintenance run published, writes/s over the last 5 minutes at least 80% of the first 5, peak RSS at 60 minutes within 1.25x of the 30-minute mark, and the known keys and the effect log within their byte budgets throughout."
+  - "Instrument gate on the production build, same backend. Pure inserts: at 16 and 64 writers on one branch at least 10x the baseline's writes/s with p99 under 1 s. Mixed: 70% inserts and 15% key-addressed updates and deletes on the same table, at 16 and 64 writers, at least 2.5x the ordinary path. One writer within 10% of the ordinary path. Per-writer counts within 2x of each other (#784). With no maintenance, 64 writers for 5 minutes on local disk never fall to 0 writes/s over a 10 s window, and the decay is reported beside the result."
 ---
 
 # RFC: Group commit with known-key admission
@@ -37,6 +39,11 @@ research drafts #1399 (`e628c35d`), #1400 (`f22f0718`) and #1401
 transaction, versioning, branch/tag, distributed-write, row-ID-lineage,
 object-store and Blob pages, read 2026-11-14, and its `io/commit.rs`,
 `lance-table` `transaction/manifest_build.rs` and `transaction/row_version.rs`.
+**Stress-tested:** the #1401 prototype merged with the per-branch
+writer-state cache (#1407) and `main`, on release binaries, on fork branch
+`research/group-commit-stress` at `155911f0`
+(`research/group-commit-stress/REPORT.md`, 2026-11-15). Its defects and
+measurements drove the 2026-11-15 revision (Decision log).
 
 This RFC supersedes the group-commit draft of PR #785
 (`2026-09-28-group-commit.md`, never merged, so no metadata names it) and
@@ -66,10 +73,26 @@ key-absence probe read the indexed fragments and memory instead of every
 unindexed fragment. That probe is what limits writers once publication is
 amortized.
 
+Three structural rules make the admission proof hold by construction rather
+than by every caller's care. The engine's one publication door appends each
+publication's effect to the log, classified from the staged effect itself.
+A class is exact only when its ids come from staging; anything else is
+`changed`. The log refuses an append that does not continue its head.
+Writes outside the group that update or delete are logged with the exact
+ids they wrote, so they refuse only the queued writes that share a key with
+them.
+
 No storage format, wire shape or API field changes. Writes that update or
 delete, name an expected head, or are validated against committed rows an
-insert can change keep today's path: non-key `@unique` and bounded `@card`
-read such rows.
+insert can change publish alone, as today: non-key `@unique` and bounded
+`@card` read such rows. A later step may batch updates and deletes
+addressed by key (§Key-addressed updates and deletes).
+
+The gain is for insert-heavy writing in one process. Each write still adds
+one fragment, so the cost per write grows until maintenance runs, and
+batching requires a maintenance cadence (§Fragments and maintenance). The
+floor of one conditional put per publication remains; a record log in
+front of `__manifest` is the design that removes it (Out of scope).
 
 ## Motivation
 
@@ -92,7 +115,8 @@ Lance 13 a publication is five serial puts: the table's transaction file,
 its manifest, then the `__manifest` data file, transaction file and
 version. Lance writes the transaction file before the manifest
 (`do_commit_detached_transaction`; the switch that skips it,
-`ManifestWriteConfig::with_transaction_file_disabled`, is `#[cfg(test)]`).
+`ManifestWriteConfig::with_transaction_file_disabled`, is `#[cfg(test)]`,
+and `pub(crate)` in Lance 14.0.2).
 That is about 165 ms at 32 ms per request. More than about six writes per
 second per branch therefore needs several writes per publication
 (#1401 §3).
@@ -125,6 +149,39 @@ was the limit, not publication. Known keys removed the limit (Evidence).
 #1399 met the same wall on a table without an id index: 6.3 cores busy at
 62 writes/s, and CPU per write rising from 31 to 110 ms within one run as
 fragments grew.
+
+### What batching does not fix
+
+The stress study measured three limits the first draft understated.
+
+- **Writes that are not inserts.** If an update or delete on a table is
+  logged as `changed`, every queued insert into that table is refused, and
+  each refused insert then publishes alone under the branch gate. On RustFS
+  at +30 ms, 48 writers with 70% fresh inserts and about 15% same-table
+  updates, deletes and upserts of present keys reached 3.2 writes/s, against
+  3.0 with batching off; at 1,024 writers every batch held one write. With
+  those writes logged by the exact ids they wrote, the same run reached 9.0
+  writes/s and 4.07 writes per commit, p99 32.3 → 11.9 s, and 1,024 writers
+  reached 15.6 writes per commit. Exact footprints are therefore part of the
+  design (§The effect log). The updates and deletes themselves still publish
+  one per publication until §Key-addressed updates and deletes lands.
+- **Fragments.** Each write adds a fragment, and several per-write and
+  per-batch passes are linear in the fragment count: the uncovered-set
+  computation, the known-key lookups, the tail's file sizes, and each
+  batch's manifest build and write. Locally, 48 writers with no maintenance
+  fell from 649 to 24 writes/s in 40 s. Past `KEYED_WRITE_MAX_ROWS` (8,192)
+  uncovered fragments times ids, `stage_keyed_write` stops proving absence
+  and every keyed insert becomes a full-table merge join: 0 writes/s. That
+  cliff is on `main` today; batching reaches it in seconds.
+- **Maintenance.** Under batching, 0 of 16 direct-path `optimize` and index
+  builds landed, because each captured before its gates and the head had
+  moved. The served `optimize` captures under the gates and kept up (54 of
+  54 in an hour), but the server refuses it once 64 writes are in flight.
+
+Batching also leaves two process-local costs: the known keys and the effect
+log start empty after a restart, and writes by another process are never
+explained, so they refuse the queue. One mutation-capable writer process per
+cluster is the supported topology (invariants, support boundaries).
 
 ## User and operational behavior
 
@@ -169,11 +226,27 @@ fragments grew.
 | Loses the compare-and-swap | Sent back, as a single write that loses it is today |
 | `WriterFenced` | `WriterFenced`, not retried; the process's holder for the branch is cleared |
 | Publication in doubt | In doubt (`manifest_publish_in_doubt`), naming the batch's attempted commit id, with uncertain evidence; a server closes admission once, as for one in-doubt write |
-| The leader's future is dropped (an embedded caller) | Before the batch's first effect: sent back. After it: uncertain evidence. The next waiter leads either way |
+| The leader's future is dropped (an embedded caller) | Before the batch's first detached commit: sent back. After it: uncertain evidence. The next waiter leads either way |
+| A follower is dropped while the lead is being handed to it | The lead passes to the next waiter; no group is left without a leader |
+| A member's own future is dropped before admission | It leaves the queue; nothing of it is published |
+
+The group, not the leader's task, owns the batch's outcome. The outcome is
+one typed value: the commit, or the batch's error with its kind, details,
+completion evidence and HTTP status. The group delivers it to every member
+unchanged, the leader included. A drop guard on the leader's lead answers
+every drained member and hands the lead on when the leader's future is
+dropped at any point, and a drop guard on each waiter passes on a lead it
+was sent but never took. These rule out four defects the stress study
+found in the prototype (the report's numbering): a group hung by a dropped leader (H3), a cancelled write
+still published (H4), followers given an internal error in place of
+`manifest_publish_in_doubt` (H7), and every member's error re-typed as
+internal, losing `WriterFenced`, conflicts and the 409 (H11).
 
 An HTTP write is an owned operation, so a disconnect never drops its future
 ([Owned server operations](2026-09-30-owned-server-operations.md)). An
-embedded caller that drops its future before admission leaves the queue.
+embedded caller that drops its future before admission leaves the queue:
+closed entries are removed when the leader drains the queue and again after
+it takes the gates.
 
 ### Fairness, settings and what does not change
 
@@ -221,8 +294,17 @@ today's path, serialized with batches by the branch gate.
    `as commit` or `as unattached branch`.
 6. It is a first attempt. A second attempt publishes alone (§Progress).
 
-Edge inserts are eligible when rule 3 allows them. Their endpoint node
-tables join the footprint as tables read and not written.
+Edge inserts are eligible when rule 3 allows them. Their endpoint ids join
+the footprint as keys read in the endpoint node tables. The prototype
+checked only the tables an entry wrote and admitted an edge across a delete
+of its endpoint (H10).
+
+**The footprint.** For each table an entry touches, its footprint is two
+exact key sets taken from staging: the keys it ***writes*** (its inserted
+ids) and the keys it ***reads*** (its inserted ids, whose absence it proved,
+and, in an endpoint node table, the endpoint ids whose existence it
+checked). Eligibility guarantees that nothing outside these sets decided the
+entry's outcome.
 
 ### The write group
 
@@ -246,7 +328,12 @@ while the previous one published. There is no timer.
 A batch runs these steps.
 
 1. **Gates.** The shared schema permit and the branch gate, which
-   `commit_all` takes today.
+   `commit_all` takes today. The leader drops queued entries whose callers
+   have gone, then reads the effect log as it is now, under the gates. A
+   copy taken before the gates misses the publications made while the leader
+   waited, refuses everything, and in the prototype then cleared the live
+   log, so the refusals never stopped: on the S3 soak, 122 → 2.35 writes/s
+   after the first `optimize` (H14).
 2. **Capture once.** The current authority, as revalidation reads it. On a
    held bound branch this reads nothing (#1350). On an unheld branch the
    leader may skip the probe when its handle's installed view is the head
@@ -270,10 +357,12 @@ A batch runs these steps.
    skips `record_successful_commit`), so the next writer's validation would
    otherwise read it, one serial request per write (#1401 §5.3). This is
    cache population only.
-7. **Complete.** Append the batch's effect to the log. Each submitting
-   handle installs the published snapshot before its receipt returns, so a
-   read on that handle sees its write. Answer every member and hand the
-   lead.
+7. **Complete.** The publication door has appended the batch's effect to
+   the log (§The effect log); the batch does not append it itself. Each
+   submitting handle installs the published snapshot before its receipt
+   returns, so a read on that handle sees its write. Answer every member
+   and hand the lead. A batch that admitted nothing publishes nothing and
+   leaves the log as it found it.
 
 ### Admission
 
@@ -285,17 +374,25 @@ none. The leader admits e, in arrival order, when all hold.
    are the batch's. Every table e read or wrote has the same table identity,
    dataset location and native ref at `Hc`.
 2. **Explained interval.** Walking back from `Hc` to `He`, within K
-   publications, every publication is explained. It is either in the
-   branch's effect log (§The effect log), or each table pin it moved reaches
-   the previous pin through `Rewrite` and `CreateIndex` commits alone, with
-   the same row count and registrations. That second test is the durable
-   proof `revalidate_write_txn_carrying` runs (#1349).
-3. **Untouched reads.** For each table e inserts into, every effect in the
-   interval preserved rows or inserted ids disjoint from e's ids there. For
-   each table e read without writing, every effect preserved rows or only
-   inserted.
-4. **Disjoint batch.** No entry admitted earlier in this batch inserts any
-   of e's ids into the same table.
+   publications, every publication is explained. The walk first follows the
+   effect log's links from its head: each record's parent is the head of
+   the record before it, and the walk never steps from one record to
+   another that does not link (§The effect log). Where the log ends before
+   `He`, each remaining publication must have moved every table pin only
+   through `Rewrite` and `CreateIndex` commits, with the same row count and
+   registrations. That is the durable proof `revalidate_write_txn_carrying`
+   runs (#1349), and it is how another process's maintenance is explained.
+   Anything else is unexplained. The prototype walked back to the capture
+   without checking that consecutive records linked, so a batch that
+   appended after a stale record hid a foreign insert of the same key, and
+   admission produced duplicate keys, dangling edges and false
+   `omnigraph.insert_absence` certificates (H1).
+3. **Untouched footprint.** For each table in e's footprint, every effect
+   in the interval preserved rows, or wrote only keys outside e's read and
+   written keys there. An effect logged `changed` on such a table fails the
+   rule.
+4. **Disjoint batch.** No entry admitted earlier in this batch writes a key
+   e reads or writes, or reads a key e writes, in the same table.
 
 A refused entry has made no effect of the batch.
 
@@ -313,16 +410,16 @@ through an arbitrary predicate, even one that matches nothing. A non-key
 `@unique` group reads other rows' committed values. A bounded `@card`
 counts a source's committed edges. An overwrite reads the whole table.
 
-Rule 1 keeps the first fact. Rules 2 and 3 keep the next two. Since `He`,
-the tables e inserts into changed only by inserts of other ids and by
-commits that changed no row, so e's ids are still absent at `Hc`. Inserts
-and row-preserving commits remove no endpoint. The last fact depends on
-nothing outside e. So e validates at `Hc` exactly as it did at `He`. Its
+Rule 1 keeps the first fact. Rules 2 and 3 keep the next two. Every
+effect since `He` either changed no row or wrote only keys outside e's
+footprint. So no effect inserted one of e's ids, and e's ids are still
+absent at `Hc`; and no effect deleted or rewrote one of e's endpoints. The
+last fact depends on nothing outside e. So e validates at `Hc` exactly as it did at `He`. Its
 staged effect, a pure insertion of its rows, is the effect a fresh
 preparation at `Hc` would stage.
 
-Rule 4 makes the members of a batch pairwise disjoint per table, so they
-commute. Every serial order of them on `Hc` yields the one state the
+Rule 4 makes the members of a batch pairwise disjoint per table: no member
+writes a key another reads or writes. So they commute. Every serial order of them on `Hc` yields the one state the
 composed commit publishes. A batch is therefore equivalent to executing its
 members serially, in admission order, on `Hc`. Every member was in flight
 when the batch published, so the publication point lies inside every
@@ -334,8 +431,12 @@ What admission must still catch:
 | Case | Caught by |
 |---|---|
 | Two entries insert the same new key | Rule 4 in one batch, rule 3 across batches. The later entry is sent back and its rerun sees the key: a strict insert gets `KeyConflict`, a keyed insert becomes an update on today's path |
+| An update, upsert or delete of the same key in this process since the capture | Rule 3: the record's written keys hold e's key |
+| An update or delete of other keys in the same table since the capture | Explained by rule 3; e is admitted |
 | Another process wrote, merged or deleted since the capture | Rule 2: unexplained |
-| An edge's endpoint was deleted since the capture | Rule 3 (logged as `changed`) or rule 2 |
+| A foreign insert of e's key hidden behind a stale log record (H1) | Rule 2: the walk follows links only, and the log resets on a record that does not link |
+| An edge's endpoint was deleted since the capture | Rule 3 (the delete's record holds the endpoint id, or the table is `changed`) or rule 2 |
+| A publication on a path that does not append to the log (H13) | Cannot happen: the publication door appends (§The effect log) |
 | A schema apply, or the branch deleted and recreated | Rule 1 |
 | Write skew through a predicate scan of a table another entry writes | Eligibility: an executed update or delete is ineligible |
 | Insert `Left` and update `Right` against insert `Right` and update `Left`, from one base where neither exists (#785 review) | Eligibility, from `op_kinds` carried through staging |
@@ -345,26 +446,61 @@ What admission must still catch:
 
 ### The effect log
 
-Each write group keeps an in-memory log. Every publication this process
-makes on the branch, through any path, appends a record while it still
-holds the branch gate. A record holds the head the publication built on, the
-head it produced, and one class per touched table:
+Each write group keeps an in-memory log. A record holds the head the
+publication built on (its parent), the head it produced, and one class per
+touched table. Three rules make the log correct by construction.
 
-- `inserted(ids)`, for an insert-only effect carrying its exact ids;
-- `row_preserving`, for a `Rewrite` or `CreateIndex` chain;
-- `changed`, for anything else.
+**The publication door writes it.** Every engine publication passes through
+`GraphCoordinator`'s commit (`db/graph_coordinator.rs`): mutations, loads,
+merges, `optimize`, index builds, schema apply, the collector and the
+system-column upgrade. That commit takes, as a required argument with no
+default, one `PublicationEffect` per table, and appends the record after a
+successful compare-and-swap, before its caller releases the branch gate.
+Nothing else writes the log, and `forbidden_apis.rs` pins that. A path
+cannot forget to log, which is how maintenance went unexplained in the
+prototype: `optimize` and index builds published through
+`commit_updates_on_branch_with_expected` directly, and every queued entry
+was refused after each maintenance run (H13).
 
-Logging ordinary-path publications too is what stops a sent-back member's
-publication from refusing every entry queued behind it. #1401's first
-prototype hit that cascade after a Bloom false positive.
+**The class comes from the staged effect.** `PublicationEffect` has one
+constructor per class, and each reads the staged effect, not the caller's
+claim:
+
+- `inserted(ids)` only from an insert-only effect of the absence-proven
+  insert writer, with the ids of the key column it wrote;
+- `touched(written ids)` only from a mutation's staging: its keyed batches
+  carry every inserted, upserted or updated id, and its delete path records
+  every deleted id (`MutationStaging::record_deleted_ids`), cascaded edges
+  included;
+- `row_preserving` only from a staged chain whose Lance operations are all
+  `Rewrite` or `CreateIndex`;
+- `changed`, which takes nothing, for loads, merges, overwrites, schema
+  evolution of a table and anything else.
+
+Every record of an edge table also carries the endpoint ids of the edges it
+wrote. The classes fail closed: a constructor that cannot produce the
+complete id set, or whose ids exceed the record's byte budget, returns
+`changed`. An incomplete footprint would admit a write it must refuse; a
+`changed` record only refuses more than it needs to.
+
+**The log type enforces its links.** An append whose parent is the log's
+head extends the log. Any other append resets the log to that one record,
+so a record that does not link to its predecessor can never be walked
+across. The walk (Admission, rule 2) steps only along links. A batch that
+admits nothing publishes nothing and so neither appends nor clears.
+
+Logging every publication of the process, not only batches, stops a
+sent-back member's publication from refusing every entry queued behind it.
+Logging updates and deletes by their exact ids, not as `changed`, is what
+keeps batching alive under a mixed workload (Motivation): on RustFS, 3.3 →
+9.0 writes/s and 1.06 → 4.07 writes per commit in the stress study.
 
 The log is cleared by a publication that changes the schema contract or the
 table set, by a branch delete or recreate, by an outcome the read-back
 leaves in doubt, and by a process restart. Entries captured before then fail
 rule 2 and are sent back.
 
-The log is bounded by K records and a byte budget for ids. An effect with
-more ids than one entry may carry is logged as `changed`. It caches facts
+The log is bounded by K records and a byte budget for ids. It caches facts
 about immutable, published commits, as invariant 12 permits, and is never
 commit authority: `ExactGraphHead` is.
 
@@ -453,6 +589,23 @@ and no overlay. The probe then scans only the indexed fragments (Lance
 `fast_search`) and answers the uncovered ones from memory. Otherwise it
 scans as today.
 
+Two rules keep the read cheap as the tail grows:
+
+- **The tail cap applies only to a scanned tail.** `stage_keyed_write`
+  proves absence only while uncovered fragments times ids stay within
+  `KEYED_WRITE_MAX_ROWS` (8,192); past that every keyed insert becomes a
+  full-table merge join. The cap bounds the `IN` lists a scan of the tail
+  plans, and a tail answered from memory plans none. So when the known keys
+  answer the whole uncovered tail, the cap does not apply. In the stress
+  study this removed a cliff to 0 writes/s: 27–36 → 126–136 writes/s on
+  release binaries once past it.
+- **The tail analysis is computed once per table version.** Which
+  fragments are uncovered, and whether the map knows all of them, is a
+  fact about one pinned version. It is computed once per version and shared
+  by every probe at that version, instead of three times per write under a
+  process-wide lock. Pure inserts doubled in the dev-build harness (112 →
+  225 writes/s), less on release builds.
+
 **Why the answer is exact.** Lance names every data file it writes from a
 fresh random UUID (`generate_random_filename`) and never rewrites a file.
 So the ids in a file are a fact about the object, true in every version,
@@ -482,11 +635,21 @@ wrong, because an entry describes an immutable object, not a branch. At
 most it makes an entry irrelevant. Keying by resolved location keeps equal
 names in different roots apart.
 
+Lance 14 moves BTREE to the row-address domain (lance#9481), so an index
+may no longer cover a compacted fragment. Such a fragment holds a file the
+map does not know and is scanned: a cost to re-measure at that bump, not a
+change in answers.
+
 **Bound and eviction.** A process-wide byte budget, counting key bytes and
-per-entry overhead, with the oldest entries evicted first. An evicted entry
-costs only the scan it saves. The prototype bounded by id count (4 M); the
-production bound is in bytes. Probes answered from the map, and misses, are
-counted in `QueryIoProbes`.
+per-entry overhead, with the oldest entries evicted first. When this process
+publishes a `Rewrite`, the entries for the files it removed are dropped at
+that publication, since no later version lists them. An evicted entry costs
+only the scan it saves. The prototype bounded by id count (4 M) and never
+evicted: in the hour-long soak it grew one entry per write, to 362,650
+files and about 100 MB, including entries for files compaction had
+replaced. The production bound is in bytes. Probes answered from the map,
+and misses, are counted in `QueryIoProbes`, and the map's bytes are
+reported.
 
 **Derived state.** The map is a cache of immutable facts keyed by the
 object they describe (invariant 12). A miss or a bypass reads the file. The
@@ -513,7 +676,51 @@ with the scan's on every fragment shape above.
 B, F, K and the budgets are constants chosen from the instrument by the
 implementer. The batcher's own memory is bounded by these caps. The #785
 spike's RSS growth with commit rate came from the table-handle cache (#859)
-and the history rewrite (#860, fixed), not from batching.
+and the history rewrite (#860, fixed), not from batching. In the stress
+soak, RSS rose from 2.6 GB at 10 minutes to 3.5 at 30 and 5.2 at 60 with no
+plateau. That is consistent with Lance's session caches filling toward
+their defaults (6 GiB index, 1 GiB metadata, `lance_access.rs`), since every
+`optimize` rebuilds the id index under a new UUID and every batch writes a
+new table manifest, plus the unbounded known keys. The soak gate therefore
+compares 60 minutes with 30 and checks the known keys and the log against
+their budgets.
+
+### Fragments and maintenance
+
+Each write adds one fragment, and batching raises the write rate, so it
+raises the rate at which fragments accumulate. These passes are linear in
+the fragment count: the uncovered-set computation (once per version after
+§Known keys), the known-key lookups per uncovered fragment, the tail's
+data-file sizes, and each batch's table manifest build and write, which
+list every fragment. Without maintenance the rate decays: locally, 48
+writers fell from 649 to 24 writes/s in 40 s.
+
+So batching is specified with a maintenance cadence, not as a feature that
+works without one:
+
+- the maintenance carry (Interactions) lands before batching, so `optimize`
+  and index builds land while batches publish;
+- the server admits a recorded `optimize` while writes are in flight
+  (`blocked_on`);
+- the user docs that enable batching state the cadence: an `optimize` that
+  compacts and reconciles indexes often enough that the uncovered tail stays
+  bounded. In the soak, a served `optimize` every minute at about 100
+  writes/s took a flat 6.6 s and held the rate within 15% over an hour;
+- the instrument gate reports the decay with no maintenance and requires
+  that it never reach 0 writes/s.
+
+**One fragment per batch** (Unresolved questions). The leader could write
+each table's admitted rows into one data file instead of composing one
+fragment per member, cutting fragment growth by the batch size. That is the
+#1399 leader-staging variant: at 64 writers on a table without an id index
+it lifted 58.3 to 147.2 writes/s, but it moves the probe and the data put
+into the serialized path, and 4 writers fell from 12.0 to 9.2 and 16 from
+46.4 to 36.8. With known keys the probe stays with the writers, and only
+the put moves. It is measured at step 6 at 4, 16, 64 and 256 writers, with
+and without maintenance, and adopted only where it does not lower
+small-batch throughput, possibly only above a batch size. Lance's
+`FLAG_FRAGMENT_TREE`, present in the format and marked unsupported in
+14.0.2, is the substrate's answer to manifests that list every fragment.
 
 ### Failure checkpoints and recovery
 
@@ -543,7 +750,12 @@ assumption.
   crossed unchanged.
 - New seams (`decide_seam!`, catalogued): after queueing, after admission,
   after the composed detached commits and before the compare-and-swap, and
-  at the lead handoff.
+  at the lead handoff. They land with the write group (step 5), before
+  batching. With batching forced on, the stress study's remaining
+  `failpoints`, `detached_commit_matrix` and DST failures were all tests that
+  arm an ordinary-path seam (`mutation.post_finalize_pre_publisher`,
+  `mutation.post_table_commit`) the batch path never crosses: until these
+  seams exist, those suites cannot reach the batch path at all.
 - `detached_commit_matrix.rs` gains a grouped-insert writer through every
   window, fault and recovery actor.
 
@@ -565,25 +777,38 @@ process. Another process stays outside the bound: the compare-and-swap and
 the 32-attempt limit cover it.
 
 #1401's prototype re-prepared refused entries outside the gates and gave up
-this bound. Its two `issue_1331` failpoint cases failed for that reason.
+this bound. Its two `issue_1331` failpoint cases failed for that reason, and
+under stress, with two or more actors or handles, 5–7% of writes reached the
+caller as `ReadSetChanged` (HTTP 409) after 32 attempts (H5). Ungated
+retries before the gated one were measured and discarded (Alternatives).
 
 ### Interactions
 
 - **Writer epoch.** A batch's publication asserts the process's holder like
   any publication, and `WriterFenced` reaches every member. On a held bound
   branch the leader's capture reads nothing. The probe-free capture for
-  writers stays the epoch's holder skip (#1350); this RFC adds none.
+  writers stays the epoch's holder skip (#1350); this RFC adds none. The
+  measured columns include the publisher's listing-free first attempt
+  (#837). If it lands, its epoch assertion on an image it has not verified
+  must compare without side effects and send any mismatch to a fresh load.
+  In the prototype that assertion ran the refusal path, which cleared the
+  process's live holder, so later writes were refused `WriterFenced`, with
+  batching off too (H12).
 - **`optimize` and index builds: batches over maintenance.** A maintenance
   publication is row-preserving, so rule 2 explains it whether this process
-  or another made it. Composition reads the compacted pin, and Lance assigns
-  fresh ids above its high-water marks.
+  or another made it: this process's through its `row_preserving` record,
+  another's through the durable proof. Composition reads the compacted pin,
+  and Lance assigns fresh ids above its high-water marks.
 - **`optimize` and index builds: maintenance under batches.** An index
   build captures before staging and is refused when the head moved before
   its gates (`maintain_indices_for_branch`), and so is `optimize`'s direct
   path (`AuthorityCapture::BeforeGates`). #1399 measured 1 of 13 index
-  builds landing at about 240 writes/s. Whatever raises the publication rate
-  starves maintenance, and the unindexed tail then grows. This RFC carries
-  both over insert-only and row-preserving publications, mirroring #1349:
+  builds landing at about 240 writes/s, and the stress study 0 of 16.
+  Whatever raises the publication rate starves maintenance, and the
+  unindexed tail then grows (§Fragments and maintenance). So the carry is a
+  prerequisite of batching, not an improvement beside it: step 4 lands
+  before step 6. This RFC carries both over insert-only and row-preserving
+  publications, mirroring #1349:
   - under the gates, prove that each moved pin reaches the captured one
     through insert-only `Update` links and `Rewrite` or `CreateIndex`
     links, with registrations unchanged and no row count going down;
@@ -594,7 +819,11 @@ this bound. Its two `issue_1331` failpoint cases failed for that reason.
   which stay unindexed, and makes `Rewrite` conflict with an `Update` only
   on overlapping fragments. Served `optimize` keeps capturing under the
   gates (`AuthorityCapture::UnderGates`), so batches wait within the bound
-  it already promises writers (`max_gate_hold`, `docs/dev/writes.md`).
+  it already promises writers (`max_gate_hold`, `docs/dev/writes.md`). The
+  server must also admit it under write load: today a recorded operation
+  counts against `DEFAULT_WRITE_OBSERVERS` (64, no override), so with 64
+  writes in flight every `optimize` is refused with 429 (`blocked_on`). The
+  served path has no index-build route; its `optimize` reconciles indexes.
 - **Schema apply.** It takes the schema gate exclusively and waits for
   in-flight batches, which hold the shared permit. Its publication clears
   the log. A queued entry captured before it is sent back and reruns
@@ -609,6 +838,71 @@ this bound. Its two `issue_1331` failpoint cases failed for that reason.
   shared `merge_authority_cache`. Batches on named branches use it, and
   this RFC does not redesign it. #1399 (§6.4), #1400 (E) and #1401 (§5.6,
   §5.8) measured it.
+
+### Key-addressed updates and deletes
+
+Step 7 may extend eligibility to updates and deletes addressed by key. Exact
+footprints for publications outside the group stop such writes from
+emptying the batch; they still publish one per publication. This step lets
+them batch too. It is designed here so that the footprint, the log and
+admission need no second redesign, and it lands only if its measurement
+passes (Rollout).
+
+**Eligibility.** An update or delete is ***key-addressed*** when its
+predicate has a conjunct that is an equality or an `IN` list on the
+target's key property, against parameters or literals. The test reads the
+typed IR predicate (invariant 9), never its text. Other conjuncts are then
+evaluated only on the rows of those keys. The write must also:
+
+- assign no key, `src` or `dst` property;
+- meet rules 3 to 6 of §Eligibility, so no non-key `@unique` group and no
+  bounded `@card` on a table it writes;
+- execute only key-addressed updates and deletes and inserts, recorded per
+  operation as `op_kinds` already are.
+
+An upsert that matched a present key counts as a key-addressed update of
+that key.
+
+**The footprint.** Its read and written keys are the narrowed keys, whether
+or not a row matched: a row's absence is read too. A node delete whose type
+has incident edge types also reads each incident edge table by endpoint, to
+cascade. There its footprint holds the deleted node ids as ***endpoint
+reads***, and its written keys are the edge ids the cascade found. Rule 3
+gains one clause: no effect in the interval wrote an edge whose endpoint ids
+meet the entry's endpoint reads. This is why every edge record carries
+endpoint ids. Rule 4 gains the same clause within a batch, so an edge insert
+to node `k` and a delete of `k` never share a batch.
+
+**Why this is enough.** A key-addressed write's outcome depends on the
+accepted schema, the rows at its keys, and, for a cascading delete, the
+edges incident to its keys. Admission proves that nothing since `He`, and
+no earlier member of the batch, wrote any of them. So the write computes at
+`Hc` what it computed at `He`: the same matched rows, the same new row
+images, the same cascade, the same affected counts. Members are pairwise
+disjoint, so they commute, and the serializability argument of §Admission
+carries over unchanged.
+
+**Composition.** An update's or delete's staged effect cannot be composed
+like an insert's. It removes old rows through a deletion file read at
+`He`, and between `He` and `Hc` another write may have added a deletion
+file to the same fragment, or compaction may have rewritten it. The leader
+therefore stages these again at `Hc`. Per table it writes one keyed write of
+the admitted updates' row images, which preparation computed and admission
+keeps valid, and one delete of the admitted deleted keys. Both are detached
+commits chained on the table's composed insert commit, and one pin
+publishes the chain. That puts, per table and batch, an id-index read and
+at least one detached commit's transaction and manifest puts inside the
+serialized path. Lance 13's rebase of one `Update` over another on the same
+fragment is not relied on; a guard would have to pin its deletion-file merge
+first.
+
+**Evidence before it lands.** The mixed-workload instrument at 16, 64 and
+1,024 writers, with this step off and on, and matrix cells for: two updates
+of one key; an update and an insert of one key; a delete of node `k` beside
+an edge insert to `k`, in one batch and across batches; a delete that
+matched nothing followed by an insert of that key; and an update whose other
+conjunct matches no row. It lands only if mixed-workload writes/s rise over
+step 6 and one writer stays within 10% of the ordinary path.
 
 ## Invariants
 
@@ -632,7 +926,7 @@ this bound. Its two `issue_1331` failpoint cases failed for that reason.
   either revalidates that complete authority, or proves that every
   publication since its capture left unchanged everything the write read.
   That is the accepted schema, the branch incarnation, the identity of
-  every table it touched, and the rows it read; only inserts of other keys
+  every table it touched, and the rows it read; only writes of other keys
   and commits that changed no row may have followed. A write so proven
   publishes on the current authority, which its publication's
   compare-and-swap names. A retry starts a new attempt; it never combines
@@ -660,8 +954,10 @@ this bound. Its two `issue_1331` failpoint cases failed for that reason.
   are counted as re-preparations; batch size, known-key probes and misses
   are counted.
 - **12, one source of truth.** The effect log and the known keys cache
-  immutable facts. The queue holds requests, not state derivable from the
-  manifest.
+  immutable facts. The log has one writer, the publication door, and each
+  record's class is derived from the staged effect it describes, failing
+  closed to `changed`; no caller states a class. The queue holds requests,
+  not state derivable from the manifest.
 - **Deny-list.** The write group is process-local and is not presented as
   fencing; the compare-and-swap and the writer epoch remain the
   cross-process fences. There is no job queue for manifest-derived work, no
@@ -691,7 +987,10 @@ this bound. Its two `issue_1331` failpoint cases failed for that reason.
 | Pipelined batches (#1401 §5.5; #1399; #1400 C) | +70% publications/s at 16 writers on RustFS (4.85 to 8.25) with writes/s unchanged: closed-loop throughput follows per-write latency, and a batch still takes about 230 ms. Stage A's detached commits carry the predecessor's parent head, which the collector would judge dead, and #1400 needs invariant 3 reworded for predicted state. Future work |
 | Probe-free capture for every writer (#1401 §5.7; #1400 B) | Safe for the compare-and-swap but not for a write's meaning. A query compiled against a catalog another handle replaced failed terminally; a recreated branch's first attempt bound the dead incarnation; a vanished `__manifest` lost its before-effect evidence. Withdrawn; the supported form is #1350's holder skip |
 | Bloom filters as the admission test | False positives refused entries and cascaded (§The effect log) |
-| The leader stages each table's write for the batch (#1399) | One probe and one fragment per table per batch. At 64 writers on a table without an id index it lifted 58.3 to 147.2 writes/s, but it moves the probe and the data put into the serialized path: 4 writers fell from 12.0 to 9.2 and 16 from 46.4 to 36.8. A strict insert's `KeyConflict` would need attributing to one member. Known keys remove the per-write probe without that; leader staging stays a candidate for fragment growth past about 250 writes/s (#1401 §5.10) |
+| Log writes outside the group as `changed` per table (the first draft) | Under a mixed workload every update or delete refuses the queue: on RustFS 3.2 writes/s against 3.0 with batching off, and one write per batch at 1,024 writers. Exact footprints reach 9.0 (§The effect log) |
+| Retry a refused entry ungated before the gated attempt | 32 ungated retries reached 8.0 writes/s on the RustFS mixed run, below exact footprints' 9.0, with no progress bound; one retry changed nothing |
+| Each caller appends its own publication to the log | One forgotten path makes every queued entry unexplained after each of its publications; the prototype's maintenance did (H13). The door appends instead |
+| The leader stages each table's write for the batch (#1399) | One probe and one fragment per table per batch. At 64 writers on a table without an id index it lifted 58.3 to 147.2 writes/s, but it moves the probe and the data put into the serialized path: 4 writers fell from 12.0 to 9.2 and 16 from 46.4 to 36.8. A strict insert's `KeyConflict` would need attributing to one member. Known keys remove the per-write probe without that. Writing one data file per table per batch, with the probe left to the writers, stays open against fragment growth (§Fragments and maintenance) |
 | A dedicated publisher task | A child producer no owned operation owns, invisible to `--measure` and `.gqt` `order:` (#785) |
 | A record log in front of `__manifest` (#1399) | One conditional put per publication and +32% at 64 writers in its setting, but it rewords invariants 2, 5 and 12 and overlaps RFC 0068. Future work, in its own RFC |
 | RFC 0068's commit record | Lowers the per-publication cost and composes with this RFC: one record per batch |
@@ -789,9 +1088,50 @@ every acknowledged write exactly once.
   RustFS at +30 ms. It took 8 writers from 0.87 to 9.23 writes/s, with
   per-writer max/min from 26 to 1.0.
 
+**The stress study (2026-11-15).** Release builds of `omnigraph` and
+`omnigraph-server` from the #1401 prototype merged with #1407 and `main`,
+on local disk and on RustFS behind toxiproxy at +15 ms each way, with
+batching forced on. Oracles on every run: every acknowledged receipt names a
+commit holding the write with its actor, one lineage chain, no duplicate
+key, no dangling edge, `@unique` held, and a replay of the acknowledged
+writes in commit order equal to the final state and to every reader's
+pinned snapshot. A write in doubt (cancelled, disconnected, crashed) may
+appear at most once.
+
+- **Correctness.** Eleven defects in the prototype, five of them able to
+  lose data or liveness under load (H1, H3, H5, H13, H14), each reproduced,
+  fixed and re-verified on the branch. After the fixes no acknowledged write
+  was lost or duplicated under crash points between the detached commits
+  and the compare-and-swap, `kill -9` of the server, toxiproxy resets,
+  truncated acknowledgements and stalls, cancellation of up to half the
+  writes, several actors, handles and processes, a writer-epoch claim, Blob
+  values and maintenance alongside. After eight aborts before the
+  compare-and-swap, `cleanup` reclaimed exactly eight unpublished manifests
+  and changed no row.
+- **Suites with batching forced on.** `writes` 67 of 67, engine
+  `integration` 704 of 704, GQT 477 of 477. The remaining `failpoints` (13),
+  `detached_commit_matrix` (7) and DST (4) failures were seams the batch path
+  never crosses, tests asserting the #1331 carry where admission now
+  explains the `optimize`, and the cost golden.
+- **Pure inserts.** 56 writers on RustFS for an hour with a served
+  `optimize` every minute: about 100 writes/s, 28 writes per commit, p50
+  about 500 ms, p99 0.6–1.3 s, 362,706 writes all verified, 54 of 54
+  `optimize` runs published.
+
+| Mixed workload, RustFS, 48 writers, 4 actors | writes/s | writes/commit | p50 / p99 |
+|---|---:|---:|---|
+| Batching off | 3.0 | 1.00 | 23.0 / 26.3 s |
+| First-draft rules (`changed` per table) | 3.2 | 1.06 | 19.6 / 32.3 s |
+| Exact footprints | **9.0** | **4.07** | **5.8 / 11.9 s** |
+
+The mix was 70% fresh inserts, about 15% same-table updates, deletes and
+upserts of present keys, and persons and edges, with `optimize` every 30 s.
+At 1,024 embedded writers with 10% same-table updates and deletes, the
+first-draft rules made 1.0 writes per commit and exact footprints 15.6.
+
 **What did not work:** rebasing each write, a linger, pipelining,
-probe-free capture and Bloom-filter admission; each is under Alternatives
-with its numbers.
+probe-free capture, Bloom-filter admission and ungated retries; each is
+under Alternatives with its numbers.
 
 ### The carried-over guard
 
@@ -813,10 +1153,24 @@ is the Lance half of the composition guard. It passes on Lance 13.0.0 at
 
 - **Known keys:** in-source `table_store` tests compare the map's answer
   with the scan's over deletion files, a column patch, compaction, an
-  unknown file and eviction. `integration/write_cost.rs` asserts that a
-  keyed insert's requests stay flat as the unindexed tail grows. The DST
-  storage-cost golden records that insert at two tail lengths under two
-  labels.
+  unknown file and eviction, and a tail past `KEYED_WRITE_MAX_ROWS` that the
+  map answers stays on the absence-proven writer.
+  `integration/write_cost.rs` asserts that a keyed insert's requests stay
+  flat as the unindexed tail grows. The DST storage-cost golden records that
+  insert at two tail lengths under two labels.
+- **The effect log:** in-source tests that a non-linking append resets the
+  log, that a walk never crosses a reset, and that each `PublicationEffect`
+  constructor returns `changed` when its ids are incomplete or over budget.
+  `forbidden_apis.rs` pins that only the publication door appends and that
+  no caller constructs an exact class from anything but a staged effect.
+  `writes.rs` asserts that every publishing path (mutation, load, merge,
+  `optimize`, index build, schema apply, collector) leaves a record of the
+  expected class.
+- **Batch outcomes:** `failpoints.rs` cells for a leader dropped before and
+  after its first detached commit, a follower dropped while handed the
+  lead, an entry dropped before admission, and every member receiving the
+  batch's typed error: `WriterFenced`, a conflict with its details and HTTP
+  status, and `manifest_publish_in_doubt` naming the batch's commit.
 - **Composition, engine half:** `integration/changes.rs` (the feed's fast
   path over a composed commit) and the merge owners (the pure-insert proof).
   `lance_surface_guards.rs` adds the Blob v2 case and, for the maintenance
@@ -829,8 +1183,12 @@ is the Lance half of the composition guard. It passes on Lance 13.0.0 at
   - disjoint keys make one commit, for strict inserts and keyed inserts;
   - the same key: the later entry is sent back, then gets `KeyConflict` or
     becomes an update;
-  - an insert beside an update on the same table;
+  - an insert beside an update of another key on the same table is
+    admitted, and beside an update of its own key is sent back;
   - an edge insert beside a delete of its endpoint;
+  - an entry parked across a foreign insert of its key behind a stale log
+    record, and across another actor's batch (H1);
+  - two handles of one process batch together;
   - non-key `@unique` and bounded `@card` stay on today's path;
   - write skew through a predicate scan;
   - the `Left`/`Right` counterexample: one publishes, the other is sent
@@ -865,17 +1223,22 @@ Each step leaves `main` shippable and lands with its owner tests. The
 per-branch writer-state cache lands separately, as a bug fix, before
 batches on named branches are measured.
 
-1. **Known keys**, with no behavior change. Owners: `table_store` in-source
-   tests, `write_cost.rs`, the DST cost golden, and `forbidden_apis.rs`
-   (only the absence-proven writer records).
+1. **Known keys**, with no behavior change: the map, the byte bound with
+   eviction and the drop of files a `Rewrite` removed, the tail analysis
+   once per table version, and the tail cap lifted when the map answers the
+   whole tail. Owners: `table_store` in-source tests, `write_cost.rs`, the
+   DST cost golden, and `forbidden_apis.rs` (only the absence-proven writer
+   records).
 2. **The footprint on the staged mutation**, with no behavior change:
    - carry `op_kinds` through staging, and rewrite its doc comment, which
      names a drift check `commit_all` no longer runs, to name the
      executed-operation class, with `strict_pre_stage_version_check` as its
      one owner (#785 review);
-   - record validation reads;
+   - record validation reads, including each edge's endpoint ids;
    - give `StagedWrite` the exact inserted ids its dangling doc comment
-     describes;
+     describes, and carry a mutation's written ids (keyed batches and
+     `record_deleted_ids`) to its publication;
+   - define `PublicationEffect` with its four constructors;
    - make eligibility one function.
 
    Owners: in-source staging tests and `writes.rs`.
@@ -883,23 +1246,34 @@ batches on named branches are measured.
    the Blob case. Owners: `lance_surface_guards.rs`, `changes.rs`, the
    merge owners and `forbidden_apis.rs`.
 4. **The maintenance carry** for index builds and `optimize`'s direct
-   path. It is useful without batching. Owners: `lance_surface_guards.rs`,
-   `failpoints.rs`, `detached_commit_matrix.rs` and the DST cost golden.
+   path. It is useful without batching, and step 6 does not land before
+   it. Owners: `lance_surface_guards.rs`, `failpoints.rs`,
+   `detached_commit_matrix.rs` and the DST cost golden.
 5. **The write group, with batches of one** and behavior unchanged: the
-   queue, the lead handoff, the log of every publication, the gated second
-   attempt, the seams, cancellation, per-member evidence, the
-   `group_commit` setting (default `off`) and the instrument. Owners:
-   `write_cost.rs`, `failpoints.rs`, `detached_commit_matrix.rs`, DST, and
-   the GQT corpus with the setting on.
-6. **Batching:** admission and composition in the batch, with the
-   setting still off by default. The invariant 3 text, `AGENTS.md` and
-   `docs/dev/writes.md` change here. Owners: the admission matrix,
+   queue per root and branch, the lead handoff with its drop guards, the
+   group-owned typed outcome, the effect log written by the publication
+   door with its link rule, the gated second attempt, the batch-path seams,
+   cancellation, per-member evidence, the `group_commit` setting (default
+   `off`) and the instrument. Owners: `write_cost.rs`, `failpoints.rs`,
+   `detached_commit_matrix.rs`, DST, `forbidden_apis.rs`, and the GQT
+   corpus with the setting on.
+6. **Batching of inserts:** admission and composition in the batch, with
+   exact footprints for publications outside it and the setting still off
+   by default. The invariant 3 text, `AGENTS.md` and `docs/dev/writes.md`
+   change here. One data file per table per batch is measured here
+   (§Fragments and maintenance). Owners: the admission matrix,
    `failpoints.rs`, DST, and the RustFS and Azurite suites.
-7. **Default on,** once `blocked_on` is clear: the soak and the instrument
-   gate, the user docs, the skill and the release note.
+7. **Key-addressed updates and deletes** in batches, if their measurement
+   passes (§Key-addressed updates and deletes). Owners: the admission
+   matrix cells of that section, `failpoints.rs`, DST and the instrument.
+   If it does not pass, the step is recorded as declined and step 8
+   follows step 6.
+8. **Default on,** once `blocked_on` is clear: the server's maintenance
+   admission, the soak and the instrument gate, the user docs with the
+   maintenance cadence, the skill and the release note.
 
 `implementation` moves to `in-progress` at step 1 and to `complete` at
-step 7.
+step 8.
 
 ## Out of scope and future work
 
@@ -916,16 +1290,32 @@ step 7.
     public way to set it. This would cut a publication from five serial
     puts to three. The engine would then match a pin by the inline
     transaction's uuid instead of the `.txn` name.
+    `with_transaction_file_disabled` is `pub(crate)` in 14.0.2, still not
+    public.
+  - Concurrent transaction-file and manifest puts for a detached commit,
+    since nothing names the manifest until the caller publishes it
+    (`io/commit.rs`, `do_commit_detached_transaction`): one serial round
+    trip per table per batch.
+  - Let the caller choose the detached version, today drawn at random
+    inside the retry loop, so the `__manifest` rows can be built while the
+    table commit is in flight.
   - Cache population after a detached commit, as `record_successful_commit`
     does for a linear one.
-  - Lance 14's `CompositeOperation`, whose actions include
-    `AssertUniqueKeys`. It could carry several writers' inserts with the
-    uniqueness check in the substrate. Readers before 14 fail on it, so it
-    waits for that bump and a format review.
-- **Broader batching:** updates and deletes by recorded footprint, Append
-  and Merge loads with exact ids, admission across foreign commits by
-  reading their change sets, per-write attribution for cross-actor batches
-  (#513), and leader staging against fragment growth.
+  - Build the Blob v2 projection schema once per scan, not once per
+    fragment read (`io/exec/filtered_read.rs`,
+    `public_blob_v2_binary_projection_schema`): with one fragment per write
+    it dominates scans.
+  - Do not unwrap a cancelled fragment-read task (`filtered_read.rs`), which
+    panics a worker at runtime shutdown.
+  - `FLAG_FRAGMENT_TREE`, marked unsupported in 14.0.2, for manifests that
+    list every fragment.
+  - An operation that carries several writers' inserts with a key
+    uniqueness assertion in the substrate. Lance 14.0.2 has none: its
+    `Transaction.operation` ends at `DataOverlay`, with no composite
+    operation. The first draft said otherwise.
+- **Broader batching:** updates and deletes by predicate, Append and Merge
+  loads with exact ids, admission across foreign commits by reading their
+  change sets, and per-write attribution for cross-actor batches (#513).
 
 ## Unresolved questions
 
@@ -933,9 +1323,17 @@ step 7.
   writer join at step 6 or later. Recommended: later, after the instrument
   has measured mutations.
 - **The default for embedded and CLI handles.** Whether `group_commit`
-  defaults to `on` everywhere at step 7 or only for the server.
+  defaults to `on` everywhere at step 8 or only for the server.
   Recommended: everywhere, since a lone writer forms batches of one, which
   cost no more.
+- **One data file per table per batch.** Whether the leader writes each
+  table's admitted rows into one data file, and from what batch size.
+  Recommended: decide from step 6's measurement (§Fragments and
+  maintenance); keep one fragment per member if it lowers small-batch
+  throughput.
+- **The mixed-workload gate.** 2.5x the ordinary path is set from the
+  stress study's 2.75x on RustFS with exact footprints. Recommended: keep
+  it for step 6, and raise it if step 7 lands.
 - **The soak thresholds** in `blocked_on`, which are proposals, are
   confirmed or changed by the maintainers before acceptance.
 
@@ -972,3 +1370,35 @@ step 7.
     recorded as future work.
   - **Carried over:** #785's Lance composition guard, unchanged except for
     the RFC path in its comment.
+- 2026-11-15: Revised after the stress study of the prototype on release
+  binaries (`research/group-commit-stress`, `155911f0`).
+  - **Correctness by construction.** The publication door appends to the
+    effect log, so no path can publish unlogged (H13). Each record's class
+    is derived from the staged effect and fails closed to `changed`. The
+    log resets on an append that does not link, and the walk follows links
+    only (H1). The leader reads the log under the gates, and a batch that
+    admits nothing leaves it unchanged (H14). The group owns one typed
+    outcome per batch, with drop guards on the lead and on each waiter (H3,
+    H4, H7, H11). The edge footprint names endpoint ids (H10).
+  - **Exact footprints for publications outside the group.** An update or
+    delete is logged by the ids it wrote, not as `changed` for its table.
+    The first draft's rule kept 1.06x of the ordinary path on a mixed
+    workload; exact footprints reached 3x.
+  - **Key-addressed updates and deletes** become step 7, designed now and
+    landing only on measurement; updates and deletes by predicate stay
+    future work.
+  - **Known keys:** the tail cap is lifted when the map answers the whole
+    tail (the cliff to 0 writes/s, C1), the tail analysis is computed once
+    per table version, and the bound is in bytes with eviction.
+  - **Fragments and maintenance** become a section: batching requires a
+    maintenance cadence, the maintenance carry is a prerequisite of
+    batching, and the server's admission of `optimize` under write load is
+    a `blocked_on` item (O1). One data file per batch is an open question.
+  - **Gates:** batch-path seams before step 6, a mixed-workload gate, a
+    no-maintenance decay check, a 60-minute soak compared with its
+    30-minute mark, and the known keys and log within their budgets.
+  - **Corrections:** Lance 14.0.2 has no composite operation, and
+    `with_transaction_file_disabled` is `pub(crate)` there.
+  - **Outside this RFC:** the server's write-observer cap (O1) and the
+    listing-free publisher's epoch side effect (H12) are fixes of their
+    own; the 8,192 tail cap's cliff without known keys is on `main`.
