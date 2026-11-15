@@ -387,6 +387,10 @@ struct Input {
     engine: Engine,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     store: Option<String>,
+    /// `--base`: the `--store` root is opened as a clone of this graph, read
+    /// through to it, on the direct engine only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
     /// `--server`: the case runs against this server instead of an engine
     /// the worker opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -688,6 +692,11 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// A case's text as a run reads it: a regular file within `LIMIT`, UTF-8.
+pub(crate) fn read_case_text(path: &Path) -> Result<String, String> {
+    String::from_utf8(read_bounded(path)?).map_err(|e| format!("invalid_case: UTF-8: {e}"))
+}
+
 mod shared_text {
     pub fn serialize<S: serde::Serializer>(
         text: &std::sync::Arc<str>,
@@ -733,6 +742,7 @@ pub fn run_corpus_case(path: &Path, executable: &Path, bless: bool) -> CaseOutco
             target: None,
             storage: None,
             store: None,
+            base: None,
             server: None,
             seed: None,
             fast_tier: true,
@@ -760,6 +770,7 @@ pub fn run_selected(
     measure: Option<MeasureOptions>,
     artifacts: Option<PathBuf>,
     store: Option<&str>,
+    base: Option<&str>,
     server: Option<&ServerTarget>,
     trace: bool,
 ) -> CaseOutcome {
@@ -771,6 +782,7 @@ pub fn run_selected(
             target,
             storage,
             store,
+            base,
             server,
             seed,
             fast_tier: false,
@@ -785,6 +797,7 @@ struct Selection<'a> {
     target: Option<&'a str>,
     storage: Option<&'a str>,
     store: Option<&'a str>,
+    base: Option<&'a str>,
     server: Option<&'a ServerTarget>,
     seed: Option<u64>,
     fast_tier: bool,
@@ -1560,17 +1573,9 @@ fn run_invocation(
     let selected = selection.target;
     let selected_storage = selection.storage;
     let selected_seed = selection.seed;
-    let text =
-        String::from_utf8(read_bounded(path)?).map_err(|e| format!("invalid_case: UTF-8: {e}"))?;
-    let text: std::sync::Arc<str> = text.into();
+    let text: std::sync::Arc<str> = read_case_text(path)?.into();
     summary.case_digest = Some(digest(text.as_bytes()));
-    let case = parse_case(&stem_of(path), &text).map_err(|error| {
-        if error.starts_with("invalid_case:") {
-            error
-        } else {
-            format!("invalid_case: {error}")
-        }
-    })?;
+    let case = parse_case(&stem_of(path), &text).map_err(|errors| errors.to_string())?;
     summary.declared = Some(case.runner.environments.clone());
     for env in &case.runner.environments {
         if matches!(env.execution, Execution::ServerDst { .. }) {
@@ -1614,8 +1619,10 @@ fn run_invocation(
     }
     .into();
     let plan_digest = digest(&json(&summary.planned)?);
-    if selection.fast_tier && case.runner.timeout_ms > 10_000 {
-        return Err("invalid_case: the required corpus admits timeout_ms at most 10000; use a standalone heavy reproduction".into());
+    if selection.fast_tier
+        && let Err(error) = omnigraph_gqt_core::corpus_admission(&case.runner)
+    {
+        return Err(error.to_string());
     }
     if selected_seed.is_some() && selected.is_none() && selected_storage.is_none() {
         return Err("invalid_case: --seed requires --target or --storage".into());
@@ -1649,6 +1656,21 @@ fn run_invocation(
         }
     } else {
         case.admit_store(selection.store)?;
+    }
+    if selection.base.is_some() {
+        if selection.store.is_none() {
+            return Err(
+                "invalid_case: --base needs --store <URI>, the clone root opened over the base it names".into(),
+            );
+        }
+        if selected_envs
+            .iter()
+            .any(|env| !matches!(env.execution, Execution::Engine { .. }))
+        {
+            return Err(
+                "unsupported_environment: --base opens a clone on the direct engine only; a DST or server environment is selected".into(),
+            );
+        }
     }
     if selection.measure.is_some()
         && !selected_envs.iter().any(|env| {
@@ -1748,6 +1770,7 @@ fn run_invocation(
                     effective_settings: settings::EffectiveSettings::for_seed(seed),
                     engine,
                     store: selection.store.map(str::to_owned),
+                    base: selection.base.map(str::to_owned),
                     server: selection.server.cloned(),
                     bless,
                     measure: selection.measure.is_some(),
@@ -1889,7 +1912,7 @@ fn run_child(
         cmd.env(crate::trace::WORKER_PATH, path);
     }
     input.effective_settings.configure(&mut cmd);
-    if let Some(store) = &input.store {
+    for store in input.store.iter().chain(&input.base) {
         cmd.envs(std::env::vars_os().filter(|(key, _)| {
             key.to_str()
                 .is_some_and(|key| store_environment_variable(store, key))
@@ -2045,6 +2068,12 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     input
         .environment
         .admit_store(case.needs_dst(), input.store.as_deref())?;
+    if input.base.is_some() && input.store.is_none() {
+        return Err("environment_changed: --base reached the worker without a --store root".into());
+    }
+    if input.base.is_some() && input.seed.is_some() {
+        return Err("environment_changed: --base reached the worker beside a seed".into());
+    }
     let csv_dir = tempfile::tempdir().map_err(|e| format!("worker_failed: tempdir: {e}"))?;
     case.materialize_csv_fixtures(csv_dir.path())
         .map_err(|e| format!("invalid_case: {e}"))?;
@@ -2074,6 +2103,7 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
                     input.bless,
                     input.engine,
                     input.store.as_deref(),
+                    input.base.as_deref(),
                 ),
             ))
         }
@@ -2537,6 +2567,7 @@ mod action_tests {
             effective_settings: settings::EffectiveSettings::for_seed(Some(0)),
             engine: Engine::V2,
             store: None,
+            base: None,
             server: None,
             bless: false,
             measure: false,

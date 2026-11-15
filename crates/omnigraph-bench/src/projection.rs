@@ -46,7 +46,8 @@ use crate::archive::{
 };
 use crate::counting::LogicalCallCounts;
 use crate::gqt_record::{
-    EmbeddedEvidence, GqtEvidence, GqtRunRecordV1, ServedSutIdentityV1, ServedSutKind,
+    CloneEvidence, EmbeddedEvidence, GqtEvidence, GqtRunRecordV1, ServedSutIdentityV1,
+    ServedSutKind,
 };
 use crate::record::RunRecordV1;
 
@@ -674,6 +675,9 @@ struct RunRow {
 enum SutEvidence {
     WorkerObserved,
     DeclaredDeployment,
+    /// The product's `omnigraph` binary as its `version --json` described
+    /// it; the build columns describe the harness worker that drove it.
+    ProductBinary,
 }
 
 #[derive(Serialize)]
@@ -1821,9 +1825,9 @@ fn legacy_run_row(
         lance_data_plane_logical_calls_min: Some(calls.lance_data_plane.min),
         lance_data_plane_logical_calls_p50: Some(calls.lance_data_plane.p50),
         lance_data_plane_logical_calls_max: Some(calls.lance_data_plane.max),
-        control_plane_logical_calls_min: Some(calls.control_plane.min),
-        control_plane_logical_calls_p50: Some(calls.control_plane.p50),
-        control_plane_logical_calls_max: Some(calls.control_plane.max),
+        control_plane_logical_calls_min: calls.control_plane.as_ref().map(|c| c.min),
+        control_plane_logical_calls_p50: calls.control_plane.as_ref().map(|c| c.p50),
+        control_plane_logical_calls_max: calls.control_plane.as_ref().map(|c| c.max),
         logical_counts_presence_json: canonical_json(
             &record.measurements.layer_presence.logical.counts,
             "logical counts presence",
@@ -1857,7 +1861,128 @@ fn gqt_run_row(
     {
         GqtEvidence::Embedded(evidence) => embedded_gqt_run_row(record, &evidence, receipt),
         GqtEvidence::Served(sut) => served_gqt_run_row(record, sut, receipt),
+        GqtEvidence::Clone(evidence) => clone_gqt_run_row(record, &evidence, receipt),
     }
+}
+
+fn clone_gqt_run_row(
+    record: &GqtRunRecordV1,
+    evidence: &CloneEvidence<'_>,
+    receipt: &ArchiveReceiptV1,
+) -> Result<RunRow, ProjectionError> {
+    let &CloneEvidence {
+        sut,
+        machine,
+        backend,
+        base,
+    } = evidence;
+    let harness = &sut.harness;
+    let wall = &record.measurements.wall_clock;
+    let calls = gqt_logical_call_summaries(record)?;
+    Ok(RunRow {
+        invocation_id: record.invocation().invocation_id.clone(),
+        record_sha256: receipt.record_sha256.clone(),
+        archive_object: receipt.object_relative_path.clone(),
+        archive_pointer: receipt.pointer_relative_path.clone(),
+        session_id: record.invocation.session_id.clone(),
+        invoked_at_unix_ms: record.invocation.invoked_at_unix_ms,
+        case_id: record.run.case_id.clone(),
+        case_digest: record.run.case_digest.clone(),
+        sut_evidence: SutEvidence::ProductBinary,
+        package_version: sut.package_version.clone(),
+        source_commit: sut
+            .source_commit
+            .clone()
+            .or_else(|| sut.requested_commit.clone())
+            .unwrap_or_default(),
+        source_tree_dirty: harness.source_tree_dirty,
+        build_profile: harness.build.profile.clone(),
+        build_opt_level: harness.build.cargo_opt_level.clone(),
+        debug_assertions: harness.build.debug_assertions,
+        target_triple: Some(harness.build.target_triple.clone()),
+        rustc_version: Some(harness.build.rustc_version.clone()),
+        build_declared_release_lto: Some(harness.build.declared_release_lto.clone()),
+        build_declared_release_codegen_units: Some(harness.build.declared_release_codegen_units),
+        build_declared_release_strip: Some(harness.build.declared_release_strip),
+        build_cargo_encoded_rustflags_present: Some(harness.build.cargo_encoded_rustflags_present),
+        build_release_profile_environment_overrides_supported: Some(
+            harness
+                .build
+                .release_profile_environment_overrides_supported,
+        ),
+        build_effective_codegen_options_proved: false,
+        worker_executable_sha256: Some(harness.build.worker_executable_sha256.clone()),
+        sut_fingerprint: typed_json_sha256(sut, "product system under test")?,
+        sut_json: canonical_json(sut, "product system under test")?,
+        client_build_json: Some(canonical_json(harness, "harness build")?),
+        client_machine_json: None,
+        machine_fingerprint: Some(typed_json_sha256(machine, "machine identity")?),
+        machine_format_version: Some(machine.format_version),
+        machine_os_name: Some(machine.os_name.clone()),
+        machine_os_version: Some(machine.os_version.clone()),
+        machine_kernel_version: Some(machine.kernel_version.clone()),
+        machine_architecture: Some(machine.architecture.clone()),
+        machine_cpu_model: Some(machine.cpu_model.clone()),
+        machine_logical_cores: Some(machine.logical_cores),
+        machine_physical_cores: Some(machine.physical_cores),
+        machine_total_memory_bytes: Some(machine.total_memory_bytes),
+        machine_resource_control_json: Some(canonical_json(
+            &machine.resource_control,
+            "machine resource control",
+        )?),
+        machine_scheduling_json: Some(canonical_json(&machine.scheduling, "machine scheduling")?),
+        machine_resource_limits_json: Some(canonical_json(
+            &machine.resource_limits,
+            "machine resource limits",
+        )?),
+        machine_label: Some(machine.machine_label.clone()),
+        backend_evidence: SutEvidence::ProductBinary,
+        backend_fingerprint: typed_json_sha256(backend, "backend evidence")?,
+        backend_json: canonical_json(backend, "backend evidence")?,
+        fixture_manifest_sha256: Some(base.manifest_sha256.clone()),
+        fixture_logical_sha256: base.summary.logical_content_sha256.clone(),
+        fixture_physical_sha256: None,
+        acquisition_status: json_string(&record.acquisition.status, "acquisition status")?,
+        claim_eligible: record.claim_eligible(),
+        terminal_failed_repetition: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.failed_repetition),
+        terminal_stage: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.stage.as_str().to_string()),
+        terminal_code: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.code.clone()),
+        requested_repetitions: record.acquisition.requested_repetitions,
+        observed_repetitions: record.acquisition.observed_repetitions,
+        min_us: wall.min_us,
+        p50_us: wall.p50_us,
+        max_us: wall.max_us,
+        p95_us: wall.p95_us,
+        p95_supported: wall.p95_supported,
+        wall_evidence: json_string(&wall.evidence, "wall evidence")?,
+        floor_multiplier_millis: record.measurements.claim_policy.floor_multiplier_millis,
+        lance_data_plane_logical_calls_min: Some(calls.lance_data_plane.min),
+        lance_data_plane_logical_calls_p50: Some(calls.lance_data_plane.p50),
+        lance_data_plane_logical_calls_max: Some(calls.lance_data_plane.max),
+        control_plane_logical_calls_min: calls.control_plane.as_ref().map(|c| c.min),
+        control_plane_logical_calls_p50: calls.control_plane.as_ref().map(|c| c.p50),
+        control_plane_logical_calls_max: calls.control_plane.as_ref().map(|c| c.max),
+        logical_counts_presence_json: canonical_json(
+            &record.measurements.layer_presence.logical.counts,
+            "logical counts presence",
+        )?,
+        physical_counts_presence_json: canonical_json(
+            &record.measurements.layer_presence.physical.counts,
+            "physical counts presence",
+        )?,
+    })
 }
 
 fn embedded_gqt_run_row(
@@ -1873,6 +1998,13 @@ fn embedded_gqt_run_row(
     } = evidence;
     let wall = &record.measurements.wall_clock;
     let calls = gqt_logical_call_summaries(record)?;
+    if calls.control_plane.is_none() {
+        return Err(ProjectionError::new(
+            "projection_gqt_counts_missing",
+            None,
+            "embedded GQT record lacks control counters",
+        ));
+    }
     Ok(RunRow {
         invocation_id: record.invocation().invocation_id.clone(),
         record_sha256: receipt.record_sha256.clone(),
@@ -1959,9 +2091,9 @@ fn embedded_gqt_run_row(
         lance_data_plane_logical_calls_min: Some(calls.lance_data_plane.min),
         lance_data_plane_logical_calls_p50: Some(calls.lance_data_plane.p50),
         lance_data_plane_logical_calls_max: Some(calls.lance_data_plane.max),
-        control_plane_logical_calls_min: Some(calls.control_plane.min),
-        control_plane_logical_calls_p50: Some(calls.control_plane.p50),
-        control_plane_logical_calls_max: Some(calls.control_plane.max),
+        control_plane_logical_calls_min: calls.control_plane.as_ref().map(|c| c.min),
+        control_plane_logical_calls_p50: calls.control_plane.as_ref().map(|c| c.p50),
+        control_plane_logical_calls_max: calls.control_plane.as_ref().map(|c| c.max),
         logical_counts_presence_json: canonical_json(
             &record.measurements.layer_presence.logical.counts,
             "logical counts presence",
@@ -3267,7 +3399,9 @@ struct MinP50Max {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LogicalCallSummaries {
     lance_data_plane: MinP50Max,
-    control_plane: MinP50Max,
+    /// Absent when the samples carry no control-plane counts: the process
+    /// route's `--stats` document reports the Lance planes only.
+    control_plane: Option<MinP50Max>,
 }
 
 /// Summarize independently measured repetitions; acquisition quantity never
@@ -3315,7 +3449,7 @@ fn logical_call_summaries(record: &RunRecordV1) -> Result<LogicalCallSummaries, 
     }
     Ok(LogicalCallSummaries {
         lance_data_plane: summarize_nearest_rank(lance_data_plane, "Lance data-plane")?,
-        control_plane: summarize_nearest_rank(control_plane, "control-plane")?,
+        control_plane: Some(summarize_nearest_rank(control_plane, "control-plane")?),
     })
 }
 
@@ -3325,13 +3459,11 @@ fn gqt_logical_call_summaries(
     let mut lance_data_plane = Vec::with_capacity(record.measurements.raw_samples.len());
     let mut control_plane = Vec::with_capacity(record.measurements.raw_samples.len());
     for sample in &record.measurements.raw_samples {
-        let (Some(logical), Some(control)) =
-            (&sample.logical_store_calls, &sample.control_store_calls)
-        else {
+        let Some(logical) = &sample.logical_store_calls else {
             return Err(ProjectionError::new(
                 "projection_gqt_counts_missing",
                 None,
-                "embedded GQT record lacks logical or control counters",
+                "embedded GQT record lacks logical counters",
             ));
         };
         let manifest = sum_call_counts(logical.manifest)?;
@@ -3343,25 +3475,33 @@ fn gqt_logical_call_summaries(
                 "per-repetition Lance data-plane logical call total does not fit u64",
             )
         })?);
-        control_plane.push(sum_u64_values(
-            [
-                control.read_text,
-                control.read_text_if_exists,
-                control.read_text_versioned,
-                control.exists,
-                control.list_dir,
-                control.mutation_calls,
-            ],
-            "per-repetition control-plane logical call total",
-        )?);
+        if let Some(control) = &sample.control_store_calls {
+            control_plane.push(sum_u64_values(
+                [
+                    control.read_text,
+                    control.read_text_if_exists,
+                    control.read_text_versioned,
+                    control.exists,
+                    control.list_dir,
+                    control.mutation_calls,
+                ],
+                "per-repetition control-plane logical call total",
+            )?);
+        }
     }
+    let control_plane = if control_plane.len() == record.measurements.raw_samples.len() {
+        Some(summarize_nearest_rank(control_plane, "control-plane")?)
+    } else {
+        None
+    };
     Ok(LogicalCallSummaries {
         lance_data_plane: summarize_nearest_rank(lance_data_plane, "Lance data-plane")?,
-        control_plane: summarize_nearest_rank(control_plane, "control-plane")?,
+        control_plane,
     })
 }
 
-fn sum_call_counts(counts: LogicalCallCounts) -> Result<u64, ProjectionError> {
+/// Every verb of one Lance plane's logical calls as one total.
+pub fn sum_call_counts(counts: LogicalCallCounts) -> Result<u64, ProjectionError> {
     sum_u64_values(
         [
             counts.get,
@@ -5236,11 +5376,11 @@ mod tests {
         );
         assert_eq!(
             summary.control_plane,
-            MinP50Max {
+            Some(MinP50Max {
                 min: 2,
                 p50: 2,
                 max: 7,
-            }
+            })
         );
     }
 

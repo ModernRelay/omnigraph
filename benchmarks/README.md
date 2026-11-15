@@ -41,26 +41,29 @@ the historical Rust instruments; their timing series must not be combined.
 Unsupported workloads are preserved temporarily in [deferred/](deferred/README.md).
 Cleanup and optimization require GQ support. Concurrent and streaming instruments require an executor that preserves their
 scheduling and transport. Their preserved sources are outside Cargo discovery
-and are not active scenarios. Read-only HTTP acquisition is available through
-the served variants below.
+and are not active scenarios. Read-only HTTP acquisition runs the same
+scenarios against a server, below.
 Raw Lance and Rust collection comparisons are retired from the benchmark suite.
 
-### Served query and traversal variants
+### The same scenario against a server
 
-`query-shapes-served` lists 13 query scenarios and `traversal-served` lists
-three traversal scenarios. Their schema-less workloads contain a warm-up read,
-the measured read, and explicit result verification. Embedded workload files
-and default selections are unchanged. Six embedded scenarios have no served
-twin because the server target has no door for them: `e2e-query-destination-search`,
-`e2e-nearest-prefilter`, `e2e-nearest-nprobes-one` and `e2e-rrf-traversal` need
-indexes (search, nearest and RRF), and `e2e-traversal-selective-csr` and
-`e2e-traversal-selective-indexed` pin a traversal path.
+A scenario names what is measured; `run … --server <url>` names where. The 13
+read-only query scenarios of `query-shapes` and the three hop traversals of
+`traversal` run against a provisioned `omnigraph-server`: their workloads hold
+a warm-up read, the measured read, a `--- restart` and a verification read, and
+on the server the restart is the long-running lifecycle's no-op (a step
+receipt with no door opened). Six of the group's scenarios have no served door:
+`e2e-query-destination-search`, `e2e-nearest-prefilter`,
+`e2e-nearest-nprobes-one` and `e2e-rrf-traversal` need indexes (search,
+nearest and RRF), and `e2e-traversal-selective-csr` and
+`e2e-traversal-selective-indexed` pin a traversal path; a served run of those
+is refused by name before any request. The served point of a scenario is
+distinct from its embedded point: the target, the receipt's backend and the
+`--network-position` level (`same-host` unless given) enter `point_id`.
 
-These scenarios require an externally provisioned graph and a typed deployment
+A served run requires an externally provisioned graph and a typed deployment
 receipt. One invocation binds one graph and dataset recipe, so run different
-fixture recipes separately. The stock definitions declare server-local
-APFS/NVMe and same-host network position; other deployments need explicit
-custom environment settings. Server build and dataset facts remain declared,
+fixture recipes separately. Server build and dataset facts remain declared,
 server counters remain absent, and these records are claim-ineligible. See the
 [served acquisition guide](../crates/omnigraph-bench/README.md#served-read-only-acquisition)
 for the command, receipt fields, cache semantics and evidence boundaries.
@@ -78,8 +81,11 @@ Large histories and registered FinBench require explicit selection.
   preparation together. The invocation supplies its physical source bundle.
 - `workloads/*.gqt` omits schema/seed and contains optional preparation reads,
   the selected operation, then explicit verification.
-- `defaults` supplies repetitions, deadline, environment and protocol settings;
-  a scenario may override them. `--repetitions` changes only sample quantity.
+- `defaults` supplies repetitions, deadline and the embedded protocol settings;
+  a scenario may override them. A served run derives `reset: none` and
+  `attribution: off`, which only the scenario's own `protocol` block overrides.
+  `--repetitions` changes only sample quantity. No scenario and no default
+  names an environment: the run does.
 
 Use the complete [custom example](custom.example.yaml), or generate a config
 from the parser's exact selected operation:
@@ -100,16 +106,20 @@ falls back to another config. With no `--config`, the CLI searches the working
 directory and its ancestors for `benchmarks.yaml` or `benchmarks/benchmarks.yaml`.
 
 A minimal config inherits five repetitions, a 60-second deadline, per-phase
-attribution, manual scheduling and a monotonic timer. Local defaults are
-APFS/clonefile on macOS or qualified XFS/plain-copy elsewhere. The repository
-config retains each scenario's original repetitions and leaves `environment`
-and `reset` out of its defaults, so a scenario without its own environment
-takes that host default and the one file runs on a macOS workstation and on a
-qualified Linux XFS volume alike; `show` reports the resolved value and the
-record carries it. A scenario whose volume is part of its meaning declares it
-explicitly, as `branch-merge-d50-process-cold-xfs` and
-`branch-merge-d50-history64-xfs` do. The resolved backend is part of a
-scenario's point identity, so APFS and XFS runs of one id are distinct points.
+attribution, manual scheduling and a monotonic timer. The environment is the
+run's: `--server` names a server, `--store` a fixture store (a directory or an
+`s3://` prefix, the latter with `--backend`) at the `clone` reset level, whose
+completed records the store keeps and `report` reads back as a series, and
+`--at <ref>` beside it measures a commit's `omnigraph` from the store's
+`builds/`; and
+without either the host's local default applies (APFS/clonefile on macOS,
+qualified XFS/plain-copy elsewhere), so the one file runs on a macOS
+workstation and on a qualified Linux XFS volume alike; the reset level follows
+the environment unless `protocol.reset` overrides it. `show` reports the resolved value for the host and the record
+carries the run's. The resolved backend is part of a scenario's point identity,
+so APFS and XFS runs of one id are distinct points; `branch-merge-d50-process-cold`
+and `branch-merge-d50-history64` (groups `aws-xfs-process-cold` and
+`aws-xfs-history64`) are the lab's XFS points by where the lab runs them.
 `show` reports all effective settings before a run. `deadline_seconds: null`
 removes the measurement deadline; the supervisor remains bounded. Protocol
 fields are `attribution`, `schedule`, `reset` and `timer`.
@@ -239,11 +249,10 @@ references, never the workstation. `show --workload FILE` lists parser ordinals
 and exact operation text; `init` validates whether the selected operation is measurable.
 
 Cache status reports source availability separately from the matching cache
-variant. Source states are `available`, `missing`, `invalid`, `unbound`,
-`not_applicable`; cache states are `missing`, `present`, `cached`, `busy`,
-`invalid`, `incomplete`, `unknown`. A served scenario reports `not_applicable`
-with the diagnostic `served_scenario_has_no_dataset_cache` and exits zero: it
-reads a provisioned graph and uses no dataset cache.
+variant. Source states are `available`, `missing`, `invalid`, `unbound`;
+cache states are `missing`, `present`, `cached`, `busy`, `invalid`,
+`incomplete`, `unknown`. Status inspects the host's local environment; a served
+run reads a provisioned graph and uses no dataset cache.
 `present` validates the published evidence; `--verify` also audits metadata and
 physical bytes before reporting `cached`. A busy entry returns immediately.
 Inspection never builds, creates directories/locks, restores, cleans or quarantines.
@@ -401,10 +410,10 @@ An explicit pair uses the same resolver, cache, worker, and archive pipeline:
 target/release/omnigraph-bench suite run   --dataset benchmarks/fixtures/tiny_graph.gqt   --queries benchmarks/workloads/tiny_restart.gqt   --measured-step 1 --measured-text '--- restart'   --repetitions 5 --deadline-seconds 60 --dataset-cache /qualified/cache
 ```
 
-The full D50 suites are `local-smoke` (warm, using the host-local default),
-`aws-xfs-process-cold` (qualified XFS) and `aws-xfs-history64` (qualified XFS,
-fixture aged by 64 reversible single-row update commits before the branches
-exist). They build 800,000 base rows. The small `local-fast` suite is a separate
+The full D50 suites are `local-smoke` (warm), `aws-xfs-process-cold` (cold,
+run by the lab on qualified XFS) and `aws-xfs-history64` (cold, fixture aged
+by 64 reversible single-row update commits before the branches exist, the
+lab's as well); each takes the host's environment. They build 800,000 base rows. The small `local-fast` suite is a separate
 smoke test, not proof of full-scale performance or correctness.
 
 Every build runs in a contained child, at its cache entry's final stable
@@ -517,9 +526,9 @@ later controlled-cloud adapter binds declared S3 facts, applies budget and lifec
 controls, executes the same typed plans, and uploads the same record format.
 S3 reset, served writes that advance a head, comparison/noise-floor reports, and proved operating-system page-cache eviction remain outside this
 slice. A served write is admitted only as an unpublished commit (`as commit`),
-verified at its snapshot and dropped; `branch-merge-d50-as-commit-served` and
-`tiny-mutate-as-commit-served` are the served twins of their engine points and
-share one workload file with them.
+verified at its snapshot and dropped; `branch-merge-d50-as-commit` and
+`tiny-mutate-as-commit` run against a server as every scenario does, with
+`--server`.
 
 ## Add a scenario
 

@@ -114,7 +114,8 @@ pub fn statement_session(
 }
 
 /// Source-side store registry after external Blob policy authorization.
-/// A captured graph destination must not override an external input's provider.
+/// A captured graph destination, or a clone's read-through mount, must not
+/// override an external input's provider: both mark their registry (`bound::MARKER`).
 /// Ordinary embedded and scoped sessions retain their existing registry.
 pub fn external_source_registry(session: &Arc<Session>) -> Arc<ObjectStoreRegistry> {
     if has_captured_provider(session) {

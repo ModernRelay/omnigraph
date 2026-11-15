@@ -201,6 +201,32 @@ pub(crate) fn admits_inline_s3_root(command: &Command) -> bool {
     )
 }
 
+/// The commands that open a direct graph as a shallow clone under `--base`:
+/// the reads and writes the embedded client serves. Maintenance, schema
+/// changes and deployment keep the one root they are given, since what a
+/// `cleanup`, an `optimize` or an upgrade leaves in a clone root is not
+/// defined. Under an `s3://` base these commands name the clone's `s3://`
+/// prefix inline (`scope::resolve`), the pair `open_clone` puts on one
+/// endpoint, where a registered direct target admits `file://` only.
+pub(crate) fn admits_base(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Query(_)
+            | Command::Mutate(_)
+            | Command::Load(_)
+            | Command::Branch { .. }
+            | Command::Commit { .. }
+            | Command::Changes { .. }
+            | Command::Diff(_)
+            | Command::Snapshot(_)
+            | Command::Export(_)
+            | Command::Blob { .. }
+            | Command::Schema {
+                command: SchemaCommand::Show { .. }
+            }
+    )
+}
+
 /// Whether the operation addresses one graph of `target`, so `--graph` or the
 /// target's `default_graph` must select it before any I/O.
 pub(crate) fn selects_graph(command: &Command, target: &ResolvedTarget) -> bool {

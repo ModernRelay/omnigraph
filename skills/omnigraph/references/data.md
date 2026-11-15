@@ -267,4 +267,6 @@ omnigraph commit list --target $REPO --branch main --json        # history
 > `lock_id` from `cluster status --target ROOT --json`, then
 > `cluster force-unlock <LOCK_ID> --target ROOT`. Data commands refuse an
 > inline cloud URI; an `s3://` root reaches only cluster and maintenance
-> commands.
+> commands, except a graph shallow clone: `--base s3://BASE` with an inline
+> `s3://` clone root reaches graph reads and writes, and every reopen of the
+> clone passes the same `--base`.
