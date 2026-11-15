@@ -1,0 +1,67 @@
+# issue: none
+# notes: A negative number is a literal inside a list literal, typed as the
+# notes: list's element type as any literal is: `[-2, 36]` against an `I32`
+# notes: property and `[-0.5, 2.0]` against an `F64` one. Outside a list a `-`
+# notes: is still unary minus.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32?
+    score: F64?
+}
+
+--- seed
+{"type":"Person","data":{"handle":"ada","age":36,"score":1.5}}
+{"type":"Person","data":{"handle":"bob","age":-2,"score":-0.5}}
+{"type":"Person","data":{"handle":"cy","age":20,"score":2.0}}
+
+--- query
+query negative_integers_in_a_list() {
+    match { $p: Person }
+    where $p.age in [-2, 36]
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query negative_floats_in_a_list() {
+    match { $p: Person }
+    where $p.score in [-0.5, 2.0]
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query a_negative_number_beside_a_bound_one() {
+    match { $p: Person }
+    where $p.age in [-3, -2, -1]
+    return { $p.handle, $p.age }
+}
+
+--- expect unordered
+{"p.handle":"bob","p.age":-2}
+
+--- expect shape
+p.handle: String
+p.age: I32?

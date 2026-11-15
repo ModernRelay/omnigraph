@@ -710,6 +710,8 @@ fn construct_name(rule: Rule) -> Option<&'static str> {
         | X::float_lit
         | X::bool_lit
         | X::list_lit
+        | X::list_elem
+        | X::neg_number
         | X::meta_field => "an expression",
         X::call_args | X::call_option => "a call argument or `name: value` option",
         X::comp_op | X::null_test | X::kw_in | X::kw_is => "a comparison",
@@ -4122,9 +4124,53 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
     }
 }
 
+/// A list literal's element: a literal, or a negative number, which inside
+/// a list is a literal rather than unary minus over one.
+fn list_elem(pair: Pair<Rule>) -> R<Literal> {
+    let inner = pair.into_inner().next().expect("grammar: a list element");
+    if inner.as_rule() != Rule::neg_number {
+        return literal(inner);
+    }
+    let number = inner
+        .clone()
+        .into_inner()
+        .next()
+        .expect("grammar: a negative number holds a number");
+    match number.as_rule() {
+        Rule::integer => {
+            let magnitude = number.as_str().parse::<i128>().map_err(|e| {
+                Refusal::from(diagnostic_at(Q005, format!("invalid integer: {e}"), &inner))
+            })?;
+            if -magnitude < i128::from(i64::MIN) {
+                return Err(diagnostic_at(
+                    Q005,
+                    format!(
+                        "invalid integer: `{}` is below the smallest I64",
+                        inner.as_str()
+                    ),
+                    &inner,
+                )
+                .into());
+            }
+            Ok(Literal::Integer(-magnitude))
+        }
+        Rule::float_lit => number
+            .as_str()
+            .parse::<f64>()
+            .map(|value| Literal::Float(-value))
+            .map_err(|e| Refusal::from(diagnostic_at(Q005, format!("invalid float: {e}"), &inner))),
+        // `-1e3`: the literal rule prints the exponent's fix.
+        _ => literal_of(number),
+    }
+}
+
 fn literal(pair: Pair<Rule>) -> R<Literal> {
-    let input = input_of(&pair);
-    let inner = pair.into_inner().next().unwrap();
+    literal_of(pair.into_inner().next().unwrap())
+}
+
+/// The literal one of `literal`'s alternatives writes.
+fn literal_of(inner: Pair<Rule>) -> R<Literal> {
+    let input = input_of(&inner);
     let parse_err = |e: CompilerError, at: &Pair<Rule>| {
         Refusal::from(compiler_error_to_diagnostic(e, position_of(at)))
     };
@@ -4168,7 +4214,7 @@ fn literal(pair: Pair<Rule>) -> R<Literal> {
                 Literal::DateTime(text)
             }
         }
-        Rule::list_lit => Literal::List(inner.into_inner().map(literal).collect::<R<Vec<_>>>()?),
+        Rule::list_lit => Literal::List(inner.into_inner().map(list_elem).collect::<R<Vec<_>>>()?),
         other => unreachable!("grammar: literal holds no {other:?}"),
     })
 }
