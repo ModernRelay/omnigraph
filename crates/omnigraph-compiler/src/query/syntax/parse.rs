@@ -1099,6 +1099,48 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
                 );
             }
             Rule::where_clause => {}
+            Rule::second_where_rec => {
+                // `where A where B` is `where (A) and (B)`.
+                let first = where_pair
+                    .as_ref()
+                    .and_then(|w| w.clone().into_inner().find(|p| p.as_rule() == Rule::expr));
+                let second = section
+                    .clone()
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::expr)
+                    .expect("grammar: a second where holds an expression");
+                let edits = match first {
+                    Some(first) => {
+                        let (a, a_end) = span_of(&first);
+                        let a_end = input[..a_end].trim_end().len();
+                        let (b, b_end) = span_of(&second);
+                        let b_end = input[..b_end].trim_end().len();
+                        vec![
+                            edit(a, a, "("),
+                            edit(a_end, b, ") and ("),
+                            edit(b_end, b_end, ")"),
+                        ]
+                    }
+                    None => Vec::new(),
+                };
+                return Err(refusal(
+                    input,
+                    Q012,
+                    "a read has one `where`: join a second condition to the first with `and`",
+                    span_of(&section),
+                    edits,
+                    MACHINE,
+                ));
+            }
+            Rule::with_after_rec => {
+                return Err(refusal_note(
+                    input,
+                    Q014,
+                    "`with` is Cypher's; `where` reads every element of `match`, and an intermediate result is drawn with `from { match { … } return { … } }`",
+                    span_of(&section),
+                    "match { …, from { match { … } return { … } } } where … return { … }",
+                ));
+            }
             Rule::match_nobrace_rec => return Err(match_nobrace(&section)),
             Rule::retrieve_rec => {
                 return Err(refusal_note(
@@ -2738,6 +2780,34 @@ fn keyword_filter(k: &Pair<Rule>) -> Option<Refusal> {
 
 /// Cypher's `… WITH x, agg AS n …`: the elements before it become an inline
 /// read whose `return` is the `with` items, drawn with `from`.
+/// `$a knows*{1,3} $b` drops the star; `$a knows* $b` has no bounds to keep,
+/// so its note shows a range.
+fn star_range(input: &str, triple: &Pair<Rule>) -> Refusal {
+    let star = triple
+        .clone()
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::star_mark)
+        .expect("grammar: a star range holds its star");
+    let bounded = triple
+        .clone()
+        .into_inner()
+        .any(|p| p.as_rule() == Rule::traversal_bounds);
+    let message = "a hop range is written `{min,max}` after the edge, with no `*`; only `shortest` takes an unbounded range, which stage Path adds";
+    if bounded {
+        let (s, e) = span_of(&star);
+        refusal(
+            input,
+            Q014,
+            message,
+            span_of(triple),
+            vec![edit(s, e, "")],
+            MACHINE,
+        )
+    } else {
+        refusal_note(input, Q014, message, span_of(triple), "$a knows{1,3} $b")
+    }
+}
+
 fn with_clause(input: &str, before: &[Pair<Rule>], with: &Pair<Rule>) -> Refusal {
     let items: Vec<&str> = with
         .clone()
@@ -2926,6 +2996,7 @@ fn element(pair: Pair<Rule>, before: &[Pair<Rule>]) -> R<Element> {
             ))
         }
         Rule::with_rec => Err(with_clause(input, before, &c)),
+        Rule::star_range_rec => Err(star_range(input, &c)),
         Rule::call_block_rec => {
             let word = c.clone().into_inner().next().unwrap();
             let (s, e) = span_of(&word);

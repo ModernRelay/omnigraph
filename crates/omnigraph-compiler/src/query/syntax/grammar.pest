@@ -205,7 +205,11 @@ missing_comma_rec = { !("," | "}" | ")" | kw_where) }
 // `order` after `limit`, `order by`, `offset`, `group by`, `having` and
 // `retrieve` are refused at the construct with a fix. The accepted texts are
 // section 7's.
-read_body = { (match_clause | match_nobrace_rec) ~ where_clause? ~ retrieve_rec? ~ (return_clause | return_nobrace_rec)? ~ read_tail* }
+read_body = { (match_clause | match_nobrace_rec) ~ where_clause? ~ (second_where_rec | with_after_rec)* ~ retrieve_rec? ~ (return_clause | return_nobrace_rec)? ~ read_tail* }
+// A second `where` after the first, refused with `and` as the fix.
+second_where_rec = { kw_where ~ expr }
+// Cypher's `WITH` between the pattern and `return`.
+with_after_rec = { fw_with ~ with_item ~ ("," ~ with_item)* }
 read_tail = _{ order_clause | order_by_rec | limit_clause | limit_neg_rec | offset_rec | group_by_rec | having_rec }
 limit_neg_rec = { kw_limit ~ "-" ~ integer }
 // `return { … }` written before `match { … }`.
@@ -243,7 +247,7 @@ having_rec = { fw_having ~ ("{" ~ brace_body ~ "}" | expr) }
 // Elements: the forms that produce rows, then the recognizers. A predicate
 // is never an element: a filter, `not { }`, a binding's braces and the
 // foreign forms are recognised here only to be refused with a fix.
-element = { arrow_traversal | cypher_pattern | list_to_rows | prefix_rec | with_rec | call_block_rec | match_prefix_rec | let_clause | from_clause | from_paren_rec | negation_rec | optional_block | optional_rec | blockless_rec | binding_brace_filter | binding_braces_rec | binding_paren_rec | binding | binding_lower_rec | traversal | filter_rec | stray_braces_rec }
+element = { arrow_traversal | cypher_pattern | list_to_rows | prefix_rec | with_rec | call_block_rec | match_prefix_rec | let_clause | from_clause | from_paren_rec | negation_rec | optional_block | optional_rec | blockless_rec | binding_brace_filter | binding_braces_rec | binding_paren_rec | binding | binding_lower_rec | traversal | star_range_rec | filter_rec | stray_braces_rec }
 let_clause     = { kw_let ~ variable ~ "=" ~ (inline_read | expr) }
 // `from` is the element when the next token is `{`, `$` or a call; `as`
 // names a ranking's score.
@@ -254,6 +258,9 @@ inline_read    = { "{" ~ (read_body ~ &"}" | matchless_read_rec) ~ "}" }
 matchless_read_rec = { (!kw_return ~ element ~ ","?)+ ~ return_clause ~ read_tail* }
 optional_block = { kw_optional ~ "{" ~ block_body ~ "}" }
 binding = { variable ~ ":" ~ type_name ~ !"{" }                                   // a node or an edge type
+// `$a knows* $b` or `$a knows*{1,3} $b`: Cypher's star on a hop range.
+star_range_rec = { variable ~ edge_binding? ~ edge_ident ~ star_mark ~ traversal_bounds? ~ variable }
+star_mark = { "*" }
 // A triple ends at its second variable: one that an operator continues is a
 // filter written among the elements, refused with the `where` fix.
 traversal = { !(variable ~ edge_binding? ~ (undirected_edge | edge_sel) ~ traversal_bounds? ~ variable ~ continuation) ~ variable ~ edge_binding? ~ (undirected_edge | edge_sel) ~ traversal_bounds? ~ variable }

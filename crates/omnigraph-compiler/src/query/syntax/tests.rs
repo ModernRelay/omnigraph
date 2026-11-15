@@ -150,6 +150,43 @@ fn match_holds_the_elements_and_where_the_predicate() {
     assert!(w.groups[0].pattern.predicate.is_some());
 }
 
+/// A second `where` joins the first with `and`, each side parenthesized, and
+/// a starred bounded range drops its star; both fixes reparse to the
+/// intended tree. A `with` after the pattern and an unbounded star print a
+/// note, since no rewrite keeps their meaning.
+#[test]
+fn a_second_where_a_with_and_a_starred_range_print_their_fixes() {
+    for (src, code, intended) in [
+        (
+            "query q() { match { $p: Person } where $p.age > 1 or $p.age < 0 where $p.age < 5 return { $p.handle } }",
+            "Q012",
+            "query q() { match { $p: Person } where ($p.age > 1 or $p.age < 0) and ($p.age < 5) return { $p.handle } }",
+        ),
+        (
+            "query q() { match { $p: Person, $p knows*{1,3} $q } return { $q.handle } }",
+            "Q014",
+            "query q() { match { $p: Person, $p knows{1,3} $q } return { $q.handle } }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), code, "{src}: {e:?}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(
+            parse_source(&fixed).unwrap_or_else(|e| panic!("{src}\n{fixed}\n{e:?}")),
+            parsed(intended),
+            "{src}"
+        );
+    }
+    for src in [
+        "query q() { match { $p: Person, $p knows* $q } where $p.handle = \"p1\" return { count($q) as n } }",
+        "query q() { match { $p: Person } with $p return { $p.handle } }",
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q014", "{src}: {e:?}");
+        assert!(e.suggestion.is_none(), "{src}: a rewrite printed: {e:?}");
+    }
+}
+
 /// Each repair of a predicate written among the elements is one suggestion
 /// over the whole `match` and its `where`, which reparses to the intended
 /// tree (section 3's table).
@@ -1439,6 +1476,7 @@ const SYNTAX_RULES: &[&str] = &[
     "retrieve_rec",
     "return_clause",
     "return_nobrace_rec",
+    "second_where_rec",
     "set_item",
     "set_rec",
     "set_stmt",
@@ -1448,6 +1486,8 @@ const SYNTAX_RULES: &[&str] = &[
     "show_stmt",
     "sql_alias_rec",
     "star_item_rec",
+    "star_mark",
+    "star_range_rec",
     "starts_with_words_rec",
     "statement_trailer",
     "stmt_keyword",
@@ -1475,6 +1515,7 @@ const SYNTAX_RULES: &[&str] = &[
     "view_decl",
     "where_clause",
     "where_stmt",
+    "with_after_rec",
     "with_item",
     "with_rec",
     "write_element",
