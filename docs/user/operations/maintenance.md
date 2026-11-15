@@ -83,11 +83,21 @@ Writes to `main` wait while optimize holds its writer gates. A run given
 `--max-gate-hold 30s` starts no table after that long except the first: the
 rest are `deferred`, finished tables publish, and a writer waits at most the
 bound plus one rewrite. Tables run in type-key order; `resume_at` names the
-first deferred one, and `--tables` runs only the listed tables, in order. Each
-table's `outcome` is `optimized`, `unchanged`, `deferred` or
-`failed` (with its `error`; the other tables still publish). The report adds
-`input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
-and `artifact` outcomes, which never fail a published run.
+first deferred one, and `--datasets` runs only the listed tables, in order. A
+direct run keeps no position between invocations: pass that key to the next
+one as `--start-at <key>`, which starts a full-catalog run there and wraps
+around, so successive bounded runs reach every table. A server keeps the
+position itself ([recorded operations](recorded-operations.md)) and refuses
+the flag.
+
+Each table's `outcome` is `optimized`, `unchanged`, `deferred` or `failed`
+(with its `error`; the other tables still publish). When a table's index work
+fails after its compaction, the compaction is still published: the table is
+`optimized` with `reason: index_failed` and the failure as its `error`, and
+the next run plans the index work again. The report adds `input_commit`, `graph_commit_id`,
+`gate_hold_ms` and the `configuration_clear` and `artifact` outcomes, which
+never fail a published run. Exit 0 means the run finished, not that every
+table was optimized: read each table's `outcome` and `reason`.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
@@ -122,7 +132,9 @@ As with optimize, a write that lands on a table while its batch is staged fails
 the run with a read-set conflict; run the command again. A vector property with
 no vectors yet and full-text coverage stay pending: only `index rebuild --kind
 full-text` refreshes a full-text index's coverage, and queries match uncovered
-rows with the index's analyzer meanwhile.
+rows with the index's analyzer meanwhile. Pending covers only a vector
+property with nothing to train on; a rebuild that fails for any other reason,
+a storage failure for one, fails the command.
 
 JSON reports `branch`, `graph_commit_id` (null for a no-op), `indexes` with each
 `type_key`, `property` (the indexed column, `__id` for the identity index),

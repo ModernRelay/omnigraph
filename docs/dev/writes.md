@@ -358,18 +358,24 @@ still does, or when no `__manifest` version ever named it and the authority
 its transaction properties record is provably gone. Nothing defers a table's
 collection; see [Maintenance](../user/operations/maintenance.md#cleanup).
 
-Optimize plans each table's compaction from its pin
+Optimize plans each table's compaction once, from its pin
 (`TableStore::plan_table_compaction`): Lance's plan, plus a task of its own
 for every other fragment whose data or overlay files still list a field id the
-schema lacks, the values of a dropped column. The rewrite scans the current
-schema only, so its files hold no dropped value; this is how a drop is erased,
-deterministically, whatever Lance's size and deletion heuristics select. It
-stages the rewrite detached with fragment ids above the base's high-water
-mark, so it needs no `ReserveFragments`; a lagging scalar or vector index is
-rebuilt whole as a detached commit chained on the rewrite under its name
-(Lance 13 folds only through a linear commit), keeping a vector index's
-partition count; the batch publishes once with an exact CAS on every planned
-pin, and a pin a concurrent writer moved fails the run with a read-set
+schema lacks, the values of a dropped column. That plan is measured against
+the run's ceilings and handed to `stage_compaction`, which refuses a plan of
+another version. The rewrite scans the current schema only, so its files hold
+no dropped value; this is how a drop is erased, deterministically, whatever
+Lance's size and deletion heuristics select. It stages the rewrite detached
+with fragment ids above the base's high-water mark, so it needs no
+`ReserveFragments`; a lagging scalar or vector index is rebuilt whole as a
+detached commit chained on the rewrite under its name (Lance 13 folds only
+through a linear commit), keeping a vector index's partition count, and a
+declared index the table lacks is built as a third. The links are
+independent: an index link that fails after an earlier link of the table
+committed leaves the committed links as the table's effect, reported
+`optimized` with the reason `index_failed`, and one that fails with no link
+before it fails the table. The batch publishes once with an exact CAS on every
+planned pin, and a pin a concurrent writer moved fails the run with a read-set
 conflict so the next run re-plans. A failure before publication leaves
 unpublished staging the collector reclaims once it is dead.
 
@@ -388,7 +394,11 @@ version, and commits detached there, so the compaction stays and the table's
 history stays one chain. An insert, an append and an overwrite carry; an
 update, delete or upsert of a row in a fragment a rewrite replaced is a
 conflict Lance reports, and the attempt is sent back, as one overtaken by a
-row change is. A caller's `--if-commit` head and an unattached base are not
+row change is. So is one whose chain cannot be read: the links before a
+table's pinned tip are named by no `__manifest` version, and a `cleanup`
+between the write's capture and its gates deletes them, which is an
+unreadable chain and not a storage fault. A caller's `--if-commit` head and
+an unattached base are not
 carried. On a branch its process does not hold, neither is a publication by
 another handle that lands after the beside-staging probe: the publisher's CAS
 refuses that one, as above. On a branch the process holds, a write takes no

@@ -341,9 +341,10 @@ pub(crate) struct StartOptimizeRequest {
     /// A canonical ULID the caller chose; a repeated submission with the same
     /// request answers the existing record.
     operation_id: String,
-    /// Only these table keys (`node:<Type>`, `edge:<Type>`), in this order.
+    /// Only these datasets, each named by its type key (`node:<Type>`,
+    /// `edge:<Type>`), in this order.
     #[serde(default)]
-    tables: Option<Vec<String>>,
+    datasets: Option<Vec<String>>,
     /// How long writers to main wait at most, within the server's ceiling.
     #[serde(default)]
     max_gate_hold_ms: Option<u64>,
@@ -352,7 +353,7 @@ pub(crate) struct StartOptimizeRequest {
 impl StartOptimizeRequest {
     fn request(&self) -> OperationRequest {
         OperationRequest::Optimize(OptimizeOptions {
-            tables: self.tables.clone(),
+            datasets: self.datasets.clone(),
             max_gate_hold_ms: self.max_gate_hold_ms,
         })
     }
@@ -714,7 +715,7 @@ pub(crate) async fn start_optimize(
         outstanding_deployment,
         ..
     } = loaded;
-    let start_at = if input.tables.is_none() {
+    let start_at = if input.datasets.is_none() {
         admitted
             .kind_state
             .optimize
@@ -1034,14 +1035,14 @@ async fn run(
             let landed = Arc::clone(&landed);
             let in_doubt = Arc::clone(&in_doubt);
             async move {
-                let tables = publication.tables.iter().map(table_outcome).collect();
+                let tables = publication.datasets.iter().map(table_outcome).collect();
                 match transition(&state, &owner, &id, |active| {
                     active.state = OperationState::Publishing;
                     active.nonce = Some(publication.nonce.clone());
                     active.input_commit = publication.input_commit.clone();
                     active.input_manifest_version = Some(publication.input_manifest_version);
                     if let Some(outcome) = active.optimize_outcome_mut() {
-                        outcome.set_tables(tables);
+                        outcome.set_datasets(tables);
                     }
                 })
                 .await
@@ -1070,8 +1071,8 @@ async fn run(
         .with_authority(AuthorityCapture::UnderGates)
         .with_cancellation(cancellation)
         .with_before_publish(hook);
-    if let Some(tables) = &options.tables {
-        request = request.with_tables(tables.clone());
+    if let Some(table_keys) = &options.datasets {
+        request = request.with_datasets(table_keys.clone());
     } else if let Some(start_at) = operation
         .optimize_outcome()
         .and_then(|outcome| outcome.start_at.clone())
@@ -1192,17 +1193,20 @@ async fn run(
 }
 
 fn table_outcome(stat: &omnigraph::db::DatasetOptimizeStats) -> TableOutcome {
-    let (reason, detail) = match stat.outcome {
-        TableOptimizeOutcome::Deferred(reason) => (Some(reason.as_str()), Some(reason.to_string())),
-        TableOptimizeOutcome::Failed => {
-            (None, stat.failure.as_ref().map(|error| error.to_string()))
+    let detail = match stat.outcome {
+        TableOptimizeOutcome::Deferred(reason) => Some(reason.to_string()),
+        TableOptimizeOutcome::Failed => stat.failure.as_ref().map(|error| error.to_string()),
+        // The committed links are in the publication; the index link that
+        // failed after them is not, and the reason says so (`index_failed`).
+        TableOptimizeOutcome::Optimized => {
+            stat.index_failure.as_ref().map(|error| error.to_string())
         }
-        _ => (None, None),
+        _ => None,
     };
     TableOutcome {
         type_key: stat.type_key.clone(),
         outcome: stat.outcome.as_str().to_string(),
-        reason: reason.map(str::to_string),
+        reason: stat.reason().map(str::to_string),
         detail: detail.map(omnigraph_cluster::truncate_detail),
         fragments_removed: stat.fragments_removed as u64,
         fragments_added: stat.fragments_added as u64,
@@ -1228,7 +1232,7 @@ fn terminal_from_report(
     operation.published_commit = report.graph_commit_id.clone();
     operation.timings.gate_hold_ms = Some(report.gate_hold.as_millis() as u64);
     if let Some(outcome) = operation.optimize_outcome_mut() {
-        outcome.set_tables(report.tables.iter().map(table_outcome).collect());
+        outcome.set_datasets(report.datasets.iter().map(table_outcome).collect());
         outcome.resume_at = report.resume_at.clone();
         outcome.configuration_clear = Some(tail(
             report.configuration_clear.as_str(),
@@ -1255,8 +1259,16 @@ fn terminal_from_report(
         }
         RunCancellation::ArrivedLate => {
             operation.state = OperationState::Succeeded;
+            // The engine reports a late cancellation for every run that
+            // passed its last cancellation point, a run that staged nothing
+            // included: only a run with a commit started a publication.
+            let passed = if report.graph_commit_id.is_some() {
+                "after the publication started"
+            } else {
+                "after the run had finished its tables, with nothing to publish"
+            };
             operation.reason = Some(format!(
-                "a cancellation arrived after the publication started{}",
+                "a cancellation arrived {passed}{}",
                 cancel_reason
                     .map(|reason| format!(": {reason}"))
                     .unwrap_or_default()
@@ -1463,7 +1475,7 @@ mod tests {
             "g",
             "domain",
             OperationRequest::Optimize(omnigraph_cluster::OptimizeOptions {
-                tables: None,
+                datasets: None,
                 max_gate_hold_ms: None,
             }),
             "operator",
@@ -1494,6 +1506,88 @@ mod tests {
             assert!(answers_without_the_gate(&op, &[], false));
             assert!(!answers_without_the_gate(&op, &[], true));
         }
+    }
+
+    /// A report from a tiny graph, for the fields a record is built from: the
+    /// engine's report types are `non_exhaustive`.
+    async fn report_with_one_table() -> (tempfile::TempDir, OptimizeReport) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = omnigraph::db::Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Person {\n    slug: String @key\n}\n",
+        )
+        .await
+        .unwrap();
+        let report = db
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(report.datasets.len(), 1);
+        (dir, report)
+    }
+
+    fn accepted() -> Operation {
+        Operation::accepted(
+            "01JBQZ00000000000000000001",
+            "g",
+            "d",
+            OperationRequest::Optimize(OptimizeOptions {
+                datasets: None,
+                max_gate_hold_ms: None,
+            }),
+            "p",
+            None,
+        )
+    }
+
+    /// The engine reports a late cancellation for every run that passed its
+    /// last cancellation point, so the record says a publication started
+    /// only when the run has a commit.
+    #[tokio::test]
+    async fn a_late_cancellation_names_a_publication_only_when_one_started() {
+        let (_dir, mut report) = report_with_one_table().await;
+        report.cancellation = RunCancellation::ArrivedLate;
+
+        report.graph_commit_id = None;
+        let idle = terminal_from_report(accepted(), &report, Some("shutdown".to_string()));
+        assert_eq!(idle.state, OperationState::Succeeded);
+        assert_eq!(idle.published_commit, None);
+        assert_eq!(
+            idle.reason.as_deref(),
+            Some(
+                "a cancellation arrived after the run had finished its tables, with nothing to publish: shutdown"
+            )
+        );
+
+        report.graph_commit_id = Some("hb1.child".to_string());
+        let published = terminal_from_report(accepted(), &report, None);
+        assert_eq!(published.state, OperationState::Succeeded);
+        assert_eq!(published.published_commit.as_deref(), Some("hb1.child"));
+        assert_eq!(
+            published.reason.as_deref(),
+            Some("a cancellation arrived after the publication started")
+        );
+    }
+
+    /// An optimized table whose index link failed after its rewrite keeps its
+    /// outcome and carries the failure as the reason `index_failed`, with the
+    /// error as its detail; a clean optimized table has neither.
+    #[tokio::test]
+    async fn an_optimized_table_records_the_index_failure_after_its_rewrite() {
+        let (_dir, mut report) = report_with_one_table().await;
+        let mut stat = report.datasets.pop().unwrap();
+        stat.outcome = TableOptimizeOutcome::Optimized;
+        let clean = table_outcome(&stat);
+        assert_eq!((clean.reason, clean.detail), (None, None));
+
+        stat.index_failure = Some(Arc::new(omnigraph::error::OmniError::manifest(
+            "index build lost",
+        )));
+        let recorded = table_outcome(&stat);
+        assert_eq!(recorded.outcome, "optimized");
+        assert_eq!(recorded.reason.as_deref(), Some("index_failed"));
+        let detail = recorded.detail.expect("the failure is recorded");
+        assert!(detail.contains("index build lost"), "{detail}");
     }
 
     #[test]

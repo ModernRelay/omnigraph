@@ -968,6 +968,65 @@ fn embed_seed_preserves_non_entity_rows() {
     assert_eq!(embedded[2]["to"], "dec-alpha");
 }
 
+/// A direct run keeps no resume position between invocations, so a bounded
+/// run names the table it stopped before and the next one is started there
+/// with `--start-at`: it visits that table first and wraps, and successive
+/// bounded runs reach every table instead of starting at the first key each
+/// time.
+#[test]
+fn optimize_start_at_resumes_a_bounded_direct_run() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let optimize = |extra: &[&str]| {
+        parse_stdout_json(&output_success(
+            cli()
+                .arg("optimize")
+                .arg("--json")
+                .arg("--target")
+                .arg(&graph)
+                .args(extra),
+        ))
+    };
+    let visited = |payload: &Value| {
+        payload["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|dataset| dataset["type_key"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // A zero hold runs the first table and defers the rest.
+    let first = optimize(&["--max-gate-hold", "0s"]);
+    let order = visited(&first);
+    assert!(order.len() >= 3, "{first}");
+    assert_ne!(first["datasets"][0]["outcome"], "deferred", "{first}");
+    assert_eq!(first["datasets"][1]["outcome"], "deferred", "{first}");
+    assert_eq!(first["resume_at"], order[1].as_str(), "{first}");
+
+    let second = optimize(&["--max-gate-hold", "0s", "--start-at", &order[1]]);
+    let mut wrapped = order[1..].to_vec();
+    wrapped.push(order[0].clone());
+    assert_eq!(visited(&second), wrapped, "{second}");
+    assert_ne!(second["datasets"][0]["outcome"], "deferred", "{second}");
+    assert_eq!(second["resume_at"], order[2].as_str(), "{second}");
+
+    // A start position belongs to a full-catalog run; the refusal comes
+    // before the graph is opened.
+    let refused = output_failure(cli().arg("optimize").arg("--target").arg(&graph).args([
+        "--start-at",
+        &order[1],
+        "--datasets",
+        &order[0],
+    ]));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("applies to a full-catalog run"),
+        "{refused:?}"
+    );
+}
+
 #[test]
 fn optimize_json_succeeds_on_local_graph() {
     // Happy path for the resolve_local_uri swap (RFC-010 Slice 1): a positional

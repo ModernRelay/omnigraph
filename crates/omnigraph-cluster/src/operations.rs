@@ -146,8 +146,9 @@ impl OperationRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OptimizeOptions {
+    /// Only these table keys, in this order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tables: Option<Vec<String>>,
+    pub datasets: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_gate_hold_ms: Option<u64>,
 }
@@ -157,12 +158,15 @@ pub struct OptimizeOptions {
 #[serde(deny_unknown_fields)]
 pub struct TableOutcome {
     pub type_key: String,
-    /// `optimized`, `unchanged`, `deferred`, `skipped` or `failed`.
+    /// `optimized`, `unchanged`, `deferred` or `failed`.
     pub outcome: String,
+    /// The token that qualifies the outcome: why a `deferred` table was not
+    /// started, or `index_failed` on an `optimized` table whose index link
+    /// failed after an earlier link of the table committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// The human detail of a deferral or a failure, at most
-    /// [`MAX_OUTCOME_DETAIL_BYTES`].
+    /// The human detail of a deferral or a failure, the index failure of an
+    /// `optimized` table included; at most [`MAX_OUTCOME_DETAIL_BYTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     pub fragments_removed: u64,
@@ -196,10 +200,13 @@ pub struct OptimizeOutcome {
     pub start_at: Option<String>,
     /// At most [`MAX_TABLE_OUTCOMES`] tables, in the run's visit order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tables: Vec<TableOutcome>,
-    /// The tables beyond the listed ones, counted per outcome code.
+    pub datasets: Vec<TableOutcome>,
+    /// The tables beyond the listed ones, counted per outcome code and
+    /// reason: the key is the outcome code, followed by a colon and the
+    /// reason when the outcome has one (`deferred:gate_hold_limit`,
+    /// `optimized:index_failed`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub more_tables: BTreeMap<String, u64>,
+    pub more_datasets: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,14 +217,19 @@ pub struct OptimizeOutcome {
 
 impl OptimizeOutcome {
     /// Keep `tables`, listing at most [`MAX_TABLE_OUTCOMES`] and counting the
-    /// rest per outcome code, so a large catalog never makes a write fail
-    /// validation.
-    pub fn set_tables(&mut self, tables: Vec<TableOutcome>) {
+    /// rest per outcome code and reason, so a large catalog never makes a
+    /// write fail validation and a table whose index work failed is never
+    /// counted among the clean ones.
+    pub fn set_datasets(&mut self, tables: Vec<TableOutcome>) {
         let mut tables = tables;
-        self.more_tables.clear();
+        self.more_datasets.clear();
         if tables.len() > MAX_TABLE_OUTCOMES {
             for table in tables.drain(MAX_TABLE_OUTCOMES..) {
-                *self.more_tables.entry(table.outcome).or_default() += 1;
+                let key = match table.reason {
+                    Some(reason) => format!("{}:{reason}", table.outcome),
+                    None => table.outcome,
+                };
+                *self.more_datasets.entry(key).or_default() += 1;
             }
         }
         for table in &mut tables {
@@ -225,7 +237,7 @@ impl OptimizeOutcome {
                 table.detail = Some(truncate_detail(detail));
             }
         }
-        self.tables = tables;
+        self.datasets = tables;
     }
 }
 
@@ -780,7 +792,7 @@ impl OperationRecord {
     fn keep_kind_state(&mut self, operation: &Operation) {
         // Only a full-catalog optimize that succeeded moves the position.
         let OperationRequest::Optimize(options) = &operation.request;
-        if operation.state != OperationState::Succeeded || options.tables.is_some() {
+        if operation.state != OperationState::Succeeded || options.datasets.is_some() {
             return;
         }
         let resume_at = operation
@@ -881,7 +893,7 @@ impl OperationRecord {
                 )));
             }
             if let OperationOutcome::Optimize(outcome) = &operation.outcome
-                && outcome.tables.len() > MAX_TABLE_OUTCOMES
+                && outcome.datasets.len() > MAX_TABLE_OUTCOMES
             {
                 return Err(invalid(format!(
                     "operation {} lists more than {MAX_TABLE_OUTCOMES} tables",
@@ -1055,7 +1067,7 @@ mod tests {
         );
         let mut other = operation(1, "g");
         other.request = OperationRequest::Optimize(OptimizeOptions {
-            tables: Some(vec!["node:Person".to_string()]),
+            datasets: Some(vec!["node:Person".to_string()]),
             max_gate_hold_ms: None,
         });
         other.request_digest =
@@ -1310,7 +1322,7 @@ mod tests {
         );
         let mut listed = operation(1, "g");
         listed.request = OperationRequest::Optimize(OptimizeOptions {
-            tables: Some(vec!["node:Person".to_string()]),
+            datasets: Some(vec!["node:Person".to_string()]),
             max_gate_hold_ms: None,
         });
         listed.optimize_outcome_mut().unwrap().resume_at = Some("node:Other".to_string());
@@ -1384,25 +1396,55 @@ mod tests {
     #[test]
     fn table_outcomes_are_listed_up_to_the_cap_and_details_are_cut() {
         let mut outcome = OptimizeOutcome::default();
-        let tables = (0..MAX_TABLE_OUTCOMES + 3)
-            .map(|n| TableOutcome {
-                type_key: format!("node:T{n}"),
-                outcome: if n % 2 == 0 { "unchanged" } else { "deferred" }.to_string(),
-                reason: None,
-                detail: Some("d".repeat(MAX_OUTCOME_DETAIL_BYTES + 100)),
-                fragments_removed: 0,
-                fragments_added: 0,
-                duration_ms: 0,
-                source_bytes: None,
+        // The tables past the cap: one clean `optimized`, one `optimized`
+        // whose index work failed, one `unchanged`, two deferred for
+        // different reasons. Each is counted under its outcome and reason.
+        let overflow = [
+            ("optimized", None),
+            ("optimized", Some("index_failed")),
+            ("unchanged", None),
+            ("deferred", Some("gate_hold_limit")),
+            ("deferred", Some("byte_budget")),
+        ];
+        let tables = (0..MAX_TABLE_OUTCOMES + overflow.len())
+            .map(|n| {
+                let (code, reason) = match n.checked_sub(MAX_TABLE_OUTCOMES) {
+                    Some(past) => overflow[past],
+                    None => ("unchanged", None),
+                };
+                TableOutcome {
+                    type_key: format!("node:T{n}"),
+                    outcome: code.to_string(),
+                    reason: reason.map(str::to_string),
+                    detail: Some("d".repeat(MAX_OUTCOME_DETAIL_BYTES + 100)),
+                    fragments_removed: 0,
+                    fragments_added: 0,
+                    duration_ms: 0,
+                    source_bytes: None,
+                }
             })
             .collect();
-        outcome.set_tables(tables);
-        assert_eq!(outcome.tables.len(), MAX_TABLE_OUTCOMES);
-        assert_eq!(outcome.more_tables.get("unchanged"), Some(&2));
-        assert_eq!(outcome.more_tables.get("deferred"), Some(&1));
+        outcome.set_datasets(tables);
+        assert_eq!(outcome.datasets.len(), MAX_TABLE_OUTCOMES);
+        let counted: Vec<(&str, u64)> = outcome
+            .more_datasets
+            .iter()
+            .map(|(key, count)| (key.as_str(), *count))
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                ("deferred:byte_budget", 1),
+                ("deferred:gate_hold_limit", 1),
+                ("optimized", 1),
+                ("optimized:index_failed", 1),
+                ("unchanged", 1),
+            ],
+            "an index failure past the cap is not counted as a clean optimized table"
+        );
         assert!(
             outcome
-                .tables
+                .datasets
                 .iter()
                 .all(|table| table.detail.as_ref().unwrap().len() == MAX_OUTCOME_DETAIL_BYTES)
         );

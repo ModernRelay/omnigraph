@@ -527,14 +527,20 @@ pub(crate) fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
     let n: u64 = num_part
         .parse()
         .map_err(|e| color_eyre::eyre::eyre!("invalid duration '{}': {}", s, e))?;
-    let secs = match unit {
-        "" | "s" => n,
-        "m" => n * 60,
-        "h" => n * 60 * 60,
-        "d" => n * 60 * 60 * 24,
-        "w" => n * 60 * 60 * 24 * 7,
+    let seconds_per_unit: u64 = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 60 * 60 * 24,
+        "w" => 60 * 60 * 24 * 7,
         _ => bail!("unknown duration unit '{}'. Supported: s, m, h, d, w", unit),
     };
+    // A product that wrapped would name a shorter duration than the one
+    // asked for, and `cleanup --older-than` would then reclaim younger
+    // history: refuse it instead.
+    let secs = n
+        .checked_mul(seconds_per_unit)
+        .ok_or_else(|| color_eyre::eyre::eyre!("duration '{}' is too long", s))?;
     Ok(std::time::Duration::from_secs(secs))
 }
 
@@ -640,6 +646,41 @@ mod tests {
             graph_resource_id_for_selection(None, "/tmp/graph.omni"),
             "/tmp/graph.omni"
         );
+    }
+
+    #[test]
+    fn parse_duration_arg_reads_each_unit_and_refuses_a_product_that_overflows() {
+        for (text, seconds) in [
+            ("45", 45),
+            ("45s", 45),
+            ("5m", 300),
+            ("2h", 7200),
+            ("7d", 604_800),
+            ("2w", 1_209_600),
+            (" 30s ", 30),
+            ("18446744073709551615s", u64::MAX),
+        ] {
+            assert_eq!(
+                parse_duration_arg(text).unwrap(),
+                std::time::Duration::from_secs(seconds),
+                "{text}"
+            );
+        }
+        // One past the largest whole number of each unit that fits: the
+        // product no longer wraps to a short duration.
+        for text in [
+            "307445734561825861m",
+            "5124095576030432h",
+            "213503982334602d",
+            "30500568904944w",
+            "18446744073709551615w",
+        ] {
+            let error = parse_duration_arg(text).unwrap_err();
+            assert!(error.to_string().contains("too long"), "{text}: {error}");
+        }
+        for text in ["", "s", "5x", "-5s", "1.5h"] {
+            assert!(parse_duration_arg(text).is_err(), "{text}");
+        }
     }
 
     #[test]
