@@ -686,6 +686,73 @@ fn optional_served() {
     assert!(ops.contains(&"Union"), "{ops:?}");
 }
 
+/// `optional { p }` writes the elements before it once,
+/// `Correlate(R, Union(p, Project(Filter(Env, ¬ exists p), nulls)))`, so a
+/// run of optionals grows the term by the same number of nodes each; the
+/// earlier form wrote `R` twice and doubled the term with each one, and a
+/// read held at most seven.
+#[test]
+fn a_run_of_optionals_grows_the_term_linearly() {
+    let read = |n: usize| {
+        let optionals: Vec<String> = (0..n)
+            .map(|i| format!("optional {{ $q{i}: Person, $p knows $q{i} }}"))
+            .collect();
+        format!(
+            "query q() {{ match {{ $p: Person, {} }} where $p.handle = \"p5\" return {{ $p.handle }} }}",
+            optionals.join(", ")
+        )
+    };
+    let size = |n: usize| read_of(&ok(&read(n))).term.size();
+    let (one, step) = (size(1), size(2) - size(1));
+    for n in [3, 8, 30, 100] {
+        assert_eq!(size(n), one + (n - 1) * step, "{n} optionals");
+    }
+    // Past the budget the read is refused, after the term reaches it.
+    let n = 4096 / step + 1;
+    let m = refused(&read(n), "T70");
+    assert!(m.contains("plan budget of 4096"), "{m}");
+}
+
+/// The plan budget is charged as the term is built: an expansion that
+/// doubles at each level, nested optionals (each writes its pattern twice,
+/// its rows and its emptiness test) or reads that each call the next one
+/// twice, stops at the first term over the budget instead of building all
+/// 2^30 nodes first.
+#[test]
+fn a_plan_budget_overrun_stops_as_the_term_is_built() {
+    let start = std::time::Instant::now();
+    let mut nested = String::from("$q30: Person, $q29 knows $q30");
+    for i in (1..30).rev() {
+        nested = format!(
+            "$q{i}: Person, $q{} knows $q{i}, optional {{ {nested} }}",
+            i - 1
+        );
+    }
+    let m = refused(
+        &format!(
+            "query q() {{ match {{ $q0: Person, optional {{ {nested} }} }} return {{ $q0.handle }} }}"
+        ),
+        "T70",
+    );
+    assert!(m.contains("plan budget"), "{m}");
+    let mut reads = vec!["query r30() { match { $p: Person } return { $p } }".to_string()];
+    for i in (0..30).rev() {
+        reads.push(format!(
+            "query r{i}() {{ match {{ from union(r{}(), r{}()) }} return {{ $p }} }}",
+            i + 1,
+            i + 1
+        ));
+    }
+    reads.reverse();
+    let m = refused(&reads.join("\n"), "T70");
+    assert!(m.contains("plan budget") && m.contains("r1 → r2"), "{m}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
 #[test]
 fn if_commit_and_valid_are_refused_with_the_writes_rfc_named() {
     for a in ["@if_commit($h)", "@valid($h)"] {

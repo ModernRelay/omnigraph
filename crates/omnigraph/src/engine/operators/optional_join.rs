@@ -5,8 +5,8 @@
 //! block's does. Every inner row is a match of the outer row its tag names
 //! and leaves under the operator's schema without the tag; an outer row no
 //! inner row names leaves once, every column the inner tree adds null on it
-//! (the core's `Union(Correlate(R, p), Project(Filter(R, ¬ exists p),
-//! nulls))`).
+//! (the core's `Correlate(R, Union(p, Project(Filter(Env, ¬ exists p),
+//! nulls)))`).
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use std::fmt;

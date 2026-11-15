@@ -1780,6 +1780,9 @@ impl<'a> Shaper<'a> {
                 self.inline_read(input, items, bindings, facts)
             }
             Term::Correlate { outer, inner } => {
+                if let Some(pattern) = optional_pattern(inner) {
+                    return self.optional(outer, pattern, facts);
+                }
                 self.facts(outer, facts)?;
                 if let Term::Group { .. } = inner.as_ref() {
                     return Err(self.refuse_at(
@@ -1792,10 +1795,7 @@ impl<'a> Shaper<'a> {
                 }
                 self.facts(inner, facts)
             }
-            Term::Union { left, right } => match optional_parts(left, right) {
-                Some((outer, pattern)) => self.optional(outer, pattern, facts),
-                None => self.union(term, facts),
-            },
+            Term::Union { .. } => self.union(term, facts),
             other => Err(self.unlowered_node(other)),
         }
     }
@@ -3336,16 +3336,16 @@ fn env_columns(term: &Term) -> Vec<String> {
     Vec::new()
 }
 
-/// The elements before an `optional { p }` and `p`, as the type checker
-/// writes the optional: `Union(Correlate(R, p), Project(Filter(Correlate(R,
+/// `p` of an `optional { p }`, from the inner term the type checker writes
+/// under `Correlate(R, …)`: `Union(p, Project(Filter(Correlate(Env,
 /// Group(p, [], [count])), ¬ exists), nulls))`.
-fn optional_parts<'t>(left: &'t Term, right: &'t Term) -> Option<(&'t Term, &'t Term)> {
-    let Term::Correlate { outer, inner } = left else {
+fn optional_pattern(inner: &Term) -> Option<&Term> {
+    let Term::Union { left, right } = inner else {
         return None;
     };
     let Term::Project {
         input, keep: false, ..
-    } = right
+    } = right.as_ref()
     else {
         return None;
     };
@@ -3353,7 +3353,7 @@ fn optional_parts<'t>(left: &'t Term, right: &'t Term) -> Option<(&'t Term, &'t 
         return None;
     };
     let Term::Correlate {
-        outer: unmatched,
+        outer: row,
         inner: grouped,
     } = input.as_ref()
     else {
@@ -3367,8 +3367,11 @@ fn optional_parts<'t>(left: &'t Term, right: &'t Term) -> Option<(&'t Term, &'t 
     else {
         return None;
     };
-    (unmatched == outer && counted == inner && keys.is_empty() && aggs.len() == 1)
-        .then_some((outer.as_ref(), inner.as_ref()))
+    (matches!(row.as_ref(), Term::Env(_) | Term::Unit)
+        && counted == left
+        && keys.is_empty()
+        && aggs.len() == 1)
+        .then_some(left.as_ref())
 }
 
 /// The window an `rrf`'s `nearest` arm draws when the read has no `limit`

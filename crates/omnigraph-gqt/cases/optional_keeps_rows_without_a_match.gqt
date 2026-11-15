@@ -1,8 +1,8 @@
 # issue: none
 # notes: `optional { p }` keeps every outer row: a row with matches once per
 # notes: match, a row with none once, the names the optional introduces null
-# notes: on it and nullable in the result (`Union(Correlate(R, p),
-# notes: Project(Filter(R, ¬ exists p), nulls))`). A `where` after it filters the
+# notes: on it and nullable in the result (`Correlate(R, Union(p,
+# notes: Project(Filter(Env, ¬ exists p), nulls)))`). A `where` after it filters the
 # notes: joined rows, a filter inside it decides only the matches, and a
 # notes: traversal written after it starts from a name it introduces. A write
 # notes: group's selection runs it too.

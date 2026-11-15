@@ -274,6 +274,7 @@ fn typed_decl(catalog: &Catalog, unit: &HashMap<String, &Decl>, decl: &Decl) -> 
         at: None,
         element_span: None,
         refusals: Vec::new(),
+        plan_limit: DEFAULT_PLAN_BUDGET,
     };
     let params = match param_types(&decl.params) {
         Ok(p) => p,
@@ -979,6 +980,10 @@ struct Ctx<'a> {
     /// The refusals the recovery points of the declaration recorded
     /// ([`Ctx::recover`]).
     refusals: Vec<QueryDiagnostic>,
+    /// The plan budget of the declaration being checked: every term built
+    /// for it is a subtree of its expanded tree, so a term over the budget
+    /// stops the compile as soon as it is built ([`Ctx::charge`]).
+    plan_limit: usize,
 }
 
 struct Frame {
@@ -1053,12 +1058,12 @@ enum Step {
         name: String,
         value: SExpr,
     },
-    /// `optional { p }`: the inner term, its new columns, and the columns
-    /// visible before it (for the padding arm's types).
+    /// `optional { p }`: the inner term, its new columns, and the outer
+    /// columns it reads (its `Env`, which the padding arm keeps).
     Optional {
         inner: Term,
         new_cols: Vec<Col>,
-        before: Vec<Col>,
+        env: Vec<Col>,
     },
 }
 
@@ -1622,6 +1627,37 @@ impl Ctx<'_> {
         }
     }
 
+    /// `T70` when `term`, of `size` nodes, is over the plan budget of the
+    /// declaration being checked. Each scope, inline read, call and union
+    /// charges the term it builds as it builds it, so an expansion that
+    /// outgrows the budget (nested `optional`s, calls that each call twice)
+    /// stops at the first term over it instead of after the whole tree is
+    /// built.
+    fn charge(&self, size: usize, term: &Term) -> R<()> {
+        if size <= self.plan_limit {
+            return Ok(());
+        }
+        let name = self.frames.first().map_or("", |f| f.decl.as_str());
+        let mut chain: Vec<String> = self.frames.iter().skip(1).map(|f| f.decl.clone()).collect();
+        call_chain(term, &mut chain);
+        Err(err_fix(
+            T70,
+            format!(
+                "`{name}` expands past its plan budget of {} plan nodes (one of its terms alone has {size}); the expansion runs through {}",
+                self.plan_limit,
+                if chain.is_empty() {
+                    "no declared read".to_string()
+                } else {
+                    chain.join(" → ")
+                }
+            ),
+            format!(
+                "declare `@budget(plan = n)` with `n` above {} on `{name}`, or share a relation with `let`",
+                self.plan_limit
+            ),
+        ))
+    }
+
     /// The construct being checked was written at `span`.
     fn set_at(&mut self, span: &SourceSpan) {
         self.at = Some((span.position, span.end_position));
@@ -1661,7 +1697,9 @@ impl Ctx<'_> {
         };
         let params = param_types(&decl.params)?;
         let budget = if top {
-            self.recorded_annotations(decl)?
+            let budget = self.recorded_annotations(decl)?;
+            self.plan_limit = budget.plan;
+            budget
         } else {
             annotations(decl)?
         };
@@ -1763,7 +1801,7 @@ impl Ctx<'_> {
                 self.recover::<()>(Err(refused))?;
             }
         }
-        self.recorded_annotations(decl)?;
+        self.plan_limit = self.recorded_annotations(decl)?.plan;
         let pmap: HashMap<String, PropType> = params.iter().cloned().collect();
         let mut groups = Vec::new();
         let mut class: Option<(WriteClass, String)> = None;
@@ -2387,6 +2425,9 @@ impl Ctx<'_> {
             ))
         };
         let mut acc = env;
+        // The scope's term so far is charged against the plan budget after
+        // every step, counting only the nodes the step adds.
+        let mut size = acc.as_ref().map_or(0, Term::size);
         // Filters placed before every binder wait for the first leaf when
         // there is no `Env` to sit on.
         let mut early = Vec::new();
@@ -2395,17 +2436,36 @@ impl Ctx<'_> {
                 early.push(step);
                 continue;
             }
-            acc = Some(apply(acc, step, &mut self.fresh));
+            acc = Some(self.charged(acc, step, &mut size)?);
             if !early.is_empty() {
                 for s in std::mem::take(&mut early) {
-                    acc = Some(apply(acc, s, &mut self.fresh));
+                    acc = Some(self.charged(acc, s, &mut size)?);
                 }
             }
         }
         for s in early {
-            acc = Some(apply(acc.or(Some(Term::Unit)), s, &mut self.fresh));
+            if acc.is_none() {
+                size = 1;
+            }
+            acc = Some(self.charged(acc.or(Some(Term::Unit)), s, &mut size)?);
         }
         Ok(acc)
+    }
+
+    /// `step` applied to `acc`, whose size is `size`, and the result charged
+    /// ([`Self::charge`]): the nodes the step adds are its fold over a
+    /// one-node term, so `acc` is not walked again.
+    fn charged(&mut self, acc: Option<Term>, step: Step, size: &mut usize) -> R<Term> {
+        *size = match acc {
+            None => 0,
+            Some(_) => *size + apply(Some(Term::Unit), step.clone(), &mut self.fresh).size() - 1,
+        };
+        let term = apply(acc, step, &mut self.fresh);
+        if *size == 0 {
+            *size = term.size();
+        }
+        self.charge(*size, &term)?;
+        Ok(term)
     }
 
     /// The elements of one scope in written order, then its `where`, one
@@ -2949,6 +3009,13 @@ impl Ctx<'_> {
             .cloned()
             .collect();
         let free = inner.free.clone();
+        // The inner term's `Env`, as `finish` builds it.
+        let env: Vec<Col> = inner
+            .outer
+            .iter()
+            .filter(|c| free.contains(&c.name))
+            .cloned()
+            .collect();
         let term = self.finish(&mut inner)?.unwrap_or(Term::Unit);
         for f in &free {
             sc.col(f);
@@ -2960,12 +3027,11 @@ impl Ctx<'_> {
                 ty: c.ty.with_nullable(true),
             })
             .collect();
-        let before_cols = sc.visible();
         sc.push_binder(
             Step::Optional {
                 inner: term,
                 new_cols: new_cols.clone(),
-                before: before_cols,
+                env,
             },
             &nullable,
         );
@@ -3412,11 +3478,13 @@ impl Ctx<'_> {
                     free.push(f);
                 }
             }
+            let term = Term::Union {
+                left: acc.term.boxed(),
+                right: arm.term.boxed(),
+            };
+            self.charge(term.size(), &term)?;
             acc = Rel {
-                term: Term::Union {
-                    left: acc.term.boxed(),
-                    right: arm.term.boxed(),
-                },
+                term,
                 ty: RelTy { cols },
                 shaped: acc.shaped,
                 ranked: None,
@@ -4111,16 +4179,18 @@ impl Ctx<'_> {
         let Rel {
             term, ty, shaped, ..
         } = out.rel;
+        let term = Term::Call {
+            name: c.name.clone(),
+            bindings: params
+                .iter()
+                .map(|(p, _)| p.clone())
+                .zip(bindings.iter().map(SExpr::to_ir))
+                .collect(),
+            body: term.boxed(),
+        };
+        self.charge(term.size(), &term)?;
         Ok(Rel {
-            term: Term::Call {
-                name: c.name.clone(),
-                bindings: params
-                    .iter()
-                    .map(|(p, _)| p.clone())
-                    .zip(bindings.iter().map(SExpr::to_ir))
-                    .collect(),
-                body: term.boxed(),
-            },
+            term,
             ty,
             shaped,
             ranked: None,
@@ -5430,20 +5500,24 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
         Step::Optional {
             inner,
             new_cols,
-            before,
+            env,
         } => {
-            // Union(Correlate(R, p), Project(Filter(R, ¬ exists p), nulls)).
-            let r = acc.unwrap_or(Term::Unit);
-            let matched = Term::Correlate {
-                outer: r.clone().boxed(),
-                inner: inner.clone().boxed(),
-            };
+            // Correlate(R, Union(p, Project(Filter(Env, ¬ exists p), nulls))):
+            // for each outer row, p's rows, or, when p has none, one row that
+            // keeps the outer columns p reads and is null in each column p
+            // adds. R is written once, so a run of optionals grows the tree
+            // linearly.
             let col = "_opt".to_string();
+            let row = if env.is_empty() {
+                Term::Unit
+            } else {
+                Term::Env(env.clone())
+            };
             let unmatched = Term::Filter {
                 input: Term::Correlate {
-                    outer: r.clone().boxed(),
+                    outer: row.boxed(),
                     inner: Term::Group {
-                        input: inner.boxed(),
+                        input: inner.clone().boxed(),
                         keys: Vec::new(),
                         aggs: vec![(col.clone(), count_rows())],
                     }
@@ -5452,31 +5526,34 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
                 .boxed(),
                 pred: not_exists(&col).to_ir(),
             };
-            let mut items = Vec::new();
-            for c in output_columns(&r) {
-                // A hidden column (a block's count) has no declared type here;
-                // every one is an `I64` count or a reference.
-                let ty = before
-                    .iter()
-                    .find(|b| b.name == c)
-                    .map_or(Ty::scalar(ScalarType::I64, false), |b| b.ty.clone());
-                items.push((c.clone(), SExpr::new(SKind::Col(c), ty)));
-            }
-            for c in &new_cols {
-                items.push((
-                    c.name.clone(),
-                    SExpr::new(SKind::Null, c.ty.with_nullable(true)),
-                ));
-            }
-            Term::Union {
-                left: matched.boxed(),
-                right: Term::Project {
-                    input: unmatched.boxed(),
-                    items: items.into_iter().map(|(n, e)| (n, e.to_ir())).collect(),
-                    keep: false,
-                }
-                .boxed(),
-            }
+            let items = env
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        SExpr::new(SKind::Col(c.name.clone()), c.ty.clone()),
+                    )
+                })
+                .chain(new_cols.iter().map(|c| {
+                    (
+                        c.name.clone(),
+                        SExpr::new(SKind::Null, c.ty.with_nullable(true)),
+                    )
+                }))
+                .map(|(n, e)| (n, e.to_ir()))
+                .collect();
+            correlate(
+                Some(acc.unwrap_or(Term::Unit)),
+                Term::Union {
+                    left: inner.boxed(),
+                    right: Term::Project {
+                        input: unmatched.boxed(),
+                        items,
+                        keep: false,
+                    }
+                    .boxed(),
+                },
+            )
         }
     }
 }

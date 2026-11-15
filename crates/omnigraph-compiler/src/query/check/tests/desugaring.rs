@@ -295,7 +295,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             ),
         ),
         (
-            "optional { p }: Union(Correlate(R, p), Project(Filter(R, ¬ exists p), nulls))",
+            "optional { p }: Correlate(R, Union(p, Project(Filter(Env, ¬ exists p), nulls)))",
             "query f() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p, $c } }",
             {
                 // An `optional` is an inner scope: `$c` is bound inside it,
@@ -317,32 +317,37 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
                         ),
                     )
                 };
-                Term::Union {
-                    left: corr(scan("p", "Person"), works()).boxed(),
-                    right: Term::Project {
-                        input: filter(
-                            block(scan("p", "Person"), works(), "_opt"),
-                            not(exists("_opt")),
-                        )
+                // `R` is written once; the padding arm reads only the one
+                // outer row, `Env`.
+                corr(
+                    scan("p", "Person"),
+                    Term::Union {
+                        left: works().boxed(),
+                        right: Term::Project {
+                            input: filter(
+                                block(env(&[("p", node("Person"))]), works(), "_opt"),
+                                not(exists("_opt")),
+                            )
+                            .boxed(),
+                            items: vec![
+                                ("p".into(), col("p", node("Person"))),
+                                (
+                                    "c".into(),
+                                    SExpr::new(
+                                        SKind::Null,
+                                        Ty::Node {
+                                            type_name: "Company".into(),
+                                            nullable: true,
+                                        },
+                                    )
+                                    .to_ir(),
+                                ),
+                            ],
+                            keep: false,
+                        }
                         .boxed(),
-                        items: vec![
-                            ("p".into(), col("p", node("Person"))),
-                            (
-                                "c".into(),
-                                SExpr::new(
-                                    SKind::Null,
-                                    Ty::Node {
-                                        type_name: "Company".into(),
-                                        nullable: true,
-                                    },
-                                )
-                                .to_ir(),
-                            ),
-                        ],
-                        keep: false,
-                    }
-                    .boxed(),
-                }
+                    },
+                )
             },
         ),
         (
