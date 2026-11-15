@@ -66,20 +66,15 @@ A comparison or string test (`contains(...)`, `starts_with(...)`) with a null
 operand is null, and `not null` is null. A `where` keeps only rows whose
 expression is true, so `not ($p.age > 30)` skips rows whose `age` is null.
 
-Numeric comparisons choose their types before execution. An integer literal
-may use the property's type when its value fits that type, and a float literal
-may use an `F32` property's type when its value is exactly representable there;
-otherwise both operands use a common numeric type. A float literal is `F64`
-even when its value is a whole number, so an integer property compared with
-`9007199254740992.0` is converted to `F64`: above 2^53 distinct integers round
-to one `F64`, and `9007199254740993` equals that literal. Write an integer
-literal (`9007199254740993`) to compare exactly. Parameters use their declared
-type, regardless of the supplied value. An `F32` property storing `0.1`
-therefore differs from the `F64` literal `0.1`, while `0.5` compares exactly. These rules
-also apply to list membership and the filters of a write, whether a filter runs
-in a scan or in memory. Mixed signed and `U64` values compare without losing
-integer precision. A literal outside its property's type, such as a misspelled
-enum value, is `T3` ([checked literals](diagnostics.md#checked-literals)).
+Numeric comparisons choose their types before execution: an integer literal
+takes the property's type when it fits, a float literal an `F32` property's
+when exactly representable, else both use a common numeric type. A float
+literal is `F64` even when whole, so `9007199254740993` equals
+`9007199254740992.0`. Parameters use their declared type. An `F32` property
+storing `0.1` differs from the literal `0.1`; `0.5` compares exactly. These
+rules hold for list membership and a write's filters, in a scan or in memory.
+Mixed signed and `U64` values keep integer precision. A literal outside its
+property's type is `T3` ([checked literals](diagnostics.md#checked-literals)).
 
 | `x` | `y` | `x and y` | `x or y` |
 |---|---|---|---|
