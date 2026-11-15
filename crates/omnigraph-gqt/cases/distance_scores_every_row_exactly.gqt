@@ -55,6 +55,8 @@ query scored($q: Vector(3)) {
 x.slug: String
 distance: F32
 
+--- expect same as reference
+
 --- query
 query window($q: Vector(3)) {
     match {
@@ -80,6 +82,8 @@ distance: F32
 --- expect plan
 pipeline 0: Scan -> Score -> Projection => Sort
 
+--- expect same as reference
+
 --- query
 query radius($q: Vector(3)) {
     match {
@@ -101,6 +105,8 @@ query radius($q: Vector(3)) {
 
 --- expect shape
 x.slug: String
+
+--- expect same as reference
 
 --- query
 query citing($q: Vector(3)) {
@@ -124,6 +130,8 @@ x.slug: String
 y.slug: String
 distance: F32
 
+--- expect same as reference
+
 --- query
 query cited_by_the_nearest($q: Vector(3)) {
     match {
@@ -146,6 +154,8 @@ query cited_by_the_nearest($q: Vector(3)) {
 x.slug: String
 y.slug: String
 
+--- expect same as reference
+
 --- query
 query closest($q: Vector(3)) {
     match {
@@ -164,6 +174,8 @@ query closest($q: Vector(3)) {
 --- expect shape
 closest: F32?
 scored: I64
+
+--- expect same as reference
 
 --- mutate
 query add() { insert Doc { slug: "g", embedding: [0.5, 0.0, 0.0] } }
@@ -192,6 +204,8 @@ query window_after_the_index($q: Vector(3)) {
 --- expect shape
 x.slug: String
 distance: F32
+
+--- expect same as reference
 
 --- query
 query overflowing($q: Vector(3)) {

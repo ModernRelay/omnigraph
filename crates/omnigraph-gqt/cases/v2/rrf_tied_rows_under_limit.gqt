@@ -117,6 +117,8 @@ query fused_v2($t: String) {
 --- expect shape
 p.slug: String
 
+--- expect same as reference
+
 --- query
 set engine = v2;
 query fused_explicit_id($t: String) {
@@ -144,6 +146,8 @@ p.slug: String
 --- expect plan
 rank fuse no row tiebreak
 
+--- expect same as reference
+
 --- query
 set engine = v2;
 query fused_covered_return($t: String) {
@@ -170,3 +174,5 @@ p.slug: String
 
 --- expect plan
 rank fuse no row tiebreak
+--- expect same as reference
+

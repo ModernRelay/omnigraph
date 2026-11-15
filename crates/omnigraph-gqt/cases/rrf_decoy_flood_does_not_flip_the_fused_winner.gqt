@@ -61,6 +61,8 @@ c.slug: String
 expand $c $a: selection named [ChunkOfArtifact out]
 rank fuse no row tiebreak
 
+--- expect same as reference
+
 --- query
 query recall_alternation($q1: String, $q2: String) {
     match {
@@ -90,6 +92,8 @@ expand $c $a: selection alternation [ChunkOfArtifact out]
 rank fuse no row tiebreak
 expand $c $a: mode indexed_scan ran indexed_scan
 
+--- expect same as reference
+
 --- query
 query recall_wildcard($q1: String, $q2: String) {
     match {
@@ -118,3 +122,5 @@ c.slug: String
 expand $c $a: selection wildcard [ChunkOfArtifact out]
 rank fuse no row tiebreak
 expand $c $a: mode indexed_scan ran indexed_scan
+--- expect same as reference
+

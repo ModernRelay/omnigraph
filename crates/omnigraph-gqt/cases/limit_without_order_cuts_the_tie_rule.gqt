@@ -45,6 +45,8 @@ p.name: String
 --- expect plan
 sort tiebreak [$p]
 
+--- expect same as reference
+
 --- query
 query pairs_in_column_order() {
     match { $z: Person, $z knows $a }
@@ -63,6 +65,8 @@ a.name: String
 --- expect plan
 sort tiebreak [$z, $a]
 
+--- expect same as reference
+
 --- query
 query first_city() {
     match { $p: Person }
@@ -75,6 +79,8 @@ query first_city() {
 
 --- expect shape
 p.city: String
+
+--- expect same as reference
 
 --- query
 query references_before_values() {
@@ -89,6 +95,8 @@ query references_before_values() {
 --- expect shape
 f.city: String
 p: Person
+
+--- expect same as reference
 
 --- query
 query values_after_references() {
@@ -108,3 +116,5 @@ query values_after_references() {
 --- expect shape
 p.name: String
 c: String
+--- expect same as reference
+

@@ -853,17 +853,16 @@ both row sets. The section is refused on a mutate step, an error expect,
 reference reads a branch. The DST runner skips the comparison, and an
 executor other than the GQT runner refuses the case.
 
-The interpreter does not model the engine's text analyzer: it splits text into
-lowercase alphanumeric tokens, with no stemming or stop words, and scores
-`bm25` in `F64` before rounding to `F32`. A step whose rows depend on the
-analyzer (a `fuzzy` match, a `bm25` order between documents the analyzer
-would tie, a projected score's last digits) carries no `expect same as
-reference`. It compares a `DateTime` as written, so a step that equates
-spellings with different offsets carries none either. The interpreter follows
-the RFC's operator table, and today's behaviour where a row says *[as today]*;
-it stores a `bm25` score at `F32`, the type the engine gives `$score`, where
-the table says `F64`. When the RFC's semantics change, it changes in the same
-pull request.
+The interpreter evaluates a field's analyzer profile as far as the RFC fixes
+it (the simple tokenizer, lowercasing, edition 2's 40-byte filter, ASCII
+folding of Latin letters, refusing any other non-ASCII letter in a folded
+field) and `bm25_v1` in `F64`, at the type the checker gives the score. The
+RFC names no stemmer or stop-word list, so it applies neither (`english_v1`, a
+field with no profile), nor NFC. A step depending on them, on `fuzzy` over a
+field with no profile, on a projected `bm25` score's last digits, on a
+catalogue type the export does not carry, or on `DateTime` spellings with
+different offsets has no `expect same as reference`. When the RFC's semantics
+change, the interpreter changes in the same pull request.
 
 ## Run and reproduce
 

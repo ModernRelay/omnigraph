@@ -44,6 +44,8 @@ query window_from_a_parameter($k: I64) {
 d.slug: String
 distance: F32
 
+--- expect same as reference
+
 --- query
 query window_from_a_parameter_keeps_every_row_of_a_target($k: I64) {
     match {
@@ -65,6 +67,8 @@ query window_from_a_parameter_keeps_every_row_of_a_target($k: I64) {
 d.slug: String
 e.slug: String
 
+--- expect same as reference
+
 --- query
 query an_rrf_arm_window_from_a_parameter($k: I64) {
     match {
@@ -84,6 +88,8 @@ query an_rrf_arm_window_from_a_parameter($k: I64) {
 
 --- expect shape
 d.slug: String
+
+--- expect same as reference
 
 --- query
 query a_window_below_one_is_refused($k: I64) {
