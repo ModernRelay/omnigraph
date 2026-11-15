@@ -9,10 +9,11 @@
 //! It is not frozen: when the RFC changes an operator's semantics, this
 //! changes with it, in the same change.
 //!
-//! Every operator the planner lowers is evaluated. `Union` and `Fix` (by
-//! naive iteration to a fixpoint) are evaluated too; a `Call` whose
-//! bindings read the row it is drawn beside is refused with
-//! [`Refusal::Unsupported`].
+//! Every core operator is evaluated, `Fix` by naive iteration to a
+//! fixpoint, and so is `Call`, its arguments bound in the caller's scope. A
+//! scan of a type the export does not carry (a catalogue type) and an
+//! analysis the RFC does not fix (a folding outside the Latin letters) are
+//! refused with [`Refusal::Unsupported`], never guessed.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
@@ -455,6 +456,19 @@ impl<'a> Interpreter<'a> {
                 };
                 let mut rows = Vec::new();
                 for t in type_name.split('|') {
+                    let declared = if edge {
+                        self.catalog.edge_types.contains_key(t)
+                    } else {
+                        self.catalog.node_types.contains_key(t)
+                    };
+                    if !declared {
+                        // A catalogue type (`@Operator`) is served by the
+                        // engine, not stored, so the export carries no row;
+                        // an interface's polymorphic scan is not evaluated.
+                        return unsupported(format!(
+                            "a scan of `{t}`, which the export does not carry"
+                        ));
+                    }
                     let entities = if edge {
                         self.graph.edges.get(t)
                     } else {
@@ -693,9 +707,16 @@ impl<'a> Interpreter<'a> {
                 }
             }
             Term::Union { left, right } => {
+                // Columns agree by position and take the left arm's names.
+                let names = columns(left);
                 let mut l = self.term(left, env)?;
                 let r = self.term(right, env)?;
-                l.rows.extend(r.rows);
+                l.rows.extend(r.rows.into_iter().map(|row| {
+                    row.into_iter()
+                        .zip(&names)
+                        .map(|((_, v), name)| (name.clone(), v))
+                        .collect()
+                }));
                 l.ordered = false;
                 l
             }
@@ -759,9 +780,8 @@ impl<'a> Interpreter<'a> {
                     (ScoreKind::Bm25, ScoreQuery::Lexical(lex)) => {
                         let scorer = self.bm25(&input.rows, column, property, lex, env)?;
                         for mut row in input.rows {
-                            if let Some(s) = scorer.score(self, &row, column, property) {
-                                // A score is an `F32`.
-                                row.push((out.clone(), Value::Float(f64::from(s as f32))));
+                            if let Some(s) = scorer.score(self, &row, column, property)? {
+                                row.push((out.clone(), Value::Float(s)));
                                 rows.push(row);
                             }
                         }
@@ -890,17 +910,19 @@ impl<'a> Interpreter<'a> {
                 ordered: false,
             },
             Term::Call { bindings, body, .. } => {
+                // Every argument is evaluated in the caller's scope, the
+                // enclosing row included, before any is bound: binding, not
+                // substitution.
+                let values = bindings
+                    .iter()
+                    .map(|(name, e)| Ok((name.clone(), self.expr(e, &Vec::new(), env)?)))
+                    .collect::<R<Vec<_>>>()?;
                 let mut saved = Vec::new();
-                for (name, e) in bindings {
-                    let mut cols = Vec::new();
-                    e.columns(&mut cols);
-                    if !cols.is_empty() {
-                        return unsupported("a call whose arguments read the row beside it");
-                    }
-                    let v = self.expr(e, &Vec::new(), env)?;
-                    saved.push((name.clone(), self.params.insert(name.clone(), v)));
+                for (name, v) in values {
+                    saved.push((name.clone(), self.params.insert(name, v)));
                 }
-                let out = self.term(body, env);
+                // The body is closed: it reads no column of the caller.
+                let out = self.term(body, &Vec::new());
                 for (name, old) in saved {
                     match old {
                         Some(v) => self.params.insert(name, v),
@@ -1014,18 +1036,99 @@ impl<'a> Interpreter<'a> {
             Value::Str(s) => s,
             other => return Err(Refusal::Input(format!("a lexical query is {other:?}"))),
         };
-        // The field corpus: every row of the type, not only the population.
+        let max_edits = self.max_edits(Some(&lex.max_edits), 0, &Vec::new(), env)?;
+        // The field corpus: every entity of the type owning the property
+        // with a non-empty analyzed value, not only the population.
         let type_name = rows.iter().find_map(|r| match get(r, column) {
             Some(Value::Ref { type_name, .. }) => Some(type_name.clone()),
             _ => None,
         });
-        let corpus: Vec<Vec<String>> = type_name
-            .and_then(|t| self.graph.nodes.get(&t))
+        let analysis = Analysis::of(self.catalog, type_name.as_deref(), property);
+        let mut corpus = Vec::new();
+        for e in type_name
+            .as_deref()
+            .and_then(|t| self.graph.nodes.get(t))
             .into_iter()
             .flatten()
-            .filter_map(|e| e.props.get(property)?.as_str().map(tokens))
-            .collect();
-        Ok(Bm25::new(tokens(&text), lex.mode_all, &corpus))
+        {
+            if let Some(text) = e.props.get(property).and_then(Json::as_str) {
+                let doc = analysis.tokens(text)?;
+                if !doc.is_empty() {
+                    corpus.push(doc);
+                }
+            }
+        }
+        Ok(Bm25::new(
+            analysis.tokens(&text)?,
+            lex.mode_all,
+            max_edits,
+            analysis,
+            corpus,
+        ))
+    }
+
+    /// An edit budget: the written `max_edits`, else `default`.
+    fn max_edits(&self, e: Option<&IRExpr>, default: usize, row: &Row, env: &Row) -> R<usize> {
+        match e {
+            None => Ok(default),
+            Some(e) => match self.expr(e, row, env)? {
+                Value::Int(n) if (0..=2).contains(&n) => Ok(n as usize),
+                other => Err(Refusal::Input(format!("an edit budget is {other:?}"))),
+            },
+        }
+    }
+
+    /// The analysis of the property `field` reads: the profile its owner's
+    /// full-text index declares.
+    fn field_analysis(&self, field: &IRExpr, row: &Row, env: &Row) -> Analysis {
+        let IRExpr::PropAccess {
+            variable, property, ..
+        } = field
+        else {
+            return Analysis::of(self.catalog, None, "");
+        };
+        let owner = match get(row, variable).or_else(|| get(env, variable)) {
+            Some(Value::Ref {
+                edge: false,
+                type_name,
+                ..
+            }) => Some(type_name.as_str()),
+            _ => None,
+        };
+        Analysis::of(self.catalog, owner, property)
+    }
+
+    /// `match_terms(field, terms(q, mode, max_edits))`: every (`all`) or some
+    /// (`any`) analyzed query term has a document term within the budget. A
+    /// null or token-empty document does not match: the predicate is false.
+    #[allow(clippy::too_many_arguments)]
+    fn lexical(
+        &self,
+        field: &IRExpr,
+        query: &IRExpr,
+        all: bool,
+        max_edits: usize,
+        row: &Row,
+        env: &Row,
+    ) -> R<Value> {
+        let analysis = self.field_analysis(field, row, env);
+        let q = match self.expr(query, row, env)? {
+            Value::Str(q) => analysis.tokens(&q)?,
+            _ => return Ok(Value::Null),
+        };
+        let doc = match self.expr(field, row, env)? {
+            Value::Str(f) => analysis.tokens(&f)?,
+            _ => return Ok(Value::Bool(false)),
+        };
+        if doc.is_empty() {
+            return Ok(Value::Bool(false));
+        }
+        let hit = |t: &String| doc.iter().any(|w| levenshtein(w, t) <= max_edits);
+        Ok(Value::Bool(if all {
+            q.iter().all(hit)
+        } else {
+            q.iter().any(hit)
+        }))
     }
 
     // -----------------------------------------------------------------
@@ -1121,21 +1224,38 @@ impl<'a> Interpreter<'a> {
                     BinaryOp::Arith(op) => arith(*op, l, self.expr(right, row, env)?, ty)?,
                 }
             }
+            // The registry's two lazy rows: `if` evaluates its condition and
+            // then only the branch it selects, `coalesce` its arguments left
+            // to right up to the first non-null, so a branch not taken never
+            // fails.
+            IRExpr::Call {
+                func: ScalarFunc::If,
+                args,
+                ..
+            } => match self.expr(&args[0], row, env)? {
+                Value::Bool(true) => self.expr(&args[1], row, env)?,
+                _ => self.expr(&args[2], row, env)?,
+            },
+            IRExpr::Call {
+                func: ScalarFunc::Coalesce,
+                args,
+                ..
+            } => {
+                for a in args {
+                    let v = self.expr(a, row, env)?;
+                    if v != Value::Null {
+                        return Ok(v);
+                    }
+                }
+                Value::Null
+            }
             IRExpr::Call { func, args, .. } => {
                 let vals = args
                     .iter()
                     .map(|a| self.expr(a, row, env))
                     .collect::<R<Vec<_>>>()?;
                 match func {
-                    ScalarFunc::If => match vals.as_slice() {
-                        [Value::Bool(true), a, _] => a.clone(),
-                        [_, _, b] => b.clone(),
-                        _ => Value::Null,
-                    },
-                    ScalarFunc::Coalesce => vals
-                        .into_iter()
-                        .find(|v| *v != Value::Null)
-                        .unwrap_or(Value::Null),
+                    ScalarFunc::If | ScalarFunc::Coalesce => unreachable!("evaluated lazily above"),
                     ScalarFunc::Concat => {
                         let mut out = String::new();
                         for v in vals {
@@ -1147,27 +1267,23 @@ impl<'a> Interpreter<'a> {
                         }
                         Value::Str(out)
                     }
-                    ScalarFunc::MatchTerms { mode } => match vals.as_slice() {
-                        [Value::Str(field), Value::Str(q)] => {
-                            let f = tokens(field);
-                            let q = tokens(q);
-                            Value::Bool(match mode {
-                                TermsMode::All => q.iter().all(|t| f.contains(t)),
-                                TermsMode::Any => q.iter().any(|t| f.contains(t)),
-                            })
-                        }
-                        _ => Value::Null,
-                    },
+                    ScalarFunc::MatchTerms { mode } => {
+                        let max_edits = self.max_edits(args.get(2), 0, row, env)?;
+                        self.lexical(
+                            &args[0],
+                            &args[1],
+                            matches!(mode, TermsMode::All),
+                            max_edits,
+                            row,
+                            env,
+                        )?
+                    }
                 }
             }
+            // `search` and `match_text` are `terms(q, mode: any)`; `fuzzy`
+            // adds an edit budget, two when unwritten (section 4, Migration).
             IRExpr::Search { field, query, .. } | IRExpr::MatchText { field, query, .. } => {
-                match (self.expr(field, row, env)?, self.expr(query, row, env)?) {
-                    (Value::Str(f), Value::Str(q)) => {
-                        let f = tokens(&f);
-                        Value::Bool(tokens(&q).iter().all(|t| f.contains(t)))
-                    }
-                    _ => Value::Null,
-                }
+                self.lexical(field, query, false, 0, row, env)?
             }
             IRExpr::Fuzzy {
                 field,
@@ -1175,24 +1291,8 @@ impl<'a> Interpreter<'a> {
                 max_edits,
                 ..
             } => {
-                let edits = match max_edits {
-                    Some(m) => match self.expr(m, row, env)? {
-                        Value::Int(n) => n as usize,
-                        _ => 2,
-                    },
-                    None => 2,
-                };
-                match (self.expr(field, row, env)?, self.expr(query, row, env)?) {
-                    (Value::Str(f), Value::Str(q)) => {
-                        let f = tokens(&f);
-                        Value::Bool(
-                            tokens(&q)
-                                .iter()
-                                .all(|t| f.iter().any(|w| levenshtein(w, t) <= edits)),
-                        )
-                    }
-                    _ => Value::Null,
-                }
+                let max_edits = self.max_edits(max_edits.as_deref(), 2, row, env)?;
+                self.lexical(field, query, false, max_edits, row, env)?
             }
             IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } | IRExpr::Rrf { .. } => {
                 return unsupported("a ranking as a scalar");
@@ -1217,6 +1317,61 @@ fn typed(v: Value, scalar: Option<ScalarType>) -> Value {
         Value::Float(f) if single => Value::Float(f64::from(f as f32)),
         Value::List(items) => Value::List(items.into_iter().map(|i| typed(i, scalar)).collect()),
         other => other,
+    }
+}
+
+/// A term's column names, in column order.
+fn columns(t: &Term) -> Vec<String> {
+    match t {
+        Term::Unit => Vec::new(),
+        Term::Env(cols) => cols.iter().map(|c| c.name.clone()).collect(),
+        Term::Scan { var, .. } => vec![var.clone()],
+        Term::Expand {
+            input,
+            dst,
+            edge_var,
+            ..
+        } => {
+            let mut out = columns(input);
+            out.push(dst.clone());
+            out.extend(edge_var.clone());
+            out
+        }
+        Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
+            columns(input)
+        }
+        Term::Project { input, items, keep } => {
+            let mut out = if *keep { columns(input) } else { Vec::new() };
+            for (name, _) in items {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+            out
+        }
+        Term::Group { keys, aggs, .. } => keys
+            .iter()
+            .map(|(n, _)| n.clone())
+            .chain(aggs.iter().map(|(n, _)| n.clone()))
+            .collect(),
+        Term::Correlate { outer, inner } => {
+            let mut out = columns(outer);
+            for name in columns(inner) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            out
+        }
+        Term::Union { left, .. } => columns(left),
+        Term::Score { input, out, .. } | Term::ApproxTopK { input, out, .. } => {
+            let mut cols = columns(input);
+            cols.push(out.clone());
+            cols
+        }
+        Term::Fuse { target, out, .. } => vec![target.clone(), out.clone()],
+        Term::Fix { body, .. } | Term::Call { body, .. } => columns(body),
+        Term::RecRef { ty, .. } => ty.names(),
     }
 }
 
@@ -1380,12 +1535,98 @@ fn cast(v: Value, ty: &ExprType) -> Value {
     }
 }
 
-/// The analyzer the reference uses: lowercase alphanumeric words.
-fn tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect()
+/// The analysis of a full-text property (section 4, Schema: Text): the
+/// declared profile's pipeline, or, with no profile, edition 2's index
+/// analysis. Lowercasing, the simple tokenizer, the token-length filter and
+/// ASCII folding are evaluated; English stemming and stop words are not,
+/// since the RFC names no stemmer revision or stop-word list, and neither is
+/// NFC, which needs Unicode data this crate does not carry.
+#[derive(Debug, Clone, Copy)]
+struct Analysis {
+    fold: bool,
+    /// Tokens of this many bytes or more are dropped.
+    max_bytes: Option<usize>,
+}
+
+impl Analysis {
+    fn of(catalog: &Catalog, owner: Option<&str>, property: &str) -> Self {
+        use omnigraph_compiler::schema::analysis::AnalyzerFilter;
+        let profile = owner
+            .and_then(|t| catalog.node_types.get(t))
+            .and_then(|t| t.full_text_profile(property));
+        match profile {
+            Some(profile) => {
+                let pipeline = profile.pipeline();
+                Self {
+                    fold: pipeline.filters.contains(&AnalyzerFilter::AsciiFolding),
+                    max_bytes: pipeline.max_token_length.map(|n| n + 1),
+                }
+            }
+            // Edition 2's analysis: English stemming, stop words, ASCII
+            // folding and a 40-byte token filter.
+            None => Self {
+                fold: true,
+                max_bytes: Some(40),
+            },
+        }
+    }
+
+    /// The analyzed tokens of `text`: split on every character that is not
+    /// alphanumeric, long tokens dropped, lowercased, folded.
+    fn tokens(&self, text: &str) -> R<Vec<String>> {
+        let mut out = Vec::new();
+        for word in text.split(|c: char| !c.is_alphanumeric()) {
+            if word.is_empty() || self.max_bytes.is_some_and(|m| word.len() >= m) {
+                continue;
+            }
+            let lower = word.to_lowercase();
+            out.push(if self.fold { fold(&lower)? } else { lower });
+        }
+        Ok(out)
+    }
+}
+
+/// ASCII folding of a lowercased token: the Latin letters with diacritics
+/// and the Latin ligatures; any other non-ASCII letter is refused, since the
+/// RFC fixes no folding table beyond them.
+fn fold(token: &str) -> R<String> {
+    const TABLE: &[(&str, &str)] = &[
+        ("àáâãäåāăą", "a"),
+        ("çćĉċč", "c"),
+        ("ďđð", "d"),
+        ("èéêëēĕėęě", "e"),
+        ("ĝğġģ", "g"),
+        ("ĥħ", "h"),
+        ("ìíîïĩīĭįı", "i"),
+        ("ĵ", "j"),
+        ("ķĸ", "k"),
+        ("ĺļľŀł", "l"),
+        ("ñńņňŋ", "n"),
+        ("òóôõöøōŏő", "o"),
+        ("ŕŗř", "r"),
+        ("śŝşšſ", "s"),
+        ("ţťŧ", "t"),
+        ("ùúûüũūŭůűų", "u"),
+        ("ŵ", "w"),
+        ("ýÿŷ", "y"),
+        ("źżž", "z"),
+        ("ß", "ss"),
+        ("æ", "ae"),
+        ("œ", "oe"),
+        ("þ", "th"),
+        ("ĳ", "ij"),
+    ];
+    let mut out = String::with_capacity(token.len());
+    for c in token.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else if let Some((_, to)) = TABLE.iter().find(|(from, _)| from.contains(c)) {
+            out.push_str(to);
+        } else {
+            return unsupported(format!("ASCII folding of `{c}`"));
+        }
+    }
+    Ok(out)
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -1405,66 +1646,95 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// BM25 over the field corpus: `k1 = 1.2`, `b = 0.75`, the idf
-/// `ln(1 + (N - n + 0.5) / (n + 0.5))`, in `F32`.
+/// `bm25_v1` (section 4): `F64`, `log1p` IDF over the field corpus, each
+/// query term's part the best stored term within the edit budget weighted
+/// `2^-edits`, parts summed in ascending UTF-8 query-term order; membership
+/// is the `terms` relation.
 struct Bm25 {
+    /// The distinct analyzed query terms, ascending.
     query: Vec<String>,
     mode_all: bool,
+    max_edits: usize,
+    analysis: Analysis,
     docs: f64,
-    avgdl: f64,
-    df: HashMap<String, f64>,
+    avg_len: f64,
+    /// The documents holding an alternative of each query term.
+    df: Vec<f64>,
 }
 
 impl Bm25 {
-    fn new(query: Vec<String>, mode_all: bool, corpus: &[Vec<String>]) -> Self {
-        let mut df = HashMap::new();
-        for doc in corpus {
-            let mut seen: Vec<&String> = Vec::new();
-            for t in doc {
-                if query.contains(t) && !seen.contains(&t) {
-                    seen.push(t);
-                    *df.entry(t.clone()).or_insert(0.0) += 1.0;
-                }
-            }
-        }
+    fn new(
+        mut query: Vec<String>,
+        mode_all: bool,
+        max_edits: usize,
+        analysis: Analysis,
+        corpus: Vec<Vec<String>>,
+    ) -> Self {
+        query.sort();
+        query.dedup();
+        let df = query
+            .iter()
+            .map(|q| {
+                corpus
+                    .iter()
+                    .filter(|doc| doc.iter().any(|t| levenshtein(q, t) <= max_edits))
+                    .count() as f64
+            })
+            .collect();
         let docs = corpus.len() as f64;
-        let avgdl = corpus.iter().map(Vec::len).sum::<usize>() as f64 / docs.max(1.0);
+        let avg_len = corpus.iter().map(Vec::len).sum::<usize>() as f64 / docs.max(1.0);
         Self {
             query,
             mode_all,
+            max_edits,
+            analysis,
             docs,
-            avgdl,
+            avg_len,
             df,
         }
     }
 
-    fn score(&self, it: &Interpreter<'_>, row: &Row, column: &str, property: &str) -> Option<f64> {
-        let doc = tokens(&it.field_text(row, column, property)?);
-        let mut matched = 0;
-        let mut total = 0f32;
-        let mut distinct: Vec<&String> = Vec::new();
-        for t in &self.query {
-            if distinct.contains(&t) {
-                continue;
-            }
-            distinct.push(t);
-            let tf = doc.iter().filter(|w| *w == t).count() as f64;
-            if tf == 0.0 {
-                continue;
-            }
-            matched += 1;
-            let n = self.df.get(t).copied().unwrap_or(0.0);
-            let idf = (1.0 + (self.docs - n + 0.5) / (n + 0.5)).ln();
-            let dl = doc.len() as f64;
-            let s = idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * dl / self.avgdl));
-            total += s as f32;
+    /// The row's score, `None` when its field does not match.
+    fn score(
+        &self,
+        it: &Interpreter<'_>,
+        row: &Row,
+        column: &str,
+        property: &str,
+    ) -> R<Option<f64>> {
+        let Some(text) = it.field_text(row, column, property) else {
+            return Ok(None);
+        };
+        let doc = self.analysis.tokens(&text)?;
+        if doc.is_empty() {
+            return Ok(None);
         }
-        let ok = if self.mode_all {
-            matched == distinct.len()
+        let norm = 1.2 * (0.25 + 0.75 * doc.len() as f64 / self.avg_len);
+        let mut matched = 0;
+        let mut total = 0f64;
+        for (q, df) in self.query.iter().zip(&self.df) {
+            let mut best: Option<f64> = None;
+            for t in &doc {
+                let edits = levenshtein(q, t);
+                if edits > self.max_edits {
+                    continue;
+                }
+                let tf = doc.iter().filter(|w| *w == t).count() as f64;
+                let weight = 2f64.powi(-(edits as i32)) * 2.2 * tf / (tf + norm);
+                best = Some(best.map_or(weight, |b: f64| b.max(weight)));
+            }
+            if let Some(best) = best {
+                matched += 1;
+                let idf = ((self.docs - df + 0.5) / (df + 0.5)).ln_1p();
+                total += idf * best;
+            }
+        }
+        let member = if self.mode_all {
+            matched == self.query.len()
         } else {
             matched > 0
         };
-        ok.then_some(f64::from(total))
+        Ok(member.then_some(total))
     }
 }
 

@@ -14,7 +14,7 @@ use super::*;
 
 const SCHEMA: &str = r#"
 node Person { name: String @key  age: I32?  city: String? }
-node Doc { slug: String @key  text: String @index  year: I32  embedding: Vector(2)? @index }
+node Doc { slug: String @key  text: String @index  title: String? @index(fulltext, analyzer = "standard_v1")  year: I32  embedding: Vector(2)? @index }
 edge Knows: Person -> Person { since: I64? }
 edge Wrote: Person -> Doc
 "#;
@@ -22,7 +22,7 @@ edge Wrote: Person -> Doc
 const DATA: &str = r#"{"type":"Person","data":{"name":"ann","age":30,"city":"Oslo"}}
 {"type":"Person","data":{"name":"bob","age":40}}
 {"type":"Person","data":{"name":"cyd","age":30,"city":"Rome"}}
-{"type":"Doc","data":{"slug":"d1","text":"graph needle","year":2020,"embedding":[0.0,1.0]}}
+{"type":"Doc","data":{"slug":"d1","text":"graph needle","title":"Graphs and Café","year":2020,"embedding":[0.0,1.0]}}
 {"type":"Doc","data":{"slug":"d2","text":"needle needle hay","year":2021,"embedding":[1.0,0.0]}}
 {"type":"Doc","data":{"slug":"d3","text":"hay","year":2022,"embedding":[1.0,1.0]}}
 {"edge":"Knows","id":"k1","from":"ann","to":"bob","data":{"since":2001}}
@@ -468,4 +468,251 @@ fn the_tie_rule_reads_an_expand_target_before_its_edge() {
     );
     assert!(ordered);
     assert_eq!(out, vec![json!({"q.name": "a", "id": "z"})]);
+}
+
+#[test]
+fn union_names_its_columns_by_position_from_the_first_arm() {
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { from union({ match { $p: Person } where $p.name = \"ann\" return { $p.name as who } }, { match { $d: Doc } where $d.slug = \"d1\" return { $d.slug as what } }) } return { $who } }"
+        )),
+        vec![json!({"who": "ann"}), json!({"who": "d1"})]
+    );
+}
+
+#[test]
+fn a_call_binds_its_argument_from_the_callers_row() {
+    let src = "query friends($n: String) { match { $p: Person, $p knows $q } where $p.name = $n return { $q } }
+query q() { match { $a: Person, from friends($a.name) } return { $a.name, $q.name } }";
+    assert_eq!(
+        sorted(rows_of(src, "q", &[])),
+        vec![
+            json!({"a.name": "ann", "q.name": "bob"}),
+            json!({"a.name": "bob", "q.name": "cyd"})
+        ]
+    );
+}
+
+#[test]
+fn distance_scores_every_row_with_a_vector() {
+    let (out, ordered) = run(
+        "query q() { match { let $docs = { match { $d: Doc } return { $d } }, from distance($docs, $d.embedding, [0.0, 1.0]) as $dist } return { $d.slug, $dist } order { $dist } }",
+        &[],
+    );
+    assert!(ordered);
+    assert_eq!(
+        out,
+        vec![
+            json!({"d.slug": "d1", "dist": 0.0}),
+            json!({"d.slug": "d3", "dist": 1.0}),
+            json!({"d.slug": "d2", "dist": 2.0})
+        ]
+    );
+}
+
+#[test]
+fn an_edge_binding_scans_every_edge_of_its_type() {
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $k: Knows } return { $k.since, $k.@src } }"
+        )),
+        vec![
+            json!({"k.@src": "ann", "k.since": 2001}),
+            json!({"k.@src": "bob", "k.since": 2002})
+        ]
+    );
+}
+
+#[test]
+fn limit_reads_its_count_from_a_parameter() {
+    // No `order`: the cut takes the first rows under the tie rule.
+    let (out, ordered) = run(
+        "query q($n: I64) { match { $p: Person } return { $p.name } limit $n }",
+        &[("n", Literal::Integer(2))],
+    );
+    assert!(ordered);
+    assert_eq!(
+        out,
+        vec![json!({"p.name": "ann"}), json!({"p.name": "bob"})]
+    );
+}
+
+#[test]
+fn if_and_coalesce_evaluate_only_what_they_select() {
+    // bob's age is 40: the division is the branch not taken.
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $p: Person, let $r = if($p.age = 40, 0, 100 / ($p.age - 40)) } return { $p.name, $r, coalesce($p.city, \"none\") as c } }"
+        )),
+        vec![
+            json!({"c": "Oslo", "p.name": "ann", "r": -10}),
+            json!({"c": "Rome", "p.name": "cyd", "r": -10}),
+            json!({"c": "none", "p.name": "bob", "r": 0})
+        ]
+    );
+}
+
+#[test]
+fn an_inline_read_groups_once_per_outer_row() {
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $p: Person, from { match { $d: Doc, $p wrote $d } return { count($d) as n } } } return { $p.name, $n } }"
+        )),
+        vec![
+            json!({"n": 0, "p.name": "bob"}),
+            json!({"n": 1, "p.name": "cyd"}),
+            json!({"n": 2, "p.name": "ann"})
+        ]
+    );
+}
+
+#[test]
+fn a_block_compares_with_a_scalar_of_the_outer_row() {
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $p: Person } where count { $d: Doc, $p wrote $d } >= $p.age - 29 return { $p.name } }"
+        )),
+        vec![json!({"p.name": "ann"}), json!({"p.name": "cyd"})]
+    );
+}
+
+#[test]
+fn fuse_yields_one_row_per_target_under_its_name() {
+    let out = rows(
+        "query q() { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, [0.0, 1.0], k: 3), bm25($all, $d.text, \"needle hay\"), k: 60) as $fused } return { $d.slug } }",
+    );
+    assert_eq!(
+        sorted(out),
+        vec![
+            json!({"d.slug": "d1"}),
+            json!({"d.slug": "d2"}),
+            json!({"d.slug": "d3"})
+        ]
+    );
+}
+
+#[test]
+fn lexical_predicates_match_any_term_and_a_null_document_never() {
+    // `search` is any-term: d1 holds `graph`, d2 and d3 `hay`.
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $d: Doc } where search($d.text, \"graph hay\") return { $d.slug } }"
+        )),
+        vec![
+            json!({"d.slug": "d1"}),
+            json!({"d.slug": "d2"}),
+            json!({"d.slug": "d3"})
+        ]
+    );
+    // Only d1 has a title; a null document does not match, so `not` keeps
+    // d2 and d3.
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $d: Doc } where not search($d.title, \"graphs\") return { $d.slug } }"
+        )),
+        vec![json!({"d.slug": "d2"}), json!({"d.slug": "d3"})]
+    );
+    // One edit reaches `needle`; none does not.
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $d: Doc } where fuzzy($d.text, \"neadle\", max_edits: 1) return { $d.slug } }"
+        )),
+        vec![json!({"d.slug": "d1"}), json!({"d.slug": "d2"})]
+    );
+    assert_eq!(
+        rows(
+            "query q() { match { $d: Doc } where fuzzy($d.text, \"neadle\", max_edits: 0) return { $d.slug } }"
+        ),
+        Vec::<Json>::new()
+    );
+}
+
+#[test]
+fn a_profile_fixes_folding_and_the_token_length_filter() {
+    let catalog = catalog();
+    // `standard_v1`: lowercase alone, so `café` stays and `graphs` is not
+    // stemmed.
+    let standard = Analysis::of(&catalog, Some("Doc"), "title");
+    assert_eq!(
+        standard.tokens("Graphs and Café").unwrap(),
+        vec!["graphs", "and", "café"]
+    );
+    // No profile is edition 2's analysis: folded, a token of 40 bytes or
+    // more dropped.
+    let edition_2 = Analysis::of(&catalog, Some("Doc"), "text");
+    let long = "x".repeat(40);
+    assert_eq!(
+        edition_2.tokens(&format!("Café {long} crème")).unwrap(),
+        vec!["cafe", "creme"]
+    );
+    // A letter outside the folding table is refused, not guessed.
+    assert!(matches!(
+        edition_2.tokens("Ωmega"),
+        Err(Refusal::Unsupported(_))
+    ));
+}
+
+#[test]
+fn bm25_v1_scores_by_the_rfc_formula() {
+    let analysis = Analysis {
+        fold: false,
+        max_bytes: None,
+    };
+    let corpus = vec![
+        vec!["a".to_string(), "b".to_string()],
+        vec!["a".to_string(), "a".to_string(), "c".to_string()],
+        vec!["c".to_string()],
+    ];
+    let scorer = Bm25::new(vec!["a".into(), "a".into()], false, 0, analysis, corpus);
+    // N = 3, df(a) = 2, avg_len = 2; the second document: tf 2, len 3.
+    let idf = ((3.0 - 2.0 + 0.5) / (2.0 + 0.5f64)).ln_1p();
+    let norm = 1.2 * (0.25 + 0.75 * 3.0 / 2.0);
+    let expected = idf * 2.2 * 2.0 / (2.0 + norm);
+    let catalog = catalog();
+    let graph = Graph::from_export(
+        &catalog,
+        r#"{"type":"Doc","data":{"slug":"x","text":"a a c","year":1}}"#,
+    )
+    .unwrap();
+    let it = Interpreter::new(&catalog, &graph, &HashMap::new());
+    let row = vec![(
+        "d".to_string(),
+        Value::Ref {
+            edge: false,
+            type_name: "Doc".into(),
+            id: "x".into(),
+        },
+    )];
+    let score = scorer.score(&it, &row, "d", "text").unwrap().unwrap();
+    assert_eq!(score.to_bits(), expected.to_bits());
+}
+
+#[test]
+fn a_scan_of_a_type_the_export_does_not_carry_is_refused() {
+    let catalog = catalog();
+    let graph = Graph::from_export(&catalog, DATA).unwrap();
+    let mut read = match check_source(
+        &catalog,
+        "query q() { match { $p: Person } return { $p.name } }",
+    )
+    .unwrap()
+    .remove(0)
+    .1
+    .unwrap()
+    .core
+    {
+        CoreDecl::Read(read) => read,
+        CoreDecl::Write(_) => panic!("a read"),
+    };
+    read.term = Term::Scan {
+        var: "o".into(),
+        ty: omnigraph_compiler::ir::core::Ty::Node {
+            type_name: "@Operator".into(),
+            nullable: false,
+        },
+    };
+    let refused = Interpreter::new(&catalog, &graph, &HashMap::new())
+        .run(&read)
+        .unwrap_err();
+    assert!(matches!(refused, Refusal::Unsupported(_)), "{refused:?}");
 }

@@ -34,3 +34,23 @@ fn the_interpreter_depends_on_the_compiler_alone() {
         );
     }
 }
+
+/// The GQT runner is the interpreter's one caller: no other crate of the
+/// workspace, the engine and the served runner included, depends on it.
+#[test]
+fn only_the_gqt_runner_depends_on_the_interpreter() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut dependents = Vec::new();
+    for entry in std::fs::read_dir(crates).unwrap() {
+        let dir = entry.unwrap().path();
+        let Ok(manifest) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+            continue;
+        };
+        let name = dir.file_name().unwrap().to_string_lossy().to_string();
+        if name != "omnigraph-reference" && manifest.contains("omnigraph-reference") {
+            dependents.push(name);
+        }
+    }
+    dependents.sort();
+    assert_eq!(dependents, ["omnigraph-gqt"]);
+}
