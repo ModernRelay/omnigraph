@@ -2065,7 +2065,8 @@ fn assignment_list(input: &str, pairs: &[Pair<Rule>]) -> R<Vec<Assignment>> {
 /// `delete T where φ` / `update T set { … } where φ`: the fix is the group
 /// form, `match { $x: T } where φ′  delete $x`, binding the type with a name
 /// the declaration does not use, each bare property of `φ` and of the
-/// assignments qualified (section 5, and the rewriter's row of section 6).
+/// assignments qualified (section 5, and the statement-`where` row of the
+/// respelling map, section 6).
 /// Over a bound variable, `delete $x where φ`, the predicate joins the
 /// group's `where`.
 fn where_statement(

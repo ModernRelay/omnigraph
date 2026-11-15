@@ -560,7 +560,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             )
         )
     );
-    // The old `delete T where φ`, as the rewriter writes it:
+    // The old `delete T where φ`, in the form the respelling map gives it:
     // Delete(Filter(Scan(T), φ), $x).
     let got = lower("query w() { match { $x: Person } where $x.age > 3  delete $x }");
     let CoreDecl::Write(w) = &got else { panic!() };

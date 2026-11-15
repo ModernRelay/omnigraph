@@ -1669,7 +1669,8 @@ fn a_ranked_from_names_its_score() {
 }
 
 /// `T65`'s suggestion draws the ranking with `from` over the read's own
-/// pattern; applied, the text type-checks to the form the rewriter writes.
+/// pattern; applied, the text type-checks to the form the respelling map
+/// gives for a ranking in `order`.
 #[test]
 fn t65_suggests_an_applicable_edit() {
     use crate::query::syntax::parse::apply_edits;
