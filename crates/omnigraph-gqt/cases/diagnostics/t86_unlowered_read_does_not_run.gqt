@@ -1,10 +1,11 @@
 # issue: none
 # notes: A read whose term this release's planner does not lower is refused at type check with `T86`, naming the stage that adds it:
 # notes: an `optional`'s node returned whole (stage B) and a read that calls itself (`Fix`, stage Rec); nothing executes.
-# notes: The `optional` itself runs. `match_terms` with an edit budget other than 0 is stage B too: only the exact
-# notes: lexical scan answers the edit relation exactly. An edge reference returned whole is stage B: the result
-# notes: has no edge object, so an edge is read through its fields. `bm25` over `terms(…)` with `mode: all` (the default)
-# notes: or an edit budget is stage B: the ranked scan matches any term with no edits, and would score that wider set.
+# notes: The `optional` itself runs. `match_terms` with an edit budget other than 0 over a field whose index declares no
+# notes: analyzer (`Doc.body` keeps edition 2's analysis) is stage B too: the exact lexical scan answers the edit relation
+# notes: for a declared analyzer only. An edge reference returned whole is stage B: the result has no edge object, so an
+# notes: edge is read through its fields. `bm25` over `terms(…)` with `mode: all` (the default) or an edit budget on such
+# notes: a field is stage B: its ranked scan matches any term with no edits, and would score that wider set.
 
 --- runner
 timeout_ms: 10000
@@ -88,7 +89,7 @@ query fuzzy_terms($s: String) { match { $d: Doc } where match_terms($d.body, ter
 --- params
 {"s": "graph"}
 
---- expect error: type error: T86: `fuzzy_terms`: this release's planner does not lower `match_terms` with an edit budget other than `max_edits: 0`; stage B (the break) adds it
+--- expect error: type error: T86: `fuzzy_terms`: this release's planner does not lower `match_terms` with an edit budget other than `max_edits: 0` over a field whose index declares no analyzer; stage B (the break) adds it
 
 --- query
 query edge_whole() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }

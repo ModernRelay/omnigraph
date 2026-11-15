@@ -2,10 +2,11 @@
 # notes: The rankings (bm25, nearest, rrf, distance), an aggregate over a score and the lexical
 # notes: predicates, over a `standard_v1` field, whose analysis the RFC fixes: the simple
 # notes: tokenizer and lowercasing, no stemming, stop words or folding. Compared with the
-# notes: reference interpreter; no step projects a bm25 score, whose last digits are the
-# notes: engine's f32 arithmetic rather than `bm25_v1`'s F64. A `bm25` over `terms(…)` asking for
-# notes: every term or an edit budget is refused (`T86`), and so is `match_terms` with an edit
-# notes: budget; `match_terms` with every term required and no edits runs.
+# notes: reference interpreter. The field declares an analyzer, so the exact lexical scan answers
+# notes: it: `bm25` is `bm25_v1` in F64, its projected scores equal the reference's, and `bm25` over
+# notes: `terms(…)` asking for every term or an edit budget runs, as does `match_terms` with an
+# notes: edit budget. An `rrf` arm over that `bm25` is not lowered yet (`T86`): the fusion ranks
+# notes: its arms on ranked scans, and the exact score is a step over the population.
 
 --- runner
 timeout_ms: 10000
@@ -60,11 +61,19 @@ d.slug: String
 --- query
 query q() {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, terms("search engines", mode: all)) as $score }
-    return { $d.slug }
+    return { $d.slug, $score }
     order { $score desc }
 }
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"d1","score":1.442567196459}
+{"d.slug":"d2","score":1.111365544211}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
 
 
 --- query
@@ -73,7 +82,13 @@ query q() {
     return { $d.slug }
 }
 
---- expect error: type error: T86:
+--- expect unordered
+{"d.slug":"d1"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
 
 
 --- query
@@ -192,17 +207,7 @@ query q() {
     order { $score desc, $d.slug }
 }
 
---- expect ordered
-{"d.slug":"d1"}
-{"d.slug":"d4"}
-{"d.slug":"d3"}
-{"d.slug":"d2"}
-{"d.slug":"d6"}
-
---- expect shape
-d.slug: String
-
---- expect same as reference
+--- expect error: type error: T86: `q`: this release's planner does not lower an `rrf` arm over `bm25` on a field whose index declares an analyzer
 
 --- query
 query q() {

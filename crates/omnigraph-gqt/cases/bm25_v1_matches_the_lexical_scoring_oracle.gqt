@@ -1,0 +1,362 @@
+# issue: none
+# notes: `bm25` on a field whose index declares an analyzer scores with `bm25_v1` (docs/rfcs/
+# notes: 2026-11-07-gq-3.md, section 4, "bm25_v1"): F64, libm's `log1p` IDF over the field corpus
+# notes: (every entity of the type with a non-empty analyzed value), alternatives within a query
+# notes: term's edit budget sharing its group's IDF, the best of them weighted 1, 1/2 or 1/4,
+# notes: parts summed in ascending query-term order; membership is the `terms` relation. Each type
+# notes: holds one fixture of the RFC's lexical scoring oracle (the spike's
+# notes: `lexical_scoring_v1.json`, scores computed in 80-digit decimal arithmetic): the expected
+# notes: scores are that oracle's, rounded once to F64, and the reference interpreter agrees.
+# notes: The ten edit-tolerant shapes are here (a rare variant, alternatives that do not add, one
+# notes: term satisfying two groups, `all` and `any` over the same statistics, null and token-empty
+# notes: values outside the corpus, two edits and a transposition, a Unicode scalar edit, and three
+# notes: corpora with no match), beside the zero-edit ones.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node RareVariant {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node ZeroEdits {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node ZeroEditsMultiTerm {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node AlternativesDoNotAdd {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node OneTermSatisfiesTwoGroups {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node AllCountsEachFamilyBeforeQueryFilter {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node AnyUsesTheSameStatistics {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node NullAndTokenEmptyAreOutsideCorpus {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node TwoEditsAndTransposition {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node UnicodeScalarEdit {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node EmptyCorpus {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node OnlyMissingAndTokenEmpty {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+node NoMatchingFamily {
+    slug: String @key
+    text: String? @index(fulltext, analyzer = "standard_v1")
+}
+
+--- seed
+{"type": "RareVariant", "data": {"slug": "f00d0", "text": "beta"}}
+{"type": "RareVariant", "data": {"slug": "f00d1", "text": "beta"}}
+{"type": "RareVariant", "data": {"slug": "f00d2", "text": "beta"}}
+{"type": "RareVariant", "data": {"slug": "f00d3", "text": "beto"}}
+{"type": "RareVariant", "data": {"slug": "f00d4", "text": "gamma"}}
+{"type": "ZeroEdits", "data": {"slug": "f01d0", "text": "beta"}}
+{"type": "ZeroEdits", "data": {"slug": "f01d1", "text": "beta"}}
+{"type": "ZeroEdits", "data": {"slug": "f01d2", "text": "beta"}}
+{"type": "ZeroEdits", "data": {"slug": "f01d3", "text": "beto"}}
+{"type": "ZeroEdits", "data": {"slug": "f01d4", "text": "gamma"}}
+{"type": "ZeroEditsMultiTerm", "data": {"slug": "f02d0", "text": "beta gamma gamma"}}
+{"type": "ZeroEditsMultiTerm", "data": {"slug": "f02d1", "text": "beta"}}
+{"type": "ZeroEditsMultiTerm", "data": {"slug": "f02d2", "text": "gamma"}}
+{"type": "ZeroEditsMultiTerm", "data": {"slug": "f02d3", "text": "zeta"}}
+{"type": "AlternativesDoNotAdd", "data": {"slug": "f03d0", "text": "beta"}}
+{"type": "AlternativesDoNotAdd", "data": {"slug": "f03d1", "text": "beta beto"}}
+{"type": "AlternativesDoNotAdd", "data": {"slug": "f03d2", "text": "beta gamma"}}
+{"type": "AlternativesDoNotAdd", "data": {"slug": "f03d3", "text": "beto"}}
+{"type": "AlternativesDoNotAdd", "data": {"slug": "f03d4", "text": "beta beta"}}
+{"type": "AlternativesDoNotAdd", "data": {"slug": "f03d5", "text": "gamma"}}
+{"type": "OneTermSatisfiesTwoGroups", "data": {"slug": "f04d0", "text": "beto"}}
+{"type": "OneTermSatisfiesTwoGroups", "data": {"slug": "f04d1", "text": "beta"}}
+{"type": "OneTermSatisfiesTwoGroups", "data": {"slug": "f04d2", "text": "beta beto"}}
+{"type": "OneTermSatisfiesTwoGroups", "data": {"slug": "f04d3", "text": "gamma"}}
+{"type": "AllCountsEachFamilyBeforeQueryFilter", "data": {"slug": "f05d0", "text": "beta gamma"}}
+{"type": "AllCountsEachFamilyBeforeQueryFilter", "data": {"slug": "f05d1", "text": "beto gamma"}}
+{"type": "AllCountsEachFamilyBeforeQueryFilter", "data": {"slug": "f05d2", "text": "beta"}}
+{"type": "AllCountsEachFamilyBeforeQueryFilter", "data": {"slug": "f05d3", "text": "gamma"}}
+{"type": "AllCountsEachFamilyBeforeQueryFilter", "data": {"slug": "f05d4", "text": "gamma beta beta"}}
+{"type": "AllCountsEachFamilyBeforeQueryFilter", "data": {"slug": "f05d5", "text": "other"}}
+{"type": "AnyUsesTheSameStatistics", "data": {"slug": "f06d0", "text": "beta gamma"}}
+{"type": "AnyUsesTheSameStatistics", "data": {"slug": "f06d1", "text": "beto gamma"}}
+{"type": "AnyUsesTheSameStatistics", "data": {"slug": "f06d2", "text": "beta"}}
+{"type": "AnyUsesTheSameStatistics", "data": {"slug": "f06d3", "text": "gamma"}}
+{"type": "AnyUsesTheSameStatistics", "data": {"slug": "f06d4", "text": "gamma beta beta"}}
+{"type": "AnyUsesTheSameStatistics", "data": {"slug": "f06d5", "text": "other"}}
+{"type": "NullAndTokenEmptyAreOutsideCorpus", "data": {"slug": "f07d0"}}
+{"type": "NullAndTokenEmptyAreOutsideCorpus", "data": {"slug": "f07d1", "text": ""}}
+{"type": "NullAndTokenEmptyAreOutsideCorpus", "data": {"slug": "f07d2", "text": "beta"}}
+{"type": "NullAndTokenEmptyAreOutsideCorpus", "data": {"slug": "f07d3", "text": "beto"}}
+{"type": "NullAndTokenEmptyAreOutsideCorpus", "data": {"slug": "f07d4", "text": "beta gamma"}}
+{"type": "TwoEditsAndTransposition", "data": {"slug": "f08d0", "text": "abcd"}}
+{"type": "TwoEditsAndTransposition", "data": {"slug": "f08d1", "text": "abce"}}
+{"type": "TwoEditsAndTransposition", "data": {"slug": "f08d2", "text": "abef"}}
+{"type": "TwoEditsAndTransposition", "data": {"slug": "f08d3", "text": "ab"}}
+{"type": "TwoEditsAndTransposition", "data": {"slug": "f08d4", "text": "acbd"}}
+{"type": "TwoEditsAndTransposition", "data": {"slug": "f08d5", "text": "zxyz"}}
+{"type": "UnicodeScalarEdit", "data": {"slug": "f09d0", "text": "café"}}
+{"type": "UnicodeScalarEdit", "data": {"slug": "f09d1", "text": "cafe"}}
+{"type": "UnicodeScalarEdit", "data": {"slug": "f09d2", "text": "other"}}
+{"type": "OnlyMissingAndTokenEmpty", "data": {"slug": "f11d0"}}
+{"type": "OnlyMissingAndTokenEmpty", "data": {"slug": "f11d1", "text": ""}}
+{"type": "OnlyMissingAndTokenEmpty", "data": {"slug": "f11d2", "text": " "}}
+{"type": "NoMatchingFamily", "data": {"slug": "f12d0"}}
+{"type": "NoMatchingFamily", "data": {"slug": "f12d1", "text": ""}}
+{"type": "NoMatchingFamily", "data": {"slug": "f12d2", "text": "gamma"}}
+
+--- query
+query rare_variant() {
+    match { let $pop = { match { $d: RareVariant } return { $d } }, from bm25($pop, $d.text, terms("beta", mode: any, max_edits: 1)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug": "f00d0", "score": 0.2876820724517809}
+{"d.slug": "f00d1", "score": 0.2876820724517809}
+{"d.slug": "f00d2", "score": 0.2876820724517809}
+{"d.slug": "f00d3", "score": 0.14384103622589045}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query zero_edits() {
+    match { let $pop = { match { $d: ZeroEdits } return { $d } }, from bm25($pop, $d.text, terms("beta", mode: any, max_edits: 0)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug": "f01d0", "score": 0.538996500732687}
+{"d.slug": "f01d1", "score": 0.538996500732687}
+{"d.slug": "f01d2", "score": 0.538996500732687}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query zero_edits_multi_term() {
+    match { let $pop = { match { $d: ZeroEditsMultiTerm } return { $d } }, from bm25($pop, $d.text, terms("gamma beta", mode: any, max_edits: 0)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug": "f02d0", "score": 1.2357761692752447}
+{"d.slug": "f02d1", "score": 0.8025914722273051}
+{"d.slug": "f02d2", "score": 0.8025914722273051}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query alternatives_do_not_add() {
+    match { let $pop = { match { $d: AlternativesDoNotAdd } return { $d } }, from bm25($pop, $d.text, terms("beta", mode: any, max_edits: 1)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug": "f03d4", "score": 0.3031751571412307}
+{"d.slug": "f03d0", "score": 0.27924027631429144}
+{"d.slug": "f03d1", "score": 0.2122226099988615}
+{"d.slug": "f03d2", "score": 0.2122226099988615}
+{"d.slug": "f03d3", "score": 0.13962013815714572}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query one_term_satisfies_two_groups() {
+    match { let $pop = { match { $d: OneTermSatisfiesTwoGroups } return { $d } }, from bm25($pop, $d.text, terms("beta beto", mode: all, max_edits: 1)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug": "f04d0", "score": 0.5826867896028797}
+{"d.slug": "f04d1", "score": 0.5826867896028797}
+{"d.slug": "f04d2", "score": 0.5727626836972345}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query all_counts_each_family_before_query_filter() {
+    match { let $pop = { match { $d: AllCountsEachFamilyBeforeQueryFilter } return { $d } }, from bm25($pop, $d.text, terms("beta gamma", mode: all, max_edits: 1)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug": "f05d4", "score": 0.8288224120191091}
+{"d.slug": "f05d0", "score": 0.8168336596755347}
+{"d.slug": "f05d1", "score": 0.612625244756651}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query any_uses_the_same_statistics() {
+    match { let $pop = { match { $d: AnyUsesTheSameStatistics } return { $d } }, from bm25($pop, $d.text, terms("beta gamma", mode: any, max_edits: 1)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug": "f06d4", "score": 0.8288224120191091}
+{"d.slug": "f06d0", "score": 0.8168336596755347}
+{"d.slug": "f06d1", "score": 0.612625244756651}
+{"d.slug": "f06d2", "score": 0.5282782907684165}
+{"d.slug": "f06d3", "score": 0.5282782907684165}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query null_and_token_empty_are_outside_corpus() {
+    match { let $pop = { match { $d: NullAndTokenEmptyAreOutsideCorpus } return { $d } }, from bm25($pop, $d.text, terms("beta", mode: any, max_edits: 1)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug": "f07d2", "score": 0.14874382975896192}
+{"d.slug": "f07d4", "score": 0.11085625048073576}
+{"d.slug": "f07d3", "score": 0.07437191487948096}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query two_edits_and_transposition() {
+    match { let $pop = { match { $d: TwoEditsAndTransposition } return { $d } }, from bm25($pop, $d.text, terms("abcd", mode: any, max_edits: 2)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug": "f08d0", "score": 0.24116205681688807}
+{"d.slug": "f08d1", "score": 0.12058102840844404}
+{"d.slug": "f08d2", "score": 0.06029051420422202}
+{"d.slug": "f08d3", "score": 0.06029051420422202}
+{"d.slug": "f08d4", "score": 0.06029051420422202}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query unicode_scalar_edit() {
+    match { let $pop = { match { $d: UnicodeScalarEdit } return { $d } }, from bm25($pop, $d.text, terms("cafe", mode: any, max_edits: 1)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug": "f09d1", "score": 0.4700036292457356}
+{"d.slug": "f09d0", "score": 0.2350018146228678}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query empty_corpus() {
+    match { let $pop = { match { $d: EmptyCorpus } return { $d } }, from bm25($pop, $d.text, terms("beta", mode: any, max_edits: 1)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query only_missing_and_token_empty() {
+    match { let $pop = { match { $d: OnlyMissingAndTokenEmpty } return { $d } }, from bm25($pop, $d.text, terms("beta", mode: any, max_edits: 1)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference
+
+--- query
+query no_matching_family() {
+    match { let $pop = { match { $d: NoMatchingFamily } return { $d } }, from bm25($pop, $d.text, terms("beta", mode: any, max_edits: 1)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect same as reference

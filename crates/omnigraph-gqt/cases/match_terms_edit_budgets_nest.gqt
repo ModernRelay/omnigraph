@@ -1,0 +1,311 @@
+# issue: none
+# notes: On a field whose index declares an analyzer, `match_terms` is the exact `terms` relation
+# notes: (docs/rfcs/2026-11-07-gq-3.md, section 4, "The lexical query"): the exact lexical scan
+# notes: analyzes document and query text with the field's profile at every edit budget, and a
+# notes: query term matches a stored term within the budget, counting one per inserted, deleted or
+# notes: substituted Unicode scalar value, so `abcd` and `acbd` are two edits apart and `cafe` and
+# notes: `café` one. `matches(0) ⊆ matches(1) ⊆ matches(2)`. Repeated or reordered query terms
+# notes: change nothing; a null, empty or punctuation-only title never matches. `search`,
+# notes: `match_text` and `fuzzy` stay registry rows and mean `match_terms(f, terms(q, mode: any))`
+# notes: there, `fuzzy` with two edits when its budget is unwritten. A budget outside 0..=2, or a
+# notes: text with no searchable term, is a type error, from a literal at check and from a
+# notes: parameter when it is bound.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String? @index(fulltext, analyzer = "standard_v1")
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d01","title":"beta gamma"}}
+{"type":"Doc","data":{"slug":"d02","title":"beto gamma"}}
+{"type":"Doc","data":{"slug":"d03","title":"Betas"}}
+{"type":"Doc","data":{"slug":"d04","title":"abcd"}}
+{"type":"Doc","data":{"slug":"d05","title":"acbd"}}
+{"type":"Doc","data":{"slug":"d06","title":"café crème"}}
+{"type":"Doc","data":{"slug":"d07","title":""}}
+{"type":"Doc","data":{"slug":"d08"}}
+{"type":"Doc","data":{"slug":"d09","title":"!!! ..."}}
+{"type":"Doc","data":{"slug":"d10","title":"btoa"}}
+
+--- query
+query zero_edits() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("beta"))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d01"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query one_edit() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("beta", max_edits: 1))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d01"}
+{"d.slug": "d02"}
+{"d.slug": "d03"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query two_edits() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("beta", max_edits: 2))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d01"}
+{"d.slug": "d02"}
+{"d.slug": "d03"}
+{"d.slug": "d10"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query budget_from_a_parameter($q: String, $n: I64) {
+    match { $d: Doc }
+    where match_terms($d.title, terms($q, max_edits: $n))
+    return { $d.slug }
+}
+
+--- params
+{"q": "BETA", "n": 1}
+
+--- expect unordered
+{"d.slug": "d01"}
+{"d.slug": "d02"}
+{"d.slug": "d03"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query transposition_is_two_edits_one() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("abcd", max_edits: 1))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d04"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query transposition_is_two_edits_two() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("abcd", max_edits: 2))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d04"}
+{"d.slug": "d05"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query unicode_scalar_zero() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("cafe"))
+    return { $d.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query unicode_scalar_one() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("cafe", max_edits: 1))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d06"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query every_term_repeated_and_reordered() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("gamma beta beta gamma", max_edits: 1))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d01"}
+{"d.slug": "d02"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query any_term() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("abcd beta", mode: any, max_edits: 1))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d01"}
+{"d.slug": "d02"}
+{"d.slug": "d03"}
+{"d.slug": "d04"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query null_and_token_empty_never_match() {
+    match { $d: Doc }
+    where not match_terms($d.title, terms("beta gamma abcd cafe", mode: any, max_edits: 2))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d07"}
+{"d.slug": "d08"}
+{"d.slug": "d09"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query fuzzy_means_two_edits() {
+    match { $d: Doc }
+    where fuzzy($d.title, "beta")
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d01"}
+{"d.slug": "d02"}
+{"d.slug": "d03"}
+{"d.slug": "d10"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query fuzzy_with_its_budget() {
+    match { $d: Doc }
+    where fuzzy($d.title, "beta", max_edits: 1)
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d01"}
+{"d.slug": "d02"}
+{"d.slug": "d03"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query search_means_any_term() {
+    match { $d: Doc }
+    where search($d.title, "abcd beta") or match_text($d.title, "crème")
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d01"}
+{"d.slug": "d04"}
+{"d.slug": "d06"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
+
+--- query
+query budget_out_of_range() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("beta", max_edits: 3))
+    return { $d.slug }
+}
+
+--- expect error: T71: `max_edits: 3` is outside 0..=2
+
+--- query
+query bound_budget_out_of_range($n: I64) {
+    match { $d: Doc }
+    where match_terms($d.title, terms("beta", max_edits: $n))
+    return { $d.slug }
+}
+
+--- params
+{"n": 3}
+
+--- expect error: T71: `max_edits: 3` is outside 0..=2
+
+--- query
+query no_searchable_term() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("!!!"))
+    return { $d.slug }
+}
+
+--- expect error: T20: the lexical query has no searchable terms
+
+--- query
+query bound_text_with_no_searchable_term($q: String) {
+    match { $d: Doc }
+    where match_terms($d.title, terms($q, max_edits: 1))
+    return { $d.slug }
+}
+
+--- params
+{"q": "... ?"}
+
+--- expect error: T20: the lexical query `... ?` has no searchable terms
