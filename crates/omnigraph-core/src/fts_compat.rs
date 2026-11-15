@@ -5,7 +5,7 @@
 //! stemmer built an index. This certificate is derived index state, not a
 //! graph migration flag or protection against an out-of-band malicious writer.
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use lance::{Dataset, index::scalar::IndexDetails};
 use lance_core::cache::CacheKey;
@@ -20,7 +20,11 @@ pub const CERTIFICATE_FILE: &str = "omnigraph_fts_compat.json";
 // This names analyzer semantics, not the running Lance release. The audited
 // Lance 13 default analyzer remains compatible with certificates written on 11.
 pub const ANALYZER_GENERATION: &str = "lance11.0.0-frostem1.20260821.3-v1";
+/// A certificate of edition 2's analysis: the analyzer generation alone.
 const FORMAT_VERSION: u32 = 1;
+/// A certificate of a declared analyzer profile: the generation and the
+/// field's analyzer fingerprint.
+const FORMAT_VERSION_FINGERPRINT: u32 = 2;
 pub const MAX_CERTIFICATE_BYTES: u64 = 64 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 4096;
 
@@ -31,6 +35,29 @@ struct Certificate {
     index_uuid: String,
     analyzer_generation: String,
     artifact_digest: String,
+    /// The analyzer fingerprint of the profile the field declared when the
+    /// index was built (format 2); absent for edition 2's analysis (format 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    analyzer_fingerprint: Option<String>,
+}
+
+/// The analyzer fingerprint each full-text column's accepted schema declares
+/// (`@index(fulltext, analyzer = ...)`, docs/rfcs/2026-11-07-gq-3.md section
+/// 4). A column absent here declares edition 2's index analysis. The accepted
+/// schema chooses the analysis; an index proves it only by a certificate
+/// naming the same fingerprint, so a certificate of another analysis refuses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredAnalyzers(BTreeMap<String, String>);
+
+impl DeclaredAnalyzers {
+    pub fn new(fingerprints: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self(fingerprints.into_iter().collect())
+    }
+
+    /// The fingerprint `column` declares, `None` for edition 2's analysis.
+    pub fn fingerprint(&self, column: &str) -> Option<&str> {
+        self.0.get(column).map(String::as_str)
+    }
 }
 
 /// Positive evidence only. No codec: proof never outlives the Lance session's
@@ -56,7 +83,14 @@ impl CacheKey for VerifiedCertificateKey {
 /// through the existing staged CreateIndex transaction. Do not use this to
 /// bless an existing index or an incremental merge/remap of unproven postings.
 /// The returned file inventory participates in Lance's native index lifecycle.
-pub async fn write_certificate(dataset: &Dataset, index: &mut IndexMetadata) -> Result<()> {
+///
+/// `fingerprint` is the analyzer fingerprint of the profile the segment was
+/// built with, `None` for edition 2's analysis.
+pub async fn write_certificate(
+    dataset: &Dataset,
+    index: &mut IndexMetadata,
+    fingerprint: Option<&str>,
+) -> Result<()> {
     let files = inventory(index)?;
     if files.iter().any(|file| file.path == CERTIFICATE_FILE) || index.base_id.is_some() {
         return Err(rebuild_required(
@@ -65,10 +99,15 @@ pub async fn write_certificate(dataset: &Dataset, index: &mut IndexMetadata) -> 
         ));
     }
     let certificate = Certificate {
-        format_version: FORMAT_VERSION,
+        format_version: if fingerprint.is_some() {
+            FORMAT_VERSION_FINGERPRINT
+        } else {
+            FORMAT_VERSION
+        },
         index_uuid: index.uuid.to_string(),
         analyzer_generation: ANALYZER_GENERATION.to_owned(),
         artifact_digest: artifact_digest(index, &files)?,
+        analyzer_fingerprint: fingerprint.map(str::to_owned),
     };
     let payload = serde_json::to_vec(&certificate).map_err(|error| {
         OmniError::manifest_internal(format!("encode FTS certificate: {error}"))
@@ -105,8 +144,15 @@ pub async fn write_certificate(dataset: &Dataset, index: &mut IndexMetadata) -> 
     Ok(())
 }
 
-/// Verify one exact snapshot-selected FTS index segment before using it.
-pub async fn verify_index(dataset: &Dataset, index: &IndexMetadata) -> Result<()> {
+/// Verify one exact snapshot-selected FTS index segment before using it:
+/// its certificate must name this engine's analyzer generation and `expected`,
+/// the analyzer fingerprint the field's accepted schema declares (`None` for
+/// edition 2's analysis).
+pub async fn verify_index(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+    expected: Option<&str>,
+) -> Result<()> {
     let files = inventory(index)?;
     let certificate_file = files
         .iter()
@@ -131,6 +177,7 @@ pub async fn verify_index(dataset: &Dataset, index: &IndexMetadata) -> Result<()
         index,
         certificate_file.size_bytes,
         &digest,
+        expected,
     );
     let session = dataset.session();
     let cache = session.file_metadata_cache();
@@ -175,7 +222,7 @@ pub async fn verify_index(dataset: &Dataset, index: &IndexMetadata) -> Result<()
     }
     let payload = std::str::from_utf8(&payload)
         .map_err(|_| rebuild_required(index, "analyzer certificate is not UTF-8"))?;
-    verify_payload(index, payload, &digest)?;
+    verify_payload(index, payload, &digest, expected)?;
     cache.insert_with_key(&key, Arc::new(true)).await;
     Ok(())
 }
@@ -187,6 +234,7 @@ fn verification_key(
     index: &IndexMetadata,
     certificate_size: u64,
     artifact_digest: &str,
+    expected: Option<&str>,
 ) -> VerifiedCertificateKey {
     let mut digest = Sha256::new();
     // A copied dataset may retain every UUID but have different certificate
@@ -202,7 +250,15 @@ fn verification_key(
     ] {
         hash_bytes(&mut digest, field.as_bytes());
     }
-    digest.update(FORMAT_VERSION.to_le_bytes());
+    // The proof is of one analysis: a field that declares another must read
+    // the certificate again and refuse.
+    match expected {
+        None => digest.update(FORMAT_VERSION.to_le_bytes()),
+        Some(fingerprint) => {
+            digest.update(FORMAT_VERSION_FINGERPRINT.to_le_bytes());
+            hash_bytes(&mut digest, fingerprint.as_bytes());
+        }
+    }
     digest.update(certificate_size.to_le_bytes());
     VerifiedCertificateKey(format!("{:x}", digest.finalize()))
 }
@@ -241,13 +297,37 @@ fn certificate_read_error(index: &IndexMetadata, error: lance::Error) -> OmniErr
     }
 }
 
-fn verify_payload(index: &IndexMetadata, payload: &str, digest: &str) -> Result<()> {
+fn verify_payload(
+    index: &IndexMetadata,
+    payload: &str,
+    digest: &str,
+    expected: Option<&str>,
+) -> Result<()> {
     let certificate: Certificate = serde_json::from_str(payload)
         .map_err(|_| rebuild_required(index, "analyzer certificate payload is malformed"))?;
-    if certificate.format_version != FORMAT_VERSION {
+    match (
+        certificate.format_version,
+        &certificate.analyzer_fingerprint,
+    ) {
+        (FORMAT_VERSION, None) | (FORMAT_VERSION_FINGERPRINT, Some(_)) => {}
+        _ => {
+            return Err(rebuild_required(
+                index,
+                "analyzer certificate format is unsupported",
+            ));
+        }
+    }
+    if certificate.analyzer_fingerprint.as_deref() != expected {
         return Err(rebuild_required(
             index,
-            "analyzer certificate format is unsupported",
+            match expected {
+                Some(_) => {
+                    "index was not built with the analyzer the field declares; rebuild it with the declared profile"
+                }
+                None => {
+                    "index was built with a declared analyzer profile the field no longer declares"
+                }
+            },
         ));
     }
     if certificate.index_uuid != index.uuid.to_string() {
@@ -417,7 +497,7 @@ mod tests {
         let original = index();
         let expected = digest(&original);
         let path = Path::from("source/_indices/certificate.json");
-        let key = verification_key("source", "store-a", &path, &original, 512, &expected).0;
+        let key = verification_key("source", "store-a", &path, &original, 512, &expected, None).0;
         for (uri, store, path, certificate_size, artifact) in [
             ("copy", "store-a", path.clone(), 512, expected.as_str()),
             ("source", "store-b", path.clone(), 512, expected.as_str()),
@@ -432,15 +512,58 @@ mod tests {
             ("source", "store-a", path.clone(), 512, "changed-artifact"),
         ] {
             assert_ne!(
-                verification_key(uri, store, &path, &original, certificate_size, artifact).0,
+                verification_key(
+                    uri,
+                    store,
+                    &path,
+                    &original,
+                    certificate_size,
+                    artifact,
+                    None
+                )
+                .0,
                 key
             );
         }
         let mut other_uuid = original.clone();
         other_uuid.uuid = "22222222-2222-4222-8222-222222222222".parse().unwrap();
         assert_ne!(
-            verification_key("source", "store-a", &path, &other_uuid, 512, &expected).0,
+            verification_key(
+                "source",
+                "store-a",
+                &path,
+                &other_uuid,
+                512,
+                &expected,
+                None
+            )
+            .0,
             key
+        );
+        // A proof of one analysis is not a proof of another.
+        let english = verification_key(
+            "source",
+            "store-a",
+            &path,
+            &original,
+            512,
+            &expected,
+            Some("sha256:english"),
+        )
+        .0;
+        assert_ne!(english, key);
+        assert_ne!(
+            verification_key(
+                "source",
+                "store-a",
+                &path,
+                &original,
+                512,
+                &expected,
+                Some("sha256:standard"),
+            )
+            .0,
+            english
         );
         let mut changed = original.clone();
         changed.name = "renamed".into();
@@ -475,9 +598,10 @@ mod tests {
             index_uuid: index.uuid.to_string(),
             analyzer_generation: ANALYZER_GENERATION.into(),
             artifact_digest: digest.clone(),
+            analyzer_fingerprint: None,
         })
         .unwrap();
-        verify_payload(&index, &valid.to_string(), &digest).unwrap();
+        verify_payload(&index, &valid.to_string(), &digest, None).unwrap();
         for (key, value) in [
             ("format_version", serde_json::json!(2)),
             ("index_uuid", serde_json::json!("another UUID")),
@@ -489,7 +613,7 @@ mod tests {
             changed[key] = value;
             assert!(
                 matches!(
-                    verify_payload(&index, &changed.to_string(), &digest),
+                    verify_payload(&index, &changed.to_string(), &digest, None),
                     Err(OmniError::FullTextIndexRebuildRequired { .. })
                 ),
                 "accepted changed {key}"
@@ -497,9 +621,50 @@ mod tests {
         }
         for malformed in ["{", "null", "{}"] {
             assert!(matches!(
-                verify_payload(&index, malformed, &digest),
+                verify_payload(&index, malformed, &digest, None),
                 Err(OmniError::FullTextIndexRebuildRequired { .. })
             ));
+        }
+    }
+
+    /// A field's declared analyzer is established only by a format-2
+    /// certificate naming its fingerprint: a certificate of edition 2's
+    /// analysis, of another profile, or of a profile the field no longer
+    /// declares refuses.
+    #[test]
+    fn certificate_establishes_only_the_declared_analyzer_fingerprint() {
+        let index = index();
+        let digest = digest(&index);
+        let certificate = |format_version, fingerprint: Option<&str>| {
+            serde_json::to_string(&Certificate {
+                format_version,
+                index_uuid: index.uuid.to_string(),
+                analyzer_generation: ANALYZER_GENERATION.into(),
+                artifact_digest: digest.clone(),
+                analyzer_fingerprint: fingerprint.map(str::to_owned),
+            })
+            .unwrap()
+        };
+        let english = certificate(FORMAT_VERSION_FINGERPRINT, Some("sha256:english"));
+        verify_payload(&index, &english, &digest, Some("sha256:english")).unwrap();
+        let edition_2 = certificate(FORMAT_VERSION, None);
+        for (payload, expected) in [
+            (&english, Some("sha256:standard")),
+            (&english, None),
+            (&edition_2, Some("sha256:english")),
+            (
+                &certificate(FORMAT_VERSION, Some("sha256:english")),
+                Some("sha256:english"),
+            ),
+            (&certificate(FORMAT_VERSION_FINGERPRINT, None), None),
+        ] {
+            assert!(
+                matches!(
+                    verify_payload(&index, payload, &digest, expected),
+                    Err(OmniError::FullTextIndexRebuildRequired { .. })
+                ),
+                "accepted {payload} for {expected:?}"
+            );
         }
     }
 

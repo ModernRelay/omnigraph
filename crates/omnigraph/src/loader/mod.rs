@@ -5567,6 +5567,8 @@ node Doc {
             }],
             check_constraints: vec![],
             embed_sources: Default::default(),
+            full_text_analysis: Default::default(),
+            full_text_fingerprints: Default::default(),
             blob_properties: Default::default(),
             arrow_schema: schema,
         };

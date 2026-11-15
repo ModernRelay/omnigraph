@@ -77,9 +77,11 @@ use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, skip};
 use crate::storage_layer::{
-    BLOB_READ_IO_BUFFER_BYTES, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS,
-    KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk,
+    BLOB_READ_IO_BUFFER_BYTES, FullTextBuild, FullTextColumn, IndexBuildSpec,
+    KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, PendingScanBudget,
+    ProvenInsertChunk,
 };
+use fts_compat::DeclaredAnalyzers;
 
 pub(crate) use crate::error::is_scratch_exhaustion;
 pub(crate) use omnigraph_core::dataset_index::FtsFilterDemand;
@@ -222,6 +224,9 @@ pub(crate) type PlannedScan = (Arc<dyn ExecutionPlan>, Option<Expr>);
 pub(crate) struct ScanTuning<'a> {
     scanner: &'a mut Scanner,
     full_text_columns: Option<HashSet<String>>,
+    /// The analyzer each column's accepted schema declares, which the
+    /// full-text segments the scan reads must be certified for.
+    declared_analyzers: DeclaredAnalyzers,
     /// FTS-index demand of the typed filters set through this surface, unioned
     /// over every `filter_expr` call although Lance keeps only the last filter:
     /// a fail-closed over-approximation.
@@ -234,6 +239,7 @@ struct PreparedScan {
     has_ordering: bool,
     has_sql_filter: bool,
     full_text_columns: Option<HashSet<String>>,
+    declared_analyzers: DeclaredAnalyzers,
     filter_demand: FtsFilterDemand,
 }
 
@@ -270,16 +276,19 @@ impl PreparedScan {
         let mut tuning = ScanTuning {
             scanner: &mut scanner,
             full_text_columns: None,
+            declared_analyzers: DeclaredAnalyzers::default(),
             filter_demand: FtsFilterDemand::default(),
         };
         configure(&mut tuning)?;
         let full_text_columns = tuning.full_text_columns;
+        let declared_analyzers = tuning.declared_analyzers;
         let filter_demand = tuning.filter_demand;
         Ok(Self {
             scanner,
             has_ordering,
             has_sql_filter: filter.is_some(),
             full_text_columns,
+            declared_analyzers,
             filter_demand,
         })
     }
@@ -287,9 +296,21 @@ impl PreparedScan {
     /// The scanner, once its full-text reads are checked against `dataset`.
     async fn validated(self, dataset: &Dataset) -> Result<Scanner> {
         if self.has_sql_filter {
-            validate_full_text_scan(dataset, &self.scanner, self.full_text_columns).await?;
+            validate_full_text_scan(
+                dataset,
+                &self.scanner,
+                self.full_text_columns,
+                &self.declared_analyzers,
+            )
+            .await?;
         } else if self.full_text_columns.is_some() || !self.filter_demand.is_empty() {
-            validate_full_text_demand(dataset, self.full_text_columns, self.filter_demand).await?;
+            validate_full_text_demand(
+                dataset,
+                self.full_text_columns,
+                self.filter_demand,
+                &self.declared_analyzers,
+            )
+            .await?;
         }
         Ok(self.scanner)
     }
@@ -348,9 +369,12 @@ impl ScanTuning<'_> {
         self
     }
 
+    /// A full-text query over a table whose columns declare `declared`: every
+    /// segment it reads must be certified for its column's declared analyzer.
     pub(crate) fn full_text_search(
         &mut self,
         query: FullTextSearchQuery,
+        declared: DeclaredAnalyzers,
     ) -> std::result::Result<&mut Self, lance::Error> {
         // Compound queries can mix explicit and omitted columns. Any omitted
         // leaf allows Lance to search all FTS columns, not just named leaves.
@@ -361,6 +385,7 @@ impl ScanTuning<'_> {
         };
         self.scanner.full_text_search(query)?;
         self.full_text_columns = Some(columns);
+        self.declared_analyzers = declared;
         Ok(self)
     }
 
@@ -1252,6 +1277,59 @@ async fn commit_detached(
         .map_err(|error| OmniError::storage(error).unpublished())
 }
 
+/// The Lance parameters a full-text segment is built with. Edition 2's index
+/// analysis is Lance's default, as before any profile existed, so no
+/// existing graph changes rows. A declared profile sets every parameter
+/// explicitly (docs/rfcs/2026-11-07-gq-3.md section 4: no unspecified Lance
+/// default is part of a profile), including the posting block size and
+/// format, so neither Lance's defaults nor `LANCE_FTS_FORMAT_VERSION` can
+/// change it. Lance 13 applies its filters in the order
+/// `max_token_length`, lowercase, stemmer, stop words, ASCII folding
+/// (`InvertedIndexParams::build`), which is every profile's order.
+///
+/// Lance has no Unicode normalization step: the profile's NFC is not applied
+/// on this path, so text that is not already NFC tokenizes as written. How
+/// NFC reaches a native index is open in the RFC (Unresolved question 10).
+fn full_text_index_params(analysis: &FullTextBuild) -> Result<InvertedIndexParams> {
+    use omnigraph_compiler::schema::analysis::{AnalyzerFilter, AnalyzerTokenizer};
+    let Some(profile) = analysis.profile else {
+        return Ok(InvertedIndexParams::default());
+    };
+    let pipeline = profile.pipeline();
+    let tokenizer = match pipeline.tokenizer {
+        AnalyzerTokenizer::Simple => "simple",
+    };
+    let has = |wanted: fn(&AnalyzerFilter) -> bool| pipeline.filters.iter().any(wanted);
+    let params = InvertedIndexParams::new(
+        tokenizer.to_string(),
+        lance_index::scalar::inverted::Language::English,
+    )
+    .document_granularity(lance_index::scalar::inverted::DocumentGranularity::Row)
+    .lance_tokenizer("text".to_string())
+    .with_position(false)
+    .max_token_length(pipeline.max_token_length)
+    .lower_case(has(|filter| matches!(filter, AnalyzerFilter::Lowercase)))
+    .stem(has(|filter| matches!(filter, AnalyzerFilter::Stem(_))))
+    .remove_stop_words(has(|filter| matches!(filter, AnalyzerFilter::StopWords(_))))
+    .custom_stop_words(None)
+    .ascii_folding(has(|filter| matches!(filter, AnalyzerFilter::AsciiFolding)))
+    .ngram_min_length(3)
+    .ngram_max_length(3)
+    .ngram_prefix_only(false)
+    .split_identifiers(false)
+    .split_on_numerics(false)
+    .preserve_original(false)
+    .index_operators(false)
+    .format_version(lance_index::scalar::inverted::InvertedListFormatVersion::V2)
+    .block_size(128)
+    .map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "the {profile} full-text parameters are invalid: {error}"
+        ))
+    })?;
+    Ok(params)
+}
+
 /// The columns of `columns` that hold no full-text segment once `effect`
 /// commits on `base` (or on `base` itself, with no effect). Decided from the
 /// base and the operation as Lance's manifest build decides, never by reading
@@ -1267,8 +1345,8 @@ async fn commit_detached(
 async fn full_text_columns_without_segment(
     base: &Dataset,
     effect: Option<&Operation>,
-    columns: &[String],
-) -> Result<Vec<String>> {
+    columns: &[FullTextColumn],
+) -> Result<Vec<FullTextColumn>> {
     let schema = match effect {
         Some(
             Operation::Overwrite { schema, .. }
@@ -1277,9 +1355,9 @@ async fn full_text_columns_without_segment(
         ) => schema,
         _ => base.schema(),
     };
-    let present: Vec<(&String, i32)> = columns
+    let present: Vec<(&FullTextColumn, i32)> = columns
         .iter()
-        .filter_map(|column| schema.field(column).map(|field| (column, field.id)))
+        .filter_map(|column| schema.field(&column.column).map(|field| (column, field.id)))
         .collect();
     if present.is_empty() || matches!(effect, Some(Operation::Overwrite { .. })) {
         return Ok(present
@@ -3431,7 +3509,7 @@ impl TableStore {
         if let Some(filter) = &filter {
             let mut scanner = ds.scan();
             scanner.filter(filter).map_err(OmniError::storage)?;
-            validate_full_text_scan(ds, &scanner, None).await?;
+            validate_full_text_scan(ds, &scanner, None, &DeclaredAnalyzers::default()).await?;
         }
         ds.count_rows(filter).await.map_err(OmniError::storage)
     }
@@ -4665,7 +4743,7 @@ impl TableStore {
         ds: Arc<Dataset>,
         mut staged: StagedWrite,
         witness: &StagingWitness,
-        declared_full_text: &[String],
+        declared_full_text: &[FullTextColumn],
     ) -> Result<(Dataset, StagedTransactionIdentity)> {
         witness.stamp(&mut staged.transaction);
         let undeclared = full_text_columns_without_segment(
@@ -4695,7 +4773,7 @@ impl TableStore {
     pub async fn commit_full_text_declarations(
         &self,
         ds: Arc<Dataset>,
-        columns: &[String],
+        columns: &[FullTextColumn],
         witness: &StagingWitness,
     ) -> Result<Option<(Dataset, StagedTransactionIdentity)>> {
         let undeclared = full_text_columns_without_segment(&ds, None, columns).await?;
@@ -4709,43 +4787,100 @@ impl TableStore {
         Ok(Some((dataset, identity)))
     }
 
+    /// Commit, detached on `ds` under `witness`, the replacement of every
+    /// full-text segment on each column of `columns` by one untrained,
+    /// certified segment built with the column's analysis: the effect of a
+    /// schema apply that changes a column's analyzer. No segment of the old
+    /// analysis survives the commit, so no search on the column reads one;
+    /// the postings are rebuilt from rows off the critical path, by
+    /// `ensure_indices` once no segment covers a fragment.
+    pub async fn commit_full_text_redeclarations(
+        &self,
+        ds: Arc<Dataset>,
+        columns: &[FullTextColumn],
+        witness: &StagingWitness,
+    ) -> Result<(Dataset, StagedTransactionIdentity)> {
+        let mut declaration = self
+            .stage_full_text_segments(&ds, columns, true)
+            .await?
+            .ok_or_else(|| {
+                OmniError::manifest_internal("a full-text redeclaration named no column")
+            })?;
+        witness.stamp(&mut declaration);
+        let dataset = commit_detached(ds, declaration, None).await?;
+        let identity = self.transaction_identity(&dataset)?;
+        Ok((dataset, identity))
+    }
+
     /// The `CreateIndex` that gives every column of `columns` an untrained,
     /// certified full-text segment on `ds`: an empty fragment bitmap, no
-    /// postings, the engine's analyzer. `None` when `columns` is empty.
+    /// postings, the column's analysis. `None` when `columns` is empty.
     pub(crate) async fn stage_full_text_declarations(
         &self,
         ds: &Dataset,
-        columns: &[String],
+        columns: &[FullTextColumn],
+    ) -> Result<Option<Transaction>> {
+        self.stage_full_text_segments(ds, columns, false).await
+    }
+
+    /// [`Self::stage_full_text_declarations`], removing every existing
+    /// full-text segment on those columns when `replace_existing`.
+    async fn stage_full_text_segments(
+        &self,
+        ds: &Dataset,
+        columns: &[FullTextColumn],
+        replace_existing: bool,
     ) -> Result<Option<Transaction>> {
         let mut new_indices = Vec::new();
+        let mut fields = HashSet::new();
         for column in columns {
-            let params = InvertedIndexParams::default();
+            let name = column.column.as_str();
+            let params = full_text_index_params(&column.analysis)?;
             let mut builder_ds = ds.clone();
             let mut segment = builder_ds
-                .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
+                .create_index_builder(&[name], IndexType::Inverted, &params)
                 .replace(true)
                 .train(false)
                 .execute_uncommitted()
                 .await
                 .map_err(|error| {
                     OmniError::storage_context(
-                        format!("declare the full-text index on '{column}'"),
+                        format!("declare the full-text index on '{name}'"),
                         error,
                     )
                 })?;
-            fts_compat::write_certificate(ds, &mut segment).await?;
+            fts_compat::write_certificate(ds, &mut segment, column.analysis.fingerprint.as_deref())
+                .await?;
+            fields.extend(segment.fields.iter().copied());
             new_indices.push(segment);
         }
-        Ok((!new_indices.is_empty()).then(|| {
+        if new_indices.is_empty() {
+            return Ok(None);
+        }
+        let removed_indices = if replace_existing && ds.manifest.index_section.is_some() {
+            ds.load_indices()
+                .await
+                .map_err(OmniError::storage)?
+                .iter()
+                .filter(|index| {
+                    is_full_text_index(index)
+                        && index.fields.iter().any(|field| fields.contains(field))
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Some(
             TransactionBuilder::new(
                 ds.manifest.version,
                 Operation::CreateIndex {
                     new_indices,
-                    removed_indices: Vec::new(),
+                    removed_indices,
                 },
             )
-            .build()
-        }))
+            .build(),
+        ))
     }
 
     /// The identity of the transaction a version records (RFC 0067), read
@@ -5915,7 +6050,7 @@ impl TableStore {
         for spec in specs {
             let (column, index_type) = match spec {
                 IndexBuildSpec::BTree { column, .. } => (column, "BTREE"),
-                IndexBuildSpec::FullText { column } => (column, "FTS"),
+                IndexBuildSpec::FullText { column, .. } => (column, "FTS"),
                 IndexBuildSpec::Vector { column } => (column, "Vector"),
             };
             if column.is_empty() {
@@ -5939,8 +6074,8 @@ impl TableStore {
                     }
                     builder.replace(true).execute_uncommitted().await
                 }
-                IndexBuildSpec::FullText { column } => {
-                    let params = InvertedIndexParams::default();
+                IndexBuildSpec::FullText { column, analysis } => {
+                    let params = full_text_index_params(analysis)?;
                     ds_clone
                         .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
                         .replace(true)
@@ -5974,8 +6109,9 @@ impl TableStore {
                     new_idx.name, new_idx.dataset_version, read_version
                 )));
             }
-            if matches!(spec, IndexBuildSpec::FullText { .. }) {
-                fts_compat::write_certificate(ds, &mut new_idx).await?;
+            if let IndexBuildSpec::FullText { analysis, .. } = spec {
+                fts_compat::write_certificate(ds, &mut new_idx, analysis.fingerprint.as_deref())
+                    .await?;
                 full_text_fields.extend(new_idx.fields.iter().copied());
             }
             if !new_names.insert(new_idx.name.clone()) {
@@ -6061,7 +6197,7 @@ impl TableStore {
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
         if filter.is_some() {
-            validate_full_text_scan(ds, &scanner, None).await?;
+            validate_full_text_scan(ds, &scanner, None, &DeclaredAnalyzers::default()).await?;
         }
         let stream = scanner
             .try_into_stream()
@@ -6887,7 +7023,7 @@ impl TableStore {
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
         if filter.is_some() {
-            validate_full_text_scan(ds, &scanner, None).await?;
+            validate_full_text_scan(ds, &scanner, None, &DeclaredAnalyzers::default()).await?;
         }
         let count = scanner.count_rows().await.map_err(OmniError::storage)?;
         Ok(count as usize)

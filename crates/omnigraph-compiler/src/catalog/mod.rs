@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::{CompilerError, Result};
+use crate::schema::analysis::{AnalyzerProfile, FullTextAnalysis, FullTextScorer};
 use crate::schema::ast::{Cardinality, Constraint, ConstraintBound, SchemaDecl, SchemaFile};
 use crate::types::{PropType, ScalarType};
 
@@ -85,11 +86,36 @@ pub struct NodeType {
     pub check_constraints: Vec<CheckConstraint>,
     /// Maps @embed target property -> its source text property + recorded model.
     pub embed_sources: HashMap<String, EmbedSource>,
+    /// The full-text analysis each property's `@index(fulltext, ...)` declares
+    /// beyond edition 2's; a property absent here keeps edition 2's index
+    /// analysis and ranks with the default scorer.
+    pub full_text_analysis: HashMap<String, FullTextAnalysis>,
+    /// The analyzer fingerprint of each property with a declared profile. Only
+    /// a catalog built from accepted IR carries them, since the fingerprint
+    /// binds the property's stable identity.
+    pub full_text_fingerprints: HashMap<String, String>,
     pub blob_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
 }
 
 impl NodeType {
+    /// The profile `property`'s full-text index declares, `None` for edition
+    /// 2's index analysis.
+    pub fn full_text_profile(&self, property: &str) -> Option<AnalyzerProfile> {
+        self.full_text_analysis
+            .get(property)
+            .and_then(|analysis| analysis.analyzer)
+    }
+
+    /// The scorer `property`'s full-text index declares: the default unless it
+    /// says otherwise.
+    pub fn full_text_scorer(&self, property: &str) -> FullTextScorer {
+        self.full_text_analysis
+            .get(property)
+            .map(|analysis| analysis.scorer)
+            .unwrap_or_default()
+    }
+
     /// Whether `property` carries a declared full-text index: a one-column
     /// `@index` or `@key` on a free-text String property
     /// ([`PropType::index_kind`]). A composite declaration builds no
@@ -477,6 +503,15 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     range_constraints,
                     check_constraints,
                     embed_sources,
+                    full_text_analysis: node
+                        .properties
+                        .iter()
+                        .filter_map(|prop| {
+                            crate::schema::analysis::declared_analysis(&prop.annotations)
+                                .map(|analysis| (prop.name.clone(), analysis))
+                        })
+                        .collect(),
+                    full_text_fingerprints: HashMap::new(),
                     blob_properties,
                     arrow_schema,
                 },
@@ -716,6 +751,24 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 range_constraints,
                 check_constraints,
                 embed_sources,
+                full_text_analysis: node
+                    .properties
+                    .iter()
+                    .filter_map(|property| {
+                        property
+                            .full_text
+                            .map(|analysis| (property.name.clone(), analysis))
+                    })
+                    .collect(),
+                full_text_fingerprints: node
+                    .properties
+                    .iter()
+                    .filter_map(|property| {
+                        property
+                            .full_text_fingerprint()
+                            .map(|fingerprint| (property.name.clone(), fingerprint))
+                    })
+                    .collect(),
                 blob_properties,
                 arrow_schema: Arc::new(Schema::new(fields)),
             },

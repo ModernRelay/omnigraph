@@ -594,6 +594,66 @@ fn a_ranked_column_whose_property_is_not_declared() {
     );
 }
 
+/// `scorer = "none"` allows matching and makes a ranking call on the field a
+/// type error, `T87`, wherever the ranking is written (docs/rfcs/2026-11-07-gq-3.md
+/// section 4, Errors). No call takes an analyzer: analysis comes from the
+/// accepted schema alone, so an analyzer option is an unknown option (`T71`).
+#[test]
+fn a_ranking_over_an_unranked_full_text_field_and_no_query_analyzer() {
+    let catalog = build_catalog(
+        &parse_schema(
+            r#"node Doc {
+    slug: String @key
+    body: String @index(fulltext, analyzer = "english_v1", scorer = "none")
+    title: String @index(fulltext, scorer = "none")
+    text: String @index(fulltext, analyzer = "standard_v1")
+    embedding: Vector(3)?
+}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let first = |src: &str| {
+        type_source(&catalog, src)
+            .unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
+            .into_iter()
+            .find_map(|(_, r)| r.err())
+    };
+    let pop = "let $pop = { match { $d: Doc } return { $d } }";
+    for field in ["body", "title"] {
+        for src in [
+            format!(
+                "query q($s: String) {{ match {{ {pop}, from bm25($pop, $d.{field}, $s) as $score }} return {{ $d.slug, $score }} }}"
+            ),
+            format!(
+                "query q($s: String, $v: Vector(3)) {{ match {{ {pop}, from rrf(nearest($pop, $d.embedding, $v, k: 5), bm25($pop, $d.{field}, $s)) as $fused }} return {{ $d.slug, $fused }} }}"
+            ),
+        ] {
+            let e = first(&src).unwrap_or_else(|| panic!("accepted:\n{src}"));
+            assert_eq!(e.code.as_str(), "T87", "{e}\n{src}");
+            assert!(e.to_string().contains("scorer = \"none\""), "{e}");
+        }
+        // Matching on the same field is admitted.
+        let src = format!(
+            "query q($s: String) {{ match {{ $d: Doc }} where match_terms($d.{field}, terms($s)) and search($d.{field}, $s) return {{ $d.slug }} }}"
+        );
+        assert!(first(&src).is_none(), "{src}");
+    }
+    let ranked = format!(
+        "query q($s: String) {{ match {{ {pop}, from bm25($pop, $d.text, $s) as $score }} return {{ $d.slug, $score }} }}"
+    );
+    assert!(first(&ranked).is_none(), "{ranked}");
+    for src in [
+        "query q($s: String) { match { $d: Doc } where match_terms($d.text, terms($s, analyzer: \"english_v1\")) return { $d.slug } }".to_string(),
+        format!(
+            "query q($s: String) {{ match {{ {pop}, from bm25($pop, $d.text, terms($s, analyzer: \"english_v1\")) as $score }} return {{ $score }} }}"
+        ),
+    ] {
+        let e = first(&src).unwrap_or_else(|| panic!("accepted:\n{src}"));
+        assert_eq!(e.code.as_str(), "T71", "{e}\n{src}");
+    }
+}
+
 #[test]
 fn nearest_without_k() {
     let m = refused(

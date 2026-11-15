@@ -241,10 +241,30 @@ pub enum IndexBuildSpec {
     },
     FullText {
         column: String,
+        analysis: FullTextBuild,
     },
     Vector {
         column: String,
     },
+}
+
+/// The analysis a full-text segment is built with: the profile the column's
+/// accepted schema declares, or edition 2's index analysis (Lance's default)
+/// when it declares none (docs/rfcs/2026-11-07-gq-3.md section 4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FullTextBuild {
+    /// `None` builds edition 2's index analysis.
+    pub profile: Option<omnigraph_compiler::schema::analysis::AnalyzerProfile>,
+    /// The analyzer fingerprint the segment's certificate records; `Some`
+    /// exactly when `profile` is.
+    pub fingerprint: Option<String>,
+}
+
+/// One column carrying a declared full-text index, with its analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullTextColumn {
+    pub column: String,
+    pub analysis: FullTextBuild,
 }
 
 /// A staged index reconciliation
@@ -878,7 +898,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         snapshot: SnapshotHandle,
         staged: StagedHandle,
         witness: &crate::table_store::StagingWitness,
-        declared_full_text: &[String],
+        declared_full_text: &[FullTextColumn],
     ) -> Result<(
         SnapshotHandle,
         crate::table_store::StagedTransactionIdentity,
@@ -890,7 +910,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn commit_full_text_declarations(
         &self,
         snapshot: SnapshotHandle,
-        columns: &[String],
+        columns: &[FullTextColumn],
         witness: &crate::table_store::StagingWitness,
     ) -> Result<
         Option<(
@@ -898,6 +918,20 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
             crate::table_store::StagedTransactionIdentity,
         )>,
     >;
+
+    /// Commit, detached under `witness`, the replacement of every full-text
+    /// segment of each column of `columns` by one untrained segment built
+    /// with the column's analysis (`TableStore::commit_full_text_redeclarations`):
+    /// the effect of a schema apply that changes a column's analyzer.
+    async fn commit_full_text_redeclarations(
+        &self,
+        snapshot: SnapshotHandle,
+        columns: &[FullTextColumn],
+        witness: &crate::table_store::StagingWitness,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )>;
 
     /// RFC 0067: the identity of the transaction a version records.
     fn transaction_identity(
@@ -1527,7 +1561,7 @@ impl TableStorage for TableStore {
         snapshot: SnapshotHandle,
         staged: StagedHandle,
         witness: &crate::table_store::StagingWitness,
-        declared_full_text: &[String],
+        declared_full_text: &[FullTextColumn],
     ) -> Result<(
         SnapshotHandle,
         crate::table_store::StagedTransactionIdentity,
@@ -1554,7 +1588,7 @@ impl TableStorage for TableStore {
     async fn commit_full_text_declarations(
         &self,
         snapshot: SnapshotHandle,
-        columns: &[String],
+        columns: &[FullTextColumn],
         witness: &crate::table_store::StagingWitness,
     ) -> Result<
         Option<(
@@ -1567,6 +1601,25 @@ impl TableStorage for TableStore {
                 .await?
                 .map(|(dataset, identity)| (SnapshotHandle::new(dataset), identity)),
         )
+    }
+
+    async fn commit_full_text_redeclarations(
+        &self,
+        snapshot: SnapshotHandle,
+        columns: &[FullTextColumn],
+        witness: &crate::table_store::StagingWitness,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )> {
+        let (dataset, identity) = TableStore::commit_full_text_redeclarations(
+            self,
+            snapshot.into_arc(),
+            columns,
+            witness,
+        )
+        .await?;
+        Ok((SnapshotHandle::new(dataset), identity))
     }
 
     async fn commit_staged_exact(

@@ -10,7 +10,7 @@ use lance_index::is_system_index;
 use lance_table::format::IndexMetadata;
 
 use crate::error::{OmniError, Result};
-use crate::fts_compat::verify_index;
+use crate::fts_compat::{DeclaredAnalyzers, verify_index};
 
 /// Whether a `key_col IN (...)` scan on a dataset will be served by the
 /// persisted scalar (BTREE) index, or silently fall back to a full filtered
@@ -68,16 +68,18 @@ impl FtsFilterDemand {
 
 /// Check only full-text reads, against this exact snapshot's artifacts.
 /// SQL SDK filters are inspected as typed expressions, not string-matched.
+/// `declared` holds the analyzer each column's accepted schema declares.
 pub async fn validate_full_text_scan(
     ds: &Dataset,
     scanner: &Scanner,
     columns: Option<HashSet<String>>,
+    declared: &DeclaredAnalyzers,
 ) -> Result<()> {
     let filter_demand = match scanner.get_expr_filter().map_err(OmniError::storage)? {
         Some(filter) => FtsFilterDemand::from_filter(&filter),
         None => FtsFilterDemand::default(),
     };
-    validate_full_text_demand(ds, columns, filter_demand).await
+    validate_full_text_demand(ds, columns, filter_demand, declared).await
 }
 
 /// The validation proper, over an already-derived demand: `columns` is
@@ -87,6 +89,7 @@ pub async fn validate_full_text_demand(
     ds: &Dataset,
     columns: Option<HashSet<String>>,
     filter_demand: FtsFilterDemand,
+    declared: &DeclaredAnalyzers,
 ) -> Result<()> {
     crate::instrumentation::record_fts_validation();
     let all_columns = columns.as_ref().is_some_and(HashSet::is_empty) || filter_demand.all_columns;
@@ -107,7 +110,15 @@ pub async fn validate_full_text_demand(
             (is_full_text_index(index) || index.index_details.is_none())
                 && (all_columns || index.fields.iter().any(|field| fields.contains(field)))
         }) {
-            verify_index(ds, index).await?;
+            // A segment over one field proves that field's declared analysis.
+            let expected = match index.fields.as_slice() {
+                [field] => ds
+                    .schema()
+                    .field_by_id(*field)
+                    .and_then(|field| declared.fingerprint(&field.name)),
+                _ => None,
+            };
+            verify_index(ds, index, expected).await?;
         }
         Ok(())
     })

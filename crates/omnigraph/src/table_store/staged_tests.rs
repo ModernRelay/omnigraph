@@ -3249,6 +3249,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                 },
                 IndexBuildSpec::FullText {
                     column: "body".to_string(),
+                    analysis: Default::default(),
                 },
                 // Second index on the SAME column: independent builders share
                 // one snapshot, so explicit names avoid an uncommitted-name
@@ -3419,7 +3420,7 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
             "characterize stock v11 reading actual v10 postings"
         );
         let guarded = TableStore::scan_stream_with(&old, None, None, None, false, |scan| {
-            scan.full_text_search(FullTextSearchQuery::new(term.into()))
+            scan.full_text_search(FullTextSearchQuery::new(term.into()), Default::default())
                 .map_err(OmniError::storage)?;
             Ok(())
         })
@@ -3434,6 +3435,7 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
             &old,
             &[IndexBuildSpec::FullText {
                 column: "text".into(),
+                analysis: Default::default(),
             }],
         )
         .await
@@ -3458,7 +3460,7 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
     for term in ["organism", "university", "running"] {
         let batches: Vec<_> =
             TableStore::scan_stream_with(&rebuilt, None, None, None, false, |scan| {
-                scan.full_text_search(FullTextSearchQuery::new(term.into()))
+                scan.full_text_search(FullTextSearchQuery::new(term.into()), Default::default())
                     .map_err(OmniError::storage)?;
                 Ok(())
             })
@@ -3471,7 +3473,7 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
     }
     assert_eq!(store.count_rows(&old, None).await.unwrap(), 3);
     assert!(matches!(
-        super::fts_compat::verify_index(&old, &old_indices[0]).await,
+        super::fts_compat::verify_index(&old, &old_indices[0], None).await,
         Err(OmniError::FullTextIndexRebuildRequired { .. })
     ));
 }

@@ -3662,6 +3662,22 @@ impl Ctx<'_> {
                     format!("declare `{property}: String @index(fulltext)` on `{type_name}`"),
                 ));
             }
+            if self
+                .catalog
+                .query_node_type(&type_name)
+                .is_some_and(|n| !n.full_text_scorer(&property).ranks())
+            {
+                return Err(err_fix(
+                    T87,
+                    format!(
+                        "`bm25` ranks `{type_name}.{property}`, whose full-text index declares `scorer = \"none\"`: the field matches but does not rank"
+                    ),
+                    format!(
+                        "match without a score, `match_terms(${}.{property}, terms(…))` in `where`, or declare `scorer = \"bm25_v1\"` on the index",
+                        column
+                    ),
+                ));
+            }
             ScoreQueryId::Lexical(self.lexical(sc, query_arg)?)
         } else {
             let ScalarType::Vector(dim) = prop.scalar else {

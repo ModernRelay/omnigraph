@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::error::{CompilerError, Result, SchemaIdentityError};
+use crate::schema::analysis::FullTextAnalysis;
 use crate::schema::ast::{Annotation, Cardinality, Constraint, ConstraintBound};
 use crate::schema::is_reserved_storage_system_column;
 use crate::types::PropType;
@@ -51,6 +52,14 @@ pub const FEATURE_SYSTEM_COLUMNS: &str = "system-columns";
 /// Feature name: the schema declares an edge `@key` (RFC 0044). Derived from
 /// the declarations at every accept.
 pub const FEATURE_EDGE_KEYS: &str = "edge-keys";
+
+/// Feature name: a property's full-text index declares an analyzer profile or
+/// a scorer (`@index(fulltext, analyzer = ..., scorer = ...)`,
+/// docs/rfcs/2026-11-07-gq-3.md section 4). Derived from the declarations at
+/// every accept; a binary that does not know it would build and certify the
+/// field's index with edition 2's analysis and rank a `scorer = "none"` field,
+/// so it refuses the IR instead.
+pub const FEATURE_FULL_TEXT_ANALYSIS: &str = "full-text-analysis";
 
 /// The per-graph spellings of the implicit stored columns. Resolved from the
 /// accepted IR's feature set; no other code path may assume a spelling
@@ -101,7 +110,9 @@ pub fn is_supported_ir_version(version: u32) -> bool {
 
 /// Every feature name this build knows; an IR naming any other is refused.
 pub fn is_known_feature(name: &str) -> bool {
-    name == FEATURE_SYSTEM_COLUMNS || name == FEATURE_EDGE_KEYS
+    name == FEATURE_SYSTEM_COLUMNS
+        || name == FEATURE_EDGE_KEYS
+        || name == FEATURE_FULL_TEXT_ANALYSIS
 }
 
 /// The feature set an accepted schema must carry: the names its declarations
@@ -119,6 +130,16 @@ pub fn required_features(ir: &SchemaIR) -> BTreeSet<String> {
     });
     if has_edge_key {
         features.insert(FEATURE_EDGE_KEYS.to_string());
+    }
+    let declares_analysis = ir
+        .interfaces
+        .iter()
+        .flat_map(|interface| &interface.properties)
+        .chain(ir.nodes.iter().flat_map(|node| &node.properties))
+        .chain(ir.edges.iter().flat_map(|edge| &edge.properties))
+        .any(|property| property.full_text.is_some());
+    if declares_analysis {
+        features.insert(FEATURE_FULL_TEXT_ANALYSIS.to_string());
     }
     features
 }
@@ -422,8 +443,24 @@ pub struct PropertyIR {
     pub annotations: Vec<Annotation>,
     pub property_constraints: Vec<PropertyConstraintShape>,
     pub embed_source: Option<EmbedSourceIR>,
+    /// The full-text analysis its index declares beyond edition 2's
+    /// (`@index(fulltext, analyzer = ..., scorer = ...)`), bound to this
+    /// property's identity: a rename keeps it, drop and re-add declares it
+    /// anew. Absent, and absent from the serialized IR, when edition 2's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_text: Option<FullTextAnalysis>,
     pub declared_directly: bool,
     pub satisfies_interface_properties: Vec<PropertyRefIR>,
+}
+
+impl PropertyIR {
+    /// The analyzer fingerprint of this property's declared profile, `None`
+    /// when its full-text index keeps edition 2's analysis.
+    pub fn full_text_fingerprint(&self) -> Option<String> {
+        self.full_text
+            .as_ref()
+            .and_then(|analysis| analysis.fingerprint(self.property_id.get()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1072,6 +1109,7 @@ fn build_properties(
                 annotations: property.annotations.clone(),
                 property_constraints: property.property_constraints.clone(),
                 embed_source,
+                full_text: property.full_text,
                 declared_directly: property.declared_directly,
                 satisfies_interface_properties,
             })
@@ -1335,6 +1373,7 @@ fn property_shape_from_ir(property: &PropertyIR) -> PropertyShape {
                 property_name: embed.source.property_name.clone(),
                 model: embed.model.clone(),
             }),
+        full_text: property.full_text,
         declared_directly: property.declared_directly,
         satisfies_interface_properties,
     }
@@ -1534,6 +1573,22 @@ pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
             )?;
             if let Some(values) = &property.prop_type.enum_values {
                 ensure_sorted_unique(values.iter().map(String::as_str), "enum values")?;
+            }
+            if property.full_text.is_some() {
+                let free_text = property.prop_type.scalar == crate::types::ScalarType::String
+                    && !property.prop_type.list
+                    && !property.prop_type.is_enum();
+                if entry.kind != TypeKind::Node
+                    || !free_text
+                    || !property
+                        .property_constraints
+                        .contains(&PropertyConstraintShape::Index)
+                {
+                    return invalid_ir(format!(
+                        "property '{}.{}' declares full-text analysis without a full-text index on a node's free-text String property",
+                        entry.name, property.name
+                    ));
+                }
             }
             if property
                 .property_constraints
@@ -2036,6 +2091,75 @@ mod tests {
             schema_shape_hash(&projected).unwrap(),
             schema_shape_hash(&desired_shape).unwrap()
         );
+    }
+
+    /// The analyzer fingerprint binds property identity (RFC 0040): a rename
+    /// keeps it, drop and re-add mints a new one, and a declared analysis
+    /// stamps the `full-text-analysis` feature an older binary refuses.
+    #[test]
+    fn full_text_analysis_is_a_feature_bound_to_property_identity() {
+        let property = |ir: &SchemaIR, name: &str| {
+            ir.nodes[0]
+                .properties
+                .iter()
+                .find(|property| property.name == name)
+                .unwrap()
+                .clone()
+        };
+        let accepted = initialize(
+            r#"node Doc { slug: String @key body: String @index(fulltext, analyzer = "english_v1") }"#,
+        );
+        assert!(accepted.features.contains(FEATURE_FULL_TEXT_ANALYSIS));
+        let body = property(&accepted, "body");
+        let fingerprint = body.full_text_fingerprint().unwrap();
+        assert_eq!(
+            build_catalog_from_ir(&accepted).unwrap().node_types["Doc"].full_text_fingerprints["body"],
+            fingerprint
+        );
+        assert!(
+            schema_ir_json(&accepted)
+                .unwrap()
+                .contains(r#""full_text":{"analyzer":"english_v1","scorer":"bm25_v1"}"#)
+        );
+
+        let evolve = |source: &str| {
+            let shape = compile_schema_shape(&parse_schema(source).unwrap()).unwrap();
+            resolve_schema_ir(&accepted, &shape).unwrap().schema_ir
+        };
+        let renamed = evolve(
+            r#"node Doc { slug: String @key text: String @rename_from("body") @index(fulltext, analyzer = "english_v1") }"#,
+        );
+        assert_eq!(
+            property(&renamed, "text").full_text_fingerprint(),
+            Some(fingerprint.clone())
+        );
+        let readded = evolve(
+            r#"node Doc { slug: String @key text: String @index(fulltext, analyzer = "english_v1") }"#,
+        );
+        let readded_fingerprint = property(&readded, "text").full_text_fingerprint().unwrap();
+        assert_ne!(readded_fingerprint, fingerprint);
+
+        // Without a declaration the feature and the field are absent, so an
+        // edition 2 schema keeps its bytes.
+        let edition_2 = evolve(r#"node Doc { slug: String @key body: String @index(fulltext) }"#);
+        assert!(!edition_2.features.contains(FEATURE_FULL_TEXT_ANALYSIS));
+        assert!(!schema_ir_json(&edition_2).unwrap().contains("full_text"));
+        assert_eq!(property(&edition_2, "body").full_text_fingerprint(), None);
+
+        // The feature set is derived: a hand-authored IR whose set disagrees
+        // with its declarations is refused, and so is an unknown feature.
+        let mut stripped = accepted.clone();
+        stripped.features.remove(FEATURE_FULL_TEXT_ANALYSIS);
+        assert!(validate_schema_ir(&stripped).is_err());
+        let mut unindexed = accepted.clone();
+        unindexed.nodes[0]
+            .properties
+            .iter_mut()
+            .find(|property| property.name == "body")
+            .unwrap()
+            .property_constraints
+            .clear();
+        assert!(validate_schema_ir(&unindexed).is_err());
     }
 
     #[test]

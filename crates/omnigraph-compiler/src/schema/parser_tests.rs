@@ -1733,3 +1733,147 @@ fn test_reject_edge_key_column_rules() {
         );
     }
 }
+
+/// `@index(fulltext, analyzer = ..., scorer = ...)` declares the property's
+/// full-text index with its analysis; `@index(fulltext)` and a bare `@index`
+/// declare the same index with edition 2's analysis (docs/rfcs/2026-11-07-gq-3.md
+/// section 4, Schema: Text).
+#[test]
+fn full_text_index_declares_its_analyzer_and_scorer() {
+    use crate::schema::analysis::{
+        AnalyzerProfile, FullTextAnalysis, FullTextScorer, declared_analysis,
+    };
+    let schema = parse_schema(
+        r#"
+node Doc {
+    slug: String @key
+    title: String @index(fulltext, analyzer = "english_v1")
+    body: String @index(fulltext, analyzer = "standard_v1", scorer = "bm25_v1")
+    note: String @index(fulltext, analyzer = "standard_folded_v1", scorer = "none")
+    tag: String @index(fulltext, scorer = "none")
+    plain: String @index(fulltext)
+    legacy: String @index
+}
+"#,
+    )
+    .unwrap();
+    let SchemaDecl::Node(node) = &schema.declarations[0] else {
+        panic!("expected Node");
+    };
+    let analysis = |name: &str| {
+        let prop = node.properties.iter().find(|p| p.name == name).unwrap();
+        declared_analysis(&prop.annotations)
+    };
+    assert_eq!(
+        analysis("title"),
+        Some(FullTextAnalysis {
+            analyzer: Some(AnalyzerProfile::EnglishV1),
+            scorer: FullTextScorer::Bm25V1,
+        })
+    );
+    assert_eq!(
+        analysis("body"),
+        Some(FullTextAnalysis {
+            analyzer: Some(AnalyzerProfile::StandardV1),
+            scorer: FullTextScorer::Bm25V1,
+        })
+    );
+    assert_eq!(
+        analysis("note"),
+        Some(FullTextAnalysis {
+            analyzer: Some(AnalyzerProfile::StandardFoldedV1),
+            scorer: FullTextScorer::None,
+        })
+    );
+    assert_eq!(
+        analysis("tag"),
+        Some(FullTextAnalysis {
+            analyzer: None,
+            scorer: FullTextScorer::None,
+        })
+    );
+    assert_eq!(analysis("plain"), None);
+    assert_eq!(analysis("legacy"), None);
+    for property in ["title", "body", "note", "tag", "plain", "legacy"] {
+        assert!(
+            node.constraints
+                .iter()
+                .any(|c| matches!(c, Constraint::Index(v) if v == &[property])),
+            "{property} declares its index"
+        );
+    }
+}
+
+#[test]
+fn full_text_index_refuses_unknown_options_profiles_scorers_and_types() {
+    for (schema, needle) in [
+        (
+            r#"node Doc { body: String @index(fulltext, analyzer = "english") }"#,
+            r#"unknown analyzer "english"; the profiles are "standard_v1", "standard_folded_v1", "english_v1""#,
+        ),
+        (
+            r#"node Doc { body: String @index(fulltext, analyzer = "english_v2") }"#,
+            "unknown analyzer \"english_v2\"",
+        ),
+        (
+            r#"node Doc { body: String @index(fulltext, scorer = "bm25") }"#,
+            r#"unknown scorer "bm25"; the scorers are "bm25_v1", "none""#,
+        ),
+        (
+            r#"node Doc { body: String @index(fulltext, tokenizer = "simple") }"#,
+            "unknown option 'tokenizer ='; it admits analyzer and scorer",
+        ),
+        (
+            r#"node Doc { body: String @index(fulltext, analyzer = "english_v1", analyzer = "standard_v1") }"#,
+            "repeats the option 'analyzer'",
+        ),
+        (
+            r#"node Doc { n: I32 @index(fulltext) }"#,
+            "needs a String property",
+        ),
+        (
+            r#"node Doc { kind: enum(a, b) @index(fulltext) }"#,
+            "an enum takes a scalar index",
+        ),
+        (
+            r#"node Doc { tags: [String] @index(fulltext) }"#,
+            "not supported on list property",
+        ),
+        (
+            r#"node Doc { body: String @index @index(fulltext) }"#,
+            "declares @index multiple times",
+        ),
+        (
+            "node A { k: String @key }\nedge E: A -> A { note: String @index(fulltext, analyzer = \"english_v1\") }",
+            "full-text analysis is declared on node properties",
+        ),
+        (
+            "interface Named { name: String @index(fulltext, analyzer = \"english_v1\") }\nnode A implements Named { k: String @key }",
+            "declare the full-text index on the implementing node's property",
+        ),
+    ] {
+        let error = parse_schema(schema).unwrap_err().to_string();
+        assert!(error.contains(needle), "{schema}: {error}");
+    }
+}
+
+/// `@index(fulltext)` after a property is that property's index; on a type
+/// that also declares a property named `fulltext` the text once read as a
+/// body-level index on it, so it is refused instead of changing meaning.
+#[test]
+fn full_text_index_after_a_property_is_refused_beside_a_property_named_fulltext() {
+    let error = parse_schema("node Doc { fulltext: String\n body: String @index(fulltext) }")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("is ambiguous"), "{error}");
+    // Written first in the body, it is still the body-level index.
+    let schema = parse_schema("node Doc { @index(fulltext)\n fulltext: String }").unwrap();
+    let SchemaDecl::Node(node) = &schema.declarations[0] else {
+        panic!("expected Node");
+    };
+    assert!(
+        node.constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::Index(v) if v == &["fulltext"]))
+    );
+}

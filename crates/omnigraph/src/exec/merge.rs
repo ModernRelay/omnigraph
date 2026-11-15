@@ -4505,11 +4505,14 @@ struct MergeChain {
     links: Vec<SnapshotHandle>,
     uuids: Vec<String>,
     witness: crate::table_store::StagingWitness,
-    declared_full_text: Vec<String>,
+    declared_full_text: Vec<crate::storage_layer::FullTextColumn>,
 }
 
 impl MergeChain {
-    fn new(witness: crate::table_store::StagingWitness, declared_full_text: Vec<String>) -> Self {
+    fn new(
+        witness: crate::table_store::StagingWitness,
+        declared_full_text: Vec<crate::storage_layer::FullTextColumn>,
+    ) -> Self {
         Self {
             links: Vec::new(),
             uuids: Vec::new(),

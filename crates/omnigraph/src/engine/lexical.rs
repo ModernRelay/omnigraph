@@ -81,8 +81,12 @@ impl LexicalMembers {
             let dataset = snapshot
                 .open_lance_dataset(&format!("node:{type_name}"))
                 .await?;
+            let node_type = catalog.node_types.get(&type_name).ok_or_else(|| {
+                OmniError::manifest_internal(format!("unknown node type '{type_name}'"))
+            })?;
             let ids = super::scan::search_filter_member_ids(
                 &dataset,
+                node_type,
                 None,
                 query,
                 catalog.system_columns.id,

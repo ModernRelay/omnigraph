@@ -310,9 +310,14 @@ async fn hydrate_nodes(
             scanner.filter_expr(filter_expr);
             scanner.prefilter(true);
             if let Some(query) = fts {
-                scanner.full_text_search(query).map_err(|error| {
-                    OmniError::storage_context("destination full-text search", error)
-                })?;
+                scanner
+                    .full_text_search(
+                        query,
+                        crate::db::omnigraph::table_ops::declared_analyzers(node_type),
+                    )
+                    .map_err(|error| {
+                        OmniError::storage_context("destination full-text search", error)
+                    })?;
             }
             Ok(())
         },

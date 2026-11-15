@@ -581,7 +581,7 @@ fn desugar_property_constraints(properties: &[PropDecl], constraints: &mut Vec<C
                 "unique" if ann.value.is_none() => {
                     constraints.push(Constraint::Unique(vec![prop.name.clone()]));
                 }
-                "index" if ann.value.is_none() => {
+                "index" if super::analysis::is_property_index_annotation(ann) => {
                     constraints.push(Constraint::Index(vec![prop.name.clone()]));
                 }
                 _ => {}
@@ -661,8 +661,10 @@ fn parse_prop_decl(pair: pest::iterators::Pair<Rule>) -> Result<PropDecl> {
 
     let mut annotations = Vec::new();
     for item in inner {
-        if let Rule::annotation = item.as_rule() {
-            annotations.push(parse_annotation(item)?);
+        match item.as_rule() {
+            Rule::annotation => annotations.push(parse_annotation(item)?),
+            Rule::index_annotation => annotations.push(parse_index_annotation(item)?),
+            _ => {}
         }
     }
 
@@ -790,6 +792,38 @@ fn parse_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {
     })
 }
 
+/// `@index(fulltext, key = "value", ...)` on a property: an `index` annotation
+/// whose value is the index kind, its options as keyword arguments. A repeated
+/// option is refused here, before the map would keep the last one.
+fn parse_index_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {
+    let mut value = None;
+    let mut kwargs = std::collections::BTreeMap::new();
+    for arg in pair.into_inner() {
+        match arg.as_rule() {
+            Rule::index_kind => value = Some(arg.as_str().to_string()),
+            Rule::annotation_kwarg => {
+                let mut kw = arg.into_inner();
+                let key = kw.next().unwrap().as_str().to_string();
+                let raw = kw.next().unwrap().as_str();
+                if kwargs
+                    .insert(key.clone(), decode_string_literal(raw)?)
+                    .is_some()
+                {
+                    return Err(CompilerError::Parse(format!(
+                        "@index(fulltext, ...) repeats the option '{key}'"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(Annotation {
+        name: "index".to_string(),
+        value,
+        kwargs,
+    })
+}
+
 fn validate_string_annotation(
     annotations: &[Annotation],
     annotation: &str,
@@ -834,6 +868,15 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                         &prop.annotations,
                         &format!("property {}.{}", interface.name, prop.name),
                     )?;
+                    if prop.annotations.iter().any(|ann| {
+                        ann.name == "index"
+                            && ann.value.as_deref() == Some(super::analysis::FULL_TEXT_INDEX_KIND)
+                    }) {
+                        return Err(CompilerError::Parse(format!(
+                            "@index(fulltext) on interface property {}.{}: declare the full-text index on the implementing node's property",
+                            interface.name, prop.name
+                        )));
+                    }
                 }
             } // Interfaces have no type-level annotations
             SchemaDecl::Node(node) => {
@@ -866,6 +909,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                 for prop in &node.properties {
                     validate_property_annotations(prop, &node.name, &node.properties, false)?;
                 }
+                refuse_ambiguous_full_text_index(&node.name, &node.properties)?;
             }
             SchemaDecl::Edge(edge) => {
                 rename_from_annotation(&edge.annotations, &format!("edge {}", edge.name))?;
@@ -895,6 +939,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                 for prop in &edge.properties {
                     validate_property_annotations(prop, &edge.name, &edge.properties, true)?;
                 }
+                refuse_ambiguous_full_text_index(&edge.name, &edge.properties)?;
             }
         }
     }
@@ -1010,11 +1055,17 @@ fn validate_property_annotations(
                 unique_seen = true;
             }
             "index" => {
-                if ann.value.is_some() {
-                    return Err(CompilerError::Parse(format!(
-                        "@index on {}.{} does not accept a value",
-                        type_name, prop.name
-                    )));
+                match ann.value.as_deref() {
+                    None => {}
+                    Some(super::analysis::FULL_TEXT_INDEX_KIND) => {
+                        validate_full_text_index(ann, prop, type_name, is_edge)?;
+                    }
+                    Some(_) => {
+                        return Err(CompilerError::Parse(format!(
+                            "@index on {}.{} does not accept a value",
+                            type_name, prop.name
+                        )));
+                    }
                 }
                 if index_seen {
                     return Err(CompilerError::Parse(format!(
@@ -1083,6 +1134,90 @@ fn validate_property_annotations(
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// `@index(fulltext)` after a property is that property's full-text index.
+/// On a type that also declares a property named `fulltext`, the same text
+/// once read as a body-level index on that property, so it is refused rather
+/// than read either way: the fix is `@index` on the property it means.
+fn refuse_ambiguous_full_text_index(type_name: &str, properties: &[PropDecl]) -> Result<()> {
+    if !properties
+        .iter()
+        .any(|prop| prop.name == super::analysis::FULL_TEXT_INDEX_KIND)
+    {
+        return Ok(());
+    }
+    for prop in properties {
+        if prop.annotations.iter().any(|ann| {
+            ann.name == "index"
+                && ann.value.as_deref() == Some(super::analysis::FULL_TEXT_INDEX_KIND)
+                && ann.kwargs.is_empty()
+        }) {
+            return Err(CompilerError::Parse(format!(
+                "@index(fulltext) after {type_name}.{} is ambiguous because {type_name} declares a property named 'fulltext': write `@index` on the property the index is for",
+                prop.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `@index(fulltext, analyzer = "...", scorer = "...")`: a full-text index on
+/// a free-text String property, with options naming a known profile and
+/// scorer. Analysis is declared on node properties, the ones whose full-text
+/// index the engine builds.
+fn validate_full_text_index(
+    ann: &Annotation,
+    prop: &PropDecl,
+    type_name: &str,
+    is_edge: bool,
+) -> Result<()> {
+    use super::analysis::{AnalyzerProfile, FullTextScorer, admitted_profiles, admitted_scorers};
+    let target = format!("{}.{}", type_name, prop.name);
+    if prop.prop_type.scalar != ScalarType::String
+        || prop.prop_type.list
+        || prop.prop_type.is_enum()
+    {
+        let reason = if prop.prop_type.is_enum() {
+            "an enum takes a scalar index; write `@index`".to_string()
+        } else {
+            format!("{target} is not a free-text String")
+        };
+        return Err(CompilerError::Parse(format!(
+            "@index(fulltext) declares a full-text index, which needs a String property: {reason}"
+        )));
+    }
+    for (key, value) in &ann.kwargs {
+        match key.as_str() {
+            "analyzer" => {
+                if AnalyzerProfile::parse(value).is_none() {
+                    return Err(CompilerError::Parse(format!(
+                        "@index(fulltext) on {target} names the unknown analyzer \"{value}\"; the profiles are {}",
+                        admitted_profiles()
+                    )));
+                }
+            }
+            "scorer" => {
+                if FullTextScorer::parse(value).is_none() {
+                    return Err(CompilerError::Parse(format!(
+                        "@index(fulltext) on {target} names the unknown scorer \"{value}\"; the scorers are {}",
+                        admitted_scorers()
+                    )));
+                }
+            }
+            other => {
+                return Err(CompilerError::Parse(format!(
+                    "@index(fulltext) on {target} has unknown option '{other} ='; it admits analyzer and scorer"
+                )));
+            }
+        }
+    }
+    if is_edge && !ann.kwargs.is_empty() {
+        return Err(CompilerError::Parse(format!(
+            "@index(fulltext) on edge property {target} declares analysis; full-text analysis is declared on node properties, whose full-text index the engine builds"
+        )));
     }
     Ok(())
 }

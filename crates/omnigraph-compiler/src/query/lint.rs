@@ -11,6 +11,7 @@ use crate::query::parser::parse_query_diagnostic;
 
 const PARSE_ERROR_CODE: &str = "Q000";
 const L201_CODE: &str = "L201";
+const L202_CODE: &str = "L202";
 const HARDCODED_MUTATION_WARNING: &str =
     "mutation declares no params; hardcoded mutations are easy to miss";
 
@@ -177,6 +178,7 @@ pub fn lint_query_file(
             }
 
             let mut findings = lint_update_coverage(catalog, &coverage);
+            findings.extend(lint_undeclared_analyzers(catalog));
             findings.sort_by(findings_cmp);
 
             let errors = results
@@ -348,6 +350,57 @@ fn lint_update_coverage(
         }
     }
     findings
+}
+
+/// `L202`: a node property's full-text index declares no analyzer, so it keeps
+/// edition 2's index analysis (the substrate's default) rather than a profile
+/// the language versions. The finding names the profile to declare,
+/// `english_v1` being the closest to that analysis
+/// (docs/rfcs/2026-11-07-gq-3.md section 4, Schema: Text).
+fn lint_undeclared_analyzers(catalog: &Catalog) -> Vec<QueryLintFinding> {
+    use crate::schema::analysis::AnalyzerProfile;
+    let mut findings = Vec::new();
+    let mut type_names = catalog.node_types.keys().collect::<Vec<_>>();
+    type_names.sort();
+    for type_name in type_names {
+        let node_type = &catalog.node_types[type_name];
+        let mut property_names = node_type.properties.keys().collect::<Vec<_>>();
+        property_names.sort();
+        for property_name in property_names {
+            if !node_type.has_full_text_index(property_name)
+                || node_type.full_text_profile(property_name).is_some()
+                || !declares_index(node_type, property_name)
+            {
+                continue;
+            }
+            let closest = AnalyzerProfile::CLOSEST_TO_EDITION_2;
+            findings.push(QueryLintFinding {
+                severity: QueryLintSeverity::Info,
+                code: L202_CODE.to_string(),
+                message: format!(
+                    "{type_name}.{property_name}'s full-text index declares no analyzer and keeps edition 2's index analysis; declare a profile, `@index(fulltext, analyzer = \"{closest}\")` being the closest (it differs by the 40-byte token filter and NFC)"
+                ),
+                type_name: Some(type_name.clone()),
+                property: Some(property_name.clone()),
+                query_names: Vec::new(),
+            });
+        }
+    }
+    findings
+}
+
+/// Whether `property` carries a written one-column `@index`, beyond the
+/// index its one-column `@key` implies: the declaration an analyzer belongs to.
+fn declares_index(node_type: &crate::catalog::NodeType, property: &str) -> bool {
+    let single =
+        |columns: &Vec<String>| matches!(columns.as_slice(), [column] if column == property);
+    let written = node_type
+        .indices
+        .iter()
+        .filter(|columns| single(columns))
+        .count();
+    let implied = usize::from(node_type.key.as_ref().is_some_and(single));
+    written > implied
 }
 
 fn findings_cmp(left: &QueryLintFinding, right: &QueryLintFinding) -> std::cmp::Ordering {

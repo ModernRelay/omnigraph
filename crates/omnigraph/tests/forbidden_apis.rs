@@ -950,7 +950,7 @@ gateway_surfaces! {
         "commit_staged_detached",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("detached full-text declaration of a schema-declared index")) => [
-        "commit_full_text_declarations",
+        "commit_full_text_declarations", "commit_full_text_redeclarations",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
         "session", "validate_initial_empty_table",
@@ -999,7 +999,7 @@ gateway_surfaces! {
         "commit_staged_detached",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("detached full-text declaration of a schema-declared index")) => [
-        "commit_full_text_declarations",
+        "commit_full_text_declarations", "commit_full_text_redeclarations",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::EphemeralScratch) => [
         "append_or_create_batch", "create_empty_dataset", "write_dataset",
@@ -1133,8 +1133,8 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
     ("storage_layer.rs", ".dataset()", 42, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 7, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", "SnapshotHandle::new(", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "DeleteBuilder::from_expr(", 1, WriteProtocol::Composed("staged delete primitive")),
     ("table_store.rs", ".extend_deletions(", 1, WriteProtocol::Composed("staged delete primitive over row addresses its caller's scan captured: Lance's DeleteBuilder after its scan")),

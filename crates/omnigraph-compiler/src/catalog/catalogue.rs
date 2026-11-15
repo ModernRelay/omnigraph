@@ -142,6 +142,8 @@ impl CatalogueType {
             range_constraints: Vec::new(),
             check_constraints: Vec::new(),
             embed_sources: HashMap::new(),
+            full_text_analysis: HashMap::new(),
+            full_text_fingerprints: HashMap::new(),
             blob_properties: Default::default(),
             arrow_schema: Arc::new(Schema::new(fields)),
         }

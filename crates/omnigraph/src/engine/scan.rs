@@ -205,6 +205,7 @@ impl<'n> NodeRead<'n> {
                     Some(query) => Some(
                         search_filter_member_ids(
                             &ds,
+                            node_type,
                             filter_expr.as_ref(),
                             query,
                             catalog.system_columns.id,
@@ -275,7 +276,10 @@ impl<'n> NodeRead<'n> {
         }
         if let Some(fts_query) = &self.fts_query {
             scanner
-                .full_text_search(fts_query.clone())
+                .full_text_search(
+                    fts_query.clone(),
+                    crate::db::omnigraph::table_ops::declared_analyzers(self.node_type),
+                )
                 .map_err(|error| OmniError::storage_context("full_text_search", error))?;
         }
         Ok(())
@@ -674,6 +678,7 @@ fn search_filter_is_ranking(
 /// Filter membership without adding the filter's score to the BM25 ranking.
 pub(super) async fn search_filter_member_ids(
     dataset: &Dataset,
+    node_type: &omnigraph_compiler::catalog::NodeType,
     filter: Option<&Expr>,
     query: FullTextSearchQuery,
     id_column: &str,
@@ -690,7 +695,10 @@ pub(super) async fn search_filter_member_ids(
                 scanner.prefilter(true);
             }
             scanner
-                .full_text_search(query)
+                .full_text_search(
+                    query,
+                    crate::db::omnigraph::table_ops::declared_analyzers(node_type),
+                )
                 .map_err(|error| OmniError::storage_context("full_text_search", error))?;
             Ok(())
         },

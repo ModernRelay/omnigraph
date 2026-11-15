@@ -117,6 +117,9 @@ codes! {
     T84 = "a name an inner scope, a block, an optional or an inline read, uses in a triple without binding it";
     T85 = "a `from` over a relation carrying an unnamed score without `as`, or an `as` on a `from` whose relation carries none";
     T86 = "a term this release's planner does not lower; the message names the stage that adds it";
+    // docs/rfcs/2026-11-07-gq-3.md section 4, Errors: `scorer = "none"`
+    // allows matching and makes a ranking call on the field a type error.
+    T87 = "a ranking call on a field whose full-text index declares `scorer = \"none\"`";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
     // the binding it ranks, and `rrf()` arms one traversal connects are T59.

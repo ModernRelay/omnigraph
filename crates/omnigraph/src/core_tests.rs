@@ -12,6 +12,105 @@ mod fts_compat_tests {
         CERTIFICATE_FILE, MAX_CERTIFICATE_BYTES, certificate_path, verify_index,
     };
 
+    /// A declared profile builds its segment with every Lance parameter set
+    /// from the profile table, none left to a Lance default
+    /// (docs/rfcs/2026-11-07-gq-3.md section 4), and certifies the field's
+    /// analyzer fingerprint; edition 2's analysis keeps Lance's default
+    /// parameters and a certificate without a fingerprint.
+    #[tokio::test]
+    async fn each_profile_builds_explicit_parameters_and_certifies_its_fingerprint() {
+        use arrow_array::{RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance::index::DatasetIndexExt;
+        use lance_index::pbold::InvertedIndexDetails;
+        use omnigraph_compiler::schema::analysis::AnalyzerProfile;
+
+        use crate::storage_layer::{FullTextBuild, IndexBuildSpec};
+        use crate::table_store::TableStore;
+
+        // (profile, stem, stop words, ASCII folding)
+        let cases = [
+            (Some(AnalyzerProfile::StandardV1), false, false, false),
+            (Some(AnalyzerProfile::StandardFoldedV1), false, false, true),
+            (Some(AnalyzerProfile::EnglishV1), true, true, true),
+            (None, true, true, true),
+        ];
+        for (profile, stem, stop_words, folding) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let uri = directory.path().join("profile.lance");
+            let uri = uri.to_str().unwrap();
+            let store = TableStore::new(
+                uri,
+                crate::lance_access::LanceAccessContext::new().data_session(),
+            );
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)])),
+                vec![Arc::new(StringArray::from(vec!["Runners were RUNNING"]))],
+            )
+            .unwrap();
+            TableStore::write_dataset(uri, batch).await.unwrap();
+            let dataset = store.open_dataset_head(uri, None).await.unwrap();
+            let fingerprint = profile.map(|profile| format!("sha256:{profile}"));
+            let staged = store
+                .stage_create_indices(
+                    &dataset,
+                    &[IndexBuildSpec::FullText {
+                        column: "body".into(),
+                        analysis: FullTextBuild {
+                            profile,
+                            fingerprint: fingerprint.clone(),
+                        },
+                    }],
+                )
+                .await
+                .unwrap();
+            let (dataset, _) = store
+                .commit_staged_exact(Arc::new(dataset), staged)
+                .await
+                .unwrap();
+            let index = dataset.load_indices().await.unwrap()[0].clone();
+            let details = index
+                .index_details
+                .as_ref()
+                .unwrap()
+                .to_msg::<InvertedIndexDetails>()
+                .unwrap();
+            assert_eq!(
+                details.base_tokenizer.as_deref(),
+                Some("simple"),
+                "{profile:?}"
+            );
+            assert_eq!(details.language, "\"English\"", "{profile:?}");
+            assert!(details.lower_case, "{profile:?}");
+            assert_eq!(details.stem, stem, "{profile:?}");
+            assert_eq!(details.remove_stop_words, stop_words, "{profile:?}");
+            assert_eq!(details.ascii_folding, folding, "{profile:?}");
+            assert!(!details.with_position, "{profile:?}");
+            assert_eq!(details.block_size, Some(128), "{profile:?}");
+            assert_eq!(details.code_config, None, "{profile:?}");
+            // Edition 2's 40-byte token filter; no profile filters by length.
+            let max_token_length = if profile.is_some() { None } else { Some(40) };
+            assert_eq!(details.max_token_length, max_token_length, "{profile:?}");
+            if profile.is_some() {
+                assert_eq!(details.posting_format_version, Some(2), "{profile:?}");
+            }
+            verify_index(&dataset, &index, fingerprint.as_deref())
+                .await
+                .unwrap();
+            let other = match fingerprint {
+                Some(_) => None,
+                None => Some("sha256:english_v1"),
+            };
+            assert!(
+                matches!(
+                    verify_index(&dataset, &index, other).await,
+                    Err(OmniError::FullTextIndexRebuildRequired { .. })
+                ),
+                "{profile:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn certificate_file_is_bounded_and_follows_shallow_clone_ownership() {
         use arrow_array::{RecordBatch, StringArray};
@@ -65,6 +164,7 @@ mod fts_compat_tests {
                 &dataset,
                 &[IndexBuildSpec::FullText {
                     column: "body".into(),
+                    analysis: Default::default(),
                 }],
             )
             .await
@@ -89,9 +189,9 @@ mod fts_compat_tests {
         let pooled_store = pooled_reader.object_store(None).await.unwrap();
         assert!(!Arc::ptr_eq(&object_store, &pooled_store));
         object_store.io_stats_incremental();
-        verify_index(&dataset, &index).await.unwrap();
+        verify_index(&dataset, &index, None).await.unwrap();
         assert!(object_store.io_stats_incremental().read_iops > 0);
-        verify_index(&dataset, &index).await.unwrap();
+        verify_index(&dataset, &index, None).await.unwrap();
         // Another graph's pooled client must not contaminate these counters.
         // Keep this deterministic instead of relying on parallel test timing.
         pooled_store.read_one_all(&path).await.unwrap();
@@ -109,7 +209,7 @@ mod fts_compat_tests {
         let tracked_store = cloud_reader.object_store(None).await.unwrap();
         assert!(!tracked_store.has_direct_local_paths());
         tracked_store.io_stats_incremental();
-        verify_index(&cloud_reader, &index).await.unwrap();
+        verify_index(&cloud_reader, &index, None).await.unwrap();
         let cold = tracked_store.io_stats_incremental();
         let methods: Vec<_> = cold.requests.iter().map(|request| request.method).collect();
         // object_store 0.14 routes a single bounded range through get_opts.
@@ -131,7 +231,7 @@ mod fts_compat_tests {
         assert_eq!(cold.requests[0].range, None);
         assert_eq!(cold.requests[1].range, Some(0..certificate_bytes));
         assert!(cold.requests.iter().all(|request| request.path == path));
-        verify_index(&cloud_reader, &index).await.unwrap();
+        verify_index(&cloud_reader, &index, None).await.unwrap();
         assert!(tracked_store.io_stats_incremental().requests.is_empty());
 
         // A changed certificate inventory or artifact cannot borrow the warm
@@ -147,7 +247,7 @@ mod fts_compat_tests {
                 .unwrap()
                 .size_bytes += 1;
             assert!(matches!(
-                verify_index(&dataset, &changed).await,
+                verify_index(&dataset, &changed, None).await,
                 Err(OmniError::FullTextIndexRebuildRequired { .. })
             ));
         }
@@ -188,11 +288,11 @@ mod fts_compat_tests {
         // must acquire its own proof. Failures must not be cached either.
         object_store.inner.delete(&path).await.unwrap();
         assert!(matches!(
-            verify_index(&cloned, &clone_index).await,
+            verify_index(&cloned, &clone_index, None).await,
             Err(OmniError::FullTextIndexRebuildRequired { .. })
         ));
         object_store.put(&path, &original).await.unwrap();
-        verify_index(&cloned, &clone_index).await.unwrap();
+        verify_index(&cloned, &clone_index, None).await.unwrap();
         assert_native_siblings(&cloned, &clone_index).await;
         // Both public BasePath shapes must resolve the same immutable file.
         let base = Arc::make_mut(&mut cloned.manifest)
@@ -202,7 +302,7 @@ mod fts_compat_tests {
         assert!(base.is_dataset_root);
         base.path.push_str("/_indices");
         base.is_dataset_root = false;
-        verify_index(&cloned, &clone_index).await.unwrap();
+        verify_index(&cloned, &clone_index, None).await.unwrap();
         assert_native_siblings(&cloned, &clone_index).await;
 
         for (case, payload) in [
@@ -227,16 +327,16 @@ mod fts_compat_tests {
             let cold = Dataset::open(uri).await.unwrap();
             assert!(
                 matches!(
-                    verify_index(&cold, &index).await,
+                    verify_index(&cold, &index, None).await,
                     Err(OmniError::FullTextIndexRebuildRequired { .. })
                 ),
                 "accepted {case}"
             );
             object_store.put(&path, &original).await.unwrap();
-            verify_index(&cold, &index).await.unwrap();
+            verify_index(&cold, &index, None).await.unwrap();
         }
         object_store.put(&path, &original).await.unwrap();
-        verify_index(&dataset, &index).await.unwrap();
+        verify_index(&dataset, &index, None).await.unwrap();
 
         let mut missing_reference = index.clone();
         missing_reference
@@ -245,20 +345,20 @@ mod fts_compat_tests {
             .unwrap()
             .retain(|file| file.path != CERTIFICATE_FILE);
         assert!(matches!(
-            verify_index(&dataset, &missing_reference).await,
+            verify_index(&dataset, &missing_reference, None).await,
             Err(OmniError::FullTextIndexRebuildRequired { .. })
         ));
         object_store.inner.delete(&path).await.unwrap();
         // forbidden-api-allow: test-only cold reader must observe deliberate certificate deletion.
         let cold = Dataset::open(uri).await.unwrap();
         assert!(matches!(
-            verify_index(&cold, &index).await,
+            verify_index(&cold, &index, None).await,
             Err(OmniError::FullTextIndexRebuildRequired { .. })
         ));
         // forbidden-api-allow: test-only cold clone must observe deletion at its source-owned certificate path.
         let cold_clone = Dataset::open(clone_uri.to_str().unwrap()).await.unwrap();
         assert!(matches!(
-            verify_index(&cold_clone, &clone_index).await,
+            verify_index(&cold_clone, &clone_index, None).await,
             Err(OmniError::FullTextIndexRebuildRequired { .. })
         ));
     }

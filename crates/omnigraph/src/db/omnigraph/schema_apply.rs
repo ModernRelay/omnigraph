@@ -1,5 +1,6 @@
 use super::*;
 use crate::seams::{decide_seam, fail};
+use crate::storage_layer::FullTextColumn;
 
 mod prepared;
 mod settlement;
@@ -353,6 +354,9 @@ where
     // Properties this apply adds, by desired table and name: no stored column
     // holds them yet.
     let mut added_properties = HashMap::<String, HashSet<String>>::new();
+    // Node properties whose declared full-text analysis changes what their
+    // index is built with or certified for, by desired table and property.
+    let mut analysis_changes = BTreeMap::<String, BTreeSet<String>>::new();
 
     for step in &plan.steps {
         match step {
@@ -443,6 +447,25 @@ where
                     .push(property_name.clone());
                 evolved_tables.insert(table_key);
             }
+            SchemaMigrationStep::ChangeFullTextAnalysis {
+                type_kind,
+                type_name,
+                property_name,
+                from,
+                to,
+            } => {
+                if matches!(type_kind, SchemaTypeKind::Node)
+                    && omnigraph_compiler::schema::analysis::changes_index_analysis(
+                        from.as_ref(),
+                        to.as_ref(),
+                    )
+                {
+                    analysis_changes
+                        .entry(schema_table_key(*type_kind, type_name))
+                        .or_default()
+                        .insert(property_name.clone());
+                }
+            }
             SchemaMigrationStep::AddConstraint { .. }
             | SchemaMigrationStep::ExtendEnum { .. }
             | SchemaMigrationStep::UpdateTypeMetadata { .. }
@@ -483,12 +506,46 @@ where
         }
     }
 
+    // A full-text column whose analyzer changes (declared, changed or
+    // removed) and whose index the accepted schema already declared has its
+    // segments replaced in this publication by one untrained segment built
+    // with the new analysis and certified with its fingerprint, so no search
+    // reads a segment of the old analysis; the postings are rebuilt off the
+    // critical path once no segment covers a fragment. A column the apply
+    // newly indexes is declared below with its analysis instead.
+    let mut redeclared_tables = BTreeMap::<String, Vec<FullTextColumn>>::new();
+    for (table_key, properties) in &analysis_changes {
+        if added_tables.contains(table_key) || dropped_tables.contains(table_key) {
+            continue;
+        }
+        let source_table_key = renamed_tables.get(table_key).unwrap_or(table_key);
+        let renames = property_renames.get(table_key);
+        let accepted = super::table_ops::declared_full_text_columns(
+            accepted_catalog.as_ref(),
+            source_table_key,
+        );
+        let columns: Vec<FullTextColumn> =
+            super::table_ops::declared_full_text_columns(&desired_catalog, table_key)
+                .into_iter()
+                .filter(|column| {
+                    let source = renames
+                        .and_then(|renames| renames.get(&column.column))
+                        .unwrap_or(&column.column);
+                    properties.contains(&column.column)
+                        && accepted.iter().any(|accepted| &accepted.column == source)
+                })
+                .collect();
+        if !columns.is_empty() {
+            redeclared_tables.insert(table_key.clone(), columns);
+        }
+    }
+
     // A full-text index the desired schema declares on a table this apply
     // neither adds, evolves nor drops (a new `@index`) is declared in this
     // publication by an untrained segment, so no search on it runs without
     // its analyzer; the postings are built off the critical path. An evolved
     // table declares its full-text columns in its evolution's commits.
-    let mut declared_tables = BTreeMap::<String, Vec<String>>::new();
+    let mut declared_tables = BTreeMap::<String, Vec<FullTextColumn>>::new();
     for type_name in desired_catalog.node_types.keys() {
         let table_key = schema_table_key(SchemaTypeKind::Node, type_name);
         if added_tables.contains(&table_key)
@@ -502,12 +559,17 @@ where
             accepted_catalog.as_ref(),
             source_table_key,
         );
-        let columns: Vec<String> =
+        let columns: Vec<FullTextColumn> =
             super::table_ops::declared_full_text_columns(&desired_catalog, &table_key)
                 .into_iter()
-                .filter(|column| !accepted.contains(column))
+                .filter(|column| {
+                    !accepted
+                        .iter()
+                        .any(|accepted| accepted.column == column.column)
+                })
                 .collect();
-        if !columns.is_empty() {
+        let redeclared = redeclared_tables.contains_key(&table_key);
+        if !columns.is_empty() || redeclared {
             declared_tables.insert(table_key, columns);
         }
     }
@@ -932,21 +994,36 @@ where
                 tip_transaction = Some(transaction);
                 fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
             }
+            let redeclared = redeclared_tables.remove(table_key).unwrap_or_default();
             let (tip, transaction) = match tip_transaction {
-                Some(transaction) => (tip, transaction),
+                Some(transaction) => (tip, Some(transaction)),
                 // The table already has the target schema: only a newly
                 // declared full-text index can still need a commit.
                 None => match db
                     .storage()
-                    .commit_full_text_declarations(tip, &declared, &witness)
+                    .commit_full_text_declarations(tip.clone(), &declared, &witness)
                     .await?
                 {
-                    Some(declared) => {
+                    Some((next, transaction)) => {
                         fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
-                        declared
+                        (next, Some(transaction))
                     }
-                    None => continue,
+                    None => (tip, None),
                 },
+            };
+            // A changed analyzer replaces its column's segments on the tip.
+            let (tip, transaction) = if redeclared.is_empty() {
+                match transaction {
+                    Some(transaction) => (tip, transaction),
+                    None => continue,
+                }
+            } else {
+                let next = db
+                    .storage()
+                    .commit_full_text_redeclarations(tip, &redeclared, &witness)
+                    .await?;
+                fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
+                next
             };
             let state = db.storage().table_state(&dataset_uri, &tip).await?;
             let published_dataset_version = entry.published_dataset_version + 1;
@@ -998,12 +1075,24 @@ where
                 &base_branch_identifier,
                 base_graph_head.as_deref(),
             )?;
-            let Some((detached, transaction)) = db
-                .storage()
-                .commit_full_text_declarations(source_ds, columns, &witness)
-                .await?
-            else {
-                continue;
+            // A new column's declaration and a changed analyzer's
+            // replacement share one commit; a redeclaration of a column
+            // without a segment replaces nothing.
+            let (detached, transaction) = match redeclared_tables.remove(table_key) {
+                Some(mut redeclared) => {
+                    redeclared.extend(columns.iter().cloned());
+                    db.storage()
+                        .commit_full_text_redeclarations(source_ds, &redeclared, &witness)
+                        .await?
+                }
+                None => match db
+                    .storage()
+                    .commit_full_text_declarations(source_ds, columns, &witness)
+                    .await?
+                {
+                    Some(declared) => declared,
+                    None => continue,
+                },
             };
             let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
             let state = db.storage().table_state(&dataset_uri, &detached).await?;

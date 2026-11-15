@@ -3990,8 +3990,10 @@ impl Omnigraph {
     /// the selected branch's current rows, publishing all tables together.
     /// Inherited tables are first-touch forked; other branches and historical
     /// snapshots retain their original indexes. Scalar/vector indexes are kept.
-    /// Rebuilt full-text indexes use the engine's default analyzer, including
-    /// indexes originally created externally with custom tokenizer settings.
+    /// Rebuilt full-text indexes use each property's declared analyzer
+    /// profile, or the engine's default analyzer where none is declared,
+    /// including indexes originally created externally with custom tokenizer
+    /// settings.
     ///
     /// Unlike [`Self::ensure_indices_on_as`], this replaces existing FTS
     /// indexes even when their row coverage is complete. It establishes the

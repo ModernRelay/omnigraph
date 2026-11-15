@@ -3323,6 +3323,200 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
     assert_eq!(search("summary").await, ["d3"]);
 }
 
+// Declaring, changing or removing a full-text analyzer is a schema change
+// applied in place (docs/rfcs/2026-11-07-gq-3.md section 4, Schema: Text): the
+// column's segments are replaced in the apply's publication by one built with
+// the declared profile and certified with the field's analyzer fingerprint, so
+// a certificate of the old analysis does not establish the new one; the
+// reconciler rebuilds the postings once, with the profile. A rename keeps the
+// fingerprint and the index.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = |column: &str, index: &str, rename: &str| {
+        format!("node Doc {{\n    slug: String @key\n    {column}: String {rename}{index}\n}}\n")
+    };
+    let db = helpers::session(
+        Omnigraph::init(uri, &schema("body", "@index", ""))
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d1","body":"Runners were RUNNING"}}
+{"type":"Doc","data":{"slug":"d2","body":"Café crème"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+    let search = |column: &'static str, term: &'static str| {
+        let db = &db;
+        async move {
+            let source = format!(
+                "query docs($q: String) {{ match {{ $d: Doc }} where search($d.{column}, $q) return {{ $d.slug }} }}"
+            );
+            first_column_sorted(
+                &query_main(db, &source, "docs", &params(&[("q", term)]))
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+    // The segments over `column`: UUID and covered fragment count.
+    let segments = |column: &'static str| {
+        let db = &db;
+        async move {
+            let ds = open_pinned_dataset_for_test(db, "main", "node:Doc").await;
+            let field = ds.schema().field(column).unwrap().id;
+            let indices = ds.load_indices().await.unwrap();
+            let segments = indices
+                .iter()
+                .filter(|index| index.fields == [field])
+                .cloned()
+                .collect::<Vec<_>>();
+            (ds, segments)
+        }
+    };
+    let fingerprint = |column: &str| {
+        db.catalog().node_types["Doc"]
+            .full_text_fingerprints
+            .get(column)
+            .cloned()
+    };
+    let rebuild_required = |result: omnigraph_core::error::Result<()>| {
+        matches!(
+            result,
+            Err(omnigraph_core::error::OmniError::FullTextIndexRebuildRequired { .. })
+        )
+    };
+
+    // Edition 2's analysis stems and folds, and its certificate names no
+    // fingerprint.
+    assert_eq!(search("body", "run").await, ["d1"]);
+    assert_eq!(search("body", "cafe").await, ["d2"]);
+    let (edition_2, edition_2_segments) = segments("body").await;
+    assert_eq!(edition_2_segments.len(), 1);
+    assert_eq!(fingerprint("body"), None);
+    omnigraph_core::fts_compat::verify_index(&edition_2, &edition_2_segments[0], None)
+        .await
+        .unwrap();
+
+    // Declaring `standard_v1` replaces the segment by an untrained one built
+    // with the profile and certified for the field's fingerprint.
+    let result = db
+        .apply_schema(&schema(
+            "body",
+            r#"@index(fulltext, analyzer = "standard_v1")"#,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert!(result.applied);
+    assert!(result.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::ChangeFullTextAnalysis { property_name, .. } if property_name == "body"
+    )));
+    let standard = fingerprint("body").expect("a declared profile has a fingerprint");
+    let (declared, declared_segments) = segments("body").await;
+    assert_eq!(declared_segments.len(), 1);
+    assert_ne!(declared_segments[0].uuid, edition_2_segments[0].uuid);
+    assert_eq!(
+        declared_segments[0]
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.len()),
+        Some(0),
+        "the replacement carries the analyzer without postings"
+    );
+    omnigraph_core::fts_compat::verify_index(&declared, &declared_segments[0], Some(&standard))
+        .await
+        .unwrap();
+    // A certificate of the old analysis does not establish the new one, nor
+    // the new one the old.
+    assert!(rebuild_required(
+        omnigraph_core::fts_compat::verify_index(
+            &edition_2,
+            &edition_2_segments[0],
+            Some(&standard)
+        )
+        .await
+    ));
+    assert!(rebuild_required(
+        omnigraph_core::fts_compat::verify_index(&declared, &declared_segments[0], None).await
+    ));
+    // `standard_v1` lowercases but neither stems nor folds.
+    assert_eq!(search("body", "run").await, Vec::<String>::new());
+    assert_eq!(search("body", "running").await, ["d1"]);
+    assert_eq!(search("body", "cafe").await, Vec::<String>::new());
+    assert_eq!(search("body", "CAFÉ").await, ["d2"]);
+
+    // The reconciler builds the postings once, with the profile.
+    db.ensure_indices_as(None).await.unwrap();
+    let (built, built_segments) = segments("body").await;
+    assert_eq!(built_segments.len(), 1);
+    assert_eq!(
+        built_segments[0]
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.len()),
+        Some(1)
+    );
+    omnigraph_core::fts_compat::verify_index(&built, &built_segments[0], Some(&standard))
+        .await
+        .unwrap();
+    assert_eq!(search("body", "run").await, Vec::<String>::new());
+    assert_eq!(search("body", "running").await, ["d1"]);
+
+    // A rename keeps the fingerprint, so the index and its proof stay.
+    let renamed = schema(
+        "text",
+        r#"@index(fulltext, analyzer = "standard_v1")"#,
+        r#"@rename_from("body") "#,
+    );
+    assert!(db.apply_schema(&renamed).await.unwrap().applied);
+    assert_eq!(fingerprint("text"), Some(standard.clone()));
+    let (_, renamed_segments) = segments("text").await;
+    assert_eq!(renamed_segments[0].uuid, built_segments[0].uuid);
+    assert_eq!(search("text", "running").await, ["d1"]);
+
+    // Changing the profile replaces the index again; `english_v1` stems and
+    // folds.
+    let english = schema("text", r#"@index(fulltext, analyzer = "english_v1")"#, "");
+    assert!(db.apply_schema(&english).await.unwrap().applied);
+    let english_fingerprint = fingerprint("text").unwrap();
+    assert_ne!(english_fingerprint, standard);
+    let (changed, changed_segments) = segments("text").await;
+    assert_eq!(changed_segments.len(), 1);
+    assert_ne!(changed_segments[0].uuid, built_segments[0].uuid);
+    omnigraph_core::fts_compat::verify_index(
+        &changed,
+        &changed_segments[0],
+        Some(&english_fingerprint),
+    )
+    .await
+    .unwrap();
+    assert_eq!(search("text", "run").await, ["d1"]);
+    assert_eq!(search("text", "cafe").await, ["d2"]);
+
+    // Removing the analyzer returns the field to edition 2's analysis, a
+    // certificate without a fingerprint.
+    assert!(
+        db.apply_schema(&schema("text", "@index(fulltext)", ""))
+            .await
+            .unwrap()
+            .applied
+    );
+    assert_eq!(fingerprint("text"), None);
+    let (removed, removed_segments) = segments("text").await;
+    assert_eq!(removed_segments.len(), 1);
+    omnigraph_core::fts_compat::verify_index(&removed, &removed_segments[0], None)
+        .await
+        .unwrap();
+    assert_eq!(search("text", "run").await, ["d1"]);
+}
+
 // Enum widening (iss-enum-widening-migration): adding variants to an enum is
 // a PURE metadata change — the accepted catalog updates, no table data is
 // touched, and the widened set is enforced immediately on writes. Narrowing

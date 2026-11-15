@@ -143,7 +143,7 @@ pub(crate) fn write_full_text_rebuild(
         Vec::new()
     } else {
         vec![
-            "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced.",
+            "Full-text indexes were rebuilt with each property's declared analyzer, or the default English analyzer where none is declared; any previous custom tokenizer settings were replaced.",
         ]
     };
     if json {
@@ -888,6 +888,21 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             type_name,
             render_annotations(annotations)
         ),
+        SchemaMigrationStep::ChangeFullTextAnalysis {
+            type_kind,
+            type_name,
+            property_name,
+            from,
+            to,
+        } => format!(
+            "change full-text analysis of '{}.{}' on {} '{}' ({} -> {})",
+            type_name,
+            property_name,
+            schema_type_kind_label(*type_kind),
+            type_name,
+            render_full_text_analysis(from.as_ref()),
+            render_full_text_analysis(to.as_ref())
+        ),
         SchemaMigrationStep::RequireProperty {
             type_kind,
             type_name,
@@ -967,6 +982,21 @@ pub(crate) fn render_prop_type(prop_type: &omnigraph_compiler::PropType) -> Stri
     } else {
         base
     }
+}
+
+/// `analyzer = "english_v1", scorer = "none"`, or `edition 2 analysis` when
+/// the index declares neither.
+fn render_full_text_analysis(
+    analysis: Option<&omnigraph_compiler::schema::analysis::FullTextAnalysis>,
+) -> String {
+    let Some(analysis) = analysis else {
+        return "edition 2 analysis".to_string();
+    };
+    let analyzer = analysis.analyzer.map_or_else(
+        || "edition 2 analysis".to_string(),
+        |profile| format!("analyzer = \"{profile}\""),
+    );
+    format!("{analyzer}, scorer = \"{}\"", analysis.scorer)
 }
 
 pub(crate) fn render_annotations(
@@ -2322,7 +2352,7 @@ mod tests {
     #[test]
     fn maintenance_full_text_reports_keep_warning_stream_and_noop_distinct() {
         use omnigraph::db::{FullTextIndexRebuildResult, RebuiltFullTextIndex};
-        let warning = "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced.";
+        let warning = "Full-text indexes were rebuilt with each property's declared analyzer, or the default English analyzer where none is declared; any previous custom tokenizer settings were replaced.";
         let result = FullTextIndexRebuildResult {
             branch: "dev".into(),
             graph_commit_id: Some("commit-1".into()),
