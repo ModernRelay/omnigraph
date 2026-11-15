@@ -996,7 +996,7 @@ mod cast_bound_tests {
             ty: ty(ScalarType::I64),
         };
         let constant = IRExpr::Cast {
-            expr: Box::new(IRExpr::Literal(Literal::Float(1.0), ty(ScalarType::F64))),
+            expr: Box::new(IRExpr::Literal(Literal::Integer(1), ty(ScalarType::I32))),
             ty: ty(ScalarType::I64),
         };
         let filter = IRExpr::comparison(property.clone(), CompOp::Eq, constant);

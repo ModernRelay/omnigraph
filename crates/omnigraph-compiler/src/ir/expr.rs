@@ -1811,14 +1811,15 @@ mod block_type_tests {
             IRExpr::Literal(Literal::Float(1.0), value(ScalarType::F64, false)),
         )
         .unwrap();
-        assert!(matches!(
-            predicate.left,
-            BlockAggregateExpr::Aggregate { .. }
-        ));
-        assert!(matches!(predicate.right, IRExpr::Cast { .. }));
-        assert_eq!(predicate.left.ty(), &value(ScalarType::I64, true));
-        assert_eq!(predicate.right.ty(), &value(ScalarType::I64, false));
-        assert_eq!(predicate.to_string(), "max($child.amount) = 1.0");
+        // A float literal stays `F64`; the integer aggregate is cast.
+        assert!(matches!(predicate.left, BlockAggregateExpr::Cast { .. }));
+        assert!(matches!(predicate.right, IRExpr::Literal(..)));
+        assert_eq!(predicate.left.ty(), &value(ScalarType::F64, true));
+        assert_eq!(predicate.right.ty(), &value(ScalarType::F64, false));
+        let BlockAggregateExpr::Aggregate { signature, .. } = predicate.left.leaf() else {
+            panic!("expected owner")
+        };
+        assert_eq!(signature.result, value(ScalarType::I64, true));
 
         let predicate = coerce::block(
             aggregate(AggFunc::Max, ScalarType::F32, ScalarType::F32),

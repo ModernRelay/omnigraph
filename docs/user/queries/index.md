@@ -66,11 +66,16 @@ A comparison or string test (`contains(...)`, `starts_with(...)`) with a null
 operand is null, and `not null` is null. A `where` keeps only rows whose
 expression is true, so `not ($p.age > 30)` skips rows whose `age` is null.
 
-Numeric comparisons choose their types before execution. A literal may use a
-property's type when its value is exactly representable in that type; otherwise
-both operands use a common numeric type. Parameters use their declared type,
-regardless of the supplied value. An `F32` property storing `0.1` therefore
-differs from the `F64` literal `0.1`, while `0.5` compares exactly. These rules
+Numeric comparisons choose their types before execution. An integer literal
+may use the property's type when its value fits that type, and a float literal
+may use an `F32` property's type when its value is exactly representable there;
+otherwise both operands use a common numeric type. A float literal is `F64`
+even when its value is a whole number, so an integer property compared with
+`9007199254740992.0` is converted to `F64`: above 2^53 distinct integers round
+to one `F64`, and `9007199254740993` equals that literal. Write an integer
+literal (`9007199254740993`) to compare exactly. Parameters use their declared
+type, regardless of the supplied value. An `F32` property storing `0.1`
+therefore differs from the `F64` literal `0.1`, while `0.5` compares exactly. These rules
 also apply to list membership and the filters of a write, whether a filter runs
 in a scan or in memory. Mixed signed and `U64` values compare without losing
 integer precision. A literal outside its property's type, such as a misspelled

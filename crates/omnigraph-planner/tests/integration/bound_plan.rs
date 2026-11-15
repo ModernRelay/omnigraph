@@ -768,22 +768,22 @@ fn cast_mirror_operand_is_the_child_consumed_by_type_validation() {
     use omnigraph_planner::mirror::ExprMirror;
     let cast = IRExpr::Cast {
         expr: Box::new(IRExpr::Literal(
-            Literal::Float(30.0),
-            value_type(ScalarType::F64, false),
+            Literal::Integer(30),
+            value_type(ScalarType::I64, false),
         )),
-        ty: value_type(ScalarType::I64, false),
+        ty: value_type(ScalarType::I32, false),
     };
     cast.check_types().unwrap();
     let mut encoded = serde_json::to_value(ExprMirror::from(&cast)).unwrap();
     assert_eq!(encoded["expr"], "cast");
     assert_eq!(encoded["operand"]["expr"], "literal");
-    assert_eq!(encoded["operand"]["ty"]["scalar"], "F64");
-    assert_eq!(encoded["ty"]["scalar"], "I64");
+    assert_eq!(encoded["operand"]["ty"]["scalar"], "I64");
+    assert_eq!(encoded["ty"]["scalar"], "I32");
     let restored = IRExpr::from(serde_json::from_value::<ExprMirror>(encoded.clone()).unwrap());
     assert_eq!(restored, cast);
     encoded["operand"] = serde_json::to_value(ExprMirror::from(&IRExpr::Param(
         "bound".into(),
-        value_type(ScalarType::F64, false),
+        value_type(ScalarType::I64, false),
     )))
     .unwrap();
     let forged = IRExpr::from(serde_json::from_value::<ExprMirror>(encoded).unwrap());

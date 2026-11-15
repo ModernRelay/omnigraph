@@ -1370,11 +1370,8 @@ fn cast(v: Value, ty: &ExprType) -> Value {
         (Value::Int(i), ScalarType::F64) => Value::Float(i as f64),
         (Value::Int(i), ScalarType::F32) => Value::Float(f64::from(i as f32)),
         (Value::Float(f), ScalarType::F32) => Value::Float(f64::from(f as f32)),
-        // A comparison's exact integer domain: a whole float literal.
-        (
-            Value::Float(f),
-            ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64,
-        ) if f.fract() == 0.0 && f.abs() < 1e38 => Value::Int(f as i128),
+        // A float is never narrowed to an integer: a float literal is `F64`
+        // even when whole, and the integer it is compared with is cast.
         (other, _) => other,
     };
     match v {

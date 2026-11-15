@@ -1,0 +1,105 @@
+# issue: none
+# notes: A float literal is F64 even when its value is a whole number. An I64 property
+# notes: compared with one is cast to F64 and the literal is never narrowed, so integers
+# notes: just above 2^53 compare by the F64 they round to: 2^53 + 1 rounds to 2^53
+# notes: (ties to even) and 2^53 + 3 to 2^53 + 4. An integer literal still compares exactly.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Number {
+    key: String @key
+    n: I64
+}
+
+--- seed
+{"type":"Number","data":{"key":"p53","n":9007199254740992}}
+{"type":"Number","data":{"key":"p53_1","n":9007199254740993}}
+{"type":"Number","data":{"key":"p53_2","n":9007199254740994}}
+{"type":"Number","data":{"key":"p53_3","n":9007199254740995}}
+
+--- query
+query equals_a_whole_float() {
+    match { $x: Number } where $x.n = 9007199254740992.0
+    return { $x.key }
+}
+--- expect unordered
+{"x.key":"p53"}
+{"x.key":"p53_1"}
+--- expect shape
+x.key: String
+--- expect plan
+cast $x.n: I64 -> F64
+no cast 9007199254740992.0
+type 9007199254740992.0: F64
+
+--- expect same as reference
+
+--- query
+query above_a_whole_float() {
+    match { $x: Number } where $x.n > 9007199254740992.0
+    return { $x.key }
+}
+--- expect unordered
+{"x.key":"p53_2"}
+{"x.key":"p53_3"}
+--- expect shape
+x.key: String
+--- expect plan
+cast $x.n: I64 -> F64
+no cast 9007199254740992.0
+
+--- expect same as reference
+
+--- query
+query equals_the_float_above_its_neighbours() {
+    match { $x: Number } where $x.n = 9007199254740996.0
+    return { $x.key }
+}
+--- expect unordered
+{"x.key":"p53_3"}
+--- expect shape
+x.key: String
+--- expect plan
+cast $x.n: I64 -> F64
+no cast 9007199254740996.0
+
+--- expect same as reference
+
+--- query
+query returns_the_float_comparison() {
+    match { $x: Number }
+    return { $x.key, $x.n >= 9007199254740994.0 as at_least }
+}
+--- expect unordered
+{"x.key":"p53","at_least":false}
+{"x.key":"p53_1","at_least":false}
+{"x.key":"p53_2","at_least":true}
+{"x.key":"p53_3","at_least":true}
+--- expect shape
+x.key: String
+at_least: Bool
+--- expect plan
+cast $x.n: I64 -> F64
+no cast 9007199254740994.0
+
+--- expect same as reference
+
+--- query
+query an_integer_literal_compares_exactly() {
+    match { $x: Number } where $x.n = 9007199254740993
+    return { $x.key }
+}
+--- expect unordered
+{"x.key":"p53_1"}
+--- expect shape
+x.key: String
+--- expect plan
+no cast $x.n
+type 9007199254740993: I64
+
+--- expect same as reference

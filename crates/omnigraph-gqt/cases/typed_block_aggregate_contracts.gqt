@@ -169,19 +169,18 @@ cast $bound: I64 -> exact_integer
 --- expect same as reference
 
 --- query
-query integer_max_narrows_exact_literal() {
+query integer_max_widens_for_a_float_literal() {
     match { $g: Group }
     where $g.name = "single" and max($c.signed) { $c: Cell, $c inGroup $g } > 9007199254740992.0
     return { $g.name as group_name }
 }
 --- expect unordered
-{"group_name":"single"}
 --- expect shape
 group_name: String
 --- expect plan
 block aggregate max($c.signed): max(I64?) extremum error -> I64?
-cast 9007199254740992.0: F64 -> I64
-no cast max($c.signed)
+cast max($c.signed): I64? -> F64?
+no cast 9007199254740992.0
 
 --- expect same as reference
 
