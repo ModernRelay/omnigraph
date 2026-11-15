@@ -391,6 +391,7 @@ pub(super) fn compare_arrays(
             right.data_type()
         )));
     }
+    let (left, right) = (&positive_zero(left)?, &positive_zero(right)?);
     match op {
         CompOp::Eq => cmp::eq(left, right),
         CompOp::Ne => cmp::neq(left, right),
@@ -403,6 +404,37 @@ pub(super) fn compare_arrays(
         }
     }
     .map_err(OmniError::arrow_internal)
+}
+
+/// The array with every `-0.0` replaced by `0.0`, for a comparison.
+///
+/// Arrow's comparison kernels compare floats by their bits (the total
+/// order), where `-0.0` and `0.0` differ; a comparison treats them as equal,
+/// as IEEE 754 does and as a filter Lance evaluates in the scan does. Sorting,
+/// `distinct` and grouping keep the total order, so only comparisons call
+/// this.
+pub(super) fn positive_zero(values: &ArrayRef) -> Result<ArrayRef> {
+    Ok(match values.data_type() {
+        DataType::Float64 => {
+            let values = values
+                .as_any()
+                .downcast_ref::<arrow_array::Float64Array>()
+                .ok_or_else(|| OmniError::manifest_internal("F64 array of another layout"))?;
+            Arc::new(values.unary::<_, arrow_array::types::Float64Type>(|value| {
+                if value == 0.0 { 0.0 } else { value }
+            }))
+        }
+        DataType::Float32 => {
+            let values = values
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| OmniError::manifest_internal("F32 array of another layout"))?;
+            Arc::new(values.unary::<_, arrow_array::types::Float32Type>(|value| {
+                if value == 0.0 { 0.0 } else { value }
+            }))
+        }
+        _ => values.clone(),
+    })
 }
 
 /// Execute an expression in its recorded type and check the produced array.
@@ -620,8 +652,9 @@ pub(super) fn array_value_eq(
     if left.is_null(left_index) || right.is_null(right_index) {
         return Ok(false);
     }
-    let equal = arrow_ord::cmp::eq(&left.slice(left_index, 1), &right.slice(right_index, 1))
-        .map_err(OmniError::arrow_internal)?;
+    let left = positive_zero(&left.slice(left_index, 1))?;
+    let right = positive_zero(&right.slice(right_index, 1))?;
+    let equal = arrow_ord::cmp::eq(&left, &right).map_err(OmniError::arrow_internal)?;
     Ok(equal.value(0))
 }
 

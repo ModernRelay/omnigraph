@@ -42,7 +42,8 @@ fn arrow_refusal(op: &str, error: ArrowError) -> OmniError {
 fn has_zero(values: &ArrayRef) -> Result<bool> {
     let literal: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![0]));
     let zero = arrow_cast::cast(&literal, values.data_type()).map_err(OmniError::arrow_internal)?;
-    let matches = arrow_ord::cmp::eq(values, &arrow_array::Scalar::new(zero))
+    let values = super::expr::positive_zero(values)?;
+    let matches = arrow_ord::cmp::eq(&values, &arrow_array::Scalar::new(zero))
         .map_err(OmniError::arrow_internal)?;
     Ok(matches.true_count() > 0)
 }

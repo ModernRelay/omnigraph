@@ -244,7 +244,8 @@ included, takes the other operand's integer type when it fits, so
 is `F64`, and `(0 - 3)` is an `I64` operand. `U64` with a signed integer and
 unary `-` over an unsigned value are refused (`T72`). The result is nullable
 when an operand is; division truncates toward zero, and `%` takes the sign of
-its left operand.
+its left operand. A comparison and the zero-divisor test treat `-0.0` and
+`0.0` as equal; a sort puts `-0.0` first and `distinct` keeps both.
 
 `from { match … return { … } }` joins the rows of an inline read, one outer
 row per inner row, correlated on the outer variables it reads. Its returned
