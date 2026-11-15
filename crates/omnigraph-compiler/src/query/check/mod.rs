@@ -4917,6 +4917,16 @@ impl Ctx<'_> {
             Expr::Neg(inner) => {
                 let v = self.expr(sc, inner, sub)?;
                 let ty = numeric(&v, "unary `-`")?;
+                if matches!(&ty, Ty::Value(t) if matches!(t.scalar, ScalarType::U32 | ScalarType::U64))
+                {
+                    return Err(err(
+                        T72,
+                        format!(
+                            "unary `-` needs a signed integer or a float, got {}",
+                            ty.display()
+                        ),
+                    ));
+                }
                 SExpr::new(SKind::Neg(v.boxed()), ty)
             }
             Expr::Arith { op, left, right } => {
@@ -5345,7 +5355,7 @@ impl Ctx<'_> {
                 };
                 require_bool(cnd, "`if`'s condition")?;
                 let ty = common(a, b, "if")?;
-                let (a, b) = (adapt(a.clone(), &ty), adapt(b.clone(), &ty));
+                let (a, b) = (fit(a.clone(), &ty), fit(b.clone(), &ty));
                 SExpr::new(
                     SKind::Call {
                         func: "if".into(),
@@ -5360,13 +5370,20 @@ impl Ctx<'_> {
                 let Some(first) = args.first() else {
                     return Err(err(T7, "`coalesce` takes one or more arguments"));
                 };
+                // The first argument meets the second as itself, so a literal
+                // there takes the other argument's type.
                 let mut ty = first.ty.clone();
-                for a in &args[1..] {
-                    ty = common(&SExpr::new(SKind::Null, ty.clone()), a, "coalesce")?;
+                for (i, a) in args.iter().enumerate().skip(1) {
+                    let so_far = if i == 1 {
+                        first.clone()
+                    } else {
+                        SExpr::new(SKind::Null, ty.clone())
+                    };
+                    ty = common(&so_far, a, "coalesce")?;
                 }
                 let all_null = args.iter().all(|a| a.ty.nullable());
                 let ty = ty.with_nullable(all_null);
-                let args = args.into_iter().map(|a| adapt(a, &ty)).collect();
+                let args = args.into_iter().map(|a| fit(a, &ty)).collect();
                 SExpr::new(
                     SKind::Call {
                         func: "coalesce".into(),
@@ -6121,10 +6138,25 @@ fn require_bool(e: &SExpr, what: &str) -> R<()> {
     }
 }
 
-/// An integer literal takes the integer type of the operand it meets; a
-/// float literal stays `F64` (the RFC's rules leave literals unstated; this
-/// is contextual literal typing).
+/// An integer literal takes the integer type of the operand it meets when it
+/// fits, and `F64` beside a float; a float literal stays `F64`. A negated
+/// integer literal is one too: `-3` beside an `I32` is the negation of an
+/// `I32` literal, where both the literal and its negation fit.
 fn adapt(e: SExpr, other: &Ty) -> SExpr {
+    if let (SKind::Neg(inner), Ty::Value(t)) = (&e.kind, other)
+        && let SKind::Lit(Literal::Integer(n)) = inner.kind
+        && !t.list
+    {
+        let scalar = match t.scalar {
+            ScalarType::I32 | ScalarType::I64 if fits(n, t.scalar) && fits(-n, t.scalar) => {
+                t.scalar
+            }
+            ScalarType::F32 | ScalarType::F64 => ScalarType::F64,
+            _ => return e,
+        };
+        let literal = SExpr::new(inner.kind.clone(), Ty::scalar(scalar, false));
+        return SExpr::new(SKind::Neg(literal.boxed()), Ty::scalar(scalar, false));
+    }
     match (&e.kind, other) {
         (SKind::Lit(Literal::Integer(n)), Ty::Value(t))
             if !t.list && is_integer(t.scalar) && fits(*n, t.scalar) =>
@@ -6199,7 +6231,8 @@ fn numeric(e: &SExpr, what: &str) -> R<Ty> {
 
 /// `+ - * / %`: one width keeps it, a narrower integer widens to the wider,
 /// an integer with a float is `F64`, `F32` beside `F64` is `F64`; the result
-/// is nullable when either operand is.
+/// is nullable when either operand is. Each operand of another type is
+/// widened by an explicit `Cast` that keeps its nullability.
 fn arith(op: ArithOp, l: SExpr, r: SExpr) -> R<SExpr> {
     let l = adapt(l, &r.ty);
     let r = adapt(r, &l.ty);
@@ -6208,23 +6241,7 @@ fn arith(op: ArithOp, l: SExpr, r: SExpr) -> R<SExpr> {
     let (Ty::Value(a), Ty::Value(b)) = (&lt, &rt) else {
         unreachable!()
     };
-    let float = |s| matches!(s, ScalarType::F32 | ScalarType::F64);
-    let signed = |s| matches!(s, ScalarType::I32 | ScalarType::I64);
-    let scalar = if a.scalar == b.scalar {
-        a.scalar
-    } else if float(a.scalar) || float(b.scalar) {
-        if a.scalar == ScalarType::F32 && b.scalar == ScalarType::F32 {
-            ScalarType::F32
-        } else {
-            ScalarType::F64
-        }
-    } else if signed(a.scalar) == signed(b.scalar) {
-        if width(a.scalar) >= width(b.scalar) {
-            a.scalar
-        } else {
-            b.scalar
-        }
-    } else if matches!(a.scalar, ScalarType::U64) || matches!(b.scalar, ScalarType::U64) {
+    let Some(scalar) = numeric_join(a.scalar, b.scalar) else {
         return Err(err(
             T72,
             format!(
@@ -6232,25 +6249,48 @@ fn arith(op: ArithOp, l: SExpr, r: SExpr) -> R<SExpr> {
                 op.symbol()
             ),
         ));
-    } else {
-        ScalarType::I64
     };
     let ty = Ty::scalar(scalar, a.nullable || b.nullable);
-    let cast = |e: SExpr| {
-        if matches!(&e.ty, Ty::Value(t) if t.scalar != scalar) && !matches!(e.kind, SKind::Lit(_)) {
-            SExpr::new(SKind::Cast(e.boxed()), Ty::scalar(scalar, false))
-        } else {
-            e
-        }
-    };
     Ok(SExpr::new(
         SKind::Arith {
             op,
-            left: cast(l).boxed(),
-            right: cast(r).boxed(),
+            left: widen(l, scalar).boxed(),
+            right: widen(r, scalar).boxed(),
         },
         ty,
     ))
+}
+
+/// The common type of two numeric scalars: one type keeps it, an integer
+/// with a float is `F64` (as is `F32` beside `F64`), a narrower integer of
+/// one signedness widens to the wider, `U32` with a signed integer is `I64`,
+/// and `U64` with a signed integer has none.
+fn numeric_join(a: ScalarType, b: ScalarType) -> Option<ScalarType> {
+    let float = |s| matches!(s, ScalarType::F32 | ScalarType::F64);
+    let signed = |s| matches!(s, ScalarType::I32 | ScalarType::I64);
+    Some(if a == b {
+        a
+    } else if float(a) || float(b) {
+        ScalarType::F64
+    } else if signed(a) == signed(b) {
+        if width(a) >= width(b) { a } else { b }
+    } else if matches!(a, ScalarType::U64) || matches!(b, ScalarType::U64) {
+        return None;
+    } else {
+        ScalarType::I64
+    })
+}
+
+/// A scalar numeric operand of another type, widened to `scalar` by an
+/// explicit `Cast` that keeps its nullability.
+fn widen(e: SExpr, scalar: ScalarType) -> SExpr {
+    match &e.ty {
+        Ty::Value(t) if !t.list && t.scalar.is_numeric() && t.scalar != scalar => {
+            let nullable = t.nullable;
+            SExpr::new(SKind::Cast(e.boxed()), Ty::scalar(scalar, nullable))
+        }
+        _ => e,
+    }
 }
 
 /// A comparison: numeric operands of different types meet through an
@@ -6451,6 +6491,16 @@ fn literal_refusal(
     E::D(d)
 }
 
+/// A branch of `if` or an argument of `coalesce` in the call's common type:
+/// a literal takes it, and another numeric value is widened to it.
+fn fit(e: SExpr, ty: &Ty) -> SExpr {
+    let e = adapt(e, ty);
+    match ty {
+        Ty::Value(t) if !t.list && t.scalar.is_numeric() => widen(e, t.scalar),
+        _ => e,
+    }
+}
+
 /// The common type of two branches (`if`, `coalesce`).
 fn common(a: &SExpr, b: &SExpr, what: &str) -> R<Ty> {
     let a2 = adapt(a.clone(), &b.ty);
@@ -6463,14 +6513,16 @@ fn common(a: &SExpr, b: &SExpr, what: &str) -> R<Ty> {
         (Ty::Value(x), Ty::Value(y))
             if x.scalar.is_numeric() && y.scalar.is_numeric() && !x.list && !y.list =>
         {
-            let float = |s| matches!(s, ScalarType::F32 | ScalarType::F64);
-            let s = if float(x.scalar) || float(y.scalar) {
-                ScalarType::F64
-            } else if width(x.scalar) >= width(y.scalar) {
-                x.scalar
-            } else {
-                y.scalar
-            };
+            let s = numeric_join(x.scalar, y.scalar).ok_or_else(|| {
+                err(
+                    T7,
+                    format!(
+                        "`{what}`'s branches are {} and {}, which have no common type",
+                        x.display_name(),
+                        y.display_name()
+                    ),
+                )
+            })?;
             Ok(Ty::scalar(s, nullable))
         }
         (x, y) if x.same_base(y) => Ok(x.with_nullable(nullable)),

@@ -1599,6 +1599,83 @@ mod render_tests {
         assert_eq!(joined.to_string(), "concat($p.name, $p.name)");
     }
 
+    /// The stored widening conversions arithmetic and the conditional rows
+    /// carry are exactly the ones the checker emits: a narrower integer to
+    /// the wider of its signedness, `U32` to `I64`, an integer or `F32` to
+    /// `F64`, each keeping its operand's nullability. A narrowing conversion
+    /// of a value, or one that changes nullability, is refused.
+    #[test]
+    fn arithmetic_widening_casts_are_the_permitted_conversions() {
+        use crate::query::syntax::ArithOp;
+        use crate::types::ScalarType::{self, F32, F64, I32, I64, U32, U64};
+        let ty = |scalar, nullable| scalar_type(scalar, nullable);
+        let value = |scalar: ScalarType, nullable| IRExpr::PropAccess {
+            variable: "p".into(),
+            property: "v".into(),
+            ty: ty(scalar, nullable),
+        };
+        let cast = |from, to, nullable| IRExpr::Cast {
+            expr: Box::new(value(from, nullable)),
+            ty: ty(to, nullable),
+        };
+        let widenings = [
+            (I32, I64),
+            (U32, U64),
+            (U32, I64),
+            (I32, F64),
+            (I64, F64),
+            (U32, F64),
+            (U64, F64),
+            (F32, F64),
+        ];
+        for (from, to) in widenings {
+            for nullable in [false, true] {
+                cast(from, to, nullable).check_types().unwrap();
+                let sum = IRExpr::Binary {
+                    left: Box::new(cast(from, to, nullable)),
+                    op: BinaryOp::Arith(ArithOp::Add),
+                    right: Box::new(value(to, false)),
+                    ty: ty(to, nullable),
+                };
+                sum.check_types().unwrap();
+                let first = IRExpr::Call {
+                    func: ScalarFunc::Coalesce,
+                    args: vec![cast(from, to, nullable), value(to, false)],
+                    ty: ty(to, false),
+                };
+                first.check_types().unwrap();
+            }
+            let dropped = IRExpr::Cast {
+                expr: Box::new(value(from, true)),
+                ty: ty(to, false),
+            };
+            assert!(dropped.check_types().is_err(), "{from:?} -> {to:?}");
+        }
+        for (from, to) in [
+            (I64, I32),
+            (U64, U32),
+            (I32, U32),
+            (I64, U64),
+            (U64, I64),
+            (I32, F32),
+            (F64, F32),
+            (F64, I64),
+            (F32, I32),
+        ] {
+            assert!(
+                cast(from, to, true).check_types().is_err(),
+                "{from:?} -> {to:?} narrows"
+            );
+        }
+        // A conditional row whose argument is not widened to the result type.
+        let unwidened = IRExpr::Call {
+            func: ScalarFunc::Coalesce,
+            args: vec![value(I32, true), value(I64, false)],
+            ty: ty(I64, false),
+        };
+        assert!(unwidened.check_types().is_err());
+    }
+
     #[test]
     fn floats_print_in_fixed_notation_with_a_decimal_point() {
         for (value, text) in [

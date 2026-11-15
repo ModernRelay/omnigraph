@@ -234,6 +234,18 @@ failing, guard the value with `if`, whose branch not taken is never
 evaluated (`let $r = if($n != 0, $t / $n, 0)`), or write the expression in
 `return`, which runs after `where`.
 
+Arithmetic is `+ - * / %` and unary `-` over numbers. Operands of two numeric
+types meet in their common type through an explicit widening: a narrower
+integer widens to the wider, `U32` with a signed integer is `I64`, and an
+integer or an `F32` with a float is `F64`; `if` and `coalesce` widen their
+arguments the same way. An integer literal, a negated one such as `-3`
+included, takes the other operand's integer type when it fits, so
+`$p.age - -3` over an `I32` is `I32` and overflows at `I32`; a float literal
+is `F64`, and `(0 - 3)` is an `I64` operand. `U64` with a signed integer and
+unary `-` over an unsigned value are refused (`T72`). The result is nullable
+when an operand is; division truncates toward zero, and `%` takes the sign of
+its left operand.
+
 `from { match … return { … } }` joins the rows of an inline read, one outer
 row per inner row, correlated on the outer variables it reads. Its returned
 references bind their names and its returned values read by name; a name it

@@ -95,6 +95,12 @@ named relation: `let $cs = { match { $c: Company } return { $c } }, from $cs`.
 elements; a value that can fail (arithmetic) runs on every row before
 `where`, so it fails (`E1`, `E2`) on rows `where` removes: guard it with
 `if(cond, value, 0)` or write it in `return`, which runs after `where`.
+Arithmetic (`+ - * / %`, unary `-`), `if` and `coalesce` widen two numeric
+types to their common one: the wider integer, `I64` for `U32` with a signed
+integer, `F64` for an integer or `F32` with a float. An integer literal,
+`-3` included, takes the other operand's integer type when it fits
+(`$p.age - -3` over an `I32` is `I32`, overflowing at `I32` with `E1`);
+`U64` with a signed integer and `-` over an unsigned value are `T72`.
 `from { match … return { … } }` joins an inline read's rows; its own
 aggregate, `distinct`, `order` and `limit` run per outer row when it reads
 an outer name (once otherwise), so an outer `where` or `limit` never widens

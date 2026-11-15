@@ -193,7 +193,7 @@ order { companies desc, $person.name asc }
 limit 20
 ```
 
-Return expressions include variables, properties, literals, `now()`, `count`,
+Return expressions include variables, properties, literals, [arithmetic](traversal.md#values-and-inline-reads), `if`, `coalesce`, `concat`, `now()`, `count`,
 `sum`, `avg`, `min`, `max`, and a [ranking](../search/index.md)'s score, named
 by its `from`'s `as` (`T85`). Each gives one column named by its alias or
 expression (`$p.name` gives `p.name`; a score drawn `as $s` gives `s`); duplicates are
