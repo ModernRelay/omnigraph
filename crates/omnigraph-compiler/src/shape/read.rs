@@ -1899,24 +1899,75 @@ impl<'a> Shaper<'a> {
         };
         self.facts(pattern, &mut inner)?;
         facts.inlined = inner.inlined;
-        // A `let` inside an `optional` is a column of its matches, null on
-        // an outer row with none; read in place, its value would not be.
-        // A block's value read in the optional's own `where` is a column
-        // of its matches nothing outside it reads.
-        if inner.lets.keys().any(|name| !is_block_column(name)) {
-            return Err(self.refuse_at("a `let` inside an `optional`", at()));
-        }
+        // The optional's own elements and `where` read its `let`s in place.
         let inner_lets = std::mem::take(&mut inner.lets);
         inner.substitute(&inner_lets);
         // The names the scope binds before it are the outer columns; a
         // rebinding of one inside is `T68`.
         let outer_columns: HashSet<String> = facts.names().into_iter().collect();
-        facts.optional_names.extend(
-            inner
-                .names()
-                .into_iter()
-                .filter(|name| !outer_columns.contains(name) && !is_anon(name)),
-        );
+        let introduced: Vec<String> = inner
+            .names()
+            .into_iter()
+            .filter(|name| !outer_columns.contains(name) && !is_anon(name))
+            .collect();
+        // A `let` inside an `optional` is a column of its matches, null on an
+        // outer row with none. Read after it, its value is taken where a node
+        // the optional binds is present and null elsewhere, which a value read
+        // in place would not be (`coalesce`, a constant, an outer name). A
+        // block's value read in the optional's own `where` is a column of its
+        // matches nothing outside it reads.
+        let mut exported: Vec<(&String, &IRExpr)> = inner_lets
+            .iter()
+            .filter(|(name, _)| !is_block_column(name))
+            .collect();
+        exported.sort_by(|a, b| a.0.cmp(b.0));
+        if !exported.is_empty() {
+            let mut nodes: Vec<(&String, &String)> = introduced
+                .iter()
+                .filter_map(|name| inner.types.get(name).map(|ty| (name, ty)))
+                .collect();
+            nodes.sort();
+            let Some((marker, type_name)) = nodes.first() else {
+                return Err(self.refuse_at("a `let` inside an `optional` that binds no node", at()));
+            };
+            let matched = IRExpr::IsNull {
+                expr: Box::new(IRExpr::Variable(
+                    marker.to_string(),
+                    ExprType::Node {
+                        type_name: type_name.to_string(),
+                    },
+                )),
+                negated: true,
+                ty: scalar(ScalarType::Bool),
+            };
+            for (name, value) in exported {
+                let ty = match value.ty().clone() {
+                    ExprType::Value { scalar, list, .. } => ExprType::Value {
+                        scalar,
+                        list,
+                        nullable: true,
+                    },
+                    other => {
+                        return Err(ShapeError::Internal(format!(
+                            "`let ${name}` inside an optional holds a {}, not a value",
+                            other.spelling()
+                        )));
+                    }
+                };
+                let mut read = IRExpr::Call {
+                    func: crate::ir::expr::ScalarFunc::If,
+                    args: vec![
+                        matched.clone(),
+                        value.clone(),
+                        IRExpr::Literal(Literal::Null, ty.clone()),
+                    ],
+                    ty,
+                };
+                substitute(&mut read, &facts.lets);
+                facts.lets.insert(name.clone(), read);
+            }
+        }
+        facts.optional_names.extend(introduced);
         facts.optionals.push(OptionalFact { inner });
         Ok(())
     }

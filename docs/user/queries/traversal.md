@@ -199,8 +199,10 @@ matches once per match, and a row with none once, with every name the
 optional introduces null on it. The names it introduces are in scope after it
 and nullable, so `$c.name` read from `optional { $c: Company, $p worksAt $c }` is
 `String?`, `$c is null` tests whether the row had a match, and `count($c)`
-counts the matches. A `where` inside the braces decides which rows match; a
-`where` after `match` filters the joined rows:
+counts the matches. A `let` inside the braces is a column of the matches,
+null on a row with none whatever it reads (`let $one = 1` too). A `where`
+inside the braces decides which rows match; a `where` after `match` filters
+the joined rows:
 
 ```gq
 query employers() {

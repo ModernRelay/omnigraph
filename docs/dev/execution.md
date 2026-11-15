@@ -36,7 +36,9 @@ A query runs against one resolved `ReadTarget`:
    tree as a scope of its own, `$x is null` over a reference tests the
    identity column, and plan acceptance requires one `OptionalJoin` per
    written optional testing its own conjuncts inside its inner tree and
-   nowhere else. A `from union(…)` whose arms read no outer name is a
+   nowhere else. A `let` inside it is read in place inside it, and after it
+   as `if(<a node it binds> is not null, value, null)`, so it is null on a
+   row with no match whatever it reads. A `from union(…)` whose arms read no outer name is a
    `PatternStep::Union` placed first, each arm its own pipeline from nothing
    with its unreturned names renamed apart, and the logical and physical
    `Union` (a new node kind: no existing one emits the rows of two

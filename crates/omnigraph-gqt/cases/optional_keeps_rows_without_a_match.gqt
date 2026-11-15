@@ -5,7 +5,8 @@
 # notes: Project(Filter(Env, ¬ exists p), nulls)))`). A `where` after it filters the
 # notes: joined rows, a filter inside it decides only the matches, and a
 # notes: traversal written after it starts from a name it introduces. A write
-# notes: group's selection runs it too.
+# notes: group's selection runs it too. A `let` inside it is a column of its
+# notes: matches: null on a row with none, whatever its value reads.
 
 --- runner
 timeout_ms: 10000
@@ -141,3 +142,70 @@ query ages() { match { $p: Person } return { $p.handle, $p.age } }
 --- expect shape
 p.handle: String
 p.age: I32?
+
+--- query
+query employer_names() {
+    match { $p: Person, optional { $c: Company, $p worksAt $c, let $n = $c.name } }
+    return { $p.handle, $n }
+}
+
+--- expect unordered
+{"n":"Acme","p.handle":"ada"}
+{"n":"Bolt","p.handle":"ada"}
+{"n":"Acme","p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+n: String?
+
+--- query
+query employed_tags() {
+    match { $p: Person, optional { $c: Company, $p worksAt $c, let $tag = concat($p.name, "@"), let $one = 1 } }
+    return { $p.handle, $tag, $one }
+}
+
+--- expect unordered
+{"one":1,"p.handle":"ada","tag":"Ada@"}
+{"one":1,"p.handle":"ada","tag":"Ada@"}
+{"one":1,"p.handle":"bob","tag":"Bob@"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+tag: String?
+one: I64?
+
+--- query
+query acme_or_none() {
+    match {
+        $p: Person,
+        optional { $c: Company, $p worksAt $c, let $n = $c.name where $n = "Acme" },
+        let $label = coalesce($n, "none"),
+    }
+    return { $p.handle, $label }
+}
+
+--- expect unordered
+{"label":"Acme","p.handle":"ada"}
+{"label":"Acme","p.handle":"bob"}
+{"label":"none","p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+label: String
+
+--- query
+query hundred_over_friend_age() {
+    match { $p: Person, optional { $q: Person, $p knows $q, let $r = 100 / $q.age } }
+    return { $p.handle, $r }
+}
+
+--- expect unordered
+{"p.handle":"ada","r":4}
+{"p.handle":"bob"}
+{"p.handle":"cy","r":2}
+
+--- expect shape
+p.handle: String
+r: I32?

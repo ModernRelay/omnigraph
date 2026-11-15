@@ -161,9 +161,9 @@ const B_IN_PROGRESS: &[InProgress] = &[
         text: "query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 1)) return { $d.title } }",
     },
     InProgress {
-        construct: "a `let` inside an `optional`",
-        site: "a `let` inside an `optional`",
-        text: "query q() { match { $p: Person, optional { $q: Person, $p knows $q, let $h = $q.handle } } return { $p.handle, $h } }",
+        construct: "a `let` inside an `optional` that binds no node",
+        site: "a `let` inside an `optional` that binds no node",
+        text: "query q() { match { $p: Person, $q: Person, optional { $p knows $q, let $x = 1 } } where $p.handle = \"a\" and $q.handle = \"b\" return { $p.name, $x } }",
     },
     InProgress {
         construct: "a union arm returning an edge",
@@ -310,6 +310,10 @@ const CLOSURE: &[Row] = &[
             ),
             (
                 "query q() { match { $p: Person, optional { $f: Person, $p knows $f }, $f worksAt $c } where $c.name = \"Acme\" return { $p.name, $f.name } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c, let $n = $c.name, let $one = 1 } } where coalesce($n, \"none\") != \"x\" return { $p.name, $n, $one } }",
                 Lowers,
             ),
         ],
