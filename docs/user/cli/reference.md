@@ -39,7 +39,8 @@ its base, or lies inside it, is refused. The option applies to `query`, `mutate`
 maintenance and schema changes keep the one root they are given. A fresh target
 directory or prefix is a new clone; the same target again shows the clone's own
 state. Nothing in the target records its base, so pass the same `--base` on
-every open of that target.
+every open of that target; a clone root opened without `--base` is refused,
+since its marker says it is a clone and not which base it was cloned from.
 
 `--as ACTOR` attributes supported direct operations. A served target derives its
 actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,

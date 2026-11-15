@@ -2070,6 +2070,17 @@ struct AtRunOutput {
     at: Vec<AtOutput>,
 }
 
+/// One `run --at` invocation's own, absolute staging directory under the
+/// dataset cache, removed when the invocation ends (the store holds every
+/// product that was put).
+struct ProductStaging(PathBuf);
+
+impl Drop for ProductStaging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// `run --at a --at b`: every ref's product resolved and inspected before
 /// any run, then the selection run once per ref against the same store, the
 /// results side by side.
@@ -2091,13 +2102,23 @@ async fn run_at(
             return print_cli_failure(Diagnostic::error(&error.code, "store", error.message), json);
         }
     };
-    let scratch = dataset_cache.join("products");
+    let scratch =
+        match std::path::absolute(dataset_cache.join("products").join(Ulid::new().to_string())) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                return print_cli_failure(
+                    Diagnostic::error("invalid_run_input", "dataset-cache", error.to_string()),
+                    json,
+                );
+            }
+        };
     if let Err(error) = fs::create_dir_all(&scratch) {
         return print_cli_failure(
             Diagnostic::error("invalid_run_input", "dataset-cache", error.to_string()),
             json,
         );
     }
+    let _staging = ProductStaging(scratch.clone());
     let mut references = Vec::new();
     for spec in &at {
         let (reference, path) = match spec.split_once('=') {
@@ -2294,6 +2315,9 @@ async fn product_at(
     let directory = scratch.join(&commit[..12]);
     fs::create_dir_all(&directory).map_err(|e| io("product scratch", e))?;
     let destination = directory.join("omnigraph");
+    if destination.is_file() {
+        return Ok(destination);
+    }
     if let Some(path) = store.resolve_build(key, &destination).await.map_err(at)? {
         return Ok(path);
     }
