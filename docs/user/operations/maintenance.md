@@ -141,8 +141,9 @@ omnigraph index rebuild --kind full-text --target ./cluster-root \
 works for one release. Under a policy, the rebuild needs `maintain` on the
 selected branch.
 
-The command fully replaces text-search indexes from current entities using the
-engine's default English analyzer, including already indexed entities. It builds
+The command fully replaces text-search indexes from current entities, with
+each property's declared [analyzer](../search/analyzers.md) or else the
+default English one, including already indexed entities. It builds
 declared node full-text indexes and replaces existing physical full-text indexes
 on nodes or edges; it does not create edge-property indexes from declarations.
 External custom tokenizer settings are not preserved. Completed rebuilds warn

@@ -219,13 +219,38 @@ where search($d.title, $q)                    // full-text filter
 A full-text call (`search`, `fuzzy`, `match_text`, `bm25`) needs a full-text
 index on its property: a one-column `@index` or `@key` on a free-text String
 node property. A call on any other property, an enum included, is refused at
-type checking (`T27`); compare enums with `=`. The analyzer folds case and
-stems, so `"deep"` matches `"Deep Learning"`. `search`, `fuzzy` and
+type checking (`T27`); compare enums with `=`. The field's analyzer decides
+what matches (next section). `search`, `fuzzy` and
 `match_text` are Boolean operands like any other in a `where`: true where the
 row is among the call's matches, false elsewhere, never null. Write
 `not search($d.title, $q)`, `search(...) or ...` or `search(...) = false`;
 the rows are the same whether or not the index covers them yet. Read as a
 value in `return`, `order` or a block's aggregate, a call is `T86`.
+
+### Analyzers
+
+The schema, never the query, chooses a field's analysis:
+`body: String @index(fulltext, analyzer = "english_v1")`. The profiles:
+
+| Profile | Lowercase | Stemming and stop words | ASCII folding |
+|---|---|---|---|
+| `standard_v1` | yes | no | no |
+| `standard_folded_v1` | yes | no | yes |
+| `english_v1` | yes | English stemmer, then English stop words | yes |
+
+All split on every non-alphanumeric character and keep tokens of any length.
+`"run"` matches `"Runners were RUNNING"` under `english_v1` only; `"cafe"`
+matches `"Café"` under `standard_folded_v1` and `english_v1`. A field written
+`@index` or `@index(fulltext)` without `analyzer` keeps the old default
+(stemming, stop words, folding and a 40-byte token filter); `lint` reports it
+as `L202` and names `english_v1`. `scorer = "none"` keeps the field matchable
+and makes `bm25` over it `T87`, alone or as an `rrf` arm; use a `where`
+filter there. No call takes an analyzer (`terms(…)` with one is `T71`). The
+native index applies no Unicode normalization, so write values and queries in
+NFC (precomposed accents). Changing a field's analyzer is a schema apply that
+replaces its index; run `omnigraph index build` afterwards, and expect a
+search of a snapshot from before the change to be refused with
+`full_text_index_rebuild_required`.
 
 ## The Key Pattern: Scope First, Rank Second
 

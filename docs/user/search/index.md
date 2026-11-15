@@ -166,10 +166,16 @@ query language's exact `contains(...)` and `starts_with(...)` functions for
 literal, case-sensitive substring and prefix matching.
 
 A full-text function needs a full-text index on its property: a one-column
-`@index` or `@key` on a free-text String property of a node. The index's
-analyzer folds case and stems, so `"deep"` matches `"Deep Learning"`. A call
-on any other String property is refused at type checking (`T27`); for an
-enum, compare its values with `=` instead. The check reads only the schema.
+`@index` or `@key` on a free-text String property of a node. A call on any
+other String property is refused at type checking (`T27`); for an enum,
+compare its values with `=` instead. The check reads only the schema.
+
+The index's analysis comes from the schema: `@index(fulltext, analyzer =
+"english_v1")` declares one of three profiles, and `scorer = "none"` keeps a
+field matchable but refuses `bm25` over it (`T87`). An index declared without
+`analyzer` keeps the default analysis earlier releases used, which folds case,
+stems and folds accents, so `"deep"` matches `"Deep Learning"`. See
+[Full-text analyzers](analyzers.md).
 
 `search`, `match_text`, and `fuzzy` are Boolean operands like any other in a
 `where`: true where the row is among the call's matches, false elsewhere,
@@ -309,7 +315,7 @@ OmniGraph currently creates:
 | Property | Index use |
 |---|---|
 | Enum, number, Boolean, Date, or DateTime | Equality, range, membership, and null filters |
-| Free-text String | Full-text functions |
+| Free-text String | Full-text functions, with the declared [analyzer](analyzers.md) |
 | Vector | `nearest` |
 
 Node ids and edge ids/endpoints are indexed automatically. Lists and Blobs do

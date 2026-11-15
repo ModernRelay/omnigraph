@@ -170,7 +170,12 @@ Changing the key field is effectively a replace — it invalidates every externa
 
 ### Constraints: `@index` and a node's `@unique` are added in place
 
-Adding `@index` is metadata only. Adding `@unique` to a node type, and making a
+Adding `@index` is metadata only. Declaring, changing or removing a full-text
+`analyzer` or `scorer` also applies in place (`schema plan` shows `change
+full-text analysis`): the apply replaces the property's index with one built
+for the new analysis, `omnigraph index build` then builds its postings, and
+searches scan with the new analysis meanwhile. A rename keeps the analysis
+and the index. Adding `@unique` to a node type, and making a
 nullable property required (`T?` → `T`, node or edge), first read the stored
 rows under the apply's locks: a live row holding a null (OG-MF-104) or two rows
 sharing a key (OG-MF-108) refuse the apply and change nothing. To add a required
@@ -188,8 +193,9 @@ property drops every constraint that names only dropped properties (its own
 `@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
 or a constraint that also names a field that stays, is refused. In-place
 migrations are additions of nullable properties and types, `@index` and node
-`@unique` additions, nullable-to-required promotion, enum widening, renames,
-and drops; any other tightening means a rebuild.
+`@unique` additions, full-text analyzer and scorer changes, nullable-to-required
+promotion, enum widening, renames, and drops; any other tightening means a
+rebuild.
 
 ### `schema apply` blocks writes while running
 
@@ -208,6 +214,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@key` — single-property node key
 - `@unique` — single-property uniqueness constraint
 - `@index` — single-property index intent (currently materialized automatically only for node properties). A String property used in `search`, `fuzzy`, `match_text` or `bm25` must declare it, or the call is refused at type check (`T27`); an enum takes no full-text index (compare it with `=`)
+- `@index(fulltext, analyzer = "english_v1", scorer = "none")` — a node String property's full-text index with its analysis. `analyzer` is one of `standard_v1` (lowercase only), `standard_folded_v1` (lowercase, ASCII folding) or `english_v1` (lowercase, English stemmer, English stop words, ASCII folding); none has a token-length filter. `scorer` is `bm25_v1` (default) or `none`, which keeps matching and makes `bm25` over the field `T87`. Without `analyzer` (or a bare `@index`) the field keeps the old default analysis, and `omnigraph lint` reports `L202` naming `english_v1` as the closest profile. An unknown profile, scorer or option is a schema error listing the admitted names; analysis is refused on interface and edge properties. See [`search.md`](search.md#analyzers)
 - `@embed("source_prop")` — associates a node Vector property with a String source; does not populate it during writes
 - `@description("...")` — metadata (no migration impact)
 

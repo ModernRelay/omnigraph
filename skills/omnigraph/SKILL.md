@@ -268,9 +268,10 @@ meaning back. Decide conservatively what to model; once modeled, constrain
 precisely, because changing a commitment later is a rebuild (adding
 `@key`/`@range`/`@check`, an edge `@unique` or a required edge to an existing
 type, changing cardinality, removing a constraint from a property that stays,
-and `T` → `T?` are refused; `@index` additions, nullable additions, enum
-widening, renames, drops, `T?` → `T` and a node `@unique` apply in place, the
-last two only when the stored rows already satisfy them).
+and `T` → `T?` are refused; `@index` additions, full-text analyzer changes,
+nullable additions, enum widening, renames, drops, `T?` → `T` and a node
+`@unique` apply in place, the last two only when the stored rows already
+satisfy them).
 
 In short: Gruber's five criteria (clarity · coherence · extendibility · minimal
 encoding bias · minimal commitment) · neither too loose (one meaning, many
@@ -426,6 +427,8 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | `$c: Company, $c worksAt $p` over `WorksAt: Person -> Company` | `T82` at the triple | Write the source first, `$p worksAt $c` (the diagnostic swaps the ends) |
 | `match { $p: Person, $c: Company }` with no triple between them | `T81` at the second component | Join them through a triple (`$p worksAt $c`), pin all but one by its `@key` or `@id` in `where`, or write the product as `let $cs = { match { $c: Company } return { $c } }, from $cs` |
 | `order { nearest(...) }`, `bm25(...)`/`rrf(...)` in `order` or `return` | `T65` | Name the population and draw the ranking, `let $pop = { match { … } return { $d } }, from nearest($pop, $d.embedding, $q, k: N) as $distance`, and order by `$distance` (or `$score desc`); the diagnostic prints the fix |
+| `bm25` over a field whose index declares `scorer = "none"`, alone or as an `rrf` arm | `T87` | Match it in `where` (`search`, `match_text`, `match_terms`), or declare `scorer = "bm25_v1"` |
+| `@index(fulltext, analyzer = "english")`, `scorer = "bm25"`, an unknown option | schema error listing the admitted names | Profiles are `standard_v1`, `standard_folded_v1`, `english_v1`; scorers `bm25_v1`, `none`; options `analyzer`, `scorer` |
 | `from nearest($pop, …)` with no `as`; `from $docs as $s` | `T85` | Name a ranking's score, `from nearest(…) as $distance` (`as $score` for `bm25`, `rrf`); drop `as` on a `from` whose relation carries no unnamed score (the diagnostic writes either) |
 | `nearest` without `limit` | `nearest() ordering requires a limit clause` at run time | Add `limit N` equal to its `k`; a BM25-only query may omit it, though bounded output is recommended |
 | Adding non-nullable property without backfill | unsupported migration | Make optional → backfill; keep it optional (tightening `T?` → `T` is refused, OG-MF-106) |
