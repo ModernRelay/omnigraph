@@ -33,7 +33,7 @@ use crate::query::file::Param;
 use crate::query::value::{
     AggFunc, BinaryOp, CompOp, DISTANCE_COLUMN, Literal, RRF_COLUMN, SCORE_COLUMN,
 };
-use crate::traversal::{EdgeMember, EdgeSelection};
+use crate::traversal::{EDGE_TYPE_COLUMN, EdgeMember, EdgeSelection};
 use crate::types::{AggSignature, Direction, ExprType, PropType, ScalarType};
 
 use super::{Construct, ElementKind, ProgrammeStage, ShapeError, Unlowered};
@@ -848,6 +848,58 @@ impl<'a> Shaper<'a> {
         unsupported(self.name, what, Construct::Read)
     }
 
+    /// The identity keys of an order key that is a reference, a binding or
+    /// a return item holding one: `(@type, @id)` for an edge whose selector
+    /// has several types, `@id` otherwise (one type: the type is constant).
+    /// Over groups the rows carry only the return items, so a node key is
+    /// its returned node object, whose first member is `@id`, a unique
+    /// key: ordering by the object is ordering by the identity. `None` for
+    /// a value key.
+    fn reference_key(
+        &self,
+        key: &IRExpr,
+        return_exprs: &[IRProjection],
+        grouped: bool,
+    ) -> Option<Vec<IRExpr>> {
+        let returned =
+            |found: &dyn Fn(&IRProjection) -> bool| return_exprs.iter().find(|p| found(p));
+        let (reference, item) = match key {
+            IRExpr::Variable(..) => (key, returned(&|p| &p.expr == key)),
+            IRExpr::AliasRef(alias, ExprType::Node { .. } | ExprType::Edge { .. }) => {
+                let item = returned(&|p| p.alias.as_deref() == Some(alias.as_str()))?;
+                (&item.expr, Some(item))
+            }
+            _ => return None,
+        };
+        let IRExpr::Variable(variable, ty) = reference else {
+            return None;
+        };
+        if grouped {
+            let item = item?;
+            return matches!(ty, ExprType::Node { .. }).then(|| {
+                vec![IRExpr::AliasRef(
+                    item.alias.clone().unwrap_or_else(|| item.column.clone()),
+                    ty.clone(),
+                )]
+            });
+        }
+        let string = ExprType::from_prop(&PropType::scalar(ScalarType::String, false));
+        let property = |property: &str| IRExpr::PropAccess {
+            variable: variable.clone(),
+            property: property.to_string(),
+            ty: string.clone(),
+        };
+        let id = property(self.catalog.system_columns.id);
+        match ty {
+            ExprType::Node { .. } => Some(vec![id]),
+            ExprType::Edge { type_name } if type_name.contains('|') => {
+                Some(vec![property(EDGE_TYPE_COLUMN), id])
+            }
+            ExprType::Edge { .. } => Some(vec![id]),
+            ExprType::Value { .. } | ExprType::ExactInteger { .. } => None,
+        }
+    }
+
     /// A refusal at `construct`.
     fn refuse_at(&self, what: impl std::fmt::Display, construct: Construct) -> ShapeError {
         unsupported(self.name, what, construct)
@@ -1156,6 +1208,15 @@ impl<'a> Shaper<'a> {
                 }
                 _ => expr,
             };
+            // A reference orders by its identity, returned or not: the edge
+            // type first for an edge over several types, then the id.
+            if let Some(reference) = self.reference_key(&expr, &return_exprs, grouped) {
+                order_by.extend(reference.into_iter().map(|expr| IROrdering {
+                    expr,
+                    descending: *descending,
+                }));
+                continue;
+            }
             order_by.push(IROrdering {
                 expr,
                 descending: *descending,

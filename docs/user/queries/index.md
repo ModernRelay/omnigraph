@@ -57,11 +57,10 @@ draws a ranking's rows in, and `let` names a relation; see [Search](../search/in
 
 ### Boolean expressions and nulls
 
-A `where` combines its tests with `and`, `or`, `not` and parentheses. `or`
-binds loosest, then `and`, `not`, comparison and arithmetic, so
-`not $p.email is null` reads as `not ($p.email is null)`. Comparisons do not
-chain: `$a < $b < $c` is a parse error. Operands of `and`, `or` and `not`
-must be `Bool` (`T41`), as in
+A `where` combines its tests with `and`, `or`, `not` and parentheses. `or` binds
+loosest, then `and`, `not`, comparison and arithmetic, so `not $p.email is null`
+reads as `not ($p.email is null)`. Comparisons do not chain: `$a < $b < $c` is a
+parse error. Operands of `and`, `or` and `not` must be `Bool` (`T41`), as in
 `($d.stage = "open" or $d.stage = "paused") and not $d.amount < $cut`.
 
 A comparison or string test (`contains(...)`, `starts_with(...)`) with a null
@@ -233,12 +232,13 @@ Order is total under the tie rule: after the written keys (ascending puts nulls
 first, descending last), each entity id in the order the pattern binds it (a
 traversal's destination before its edge), then a `from`'s value columns, all
 ascending; group rows use their keys, bare nodes (by id) first. Ids are read
-only when they can change the visible order. A `limit` with no `order` cuts this
-order alone: `limit 2` returns the two smallest ids, not a scan's first rows,
-and reads every match. On ungrouped, non-DISTINCT rows an order key need not be
-projected: `order { $p.age > 30 }` sorts by a value the return leaves out. Over
-grouped rows, an aggregated or DISTINCT return, an order key must be a return
-item or its alias (`T42`): `count($d)` after `return { count($d) as deals }`.
+only when they can change the order. A `limit` with no `order` cuts this order
+alone: `limit 2` returns the two smallest ids, not a scan's first rows, and
+reads every match. On ungrouped, non-DISTINCT rows an order key need not be
+projected, as in `order { $p.age > 30 }`. A reference key sorts by identity:
+`$p` by `$p.@id`, a multi-type edge by `@type`, then `@id`. Over grouped rows,
+an aggregated or DISTINCT return, an order key must be a return item or its
+alias (`T42`): `count($d)` after `return { count($d) as deals }`.
 
 A read that draws from a [ranking](../search/index.md) orders by its score
 column like any other: `order { $distance }` for `nearest`, by ascending

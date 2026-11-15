@@ -274,7 +274,8 @@ Each projection needs a distinct result column name (`T25`): use aliases when
 expressions would collide. Aliases can be used in `order`, including after a
 leading score key (`order { $distance, title }`), but cannot be projected again
 in `return` (`T36`). On ungrouped rows any expression may be an order key, returned
-or not. Over grouped rows (an aggregate or `return distinct`) an order key must
+or not; a node or edge reference sorts by its identity (`order { $p }` by
+`$p.@id`, an edge over several types by `@type`, then `@id`). Over grouped rows (an aggregate or `return distinct`) an order key must
 be a `return` item or its alias, such as `order { count($f) desc }` after
 `count($f)` in `return` (`T42`).
 
