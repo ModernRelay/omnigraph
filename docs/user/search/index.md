@@ -18,13 +18,13 @@ with `as`.
 | `match_text($d.body, $q)` | Match a full-text query in a `match` block. |
 | `match_terms($d.body, terms($q, mode: all))` | True where the property holds every analyzed term of `$q` (`mode: all`, the default) or one of them (`mode: any`). |
 
-The first argument of a ranking is the population it ranks: a relation a
-`let` names before the ranking, `let $pop = { match { ... } return { $d } }`,
-whose `return` names the bindings the rest of the query reads, or the same
-inline read in its place. The second is the ranked property of a node binding
-of that population. `from` adds the population's columns and the score column
-to the query, under the name its `as` writes: `from nearest($pop, $d.embedding,
-$q, k: 10) as $distance` names it `$distance`, and `as $near` would name it
+The first argument of a ranking is the population it ranks: a relation a `let`
+names before the ranking, `let $pop = { match { ... } return { $d } }`, whose
+`return` names the bindings the rest of the query reads, or the same inline
+read in its place. The second is the ranked property of a node binding of that
+population. `from` adds the population's columns and the score column to the
+query, under the name its `as` writes: `from nearest($pop, $d.embedding, $q,
+k: 10) as $distance` names it `$distance`, and `as $near` would name it
 `$near`; no score column has a fixed name. The rule reads the relation's type:
 a ranking function's result carries an unnamed score, and so does a `let` name
 bound to one, so `let $r = nearest(...)` then `from $r` needs `as`, while an
@@ -35,27 +35,27 @@ argument, such as an `rrf` arm, a score stays unnamed: nothing reads it, and
 `rrf` consumes it as the arm's ranking. Return the score by the name `as` gave
 it, aliased or not, and order by it, `order { $distance }` for a distance and
 `order { $score desc }` for a relevance score. The score is an ordinary
-column: it may be any `order` key, in either direction, or none.
-Elements and a `where` written after the `from` run over the rows the ranking
-selected; a row they remove is not replaced by the next candidate. A ranking written as a call in `order` or `return`, such as
-`order { nearest($d.embedding, $q) }`, is refused (`T65`) with the `from` form
-as its fix.
+column: it may be any `order` key, in either direction, or none. Elements and
+a `where` written after the `from` run over the rows the ranking selected; a
+row they remove is not replaced by the next candidate. A ranking written as a
+call in `order` or `return`, such as `order { nearest($d.embedding, $q) }`, is
+refused (`T65`) with the `from` form as its fix.
 
-Search arguments use their declared types. `nearest` requires its window
-`k` (`T17`), an integer literal or parameter of at least 1: it selects the `k`
+Search arguments use their declared types. `nearest` requires its window `k`
+(`T17`), an integer literal or parameter of at least 1: it selects the `k`
 nearest targets of the population with every row each has, and the read's
 `limit`, which may be larger, smaller or absent, cuts the rows after that. A
 window read from a parameter takes the count the parameter is bound to when
-the read runs, in an `rrf` arm too; a count below 1 is refused. `fuzzy` defaults `max_edits` to 2 when
-omitted; a literal must be 0 to 2 (`T71`) and a parameter an integer from 0
-to 4,294,967,295. `rrf` takes `k` as an integer literal from 1 to 1,000,000
-or an integer parameter, and `weights` as a list literal of one number per
-arm, each above 0 and at most 1,000,000; a list of another length is refused
-(`T75`) and a weight out of range (`T71`). Options are named: `fuzzy($d.body, $q, 2)` is
-refused (`T71`) with `max_edits: 2` as its fix. A supplied null is an error,
-including a nullable parameter that was omitted from the parameter map. Query
-text and vectors must also be non-null; vector elements must convert to
-finite F32 values.
+the read runs, in an `rrf` arm too; a count below 1 is refused. `fuzzy`
+defaults `max_edits` to 2 when omitted; a literal must be 0 to 2 (`T71`) and a
+parameter an integer from 0 to 4,294,967,295. `rrf` takes `k` as an integer
+literal from 1 to 1,000,000 or an integer parameter, and `weights` as a list
+literal of one number per arm, each above 0 and at most 1,000,000; a list of
+another length is refused (`T75`) and a weight out of range (`T71`). Options
+are named: `fuzzy($d.body, $q, 2)` is refused (`T71`) with `max_edits: 2` as
+its fix. A supplied null is an error, including a nullable parameter that was
+omitted from the parameter map. Query text and vectors must also be non-null;
+vector elements must convert to finite F32 values.
 
 Filters in the population's `match` are applied before ranking, so `limit 10`
 means the top ten matches that satisfy the graph and property filters.
@@ -180,17 +180,17 @@ field matchable but refuses `bm25` over it (`T87`). An index declared without
 stems and folds accents, so `"deep"` matches `"Deep Learning"`. See
 [Full-text analyzers](analyzers.md).
 
-`search`, `match_text`, `fuzzy` and `match_terms` are Boolean operands like any other in a
-`where`: true where the row is among the call's matches, false elsewhere,
-and never null, so a row whose property is null is false. `not search(...)`,
-`search(...) or ...`, `search(...) = false` and
-`not coalesce(search(...), false)` all run, inside blocks too, and keep
-exactly the rows the call's matches decide: a call standing alone is answered
-by its binding's scan, and any other use by the same full-text query over the
-whole table, so a row an index has not covered yet answers as an indexed one
-does. A full-text call read as a value, in `return`, `order` or a block's
-aggregate, is not lowered in this release (`T86`), nor is `match_terms` with
-an edit budget other than `max_edits: 0`: only an exact scan answers it.
+`search`, `match_text`, `fuzzy` and `match_terms` are Boolean operands like
+any other in a `where`: true where the row is among the call's matches, false
+elsewhere, and never null, so a row whose property is null is false. `not
+search(...)`, `search(...) or ...`, `search(...) = false` and `not
+coalesce(search(...), false)` all run, inside blocks too, and keep exactly the
+rows the call's matches decide: a call standing alone is answered by its
+binding's scan, and any other use by the same full-text query over the whole
+table, so a row an index has not covered yet answers as an indexed one does. A
+full-text call read as a value, in `return`, `order` or a block's aggregate,
+is not lowered in this release (`T86`), nor is `match_terms` with an edit
+budget other than `max_edits: 0`: only an exact scan answers it.
 
 Separate `not` blocks may reuse a local variable name for different node
 types. Each full-text call uses the index on the type and property bound
@@ -239,14 +239,8 @@ query hybrid($vector: Vector(4), $text: String) {
 
 An `rrf` takes two arms. Two arms that rank the same population, property
 and query are refused (`T75`), and so are arms that rank two different
-bindings: the fused target would be a pair.
-
-A target's fused score is the sum, over the arms that selected it, of the
-arm's weight divided by `k` plus the target's rank in that arm, counted from
-1; an arm that did not select the target adds nothing. `weights` scales each
-arm's votes, in arm order: with `weights: [1.0, 5.0]` a target ranked first by
-the second arm scores `5 / 61` from it, so the second arm leads the fusion.
-Weights all 1.0 are the unweighted fusion.
+bindings: the fused target would be a pair. A target's fused score sums
+`weight / (k + rank)` over the arms that selected it, ranks counted from 1.
 
 Ranking order is a contract, not a side effect: search-ordered results are
 sorted on the search score itself, including through multi-hop traversals, with
@@ -319,8 +313,8 @@ has no `ranking`.
 
 ## Indexes
 
-`@index` and `@key` declare index intent. For a single-property node declaration,
-OmniGraph currently creates:
+`@index` and `@key` declare index intent. For a single-property node
+declaration, Omnigraph currently creates:
 
 | Property | Index use |
 |---|---|
@@ -350,7 +344,7 @@ omnigraph optimize --target ./graph.omni
 ```
 
 after a large load or merge, and on a regular maintenance cadence, to refresh
-coverage and compact data on `main`. On another branch, `index build` builds the
-branch's missing indexes and refreshes lagging BTREE and vector coverage; see
-[Build indexes](../operations/maintenance.md#build-indexes). An empty vector property remains pending until it has a
-non-null vector to index.
+coverage and compact data on `main`. On another branch, `index build` builds
+the branch's missing indexes and refreshes lagging BTREE and vector coverage;
+see [Build indexes](../operations/maintenance.md#build-indexes). An empty
+vector property remains pending until it has a non-null vector to index.
