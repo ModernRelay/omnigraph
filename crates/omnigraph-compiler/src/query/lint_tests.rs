@@ -125,7 +125,7 @@ update Person set { missing: "nope" } where slug = $slug
     assert_eq!(
         operation.result,
         vec![QueryResultFieldDescriptor {
-            name: "name".to_string(),
+            name: "p.name".to_string(),
             kind: QueryValueKind::String,
             item_kind: None,
             vector_dim: None,
@@ -547,19 +547,19 @@ return {
     assert_eq!(
         shapes,
         vec![
-            ("slug", QueryValueKind::String, None, None, false),
-            ("count", QueryValueKind::Int, None, None, false),
-            ("total", QueryValueKind::BigInt, None, None, false),
-            ("score", QueryValueKind::Float, None, None, false),
+            ("d.slug", QueryValueKind::String, None, None, false),
+            ("d.count", QueryValueKind::Int, None, None, false),
+            ("d.total", QueryValueKind::BigInt, None, None, false),
+            ("d.score", QueryValueKind::Float, None, None, false),
             (
-                "tags",
+                "d.tags",
                 QueryValueKind::List,
                 Some(QueryValueKind::Date),
                 None,
                 true,
             ),
-            ("embedding", QueryValueKind::Vector, None, Some(3), false,),
-            ("createdAt", QueryValueKind::DateTime, None, None, true,),
+            ("d.embedding", QueryValueKind::Vector, None, Some(3), false,),
+            ("d.createdAt", QueryValueKind::DateTime, None, None, true,),
             ("d", QueryValueKind::Object, None, None, false),
         ]
     );
@@ -568,7 +568,7 @@ return {
     assert_eq!(
         serialized["results"][0]["operation"]["result"][4],
         serde_json::json!({
-            "name": "tags",
+            "name": "d.tags",
             "kind": "list",
             "item_kind": "date",
             "nullable": true
@@ -577,7 +577,7 @@ return {
     assert_eq!(
         serialized["results"][0]["operation"]["result"][5],
         serde_json::json!({
-            "name": "embedding",
+            "name": "d.embedding",
             "kind": "vector",
             "vector_dim": 3,
             "nullable": false

@@ -101,9 +101,8 @@ pub fn describe_checked_query_operation(
             let ir = crate::lower_query(catalog, query)?;
             ir.return_exprs
                 .iter()
-                .zip(&query.returns)
-                .map(|(projection, item)| {
-                    let field = projection_field(catalog, &item.inferred_name, &projection.ty)?;
+                .map(|projection| {
+                    let field = projection_field(catalog, &projection.column, &projection.ty)?;
                     result_field_descriptor(&field)
                 })
                 .collect::<Result<Vec<_>>>()?

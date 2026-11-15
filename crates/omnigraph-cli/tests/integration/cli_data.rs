@@ -1607,12 +1607,12 @@ query list_policies() {
         serde_json::json!({
             "result": [
                 {
-                    "name": "name",
+                    "name": "p.name",
                     "kind": "string",
                     "nullable": true
                 },
                 {
-                    "name": "effectiveTo",
+                    "name": "p.effectiveTo",
                     "kind": "datetime",
                     "nullable": true
                 }

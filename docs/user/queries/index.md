@@ -333,7 +333,8 @@ If a server omits it, the result and access sets are unknown. When present:
 
 - `result` lists projected fields in return order. Each field has `name`,
   `kind`, and `nullable`; list fields also have `item_kind`, and vectors
-  have `vector_dim`.
+  have `vector_dim`. The name is the key in each result row. For example, `$p.name`
+  produces `p.name`, and `$p.name as label` produces `label`.
 - `reads` conservatively lists every node or edge type the query may inspect.
 - `writes` lists every node or edge type the query may change and is empty
   for a read query.

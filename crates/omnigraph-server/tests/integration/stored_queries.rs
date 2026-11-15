@@ -912,7 +912,7 @@ async fn list_queries_describes_only_exposed_operations_issue_468() {
                 "find_person",
                 r#"query find_person($name: String) {
                     match { $p: Person { name: $name } $friend: Person $p knows $friend }
-                    return { $friend.age as years, $p.name as source_name }
+                    return { $friend.age as years, $p.name, $friend.name }
                 }"#,
                 true,
             ),
@@ -955,13 +955,28 @@ async fn list_queries_describes_only_exposed_operations_issue_468() {
     assert_eq!(fp["params"][0]["kind"], "string");
     let ap = entries.iter().find(|q| q["name"] == "add_person").unwrap();
     assert_eq!(ap["mutation"], true, "stored insert → mutation");
+    let (status, result) = json_response(
+        &app,
+        invoke_request(
+            "find_person",
+            "t-invoke",
+            json!({"params": {"name": "Bob"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        result["rows"],
+        json!([{"years": 28, "p.name": "Bob", "friend.name": "Diana"}])
+    );
     let person = json!({"kind": "node", "type_name": "Person"});
     assert_eq!(
         fp["operation"],
         json!({
             "result": [
                 {"name": "years", "kind": "int", "nullable": true},
-                {"name": "source_name", "kind": "string", "nullable": false}
+                {"name": "p.name", "kind": "string", "nullable": false},
+                {"name": "friend.name", "kind": "string", "nullable": false}
             ],
             "reads": [person, {"kind": "edge", "type_name": "Knows"}],
             "writes": []
