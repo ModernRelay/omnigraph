@@ -343,14 +343,14 @@ mod tests {
     fn constant_cast_executes_without_erasing_its_stored_witness() {
         let cast = IRExpr::Cast {
             expr: Box::new(IRExpr::Literal(
-                Literal::Float(30.0),
-                scalar(ScalarType::F64, false),
+                Literal::Integer(30),
+                scalar(ScalarType::I64, false),
             )),
-            ty: scalar(ScalarType::I64, false),
+            ty: scalar(ScalarType::I32, false),
         };
         let params = ParamMap::new();
         let values = evaluate_constant_array(&cast, &params).expect("exact literal narrowing");
-        assert_eq!(values.data_type(), &DataType::Int64);
+        assert_eq!(values.data_type(), &DataType::Int32);
         assert_eq!(
             evaluate_constant(&cast, &params).unwrap(),
             Literal::Integer(30)
