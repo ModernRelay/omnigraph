@@ -37,6 +37,33 @@ pub fn print_file(file: &SourceFile) -> String {
 }
 
 pub fn print_decl(d: &Decl) -> String {
+    let mut out = header(d);
+    out.push_str(" { ");
+    match &d.body {
+        DeclBody::Read(body) => out.push_str(&read_body(body)),
+        DeclBody::Write(body) => {
+            let groups: Vec<String> = body
+                .groups
+                .iter()
+                .map(|group| {
+                    let mut parts = Vec::new();
+                    if !group.pattern.elements.is_empty() {
+                        parts.push(match_pattern(&group.pattern));
+                    }
+                    parts.extend(group.statements.iter().map(statement));
+                    parts.join("  ")
+                })
+                .collect();
+            out.push_str(&groups.join("  "));
+        }
+    }
+    out.push_str(" }");
+    out
+}
+
+/// A declaration's text before its body's brace: the name, the parameters,
+/// the annotations and the write mode.
+pub fn header(d: &Decl) -> String {
     let mut out = format!("query {}(", d.name);
     for (i, p) in d.params.iter().enumerate() {
         if i > 0 {
@@ -93,26 +120,6 @@ pub fn print_decl(d: &Decl) -> String {
             }
         }
     }
-    out.push_str(" { ");
-    match &d.body {
-        DeclBody::Read(body) => out.push_str(&read_body(body)),
-        DeclBody::Write(body) => {
-            let groups: Vec<String> = body
-                .groups
-                .iter()
-                .map(|group| {
-                    let mut parts = Vec::new();
-                    if !group.pattern.elements.is_empty() {
-                        parts.push(match_pattern(&group.pattern));
-                    }
-                    parts.extend(group.statements.iter().map(statement));
-                    parts.join("  ")
-                })
-                .collect();
-            out.push_str(&groups.join("  "));
-        }
-    }
-    out.push_str(" }");
     out
 }
 
@@ -125,7 +132,7 @@ fn annotation_value(v: &AnnotationValue) -> String {
     }
 }
 
-fn statement(s: &Stmt) -> String {
+pub(crate) fn statement(s: &Stmt) -> String {
     let assignments = |a: &[Assignment]| {
         a.iter()
             .map(|a| format!("{}: {}", a.property, expr(&a.value)))
@@ -194,14 +201,14 @@ pub fn match_pattern(p: &Pattern) -> String {
 }
 
 /// A block's or an `optional`'s braces: its elements and its own `where`.
-fn braced(p: &Pattern) -> String {
+pub(crate) fn braced(p: &Pattern) -> String {
     match &p.predicate {
         Some(w) => format!("{{ {} where {} }}", elements(p), expr(w)),
         None => format!("{{ {} }}", elements(p)),
     }
 }
 
-fn elements(p: &Pattern) -> String {
+pub(crate) fn elements(p: &Pattern) -> String {
     p.elements
         .iter()
         .map(element)
@@ -209,7 +216,7 @@ fn elements(p: &Pattern) -> String {
         .join(", ")
 }
 
-fn inline(body: &ReadBody) -> String {
+pub(crate) fn inline(body: &ReadBody) -> String {
     format!("{{ {} }}", read_body(body))
 }
 
@@ -260,7 +267,7 @@ pub fn element(c: &Element) -> String {
     }
 }
 
-fn relation(rel: &RelExpr) -> String {
+pub(crate) fn relation(rel: &RelExpr) -> String {
     match rel {
         RelExpr::Inline(body) => inline(body),
         RelExpr::Call(c) => call(c),
@@ -268,7 +275,7 @@ fn relation(rel: &RelExpr) -> String {
     }
 }
 
-fn block(b: &Block) -> String {
+pub(crate) fn block(b: &Block) -> String {
     let head = match (b.func, &b.arg) {
         (BlockFunc::Exists, _) => "exists".to_string(),
         (BlockFunc::Agg(f), None) => agg(f).to_string(),
@@ -277,7 +284,7 @@ fn block(b: &Block) -> String {
     format!("{head} {}", braced(&b.pattern))
 }
 
-fn agg(f: AggFunc) -> &'static str {
+pub(crate) fn agg(f: AggFunc) -> &'static str {
     match f {
         AggFunc::Count => "count",
         AggFunc::Sum => "sum",
@@ -287,7 +294,7 @@ fn agg(f: AggFunc) -> &'static str {
     }
 }
 
-fn comp(op: CompOp) -> &'static str {
+pub(crate) fn comp(op: CompOp) -> &'static str {
     match op {
         CompOp::Eq => "=",
         CompOp::Ne => "!=",
@@ -300,7 +307,7 @@ fn comp(op: CompOp) -> &'static str {
     }
 }
 
-fn call(c: &Call) -> String {
+pub(crate) fn call(c: &Call) -> String {
     let mut parts: Vec<String> = c
         .args
         .iter()
@@ -315,7 +322,7 @@ fn call(c: &Call) -> String {
 
 /// Precedence, lowest first, following the grammar's ladder.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Prec {
+pub(crate) enum Prec {
     Or,
     And,
     Not,
@@ -326,7 +333,7 @@ enum Prec {
     Atom,
 }
 
-fn prec(e: &Expr) -> Prec {
+pub(crate) fn prec(e: &Expr) -> Prec {
     match e {
         Expr::Or(..) => Prec::Or,
         Expr::And(..) => Prec::And,
@@ -411,6 +418,15 @@ pub fn literal(l: &Literal) -> String {
         Literal::Null => "null".to_string(),
         Literal::String(s) => string(s),
         Literal::Integer(i) => i.to_string(),
+        // A literal too large for `F64` reads as infinity; this spelling
+        // reads back to it.
+        Literal::Float(f) if f.is_infinite() => {
+            if f.is_sign_negative() {
+                "-1.0e999".to_string()
+            } else {
+                "1.0e999".to_string()
+            }
+        }
         Literal::Float(f) => {
             let mut s = format!("{f:?}");
             if let Some(e) = s.find('e') {

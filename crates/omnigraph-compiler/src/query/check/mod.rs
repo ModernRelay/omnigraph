@@ -946,6 +946,45 @@ const SCALAR_ROWS: &[&str] = &[
     "concat",
 ];
 const AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max"];
+/// The default an omitted option of a registry row takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OptionDefault {
+    /// No default: the option is required, or its absence means something
+    /// no written value does.
+    None,
+    Integer(i128),
+    /// An enumerated word, written bare.
+    Word(&'static str),
+    /// A list of one `1` per positional argument (`rrf`'s `weights`).
+    OnePerArgument,
+}
+
+/// The options of each registry row that takes options, in the registry's
+/// order, with the default each takes when it is omitted: the order
+/// `queries fmt` writes, dropping an option equal to its default
+/// (section 6).
+pub(crate) const REGISTRY_OPTIONS: &[(&str, &[(&str, OptionDefault)])] = &[
+    (
+        "nearest",
+        &[("k", OptionDefault::None), ("recall", OptionDefault::None)],
+    ),
+    (
+        "rrf",
+        &[
+            ("k", OptionDefault::Integer(RRF_DEFAULT_K as i128)),
+            ("weights", OptionDefault::OnePerArgument),
+        ],
+    ),
+    (
+        "terms",
+        &[
+            ("mode", OptionDefault::Word("all")),
+            ("max_edits", OptionDefault::Integer(0)),
+        ],
+    ),
+    ("fuzzy", &[("max_edits", OptionDefault::Integer(2))]),
+];
+
 /// Words a registry row may never be named (section 5).
 const CLAUSE_KEYWORDS: &[&str] = &["let", "from", "optional", "exists", "not"];
 /// Annotations retained as pure metadata.
@@ -7185,7 +7224,7 @@ fn conjuncts(e: &Expr) -> Vec<&Expr> {
 
 /// The name a return item produces: its alias, `var.prop` for a property,
 /// the variable for a reference.
-fn item_name(e: &Expr, alias: Option<&str>) -> String {
+pub(crate) fn item_name(e: &Expr, alias: Option<&str>) -> String {
     if let Some(a) = alias {
         return a.to_string();
     }
@@ -7531,4 +7570,4 @@ mod traversal;
 pub use scalar::{SExpr, SKind, Terms};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
