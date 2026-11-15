@@ -1812,6 +1812,7 @@ mod result_contract {
                 primary: Box::new(rank()),
                 secondary: Box::new(rank()),
                 k: None,
+                weights: None,
                 ty: ty(ScalarType::F64, false),
             },
             IRExpr::Aggregate {

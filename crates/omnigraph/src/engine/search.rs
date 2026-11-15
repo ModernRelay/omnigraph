@@ -301,11 +301,13 @@ impl SearchMode {
     }
 }
 
-/// `rrf(a, b, k)` as the fusion runs it: the rank constant. The query's
-/// `limit` cuts the fused rows in the `Sort` above the fusion, never here.
+/// `rrf(a, b, k, weights)` as the fusion runs it: the rank constant and
+/// each arm's weight, in arm order. The query's `limit` cuts the fused rows
+/// in the `Sort` above the fusion, never here.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RrfMode {
     pub(super) k: u32,
+    pub(super) weights: [f64; 2],
 }
 
 #[derive(Debug, PartialEq)]
@@ -408,6 +410,21 @@ pub(super) fn resolve_rrf_k(expr: Option<&IRExpr>, params: &ParamMap) -> Result<
         .ok()
         .filter(|value| *value > 0)
         .ok_or_else(|| OmniError::manifest("rrf k must be greater than 0 and fit U32"))
+}
+
+/// The arms' weights: every arm `1.0` when the plan stores none, otherwise
+/// the stored `[F64]` literal, one weight in `(0, 1000000]` per arm.
+pub(super) fn resolve_rrf_weights(expr: Option<&IRExpr>) -> Result<[f64; 2]> {
+    let Some(expr) = expr else {
+        return Ok([1.0; 2]);
+    };
+    omnigraph_compiler::ir::rrf_weight_values(expr, 2)
+        .and_then(|weights| <[f64; 2]>::try_from(weights).ok())
+        .ok_or_else(|| {
+            OmniError::manifest_internal(
+                "rrf weights must be one F64 in (0, 1000000] per arm, as the query writes them",
+            )
+        })
 }
 
 /// Resolve the nearest() target property's vector dimension and the embedding

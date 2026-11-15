@@ -600,7 +600,7 @@ query window_then_where($q: Vector(4)) {
     order { $d.slug }
 }
 query fused($t: String, $q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60, weights: [2.0, 1.0]) as $score, $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 3
@@ -1553,6 +1553,40 @@ async fn a_fusion_replays() {
         "{error}"
     );
     assert!(error.to_string().contains("predicate origin"), "{error}");
+
+    // The plan carries the weights the query writes; a plan that drops them
+    // would fuse other scores, so the replay door refuses it.
+    let mut unweighted = plan.clone();
+    match unweighted.plan.node_mut(fuse) {
+        Some(PhysicalNode::RankFuse { weights, .. }) => {
+            assert_eq!(
+                weights
+                    .as_ref()
+                    .and_then(|w| omnigraph_compiler::ir::rrf_weight_values(w, 2)),
+                Some(vec![2.0, 1.0])
+            );
+            *weights = None;
+        }
+        other => panic!("the fusion is a RankFuse: {other:?}"),
+    }
+    let error = match db
+        .replay_bound_plan(
+            "main",
+            &with_plan(&envelope, serde_json::to_value(&unweighted).unwrap()),
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(replay) => panic!(
+            "an unweighted fusion replayed: {:?}",
+            rows_of(&replay.result)
+        ),
+    };
+    assert!(
+        matches!(&error, OmniError::Manifest(error) if error.kind == ManifestErrorKind::BadRequest),
+        "{error}"
+    );
+    assert!(error.to_string().contains("`weights`"), "{error}");
 
     // Two nearest arms record their attempts apart, one decision per scan.
     let mut params =

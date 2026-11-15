@@ -363,6 +363,7 @@ pub enum NodeMirror {
     RankFuse {
         arms: [RankArm; 2],
         k: Option<ExprMirror>,
+        weights: Option<ExprMirror>,
         limit: Option<usize>,
         prefilter: PrefilterMirror,
         row_tiebreak: Vec<ColumnRef>,
@@ -633,12 +634,14 @@ impl From<&PhysicalNode> for NodeMirror {
             PhysicalNode::RankFuse {
                 arms,
                 k,
+                weights,
                 limit,
                 prefilter,
                 row_tiebreak,
             } => Self::RankFuse {
                 arms: arms.clone(),
                 k: k.as_ref().map(ExprMirror::from),
+                weights: weights.as_ref().map(ExprMirror::from),
                 limit: *limit,
                 prefilter: PrefilterMirror::from(prefilter),
                 row_tiebreak: row_tiebreak.clone(),
@@ -925,12 +928,14 @@ impl TryFrom<NodeMirror> for PhysicalNode {
             NodeMirror::RankFuse {
                 arms,
                 k,
+                weights,
                 limit,
                 prefilter,
                 row_tiebreak,
             } => Self::RankFuse {
                 arms,
                 k: k.map(IRExpr::from),
+                weights: weights.map(IRExpr::from),
                 limit,
                 prefilter: Prefilter::from(prefilter),
                 row_tiebreak,
@@ -1726,6 +1731,7 @@ pub enum ExprMirror {
         primary: Box<ExprMirror>,
         secondary: Box<ExprMirror>,
         k: Option<Box<ExprMirror>>,
+        weights: Option<Box<ExprMirror>>,
         ty: ExprType,
     },
     Variable {
@@ -1840,11 +1846,13 @@ impl From<&IRExpr> for ExprMirror {
                 primary,
                 secondary,
                 k,
+                weights,
                 ty,
             } => Self::Rrf {
                 primary: boxed(primary),
                 secondary: boxed(secondary),
                 k: k.as_deref().map(boxed),
+                weights: weights.as_deref().map(boxed),
                 ty: ty.clone(),
             },
             IRExpr::Variable(name, ty) => Self::Variable {
@@ -1964,11 +1972,13 @@ impl From<ExprMirror> for IRExpr {
                 primary,
                 secondary,
                 k,
+                weights,
                 ty,
             } => Self::Rrf {
                 primary: unboxed(*primary),
                 secondary: unboxed(*secondary),
                 k: k.map(|inner| unboxed(*inner)),
+                weights: weights.map(|inner| unboxed(*inner)),
                 ty,
             },
             ExprMirror::Variable { name, ty } => Self::Variable(name, ty),

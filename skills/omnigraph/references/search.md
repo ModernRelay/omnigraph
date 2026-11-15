@@ -73,7 +73,7 @@ replacement vectors; neither `merge` nor `overwrite` does that automatically.
 A ranking is a relation drawn into `match` with `from`, which names its score
 with `as`: `from nearest(rel, $c.embedding, $q, k: n) as $distance`,
 `from bm25(rel, $d.title, $q) as $score`,
-`from rrf(arm, arm, k: 60) as $score`. `rel` is the population, a relation
+`from rrf(arm, arm, k: 60, weights: [1.0, 1.0]) as $score`. `rel` is the population, a relation
 named with `let` before the ranking, `let $pop = { match { … } where … return { $c } }`,
 whose `return` lists every binding the rest of the query reads (an inline read
 in its place also works). `from` adds the population's columns and the score
@@ -143,6 +143,10 @@ query top_titles($q: String) {
 
 `let` names the population once and both arms rank it. `rrf` takes two arms;
 identical arms, or arms that rank two different bindings, are refused (`T75`).
+A target scores the sum over the arms that selected it of
+`weight / (k + rank)`, ranks counted from 1; `weights: [w, w]` (one number in
+`(0, 1000000]` per arm, default 1.0, another length `T75`) gives an arm more
+say, so `weights: [1.0, 3.0]` lets the second arm lead.
 It yields one row per target with the fused score and no other population
 column; a population that reaches a target several times adds no row, and a
 read that needs a population column draws it again after the `from`

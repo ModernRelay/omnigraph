@@ -1150,6 +1150,7 @@ fn search_node(
             primary,
             secondary,
             k,
+            weights,
             ..
         } => {
             let arms = [search_target(primary)?, search_target(secondary)?];
@@ -1164,6 +1165,7 @@ fn search_node(
                 input,
                 arms: Box::new(arms),
                 k: k.as_deref().cloned(),
+                weights: weights.as_deref().cloned(),
                 limit,
                 reads,
                 row_tiebreak: Vec::new(),
@@ -3062,6 +3064,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             input: _,
             arms,
             k: _,
+            weights: _,
             limit: _,
             reads,
             row_tiebreak,
@@ -4275,6 +4278,7 @@ impl Lowering<'_> {
                 input,
                 arms,
                 k,
+                weights,
                 limit,
                 row_tiebreak,
                 leads,
@@ -4366,6 +4370,7 @@ impl Lowering<'_> {
                 Ok(self.physical.add(PhysicalNode::RankFuse {
                     arms: [primary_arm, secondary_arm],
                     k: k.clone(),
+                    weights: weights.clone(),
                     limit,
                     prefilter,
                     row_tiebreak: row_tiebreak.clone(),

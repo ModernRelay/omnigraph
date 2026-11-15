@@ -37,10 +37,12 @@ pub(crate) fn expr(root: &IRExpr) -> Value {
                         primary,
                         secondary,
                         k,
+                        weights,
                         ..
                     } => {
                         let mut args = vec![primary.as_ref(), secondary.as_ref()];
                         args.extend(k.as_deref());
+                        args.extend(weights.as_deref());
                         ("rrf", args)
                     }
                     IRExpr::Variable(_, _) => ("variable", vec![]),

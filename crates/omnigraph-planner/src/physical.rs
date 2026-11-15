@@ -1048,10 +1048,12 @@ physical_nodes! {
         shape: PipelineShape::Streaming, sides: vec![], cut: None, order: None;
     /// `rrf(a, b)`: two arms, each its own copy of the pipeline with one
     /// ranked scan, every arm row emitted with `<primary binding>._rrf`; `k`
-    /// as written, `limit` only the nearest arm's window, `prefilter` feeds `bm25`.
+    /// and `weights` as written (`None`: every arm `1.0`), `limit` only the
+    /// nearest arm's window, `prefilter` feeds `bm25`.
     RankFuse {
         arms: [RankArm; 2],
         k: Option<IRExpr>,
+        weights: Option<IRExpr>,
         limit: Option<usize>,
         prefilter: Prefilter,
         /// Downstream row keys after the arm score and fused node identity.
@@ -1625,6 +1627,7 @@ impl PhysicalPlan {
             PhysicalNode::RankFuse {
                 arms,
                 k,
+                weights,
                 limit,
                 row_tiebreak,
                 ..
@@ -1636,6 +1639,8 @@ impl PhysicalPlan {
                     .collect::<Vec<Value>>(),
                 "k": k.as_ref().map(ToString::to_string),
                 "typed_k": k.as_ref().map(crate::typed::expr),
+                "weights": weights.as_ref().map(ToString::to_string),
+                "typed_weights": weights.as_ref().map(crate::typed::expr),
                 "limit": limit,
                 "row_tiebreak": tiebreak_text(row_tiebreak),
             }),

@@ -119,6 +119,7 @@ fn search_expression_arms_attribute_field_and_nested_columns() {
                 ty: value_type(ScalarType::F32, false),
             }),
             k: Some(Box::new(prop("c", "k_ref"))),
+            weights: None,
             ty: value_type(ScalarType::F64, false),
         }],
     );
@@ -153,6 +154,7 @@ fn rank_fuse_targets_read_the_node_object_in_both_arms() {
                 ty: value_type(ScalarType::F32, false),
             }),
             k: None,
+            weights: None,
             ty: value_type(ScalarType::F64, false),
         }],
     );

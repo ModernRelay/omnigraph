@@ -92,6 +92,7 @@ pub(crate) enum Search {
     Fuse {
         arms: Box<[Retrieval; 2]>,
         k: Option<IRExpr>,
+        weights: Option<IRExpr>,
     },
 }
 
@@ -505,11 +506,13 @@ impl Requirements {
                 primary,
                 secondary,
                 k,
+                weights,
                 ..
             }) => match (Retrieval::of(primary), Retrieval::of(secondary)) {
                 (Some(primary), Some(secondary)) => Some(Search::Fuse {
                     arms: Box::new([primary, secondary]),
                     k: k.as_deref().cloned(),
+                    weights: weights.as_deref().cloned(),
                 }),
                 _ => None,
             },

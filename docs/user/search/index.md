@@ -12,7 +12,7 @@ with `as`.
 | `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by L2 distance, with the distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
 | `distance(rel, $d.embedding, $q)` | Every row of `rel` with the exact squared L2 distance of its vector to `$q` as the score; a row whose vector is null is dropped. `$q` may be a vector or text, as for `nearest`. |
 | `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their BM25 relevance as the score. |
-| `rrf(ranking, ranking, k: 60)` | Two rankings of one population fused with Reciprocal Rank Fusion: the result has the ranked node column and the fused score, named by the `as` of the `from` that draws it, and nothing else. The default `k` is 60. |
+| `rrf(ranking, ranking, k: 60, weights: [w, w])` | Two rankings of one population fused with Reciprocal Rank Fusion: the result has the ranked node column and the fused score, named by the `as` of the `from` that draws it, and nothing else. The default `k` is 60 and every weight defaults to 1.0. |
 | `search($d.body, $q)` | Full-text token search. |
 | `fuzzy($d.body, $q, max_edits: n)` | Full-text search with edit-distance tolerance. |
 | `match_text($d.body, $q)` | Match a full-text query in a `match` block. |
@@ -48,7 +48,9 @@ window read from a parameter takes the count the parameter is bound to when
 the read runs, in an `rrf` arm too; a count below 1 is refused. `fuzzy` defaults `max_edits` to 2 when
 omitted; a literal must be 0 to 2 (`T71`) and a parameter an integer from 0
 to 4,294,967,295. `rrf` takes `k` as an integer literal from 1 to 1,000,000
-or an integer parameter. Options are named: `fuzzy($d.body, $q, 2)` is
+or an integer parameter, and `weights` as a list literal of one number per
+arm, each above 0 and at most 1,000,000; a list of another length is refused
+(`T75`) and a weight out of range (`T71`). Options are named: `fuzzy($d.body, $q, 2)` is
 refused (`T71`) with `max_edits: 2` as its fix. A supplied null is an error,
 including a nullable parameter that was omitted from the parameter map. Query
 text and vectors must also be non-null; vector elements must convert to
@@ -237,6 +239,13 @@ query hybrid($vector: Vector(4), $text: String) {
 An `rrf` takes two arms. Two arms that rank the same population, property
 and query are refused (`T75`), and so are arms that rank two different
 bindings: the fused target would be a pair.
+
+A target's fused score is the sum, over the arms that selected it, of the
+arm's weight divided by `k` plus the target's rank in that arm, counted from
+1; an arm that did not select the target adds nothing. `weights` scales each
+arm's votes, in arm order: with `weights: [1.0, 5.0]` a target ranked first by
+the second arm scores `5 / 61` from it, so the second arm leads the fusion.
+Weights all 1.0 are the unweighted fusion.
 
 Ranking order is a contract, not a side effect: search-ordered results are
 sorted on the search score itself, including through multi-hop traversals, with

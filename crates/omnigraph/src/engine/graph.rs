@@ -151,16 +151,17 @@ pub(super) fn fuse_arms(
     }
 
     let k = rrf.k as f64;
+    let [primary_weight, secondary_weight] = rrf.weights;
     let scored: Vec<(String, f64)> = all_ids
         .iter()
         .map(|id| {
             let p = primary_rank
                 .get(id)
-                .map(|&r| 1.0 / (k + r as f64 + 1.0))
+                .map(|&r| primary_weight / (k + r as f64 + 1.0))
                 .unwrap_or(0.0);
             let s = secondary_rank
                 .get(id)
-                .map(|&r| 1.0 / (k + r as f64 + 1.0))
+                .map(|&r| secondary_weight / (k + r as f64 + 1.0))
                 .unwrap_or(0.0);
             (id.clone(), p + s)
         })

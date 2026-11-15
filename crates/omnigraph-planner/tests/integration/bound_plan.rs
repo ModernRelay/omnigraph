@@ -234,6 +234,7 @@ fn fused_saved_node_refuses_a_reader_without_declared_row_keys() {
             primary: Box::new(arm.clone()),
             secondary: Box::new(arm),
             k: None,
+            weights: None,
             ty: value_type(ScalarType::F64, false),
         }),
         values: Default::default(),
@@ -356,6 +357,7 @@ fn a_fused_plan_reads_back_with_both_arms() {
             Literal::Integer(30),
             value_type(ScalarType::I64, false),
         ))),
+        weights: None,
         ty: value_type(ScalarType::F64, false),
     });
     let primary = ranked_scan(&plan, RankScope::Primary);
@@ -671,6 +673,7 @@ fn expression_mirror_preserves_every_typed_interior_and_nested_cast() {
                 Literal::Integer(60),
                 value_type(ScalarType::I64, false),
             ))),
+            weights: None,
             ty: value_type(ScalarType::F64, false),
         },
         IRExpr::Not(

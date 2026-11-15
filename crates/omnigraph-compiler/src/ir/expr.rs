@@ -5,7 +5,7 @@
 use crate::error::{CompilerError, Result};
 use crate::query::syntax::ArithOp;
 use crate::query::value::{AggFunc, BinaryOp, CompOp, Literal, NOW_PARAM_NAME, Precedence};
-use crate::types::{AggSignature, ExprType, PropType};
+use crate::types::{AggSignature, ExprType, PropType, ScalarType};
 
 use super::coerce;
 
@@ -244,6 +244,62 @@ impl std::fmt::Display for SubqueryPredicate {
     }
 }
 
+/// The largest `rrf` weight: with `k >= 1` and at most sixteen arms the
+/// fused sum stays finite.
+pub const RRF_MAX_WEIGHT: f64 = 1_000_000.0;
+
+/// The stored `weights` of an `rrf` over `arms` arms: `None` when every
+/// weight is `1.0` (the unwritten default, so an unweighted fusion keeps one
+/// spelling), otherwise the `[F64]` literal of the weights in arm order.
+pub fn rrf_weights_expr(weights: &[f64]) -> Option<IRExpr> {
+    if weights
+        .iter()
+        .all(|weight| weight.to_bits() == 1.0_f64.to_bits())
+    {
+        return None;
+    }
+    Some(IRExpr::Literal(
+        Literal::List(
+            weights
+                .iter()
+                .map(|weight| Literal::Float(*weight))
+                .collect(),
+        ),
+        ExprType::Value {
+            scalar: ScalarType::F64,
+            list: true,
+            nullable: false,
+        },
+    ))
+}
+
+/// The weights a stored `rrf` `weights` literal carries, when it is the shape
+/// [`rrf_weights_expr`] builds for `arms` arms with every weight in
+/// `(0, RRF_MAX_WEIGHT]`; `None` for anything else.
+pub fn rrf_weight_values(weights: &IRExpr, arms: usize) -> Option<Vec<f64>> {
+    let IRExpr::Literal(
+        Literal::List(items),
+        ExprType::Value {
+            scalar: ScalarType::F64,
+            list: true,
+            nullable: false,
+        },
+    ) = weights
+    else {
+        return None;
+    };
+    if items.len() != arms {
+        return None;
+    }
+    items
+        .iter()
+        .map(|item| match item {
+            Literal::Float(weight) if *weight > 0.0 && *weight <= RRF_MAX_WEIGHT => Some(*weight),
+            _ => None,
+        })
+        .collect()
+}
+
 impl IRExpr {
     /// The compiler-owned result type of every expression node.
     pub fn ty(&self) -> &ExprType {
@@ -328,10 +384,12 @@ impl IRExpr {
                     primary,
                     secondary,
                     k,
+                    weights,
                     ..
                 } => {
                     pending.extend([primary.as_ref(), secondary.as_ref()]);
                     pending.extend(k.as_deref());
+                    pending.extend(weights.as_deref());
                 }
                 Self::Aggregate { arg, .. }
                 | Self::Not(arg, _)
@@ -380,10 +438,12 @@ impl IRExpr {
                     primary,
                     secondary,
                     k,
+                    weights,
                     ..
                 } => {
                     pending.extend([primary.as_ref(), secondary.as_ref()]);
                     pending.extend(k.as_deref());
+                    pending.extend(weights.as_deref());
                 }
                 Self::Aggregate { arg, .. }
                 | Self::Not(arg, _)
@@ -434,8 +494,10 @@ impl IRExpr {
                     primary,
                     secondary,
                     k,
+                    weights,
                     ..
                 } => {
+                    pending.extend(weights.as_deref());
                     pending.extend(k.as_deref());
                     pending.extend([secondary.as_ref(), primary.as_ref()]);
                 }
@@ -493,7 +555,6 @@ impl IRExpr {
     /// Validate each stored local type rule without consulting the catalog or
     /// bound parameter values. Operator return owners validate alias identity.
     pub fn check_types(&self) -> Result<()> {
-        use crate::types::ScalarType;
         let mut pending = vec![self];
         while let Some(expr) = pending.pop() {
             let bad = |detail: &str| CompilerError::Plan(detail.to_string());
@@ -569,9 +630,18 @@ impl IRExpr {
                     primary,
                     secondary,
                     k,
+                    weights,
                     ty,
                 } => {
                     expect(ty, scalar_type(ScalarType::F64, false))?;
+                    if weights
+                        .as_deref()
+                        .is_some_and(|weights| rrf_weight_values(weights, 2).is_none())
+                    {
+                        return Err(bad(
+                            "rrf weights must be a non-null [F64] literal of one weight in (0, 1000000] per arm",
+                        ));
+                    }
                     for arm in [primary.as_ref(), secondary.as_ref()] {
                         if !matches!(arm, Self::Nearest { .. } | Self::Bm25 { .. })
                             || !scalar_is(arm.ty(), ScalarType::F32)
@@ -584,6 +654,7 @@ impl IRExpr {
                     }
                     pending.extend([primary.as_ref(), secondary.as_ref()]);
                     pending.extend(k.as_deref());
+                    pending.extend(weights.as_deref());
                 }
                 Self::Binary {
                     left,
@@ -867,15 +938,19 @@ impl std::fmt::Display for IRExpr {
             IRExpr::Rrf {
                 primary,
                 secondary,
-                k: None,
+                k,
+                weights,
                 ty: _,
-            } => write!(f, "rrf({primary}, {secondary})"),
-            IRExpr::Rrf {
-                primary,
-                secondary,
-                k: Some(k),
-                ty: _,
-            } => write!(f, "rrf({primary}, {secondary}, {k})"),
+            } => {
+                write!(f, "rrf({primary}, {secondary}")?;
+                if let Some(k) = k {
+                    write!(f, ", {k}")?;
+                }
+                if let Some(weights) = weights {
+                    write!(f, ", weights: {weights}")?;
+                }
+                f.write_str(")")
+            }
             IRExpr::Variable(name, _) => write!(f, "${name}"),
             IRExpr::Param(name, _) if name == NOW_PARAM_NAME => f.write_str("now()"),
             IRExpr::Param(name, _) => write!(f, "${name}"),
@@ -1144,7 +1219,7 @@ mod render_tests {
             },
         };
         assert_eq!(nearest.to_string(), "nearest($d.embedding, $q)");
-        let rrf = IRExpr::Rrf {
+        let mut rrf = IRExpr::Rrf {
             primary: Box::new(nearest),
             secondary: Box::new(IRExpr::Bm25 {
                 field: Box::new(prop("d", "text")),
@@ -1168,6 +1243,7 @@ mod render_tests {
                     false,
                 )),
             ))),
+            weights: None,
             ty: crate::types::ExprType::Value {
                 scalar: crate::types::ScalarType::F64,
                 list: false,
@@ -1178,6 +1254,26 @@ mod render_tests {
             rrf.to_string(),
             "rrf(nearest($d.embedding, $q), bm25($d.text, \"needle\"), 60)"
         );
+        rrf.check_types().unwrap();
+        // Unit weights keep the unweighted spelling; others are stored and
+        // printed, and a malformed list fails the stored types.
+        assert_eq!(rrf_weights_expr(&[1.0, 1.0]), None);
+        let IRExpr::Rrf { weights, .. } = &mut rrf else {
+            unreachable!()
+        };
+        *weights = rrf_weights_expr(&[1.0, 5.0]).map(Box::new);
+        assert_eq!(
+            rrf.to_string(),
+            "rrf(nearest($d.embedding, $q), bm25($d.text, \"needle\"), 60, weights: [1.0, 5.0])"
+        );
+        rrf.check_types().unwrap();
+        for bad in [vec![2.0], vec![1.0, 0.0], vec![1.0, RRF_MAX_WEIGHT * 2.0]] {
+            let IRExpr::Rrf { weights, .. } = &mut rrf else {
+                unreachable!()
+            };
+            *weights = rrf_weights_expr(&bad).map(Box::new);
+            assert!(rrf.check_types().is_err(), "{bad:?}");
+        }
         let count = IRExpr::Aggregate {
             func: AggFunc::Count,
             distinct: false,
@@ -1683,10 +1779,14 @@ pub enum IRExpr {
         query: Box<IRExpr>,
         ty: ExprType,
     },
+    /// `rrf(primary, secondary, k, weights)`: `k` absent is the default
+    /// constant; `weights` absent is every arm weighted `1.0`, otherwise a
+    /// non-null `[F64]` literal with one weight per arm in written order.
     Rrf {
         primary: Box<IRExpr>,
         secondary: Box<IRExpr>,
         k: Option<Box<IRExpr>>,
+        weights: Option<Box<IRExpr>>,
         ty: ExprType,
     },
     Variable(String, ExprType),

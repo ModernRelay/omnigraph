@@ -675,12 +675,14 @@ pub enum LogicalNode {
         leads: bool,
     },
     /// A leading `order { rrf(a, b) }`: both arms run the input tree, ranked
-    /// on their targets, and fuse. `k` is the rank constant as written;
-    /// `limit` the query's limit, which sizes a nearest arm.
+    /// on their targets, and fuse. `k` is the rank constant and `weights`
+    /// the arms' weights as written (`None`: every arm `1.0`); `limit` the
+    /// query's limit, which sizes a nearest arm.
     RankFuse {
         input: LogicalId,
         arms: Box<[SearchArm; 2]>,
         k: Option<IRExpr>,
+        weights: Option<IRExpr>,
         limit: Option<u64>,
         reads: Vec<ColumnRef>,
         row_tiebreak: Vec<ColumnRef>,
@@ -1229,6 +1231,7 @@ impl LogicalPlan {
             LogicalNode::RankFuse {
                 arms,
                 k,
+                weights,
                 reads,
                 row_tiebreak,
                 ..
@@ -1237,6 +1240,7 @@ impl LogicalPlan {
                 "targets": arms.iter().map(|arm| &arm.binding).collect::<Vec<_>>(),
                 "typed_queries": arms.iter().map(|arm| crate::typed::expr(&arm.query)).collect::<Vec<_>>(),
                 "typed_k": k.as_ref().map(crate::typed::expr),
+                "typed_weights": weights.as_ref().map(crate::typed::expr),
                 "reads": rendered(reads),
                 "row_tiebreak": tiebreak_text(row_tiebreak),
             }),

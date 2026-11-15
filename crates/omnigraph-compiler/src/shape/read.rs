@@ -25,7 +25,10 @@ use crate::ir::core::{
     ANON_PREFIX, Agg, Col, CoreNode, CoreRead, Count, FRESH_PREFIX, LexicalQuery, RRF_DEFAULT_K,
     ScoreKind, ScoreQuery, Term, Ty,
 };
-use crate::ir::{BlockAggregateExpr, IRExpr, IROrdering, IRParam, IRProjection, SubqueryPredicate};
+use crate::ir::{
+    BlockAggregateExpr, IRExpr, IROrdering, IRParam, IRProjection, SubqueryPredicate,
+    rrf_weights_expr,
+};
 use crate::query::file::Param;
 use crate::query::value::{
     AggFunc, BinaryOp, CompOp, DISTANCE_COLUMN, Literal, RRF_COLUMN, SCORE_COLUMN,
@@ -1591,8 +1594,8 @@ impl<'a> Shaper<'a> {
             arms,
             target,
             k,
+            weights,
             out,
-            ..
         } = fuse
         else {
             unreachable!("fuse_leaf returns a Fuse")
@@ -1628,6 +1631,7 @@ impl<'a> Shaper<'a> {
                 primary: Box::new(primary),
                 secondary: Box::new(secondary),
                 k,
+                weights: rrf_weights_expr(weights).map(Box::new),
                 ty: scalar(ScalarType::F64),
             },
             out: out.clone(),

@@ -819,7 +819,10 @@ pub(super) fn validate_plan_values(
                 PhysicalNode::AntiJoin { .. }
                 | PhysicalNode::OptionalJoin { .. }
                 | PhysicalNode::Union { .. } => {}
-                PhysicalNode::RankFuse { k, .. } => pending.extend(k),
+                PhysicalNode::RankFuse { k, weights, .. } => {
+                    pending.extend(k);
+                    pending.extend(weights);
+                }
                 PhysicalNode::Score { query, .. } => pending.push(query),
                 PhysicalNode::Let { value, .. } => pending.push(value),
                 PhysicalNode::Correlate { read, .. } => pending.extend(read.exprs()),
@@ -929,10 +932,12 @@ pub(super) fn validate_plan_values(
                     primary,
                     secondary,
                     k,
+                    weights,
                     ty: _,
                 } => {
                     pending.extend([primary.as_ref(), secondary.as_ref()]);
                     pending.extend(k.as_deref());
+                    pending.extend(weights.as_deref());
                 }
                 IRExpr::Aggregate {
                     func: _,

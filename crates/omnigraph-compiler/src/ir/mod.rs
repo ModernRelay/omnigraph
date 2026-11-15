@@ -11,7 +11,10 @@ pub mod load;
 pub mod write;
 
 pub use core::is_fresh_variable;
-pub use expr::{BlockAggregateExpr, IRExpr, IROrdering, IRProjection, SubqueryPredicate};
+pub use expr::{
+    BlockAggregateExpr, IRExpr, IROrdering, IRProjection, RRF_MAX_WEIGHT, SubqueryPredicate,
+    rrf_weight_values, rrf_weights_expr,
+};
 pub use load::{Endpoint, LoadCheck, LoadIR, UniqueRole, ValidateCheck, checks_for, lower_load};
 pub use write::{DeltaClass, WriteKind, WriteTableIR, lower_write_table};
 
