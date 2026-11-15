@@ -406,7 +406,31 @@ pub fn parse_source_all(input: &str) -> (Option<SourceFile>, Vec<QueryDiagnostic
         }
     }
     out.sort_by_key(|d| d.position.map_or(0, |p| p.byte));
+    // Neutralizing keeps every byte offset but blanks a multi-byte
+    // character into one space per byte, so a column counted in the
+    // neutralized text can overcount: each line and column is counted again
+    // in the source as written.
+    for d in &mut out {
+        reposition(input, d);
+    }
     (None, out)
+}
+
+/// `d`'s positions counted again in `input` from their byte offsets.
+fn reposition(input: &str, d: &mut QueryDiagnostic) {
+    let again = |p: &mut Position| *p = Position::at(input, p.byte as usize);
+    for p in d.position.iter_mut().chain(d.end.iter_mut()) {
+        again(p);
+    }
+    if let Some(extra) = d.extra.as_mut() {
+        for r in &mut extra.related {
+            again(&mut r.position);
+            again(&mut r.end);
+        }
+        for f in &mut extra.further {
+            reposition(input, f);
+        }
+    }
 }
 
 /// A refusal's diagnostic with the end of its construct's span.

@@ -283,3 +283,148 @@ fn an_unknown_name_lists_the_nearest_names_of_its_kind_with_their_types() {
         "`nearest` has no option `kk`; it admits k (integer), recall (F64 in (0, 1])"
     );
 }
+
+/// Each refusal's code, line, column and the text its span covers.
+#[track_caller]
+fn located(src: &str) -> Vec<(String, u32, u32, String)> {
+    pass(src)
+        .iter()
+        .map(|d| {
+            let p = d.position.expect("a parse refusal has a position");
+            (
+                d.code.as_str().to_string(),
+                p.line,
+                p.column,
+                spanned(src, d).to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A character outside ASCII is one token to parse recovery, never a byte
+/// offset inside it: a name holding one is refused with `Q001` at the
+/// character (its column counted in characters), the same refusal an ASCII
+/// stray character gets, and a string or a comment holding one parses.
+#[test]
+fn a_non_ascii_character_is_refused_at_its_position() {
+    let q = |s: &str, at: (u32, u32, &str)| {
+        assert_eq!(
+            located(s),
+            [("Q001".to_string(), at.0, at.1, at.2.to_string())],
+            "{s}"
+        );
+    };
+    q(
+        "query q() { match { $p: Persön } return { $p.handle } }",
+        (1, 29, "ö"),
+    );
+    q(
+        "query q() { match { $p: Person, $p knöws $q } return { $q.handle } }",
+        (1, 38, "ö"),
+    );
+    q(
+        "query q() { match { $p: Person, $q: 日本 } return { $p.handle } }",
+        (1, 37, "日"),
+    );
+    q(
+        "query q() { match { $é: Person } return { $p.handle } }",
+        (1, 21, "$"),
+    );
+    // After a neutralized unit that held one, the next refusal's column is
+    // counted in the source as written.
+    assert_eq!(
+        located("query q() { match { $é: Person, $p: Pers~on } return { $p } }"),
+        [
+            ("Q001".to_string(), 1, 21, "$".to_string()),
+            ("Q001".to_string(), 1, 41, "~".to_string()),
+        ]
+    );
+    // A broken quote: the string never closes, and the character after it
+    // is inside the refused text.
+    q(
+        r#"query q() { match { $p: Person } where $p.name = "ab é return { $p.handle } }"#,
+        (1, 50, "\""),
+    );
+    // Inside a string or a comment, a character is text.
+    for src in [
+        r#"query q() { match { $p: Person } where $p.name = "Zoë 日本 😀" return { $p.handle } }"#,
+        "query q() { match { $p: Person } // café\n return { $p.handle } }",
+        "query q() { match { $p: Person } /* naïve 日本 */ return { $p.handle } }",
+        r#"query q() @description("naïve") { match { $p: Person } return { $p.handle } }"#,
+    ] {
+        assert_eq!(pass(src), [], "{src}");
+    }
+    // A write.
+    let src = r#"query w() { insert Persön { handle: "a", name: "b" } }"#;
+    assert_eq!(located(src)[0].0, "Q001", "{src}");
+}
+
+/// The property behind the test above: any non-ASCII text inserted at any
+/// character boundary of a valid source, or put in place of any character,
+/// is refused or accepted without a panic, and every position a refusal
+/// carries is a character boundary whose line and column are counted in the
+/// source as written.
+#[test]
+fn non_ascii_mutations_never_panic_and_position_at_characters() {
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+
+    const SOURCES: &[&str] = &[
+        r#"query q($h: String) { match { $p: Person, $p knows $f, optional { $f worksAt $c } } where $p.handle = $h and $f.age > 3 return { $p.name, $f.name as friend, count($c) as n } order { n desc } limit 5 }"#,
+        r#"query q() { match { $d: Doc, let $t = $d.title, not exists { $d cites $e } } where $d.title = "Zoë" // café
+ return { $t } }"#,
+        r#"query w($h: String) { insert Person { handle: $h, name: "Ünïcode" } match { $p: Person } where $p.handle = "x" update $p set { city: "Köln" } }"#,
+        r#"query q() { match { $p: Person, $p knows{1,3} $q } /* naïve */ return { $q.handle } }"#,
+    ];
+    const PIECES: &[&str] = &[
+        "é", "ö", "日本", "😀", "\u{feff}", "e\u{301}", "ß", "Ω", "\u{2028}", "\"é", "$é", "é\"",
+        "'ü'", "/*é", "//é\n", "\\é",
+    ];
+    let catalog = catalog();
+    let mut runner = TestRunner::new(Config {
+        cases: 2_000,
+        failure_persistence: None,
+        ..Config::default()
+    });
+    let strategy = (
+        proptest::sample::select(SOURCES),
+        proptest::sample::select(PIECES),
+        any::<prop::sample::Index>(),
+        any::<bool>(),
+    );
+    runner
+        .run(&strategy, |(source, piece, at, replace)| {
+            let boundaries: Vec<usize> = source
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([source.len()])
+                .collect();
+            let start = boundaries[at.index(boundaries.len())];
+            let end = if replace {
+                source[start..]
+                    .chars()
+                    .next()
+                    .map_or(start, |c| start + c.len_utf8())
+            } else {
+                start
+            };
+            let src = format!("{}{piece}{}", &source[..start], &source[end..]);
+            let refusals = std::panic::catch_unwind(|| check_source_all(&catalog, &src))
+                .map_err(|_| TestCaseError::fail(format!("panicked on {src:?}")))?;
+            for d in &refusals {
+                for p in d.position.iter().chain(d.end.iter()) {
+                    let byte = p.byte as usize;
+                    prop_assert!(src.is_char_boundary(byte), "{d} at byte {byte} of {src:?}");
+                    prop_assert_eq!(
+                        *p,
+                        crate::query::diagnostic::Position::at(&src, byte),
+                        "{} in {:?}",
+                        d,
+                        src
+                    );
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+}

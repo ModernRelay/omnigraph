@@ -112,6 +112,16 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// The length of the UTF-8 character whose first byte is `lead`.
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0xF0.. => 4,
+        0xE0.. => 3,
+        0xC0.. => 2,
+        _ => 1,
+    }
+}
+
 fn keyword(word: &str, wanted: &[&str]) -> bool {
     wanted.iter().any(|w| word.eq_ignore_ascii_case(w))
 }
@@ -172,7 +182,10 @@ impl Scan {
                 prev = Some((word, start));
                 continue;
             }
-            i += 1;
+            // Any other character is one token, all of its bytes: a byte
+            // offset inside a multi-byte character is no boundary, and
+            // slicing there would split it.
+            i += utf8_len(c);
             match c {
                 b'{' => {
                     let frame = if stack.len() == 1 {

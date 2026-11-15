@@ -78,9 +78,14 @@ pub struct Position {
 impl Position {
     /// The line and column of byte offset `byte` in `source`; an offset past
     /// the end positions at the end.
+    /// An offset inside a multi-byte character positions at that
+    /// character.
     pub fn at(source: &str, byte: usize) -> Self {
-        let byte = byte.min(source.len());
-        let prefix = source.get(..byte).unwrap_or(source);
+        let mut byte = byte.min(source.len());
+        while !source.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        let prefix = &source[..byte];
         let line = prefix.matches('\n').count() + 1;
         let column = prefix
             .rsplit('\n')

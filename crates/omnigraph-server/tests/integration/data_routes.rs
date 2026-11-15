@@ -3290,6 +3290,32 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
             "{path}"
         );
 
+        // A name holding a character outside ASCII is a typed `Q001` at the
+        // name, its column counted in characters: parse recovery once
+        // split the character, so `/query` answered 500 and `/mutate` closed
+        // the connection with no response.
+        for (text, column) in [
+            (
+                r#"query w() { insert Persön { name: "Nia", age: 20 } }"#,
+                20,
+            ),
+            ("query q() { match { $p: Persön } return { $p.name } }", 29),
+        ] {
+            let body = json!({field: text, "branch": "main"});
+            let (status, out) = json_response(&app, send(path, token, body, expected_head)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
+            let error: ErrorOutput = serde_json::from_value(out).unwrap();
+            let diagnostic = error
+                .diagnostic
+                .expect("a refused query carries its diagnostic");
+            assert_eq!(diagnostic.code, "Q001", "{path}: {text}");
+            assert_eq!(
+                diagnostic.position.map(|at| (at.line, at.column)),
+                Some((1, column)),
+                "{path}: {text}"
+            );
+        }
+
         // A source nested past the bound is refused before the grammar
         // recurses over it; parsed, it would exhaust the worker's stack and
         // abort the server for every caller.
