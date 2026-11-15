@@ -437,6 +437,8 @@ pipe, not terminal/file output, and never exports refresh credentials.
 --cluster ID` uses authenticated discovery. `target refresh NAME` explicitly
 refreshes a managed endpoint without changing its incarnation. `target remove
 NAME` keeps credentials/journals and requires remaining references to be valid.
+Configuration edits preserve untouched YAML, including relative paths. On
+`config_not_editable`, edit the operator file manually.
 Onboarding requires `login --create-profile NAME`, with optional `--organization ID`
 and `--api URL` (default `https://platform.omnigraph.dev`). Bare login uses
 `defaults.profile`; `login --profile NAME` selects an existing profile. Missing

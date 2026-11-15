@@ -6,6 +6,7 @@ mod access;
 mod args;
 use crate::credential_sources::{self as credentials, SecretStore};
 use crate::operator::InvocationConfig;
+use crate::operator_schema::editor::Editor;
 use crate::operator_schema::{AuthProfile, ClientSecretSource, Target, TokenSource};
 use crate::targets::{self, ResolvedTarget, TargetBinding};
 pub(crate) use access::run_access;
@@ -21,7 +22,7 @@ fn path(input: &InvocationConfig) -> Result<std::path::PathBuf> {
 
 fn edit(
     input: &InvocationConfig,
-    change: impl FnOnce(&mut crate::operator_schema::OperatorConfig) -> Result<()>,
+    change: impl FnOnce(&crate::operator_schema::OperatorConfig, &mut Editor) -> Result<()>,
 ) -> Result<()> {
     let path = path(input)?;
     let _lock = targets::ConfigEditLock::acquire(&path)?;
@@ -29,10 +30,13 @@ fn edit(
     input.check_rename_pending()?;
     let before = crate::operator::read_operator_file(&path, "operator config")?
         .unwrap_or_else(|| "version: 1\n".into());
-    let mut config = crate::operator_schema::parse(&before, path.parent().unwrap())?;
-    change(&mut config)?;
-    let after = yaml_serde::to_string(&config)?;
-    crate::operator_schema::parse(&after, path.parent().unwrap())?;
+    let base = path.parent().unwrap();
+    let (config, mut document) = Editor::open(&before, base)?;
+    change(&config, &mut document)?;
+    let after = document.finish(base)?;
+    if after == before {
+        return Ok(());
+    }
     targets::replace_file(&path, &after)
 }
 
@@ -55,27 +59,51 @@ pub(crate) async fn onboard(
     {
         bail!("profile already exists; use login --profile");
     }
-    let candidate = serde_json::json!({"version":1,"profiles":{name:{"api":api,"organization_id":"org_pending","auth":{"provider":"omnigraph"}}}});
+    let mut profile = serde_json::json!({
+        "api": api,
+        "organization_id": "org_pending",
+        "auth": {"provider": "omnigraph"},
+    });
+    let candidate = serde_json::json!({"version": 1, "profiles": {name: &profile}});
     let validated =
         crate::operator_schema::parse(&serde_json::to_string(&candidate)?, &configured.base_dir)?;
-    let mut profile = validated.profiles[name].clone();
-    let route = profile.api.trim_end_matches('/').to_owned();
-    profile.api = route.clone();
+    let route = validated.profiles[name]
+        .api
+        .trim_end_matches('/')
+        .to_owned();
     let auth = crate::operator_routing::registration_auth(input, name, &route)?;
-    crate::operator_routing::AUTH.scope(Some(auth), async {
-            let receipt = crate::managed::register_login(route.clone(), organization, stderr).await?;
-        let organization = receipt["data"]["account_id"].as_str().ok_or_else(|| eyre!("verified login response has no organization"))?;
-        profile.organization_id = organization.to_owned();
-        if let Err(error) = edit(input, |config| {
-            if config.profiles.contains_key(name) { bail!("profile was registered concurrently"); }
-            config.profiles.insert(name.into(), profile);
-            Ok(())
-        }) {
-            let cleanup = crate::managed::discard_registration(route, organization).await;
-            bail!("profile could not be saved: {error}; session cleanup completed: {}", cleanup.is_ok());
-        }
-        crate::output::write_json(&serde_json::json!({"registered":name,"profile":name,"organization_id":organization}), stdout)
-    }).await
+    crate::operator_routing::AUTH
+        .scope(Some(auth), async {
+            let receipt =
+                crate::managed::register_login(route.clone(), organization, stderr).await?;
+            let organization = receipt["data"]["account_id"]
+                .as_str()
+                .ok_or_else(|| eyre!("verified login response has no organization"))?;
+            profile["organization_id"] = organization.into();
+            if let Err(error) = edit(input, |config, document| {
+                if config.profiles.contains_key(name) {
+                    bail!("profile was registered concurrently");
+                }
+                document.insert("profiles", name, profile)
+            }) {
+                let cleanup = crate::managed::discard_registration(route, organization).await;
+                let message = format!(
+                    "profile could not be saved: {error}; session cleanup completed: {}",
+                    cleanup.is_ok()
+                );
+                if let Some(refusal) = error.downcast_ref::<targets::TargetError>() {
+                    return Err(targets::refusal(refusal.code, message));
+                }
+                bail!(message);
+            }
+            crate::output::write_json(
+                &serde_json::json!({
+                    "registered": name, "profile": name, "organization_id": organization
+                }),
+                stdout,
+            )
+        })
+        .await
 }
 
 pub(crate) fn run_config(
@@ -144,6 +172,17 @@ pub(crate) fn run_config(
             writeln!(stdout, "operator configuration is valid")?;
             Ok(())
         }
+    }
+}
+
+// An explicit JSON null on an optional target field means absent. The
+// operator YAML only accepts nulls inside alias parameters.
+fn omit_absent_fields(value: &mut serde_json::Value) {
+    if let Some(fields) = value.as_object_mut() {
+        fields.retain(|_, field| {
+            omit_absent_fields(field);
+            !field.is_null()
+        });
     }
 }
 
@@ -275,7 +314,9 @@ pub(crate) async fn run_target(
                 else {
                     bail!("managed registration requires a profile");
                 };
-                crate::managed::register_target(binding, profile, &cluster).await?
+                serde_json::to_value(
+                    crate::managed::register_target(binding, profile, &cluster).await?,
+                )?
             } else {
                 if stdin_is_terminal {
                     bail!(
@@ -292,9 +333,14 @@ pub(crate) async fn run_target(
                         "no target JSON on stdin; pipe a target object to target add NAME, or use --cluster ID for managed discovery"
                     );
                 }
-                serde_json::from_slice::<Target>(&bytes)?
+                // Check the typed input (including duplicate fields), then retain
+                // the supplied fields and their unresolved spellings for the file.
+                serde_json::from_slice::<Target>(&bytes)?;
+                let mut value = serde_json::from_slice(&bytes)?;
+                omit_absent_fields(&mut value);
+                value
             };
-            edit(input, |config| {
+            edit(input, |config, document| {
                 if let Some(profile) = profile {
                     if config.profiles.get(profile) != expected_profile {
                         bail!("profile changed during registration");
@@ -303,8 +349,7 @@ pub(crate) async fn run_target(
                 if config.targets.contains_key(&name) {
                     bail!("target already exists");
                 }
-                config.targets.insert(name.clone(), entry);
-                Ok(())
+                document.insert("targets", &name, entry)
             })?;
             if json {
                 crate::output::write_json(&serde_json::json!({"registered":name}), stdout)
@@ -355,22 +400,21 @@ pub(crate) async fn run_target(
             };
             let endpoint_available = endpoint.is_some();
             let endpoint = endpoint.or_else(|| previous.clone());
-            edit(input, |current| {
+            edit(input, |current, document| {
                 if current.profiles.get(profile) != source.profiles.get(profile) {
                     bail!("profile changed during refresh");
                 }
                 let entry = current
                     .targets
-                    .get_mut(&name)
+                    .get(&name)
                     .ok_or_else(|| eyre!("target was removed"))?;
                 if entry != old {
                     bail!("target changed during refresh");
                 }
-                if let Target::Managed {
-                    endpoint: current, ..
-                } = entry
+                if endpoint != previous
+                    && let Some(url) = &endpoint
                 {
-                    *current = endpoint.clone();
+                    document.put(&["targets", &name, "endpoint"], &serde_json::json!(url))?;
                 }
                 Ok(())
             })?;
@@ -383,11 +427,11 @@ pub(crate) async fn run_target(
             }
         }
         TargetCommand::Remove { name, json } => {
-            edit(input, |config| {
-                if config.targets.remove(&name).is_none() {
+            edit(input, |config, document| {
+                if !config.targets.contains_key(&name) {
                     bail!("unknown target");
                 }
-                Ok(())
+                document.remove("targets", &name)
             })?;
             if json {
                 crate::output::write_json(

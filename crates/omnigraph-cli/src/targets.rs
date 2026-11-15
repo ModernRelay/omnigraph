@@ -743,10 +743,24 @@ impl OperatorConfig {
 /// Replace the file by writing a sibling and renaming it over, keeping its
 /// permissions.
 pub(crate) fn replace_file(path: &Path, text: &str) -> Result<()> {
-    if text.len() > crate::operator::OPERATOR_FILE_MAX_BYTES {
+    replace_file_with_limit(
+        path,
+        text,
+        "operator config",
+        crate::operator::OPERATOR_FILE_MAX_BYTES,
+    )
+}
+
+pub(crate) fn replace_file_with_limit(
+    path: &Path,
+    text: &str,
+    description: &str,
+    max_bytes: usize,
+) -> Result<()> {
+    if text.len() > max_bytes {
         return Err(refusal(
             "target_config_invalid",
-            "operator config exceeds 1 MiB",
+            format!("{description} exceeds {} MiB", max_bytes / (1024 * 1024)),
         ));
     }
     let parent = path

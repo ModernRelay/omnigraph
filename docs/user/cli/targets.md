@@ -178,15 +178,15 @@ Refresh verifies the same incarnation before changing the route pin; a missing
 endpoint preserves the old pin and reports `endpoint_available: false`.
 Normal requests never adopt changed endpoints or follow redirects.
 
-`target list` shows each destination, its managed profile, and the default marker.
-`target list`, `target inspect NAME [--resolved]` and `config validate` are offline, with optional
-`--json`. `target inspect --json` also reports `home` and, for a server target, `binding`: the digests
-a [Studio link](studio.md#the-link) carries. `target add NAME` without `--cluster` reads a complete
-target JSON object from piped stdin (64 KiB limit); terminal or empty input produces setup guidance.
-Managed add uses `--profile` or `defaults.profile`. `target remove NAME` preserves credentials and
-journals; references must remain valid. Add/remove never switch defaults.
-Discovery-backed add and refresh contact the service. Resolved inspection expands
-the profile and provider; identity is unknown and transport availability is not checked.
+`target list` shows destinations, their managed profiles and the default marker. `target list`,
+`target inspect NAME [--resolved]` and `config validate` work offline with optional `--json`. Inspection
+reports the `home` and server `binding` digests used by [Studio links](studio.md#the-link). `--resolved` expands the
+profile and provider without verifying identity or connectivity. Without `--cluster`, `target add NAME`
+reads a complete target as JSON from stdin (64 KiB limit). Empty or terminal input prints setup guidance.
+Managed add uses `--profile` or `defaults.profile`. Discovery-backed add and refresh contact the service.
+`target remove NAME` keeps credentials and journals. References must stay valid. Add and remove keep the defaults.
+Edits preserve comments, key order and relative paths outside the changed entry. A rename updates its
+references too. If the CLI cannot isolate an edit, it reports `config_not_editable` and leaves the file intact.
 
 Logout clears local session and derived credentials and reports whether remote
 revocation was confirmed; independently valid data tokens may remain usable.

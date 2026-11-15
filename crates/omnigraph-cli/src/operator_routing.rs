@@ -1104,7 +1104,7 @@ pub(crate) fn check_state_rename_pending(path: &Path) -> Result<()> {
 }
 
 fn check_journal_pending(path: &Path) -> Result<()> {
-    if crate::operator::read_operator_file(path, "rename journal")?.is_some() {
+    if path.try_exists()? {
         bail!(
             "configuration rename is incomplete; run config recover-rename with this --operator-config"
         );
@@ -1121,6 +1121,36 @@ struct RenameJournal {
     after_bindings: String,
 }
 
+impl RenameJournal {
+    // Four 1 MiB file images, at most six JSON bytes per source byte
+    // (a \u00XX escape), rounded up by one MiB for the enclosing object.
+    const MAX_BYTES: usize = (4 * 6 + 1) * crate::operator::OPERATOR_FILE_MAX_BYTES;
+
+    fn check_file_sizes(&self) -> Result<()> {
+        for text in [
+            self.before_config.as_str(),
+            self.after_config.as_str(),
+            self.before_bindings.as_deref().unwrap_or_default(),
+            self.after_bindings.as_str(),
+        ] {
+            if text.len() > crate::operator::OPERATOR_FILE_MAX_BYTES {
+                bail!("rename journal contains a file larger than 1 MiB");
+            }
+        }
+        Ok(())
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        self.check_file_sizes()?;
+        crate::targets::replace_file_with_limit(
+            path,
+            &serde_json::to_string(self)?,
+            "rename journal",
+            Self::MAX_BYTES,
+        )
+    }
+}
+
 fn move_entry<T>(entries: &mut BTreeMap<String, T>, from: &str, to: &str) -> Result<()> {
     if entries.contains_key(to) {
         bail!("rename destination already exists");
@@ -1130,12 +1160,6 @@ fn move_entry<T>(entries: &mut BTreeMap<String, T>, from: &str, to: &str) -> Res
         .ok_or_else(|| eyre!("rename source does not exist"))?;
     entries.insert(to.into(), value);
     Ok(())
-}
-
-fn rename_default(selected: &mut Option<String>, from: &str, to: &str) {
-    if selected.as_deref() == Some(from) {
-        *selected = Some(to.into());
-    }
 }
 
 pub(crate) fn rename(
@@ -1156,31 +1180,51 @@ pub(crate) fn rename(
     let bindings_path = input.auth_state_path()?;
     let before_config = crate::operator::read_operator_file(&path, "operator configuration")?
         .ok_or_else(|| eyre!("operator configuration is missing"))?;
-    let mut config = schema::parse(&before_config, path.parent().unwrap())?;
+    let base = path.parent().unwrap();
+    let (config, mut document) = schema::editor::Editor::open(&before_config, base)?;
     let (before_bindings, mut state) = binding_state(&path, &bindings_path)?;
+    let (section, exists, occupied) = match kind {
+        Rename::Profile => (
+            "profiles",
+            config.profiles.contains_key(from),
+            config.profiles.contains_key(to),
+        ),
+        Rename::Target => (
+            "targets",
+            config.targets.contains_key(from),
+            config.targets.contains_key(to),
+        ),
+    };
+    if occupied {
+        bail!("rename destination already exists");
+    }
+    if !exists {
+        bail!("rename source does not exist");
+    }
+    document.rename(section, from, to)?;
     let owner_move = match kind {
         Rename::Profile => {
-            move_entry(&mut config.profiles, from, to)?;
-            rename_default(&mut config.defaults.profile, from, to);
-            for target in config.targets.values_mut() {
-                if let Target::Managed { profile, .. } = target {
-                    if profile == from {
-                        *profile = to.into();
-                    }
+            if config.defaults.profile.as_deref() == Some(from) {
+                document.set_reference(&["defaults", "profile"], to)?;
+            }
+            for (name, target) in &config.targets {
+                if matches!(target, Target::Managed {profile,..} if profile == from) {
+                    document.set_reference(&["targets", name, "profile"], to)?;
                 }
             }
             Some((format!("profile:{from}"), format!("profile:{to}")))
         }
         Rename::Target => {
-            let server = matches!(config.targets.get(from), Some(Target::Server { .. }));
-            move_entry(&mut config.targets, from, to)?;
-            rename_default(&mut config.defaults.target, from, to);
-            for alias in config.aliases.values_mut() {
+            if config.defaults.target.as_deref() == Some(from) {
+                document.set_reference(&["defaults", "target"], to)?;
+            }
+            for (name, alias) in &config.aliases {
                 if alias.target == from {
-                    alias.target = to.into();
+                    document.set_reference(&["aliases", name, "target"], to)?;
                 }
             }
-            server.then(|| (format!("server:{from}"), format!("server:{to}")))
+            matches!(config.targets.get(from), Some(Target::Server { .. }))
+                .then(|| (format!("server:{from}"), format!("server:{to}")))
         }
     };
     if let Some((from, to)) = owner_move {
@@ -1191,8 +1235,7 @@ pub(crate) fn rename(
             move_entry(&mut state.owners, &from, &to)?;
         }
     }
-    let after_config = yaml_serde::to_string(&config)?;
-    schema::parse(&after_config, path.parent().unwrap())?;
+    let after_config = document.finish(base)?;
     let journal = RenameJournal {
         before_config,
         after_config,
@@ -1200,7 +1243,7 @@ pub(crate) fn rename(
         after_bindings: serde_json::to_string(&state)?,
     };
     let journal_path = adjacent(&bindings_path, ".rename.json");
-    crate::targets::replace_file(&journal_path, &serde_json::to_string(&journal)?)?;
+    journal.write(&journal_path)?;
     finish_rename(&path, &bindings_path, &journal_path, &journal, false)
 }
 
@@ -1211,6 +1254,7 @@ fn finish_rename(
     journal: &RenameJournal,
     legacy: bool,
 ) -> Result<()> {
+    journal.check_file_sizes()?;
     let config = crate::operator::read_operator_file(path, "operator configuration")?;
     let bindings = crate::operator::read_operator_file(bindings_path, "owner/profile bindings")?;
     if ![
@@ -1257,7 +1301,11 @@ pub(crate) fn recover_rename(input: &crate::operator::InvocationConfig) -> Resul
     let _bindings_lock = lock_auth_state(input)?;
     let state_path = input.auth_state_path()?;
     let journal_path = adjacent(&state_path, ".rename.json");
-    let text = crate::operator::read_operator_file(&journal_path, "rename journal")?;
+    let text = crate::operator::read_operator_file_with_limit(
+        &journal_path,
+        "rename journal",
+        RenameJournal::MAX_BYTES,
+    )?;
     let old_journal_path = adjacent(&path, ".rename.json");
     let old = crate::operator::read_operator_file(&old_journal_path, "legacy rename journal")?;
     match (text, old) {
@@ -1687,6 +1735,48 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    #[test]
+    fn rename_and_recovery_preserve_large_commented_config_issue_1169() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+        let path = input.config_path().unwrap();
+        let bindings_path = input.auth_state_path().unwrap();
+        let journal_path = adjacent(&bindings_path, ".rename.json");
+        // The comment alone fits the operator file limit; its two images in
+        // the recovery journal exceed that limit even before JSON escaping.
+        let comment = format!("#{}\n", "\\\"".repeat(300 * 1024));
+        let original = format!(
+            "{comment}version: 1\ntargets:\n  old: {{kind: server, endpoint: https://example.test, auth: {{provider: anonymous}}}}\n"
+        );
+        let expected = original.replace("  old:", "  new:");
+        std::fs::write(&path, &original).unwrap();
+        rename(&input, Rename::Target, "old", "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+
+        // Simulate interruption after the bindings were installed but before
+        // the YAML was replaced. Recovery still accepts the existing format.
+        let journal = RenameJournal {
+            before_config: original.clone(),
+            after_config: expected.clone(),
+            before_bindings: None,
+            after_bindings: std::fs::read_to_string(&bindings_path).unwrap(),
+        };
+        std::fs::write(&path, original).unwrap();
+        std::fs::write(&journal_path, serde_json::to_string(&journal).unwrap()).unwrap();
+        let pending = input.check_rename_pending().unwrap_err();
+        assert!(
+            pending.to_string().contains("config recover-rename"),
+            "{pending}"
+        );
+        recover_rename(&input).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        assert_eq!(
+            std::fs::read_to_string(&bindings_path).unwrap(),
+            journal.after_bindings
+        );
+        assert!(!journal_path.exists());
     }
 
     #[test]
