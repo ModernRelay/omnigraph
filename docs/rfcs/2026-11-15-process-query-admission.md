@@ -88,6 +88,12 @@ capacity happens to be free. The same plan retains its pool and spill decisions;
 the host either admits that execution or refuses it. A caller can explicitly
 select a smaller query limit and plan again.
 
+The reservation is conservative: queries with the same declared limit reserve
+the same pool allowance even when their actual use differs. This trades
+concurrency for a predictable admitted envelope. Mixed-workload evaluation must
+include small reads with their normal session limits, not only specially tuned
+small-query limits.
+
 ## Design
 
 ### One owner, separate query pools
@@ -154,6 +160,12 @@ native hooks required by the settlement RFC. Likewise, a returned result can
 outlive execution: its retained buffers transfer to output ownership before the
 execution permit is refunded.
 
+`QueryResult` lives in the compiler crate and exposes cloned batches and
+`into_batches`. A permit stored only on the result object would disappear while
+legal Arrow batch clones still retain its data. Output accounting must follow
+those buffer owners or an explicit, bounded ownership transfer; changing the
+outer result's destructor alone does not establish that lifetime.
+
 ### Observation
 
 Expose a consistent engine snapshot of configured bytes, reserved bytes, active
@@ -179,6 +191,30 @@ native work alive. An allowance must account for those behaviors and the
 simultaneous contexts in the selected path. The settlement RFC already records
 native read/CPU lifetime probes; extend them for Lance 13 rather than replace
 them with a timer or a count of returned futures.
+
+The pinned crate sources expose three concrete integration boundaries:
+
+- [`Scanner::try_into_stream`](https://docs.rs/crate/lance/13.0.0/source/src/dataset/scanner.rs)
+  passes default `LanceExecutionOptions` to `execute_plan`. A caller's graph
+  pool does not automatically become the pool of that independent execution.
+- [`ScanScheduler`](https://docs.rs/crate/lance-io/13.0.0/source/src/scheduler.rs)
+  closes its queue on drop, but its I/O loop drains accepted requests. Its
+  response owner refunds local backpressure on final response drop. A graph
+  permit needs to follow that actual work, not only its waiting future.
+- [`spawn_cpu`](https://docs.rs/crate/lance-core/13.0.0/source/src/utils/tokio.rs)
+  submits a closure to a separate blocking runtime. Dropping the returned future
+  leaves a started closure and its captured input alive. The existing
+  `dropped_native_cpu_futures_retain_each_captured_input_until_completion` and
+  `dropped_scan_schedulers_retain_independent_native_read_budgets` guards own
+  these two lifetime cases.
+
+DataFusion 54's
+[`MemoryPool::grow`](https://docs.rs/crate/datafusion-execution/54.0.0/source/src/memory_pool/mod.rs)
+must succeed; only `try_grow` may refuse. The current graph pool forwards
+infallible growth to its inner pool. Qualification must therefore include
+consumers' infallible allocations and batch overshoot, as well as successful
+`try_grow` reservations. Reserving a pool's nominal limit alone does not cover
+that additional demand.
 
 ## Invariants and compatibility
 
