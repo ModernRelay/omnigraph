@@ -929,7 +929,7 @@ fn the_ranking_functions_type_their_result_columns() {
     assert_eq!(cols(&c)[0], ("distance".into(), "F32".into()));
     assert!(format!("{:?}", read_of(&c).term).contains("recall: Some(0.9)"));
     let c = ok(
-        "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s, mode: all, max_edits: 1)) as $score } return { $score } }",
+        "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s, mode: any, max_edits: 0)) as $score } return { $score } }",
     );
     assert_eq!(cols(&c)[0], ("score".into(), "F32".into()));
     // `rrf` yields the target and `score` only: the population's other

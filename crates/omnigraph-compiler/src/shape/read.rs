@@ -1589,6 +1589,24 @@ impl<'a> Shaper<'a> {
                     exact: None,
                 }),
             )),
+            // The ranked scan's full-text query is today's any-term,
+            // zero-edit match; a `terms(…)` value asking for every term or
+            // for an edit budget would be scored over that wider membership.
+            Term::Score {
+                kind: ScoreKind::Bm25,
+                query:
+                    ScoreQuery::Lexical(LexicalQuery {
+                        mode_all,
+                        max_edits,
+                        ..
+                    }),
+                ..
+            } if *mode_all || !matches!(max_edits, IRExpr::Literal(Literal::Integer(0), _)) => {
+                Err(self.refuse_at(
+                    "`bm25` over a `terms(…)` value with `mode: all` or an edit budget other than 0",
+                    Construct::Element(FROM, None),
+                ))
+            }
             Term::Score {
                 input,
                 column,

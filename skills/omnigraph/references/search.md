@@ -72,7 +72,8 @@ replacement vectors; neither `merge` nor `overwrite` does that automatically.
 
 A ranking is a relation drawn into `match` with `from`, which names its score
 with `as`: `from nearest(rel, $c.embedding, $q, k: n) as $distance`,
-`from bm25(rel, $d.title, $q) as $score`,
+`from bm25(rel, $d.title, $q) as $score` (any term of the String `$q`; `terms($q)`
+asks for every term, which `bm25` does not lower yet, `T86`),
 `from rrf(arm, arm, k: 60, weights: [1.0, 1.0]) as $score`. `rel` is the population, a relation
 named with `let` before the ranking, `let $pop = { match { … } where … return { $c } }`,
 whose `return` lists every binding the rest of the query reads (an inline read

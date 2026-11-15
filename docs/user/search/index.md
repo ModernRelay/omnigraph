@@ -11,7 +11,7 @@ with `as`.
 |---|---|
 | `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by L2 distance, with the distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
 | `distance(rel, $d.embedding, $q)` | Every row of `rel` with the exact squared L2 distance of its vector to `$q` as the score; a row whose vector is null is dropped. `$q` may be a vector or text, as for `nearest`. |
-| `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their BM25 relevance as the score. |
+| `bm25(rel, $d.body, $q)` | The targets of `rel` that match any term of `$q`, with their BM25 relevance as the score. `$q` is a String or `terms($q, mode: any)`; `mode: all` (the `terms` default) and an edit budget are not lowered in this release (`T86`). |
 | `rrf(ranking, ranking, k: 60, weights: [w, w])` | Two rankings of one population fused with Reciprocal Rank Fusion: the result has the ranked node column and the fused score, named by the `as` of the `from` that draws it, and nothing else. The default `k` is 60 and every weight defaults to 1.0. |
 | `search($d.body, $q)` | Full-text token search. |
 | `fuzzy($d.body, $q, max_edits: n)` | Full-text search with edit-distance tolerance. |
