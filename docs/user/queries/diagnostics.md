@@ -299,7 +299,8 @@ that calls itself.
 | A node an `optional` introduces, returned whole | B |
 | A ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit` | B |
 | A block compared with another block's value, a block of several aggregates | B |
-| A full-text call (`search`, `fuzzy`, `match_text`) read as a value in `return`, `order` or a block's aggregate | B |
+| A full-text call (`search`, `fuzzy`, `match_text`, `match_terms`) read as a value in `return`, `order` or a block's aggregate | B |
+| `match_terms` with an edit budget other than `max_edits: 0` (only the exact lexical scan answers the edit relation exactly) | B |
 | A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B |
 | A read that calls itself (`Fix`) | Rec |
 

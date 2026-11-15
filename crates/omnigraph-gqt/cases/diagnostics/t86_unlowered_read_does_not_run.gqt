@@ -1,7 +1,8 @@
 # issue: none
 # notes: A read whose term this release's planner does not lower is refused at type check with `T86`, naming the stage that adds it:
 # notes: an `optional`'s node returned whole (stage B) and a read that calls itself (`Fix`, stage Rec); nothing executes.
-# notes: The `optional` itself runs.
+# notes: The `optional` itself runs. `match_terms` with an edit budget other than 0 is stage B too: only the exact
+# notes: lexical scan answers the edit relation exactly.
 
 --- runner
 timeout_ms: 10000
@@ -78,3 +79,11 @@ query reachable($from: String) {
 {"from": "ada"}
 
 --- expect error: type error: T86: `reachable`: this release's planner does not lower a read that calls itself (`Fix`); stage Rec (recursion, the `Fix` evaluator) adds it
+
+--- query
+query fuzzy_terms($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 1)) return { $d.title } }
+
+--- params
+{"s": "graph"}
+
+--- expect error: type error: T86: `fuzzy_terms`: this release's planner does not lower `match_terms` with an edit budget other than `max_edits: 0`; stage B (the break) adds it

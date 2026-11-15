@@ -1757,6 +1757,9 @@ impl<'a> Shaper<'a> {
                 self.facts(input, facts)?;
                 for (name, value) in items {
                     let at = Construct::Element(&[ElementKind::Let], Some(name.clone()));
+                    if holds_edit_tolerant_match(value) {
+                        return Err(self.refuse_at(EDIT_TOLERANT_MATCH, at));
+                    }
                     let mut cols = Vec::new();
                     value.columns(&mut cols);
                     if cols.iter().any(|c| is_block_column(c)) {
@@ -2527,6 +2530,9 @@ impl<'a> Shaper<'a> {
     }
 
     fn filter(&self, input: &Term, pred: &IRExpr, facts: &mut Facts) -> Result<(), ShapeError> {
+        if holds_edit_tolerant_match(pred) {
+            return Err(self.refuse(EDIT_TOLERANT_MATCH));
+        }
         // A triple whose ends were both bound: the expansion to a fresh name
         // and the identity filter tying it to the end.
         if let Term::Expand {
@@ -3257,18 +3263,19 @@ fn block_comparison(pred: &IRExpr, column: &str) -> Option<(CompOp, IRExpr)> {
     None
 }
 
-/// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`):
-/// a filter or a `let` reads one as membership of the row in its matches,
-/// which a return item, an order key or a block's aggregate does not lower
-/// yet.
+/// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`,
+/// `match_terms`): a filter or a `let` reads one as membership of the row in
+/// its matches, which a return item, an order key or a block's aggregate
+/// does not lower yet.
 fn holds_lexical_call(expr: &IRExpr) -> bool {
     let mut found = false;
     let mut pending = vec![expr];
     while let Some(expr) = pending.pop() {
+        if expr.lexical_predicate_field().is_some() {
+            found = true;
+            continue;
+        }
         match expr {
-            IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. } => {
-                found = true;
-            }
             IRExpr::Binary { left, right, .. } => pending.extend([left.as_ref(), right.as_ref()]),
             IRExpr::Not(inner, _)
             | IRExpr::Cast { expr: inner, .. }
@@ -3276,7 +3283,11 @@ fn holds_lexical_call(expr: &IRExpr) -> bool {
             | IRExpr::IsNull { expr: inner, .. } => pending.push(inner),
             IRExpr::Aggregate { arg, .. } => pending.push(arg),
             IRExpr::Call { args, .. } => pending.extend(args),
-            IRExpr::PropAccess { .. }
+            // The predicates themselves were taken above.
+            IRExpr::Search { .. }
+            | IRExpr::Fuzzy { .. }
+            | IRExpr::MatchText { .. }
+            | IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
             | IRExpr::Bm25 { .. }
             | IRExpr::Rrf { .. }
@@ -3286,6 +3297,30 @@ fn holds_lexical_call(expr: &IRExpr) -> bool {
             | IRExpr::AliasRef(..) => {}
         }
     }
+    found
+}
+
+/// `match_terms` whose edit budget is not the literal `0`. Membership runs
+/// Lance's full-text query, whose fuzzy expansion keeps a bounded number of
+/// expansions per term, so it is not the exact edit relation; the exact
+/// lexical scan answers it.
+const EDIT_TOLERANT_MATCH: &str = "`match_terms` with an edit budget other than `max_edits: 0`";
+
+/// Whether `expr` holds a `match_terms` whose edit budget is not the
+/// literal `0` (a parameter included, whose value is not known here).
+fn holds_edit_tolerant_match(expr: &IRExpr) -> bool {
+    let mut found = false;
+    expr.visit_nodes(|node| {
+        if let IRExpr::Call {
+            func: crate::ir::expr::ScalarFunc::MatchTerms { .. },
+            args,
+            ..
+        } = node
+            && !matches!(args.get(2), Some(IRExpr::Literal(Literal::Integer(0), _)))
+        {
+            found = true;
+        }
+    });
     found
 }
 

@@ -2945,26 +2945,26 @@ fn identity_reads(node: &LogicalNode) -> Vec<String> {
     }
 }
 
-/// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`).
+/// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`,
+/// `match_terms`).
 fn has_lexical_call(expr: &IRExpr) -> bool {
     let mut bindings = Vec::new();
     lexical_bindings(expr, &mut bindings);
     !bindings.is_empty()
 }
 
-/// The binding of every full-text call (`search`, `fuzzy`, `match_text`) in
-/// `expr`, whose field is that binding's property.
+/// The binding of every full-text call (`search`, `fuzzy`, `match_text`,
+/// `match_terms`) in `expr`, whose field is that binding's property.
 fn lexical_bindings(expr: &IRExpr, out: &mut Vec<String>) {
-    match expr {
-        IRExpr::Search { field, .. }
-        | IRExpr::Fuzzy { field, .. }
-        | IRExpr::MatchText { field, .. } => {
-            if let IRExpr::PropAccess { variable, .. } = field.as_ref()
-                && !out.contains(variable)
-            {
-                out.push(variable.clone());
-            }
+    if let Some(field) = expr.lexical_predicate_field() {
+        if let IRExpr::PropAccess { variable, .. } = field
+            && !out.contains(variable)
+        {
+            out.push(variable.clone());
         }
+        return;
+    }
+    match expr {
         IRExpr::Binary { left, right, .. } => {
             lexical_bindings(left, out);
             lexical_bindings(right, out);
@@ -2974,7 +2974,11 @@ fn lexical_bindings(expr: &IRExpr, out: &mut Vec<String>) {
         | IRExpr::Neg { expr: inner, .. }
         | IRExpr::IsNull { expr: inner, .. } => lexical_bindings(inner, out),
         IRExpr::Call { args, .. } => args.iter().for_each(|arg| lexical_bindings(arg, out)),
-        IRExpr::PropAccess { .. }
+        // The predicates themselves were taken above.
+        IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }

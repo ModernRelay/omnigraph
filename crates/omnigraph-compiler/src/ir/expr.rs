@@ -301,6 +301,24 @@ pub fn rrf_weight_values(weights: &IRExpr, arms: usize) -> Option<Vec<f64>> {
 }
 
 impl IRExpr {
+    /// The searched field of a full-text predicate, `search`, `fuzzy`,
+    /// `match_text` or `match_terms`: a Boolean that is true where the row's
+    /// field matches the call's query. `None` for any other node, `bm25`
+    /// included (a score, not a predicate).
+    pub fn lexical_predicate_field(&self) -> Option<&IRExpr> {
+        match self {
+            Self::Search { field, .. }
+            | Self::Fuzzy { field, .. }
+            | Self::MatchText { field, .. } => Some(field),
+            Self::Call {
+                func: ScalarFunc::MatchTerms { .. },
+                args,
+                ..
+            } => args.first(),
+            _ => None,
+        }
+    }
+
     /// The compiler-owned result type of every expression node.
     pub fn ty(&self) -> &ExprType {
         match self {
@@ -357,14 +375,32 @@ impl IRExpr {
 
     /// Visit each typed leaf without recursing on a user-sized expression tree.
     pub fn visit_leaves(&self, mut visit: impl FnMut(&Self)) {
+        self.visit_nodes(|expr| {
+            if matches!(
+                expr,
+                Self::PropAccess { .. }
+                    | Self::Variable(_, _)
+                    | Self::Param(_, _)
+                    | Self::Literal(_, _)
+                    | Self::AliasRef(_, _)
+            ) {
+                visit(expr)
+            }
+        })
+    }
+
+    /// Visit every node, each before its children, without recursing on a
+    /// user-sized expression tree.
+    pub fn visit_nodes(&self, mut visit: impl FnMut(&Self)) {
         let mut pending = vec![self];
         while let Some(expr) = pending.pop() {
+            visit(expr);
             match expr {
                 Self::PropAccess { .. }
                 | Self::Variable(_, _)
                 | Self::Param(_, _)
                 | Self::Literal(_, _)
-                | Self::AliasRef(_, _) => visit(expr),
+                | Self::AliasRef(_, _) => {}
                 Self::Nearest { query, .. } => pending.push(query),
                 Self::Search { field, query, .. }
                 | Self::MatchText { field, query, .. }

@@ -16,6 +16,7 @@ with `as`.
 | `search($d.body, $q)` | Full-text token search. |
 | `fuzzy($d.body, $q, max_edits: n)` | Full-text search with edit-distance tolerance. |
 | `match_text($d.body, $q)` | Match a full-text query in a `match` block. |
+| `match_terms($d.body, terms($q, mode: all))` | True where the property holds every analyzed term of `$q` (`mode: all`, the default) or one of them (`mode: any`). |
 
 The first argument of a ranking is the population it ranks: a relation a
 `let` names before the ranking, `let $pop = { match { ... } return { $d } }`,
@@ -179,7 +180,7 @@ field matchable but refuses `bm25` over it (`T87`). An index declared without
 stems and folds accents, so `"deep"` matches `"Deep Learning"`. See
 [Full-text analyzers](analyzers.md).
 
-`search`, `match_text`, and `fuzzy` are Boolean operands like any other in a
+`search`, `match_text`, `fuzzy` and `match_terms` are Boolean operands like any other in a
 `where`: true where the row is among the call's matches, false elsewhere,
 and never null, so a row whose property is null is false. `not search(...)`,
 `search(...) or ...`, `search(...) = false` and
@@ -188,7 +189,8 @@ exactly the rows the call's matches decide: a call standing alone is answered
 by its binding's scan, and any other use by the same full-text query over the
 whole table, so a row an index has not covered yet answers as an indexed one
 does. A full-text call read as a value, in `return`, `order` or a block's
-aggregate, is not lowered in this release (`T86`).
+aggregate, is not lowered in this release (`T86`), nor is `match_terms` with
+an edit budget other than `max_edits: 0`: only an exact scan answers it.
 
 Separate `not` blocks may reuse a local variable name for different node
 types. Each full-text call uses the index on the type and property bound
@@ -208,9 +210,8 @@ The column `as` names, `$score` here, holds the relevance the ranking used.
 `rrf` gives the fused score as an `F64`. Without an alias the result column
 takes the name `as` gave the score (`as $relevance`, returned as
 `$relevance`, is the column `relevance`); an alias in `return` renames it like
-any column. A search
-predicate, `search(...)`, `fuzzy(...)` or `match_text(...)`, is a filter and
-not a return item in this release (`T86`). An aggregate reads the score as a
+any column. A search predicate, `search(...)`, `fuzzy(...)`, `match_text(...)`
+or `match_terms(...)`, is a filter and not a return item in this release (`T86`). An aggregate reads the score as a
 column of every row the ranking keeps: `return { max($score) as best }` is
 the best score among them, and over a `nearest` window, among its targets.
 

@@ -218,18 +218,20 @@ match { $d: Doc }
 where search($d.title, $q)                    // full-text filter
   and fuzzy($d.title, $q, max_edits: 2)       // fuzzy filter, max 2 edits
   and match_text($d.body, $q)                 // regular full-text filter (not phrase search)
+  and match_terms($d.body, terms($q))         // every analyzed term of $q; mode: any for one
 ```
 
 A full-text call (`search`, `fuzzy`, `match_text`, `bm25`) needs a full-text
 index on its property: a one-column `@index` or `@key` on a free-text String
 node property. A call on any other property, an enum included, is refused at
 type checking (`T27`); compare enums with `=`. The field's analyzer decides
-what matches (next section). `search`, `fuzzy` and
-`match_text` are Boolean operands like any other in a `where`: true where the
+what matches (next section). `search`, `fuzzy`, `match_text` and
+`match_terms` are Boolean operands like any other in a `where`: true where the
 row is among the call's matches, false elsewhere, never null. Write
 `not search($d.title, $q)`, `search(...) or ...` or `search(...) = false`;
 the rows are the same whether or not the index covers them yet. Read as a
-value in `return`, `order` or a block's aggregate, a call is `T86`.
+value in `return`, `order` or a block's aggregate, a call is `T86`, and so is
+`match_terms` with an edit budget other than `max_edits: 0`.
 
 ### Analyzers
 

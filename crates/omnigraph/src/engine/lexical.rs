@@ -1,4 +1,5 @@
-//! Full-text calls (`search`, `fuzzy`, `match_text`) as Boolean operands.
+//! Full-text calls (`search`, `fuzzy`, `match_text`, `match_terms`) as
+//! Boolean operands.
 //!
 //! A call standing alone as a conjunct is answered by its binding's scan as
 //! membership in the call's matches. Anywhere else, under `not` or `or`,
@@ -203,8 +204,11 @@ fn operand_exprs(node: &PhysicalNode) -> Vec<&IRExpr> {
 
 /// Every full-text call in `expr`.
 fn calls_of<'e>(expr: &'e IRExpr, out: &mut Vec<&'e IRExpr>) {
+    if expr.lexical_predicate_field().is_some() {
+        out.push(expr);
+        return;
+    }
     match expr {
-        IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. } => out.push(expr),
         IRExpr::Binary { left, right, .. } => {
             calls_of(left, out);
             calls_of(right, out);
@@ -214,7 +218,11 @@ fn calls_of<'e>(expr: &'e IRExpr, out: &mut Vec<&'e IRExpr>) {
         | IRExpr::Neg { expr: inner, .. }
         | IRExpr::IsNull { expr: inner, .. } => calls_of(inner, out),
         IRExpr::Call { args, .. } => args.iter().for_each(|arg| calls_of(arg, out)),
-        IRExpr::PropAccess { .. }
+        // The predicates themselves were taken above.
+        IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
@@ -228,11 +236,11 @@ fn calls_of<'e>(expr: &'e IRExpr, out: &mut Vec<&'e IRExpr>) {
 
 /// `expr` with every full-text call `rewrite` answers replaced by its answer.
 fn substitute(expr: &IRExpr, rewrite: &mut impl FnMut(&IRExpr) -> Option<IRExpr>) -> IRExpr {
+    if expr.lexical_predicate_field().is_some() {
+        return rewrite(expr).unwrap_or_else(|| expr.clone());
+    }
     let mut sub = |e: &IRExpr| Box::new(substitute(e, rewrite));
     match expr {
-        IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. } => {
-            rewrite(expr).unwrap_or_else(|| expr.clone())
-        }
         IRExpr::Binary {
             left,
             op,
@@ -277,13 +285,8 @@ fn substitute(expr: &IRExpr, rewrite: &mut impl FnMut(&IRExpr) -> Option<IRExpr>
 
 /// The binding whose property a full-text call searches.
 fn call_binding(call: &IRExpr) -> Option<&str> {
-    match call {
-        IRExpr::Search { field, .. }
-        | IRExpr::Fuzzy { field, .. }
-        | IRExpr::MatchText { field, .. } => match field.as_ref() {
-            IRExpr::PropAccess { variable, .. } => Some(variable),
-            _ => None,
-        },
+    match call.lexical_predicate_field()? {
+        IRExpr::PropAccess { variable, .. } => Some(variable),
         _ => None,
     }
 }

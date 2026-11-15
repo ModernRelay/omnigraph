@@ -49,6 +49,7 @@ const B_IN_PROGRESS: &[&str] = &[
     "a block compared with another block's value",
     "a write group selecting over a table an earlier group changes",
     "a full-text call read as a value",
+    "match_terms with an edit budget",
 ];
 
 const CLOSURE: &[Row] = &[
@@ -270,6 +271,21 @@ const CLOSURE: &[Row] = &[
             (
                 "query q($s: String) { match { $p: Person } where not exists { $d: Doc, $p authored $d where not search($d.body, $s) } return { $p.name } }",
                 Lowers,
+            ),
+            // `match_terms` is the same operand, with every term required or
+            // any one.
+            (
+                "query q($s: String) { match { $d: Doc, $p: Person, $p authored $d } where match_terms($d.body, terms($s)) or not match_terms($d.body, terms($s, mode: any, max_edits: 0)) or $p.age > 30 return { $d.title } }",
+                Lowers,
+            ),
+            (
+                "query q($s: String) { match { $p: Person } where count { $d: Doc, $p authored $d where match_terms($d.body, terms($s, mode: all)) } > 0 return { $p.name } }",
+                Lowers,
+            ),
+            // "match_terms with an edit budget"
+            (
+                "query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 1)) return { $d.title } }",
+                Refused("B"),
             ),
             // "a full-text call read as a value"
             (
