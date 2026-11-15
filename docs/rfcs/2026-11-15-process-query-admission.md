@@ -70,18 +70,21 @@ all installations is a later release decision supported by workload evidence.
 | Condition | Outcome |
 |---|---|
 | The full envelope fits in available capacity | Reserve it atomically, then dispatch. |
-| The envelope fits alone, but concurrent work holds capacity | HTTP 503, `execution_capacity_exceeded`, `effects: none`, `action: retry`. |
-| The envelope is larger than the configured total | HTTP 400, `bad_request`, `effects: none`, `action: fix`. |
+| The envelope fits alone, but concurrent work holds capacity | HTTP 429, `too_many_requests`, `effects: none`, `action: retry`. |
+| The envelope is larger than the configured total | HTTP 413, `payload_too_large`, `effects: none`, `action: fix`. |
 | A query exhausts its admitted private pool | Keep the existing `query_memory_bytes` refusal. |
 | A caller disconnects or abandons its future | Keep the charge with the work and resources it covered. |
 
 Both admission refusals carry `resource_limit` with resource
-`process_query_memory_bytes`, the configured `limit`, and the attempted aggregate
-`actual`. A retryable refusal also retains the execution's requested envelope
-in the engine error, so transports can distinguish temporary occupancy from an
-oversized request without parsing text. No work is queued and no retry is
-performed by the engine. Existing CLI retry-exit conventions and MCP error
-projection apply to the new code.
+`process_query_memory_bytes` and the configured `limit`. For temporary occupancy,
+`actual` is the attempted aggregate; for an oversized request, it is the requested
+envelope. The typed engine refusal retains the requested envelope and held
+capacity, so transports distinguish the two conditions without parsing text.
+These use the existing error codes: the registry already assigns admission
+exhaustion to 429 and a request's work exceeding its bound to 413. HTTP keeps the
+existing `Retry-After: 60` admission policy; the CLI keeps its retry-exit
+convention and MCP its existing error projection. No work is queued and no retry
+is performed by the engine.
 
 Admission does not lower an already accepted plan's `memory_limit` to whatever
 capacity happens to be free. The same plan retains its pool and spill decisions;
@@ -226,9 +229,10 @@ never waits for an ordinary permit held by its own parent.
 
 It changes no graph format, snapshot authority or publication protocol. Existing
 per-query limits remain part of the accepted plan. Configured admission adds a
-temporary-capacity error to HTTP/CLI/MCP; the new API error registry entry,
+new resource name under the existing HTTP/CLI/MCP error codes. The affected
 OpenAPI responses, troubleshooting guide and shipped agent skill change
-together. Old clients can still read the structured error body. Disabling
+together. The current strict `ErrorCode` deserializer keeps accepting these
+known codes. Disabling
 configuration on restart restores the earlier admission behavior without a data
 migration.
 
