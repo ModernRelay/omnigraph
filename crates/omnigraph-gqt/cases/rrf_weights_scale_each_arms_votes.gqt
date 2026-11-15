@@ -41,6 +41,8 @@ query unweighted() {
 d.slug: String
 s: F64
 
+--- expect same as reference
+
 --- query
 query weighted() {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, [0.0, 1.0, 0.0], k: 3), bm25($all, $d.title, "graph"), k: 60, weights: [1.0, 5.0]) as $s }
@@ -57,6 +59,8 @@ query weighted() {
 d.slug: String
 s: F64
 
+--- expect same as reference
+
 --- query
 query unit_weights() {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, [0.0, 1.0, 0.0], k: 3), bm25($all, $d.title, "graph"), k: 60, weights: [1, 1]) as $s }
@@ -72,3 +76,5 @@ query unit_weights() {
 --- expect shape
 d.slug: String
 s: F64
+--- expect same as reference
+
