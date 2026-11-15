@@ -46,11 +46,9 @@ input bytes. It does not account the execution pools or scanner buffers of those
 operations. Admission belongs below the transports: HTTP, MCP, direct CLI and
 embedded callers must contend for the same capacity, across graph handles.
 
-The issue's October 18 reproduction reports three contexts each retaining
-32 MiB, with no shared refusal; its constrained process was OOM-killed. Its
-November 10 follow-up identifies scanner read-ahead outside the query pool.
-Those observations are reported evidence. The source inventory below is against
-Omnigraph `6d92b436`, with Lance 13.0.0 and DataFusion 54.0.0.
+The issue reports OOMs from concurrent analytical queries and identifies scanner
+read-ahead outside the query pool. The local probes below reproduce independent
+pool admission on Omnigraph `6d92b436`, with Lance 13.0.0 and DataFusion 54.0.0.
 
 ## User and operational behavior
 
@@ -253,6 +251,34 @@ migration.
   supplies the typed outcome before concurrent reservations exhaust that limit.
 
 ## Evidence and tests
+
+### Current behavior
+
+Measured on Windows x86_64 with Rust 1.98.1, against the engine source at
+`6d92b436`. The seven existing `engine::context::tests` pass before adding the
+two [reservation probes](https://github.com/QinXi-ai/omnigraph/commit/dc224eec8a3dc52ed7973917e51482f8cb23ad2d).
+Both probes pass and release their reservations to zero:
+
+| Probe | Observation |
+|---|---|
+| Three real `QueryContext` instances, each with a 32 MiB limit | All three reserve their full private allowance: 100,663,296 bytes combined. |
+| Direct infallible pool API, 1,024-byte nominal limit | `grow(2_048)` succeeds and the pool records 2,048 reserved bytes. |
+
+The two existing native lifetime guards named above also pass on the same
+source: captured CPU inputs and accepted native reads remain owned after their
+callers disappear, then release after the actual work finishes. These instruments
+measure reservation counters and retained owners. Mixed-workload RSS measurements
+belong to the implementation evidence below.
+
+Commands, with the probe commit checked out for the second command:
+
+```bash
+cargo test -p omnigraph-engine --lib engine::context::tests --locked
+cargo test -p omnigraph-engine --lib issue_724 --locked -- --nocapture
+cargo test -p omnigraph-engine --test lance_surface_guards --locked -- --exact dropped_native_cpu_futures_retain_each_captured_input_until_completion dropped_scan_schedulers_retain_independent_native_read_budgets
+```
+
+### Implementation evidence
 
 Extend the existing owners in [Testing](../dev/testing.md):
 
