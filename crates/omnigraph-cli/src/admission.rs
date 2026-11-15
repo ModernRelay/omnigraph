@@ -19,10 +19,40 @@ pub(crate) async fn scope<F: Future>(future: F) -> F::Output {
     COMMAND.scope(Owners::default(), future).await
 }
 
+/// The storage an embedded command opens its graph with: the captured
+/// binding's own, or, under `--base`, read-through storage over `base`
+/// (the graph shallow clone RFC), built from the two root URIs; an S3 pair
+/// takes its clients from the standard `AWS_*` environment, as the engine's
+/// `open_clone` does. A root that holds a clone's `__clone/created` marker
+/// is a clone, and opening it without its base is refused by name.
+pub(crate) async fn embedded_storage(
+    binding: &CapturedStorageBinding,
+    base: Option<&str>,
+) -> Result<Arc<dyn omnigraph::storage::StorageAdapter>> {
+    match base {
+        None => {
+            let storage = storage_for_binding(binding)?;
+            let root = binding.uri();
+            let marker = format!("{}/__clone/created", root.trim_end_matches('/'));
+            if storage.exists(&marker).await? {
+                return Err(crate::targets::refusal(
+                    "target_invalid",
+                    format!(
+                        "{root} is a graph shallow clone; open it with --base <the base it was cloned from>"
+                    ),
+                ));
+            }
+            Ok(storage)
+        }
+        Some(base) => Ok(omnigraph::storage::storage_read_through(base, binding.uri()).await?),
+    }
+}
+
 /// Read commands never acquire writer admission or run the writable capability
 /// probe. Cluster authority is observed around the open, not held as a lease.
 pub(crate) async fn open_read_only_with_binding(
     binding: &CapturedStorageBinding,
+    base: Option<&str>,
     expected_state_cas: Option<&str>,
 ) -> Result<omnigraph::db::Omnigraph> {
     let authority =
@@ -31,7 +61,7 @@ pub(crate) async fn open_read_only_with_binding(
             .map_err(report)?;
     let db = omnigraph::db::Omnigraph::open_read_only_with_storage(
         binding.uri(),
-        storage_for_binding(binding)?,
+        embedded_storage(binding, base).await?,
     )
     .await?;
     if let Some(authority) = authority {

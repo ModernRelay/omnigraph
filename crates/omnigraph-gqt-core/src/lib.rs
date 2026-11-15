@@ -37,6 +37,7 @@ pub mod concurrent;
 pub mod diagnostic;
 mod generate;
 mod host;
+mod process;
 pub mod runner_config;
 mod served;
 mod yaml;
@@ -54,6 +55,9 @@ pub enum ParamsInput {
 }
 pub use host::{ExecutionHost, PlainHost};
 use omnigraph::storage::StorageAdapter;
+pub use process::{
+    PROCESS_STATS_RECORD, ProcessTarget, admit_process_workload, execute_measured_process,
+};
 pub use runner_config::{
     CORPUS_TIMEOUT_MS, Execution, RunnerConfig, SeamDirective, corpus_admission, parse_runner,
     parse_seam,
@@ -62,7 +66,10 @@ pub use runner_config::{
 /// The case format's version: one number, bumped whenever `grammar_text()`
 /// changes, pinned by the grammar golden under `tests/grammar/`.
 pub const GQT_FORMAT_VERSION: u32 = 1;
-pub use served::{ServerTarget, admit_served, execute_steps_served};
+pub use served::{
+    ServerTarget, admit_served, admit_served_workload, execute_measured_served,
+    execute_steps_served,
+};
 
 mod load_plan;
 mod plan;

@@ -335,7 +335,7 @@ pub fn scenario(catalog: &Catalog, scenario: &Scenario) -> ScenarioEntry {
             .filter(|(_, members)| members.contains(&scenario.id))
             .map(|(id, _)| id.clone())
             .collect(),
-        repetitions: scenario.expand(&catalog.definition.defaults).1,
+        repetitions: scenario.repetitions(&catalog.definition.defaults),
         source: state,
         diagnostics,
     }

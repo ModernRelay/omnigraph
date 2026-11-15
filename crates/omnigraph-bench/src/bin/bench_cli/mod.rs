@@ -277,7 +277,7 @@ pub fn show(args: ShowArgs) -> ExitCode {
             "resolved_workload":resolved_workload,
             "workload":scenario.workload,"measured_step":plan.definition.workload.measured_step,
             "environment":plan.definition.environment,"protocol":plan.definition.protocol,
-            "repetitions":scenario.expand(&catalog.definition.defaults).1,
+            "repetitions":scenario.repetitions(&catalog.definition.defaults),
             "recipe_sha256":plan.recipe_sha256,"planned_sha256":plan.planned_sha256,
             "needs_indices":plan.needs_indices,"cache_condition":plan.cache_condition,
         }),
@@ -355,7 +355,7 @@ pub fn cache(command: CacheCommand) -> ExitCode {
             };
             let inspection = match plan.dataset_build_plan() {
                 Ok(build) => dataset_cache::inspect(&build, &dataset_cache, binding, verify),
-                Err(message) => CacheInspection::served_not_applicable(&dataset_cache, message),
+                Err(message) => return failure(problem("invalid_scenario", message), args.json),
             };
             let diagnostics = inspection
                 .diagnostic
@@ -373,11 +373,7 @@ pub fn cache(command: CacheCommand) -> ExitCode {
 }
 fn inspection_succeeded(inspection: &CacheInspection) -> bool {
     match inspection.source {
-        Some(
-            SourceAvailability::Missing
-            | SourceAvailability::Unbound
-            | SourceAvailability::NotApplicable,
-        ) => true,
+        Some(SourceAvailability::Missing | SourceAvailability::Unbound) => true,
         Some(SourceAvailability::Invalid) => false,
         Some(SourceAvailability::Available) | None => match inspection.cache {
             CacheState::Missing | CacheState::Present | CacheState::Cached | CacheState::Busy => {
@@ -491,7 +487,6 @@ fn generate(args: &InitArgs) -> Result<PathBuf, Vec<Diagnostic>> {
             },
             repetitions: None,
             deadline_seconds: None,
-            environment: None,
             protocol: ProtocolOverrides::default(),
         }],
         groups: BTreeMap::new(),
@@ -511,8 +506,8 @@ fn generate(args: &InitArgs) -> Result<PathBuf, Vec<Diagnostic>> {
     Ok(output)
 }
 
-const CONFIG_HELP: &str = "Config version 2\n\nfixtures/ contains starting-state GQT; workloads/ contains operations and checks.\nbenchmarks.yaml defines scenarios once, optional groups of scenario IDs, and an explicit run list.\n\nrun NAME selects one scenario or group. run --config FILE uses only FILE's run list.\nWithout --config, explicit paths, filenames with a suffix, and existing local entries use the legacy case loader.\nUse ./NAME to force a case path; use --config to select a catalog name even if a local entry has that name.\nPaths inside YAML are relative to that YAML's directory and must stay inside it.\n--config never falls back if the file is missing or invalid.\n\nEach scenario needs id, fixture, workload and measured_step (ordinal plus exact operation text).\nA fixture is a GQT path, or {kind: registered, reference: ..., preparation: ...}.\nDefaults: repetitions=5, deadline_seconds=60, local APFS/clonefile on macOS or XFS/plain-copy elsewhere.\nEnvironment and protocol are expanded before identity: per-phase attribution, manual schedule, monotonic timer.\nScenario fields override defaults; run --repetitions overrides only sample quantity.\ndeadline_seconds: null disables the measurement deadline, not the supervisor watchdog.\nProtocol overrides are attribution, schedule, reset and timer; deadline_seconds is a scenario/default field.\n\nCopy benchmarks/custom.example.yaml, or generate a checked config:\n  omnigraph-bench show --workload benchmarks/workloads/tiny_read.gqt\n  omnigraph-bench init --fixture benchmarks/fixtures/tiny_graph.gqt --workload benchmarks/workloads/tiny_read.gqt --step 1 --output custom.yaml\n  omnigraph-bench run --config custom.yaml\n";
-const CACHE_HELP: &str = "Cache inspection is read-only and never builds, restores, cleans or quarantines data.\n\n  omnigraph-bench cache status tiny-read --json\n  omnigraph-bench cache status tiny-read --verify --json\n  omnigraph-bench cache list --limit 100 --json\n\nThe default cache is target/gqt-datasets relative to cwd. Use the same --dataset-cache path for run and status.\nKeys bind recipe, engine/builder, backend/reset, cache location, required indexes and registered-source identity.\nHistorical variants may exist while the current scenario has a cache miss.\nSource: available, missing, invalid, unbound, not_applicable. Cache: missing, present, cached, busy, invalid, incomplete, unknown.\npresent checks published evidence; --verify audits full bytes before reporting cached.\nbusy returns immediately for a held lease. Missing or unbound sources give unknown cache status.\nServed scenarios report not_applicable: they read a provisioned graph and use no dataset cache.\nA status is a snapshot, not a reservation. Cache missing is a successful observation; inability to inspect fails.\nrun builds missing fixtures unless --no-build is supplied. dataset build prepares fixtures explicitly.\nLegacy dataset validate acquires a lease and stages worker files; use cache status for read-only inspection.\n";
+const CONFIG_HELP: &str = "Config version 2\n\nfixtures/ contains starting-state GQT; workloads/ contains operations and checks.\nbenchmarks.yaml defines scenarios once, optional groups of scenario IDs, and an explicit run list.\n\nrun NAME selects one scenario or group. run --config FILE uses only FILE's run list.\nWithout --config, explicit paths, filenames with a suffix, and existing local entries use the legacy case loader.\nUse ./NAME to force a case path; use --config to select a catalog name even if a local entry has that name.\nPaths inside YAML are relative to that YAML's directory and must stay inside it.\n--config never falls back if the file is missing or invalid.\n\nEach scenario needs id, fixture, workload and measured_step (ordinal plus exact operation text).\nA fixture is a GQT path, or {kind: registered, reference: ..., preparation: ...}.\nDefaults: repetitions=5, deadline_seconds=60; a scenario names what is measured, never where.\nThe run supplies the environment (--server; --store, a fixture store at the clone reset level, with --backend for an s3:// store; the host's local default, APFS/clonefile on macOS or XFS/plain-copy elsewhere, otherwise) and the reset level follows it;\nenvironment and protocol are expanded before identity: per-phase attribution, manual schedule, monotonic timer.\nScenario fields override defaults; run --repetitions overrides only sample quantity.\ndeadline_seconds: null disables the measurement deadline, not the supervisor watchdog.\nProtocol overrides are attribution, schedule, reset and timer; deadline_seconds is a scenario/default field.\n\nCopy benchmarks/custom.example.yaml, or generate a checked config:\n  omnigraph-bench show --workload benchmarks/workloads/tiny_read.gqt\n  omnigraph-bench init --fixture benchmarks/fixtures/tiny_graph.gqt --workload benchmarks/workloads/tiny_read.gqt --step 1 --output custom.yaml\n  omnigraph-bench run --config custom.yaml\n";
+const CACHE_HELP: &str = "Cache inspection is read-only and never builds, restores, cleans or quarantines data.\n\n  omnigraph-bench cache status tiny-read --json\n  omnigraph-bench cache status tiny-read --verify --json\n  omnigraph-bench cache list --limit 100 --json\n\nThe default cache is target/gqt-datasets relative to cwd. Use the same --dataset-cache path for run and status.\nKeys bind recipe, engine/builder, backend/reset, cache location, required indexes and registered-source identity.\nHistorical variants may exist while the current scenario has a cache miss.\nSource: available, missing, invalid, unbound. Cache: missing, present, cached, busy, invalid, incomplete, unknown.\npresent checks published evidence; --verify audits full bytes before reporting cached.\nbusy returns immediately for a held lease. Missing or unbound sources give unknown cache status.\nStatus inspects the host's local environment; a served run reads a provisioned graph and uses no dataset cache.\nA status is a snapshot, not a reservation. Cache missing is a successful observation; inability to inspect fails.\nrun builds missing fixtures unless --no-build is supplied. dataset build prepares fixtures explicitly.\nLegacy dataset validate acquires a lease and stages worker files; use cache status for read-only inspection.\n";
 
 pub fn help(args: HelpArgs) -> ExitCode {
     let mut command = Cli::command();
@@ -530,7 +525,7 @@ pub fn help(args: HelpArgs) -> ExitCode {
         return success(
             &json!({"config_version":catalog::CONFIG_VERSION,"cli_output_version":1,"runner_output_version":RUNNER_OUTPUT_VERSION,
                 "commands":command_schema(&command),
-                "required_combinations": {"show":"exactly one of NAME or --workload; --workload conflicts with --config", "run":"NAME or config run list; --dataset/--queries overrides require a legacy YAML case path", "init":"--fixture, --workload, --step and --output", "served_run":"--server requires --graph and --server-receipt; --server-token-env names an optional credential environment variable; all selected scenarios must match one receipt; explicit --dataset/--queries pairs refuse --server; served runs refuse --no-build and --fixture; for run, --dataset-cache is the client scratch root"},"config_help":CONFIG_HELP,"cache_help":CACHE_HELP,
+                "required_combinations": {"show":"exactly one of NAME or --workload; --workload conflicts with --config", "run":"NAME or config run list; --dataset/--queries overrides require a legacy YAML case path", "init":"--fixture, --workload, --step and --output", "served_run":"--server requires --graph and --server-receipt; --network-position (same-host, same-region, remote; default same-host) is a level of the point; --server-token-env names an optional credential environment variable; all selected scenarios must match one receipt and have a served door; explicit --dataset/--queries pairs refuse --server; served runs refuse --no-build and --fixture; for run, --dataset-cache is the client scratch root"},"config_help":CONFIG_HELP,"cache_help":CACHE_HELP,
                 "output":{"inspection":"cli_output_version=1, ok, value, diagnostics","execution":"runner_output_version=2 with archive/partial-failure evidence","errors":"severity, code, path, message; JSON stdout only"},
                 "effects":{"help/list/show/cache":"read-only; no database execution","init":"creates one new YAML file","run/dataset":"embedded builds, restores or executes; served reads an already provisioned graph without reset; run may publish to an explicitly selected archive"},
                 "examples":["omnigraph-bench list fixtures --json","omnigraph-bench list workloads --json","omnigraph-bench list scenarios --json","omnigraph-bench show tiny-read --json","omnigraph-bench run tiny-read","omnigraph-bench run --config benchmarks/custom.example.yaml","omnigraph-bench cache status tiny-read --json"]

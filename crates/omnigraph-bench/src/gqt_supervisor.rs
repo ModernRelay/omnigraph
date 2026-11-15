@@ -320,6 +320,32 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
         }
     }
 
+    if let crate::gqt_protocol::RepetitionInputV2::Clone { input: clone } = &input.execution {
+        let written = crate::gqt_runner::block_on_own_thread(async {
+            crate::store::FixtureStore::open(&clone.store_uri)?
+                .clone_writes_outside_marker(&clone.clone)
+                .await
+        })
+        .and_then(|written| written);
+        match written {
+            Ok(written) if written.is_empty() => {}
+            Ok(written) => {
+                return worker.kill_error(
+                    "prepare-protocol",
+                    "pre_measurement_write_detected",
+                    format!(
+                        "the preparation wrote {} object(s) under the clone before the measured step: {}",
+                        written.len(),
+                        written.join(", ")
+                    ),
+                );
+            }
+            Err(error) => {
+                return worker.kill_error("prepare-protocol", &error.code, error.message);
+            }
+        }
+    }
+
     let begin = ParentFrameV2::Begin {
         protocol_version: WORKER_PROTOCOL_VERSION,
         repetition: input.repetition,
@@ -550,7 +576,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
         RepetitionInputV2::Embedded { .. } => {
             sample.peak_rss_bytes = Some(child_exit.peak_rss_bytes)
         }
-        RepetitionInputV2::Served { .. } => {
+        RepetitionInputV2::Served { .. } | RepetitionInputV2::Clone { .. } => {
             sample.client_peak_rss_bytes = Some(child_exit.peak_rss_bytes)
         }
     }

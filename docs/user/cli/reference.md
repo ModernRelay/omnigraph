@@ -28,6 +28,19 @@ endpoints; other cloud-direct and catalogue targets are unsupported. Use `./name
 relative filesystem address; a bare name selects a registered target.
 `init --schema graph.pg ./graph.omni` remains a creation convenience and refuses `--target`.
 
+`--base URI` opens a direct graph target as a graph shallow clone of the graph
+at `URI`: a read falls through to the base where the target has no object of its
+own, every write lands in the target, and the base is never written. Both are
+local directories or `s3://` prefixes of one endpoint (an S3 pair reads the
+standard `AWS_*` environment, and the clone's `s3://` prefix is named inline as
+the target, the one inline `s3://` graph the CLI admits); a target that contains
+its base, or lies inside it, is refused. The option applies to `query`, `mutate`, `load`, `branch`,
+`commit`, `changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`;
+maintenance and schema changes keep the one root they are given. A fresh target
+directory or prefix is a new clone; the same target again shows the clone's own
+state. Nothing in the target records its base, so pass the same `--base` on
+every open of that target.
+
 `--as ACTOR` attributes supported direct operations. A served target derives its
 actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
 exiting 4 on a mismatch ([Assert the actor](../operations/server.md#assert-the-actor));
@@ -110,6 +123,22 @@ non-uniform and TOON repeats every key. Numbers use TOON's canonical spelling,
 so an integral value is `1` where the JSON writer may spell `1.0`. The CLI ends
 the TOON document with a newline. The HTTP API returns JSON. A refusal follows
 [Diagnostics](../queries/diagnostics.md).
+
+### Invocation statistics
+
+`--stats PATH` writes one JSON document when the invocation ends, a refusal
+before the command dispatches included: `stats_version` (`1`), `elapsed_ms`
+(the invocation from target resolution to its last byte of output), `exit_code`
+(the code the process exits with), `storage` with the logical object-store
+calls the engine issued on the `manifest` and `table` planes of a direct target
+(`get`, `put`, `put_part`, `head`, `list`, `delete`, `copy`, `rename`,
+`multipart_complete`, `multipart_abort`; every direct target counts, a local
+directory included; a served target issues none in this process, so both planes
+read zero there), and `peak_rss_bytes` where the platform reports it. One
+logical call may fan out into several requests below the engine, so these are
+never request or cost counts. The document is the whole invocation, not one
+statement, and a document that cannot be written fails the command after it
+ran, so a write it carried has committed.
 
 ### Machine-readable read and write positions
 
