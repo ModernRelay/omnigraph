@@ -253,12 +253,13 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             primary,
             secondary,
             k,
+            weights,
             ..
         } => {
             params_of_expr(primary, out);
             params_of_expr(secondary, out);
-            if let Some(k) = k {
-                params_of_expr(k, out);
+            for option in [k, weights].into_iter().flatten() {
+                params_of_expr(option, out);
             }
         }
         IRExpr::Aggregate { arg, .. } => params_of_expr(arg, out),

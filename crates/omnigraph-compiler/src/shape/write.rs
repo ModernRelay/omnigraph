@@ -151,9 +151,6 @@ impl WriteShape {
         // The tables the groups before the current one write.
         let mut written = BTreeSet::new();
         for (g, group) in write.groups.iter().enumerate() {
-            if super::holds_match_terms(&group.input) {
-                return Err(super::match_terms_unlowered(name, Construct::Group(g)));
-            }
             match staged(group) {
                 Some(selection) => lower_staged(name, g, group, selection, &mut ops)?,
                 None => {
@@ -190,6 +187,11 @@ impl WriteShape {
                         name: name.clone(),
                         type_name: ty.display_name().trim_end_matches('?').to_string(),
                         nullable: ty.nullable,
+                        default: write
+                            .defaults
+                            .iter()
+                            .find(|(declared, _)| declared == name)
+                            .map(|(_, value)| value.clone()),
                     },
                     ty: ExprType::from_prop(ty),
                 })
@@ -488,6 +490,7 @@ fn lower_selected(
     let core = CoreRead {
         name: write.name.clone(),
         params: write.params.clone(),
+        defaults: write.defaults.clone(),
         term,
         result: RelTy::default(),
         plan_budget: DEFAULT_PLAN_BUDGET,

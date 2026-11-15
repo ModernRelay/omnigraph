@@ -113,6 +113,7 @@ fn multi_input_samples(plan: &mut PhysicalPlan) -> Vec<PhysicalNode> {
                 arm(leaf(plan), RankKind::Bm25),
             ],
             k: None,
+            weights: None,
             limit: None,
             prefilter: Prefilter {
                 ranked_type: "Doc".to_string(),

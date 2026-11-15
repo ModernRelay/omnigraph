@@ -885,7 +885,9 @@ impl Requirements {
     fn check_search(&self, plan: &PhysicalPlan) -> Result<(), ValidationError> {
         let ranked = ranked_scans(plan);
         let fuse = plan.live().find_map(|(_, node)| match node {
-            PhysicalNode::RankFuse { arms, k, .. } => Some((arms, k)),
+            PhysicalNode::RankFuse {
+                arms, k, weights, ..
+            } => Some((arms, k, weights)),
             _ => None,
         });
         let expected: Vec<(RankScope, &Retrieval)> = match &self.search {
@@ -964,7 +966,10 @@ impl Requirements {
             self.check_access(plan, type_key, access)?;
         }
         match (&self.search, fuse) {
-            (Some(Search::Fuse { arms, k }), Some((planned, planned_k))) => {
+            (
+                Some(Search::Fuse { arms, k, weights }),
+                Some((planned, planned_k, planned_weights)),
+            ) => {
                 for (arm, retrieval) in planned.iter().zip(arms.iter()) {
                     if arm.binding != retrieval.binding || arm.kind != retrieval.kind {
                         return Err(ValidationError::violated(
@@ -980,6 +985,12 @@ impl Requirements {
                     return Err(ValidationError::violated(
                         "search identity",
                         "the fusion's `k` is not the one the query writes",
+                    ));
+                }
+                if planned_weights != weights {
+                    return Err(ValidationError::violated(
+                        "search identity",
+                        "the fusion's `weights` are not the ones the query writes",
                     ));
                 }
             }

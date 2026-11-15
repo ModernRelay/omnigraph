@@ -748,6 +748,14 @@ fn expression_type(text: &str) -> Option<String> {
     if base == "exact_integer" || base == "[exact_integer]" {
         return Some(text.to_string());
     }
+    // An edge reference, as `count($k)` reads it: `edge` and its selector's
+    // types.
+    if let Some(types) = text.strip_prefix("edge ") {
+        return types
+            .split('|')
+            .all(crate::shape::is_type_name)
+            .then(|| text.to_string());
+    }
     aggregate_type(text)
 }
 
@@ -1039,7 +1047,8 @@ fn typed_node(value: &Value) -> Result<TypedNode, String> {
         "property" | "variable" | "param" | "literal" | "alias" | "count_rows" => args.is_empty(),
         "nearest" | "aggregate" | "not" | "is_null" | "cast" | "neg" => args.len() == 1,
         "search" | "match_text" | "bm25" | "and" | "or" | "compare" | "arith" => args.len() == 2,
-        "fuzzy" | "rrf" => (2..=3).contains(&args.len()),
+        "fuzzy" => (2..=3).contains(&args.len()),
+        "rrf" => (2..=4).contains(&args.len()),
         "if" => args.len() == 3,
         "coalesce" | "concat" | "match_terms" => !args.is_empty(),
         _ => false,
@@ -1092,7 +1101,9 @@ fn collect_typed_fields(node: &Value, out: &mut Vec<Result<TypedNode, String>>) 
             Value::Object(fields) => {
                 for (key, value) in fields {
                     if key.starts_with("typed_") {
-                        if !value.is_null() || !matches!(key.as_str(), "typed_filter" | "typed_k") {
+                        if !value.is_null()
+                            || !matches!(key.as_str(), "typed_filter" | "typed_k" | "typed_weights")
+                        {
                             collect_typed_tree(value, out);
                         }
                     } else if key != "inputs" {

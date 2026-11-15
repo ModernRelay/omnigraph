@@ -125,6 +125,7 @@ fn issue_659_rrf_declares_typed_downstream_order_without_changing_fusion_identit
                 primary: Box::new(arm.clone()),
                 secondary: Box::new(arm),
                 k: None,
+                weights: None,
                 ty: value_type(ScalarType::F64, false),
             }],
         );
@@ -186,6 +187,7 @@ fn rank_fuse_row_keys_cover_both_arms_without_correlated_locals_issue_659() {
             primary: Box::new(arm("a")),
             secondary: Box::new(arm("b")),
             k: None,
+            weights: None,
             ty: value_type(ScalarType::F64, false),
         },
         descending: false,
@@ -255,6 +257,7 @@ fn every_nested_rank_fuse_validates_its_row_keys_issue_659() {
             primary: Box::new(arm.clone()),
             secondary: Box::new(arm),
             k: None,
+            weights: None,
             ty: value_type(ScalarType::F64, false),
         }],
     );
@@ -303,6 +306,7 @@ fn rank_fuse_without_downstream_bindings_keeps_an_empty_key_list_issue_659() {
             primary: Box::new(arm.clone()),
             secondary: Box::new(arm),
             k: None,
+            weights: None,
             ty: value_type(ScalarType::F64, false),
         }],
     );
@@ -492,6 +496,7 @@ fn fused_row_identity_declared_under_the_fused_score_sort() {
             primary: Box::new(arm.clone()),
             secondary: Box::new(arm),
             k: None,
+            weights: None,
             ty: value_type(ScalarType::F64, false),
         }
     };
@@ -880,6 +885,7 @@ fn issue_659_budgeted_search_declares_no_topology_prefilter() {
             primary: Box::new(nearest),
             secondary: Box::new(bm25),
             k: None,
+            weights: None,
             ty: value_type(ScalarType::F64, false),
         },
     ] {

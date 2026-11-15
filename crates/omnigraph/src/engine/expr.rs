@@ -391,6 +391,7 @@ pub(super) fn compare_arrays(
             right.data_type()
         )));
     }
+    let (left, right) = (&positive_zero(left)?, &positive_zero(right)?);
     match op {
         CompOp::Eq => cmp::eq(left, right),
         CompOp::Ne => cmp::neq(left, right),
@@ -403,6 +404,37 @@ pub(super) fn compare_arrays(
         }
     }
     .map_err(OmniError::arrow_internal)
+}
+
+/// The array with every `-0.0` replaced by `0.0`, for a comparison.
+///
+/// Arrow's comparison kernels compare floats by their bits (the total
+/// order), where `-0.0` and `0.0` differ; a comparison treats them as equal,
+/// as IEEE 754 does and as a filter Lance evaluates in the scan does. Sorting,
+/// `distinct` and grouping keep the total order, so only comparisons call
+/// this.
+pub(super) fn positive_zero(values: &ArrayRef) -> Result<ArrayRef> {
+    Ok(match values.data_type() {
+        DataType::Float64 => {
+            let values = values
+                .as_any()
+                .downcast_ref::<arrow_array::Float64Array>()
+                .ok_or_else(|| OmniError::manifest_internal("F64 array of another layout"))?;
+            Arc::new(values.unary::<_, arrow_array::types::Float64Type>(|value| {
+                if value == 0.0 { 0.0 } else { value }
+            }))
+        }
+        DataType::Float32 => {
+            let values = values
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| OmniError::manifest_internal("F32 array of another layout"))?;
+            Arc::new(values.unary::<_, arrow_array::types::Float32Type>(|value| {
+                if value == 0.0 { 0.0 } else { value }
+            }))
+        }
+        _ => values.clone(),
+    })
 }
 
 /// Execute an expression in its recorded type and check the produced array.
@@ -620,8 +652,9 @@ pub(super) fn array_value_eq(
     if left.is_null(left_index) || right.is_null(right_index) {
         return Ok(false);
     }
-    let equal = arrow_ord::cmp::eq(&left.slice(left_index, 1), &right.slice(right_index, 1))
-        .map_err(OmniError::arrow_internal)?;
+    let left = positive_zero(&left.slice(left_index, 1))?;
+    let right = positive_zero(&right.slice(right_index, 1))?;
+    let equal = arrow_ord::cmp::eq(&left, &right).map_err(OmniError::arrow_internal)?;
     Ok(equal.value(0))
 }
 
@@ -724,23 +757,45 @@ pub(super) fn evaluate_projection(
 
 /// What `count($var)` counts: the binding's identity column, one per row and
 /// never null, under the bare `$var` projection's name. The scan behind the
-/// binding is pruned to it (`projection_pushdown`, #704), so no node struct is built.
+/// binding is pruned to it (`projection_pushdown`), so no node struct is
+/// built. A node binding's identity is its id; an edge binding's is its id
+/// too, and for an edge over several types, whose rows carry the edge type,
+/// its type and id together, joined by a NUL that no type name holds, so
+/// `count(distinct $k)` tells two types' equal ids apart.
 pub(super) fn identity_column(
     wide_batch: &RecordBatch,
     variable: &str,
     ctx: &ProjectionContext,
 ) -> Result<(String, ArrayRef)> {
-    if ctx.node_type(variable).is_none() {
-        return Err(OmniError::manifest(format!(
-            "variable '{}' is not a node binding",
-            variable
-        )));
-    }
     let col_name = format!("{}.{}", variable, ctx.catalog.system_columns.id);
     let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
         OmniError::manifest(format!("column '{}' not found in wide batch", col_name))
     })?;
-    Ok((variable.to_string(), col.clone()))
+    if ctx.node_type(variable).is_some() {
+        return Ok((variable.to_string(), col.clone()));
+    }
+    let type_name = format!(
+        "{variable}.{}",
+        omnigraph_compiler::traversal::EDGE_TYPE_COLUMN
+    );
+    let Some(types) = wide_batch.column_by_name(&type_name) else {
+        return Ok((variable.to_string(), col.clone()));
+    };
+    let as_strings = |array: &ArrayRef, name: &str| {
+        array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .cloned()
+            .ok_or_else(|| OmniError::manifest_internal(format!("column '{name}' is not a String")))
+    };
+    let (ids, types) = (as_strings(col, &col_name)?, as_strings(types, &type_name)?);
+    let identities: StringArray = (0..ids.len())
+        .map(|row| {
+            (ids.is_valid(row) && types.is_valid(row))
+                .then(|| format!("{}\0{}", types.value(row), ids.value(row)))
+        })
+        .collect();
+    Ok((variable.to_string(), Arc::new(identities)))
 }
 
 #[cfg(test)]

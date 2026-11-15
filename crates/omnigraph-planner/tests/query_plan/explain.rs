@@ -366,6 +366,7 @@ fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
         }),
         secondary: Box::new(bm25),
         k: None,
+        weights: None,
         ty: value_type(ScalarType::F64, false),
     };
     let contains = IRExpr::comparison(prop("c", "text"), CompOp::StringContains, prop("n", "slug"));

@@ -95,6 +95,12 @@ named relation: `let $cs = { match { $c: Company } return { $c } }, from $cs`.
 elements; a value that can fail (arithmetic) runs on every row before
 `where`, so it fails (`E1`, `E2`) on rows `where` removes: guard it with
 `if(cond, value, 0)` or write it in `return`, which runs after `where`.
+Arithmetic (`+ - * / %`, unary `-`), `if` and `coalesce` widen two numeric
+types to their common one: the wider integer, `I64` for `U32` with a signed
+integer, `F64` for an integer or `F32` with a float. An integer literal,
+`-3` included, takes the other operand's integer type when it fits
+(`$p.age - -3` over an `I32` is `I32`, overflowing at `I32` with `E1`);
+`U64` with a signed integer and `-` over an unsigned value are `T72`.
 `from { match … return { … } }` joins an inline read's rows; its own
 aggregate, `distinct`, `order` and `limit` run per outer row when it reads
 an outer name (once otherwise), so an outer `where` or `limit` never widens
@@ -268,13 +274,15 @@ means a declared user property named `id`; it is not an identity shorthand.
 `{"@id":"alice","name":"Alice"}`. It includes declared properties except
 Blob and Vector properties. Project `$p.@id` for just the identity or
 `$p.embedding` for a vector; Blob values require the Blob API. Bare edge
-bindings cannot be projected.
+bindings cannot be projected (`T86`); return their fields (`$k.@id`, `$k.@src`,
+`$k.@dst`, `$k.@type`, properties).
 
 Each projection needs a distinct result column name (`T25`): use aliases when
 expressions would collide. Aliases can be used in `order`, including after a
 leading score key (`order { $distance, title }`), but cannot be projected again
 in `return` (`T36`). On ungrouped rows any expression may be an order key, returned
-or not. Over grouped rows (an aggregate or `return distinct`) an order key must
+or not; a node or edge reference sorts by its identity (`order { $p }` by
+`$p.@id`, an edge over several types by `@type`, then `@id`). Over grouped rows (an aggregate or `return distinct`) an order key must
 be a `return` item or its alias, such as `order { count($f) desc }` after
 `count($f)` in `return` (`T42`).
 
@@ -375,7 +383,8 @@ query friend_counts() {
 ```
 
 Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggregated return fields.
-`count(distinct $f)` counts distinct nodes and `count(distinct $f.city)`
+`count(distinct $f)` counts distinct nodes (distinct edges over an edge
+binding `$k`) and `count(distinct $f.city)`
 distinct non-null values; `distinct` under another aggregate is refused
 (`T57`). `return distinct { … }` keeps one row per distinct projected tuple
 before `order`/`limit` (with aggregates: `T56`). A comparison in `return`

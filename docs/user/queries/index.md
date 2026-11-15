@@ -30,16 +30,18 @@ omnigraph query engineers --query queries.gq \
 ## Declarations and parameters
 
 ```text
-query <name>($required: String, $optional: I32?) { ... }
+query <name>($required: String, $optional: I32?, $min: I32 = 18) { ... }
 ```
 
-Parameter types use the schema scalar types. Every non-nullable declared
-parameter must be supplied; omission fails before query execution. A trailing
-`?` accepts `null` or an omitted value. `@description("...")` and
-`@instruction("...")` attach metadata for tool clients. An integer parameter
-carries its type's whole range: a `U64` takes `0` to `18446744073709551615`.
-A source declares each name once, compared case-sensitively as a call resolves
-it; a second declaration is `T83`, naming both: rename or delete the later one.
+Parameter types use the schema scalar types. A non-nullable parameter without
+a default must be supplied; omission fails before execution. A trailing `?`
+accepts `null` or an omitted value, which is null. `= value` declares a
+default, a literal of the type (`T3` otherwise), that an omitted parameter
+takes; a supplied value or an explicit `null` replaces it. `@description` and
+`@instruction` attach metadata for tool clients. An integer parameter carries
+its type's whole range: a `U64` takes `0` to `18446744073709551615`. A source
+declares each name once, compared case-sensitively as a call resolves it; a
+second declaration is `T83`, naming both: rename or delete the later one.
 
 ## Match patterns
 
@@ -55,11 +57,10 @@ draws a ranking's rows in, and `let` names a relation; see [Search](../search/in
 
 ### Boolean expressions and nulls
 
-A `where` combines its tests with `and`, `or`, `not` and parentheses. `or`
-binds loosest, then `and`, `not`, comparison and arithmetic, so
-`not $p.email is null` reads as `not ($p.email is null)`. Comparisons do not
-chain: `$a < $b < $c` is a parse error. Operands of `and`, `or` and `not`
-must be `Bool` (`T41`), as in
+A `where` combines its tests with `and`, `or`, `not` and parentheses. `or` binds
+loosest, then `and`, `not`, comparison and arithmetic, so `not $p.email is null`
+reads as `not ($p.email is null)`. Comparisons do not chain: `$a < $b < $c` is a
+parse error. Operands of `and`, `or` and `not` must be `Bool` (`T41`), as in
 `($d.stage = "open" or $d.stage = "paused") and not $d.amount < $cut`.
 
 A comparison or string test (`contains(...)`, `starts_with(...)`) with a null
@@ -92,8 +93,7 @@ to `null` makes every comparison on it null, and `is null` refuses a `Blob`.
 or a return alias. `$p.and` after a dot and `and: 1` in an assignment stay
 legal; `nothing` and `android` are ordinary identifiers.
 A bare name is never a value in a read (`Q018`): a property is `$x.name`, a
-parameter `$name` and a string `"name"`; the one bare name is a return alias in
-`order`.
+parameter `$name` and a string `"name"`; the one bare name is an `order` alias.
 Inside `match` any word is an edge name, reserved words included: `$i in $b`
 follows the edge `In` there and tests membership in `where` (`T7` for the
 wrong side); a [write](../mutations/index.md) selects the same way.
@@ -164,9 +164,8 @@ query prolific($least: I64) {
   and `contains` over a list, are `T7`, with the call or `in` as the fix.
 
 `NULL` never matches these predicates, and `%` and `_` are not wildcards. They
-are correct without an index, and a free-text String index does not accelerate
-them; use [full-text search](../search/index.md) for tokens, fuzzy matching and
-relevance.
+are correct without an index, and a free-text index does not speed them up;
+use [full-text search](../search/index.md) for tokens, fuzzy matching, relevance.
 
 ### System fields
 
@@ -194,7 +193,7 @@ order { companies desc, $person.name asc }
 limit 20
 ```
 
-Return expressions include variables, properties, literals, `now()`, `count`,
+Return expressions include variables, properties, literals, [arithmetic](traversal.md#values-and-inline-reads), `if`, `coalesce`, `concat`, `now()`, `count`,
 `sum`, `avg`, `min`, `max`, and a [ranking](../search/index.md)'s score, named
 by its `from`'s `as` (`T85`). Each gives one column named by its alias or
 expression (`$p.name` gives `p.name`; a score drawn `as $s` gives `s`); duplicates are
@@ -208,8 +207,8 @@ dates chronologically). With no matches, an aggregate-only return gives one row
 
 A bare node returns one object with `@id` and every property except `Blob` and
 `Vector`: `$p` produces column `p`; project a property for one field. `count($p)`
-counts rows and `count(distinct $p)` distinct nodes; `count(distinct $p.city)`
-counts distinct non-null values, so a node reached by several paths counts once.
+counts rows, `count(distinct $p)` distinct nodes (or edges) and `count(distinct $p.city)`
+distinct non-null values, so a node reached by several paths counts once.
 Other aggregates require a property (`T8`) and refuse `distinct` (`T57`).
 
 A comparison or Boolean expression requires an alias (`T43`), such as
@@ -233,12 +232,13 @@ Order is total under the tie rule: after the written keys (ascending puts nulls
 first, descending last), each entity id in the order the pattern binds it (a
 traversal's destination before its edge), then a `from`'s value columns, all
 ascending; group rows use their keys, bare nodes (by id) first. Ids are read
-only when they can change the visible order. A `limit` with no `order` cuts this
-order alone: `limit 2` returns the two smallest ids, not a scan's first rows,
-and reads every match. On ungrouped, non-DISTINCT rows an order key need not be
-projected: `order { $p.age > 30 }` sorts by a value the return leaves out. Over
-grouped rows, an aggregated or DISTINCT return, an order key must be a return
-item or its alias (`T42`): `count($d)` after `return { count($d) as deals }`.
+only when they can change the order. A `limit` with no `order` cuts this order
+alone: `limit 2` returns the two smallest ids, not a scan's first rows, and
+reads every match. On ungrouped, non-DISTINCT rows an order key need not be
+projected, as in `order { $p.age > 30 }`. A reference key sorts by identity:
+`$p` by `$p.@id`, a multi-type edge by `@type`, then `@id`. Over grouped rows,
+an aggregated or DISTINCT return, an order key must be a return item or its
+alias (`T42`): `count($d)` after `return { count($d) as deals }`.
 
 A read that draws from a [ranking](../search/index.md) orders by its score
 column like any other: `order { $distance }` for `nearest`, by ascending

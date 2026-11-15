@@ -36,6 +36,7 @@ pub struct AggregateFields<'p> {
 pub struct RankFuseFields<'p> {
     pub arms: &'p [RankArm; 2],
     pub k: Option<&'p IRExpr>,
+    pub weights: Option<&'p IRExpr>,
     pub limit: Option<usize>,
     pub row_tiebreak: &'p [ColumnRef],
 }
@@ -684,6 +685,7 @@ impl PhysicalPlan {
             PhysicalNode::RankFuse {
                 arms,
                 k,
+                weights,
                 limit,
                 row_tiebreak,
                 ..
@@ -695,6 +697,7 @@ impl PhysicalPlan {
                     RankFuseFields {
                         arms,
                         k: k.as_ref(),
+                        weights: weights.as_ref(),
                         limit: *limit,
                         row_tiebreak,
                     },

@@ -1,0 +1,74 @@
+# issue: none
+# notes: `weights:` scales each arm's reciprocal rank: rrf(d) = sum over the arms that selected d of
+# notes: weight[arm] / (k + rank[arm, d]). The nearest arm ranks d1 (distance 0), d3, d2; bm25 over
+# notes: "graph" ranks d2 (three occurrences), d1, and does not select d3. With k = 60:
+# notes: unweighted, d1 = 1/61 + 1/62 = 0.032522474881, d2 = 1/63 + 1/61 = 0.032266458496 and
+# notes: d3 = 1/62 = 0.016129032258, so d1 leads; with weights [1, 5], d1 = 1/61 + 5/62 = 0.097038603913,
+# notes: d2 = 1/63 + 5/61 = 0.097840228988 and d3 = 1/62 = 0.016129032258, so d2 leads.
+# notes: Weights all 1, written as integers, are the unweighted fusion.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String @index
+    embedding: Vector(3) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","title":"graph query","embedding":[0.0,1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d2","title":"graph graph graph","embedding":[1.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d3","title":"hay","embedding":[0.0,0.9,0.1]}}
+
+--- query
+query unweighted() {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, [0.0, 1.0, 0.0], k: 3), bm25($all, $d.title, "graph"), k: 60) as $s }
+    return { $d.slug, $s }
+    order { $s desc }
+}
+
+--- expect ordered
+{"d.slug":"d1","s":0.032522474881}
+{"d.slug":"d2","s":0.032266458496}
+{"d.slug":"d3","s":0.016129032258}
+
+--- expect shape
+d.slug: String
+s: F64
+
+--- query
+query weighted() {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, [0.0, 1.0, 0.0], k: 3), bm25($all, $d.title, "graph"), k: 60, weights: [1.0, 5.0]) as $s }
+    return { $d.slug, $s }
+    order { $s desc }
+}
+
+--- expect ordered
+{"d.slug":"d2","s":0.097840228988}
+{"d.slug":"d1","s":0.097038603913}
+{"d.slug":"d3","s":0.016129032258}
+
+--- expect shape
+d.slug: String
+s: F64
+
+--- query
+query unit_weights() {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, [0.0, 1.0, 0.0], k: 3), bm25($all, $d.title, "graph"), k: 60, weights: [1, 1]) as $s }
+    return { $d.slug, $s }
+    order { $s desc }
+}
+
+--- expect ordered
+{"d.slug":"d1","s":0.032522474881}
+{"d.slug":"d2","s":0.032266458496}
+{"d.slug":"d3","s":0.016129032258}
+
+--- expect shape
+d.slug: String
+s: F64

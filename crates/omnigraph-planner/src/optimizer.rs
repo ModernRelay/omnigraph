@@ -14,7 +14,7 @@ use omnigraph_compiler::query::file::LoadStmtMode;
 use omnigraph_compiler::query::value::{AggFunc, CompOp, Literal};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
-use omnigraph_compiler::types::Direction;
+use omnigraph_compiler::types::{Direction, ExprType};
 
 use crate::cost::{
     AccessPath, AntiJoinStrategy, CoverageProvenance, EndpointProbe, ExpandCostInputs, ExpandMode,
@@ -1150,6 +1150,7 @@ fn search_node(
             primary,
             secondary,
             k,
+            weights,
             ..
         } => {
             let arms = [search_target(primary)?, search_target(secondary)?];
@@ -1164,6 +1165,7 @@ fn search_node(
                 input,
                 arms: Box::new(arms),
                 k: k.as_deref().cloned(),
+                weights: weights.as_deref().cloned(),
                 limit,
                 reads,
                 row_tiebreak: Vec::new(),
@@ -1835,7 +1837,12 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
             }
         }
         IRExpr::Aggregate { func, arg, .. } => match (func, arg.as_ref()) {
-            (AggFunc::Count, IRExpr::Variable(variable, _)) => {
+            (AggFunc::Count, IRExpr::Variable(variable, ty)) => {
+                // An edge over several types is identified by its type and
+                // its id together.
+                if matches!(ty, ExprType::Edge { type_name } if type_name.contains('|')) {
+                    out.push(ColumnRef::property(variable, EDGE_TYPE_MEMBER));
+                }
                 out.push(ColumnRef::property(variable, IDENTITY_MEMBER));
             }
             _ => reads_of_expr(arg, out),
@@ -2943,26 +2950,26 @@ fn identity_reads(node: &LogicalNode) -> Vec<String> {
     }
 }
 
-/// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`).
+/// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`,
+/// `match_terms`).
 fn has_lexical_call(expr: &IRExpr) -> bool {
     let mut bindings = Vec::new();
     lexical_bindings(expr, &mut bindings);
     !bindings.is_empty()
 }
 
-/// The binding of every full-text call (`search`, `fuzzy`, `match_text`) in
-/// `expr`, whose field is that binding's property.
+/// The binding of every full-text call (`search`, `fuzzy`, `match_text`,
+/// `match_terms`) in `expr`, whose field is that binding's property.
 fn lexical_bindings(expr: &IRExpr, out: &mut Vec<String>) {
-    match expr {
-        IRExpr::Search { field, .. }
-        | IRExpr::Fuzzy { field, .. }
-        | IRExpr::MatchText { field, .. } => {
-            if let IRExpr::PropAccess { variable, .. } = field.as_ref()
-                && !out.contains(variable)
-            {
-                out.push(variable.clone());
-            }
+    if let Some(field) = expr.lexical_predicate_field() {
+        if let IRExpr::PropAccess { variable, .. } = field
+            && !out.contains(variable)
+        {
+            out.push(variable.clone());
         }
+        return;
+    }
+    match expr {
         IRExpr::Binary { left, right, .. } => {
             lexical_bindings(left, out);
             lexical_bindings(right, out);
@@ -2972,7 +2979,11 @@ fn lexical_bindings(expr: &IRExpr, out: &mut Vec<String>) {
         | IRExpr::Neg { expr: inner, .. }
         | IRExpr::IsNull { expr: inner, .. } => lexical_bindings(inner, out),
         IRExpr::Call { args, .. } => args.iter().for_each(|arg| lexical_bindings(arg, out)),
-        IRExpr::PropAccess { .. }
+        // The predicates themselves were taken above.
+        IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
@@ -3062,6 +3073,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             input: _,
             arms,
             k: _,
+            weights: _,
             limit: _,
             reads,
             row_tiebreak,
@@ -4275,6 +4287,7 @@ impl Lowering<'_> {
                 input,
                 arms,
                 k,
+                weights,
                 limit,
                 row_tiebreak,
                 leads,
@@ -4366,6 +4379,7 @@ impl Lowering<'_> {
                 Ok(self.physical.add(PhysicalNode::RankFuse {
                     arms: [primary_arm, secondary_arm],
                     k: k.clone(),
+                    weights: weights.clone(),
                     limit,
                     prefilter,
                     row_tiebreak: row_tiebreak.clone(),

@@ -4,8 +4,8 @@
 # notes: tokenizer and lowercasing, no stemming, stop words or folding. Compared with the
 # notes: reference interpreter; no step projects a bm25 score, whose last digits are the
 # notes: engine's f32 arithmetic rather than `bm25_v1`'s F64. A `bm25` over `terms(…)` asking for
-# notes: every term or an edit budget is refused (`T86`): the scan matches any term with no edits;
-# notes: so is `match_terms`, which no evaluator of this release runs.
+# notes: every term or an edit budget is refused (`T86`), and so is `match_terms` with an edit
+# notes: budget; `match_terms` with every term required and no edits runs.
 
 --- runner
 timeout_ms: 10000
@@ -75,6 +75,22 @@ query q() {
 
 --- expect error: type error: T86:
 
+
+--- query
+query q() {
+    match { $d: Doc } where match_terms($d.text, terms("graph search", mode: all)) or match_terms($d.text, terms("VECTORS documents", mode: any))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"d1"}
+{"d.slug":"d2"}
+{"d.slug":"d4"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
 
 --- query
 query q() {

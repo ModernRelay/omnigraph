@@ -86,7 +86,11 @@ $k.@src, $k.@dst }`. Edge
 bindings are available only for a single hop. Alternatives share the same
 deduplication and shortest-distance search across all members. Bound edges are
 identified by canonical type plus ID, so equal IDs in different types remain
-distinct. An undirected self-loop appears once.
+distinct: `count(distinct $k)` counts them apart, and `order { $k }` sorts by
+type, then ID. An undirected self-loop appears once. A bound edge is read
+through its fields (`$k.@id`, `$k.@src`, `$k.@dst`, `$k.@type` and its
+properties); a result has no edge object, so `return { $k }` is not lowered in
+this release (`T86`).
 
 A bound edge property must exist on every member with the same base value type.
 Scalar/list shape and Vector dimensions must agree. It is nullable if any
@@ -229,6 +233,19 @@ would remove. No conjunct of `where` runs below it. To keep such a row from
 failing, guard the value with `if`, whose branch not taken is never
 evaluated (`let $r = if($n != 0, $t / $n, 0)`), or write the expression in
 `return`, which runs after `where`.
+
+Arithmetic is `+ - * / %` and unary `-` over numbers. Operands of two numeric
+types meet in their common type through an explicit widening: a narrower
+integer widens to the wider, `U32` with a signed integer is `I64`, and an
+integer or an `F32` with a float is `F64`; `if` and `coalesce` widen their
+arguments the same way. An integer literal, a negated one such as `-3`
+included, takes the other operand's integer type when it fits, so
+`$p.age - -3` over an `I32` is `I32` and overflows at `I32`; a float literal
+is `F64`, and `(0 - 3)` is an `I64` operand. `U64` with a signed integer and
+unary `-` over an unsigned value are refused (`T72`). The result is nullable
+when an operand is; division truncates toward zero, and `%` takes the sign of
+its left operand. A comparison and the zero-divisor test treat `-0.0` and
+`0.0` as equal; a sort puts `-0.0` first and `distinct` keeps both.
 
 `from { match … return { … } }` joins the rows of an inline read, one outer
 row per inner row, correlated on the outer variables it reads. Its returned

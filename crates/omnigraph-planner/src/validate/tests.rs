@@ -763,6 +763,49 @@ fn another_query_argument_fails_search_identity() {
     assert_eq!(check, "search identity", "{detail}");
 }
 
+fn fusion_weights(plan: &mut PhysicalPlan) -> &mut Option<IRExpr> {
+    let id = node_ids(plan, |node| matches!(node, PhysicalNode::RankFuse { .. }))[0];
+    match plan.node_mut(id) {
+        Some(PhysicalNode::RankFuse { weights, .. }) => weights,
+        _ => unreachable!("a RankFuse"),
+    }
+}
+
+/// A fusion runs the weights the query writes: dropped, reordered or added
+/// weights change every fused score, so each is refused.
+#[test]
+fn other_fusion_weights_fail_search_identity() {
+    let fused = |weights: &str| {
+        format!(
+            "query q($q: String) {{ match {{ let $all = {{ match {{ $d: Doc }} return {{ $d }} }}, from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60{weights}) as $score, $d: Doc }} return {{ $d.slug }} order {{ $score desc }} limit 2 }}"
+        )
+    };
+    let params = [("q", Literal::String("needle".into()))];
+    let weighted = Fixture::new(&fused(", weights: [1.0, 5.0]"), &params);
+    let mut plan = weighted.plan();
+    let written = fusion_weights(&mut plan).clone();
+    assert_eq!(
+        written
+            .as_ref()
+            .and_then(|w| omnigraph_compiler::ir::rrf_weight_values(w, 2)),
+        Some(vec![1.0, 5.0])
+    );
+    weighted.accept(plan.clone()).unwrap();
+    for other in [None, omnigraph_compiler::ir::rrf_weights_expr(&[5.0, 1.0])] {
+        let mut edited = plan.clone();
+        *fusion_weights(&mut edited) = other;
+        let (check, detail) = weighted.refused(edited);
+        assert_eq!(check, "search identity", "{detail}");
+        assert!(detail.contains("`weights`"), "{detail}");
+    }
+    let unweighted = Fixture::new(&fused(""), &params);
+    let mut plan = unweighted.plan();
+    assert!(fusion_weights(&mut plan).is_none());
+    *fusion_weights(&mut plan) = written;
+    let (check, detail) = unweighted.refused(plan);
+    assert_eq!(check, "search identity", "{detail}");
+}
+
 #[test]
 fn a_capped_bm25_scan_fails_the_row_cut() {
     let fixture = ranked();

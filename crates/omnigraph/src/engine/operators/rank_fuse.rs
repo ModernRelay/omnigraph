@@ -75,6 +75,7 @@ impl fmt::Debug for RankFuseExec {
             .field("id_column", &self.id_column)
             .field("fused_score", &self.fused_score)
             .field("k", &self.rrf.k)
+            .field("weights", &self.rrf.weights)
             .finish_non_exhaustive()
     }
 }
@@ -83,10 +84,12 @@ impl DisplayAs for RankFuseExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "RankFuseExec: on={}, score={}, k={}, arms=[{} {}, {} {}]",
+            "RankFuseExec: on={}, score={}, k={}, weights=[{}, {}], arms=[{} {}, {} {}]",
             self.id_column,
             self.fused_score,
             self.rrf.k,
+            self.rrf.weights[0],
+            self.rrf.weights[1],
             self.orders[0].score_column,
             direction(self.orders[0].descending),
             self.orders[1].score_column,
@@ -283,7 +286,10 @@ mod tests {
         let fused = fuse_arms(
             &ranked,
             &ranked,
-            &RrfMode { k: 60 },
+            &RrfMode {
+                k: 60,
+                weights: [1.0; 2],
+            },
             "p.__id",
             "p._rrf",
             &memory,

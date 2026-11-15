@@ -24,8 +24,9 @@ use crate::physical::{NodeId, PhysicalPlan};
 /// (`correlated` or `key_set`). Version 10 adds to version 9 every table's
 /// `source` (`dataset` or `catalogue`) and the assumptions' catalogue
 /// fingerprints. Version 11 adds to version 10 a literal arm for an integer
-/// outside the `i64` range, carried as its decimal text.
-pub const BOUND_PLAN_VERSION: u32 = 11;
+/// outside the `i64` range, carried as its decimal text. Version 12 adds to
+/// version 11 an `rrf`'s `weights`, on its expression and its `RankFuse`.
+pub const BOUND_PLAN_VERSION: u32 = 12;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

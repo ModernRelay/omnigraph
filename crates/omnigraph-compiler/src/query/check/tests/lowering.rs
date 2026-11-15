@@ -39,6 +39,7 @@ struct Row {
 /// owns it; this table's schema has no `Blob`).
 const B_IN_PROGRESS: &[&str] = &[
     "a node an optional introduces returned whole",
+    "an edge reference returned whole",
     "a ranking inside an inline read with its own order and limit",
     "a union arm returning an edge",
     "a union arm returning a value that reads the enclosing scope",
@@ -49,8 +50,8 @@ const B_IN_PROGRESS: &[&str] = &[
     "a block compared with another block's value",
     "a write group selecting over a table an earlier group changes",
     "a full-text call read as a value",
-    "a bm25 over terms with every term required",
-    "a match_terms predicate",
+    "match_terms with an edit budget",
+    "bm25 over terms with mode: all or an edit budget",
 ];
 
 const CLOSURE: &[Row] = &[
@@ -116,6 +117,15 @@ const CLOSURE: &[Row] = &[
             ),
             (
                 "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name } }",
+                Lowers,
+            ),
+            // "an edge reference returned whole"
+            (
+                "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }",
+                Refused("B"),
+            ),
+            (
+                "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $k.@id, $k.@src, $k.@dst } order { $k } }",
                 Lowers,
             ),
             // "a node an optional introduces returned whole"
@@ -216,13 +226,9 @@ const CLOSURE: &[Row] = &[
                 "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s, mode: any)) as $score } return { $d.title } order { $score desc } limit 3 }",
                 Lowers,
             ),
-            // `terms` defaults to `mode: all`, which the scan does not run.
+            // "bm25 over terms with mode: all or an edit budget"
             (
                 "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s)) as $score } return { $d.title } order { $score desc } limit 3 }",
-                Refused("B"),
-            ),
-            (
-                "query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any)) return { $d.title } }",
                 Refused("B"),
             ),
             (
@@ -281,6 +287,21 @@ const CLOSURE: &[Row] = &[
             (
                 "query q($s: String) { match { $p: Person } where not exists { $d: Doc, $p authored $d where not search($d.body, $s) } return { $p.name } }",
                 Lowers,
+            ),
+            // `match_terms` is the same operand, with every term required or
+            // any one.
+            (
+                "query q($s: String) { match { $d: Doc, $p: Person, $p authored $d } where match_terms($d.body, terms($s)) or not match_terms($d.body, terms($s, mode: any, max_edits: 0)) or $p.age > 30 return { $d.title } }",
+                Lowers,
+            ),
+            (
+                "query q($s: String) { match { $p: Person } where count { $d: Doc, $p authored $d where match_terms($d.body, terms($s, mode: all)) } > 0 return { $p.name } }",
+                Lowers,
+            ),
+            // "match_terms with an edit budget"
+            (
+                "query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 1)) return { $d.title } }",
+                Refused("B"),
             ),
             // "a full-text call read as a value"
             (

@@ -1,0 +1,164 @@
+# issue: none
+# notes: An `order` key that is a node or edge reference orders by its identity, returned or not
+# notes: (docs/rfcs/2026-11-07-gq-3.md, section 2, the Order operator: "the identity (type, id) of every
+# notes: reference column"): a node by its `@id`, an edge by its `@id`, and an edge over several
+# notes: types by its type, then its `@id`. Names sort the other way from handles, so ordering by a
+# notes: property would show. Over `distinct` rows a returned node orders by its identity too, and so
+# notes: does a reference key of an inline read's own `order`, grouped or not.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+}
+edge Knows: Person -> Person
+edge Likes: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"a","name":"Zed"}}
+{"type":"Person","data":{"handle":"b","name":"Yan"}}
+{"type":"Person","data":{"handle":"c","name":"Xia"}}
+{"edge":"Knows","id":"k2","from":"a","to":"b","data":{}}
+{"edge":"Knows","id":"k1","from":"b","to":"c","data":{}}
+{"edge":"Knows","id":"k3","from":"a","to":"c","data":{}}
+{"edge":"Likes","id":"e9","from":"c","to":"a","data":{}}
+
+--- query
+query by_unreturned_node() {
+    match { $p: Person }
+    return { $p.name }
+    order { $p desc }
+}
+
+--- expect ordered
+{"p.name": "Xia"}
+{"p.name": "Yan"}
+{"p.name": "Zed"}
+
+--- expect shape
+p.name: String
+
+--- query
+query by_returned_node() {
+    match { $p: Person }
+    return { $p.handle, $p }
+    order { $p }
+    limit 2
+}
+
+--- expect ordered
+{"p.handle": "a", "p": {"@id": "a", "handle": "a", "name": "Zed"}}
+{"p.handle": "b", "p": {"@id": "b", "handle": "b", "name": "Yan"}}
+
+--- expect shape
+p.handle: String
+p: Person
+
+--- query
+query by_aliased_node() {
+    match { $p: Person }
+    return { $p as who }
+    order { who desc }
+    limit 1
+}
+
+--- expect ordered
+{"who": {"@id": "c", "handle": "c", "name": "Xia"}}
+
+--- expect shape
+who: Person
+
+--- query
+query by_edge() {
+    match { $a: Person, $b: Person, $a $k:knows $b }
+    return { $a.handle, $b.handle }
+    order { $k }
+}
+
+--- expect ordered
+{"a.handle": "b", "b.handle": "c"}
+{"a.handle": "a", "b.handle": "b"}
+{"a.handle": "a", "b.handle": "c"}
+
+--- expect shape
+a.handle: String
+b.handle: String
+
+--- query
+query by_edge_of_two_types() {
+    match { $a: Person, $b: Person, $a $k:(knows | likes) $b }
+    return { $k.@type, $a.handle, $b.handle }
+    order { $k desc }
+}
+
+--- expect ordered
+{"k.@type": "Likes", "a.handle": "c", "b.handle": "a"}
+{"k.@type": "Knows", "a.handle": "a", "b.handle": "c"}
+{"k.@type": "Knows", "a.handle": "a", "b.handle": "b"}
+{"k.@type": "Knows", "a.handle": "b", "b.handle": "c"}
+
+--- expect shape
+k.@type: String
+a.handle: String
+b.handle: String
+
+--- query
+query by_distinct_node() {
+    match { $a: Person, $b: Person, $a knows $b }
+    return distinct { $a }
+    order { $a desc }
+}
+
+--- expect ordered
+{"a": {"@id": "b", "handle": "b", "name": "Yan"}}
+{"a": {"@id": "a", "handle": "a", "name": "Zed"}}
+
+--- expect shape
+a: Person
+
+--- query
+query inline_read_by_node() {
+    match { from { match { $p: Person } return { $p } order { $p desc } limit 2 } }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Xia"}
+{"p.name": "Yan"}
+
+--- expect shape
+p.name: String
+
+--- query
+query inline_read_by_edge() {
+    match { from { match { $a: Person, $b: Person, $a $k:knows $b } return { $a, $b } order { $k desc } limit 1 } }
+    return { $a.handle, $b.handle }
+}
+
+--- expect unordered
+{"a.handle": "a", "b.handle": "c"}
+
+--- expect shape
+a.handle: String
+b.handle: String
+
+--- query
+query inline_read_by_grouped_node() {
+    match { from { match { $a: Person, $b: Person, $a knows $b } return { $a, count($b) as n } order { $a desc } limit 1 } }
+    return { $a.handle, $n }
+}
+
+--- expect unordered
+{"a.handle": "b", "n": 1}
+
+--- expect shape
+a.handle: String
+n: I64

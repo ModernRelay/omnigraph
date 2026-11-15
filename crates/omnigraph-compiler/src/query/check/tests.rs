@@ -875,11 +875,23 @@ fn arithmetic_widens_and_propagates_null() {
     );
     assert_eq!(ty("$p.age + 1"), "I32?", "nullable when an operand is");
     assert_eq!(ty("-$l % 3"), "I64");
+    assert_eq!(ty("$u + $i"), "I64", "U32 with a signed integer is I64");
+    assert_eq!(ty("$p.age + $l"), "I64?");
     assert_eq!(
-        ty("$u + $i"),
-        "I64",
-        "mixed signedness: the RFC states no rule"
+        ty("$p.age - -3"),
+        "I32?",
+        "a negated integer literal takes the other operand's type"
     );
+    assert_eq!(ty("$p.age - (0 - 3)"), "I64?", "`0 - 3` is an I64 operand");
+    assert_eq!(
+        ty("$i + -2147483648"),
+        "I64",
+        "the literal of `-2147483648` does not fit an I32"
+    );
+    assert_eq!(ty("$g * -2"), "F64");
+    assert_eq!(ty("coalesce($p.age, -1)"), "I32");
+    assert_eq!(ty("coalesce($p.age, $l)"), "I64");
+    assert_eq!(ty("if($p.age > 3, $p.age, $g)"), "F64?");
     for e in ["$p.name + 1", "$p + 1", "-$p.name", "$p.age + true"] {
         refused(
             &format!("query q() {{ match {{ $p: Person }} return {{ {e} as v }} }}"),
@@ -888,6 +900,14 @@ fn arithmetic_widens_and_propagates_null() {
     }
     refused(
         "query q($u: U64, $i: I32) { match { $p: Person } return { $u + $i as v } }",
+        "T72",
+    );
+    refused(
+        "query q($u: U64, $i: I32) { match { $p: Person } return { coalesce($u, $i) as v } }",
+        "T7",
+    );
+    refused(
+        "query q($u: U32) { match { $p: Person } return { -$u as v } }",
         "T72",
     );
     // The term carries `can_fail`, so the planner keeps it behind its guards.
@@ -902,6 +922,169 @@ fn arithmetic_widens_and_propagates_null() {
         }
     }
     assert!(find_filter(&read_of(&c).term).unwrap().can_fail());
+}
+
+/// The value a read's `return { … as v }` stores for `v`, through the
+/// alias a computed item is projected under.
+fn returned(c: &CoreDecl) -> crate::ir::expr::IRExpr {
+    use crate::ir::expr::IRExpr;
+    fn find<'a>(t: &'a Term, name: &str) -> Option<&'a IRExpr> {
+        match t {
+            Term::Project { items, input, .. } => match items.iter().find(|(n, _)| n == name) {
+                Some((_, IRExpr::AliasRef(inner, _))) if inner != name => find(input, inner),
+                Some((_, e)) => Some(e),
+                None => find(input, name),
+            },
+            Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
+                find(input, name)
+            }
+            _ => None,
+        }
+    }
+    find(&read_of(c).term, "v")
+        .expect("the read returns `v`")
+        .clone()
+}
+
+/// Arithmetic over two numeric types stores an explicit widening `Cast` on
+/// the narrower operand, keeping its nullability, and a negated literal typed
+/// as the other operand; `coalesce` and `if` widen their arguments the same
+/// way.
+#[test]
+fn arithmetic_stores_widening_casts_and_typed_literals() {
+    use crate::ir::expr::{IRExpr, ScalarFunc};
+    use crate::query::value::{BinaryOp, Literal};
+    use crate::types::{ExprType, ScalarType};
+    let value = |e: &str| {
+        returned(&ok(&format!(
+            "query q($l: I64) {{ match {{ $p: Person }} return {{ {e} as v }} }}"
+        )))
+    };
+    let ty = |scalar, nullable| ExprType::Value {
+        scalar,
+        list: false,
+        nullable,
+    };
+    let IRExpr::Binary {
+        left, op, right, ..
+    } = value("$p.age + $l")
+    else {
+        panic!("arithmetic")
+    };
+    assert_eq!(op, BinaryOp::Arith(crate::query::syntax::ArithOp::Add));
+    let IRExpr::Cast { expr, ty: cast } = *left else {
+        panic!("the I32 operand is cast: {left:?}")
+    };
+    assert_eq!(
+        cast,
+        ty(ScalarType::I64, true),
+        "the cast keeps `age`'s null"
+    );
+    assert_eq!(expr.ty(), &ty(ScalarType::I32, true));
+    assert!(matches!(*right, IRExpr::Param(..)));
+    let IRExpr::Binary { left, right, .. } = value("$p.age - -3") else {
+        panic!("arithmetic")
+    };
+    assert!(matches!(*left, IRExpr::PropAccess { .. }));
+    let IRExpr::Neg { expr, ty: negated } = *right else {
+        panic!("a negated literal: {right:?}")
+    };
+    assert_eq!(negated, ty(ScalarType::I32, false));
+    assert_eq!(
+        *expr,
+        IRExpr::Literal(Literal::Integer(3), ty(ScalarType::I32, false))
+    );
+    let IRExpr::Call {
+        func: ScalarFunc::Coalesce,
+        args,
+        ty: result,
+    } = value("coalesce($p.age, $l)")
+    else {
+        panic!("coalesce")
+    };
+    assert_eq!(result, ty(ScalarType::I64, false));
+    assert!(
+        matches!(&args[0], IRExpr::Cast { ty, .. } if *ty == ExprType::Value { scalar: ScalarType::I64, list: false, nullable: true })
+    );
+    assert!(matches!(&args[1], IRExpr::Param(..)));
+}
+
+/// Every arithmetic operator, unary minus, `coalesce`, `if` and comparison
+/// over every pair of numeric operands (nullable and not, literals and a
+/// negated literal among them) either types to a term the planner's stored
+/// type rules accept, or is refused with a typing code: none reaches the
+/// planner as an uncoded plan error.
+#[test]
+fn every_numeric_operand_pair_types_to_a_term_the_planner_accepts() {
+    use crate::types::ScalarType;
+    let scalars = [
+        ScalarType::I32,
+        ScalarType::I64,
+        ScalarType::U32,
+        ScalarType::U64,
+        ScalarType::F32,
+        ScalarType::F64,
+    ];
+    let mut params = Vec::new();
+    let mut operands = Vec::new();
+    for (i, scalar) in scalars.iter().enumerate() {
+        for nullable in [false, true] {
+            let name = format!("a{i}{}", if nullable { "n" } else { "" });
+            params.push(format!(
+                "${name}: {scalar:?}{}",
+                if nullable { "?" } else { "" }
+            ));
+            operands.push(format!("${name}"));
+        }
+    }
+    operands.extend(
+        [
+            "$p.age",
+            "3",
+            "-3",
+            "3000000000",
+            "-2147483648",
+            "1.5",
+            "-1.5",
+            "(0 - 3)",
+            "(1 / 0)",
+        ]
+        .map(String::from),
+    );
+    let params = params.join(", ");
+    let mut expressions = Vec::new();
+    for a in &operands {
+        expressions.push(format!("-{a}"));
+        for b in &operands {
+            for op in ["+", "-", "*", "/", "%", "<", "="] {
+                expressions.push(format!("{a} {op} {b}"));
+            }
+            expressions.push(format!("coalesce({a}, {b})"));
+            expressions.push(format!("if($p.age > 3, {a}, {b})"));
+        }
+    }
+    let mut accepted = 0;
+    for e in &expressions {
+        let src = format!("query q({params}) {{ match {{ $p: Person }} return {{ {e} as v }} }}");
+        for (_, result) in check(&src) {
+            match result {
+                Ok(c) => {
+                    let value = returned(&c.core);
+                    value
+                        .check_types()
+                        .unwrap_or_else(|error| panic!("`{e}` types to a refused term: {error}"));
+                    accepted += 1;
+                }
+                // `U64` with a signed integer, unary minus over an unsigned
+                // integer, and a literal outside a property's range.
+                Err(d) => assert!(
+                    ["T72", "T7", "T3"].contains(&d.code.as_str()),
+                    "`{e}` is refused without its typing code: {d}"
+                ),
+            }
+        }
+    }
+    assert!(accepted > expressions.len() / 2, "{accepted} accepted");
 }
 
 #[test]
@@ -929,7 +1112,7 @@ fn the_ranking_functions_type_their_result_columns() {
     assert_eq!(cols(&c)[0], ("distance".into(), "F32".into()));
     assert!(format!("{:?}", read_of(&c).term).contains("recall: Some(0.9)"));
     let c = ok(
-        "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s, mode: all, max_edits: 1)) as $score } return { $score } }",
+        "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s, mode: any, max_edits: 0)) as $score } return { $score } }",
     );
     assert_eq!(cols(&c)[0], ("score".into(), "F32".into()));
     // `rrf` yields the target and `score` only: the population's other

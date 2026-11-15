@@ -473,6 +473,7 @@ fn a_rank_fuse_lowers_each_arm_once_primary_first() {
             arm(secondary, RankKind::Bm25),
         ],
         k: None,
+        weights: None,
         limit: Some(3),
         prefilter: no_prefilter(),
         row_tiebreak: Vec::new(),
@@ -544,6 +545,7 @@ fn a_node_with_two_consumers_refuses_the_lowering() {
     let fuse = plan.add(PhysicalNode::RankFuse {
         arms: [arm(), arm()],
         k: None,
+        weights: None,
         limit: Some(3),
         prefilter: no_prefilter(),
         row_tiebreak: Vec::new(),

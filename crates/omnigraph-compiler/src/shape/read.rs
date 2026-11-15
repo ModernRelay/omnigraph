@@ -25,12 +25,15 @@ use crate::ir::core::{
     ANON_PREFIX, Agg, Col, CoreNode, CoreRead, Count, FRESH_PREFIX, LexicalQuery, RRF_DEFAULT_K,
     ScoreKind, ScoreQuery, Term, Ty,
 };
-use crate::ir::{BlockAggregateExpr, IRExpr, IROrdering, IRParam, IRProjection, SubqueryPredicate};
+use crate::ir::{
+    BlockAggregateExpr, IRExpr, IROrdering, IRParam, IRProjection, SubqueryPredicate,
+    rrf_weights_expr,
+};
 use crate::query::file::Param;
 use crate::query::value::{
     AggFunc, BinaryOp, CompOp, DISTANCE_COLUMN, Literal, RRF_COLUMN, SCORE_COLUMN,
 };
-use crate::traversal::{EdgeMember, EdgeSelection};
+use crate::traversal::{EDGE_TYPE_COLUMN, EdgeMember, EdgeSelection};
 use crate::types::{AggSignature, Direction, ExprType, PropType, ScalarType};
 
 use super::{Construct, ElementKind, ProgrammeStage, ShapeError, Unlowered};
@@ -845,6 +848,44 @@ impl<'a> Shaper<'a> {
         unsupported(self.name, what, Construct::Read)
     }
 
+    /// The identity keys of an order key that is a reference, a binding or
+    /// a return item holding one: `(@type, @id)` for an edge whose selector
+    /// has several types, `@id` otherwise (one type: the type is constant).
+    /// Over groups the rows carry only the return items, so a node key is
+    /// its returned node object, whose first member is `@id`, a unique
+    /// key: ordering by the object is ordering by the identity. `None` for
+    /// a value key.
+    fn reference_key(
+        &self,
+        key: &IRExpr,
+        return_exprs: &[IRProjection],
+        grouped: bool,
+    ) -> Option<Vec<IRExpr>> {
+        let returned =
+            |found: &dyn Fn(&IRProjection) -> bool| return_exprs.iter().find(|p| found(p));
+        let (reference, item) = match key {
+            IRExpr::Variable(..) => (key, returned(&|p| &p.expr == key)),
+            IRExpr::AliasRef(alias, ExprType::Node { .. } | ExprType::Edge { .. }) => {
+                let item = returned(&|p| p.alias.as_deref() == Some(alias.as_str()))?;
+                (&item.expr, Some(item))
+            }
+            _ => return None,
+        };
+        let IRExpr::Variable(variable, ty) = reference else {
+            return None;
+        };
+        if grouped {
+            let item = item?;
+            return matches!(ty, ExprType::Node { .. }).then(|| {
+                vec![IRExpr::AliasRef(
+                    item.alias.clone().unwrap_or_else(|| item.column.clone()),
+                    ty.clone(),
+                )]
+            });
+        }
+        reference_identity(variable, ty, self.catalog.system_columns.id)
+    }
+
     /// A refusal at `construct`.
     fn refuse_at(&self, what: impl std::fmt::Display, construct: Construct) -> ShapeError {
         unsupported(self.name, what, construct)
@@ -877,9 +918,6 @@ impl<'a> Shaper<'a> {
     }
 
     fn read(&self, read: &CoreRead) -> Result<ReadShape, ShapeError> {
-        if super::holds_match_terms(&read.term) {
-            return Err(super::match_terms_unlowered(self.name, Construct::Read));
-        }
         // A recursive read types to `Fix`, which stage Rec evaluates.
         let mut nodes = Vec::new();
         read.term.nodes(&mut nodes);
@@ -1026,6 +1064,15 @@ impl<'a> Shaper<'a> {
                     Construct::ReturnItem(i),
                 ));
             }
+            // The public result has a node object and no edge object: an
+            // edge reference is read through its fields (`$k.@id`, `$k.@src`,
+            // `$k.@dst`, `$k.@type`, its properties).
+            if let Some(IRExpr::Variable(_, ExprType::Edge { .. })) = items.get(hidden) {
+                return Err(self.refuse_at(
+                    "an edge reference returned whole (the result has no edge object)",
+                    Construct::ReturnItem(i),
+                ));
+            }
             let item = match (items.get(hidden), aggs.get(hidden)) {
                 (Some(e), _) => self
                     .item(e, &aggs, ranking.as_ref())
@@ -1156,6 +1203,15 @@ impl<'a> Shaper<'a> {
                 }
                 _ => expr,
             };
+            // A reference orders by its identity, returned or not: the edge
+            // type first for an edge over several types, then the id.
+            if let Some(reference) = self.reference_key(&expr, &return_exprs, grouped) {
+                order_by.extend(reference.into_iter().map(|expr| IROrdering {
+                    expr,
+                    descending: *descending,
+                }));
+                continue;
+            }
             order_by.push(IROrdering {
                 expr,
                 descending: *descending,
@@ -1270,6 +1326,11 @@ impl<'a> Shaper<'a> {
                         name: name.clone(),
                         type_name: ty.display_name().trim_end_matches('?').to_string(),
                         nullable: ty.nullable,
+                        default: read
+                            .defaults
+                            .iter()
+                            .find(|(declared, _)| declared == name)
+                            .map(|(_, value)| value.clone()),
                     },
                     ty: ExprType::from_prop(ty),
                 })
@@ -1514,50 +1575,51 @@ impl<'a> Shaper<'a> {
                     exact: None,
                 }),
             )),
+            // The ranked scan's full-text query is today's any-term,
+            // zero-edit match; a `terms(…)` value asking for every term or
+            // for an edit budget would be scored over that wider membership.
+            Term::Score {
+                kind: ScoreKind::Bm25,
+                query:
+                    ScoreQuery::Lexical(LexicalQuery {
+                        mode_all,
+                        max_edits,
+                        ..
+                    }),
+                ..
+            } if *mode_all || !matches!(max_edits, IRExpr::Literal(Literal::Integer(0), _)) => {
+                Err(self.refuse_at(
+                    "`bm25` over a `terms(…)` value with `mode: all` or an edit budget other than 0",
+                    Construct::Element(FROM, None),
+                ))
+            }
             Term::Score {
                 input,
                 column,
                 property,
                 kind: ScoreKind::Bm25,
-                query:
-                    ScoreQuery::Lexical(LexicalQuery {
-                        text,
-                        mode_all,
-                        max_edits,
-                    }),
+                query: ScoreQuery::Lexical(LexicalQuery { text, .. }),
                 out,
-            } => {
-                // The engine's `bm25` matches any term with no edits; a
-                // `terms(…)` that asks for every term or an edit budget is
-                // a query the scan would answer as `mode: any` with none.
-                let zero_edits = matches!(max_edits, IRExpr::Literal(Literal::Integer(0), _));
-                if *mode_all || !zero_edits {
-                    return Err(self.refuse_at(
-                        "a `bm25` over `terms(…)` with `mode: all` or an edit budget",
-                        Construct::Element(FROM, None),
-                    ));
-                }
-                Ok((
-                    self.population(input)?,
-                    Some(Ranking {
-                        key: IRExpr::Bm25 {
-                            field: Box::new(IRExpr::PropAccess {
-                                variable: column.clone(),
-                                property: property.clone(),
-                                ty: scalar(ScalarType::String),
-                            }),
-                            query: Box::new(text.clone()),
-                            ty: scalar(ScalarType::F32),
-                        },
-                        out: out.clone(),
-                        column: column.clone(),
-                        score: (SCORE_COLUMN, scalar(ScalarType::F32)),
-                        descending: true,
-                        windows: Vec::new(),
-                        exact: None,
-                    }),
-                ))
-            }
+            } => Ok((
+                self.population(input)?,
+                Some(Ranking {
+                    key: IRExpr::Bm25 {
+                        field: Box::new(IRExpr::PropAccess {
+                            variable: column.clone(),
+                            property: property.clone(),
+                            ty: scalar(ScalarType::String),
+                        }),
+                        query: Box::new(text.clone()),
+                        ty: scalar(ScalarType::F32),
+                    },
+                    out: out.clone(),
+                    column: column.clone(),
+                    score: (SCORE_COLUMN, scalar(ScalarType::F32)),
+                    descending: true,
+                    windows: Vec::new(),
+                    exact: None,
+                }),
+            )),
             Term::Score {
                 input,
                 column,
@@ -1611,8 +1673,8 @@ impl<'a> Shaper<'a> {
             arms,
             target,
             k,
+            weights,
             out,
-            ..
         } = fuse
         else {
             unreachable!("fuse_leaf returns a Fuse")
@@ -1648,6 +1710,7 @@ impl<'a> Shaper<'a> {
                 primary: Box::new(primary),
                 secondary: Box::new(secondary),
                 k,
+                weights: rrf_weights_expr(weights).map(Box::new),
                 ty: scalar(ScalarType::F64),
             },
             out: out.clone(),
@@ -1768,6 +1831,9 @@ impl<'a> Shaper<'a> {
                 self.facts(input, facts)?;
                 for (name, value) in items {
                     let at = Construct::Element(&[ElementKind::Let], Some(name.clone()));
+                    if holds_edit_tolerant_match(value) {
+                        return Err(self.refuse_at(EDIT_TOLERANT_MATCH, at));
+                    }
                     let mut cols = Vec::new();
                     value.columns(&mut cols);
                     if cols.iter().any(|c| is_block_column(c)) {
@@ -2477,15 +2543,22 @@ impl<'a> Shaper<'a> {
                 *variable = name.clone();
             }
         };
+        // A reference key orders the read's own rows by its identity, as a
+        // read's `order` does; a grouped reference keeps its binding's
+        // identity column.
+        let id = self.catalog.system_columns.id;
         let order_by = order_keys
             .into_iter()
-            .map(|(key, descending)| {
+            .flat_map(|(key, descending)| {
                 let mut key = read_lets(key);
                 substitute(&mut key, &rows);
-                IROrdering {
-                    expr: key,
-                    descending,
-                }
+                let keys = match &key {
+                    IRExpr::Variable(variable, ty) => reference_identity(variable, ty, id),
+                    _ => None,
+                };
+                keys.unwrap_or_else(|| vec![key])
+                    .into_iter()
+                    .map(move |expr| IROrdering { expr, descending })
             })
             .collect();
         let mut read = InnerRead {
@@ -2538,6 +2611,9 @@ impl<'a> Shaper<'a> {
     }
 
     fn filter(&self, input: &Term, pred: &IRExpr, facts: &mut Facts) -> Result<(), ShapeError> {
+        if holds_edit_tolerant_match(pred) {
+            return Err(self.refuse(EDIT_TOLERANT_MATCH));
+        }
         // A triple whose ends were both bound: the expansion to a fresh name
         // and the identity filter tying it to the end.
         if let Term::Expand {
@@ -3268,18 +3344,19 @@ fn block_comparison(pred: &IRExpr, column: &str) -> Option<(CompOp, IRExpr)> {
     None
 }
 
-/// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`):
-/// a filter or a `let` reads one as membership of the row in its matches,
-/// which a return item, an order key or a block's aggregate does not lower
-/// yet.
+/// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`,
+/// `match_terms`): a filter or a `let` reads one as membership of the row in
+/// its matches, which a return item, an order key or a block's aggregate
+/// does not lower yet.
 fn holds_lexical_call(expr: &IRExpr) -> bool {
     let mut found = false;
     let mut pending = vec![expr];
     while let Some(expr) = pending.pop() {
+        if expr.lexical_predicate_field().is_some() {
+            found = true;
+            continue;
+        }
         match expr {
-            IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. } => {
-                found = true;
-            }
             IRExpr::Binary { left, right, .. } => pending.extend([left.as_ref(), right.as_ref()]),
             IRExpr::Not(inner, _)
             | IRExpr::Cast { expr: inner, .. }
@@ -3287,7 +3364,11 @@ fn holds_lexical_call(expr: &IRExpr) -> bool {
             | IRExpr::IsNull { expr: inner, .. } => pending.push(inner),
             IRExpr::Aggregate { arg, .. } => pending.push(arg),
             IRExpr::Call { args, .. } => pending.extend(args),
-            IRExpr::PropAccess { .. }
+            // The predicates themselves were taken above.
+            IRExpr::Search { .. }
+            | IRExpr::Fuzzy { .. }
+            | IRExpr::MatchText { .. }
+            | IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
             | IRExpr::Bm25 { .. }
             | IRExpr::Rrf { .. }
@@ -3297,6 +3378,50 @@ fn holds_lexical_call(expr: &IRExpr) -> bool {
             | IRExpr::AliasRef(..) => {}
         }
     }
+    found
+}
+
+/// The identity keys of the reference `variable` of type `ty`: its id
+/// column `id`, after its edge type for an edge whose selector has several
+/// types (one type: the type is constant). `None` for a value.
+fn reference_identity(variable: &str, ty: &ExprType, id: &str) -> Option<Vec<IRExpr>> {
+    let string = ExprType::from_prop(&PropType::scalar(ScalarType::String, false));
+    let property = |property: &str| IRExpr::PropAccess {
+        variable: variable.to_string(),
+        property: property.to_string(),
+        ty: string.clone(),
+    };
+    match ty {
+        ExprType::Node { .. } => Some(vec![property(id)]),
+        ExprType::Edge { type_name } if type_name.contains('|') => {
+            Some(vec![property(EDGE_TYPE_COLUMN), property(id)])
+        }
+        ExprType::Edge { .. } => Some(vec![property(id)]),
+        ExprType::Value { .. } | ExprType::ExactInteger { .. } => None,
+    }
+}
+
+/// `match_terms` whose edit budget is not the literal `0`. Membership runs
+/// Lance's full-text query, whose fuzzy expansion keeps a bounded number of
+/// expansions per term, so it is not the exact edit relation; the exact
+/// lexical scan answers it.
+const EDIT_TOLERANT_MATCH: &str = "`match_terms` with an edit budget other than `max_edits: 0`";
+
+/// Whether `expr` holds a `match_terms` whose edit budget is not the
+/// literal `0` (a parameter included, whose value is not known here).
+fn holds_edit_tolerant_match(expr: &IRExpr) -> bool {
+    let mut found = false;
+    expr.visit_nodes(|node| {
+        if let IRExpr::Call {
+            func: crate::ir::expr::ScalarFunc::MatchTerms { .. },
+            args,
+            ..
+        } = node
+            && !matches!(args.get(2), Some(IRExpr::Literal(Literal::Integer(0), _)))
+        {
+            found = true;
+        }
+    });
     found
 }
 

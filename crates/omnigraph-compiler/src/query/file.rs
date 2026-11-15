@@ -4,6 +4,7 @@
 
 use std::fmt::Write as _;
 
+use crate::query::value::Literal;
 use crate::settings::{SettingId, SettingValue};
 
 /// A parsed `.gq` source: the `set` and `reset` lines at its head, then its
@@ -573,4 +574,7 @@ pub struct Param {
     pub name: String,
     pub type_name: String,
     pub nullable: bool,
+    /// The declared default, its sign applied: the value binding uses when
+    /// the caller omits the parameter.
+    pub default: Option<Literal>,
 }

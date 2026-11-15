@@ -1,1 +1,0 @@
-- `match_terms`, and `bm25` over `terms(…)` with `mode: all` or an edit budget, are refused with `T86`; they failed when run or ranked as any-term.

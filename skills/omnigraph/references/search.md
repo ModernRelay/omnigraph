@@ -72,8 +72,9 @@ replacement vectors; neither `merge` nor `overwrite` does that automatically.
 
 A ranking is a relation drawn into `match` with `from`, which names its score
 with `as`: `from nearest(rel, $c.embedding, $q, k: n) as $distance`,
-`from bm25(rel, $d.title, $q) as $score`,
-`from rrf(arm, arm, k: 60) as $score`. `rel` is the population, a relation
+`from bm25(rel, $d.title, $q) as $score` (any term of the String `$q`; `terms($q)`
+asks for every term, which `bm25` does not lower yet, `T86`),
+`from rrf(arm, arm, k: 60, weights: [1.0, 1.0]) as $score`. `rel` is the population, a relation
 named with `let` before the ranking, `let $pop = { match { … } where … return { $c } }`,
 whose `return` lists every binding the rest of the query reads (an inline read
 in its place also works). `from` adds the population's columns and the score
@@ -143,6 +144,10 @@ query top_titles($q: String) {
 
 `let` names the population once and both arms rank it. `rrf` takes two arms;
 identical arms, or arms that rank two different bindings, are refused (`T75`).
+A target scores the sum over the arms that selected it of
+`weight / (k + rank)`, ranks counted from 1; `weights: [w, w]` (one number in
+`(0, 1000000]` per arm, default 1.0, another length `T75`) gives an arm more
+say, so `weights: [1.0, 3.0]` lets the second arm lead.
 It yields one row per target with the fused score and no other population
 column; a population that reaches a target several times adds no row, and a
 read that needs a population column draws it again after the `from`
@@ -214,18 +219,20 @@ match { $d: Doc }
 where search($d.title, $q)                    // full-text filter
   and fuzzy($d.title, $q, max_edits: 2)       // fuzzy filter, max 2 edits
   and match_text($d.body, $q)                 // regular full-text filter (not phrase search)
+  and match_terms($d.body, terms($q))         // every analyzed term of $q; mode: any for one
 ```
 
 A full-text call (`search`, `fuzzy`, `match_text`, `bm25`) needs a full-text
 index on its property: a one-column `@index` or `@key` on a free-text String
 node property. A call on any other property, an enum included, is refused at
 type checking (`T27`); compare enums with `=`. The field's analyzer decides
-what matches (next section). `search`, `fuzzy` and
-`match_text` are Boolean operands like any other in a `where`: true where the
+what matches (next section). `search`, `fuzzy`, `match_text` and
+`match_terms` are Boolean operands like any other in a `where`: true where the
 row is among the call's matches, false elsewhere, never null. Write
 `not search($d.title, $q)`, `search(...) or ...` or `search(...) = false`;
 the rows are the same whether or not the index covers them yet. Read as a
-value in `return`, `order` or a block's aggregate, a call is `T86`.
+value in `return`, `order` or a block's aggregate, a call is `T86`, and so is
+`match_terms` with an edit budget other than `max_edits: 0`.
 
 ### Analyzers
 
@@ -245,9 +252,7 @@ matches `"Café"` under `standard_folded_v1` and `english_v1`. A field written
 (stemming, stop words, folding and a 40-byte token filter); `lint` reports it
 as `L202` and names `english_v1`. `scorer = "none"` keeps the field matchable
 and makes `bm25` over it `T87`, alone or as an `rrf` arm; use a `where`
-filter there. No call takes an analyzer (`terms(…)` with one is `T71`).
-`match_terms`, and `bm25` over `terms(…)` with `mode: all` or `max_edits`, are
-`T86` in this release: pass `bm25` a String (any term, no edits). The
+filter there. No call takes an analyzer (`terms(…)` with one is `T71`). The
 native index applies no Unicode normalization, so write values and queries in
 NFC (precomposed accents). Changing a field's analyzer is a schema apply that
 replaces its index; run `omnigraph index build` afterwards, and expect a

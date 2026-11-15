@@ -600,7 +600,7 @@ query window_then_where($q: Vector(4)) {
     order { $d.slug }
 }
 query fused($t: String, $q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60, weights: [2.0, 1.0]) as $score, $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 3
@@ -1554,6 +1554,40 @@ async fn a_fusion_replays() {
     );
     assert!(error.to_string().contains("predicate origin"), "{error}");
 
+    // The plan carries the weights the query writes; a plan that drops them
+    // would fuse other scores, so the replay door refuses it.
+    let mut unweighted = plan.clone();
+    match unweighted.plan.node_mut(fuse) {
+        Some(PhysicalNode::RankFuse { weights, .. }) => {
+            assert_eq!(
+                weights
+                    .as_ref()
+                    .and_then(|w| omnigraph_compiler::ir::rrf_weight_values(w, 2)),
+                Some(vec![2.0, 1.0])
+            );
+            *weights = None;
+        }
+        other => panic!("the fusion is a RankFuse: {other:?}"),
+    }
+    let error = match db
+        .replay_bound_plan(
+            "main",
+            &with_plan(&envelope, serde_json::to_value(&unweighted).unwrap()),
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(replay) => panic!(
+            "an unweighted fusion replayed: {:?}",
+            rows_of(&replay.result)
+        ),
+    };
+    assert!(
+        matches!(&error, OmniError::Manifest(error) if error.kind == ManifestErrorKind::BadRequest),
+        "{error}"
+    );
+    assert!(error.to_string().contains("`weights`"), "{error}");
+
     // Two nearest arms record their attempts apart, one decision per scan.
     let mut params =
         ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
@@ -2288,6 +2322,25 @@ query instants() {
         !plan.values.params.is_empty(),
         "the bound instant rides in the value table, which is why every replay returned the run's own instants"
     );
+}
+
+/// An omitted parameter is bound to its declared default at gather, so the
+/// value table carries the default and the replay reads it from there.
+#[tokio::test]
+async fn a_defaulted_parameter_replays_from_the_value_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let source = r#"
+query older($min: I64 = 35) {
+    match { $p: Person }
+    where $p.age > $min
+    return { $p.name }
+    order { $p.name }
+}
+"#;
+    let Replayed { result, plan, .. } = replayed(&db, source, "older", &ParamMap::new()).await;
+    assert_eq!(result.len(), 2, "{result:?}");
+    assert_eq!(plan.values.params.get("min"), Some(&Literal::Integer(35)));
 }
 
 /// A saved plan carrying a count cut the query does not require is invalid

@@ -1,0 +1,1 @@
+- `count($k)` and `count(distinct $k)` over an edge binding run instead of failing with an internal error; distinct counts edges by type and id.

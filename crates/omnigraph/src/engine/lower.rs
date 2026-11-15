@@ -1274,10 +1274,12 @@ impl Lower for Walk<'_, '_> {
         let RankFuseFields {
             arms,
             k,
+            weights,
             limit: _,
             row_tiebreak,
         } = fields;
         let k = resolve_rrf_k(k, self.lowering.params())?;
+        let weights = resolve_rrf_weights(weights)?;
         let id_column = format!(
             "{}.{}",
             arms[0].binding, self.lowering.catalog.system_columns.id
@@ -1297,7 +1299,7 @@ impl Lower for Walk<'_, '_> {
         let fuse = RankFuseExec::new(
             primary,
             secondary,
-            RrfMode { k },
+            RrfMode { k, weights },
             id_column,
             fused_score,
             [order(&arms[0]), order(&arms[1])],

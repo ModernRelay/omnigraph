@@ -1023,6 +1023,7 @@ mod traversal_admission_tests {
         let root = plan.add(PhysicalNode::RankFuse {
             arms: [arm(RankKind::Nearest), arm(RankKind::Bm25)],
             k: None,
+            weights: None,
             limit: Some(1),
             prefilter: prefilter(vec![]),
             row_tiebreak: vec![ColumnRef::property("q", "@id")],

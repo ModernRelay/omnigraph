@@ -11,6 +11,7 @@ use datafusion::prelude::{Expr, col, lit as df_lit};
 use datafusion::scalar::ScalarValue;
 use lance_core::ROW_ADDR;
 use lance_index::scalar::FullTextSearchQuery;
+use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
 
 /// `id IN (ids)` as one structured DataFusion `Expr` — the scan-pushdown
 /// shape shared by `hydrate_nodes` and the rrf prefilter gate's arm push.
@@ -983,6 +984,41 @@ pub(super) fn build_fts_query(
             (
                 prop,
                 lance_index::scalar::FullTextSearchQuery::new_fuzzy(q, Some(edits)),
+            )
+        }
+        // `match_terms(field, terms(text, mode:, max_edits: 0))`: Lance's
+        // zero-edit match query, every analyzed query term required
+        // (`Operator::And`) or any one (`Operator::Or`). An edit budget is
+        // refused at type check (`T86`): Lance's fuzzy expansion keeps a
+        // bounded number of expansions, so it is not the exact relation.
+        IRExpr::Call {
+            func: ScalarFunc::MatchTerms { mode },
+            args,
+            ..
+        } => {
+            let [field, text, max_edits] = args.as_slice() else {
+                return Ok(None);
+            };
+            let Some(prop) = extract_property(field) else {
+                return Ok(None);
+            };
+            if resolve_to_int(max_edits, params)? != 0 {
+                return Err(OmniError::manifest(
+                    "`match_terms` with an edit budget is not answered by this release",
+                ));
+            }
+            let operator = match mode {
+                TermsMode::All => lance_index::scalar::inverted::query::Operator::And,
+                TermsMode::Any => lance_index::scalar::inverted::query::Operator::Or,
+            };
+            let q = resolve_to_string(text, params)?;
+            (
+                prop,
+                lance_index::scalar::FullTextSearchQuery::new_query(
+                    lance_index::scalar::inverted::query::MatchQuery::new(q)
+                        .with_operator(operator)
+                        .into(),
+                ),
             )
         }
         IRExpr::PropAccess { .. }

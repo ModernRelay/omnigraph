@@ -1,0 +1,93 @@
+# issue: none
+# notes: `count($k)` over an edge binding counts its rows and `count(distinct $k)` its distinct edges,
+# notes: by identity: an edge's `@id`, and for an edge over several types its type and `@id`
+# notes: together, so the `Knows` and the `Likes` edge that share the id `k1` are two edges.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+}
+edge Knows: Person -> Person
+edge Likes: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"a"}}
+{"type":"Person","data":{"handle":"b"}}
+{"type":"Person","data":{"handle":"c"}}
+{"edge":"Knows","id":"k1","from":"a","to":"b","data":{}}
+{"edge":"Knows","id":"k2","from":"a","to":"c","data":{}}
+{"edge":"Knows","id":"k3","from":"b","to":"c","data":{}}
+{"edge":"Likes","id":"k1","from":"c","to":"a","data":{}}
+
+--- query
+query edges_of_a() {
+    match { $p: Person, $q: Person, $p $k:knows $q }
+    where $p.handle = "a"
+    return { count($k) as n }
+}
+
+--- expect unordered
+{"n": 2}
+
+--- expect shape
+n: I64
+
+--- query
+query distinct_edges() {
+    match { $p: Person, $q: Person, $p $k:knows $q }
+    return { count(distinct $k) as n }
+}
+
+--- expect unordered
+{"n": 3}
+
+--- expect shape
+n: I64
+
+--- query
+query edges_per_person() {
+    match { $p: Person, $q: Person, $p $k:knows $q }
+    return { $p.handle, count($k) as n }
+}
+
+--- expect unordered
+{"p.handle": "a", "n": 2}
+{"p.handle": "b", "n": 1}
+
+--- expect shape
+p.handle: String
+n: I64
+
+--- query
+query edges_of_two_types() {
+    match { $p: Person, $q: Person, $p $k:(knows | likes) $q }
+    return { count($k) as n, count(distinct $k) as d }
+}
+
+--- expect unordered
+{"n": 4, "d": 4}
+
+--- expect shape
+n: I64
+d: I64
+
+--- query
+query knows_two() {
+    match { $p: Person }
+    where count($k) { $q: Person, $p $k:knows $q } > 1
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle": "a"}
+
+--- expect shape
+p.handle: String
