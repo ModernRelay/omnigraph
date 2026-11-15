@@ -45,6 +45,9 @@ datafusion = { workspace = true }
 lance-file = { workspace = true }
 lance-index = { workspace = true }
 lance-linalg = { workspace = true }
+lance-tokenizer = { workspace = true }
+libm = { workspace = true }
+unicode-normalization = { workspace = true }
 lance-namespace = { workspace = true }
 lance-table = { workspace = true }
 prost = "0.14"

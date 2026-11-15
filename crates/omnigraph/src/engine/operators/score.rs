@@ -1,17 +1,29 @@
-//! `ScoreExec`: `distance(rel, $x.f, q)`, the core's exact `Score`. Every
-//! input row leaves with the distance of its vector to the query vector
-//! appended under the scored binding's `_distance` column, `F32`, in input
-//! order; a row whose vector is null drops, and every other column rides
-//! through. The distance is the field's declared one, `l2` (the sum of
-//! squared component differences, no square root), the only one a schema
-//! declares in this release. No index is read, so the rows are the same
-//! under every index state; a non-finite stored component, query component
-//! or result is refused with `E3`.
+//! `ScoreExec`: the core's exact `Score`, in input order, every other column
+//! riding through. No index is read, so the rows are the same under every
+//! index state.
+//!
+//! `distance(rel, $x.f, q)`: every input row leaves with the distance of its
+//! vector to the query vector appended under the scored binding's
+//! `_distance` column, `F32`; a row whose vector is null drops. The distance
+//! is the field's declared one, `l2` (the sum of squared component
+//! differences, no square root), the only one a schema declares in this
+//! release. A non-finite stored component, query component or result is
+//! refused with `E3`.
+//!
+//! `bm25` on a field whose index declares an analyzer: every input row whose
+//! identity is among the exact lexical scan's matches leaves with its
+//! `bm25_v1` score appended under the binding's `_score` column, `F64`;
+//! every other row drops (its value is null, token-empty or does not match).
 
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch};
+use std::collections::HashMap;
+
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, RecordBatch,
+    StringArray,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DfResult;
 use datafusion::execution::TaskContext;
@@ -32,16 +44,58 @@ const OUTPUT: &str = "score output";
 
 pub(crate) struct ScoreExec {
     input: Arc<dyn ExecutionPlan>,
-    /// The vector column in the input.
+    /// The vector column in the input, or under `bm25` its identity column.
     column: String,
-    /// The appended distance column.
+    /// The appended score column.
     score: String,
-    query: Arc<Vec<f32>>,
+    source: ScoreSource,
     shape: Streaming,
     metrics: ExecutionPlanMetricsSet,
 }
 
+/// What a score reads: the bound query vector of a `distance`, or the exact
+/// lexical scan's `bm25_v1` scores by identity.
+#[derive(Clone)]
+enum ScoreSource {
+    Distance(Arc<Vec<f32>>),
+    Bm25(Arc<HashMap<String, f64>>),
+}
+
 impl ScoreExec {
+    /// `bm25` on a field whose index declares an analyzer: the rows whose
+    /// identity column `id_column` names a key of `scores`, with its score
+    /// appended as `score`.
+    pub(crate) fn bm25(
+        input: Arc<dyn ExecutionPlan>,
+        id_column: String,
+        score: String,
+        scores: Arc<HashMap<String, f64>>,
+    ) -> Result<Self> {
+        let input_schema = input.schema();
+        match input_schema
+            .field_with_name(&id_column)
+            .map(|f| f.data_type())
+        {
+            Ok(DataType::Utf8) => {}
+            _ => {
+                return Err(OmniError::manifest_internal(format!(
+                    "the exact `bm25` reads the identity column '{id_column}', which its input does not carry as a string"
+                )));
+            }
+        }
+        let mut fields: Vec<Arc<Field>> = input_schema.fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new(&score, DataType::Float64, false)));
+        let shape = Streaming::new(Arc::new(Schema::new(fields)));
+        Ok(Self {
+            input,
+            column: id_column,
+            score,
+            source: ScoreSource::Bm25(scores),
+            shape,
+            metrics: ExecutionPlanMetricsSet::new(),
+        })
+    }
+
     pub(crate) fn try_new(
         input: Arc<dyn ExecutionPlan>,
         column: String,
@@ -77,11 +131,53 @@ impl ScoreExec {
             input,
             column,
             score,
-            query,
+            source: ScoreSource::Distance(query),
             shape,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
+}
+
+/// `batch` with each member's `bm25_v1` score appended and every other row
+/// removed.
+fn lexically_scored(
+    batch: &RecordBatch,
+    column: usize,
+    scores: &HashMap<String, f64>,
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let ids = batch
+        .column(column)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::manifest_internal("the scored identity is not a string"))?;
+    let mut out = Vec::with_capacity(ids.len());
+    let mut keep = Vec::with_capacity(ids.len());
+    for row in 0..ids.len() {
+        match ids
+            .is_valid(row)
+            .then(|| scores.get(ids.value(row)))
+            .flatten()
+        {
+            Some(score) => {
+                out.push(*score);
+                keep.push(true);
+            }
+            None => {
+                out.push(0.0);
+                keep.push(false);
+            }
+        }
+    }
+    let keep = BooleanArray::from(keep);
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns.push(Arc::new(Float64Array::from(out)));
+    let whole =
+        RecordBatch::try_new(Arc::clone(schema), columns).map_err(OmniError::arrow_internal)?;
+    if keep.true_count() == keep.len() {
+        return Ok(whole);
+    }
+    arrow_select::filter::filter_record_batch(&whole, &keep).map_err(OmniError::arrow_internal)
 }
 
 fn non_finite(message: String) -> OmniError {
@@ -165,13 +261,22 @@ impl fmt::Debug for ScoreExec {
 
 impl DisplayAs for ScoreExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "ScoreExec: {}=l2({}, query of {})",
-            self.score,
-            self.column,
-            self.query.len()
-        )
+        match &self.source {
+            ScoreSource::Distance(query) => write!(
+                f,
+                "ScoreExec: {}=l2({}, query of {})",
+                self.score,
+                self.column,
+                query.len()
+            ),
+            ScoreSource::Bm25(scores) => write!(
+                f,
+                "ScoreExec: {}=bm25_v1 of {} matches by {}",
+                self.score,
+                scores.len(),
+                self.column
+            ),
+        }
     }
 }
 
@@ -197,13 +302,22 @@ impl ExecutionPlan for ScoreExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 1, "ScoreExec has one child");
+        let child = children.pop().expect("one child");
         Ok(Arc::new(
-            Self::try_new(
-                children.pop().expect("one child"),
-                self.column.clone(),
-                self.score.clone(),
-                Arc::clone(&self.query),
-            )
+            match &self.source {
+                ScoreSource::Distance(query) => Self::try_new(
+                    child,
+                    self.column.clone(),
+                    self.score.clone(),
+                    Arc::clone(query),
+                ),
+                ScoreSource::Bm25(scores) => Self::bm25(
+                    child,
+                    self.column.clone(),
+                    self.score.clone(),
+                    Arc::clone(scores),
+                ),
+            }
             .map_err(external)?,
         ))
     }
@@ -217,10 +331,14 @@ impl ExecutionPlan for ScoreExec {
         let column = self.input.schema().index_of(&self.column)?;
         let input = self.input.execute(0, Arc::clone(&ctx))?;
         let memory = WorkMemory::new(ctx, OUTPUT)?;
-        let query = Arc::clone(&self.query);
+        let source = self.source.clone();
         let schema = self.schema();
         Ok(self.shape.map(&self.metrics, input, move |batch| {
-            let out = scored(&batch, column, &query, &schema).map_err(external)?;
+            let out = match &source {
+                ScoreSource::Distance(query) => scored(&batch, column, query, &schema),
+                ScoreSource::Bm25(scores) => lexically_scored(&batch, column, scores, &schema),
+            }
+            .map_err(external)?;
             let lease = memory.child(OUTPUT)?;
             lease.hold(&out)?;
             Ok(Mapped::Batch {

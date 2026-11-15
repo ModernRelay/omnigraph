@@ -295,6 +295,13 @@ impl PlanSource for QuerySource<'_> {
         }
     }
 
+    fn full_text_declares_analyzer(&self, type_key: &str, property: &str) -> bool {
+        type_key
+            .strip_prefix("node:")
+            .and_then(|type_name| self.catalog.node_types.get(type_name))
+            .is_some_and(|node| node.full_text_profile(property).is_some())
+    }
+
     fn canonical_key_id(
         &self,
         type_key: &str,

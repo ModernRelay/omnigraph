@@ -1740,7 +1740,7 @@ impl Bm25 {
             }
             if let Some(best) = best {
                 matched += 1;
-                let idf = ((self.docs - df + 0.5) / (df + 0.5)).ln_1p();
+                let idf = libm::log1p((self.docs - df + 0.5) / (df + 0.5));
                 total += idf * best;
             }
         }

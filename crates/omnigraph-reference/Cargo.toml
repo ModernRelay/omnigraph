@@ -8,6 +8,7 @@ repository = "https://github.com/ModernRelay/omnigraph"
 publish = false
 
 [dependencies]
+libm = { workspace = true }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1" }
 serde_json = { workspace = true }
 

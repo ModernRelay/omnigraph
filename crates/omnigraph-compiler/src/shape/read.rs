@@ -118,16 +118,23 @@ pub enum PatternStep {
         /// `OuterReference` on this name; `None` for arms from nothing.
         outer_var: Option<String>,
     },
-    /// `distance(rel, $x.f, q)`, the core's exact `Score`: every row of the
-    /// steps before it with the distance of `binding`'s vector property to
-    /// `query` under the field's declared distance appended as the binding's
-    /// `_distance` column (`F32`); a row whose vector is null drops, and the
-    /// other columns ride through. `type_name` is the binding's node type,
-    /// whose embedding recipe a String query is encoded with.
+    /// The core's exact `Score` over every row of the steps before it, the
+    /// other columns riding through. `distance(rel, $x.f, q)` appends the
+    /// distance of `binding`'s vector property to `query` under the field's
+    /// declared distance as the binding's `_distance` column (`F32`); a row
+    /// whose vector is null drops. `bm25(rel, $x.f, q)` on a field whose
+    /// index declares an analyzer appends `bm25_v1` of `binding`'s String
+    /// property against the field corpus as the binding's `_score` column
+    /// (`F64`), keeping only the rows whose value matches: `query` is then
+    /// the `match_terms(field, terms(…))` predicate the score retains, its
+    /// membership. `type_name` is the binding's node type: the table whose
+    /// rows are the field corpus, or whose embedding recipe a String query is
+    /// encoded with.
     Score {
         binding: String,
         type_name: String,
         property: String,
+        kind: ScoreKind,
         query: IRExpr,
     },
     /// `optional { p }`: every outer row with each of its matches in
@@ -265,7 +272,11 @@ impl ReadShape {
     /// The shape of `read`, or the term this release's planner does not
     /// lower.
     pub fn of(read: &CoreRead, catalog: &Catalog) -> Result<Self, ShapeError> {
-        Shaper::new(catalog, &read.name, &read.params).read(read)
+        let mut shaper = Shaper::new(catalog, &read.name, &read.params);
+        node_owners(&read.term, &mut shaper.owners);
+        let mut read = read.clone();
+        shaper.canonical_lexical(&mut read.term);
+        shaper.read(&read)
     }
 
     /// The shape of the read declared as `name` in `source`, checked against
@@ -304,10 +315,11 @@ struct Ranking {
     /// The `k` of each `nearest` window the ranking draws (its own, or its
     /// `rrf` arms'): a literal, or a parameter bound at execution.
     windows: Vec<Count>,
-    /// `distance`'s exact score: the vector property and the query. It is
-    /// a step over its population's rows, never a ranked scan, and its
-    /// `order` and `limit` are the read's own sort and cut.
-    exact: Option<(String, IRExpr)>,
+    /// An exact score: the scored property, the score's kind and its query
+    /// (`distance`'s vector, or the `match_terms` predicate an exact `bm25`
+    /// retains). It is a step over its population's rows, never a ranked
+    /// scan, and its `order` and `limit` are the read's own sort and cut.
+    exact: Option<(String, ScoreKind, IRExpr)>,
 }
 
 /// A body split at the ranking it draws.
@@ -415,6 +427,9 @@ struct Shaper<'a> {
     catalog: &'a Catalog,
     name: &'a str,
     params: &'a [(String, PropType)],
+    /// The node types each node variable of the read takes, over every
+    /// scope; a full-text call's field is a property of its variable's type.
+    owners: HashMap<String, Vec<String>>,
 }
 
 /// The pattern facts of one scope, in the order the term states them.
@@ -837,7 +852,47 @@ impl<'a> Shaper<'a> {
             catalog,
             name,
             params,
+            owners: HashMap::new(),
         }
+    }
+
+    /// Whether `property` of the node variable `variable` declares an
+    /// analyzer profile on its full-text index: `Some(true)` when every
+    /// type the variable takes declares one, `Some(false)` when none does,
+    /// `None` when the types disagree or the variable is no stored node.
+    fn declared_analyzer(&self, variable: &str, property: &str) -> Option<bool> {
+        let types = self.owners.get(variable)?;
+        let mut declared = types.iter().map(|type_name| {
+            self.catalog
+                .node_types
+                .get(type_name)
+                .map(|node| node.full_text_profile(property).is_some())
+        });
+        let first = declared.next()??;
+        declared.all(|d| d == Some(first)).then_some(first)
+    }
+
+    /// Whether the full-text call `call` reads a field that declares an
+    /// analyzer: the exact lexical scan answers it.
+    fn exact_lexical(&self, call: &IRExpr) -> bool {
+        matches!(
+            call.lexical_predicate_field(),
+            Some(IRExpr::PropAccess { variable, property, .. })
+                if self.declared_analyzer(variable, property) == Some(true)
+        )
+    }
+
+    /// `term` with every `search`, `match_text` and `fuzzy` over a field
+    /// whose index declares an analyzer written as the `match_terms` it
+    /// means there (docs/rfcs/2026-11-07-gq-3.md, section 4, Migration):
+    /// `match_terms(f, terms(q, mode: any))`, with `fuzzy`'s edit budget, two
+    /// when unwritten. A field with no profile keeps the call as written.
+    fn canonical_lexical(&self, term: &mut Term) {
+        term_exprs_mut(term, &mut |expr| {
+            canonical_lexical_expr(expr, &|variable, property| {
+                self.declared_analyzer(variable, property) == Some(true)
+            })
+        });
     }
 
     /// A parameter's declared type.
@@ -1263,21 +1318,22 @@ impl<'a> Shaper<'a> {
                 }
             };
             pipeline.push(match &ranking.exact {
-                Some((property, query)) => {
-                    PatternStep::Score {
-                        binding: ranking.column.clone(),
-                        type_name: population.types.get(&ranking.column).cloned().ok_or_else(
-                            || {
-                                ShapeError::Internal(format!(
-                                    "`distance` scores `{}`, which its population binds as no node",
-                                    ranking.column
-                                ))
-                            },
-                        )?,
-                        property: property.clone(),
-                        query: query.clone(),
-                    }
-                }
+                Some((property, kind, query)) => PatternStep::Score {
+                    binding: ranking.column.clone(),
+                    type_name: population
+                        .types
+                        .get(&ranking.column)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ShapeError::Internal(format!(
+                                "an exact score ranks `{}`, which its population binds as no node",
+                                ranking.column
+                            ))
+                        })?,
+                    property: property.clone(),
+                    kind: *kind,
+                    query: query.clone(),
+                },
                 None => PatternStep::Rank {
                     key: ranking.key.clone(),
                     binding: ranking.column.clone(),
@@ -1566,9 +1622,47 @@ impl<'a> Shaper<'a> {
                     exact: None,
                 }),
             )),
-            // The ranked scan's full-text query is today's any-term,
-            // zero-edit match; a `terms(…)` value asking for every term or
-            // for an edit budget would be scored over that wider membership.
+            // On a field whose index declares an analyzer, `bm25` is the
+            // exact score: `bm25_v1` over the field corpus, keeping the rows
+            // its `terms(…)` value matches, a step over its population.
+            Term::Score {
+                column,
+                property,
+                kind: ScoreKind::Bm25,
+                query: ScoreQuery::Lexical(lexical),
+                input,
+                out,
+            } if self.declared_analyzer(column, property) == Some(true) => Ok((
+                self.population(input)?,
+                Some(Ranking {
+                    key: IRExpr::PropAccess {
+                        variable: column.clone(),
+                        property: SCORE_COLUMN.to_string(),
+                        ty: scalar(ScalarType::F64),
+                    },
+                    out: out.clone(),
+                    column: column.clone(),
+                    score: (SCORE_COLUMN, scalar(ScalarType::F64)),
+                    descending: true,
+                    windows: Vec::new(),
+                    exact: Some((
+                        property.clone(),
+                        ScoreKind::Bm25,
+                        match_terms_call(
+                            IRExpr::PropAccess {
+                                variable: column.clone(),
+                                property: property.clone(),
+                                ty: self.field_type(column, property),
+                            },
+                            lexical,
+                        ),
+                    )),
+                }),
+            )),
+            // With no declared analyzer, the ranked scan's full-text query is
+            // today's any-term, zero-edit match; a `terms(…)` value asking for
+            // every term or for an edit budget would be scored over that
+            // wider membership.
             Term::Score {
                 kind: ScoreKind::Bm25,
                 query:
@@ -1631,7 +1725,7 @@ impl<'a> Shaper<'a> {
                     score: (DISTANCE_COLUMN, scalar(ScalarType::F32)),
                     descending: false,
                     windows: Vec::new(),
-                    exact: Some((property.clone(), query.clone())),
+                    exact: Some((property.clone(), ScoreKind::Distance, query.clone())),
                 }),
             )),
             Term::Score { .. } => Err(ShapeError::Internal(
@@ -1688,9 +1782,12 @@ impl<'a> Shaper<'a> {
         let mut windows = Vec::new();
         let mut arm = |t: &Term| -> Result<IRExpr, ShapeError> {
             match self.ranking(t)? {
-                (_, Some(r)) if r.exact.is_some() => {
+                (_, Some(r)) if matches!(r.exact, Some((_, ScoreKind::Distance, _))) => {
                     Err(self.refuse("an `rrf` arm over `distance`"))
                 }
+                (_, Some(r)) if r.exact.is_some() => Err(self.refuse(
+                    "an `rrf` arm over `bm25` on a field whose index declares an analyzer",
+                )),
                 (_, Some(r)) => {
                     windows.extend(r.windows);
                     Ok(r.key)
@@ -1839,7 +1936,7 @@ impl<'a> Shaper<'a> {
                 self.facts(input, facts)?;
                 for (name, value) in items {
                     let at = Construct::Element(&[ElementKind::Let], Some(name.clone()));
-                    if holds_edit_tolerant_match(value) {
+                    if self.holds_edit_tolerant_match(value) {
                         return Err(self.refuse_at(EDIT_TOLERANT_MATCH, at));
                     }
                     let mut value = value.clone();
@@ -2676,7 +2773,7 @@ impl<'a> Shaper<'a> {
     }
 
     fn filter(&self, input: &Term, pred: &IRExpr, facts: &mut Facts) -> Result<(), ShapeError> {
-        if holds_edit_tolerant_match(pred) {
+        if self.holds_edit_tolerant_match(pred) {
             return Err(self.refuse(EDIT_TOLERANT_MATCH));
         }
         // A triple whose ends were both bound: the expansion to a fresh name
@@ -3604,28 +3701,263 @@ fn reference_identity(variable: &str, ty: &ExprType, id: &str) -> Option<Vec<IRE
     }
 }
 
-/// `match_terms` whose edit budget is not the literal `0`. Membership runs
-/// Lance's full-text query, whose fuzzy expansion keeps a bounded number of
-/// expansions per term, so it is not the exact edit relation; the exact
-/// lexical scan answers it.
-const EDIT_TOLERANT_MATCH: &str = "`match_terms` with an edit budget other than `max_edits: 0`";
+/// `match_terms` whose edit budget is not the literal `0`, over a field
+/// whose index declares no analyzer. Membership there runs Lance's
+/// full-text query, whose fuzzy expansion keeps a bounded number of
+/// expansions per term, so it is not the exact edit relation, and the RFC
+/// states the edit relation for declared analyzers only.
+const EDIT_TOLERANT_MATCH: &str = "`match_terms` with an edit budget other than `max_edits: 0` over a field whose index declares no analyzer";
 
-/// Whether `expr` holds a `match_terms` whose edit budget is not the
-/// literal `0` (a parameter included, whose value is not known here).
-fn holds_edit_tolerant_match(expr: &IRExpr) -> bool {
-    let mut found = false;
-    expr.visit_nodes(|node| {
-        if let IRExpr::Call {
-            func: crate::ir::expr::ScalarFunc::MatchTerms { .. },
-            args,
-            ..
-        } = node
-            && !matches!(args.get(2), Some(IRExpr::Literal(Literal::Integer(0), _)))
-        {
-            found = true;
+impl Shaper<'_> {
+    /// Whether `expr` holds a `match_terms` whose edit budget is not the
+    /// literal `0` (a parameter included, whose value is not known here)
+    /// over a field the exact lexical scan does not answer.
+    fn holds_edit_tolerant_match(&self, expr: &IRExpr) -> bool {
+        let mut found = false;
+        expr.visit_nodes(|node| {
+            if let IRExpr::Call {
+                func: crate::ir::expr::ScalarFunc::MatchTerms { .. },
+                args,
+                ..
+            } = node
+                && !matches!(args.get(2), Some(IRExpr::Literal(Literal::Integer(0), _)))
+                && !self.exact_lexical(node)
+            {
+                found = true;
+            }
+        });
+        found
+    }
+
+    /// The type a read of `variable.property` has: the declared property's,
+    /// a non-null String when the variable's type is not known here.
+    fn field_type(&self, variable: &str, property: &str) -> ExprType {
+        self.owners
+            .get(variable)
+            .and_then(|types| types.first())
+            .and_then(|type_name| self.catalog.node_types.get(type_name))
+            .and_then(|node| node.properties.get(property))
+            .map_or_else(|| scalar(ScalarType::String), ExprType::from_prop)
+    }
+}
+
+/// `match_terms(field, terms(text, mode, max_edits))`, the predicate a
+/// lexical query states over `field`.
+fn match_terms_call(field: IRExpr, lexical: &LexicalQuery) -> IRExpr {
+    IRExpr::Call {
+        func: crate::ir::expr::ScalarFunc::MatchTerms {
+            mode: if lexical.mode_all {
+                crate::ir::expr::TermsMode::All
+            } else {
+                crate::ir::expr::TermsMode::Any
+            },
+        },
+        args: vec![field, lexical.text.clone(), lexical.max_edits.clone()],
+        ty: scalar(ScalarType::Bool),
+    }
+}
+
+/// The node types every node variable of `term` takes, over every scope.
+fn node_owners(term: &Term, out: &mut HashMap<String, Vec<String>>) {
+    let mut add = |variable: &str, type_name: &str| {
+        let types = out.entry(variable.to_string()).or_default();
+        if !types.iter().any(|t| t == type_name) {
+            types.push(type_name.to_string());
         }
+    };
+    match term {
+        Term::Unit | Term::RecRef { .. } => {}
+        Term::Env(cols) => {
+            for col in cols {
+                if let Ty::Node { type_name, .. } = &col.ty {
+                    add(&col.name, type_name);
+                }
+            }
+        }
+        Term::Scan { var, ty } => {
+            if let Ty::Node { type_name, .. } = ty {
+                add(var, type_name);
+            }
+        }
+        Term::Expand {
+            input,
+            src,
+            dst,
+            src_type,
+            dst_type,
+            ..
+        } => {
+            add(src, src_type);
+            add(dst, dst_type);
+            node_owners(input, out);
+        }
+        Term::Filter { input, .. }
+        | Term::Project { input, .. }
+        | Term::Group { input, .. }
+        | Term::Order { input, .. }
+        | Term::Cut { input, .. }
+        | Term::Score { input, .. }
+        | Term::ApproxTopK { input, .. } => node_owners(input, out),
+        Term::Correlate { outer, inner } => {
+            node_owners(outer, out);
+            node_owners(inner, out);
+        }
+        Term::Union { left, right } => {
+            node_owners(left, out);
+            node_owners(right, out);
+        }
+        Term::Fuse { arms, .. } => arms.iter().for_each(|arm| node_owners(arm, out)),
+        Term::Fix { body, .. } | Term::Call { body, .. } => node_owners(body, out),
+    }
+}
+
+/// Apply `f` to every expression `term` holds, in every scope.
+fn term_exprs_mut(term: &mut Term, f: &mut dyn FnMut(&mut IRExpr)) {
+    match term {
+        Term::Unit | Term::Env(_) | Term::Scan { .. } | Term::RecRef { .. } => {}
+        Term::Expand { input, .. } | Term::Cut { input, .. } => term_exprs_mut(input, f),
+        Term::Filter { input, pred } => {
+            f(pred);
+            term_exprs_mut(input, f);
+        }
+        Term::Project { input, items, .. } => {
+            items.iter_mut().for_each(|(_, value)| f(value));
+            term_exprs_mut(input, f);
+        }
+        Term::Group { input, keys, aggs } => {
+            keys.iter_mut().for_each(|(_, key)| f(key));
+            aggs.iter_mut()
+                .filter_map(|(_, agg)| agg.arg.as_mut())
+                .for_each(&mut *f);
+            term_exprs_mut(input, f);
+        }
+        Term::Order { input, keys } => {
+            keys.iter_mut().for_each(|(key, _)| f(key));
+            term_exprs_mut(input, f);
+        }
+        Term::Score { input, query, .. } => {
+            match query {
+                ScoreQuery::Vector(query) => f(query),
+                ScoreQuery::Lexical(lexical) => {
+                    f(&mut lexical.text);
+                    f(&mut lexical.max_edits);
+                }
+            }
+            term_exprs_mut(input, f);
+        }
+        Term::ApproxTopK { input, query, .. } => {
+            f(query);
+            term_exprs_mut(input, f);
+        }
+        Term::Correlate { outer, inner } => {
+            term_exprs_mut(outer, f);
+            term_exprs_mut(inner, f);
+        }
+        Term::Union { left, right } => {
+            term_exprs_mut(left, f);
+            term_exprs_mut(right, f);
+        }
+        Term::Fuse { arms, .. } => arms.iter_mut().for_each(|arm| term_exprs_mut(arm, f)),
+        Term::Fix { body, .. } => term_exprs_mut(body, f),
+        Term::Call { bindings, body, .. } => {
+            bindings.iter_mut().for_each(|(_, value)| f(value));
+            term_exprs_mut(body, f);
+        }
+    }
+}
+
+/// `expr` with every `search`, `match_text` and `fuzzy` whose field
+/// `declared` holds rewritten to its `match_terms`.
+fn canonical_lexical_expr(expr: &mut IRExpr, declared: &dyn Fn(&str, &str) -> bool) {
+    let rewrite = match &*expr {
+        IRExpr::Search { field, query, .. } | IRExpr::MatchText { field, query, .. } => {
+            Some((field, query, None))
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+            ..
+        } => Some((field, query, Some(max_edits.as_deref()))),
+        _ => None,
+    }
+    .filter(|(field, _, _)| {
+        matches!(field.as_ref(), IRExpr::PropAccess { variable, property, .. }
+            if declared(variable, property))
+    })
+    .map(|(field, query, max_edits)| {
+        let max_edits = match max_edits {
+            None => IRExpr::Literal(Literal::Integer(0), scalar(ScalarType::I64)),
+            Some(None) => IRExpr::Literal(Literal::Integer(2), scalar(ScalarType::I64)),
+            Some(Some(budget)) => budget.clone(),
+        };
+        match_terms_call(
+            field.as_ref().clone(),
+            &LexicalQuery {
+                text: query.as_ref().clone(),
+                mode_all: false,
+                max_edits,
+            },
+        )
     });
-    found
+    if let Some(call) = rewrite {
+        *expr = call;
+        return;
+    }
+    match expr {
+        IRExpr::Nearest { query, .. } => canonical_lexical_expr(query, declared),
+        IRExpr::Search { field, query, .. }
+        | IRExpr::MatchText { field, query, .. }
+        | IRExpr::Bm25 { field, query, .. } => {
+            canonical_lexical_expr(field, declared);
+            canonical_lexical_expr(query, declared);
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+            ..
+        } => {
+            canonical_lexical_expr(field, declared);
+            canonical_lexical_expr(query, declared);
+            if let Some(m) = max_edits {
+                canonical_lexical_expr(m, declared);
+            }
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+            weights,
+            ..
+        } => {
+            canonical_lexical_expr(primary, declared);
+            canonical_lexical_expr(secondary, declared);
+            if let Some(k) = k {
+                canonical_lexical_expr(k, declared);
+            }
+            if let Some(w) = weights {
+                canonical_lexical_expr(w, declared);
+            }
+        }
+        IRExpr::Aggregate { arg, .. }
+        | IRExpr::Not(arg, _)
+        | IRExpr::IsNull { expr: arg, .. }
+        | IRExpr::Neg { expr: arg, .. }
+        | IRExpr::Cast { expr: arg, .. } => canonical_lexical_expr(arg, declared),
+        IRExpr::Binary { left, right, .. } => {
+            canonical_lexical_expr(left, declared);
+            canonical_lexical_expr(right, declared);
+        }
+        IRExpr::Call { args, .. } => args
+            .iter_mut()
+            .for_each(|arg| canonical_lexical_expr(arg, declared)),
+        IRExpr::Literal(_, _)
+        | IRExpr::Param(_, _)
+        | IRExpr::PropAccess { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::AliasRef(_, _) => {}
+    }
 }
 
 /// The variable a search predicate filter searches.

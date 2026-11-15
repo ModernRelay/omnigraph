@@ -297,6 +297,14 @@ pub trait PlanSource {
         FullTextCoverage::Partial
     }
 
+    /// Whether `property`'s full-text index on the table `type_key` names
+    /// declares an analyzer profile: the exact lexical scan instantiates
+    /// that analyzer from the accepted schema and answers whether or not an
+    /// index exists.
+    fn full_text_declares_analyzer(&self, _type_key: &str, _property: &str) -> bool {
+        false
+    }
+
     /// The fingerprint of the catalogue table `type_key` names at this source:
     /// its rows and schema as the running binary derives them, so a plan records
     /// what it read and a replay checks it. `None` for a source with no catalogue.

@@ -3742,11 +3742,22 @@ impl Ctx<'_> {
             }
             ScoreQueryId::Vector(q)
         };
-        // Both scores are `F32`, the type today's scans produce; section 2
-        // types `bm25` `F64` with its `bm25_v1` scorer, which this engine
-        // does not yet run.
-        let out_ty = Ty::scalar(ScalarType::F32, false);
-        let _ = kind;
+        // `distance` is `F32`. `bm25` on a field whose index declares an
+        // analyzer is `bm25_v1`, `F64` (section 2); on a field with edition
+        // 2's analysis it keeps the `F32` score Lance's index produces.
+        let declared = kind == ScoreKind::Bm25
+            && self
+                .catalog
+                .query_node_type(&type_name)
+                .is_some_and(|n| n.full_text_profile(&property).is_some());
+        let out_ty = Ty::scalar(
+            if declared {
+                ScalarType::F64
+            } else {
+                ScalarType::F32
+            },
+            false,
+        );
         let score_at = pop.ty.cols.len();
         let mut cols = pop.ty.cols.clone();
         cols.push(Col {

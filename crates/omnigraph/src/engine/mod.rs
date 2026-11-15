@@ -47,6 +47,7 @@ mod explain;
 mod expr;
 mod graph;
 mod lexical;
+mod lexical_scan;
 mod lower;
 mod operators;
 pub(crate) mod plan_source;

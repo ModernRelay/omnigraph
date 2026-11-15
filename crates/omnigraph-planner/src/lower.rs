@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 
+use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_compiler::traversal::EdgeSelection;
 
@@ -205,14 +206,18 @@ pub trait Lower {
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
-    /// Every input row with the exact distance of `binding`'s vector
-    /// `property` to the node's bound query vector appended; a row whose
-    /// vector is null drops.
+    /// Every input row with its exact score appended: under `Distance`, the
+    /// distance of `binding`'s vector `property` to the node's bound query
+    /// vector, a row whose vector is null dropping; under `Bm25`, `bm25_v1`
+    /// of `binding`'s String `property` against the field corpus, a row
+    /// whose value `query` does not match dropping.
     fn score(
         &mut self,
         id: NodeId,
         binding: &str,
         property: &str,
+        kind: ScoreKind,
+        query: &IRExpr,
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
@@ -542,10 +547,11 @@ impl PhysicalPlan {
                 binding,
                 type_name: _,
                 property,
-                query: _,
+                kind,
+                query,
             } => {
                 let input = self.lower_node(*input, l)?;
-                l.score(id, binding, property, input)
+                l.score(id, binding, property, *kind, query, input)
             }
             PhysicalNode::Let { input, name, value } => {
                 let input = self.lower_node(*input, l)?;

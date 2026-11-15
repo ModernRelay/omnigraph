@@ -86,8 +86,8 @@ pub use physical::{
     HydratedBinding, HydratedColumn, NearestPolicy, NodeId, OperatorRow, OrderKey, OverfetchRung,
     PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineShape, PipelineSink, PipelineSource,
     PipelineSpec, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind,
-    RankScope, RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows,
-    validate_streams,
+    RankScope, RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows, score_column,
+    score_kind_name, validate_streams,
 };
 pub use ranking::{PlannedRanking, planned_ranking};
 pub use read_shape::{InnerRead, PatternStep, ReadShape};

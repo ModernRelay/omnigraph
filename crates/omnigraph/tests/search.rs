@@ -2931,6 +2931,200 @@ async fn a_full_text_index_with_no_segment_refuses_the_call_issue_747() {
     );
 }
 
+const DECLARED_ANALYZER_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    body: String @index(fulltext, analyzer = "standard_folded_v1")
+}
+"#;
+
+const DECLARED_ANALYZER_QUERIES: &str = r#"
+query docs($q: String) {
+    match { $d: Doc } where match_terms($d.body, terms($q, mode: any, max_edits: 1))
+    return { $d.slug }
+}
+query ranked($q: String) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $q) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+"#;
+
+/// On a field whose index declares an analyzer, the exact lexical scan
+/// answers a table version that holds rows and no segment of the index, the
+/// state an undeclared field refuses with `FullTextIndexRequired`: the scan
+/// instantiates the analyzer from the accepted schema and reads no index, so
+/// matching and ranking answer before any index work, and alike after it.
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn a_declared_analyzer_answers_with_no_index_segment() {
+    use lance::index::DatasetIndexExt;
+    use omnigraph::db::ReadTarget;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(
+        Omnigraph::init(uri, DECLARED_ANALYZER_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let entry = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .clone();
+    let mut raw = lance::Dataset::open(&format!("{uri}/{}", entry.dataset_path))
+        .await
+        .unwrap();
+    let body = raw.schema().field("body").unwrap().id;
+    assert!(
+        !raw.load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|index| index.fields.contains(&body)),
+        "the creation version declares no segment on `body`"
+    );
+    let schema = std::sync::Arc::new(arrow_schema::Schema::from(raw.schema()));
+    let column = |values: [&str; 3]| {
+        std::sync::Arc::new(StringArray::from(values.to_vec())) as arrow_array::ArrayRef
+    };
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "__id" | "slug" => column(["d1", "d2", "d3"]),
+            "body" => column(["Deep Learning", "deep dive", "Café"]),
+            other => panic!("unexpected `Doc` field {other}"),
+        })
+        .collect::<Vec<_>>();
+    lance_append_inline(
+        &mut raw,
+        arrow_array::RecordBatch::try_new(schema, columns).unwrap(),
+    )
+    .await;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Doc", None)
+        .await
+        .unwrap();
+
+    let deap = params(&[("q", "DEAP")]);
+    let deep = params(&[("q", "deep")]);
+    let ranked = |result: &QueryResult| -> Vec<(String, f64)> {
+        let batch = result.concat_batches().unwrap();
+        let slugs = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let scores = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        (0..batch.num_rows())
+            .map(|row| (slugs.value(row).to_string(), scores.value(row)))
+            .collect()
+    };
+    let before = ranked(
+        &query_branch(&db, "main", DECLARED_ANALYZER_QUERIES, "ranked", &deep)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        before
+            .iter()
+            .map(|(slug, _)| slug.as_str())
+            .collect::<Vec<_>>(),
+        ["d1", "d2"]
+    );
+    assert!(
+        before
+            .iter()
+            .all(|(_, score)| score.is_finite() && *score > 0.0)
+    );
+    assert_eq!(
+        first_column_sorted(
+            &query_branch(&db, "main", DECLARED_ANALYZER_QUERIES, "docs", &deap)
+                .await
+                .unwrap()
+        ),
+        ["d1", "d2"],
+        "one edit from `deap`, case folded, with no segment"
+    );
+    db.explain_query(
+        ReadTarget::branch("main"),
+        DECLARED_ANALYZER_QUERIES,
+        "docs",
+        &deap,
+    )
+    .await
+    .unwrap();
+
+    db.ensure_indices_as(None).await.unwrap();
+    assert_eq!(
+        first_column_sorted(
+            &query_branch(&db, "main", DECLARED_ANALYZER_QUERIES, "docs", &deap)
+                .await
+                .unwrap()
+        ),
+        ["d1", "d2"],
+        "the built index changes no row"
+    );
+    assert_eq!(
+        ranked(
+            &query_branch(&db, "main", DECLARED_ANALYZER_QUERIES, "ranked", &deep)
+                .await
+                .unwrap()
+        ),
+        before,
+        "the built index changes no score"
+    );
+}
+
+/// The exact lexical scan charges every analyzed token and term comparison
+/// against the read's work budget: a budget below the scan's work fails the
+/// read with `read_work_limit`, never a partial answer, and one above it
+/// answers in full.
+#[tokio::test]
+async fn the_exact_lexical_scan_charges_the_read_work_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(
+        Omnigraph::init(uri, DECLARED_ANALYZER_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load(
+        "main",
+        r#"{"type":"Doc","data":{"slug":"d1","body":"Deep Learning"}}
+{"type":"Doc","data":{"slug":"d2","body":"deep dive into deep water"}}
+{"type":"Doc","data":{"slug":"d3","body":"Café"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let deap = params(&[("q", "deap")]);
+    let tight = with_setting(&db, "read_work_limit", "4");
+    let error = query_branch(&tight, "main", DECLARED_ANALYZER_QUERIES, "docs", &deap)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("read_work_limit"),
+        "a budget below the scan's work names the setting: {error}"
+    );
+    let ample = with_setting(&db, "read_work_limit", "1000");
+    assert_eq!(
+        first_column_sorted(
+            &query_branch(&ample, "main", DECLARED_ANALYZER_QUERIES, "docs", &deap)
+                .await
+                .unwrap()
+        ),
+        ["d1", "d2"]
+    );
+}
+
 #[cfg(feature = "failpoints")]
 const ISSUE_1297_QUERIES: &str = r#"
 query nearest_scored($q: Vector(2)) {

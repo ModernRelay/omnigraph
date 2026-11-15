@@ -646,14 +646,11 @@ pub(super) fn validate_plan_values(
                         }
                     }
                 }
-                PhysicalNode::Score { binding, .. } => {
-                    owners.scores.insert(
-                        (
-                            binding.as_str(),
-                            omnigraph_compiler::query::value::DISTANCE_COLUMN,
-                        ),
-                        (DataType::Float32, false),
-                    );
+                PhysicalNode::Score { binding, kind, .. } => {
+                    let (column, data_type) = omnigraph_planner::score_column(*kind);
+                    owners
+                        .scores
+                        .insert((binding.as_str(), column), (data_type, false));
                 }
                 PhysicalNode::RankFuse { arms, .. } => {
                     owners.scores.insert(

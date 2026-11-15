@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
 use omnigraph_compiler::ir::{
     BlockAggregateExpr, IRExpr, IROrdering, IRProjection, SubqueryPredicate,
@@ -280,6 +281,9 @@ pub enum NodeMirror {
         binding: String,
         type_name: String,
         property: String,
+        /// Absent in a plan saved before `bm25` scored exactly: `distance`.
+        #[serde(default)]
+        kind: ScoreKindMirror,
         query: ExprMirror,
     },
     Let {
@@ -493,12 +497,14 @@ impl From<&PhysicalNode> for NodeMirror {
                 binding,
                 type_name,
                 property,
+                kind,
                 query,
             } => Self::Score {
                 input: *input,
                 binding: binding.clone(),
                 type_name: type_name.clone(),
                 property: property.clone(),
+                kind: ScoreKindMirror::from(*kind),
                 query: ExprMirror::from(query),
             },
             PhysicalNode::Let { input, name, value } => Self::Let {
@@ -792,12 +798,14 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 binding,
                 type_name,
                 property,
+                kind,
                 query,
             } => Self::Score {
                 input,
                 binding,
                 type_name,
                 property,
+                kind: ScoreKind::from(kind),
                 query: IRExpr::from(query),
             },
             NodeMirror::Let { input, name, value } => Self::Let {
@@ -1339,6 +1347,33 @@ impl From<ArithOpMirror> for ArithOp {
             ArithOpMirror::Mul => Self::Mul,
             ArithOpMirror::Div => Self::Div,
             ArithOpMirror::Rem => Self::Rem,
+        }
+    }
+}
+
+/// An exact `Score`'s kind in a saved plan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoreKindMirror {
+    #[default]
+    Distance,
+    Bm25,
+}
+
+impl From<ScoreKind> for ScoreKindMirror {
+    fn from(kind: ScoreKind) -> Self {
+        match kind {
+            ScoreKind::Distance => Self::Distance,
+            ScoreKind::Bm25 => Self::Bm25,
+        }
+    }
+}
+
+impl From<ScoreKindMirror> for ScoreKind {
+    fn from(kind: ScoreKindMirror) -> Self {
+        match kind {
+            ScoreKindMirror::Distance => Self::Distance,
+            ScoreKindMirror::Bm25 => Self::Bm25,
         }
     }
 }

@@ -22,16 +22,20 @@ use omnigraph_compiler::query::value::RRF_COLUMN;
 use omnigraph_compiler::types::{ExprType, ScalarType};
 
 use super::budget::Budget;
-use super::requirements::{Block, Requirements, Retrieval, Search, constant_true};
+use super::requirements::{Block, ExactScore, Requirements, Retrieval, Search, constant_true};
 use super::{AcceptInput, ValidationError};
 use crate::cost::AntiJoinStrategy;
 use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use crate::optimizer::{RRF_NEAREST_ARM_K, contains_aggregate, derived_order};
 use crate::physical::{
     Assumptions, Eligibility, EmptyEligible, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan,
-    RankKind, RankScope, RankedAccess,
+    RankKind, RankScope, RankedAccess, score_kind_name,
 };
 use crate::source::FullTextCoverage;
+use omnigraph_compiler::ir::core::ScoreKind;
+use omnigraph_compiler::ir::expr::ScalarFunc;
+use omnigraph_compiler::query::value::SCORE_COLUMN;
+use omnigraph_compiler::schema::analysis::FullTextScorer;
 
 /// The nodes of one pipeline: every node reachable from `root` without
 /// entering a correlated block's inner tree.
@@ -217,12 +221,14 @@ fn named_expr<'e>(returns: &'e [IRProjection], key: &'e IRExpr) -> &'e IRExpr {
     }
 }
 
-/// Every full-text call the query writes reads its property's index at the
-/// pinned snapshot, so the plan records that index's coverage, and the
-/// coverage holds a segment (full or partial; an untrained declaration
-/// carries the analyzer too). Replay re-derives every recorded coverage from
-/// the pinned dataset, so a saved plan can neither omit the fact nor claim a
-/// segment the snapshot lacks.
+/// Every full-text call the query writes over a field whose index declares
+/// no analyzer reads its property's index at the pinned snapshot, so the
+/// plan records that index's coverage, and the coverage holds a segment
+/// (full or partial; an untrained declaration carries the analyzer too).
+/// Replay re-derives every recorded coverage from the pinned dataset, so a
+/// saved plan can neither omit the fact nor claim a segment the snapshot
+/// lacks. A field that declares an analyzer is answered by the exact lexical
+/// scan, which reads no index, so its coverage is no prerequisite.
 fn check_full_text_indexes(
     plan: &PhysicalPlan,
     input: &AcceptInput<'_>,
@@ -231,6 +237,9 @@ fn check_full_text_indexes(
     let targets = crate::optimizer::full_text_targets(input.ir);
     budget.visit(u64::try_from(targets.len()).unwrap_or(u64::MAX))?;
     for (type_name, property) in targets {
+        if declares_analyzer(input, &type_name, &property) {
+            continue;
+        }
         let key = Assumptions::full_text_key(&format!("node:{type_name}"), &property);
         match plan.assumptions().full_text.get(&key) {
             Some(FullTextCoverage::Full | FullTextCoverage::Partial) => {}
@@ -243,6 +252,62 @@ fn check_full_text_indexes(
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// Whether `type_name.property`'s full-text index declares an analyzer
+/// profile in the accepted catalog.
+fn declares_analyzer(input: &AcceptInput<'_>, type_name: &str, property: &str) -> bool {
+    input
+        .catalog
+        .node_types
+        .get(type_name)
+        .is_some_and(|node| node.full_text_profile(property).is_some())
+}
+
+/// An exact `bm25` is `bm25_v1` of a declared field over its field corpus:
+/// its retained predicate is `match_terms` over the scored `$binding.property`
+/// (the membership, evaluated before any cut), and the corpus type declares
+/// an analyzer and the ranking scorer on that property.
+fn check_exact_bm25(score: &ExactScore, input: &AcceptInput<'_>) -> Result<(), ValidationError> {
+    let retained = matches!(
+        &score.query,
+        IRExpr::Call {
+            func: ScalarFunc::MatchTerms { .. },
+            args,
+            ..
+        } if matches!(
+            args.first(),
+            Some(IRExpr::PropAccess { variable, property, .. })
+                if *variable == score.binding && *property == score.property
+        ) && args.len() == 3
+    );
+    if !retained {
+        return Err(ValidationError::violated(
+            "predicate retention",
+            format!(
+                "the exact `bm25` of `${}.{}` retains `{}`, not the `match_terms` of its field",
+                score.binding, score.property, score.query
+            ),
+        ));
+    }
+    let corpus = input
+        .catalog
+        .node_types
+        .get(&score.type_name)
+        .is_some_and(|node| {
+            node.full_text_profile(&score.property).is_some()
+                && node.full_text_scorer(&score.property) == FullTextScorer::Bm25V1
+        });
+    if !corpus {
+        return Err(ValidationError::violated(
+            "scoring corpus",
+            format!(
+                "the exact `bm25` scores `{}.{}`, whose index declares no analyzer with the `bm25_v1` scorer",
+                score.type_name, score.property
+            ),
+        ));
     }
     Ok(())
 }
@@ -298,7 +363,7 @@ impl Requirements {
         self.check_optionals(plan, &top, budget)?;
         self.check_correlates(plan, &top, budget)?;
         self.check_unions(plan, &top)?;
-        self.check_scores(plan, &top)?;
+        self.check_scores(plan, &top, input)?;
         self.check_lets(plan, &top)?;
         check_full_text_indexes(plan, input, budget)?;
         self.check_search(plan)?;
@@ -734,36 +799,61 @@ impl Requirements {
         Ok(())
     }
 
-    /// The plan runs one `Score` per written `distance`, over the same
-    /// binding, vector property and query.
-    fn check_scores(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
-        let mut planned: Vec<(&String, &String, &IRExpr)> = top
+    /// The plan runs one `Score` per written exact score, of the same kind,
+    /// over the same binding, node type, property and query. An exact
+    /// `bm25` retains its `match_terms` predicate over the scored field,
+    /// scores against the field corpus of a type whose index declares an
+    /// analyzer and the `bm25_v1` scorer, and every read of a binding's
+    /// `F64` `_score` is such a score's.
+    fn check_scores(
+        &self,
+        plan: &PhysicalPlan,
+        top: &[NodeId],
+        input: &AcceptInput<'_>,
+    ) -> Result<(), ValidationError> {
+        let mut planned: Vec<ExactScore> = top
             .iter()
             .filter_map(|id| match plan.node(*id) {
                 Some(PhysicalNode::Score {
                     binding,
+                    type_name,
                     property,
+                    kind,
                     query,
                     ..
-                }) => Some((binding, property, query)),
+                }) => Some(ExactScore {
+                    binding: binding.clone(),
+                    type_name: type_name.clone(),
+                    property: property.clone(),
+                    kind: *kind,
+                    query: query.clone(),
+                }),
                 _ => None,
             })
+            .collect();
+        let scored: Vec<String> = planned
+            .iter()
+            .filter(|score| score.kind == ScoreKind::Bm25)
+            .map(|score| score.binding.clone())
             .collect();
         if planned.len() != self.scores.len() {
             return Err(ValidationError::violated(
                 "plan shape",
                 format!(
-                    "the query scores {} distances; the plan runs {} scores",
+                    "the query writes {} exact scores; the plan runs {} scores",
                     self.scores.len(),
                     planned.len()
                 ),
             ));
         }
-        for (binding, property, query) in &self.scores {
-            match planned
-                .iter()
-                .position(|(b, p, q)| *b == binding && *p == property && *q == query)
-            {
+        for score in &self.scores {
+            let ExactScore {
+                binding,
+                property,
+                query,
+                ..
+            } = score;
+            match planned.iter().position(|planned| planned == score) {
                 Some(index) => {
                     planned.remove(index);
                 }
@@ -771,11 +861,49 @@ impl Requirements {
                     return Err(ValidationError::violated(
                         "search identity",
                         format!(
-                            "no score of the plan reads `${binding}.{property}` against `{query}` as the query's `distance` does"
+                            "no score of the plan reads `${binding}.{property}` against `{query}` as the query's {} does",
+                            score_kind_name(score.kind)
                         ),
                     ));
                 }
             }
+            if score.kind == ScoreKind::Bm25 {
+                check_exact_bm25(score, input)?;
+            }
+        }
+        // Score origin: a `_score` read as `bm25_v1`'s `F64` comes from an
+        // exact `bm25` of its binding.
+        let mut reads = Vec::new();
+        for expr in self
+            .returns
+            .iter()
+            .map(|projection| &projection.expr)
+            .chain(self.order.iter().map(|ordering| &ordering.expr))
+            .chain(&self.eligibility)
+        {
+            expr.visit_nodes(|node| {
+                if let IRExpr::PropAccess {
+                    variable,
+                    property,
+                    ty:
+                        ExprType::Value {
+                            scalar: ScalarType::F64,
+                            ..
+                        },
+                } = node
+                    && property == SCORE_COLUMN
+                {
+                    reads.push(variable.clone());
+                }
+            });
+        }
+        if let Some(read) = reads.iter().find(|read| !scored.contains(read)) {
+            return Err(ValidationError::violated(
+                "score origin",
+                format!(
+                    "the query reads `${read}.{SCORE_COLUMN}`, which no exact `bm25` of the plan produces"
+                ),
+            ));
         }
         Ok(())
     }

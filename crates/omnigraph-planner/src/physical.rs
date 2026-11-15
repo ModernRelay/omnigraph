@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
 use arrow_schema::SchemaRef;
+use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
 use omnigraph_compiler::query::value::{BinaryOp, CompOp};
 use omnigraph_compiler::traversal::EdgeSelection;
@@ -48,6 +49,29 @@ impl RankKind {
             Self::Nearest => ("_distance", false),
             Self::Bm25 => ("_score", true),
         }
+    }
+}
+
+/// The name an exact `Score`'s kind takes in explain and in a saved plan.
+pub fn score_kind_name(kind: ScoreKind) -> &'static str {
+    match kind {
+        ScoreKind::Distance => "distance",
+        ScoreKind::Bm25 => "bm25",
+    }
+}
+
+/// The column an exact `Score` of `kind` appends under its binding, and its
+/// type: `distance`'s `_distance` (`F32`), `bm25_v1`'s `_score` (`F64`).
+pub fn score_column(kind: ScoreKind) -> (&'static str, arrow_schema::DataType) {
+    match kind {
+        ScoreKind::Distance => (
+            omnigraph_compiler::query::value::DISTANCE_COLUMN,
+            arrow_schema::DataType::Float32,
+        ),
+        ScoreKind::Bm25 => (
+            omnigraph_compiler::query::value::SCORE_COLUMN,
+            arrow_schema::DataType::Float64,
+        ),
     }
 }
 
@@ -903,19 +927,26 @@ physical_nodes! {
         targets: usize,
     } => "TargetCut" [input: NodeId]
         shape: PipelineShape::Streaming, sides: vec![], cut: None, order: order_of(*input);
-    /// `distance(rel, $x.f, q)`, the core's exact `Score`: every input row
-    /// with the exact distance of `binding`'s vector `property` to the query
-    /// vector the value table binds for this node, under the field's
-    /// declared distance, appended as `<binding>._distance` (`F32`); a row
-    /// whose vector is null drops, a non-finite input is refused (`E3`), and
-    /// the other columns ride through in input order. No index is read, so
-    /// index state never changes its rows. `type_name` is the binding's node
-    /// type, whose recipe encodes a String `query` at binding.
+    /// The core's exact `Score`; the other columns ride through in input
+    /// order and no index is read, so index state never changes its rows.
+    /// `Distance` (`distance(rel, $x.f, q)`): every input row with the exact
+    /// distance of `binding`'s vector `property` to the query vector the
+    /// value table binds for this node, under the field's declared distance,
+    /// appended as `<binding>._distance` (`F32`); a row whose vector is null
+    /// drops and a non-finite input is refused (`E3`). `type_name` is the
+    /// binding's node type, whose recipe encodes a String `query` at
+    /// binding. `Bm25` (`bm25` on a field whose index declares an analyzer):
+    /// the exact lexical scan. `query` is the `match_terms` predicate the
+    /// score retains; every input row whose `property` matches it leaves with
+    /// `bm25_v1` against the field corpus (every entity of `type_name` with
+    /// a non-empty analyzed value, before any filter) appended as
+    /// `<binding>._score` (`F64`), and every other row drops.
     Score {
         input: NodeId,
         binding: String,
         type_name: String,
         property: String,
+        kind: ScoreKind,
         query: IRExpr,
     } => "Score" [input: NodeId]
         shape: PipelineShape::Streaming, sides: vec![], cut: None, order: order_of(*input);
@@ -1531,6 +1562,7 @@ impl PhysicalPlan {
                 binding,
                 type_name,
                 property,
+                kind,
                 query,
                 ..
             } => json!({
@@ -1538,6 +1570,7 @@ impl PhysicalPlan {
                 "binding": binding,
                 "type_name": type_name,
                 "property": property,
+                "kind": score_kind_name(*kind),
                 "typed_query": crate::typed::expr(query),
             }),
             PhysicalNode::Let { name, value, .. } => json!({

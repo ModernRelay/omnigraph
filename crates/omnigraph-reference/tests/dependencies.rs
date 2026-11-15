@@ -1,6 +1,8 @@
 //! The interpreter is an oracle only while it shares nothing with what it
 //! checks: it reads the compiler's core IR and a JSONL export, never the
-//! planner, the engine or Lance.
+//! planner, the engine or Lance. `libm` is the math library `bm25_v1`'s
+//! numeric profile names (docs/rfcs/2026-11-07-gq-3.md, section 4), so the
+//! oracle computes the IDF with the same `log1p` the RFC fixes.
 
 use std::path::Path;
 
@@ -19,7 +21,7 @@ fn the_interpreter_depends_on_the_compiler_alone() {
         .filter_map(|l| l.split_once('=').map(|(name, _)| name.trim()))
         .filter(|name| !name.is_empty())
         .collect();
-    assert_eq!(deps, ["omnigraph-compiler", "serde_json"]);
+    assert_eq!(deps, ["libm", "omnigraph-compiler", "serde_json"]);
     let source = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
     for forbidden in [
         "omnigraph_planner",

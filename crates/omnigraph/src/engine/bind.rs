@@ -32,9 +32,12 @@ pub(super) async fn bind(
     }
     let mut vectors = BTreeMap::new();
     for (id, node) in plan.live() {
+        // An exact `bm25` reads no vector: the exact lexical scan answers it
+        // before the run.
         if let PhysicalNode::Score {
             type_name,
             property,
+            kind: omnigraph_compiler::ir::core::ScoreKind::Distance,
             query,
             ..
         } = node
@@ -49,6 +52,9 @@ pub(super) async fn bind(
             )
             .await?;
             vectors.insert(id, vector);
+            continue;
+        }
+        if matches!(node, PhysicalNode::Score { .. }) {
             continue;
         }
         let PhysicalNode::Scan { spec, ranked, .. } = node else {

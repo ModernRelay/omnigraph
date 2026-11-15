@@ -4,6 +4,7 @@ use std::hash::Hash;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::SystemColumns;
+use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::{
     DeltaClass, IRExpr, IROrdering, IRProjection, SubqueryPredicate, ValidateCheck,
 };
@@ -697,15 +698,21 @@ pub enum LogicalNode {
         binding: String,
         targets: u64,
     },
-    /// `distance(rel, $x.f, q)`: every input row with the exact distance of
-    /// `binding`'s vector `property` to `query` appended as the binding's
-    /// `_distance` column; a row whose vector is null drops. `type_name` is
-    /// the binding's node type; `reads` the vector column and the query's.
+    /// The core's exact `Score`. `Distance` (`distance(rel, $x.f, q)`):
+    /// every input row with the exact distance of `binding`'s vector
+    /// `property` to `query` appended as the binding's `_distance` column; a
+    /// row whose vector is null drops. `Bm25` (`bm25` on a field whose index
+    /// declares an analyzer): every input row whose String `property`
+    /// matches `query`, a `match_terms` predicate, with `bm25_v1` against the
+    /// field corpus of `type_name` appended as the binding's `_score`
+    /// column, by the exact lexical scan. `type_name` is the binding's node
+    /// type; `reads` the scored column and the query's.
     Score {
         input: LogicalId,
         binding: String,
         type_name: String,
         property: String,
+        kind: ScoreKind,
         query: IRExpr,
         reads: Vec<ColumnRef>,
     },
@@ -1181,6 +1188,7 @@ impl LogicalPlan {
                 binding,
                 type_name,
                 property,
+                kind,
                 query,
                 reads,
                 ..
@@ -1189,6 +1197,7 @@ impl LogicalPlan {
                 "binding": binding,
                 "type_name": type_name,
                 "property": property,
+                "kind": crate::physical::score_kind_name(*kind),
                 "typed_query": crate::typed::expr(query),
                 "reads": rendered(reads),
             }),

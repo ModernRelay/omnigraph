@@ -129,7 +129,7 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         default: "100000000",
         scope: SettingScope::Request,
         env: "OMNIGRAPH_READ_WORK_LIMIT",
-        doc: "how many results the expansions of one read may produce, every hop of every traversal together; exhaustion fails the read with an error naming it, never a partial result",
+        doc: "how much work one read may do: the results its expansions produce, every hop of every traversal together, and the tokens and term comparisons of its exact lexical scans; exhaustion fails the read with an error naming it, never a partial result",
     },
     SettingSpec {
         name: "write_max_bytes",

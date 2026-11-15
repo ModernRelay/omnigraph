@@ -5789,7 +5789,9 @@ dependencies = [
  "lance-namespace",
  "lance-select",
  "lance-table",
+ "lance-tokenizer",
  "libc",
+ "libm",
  "object_store 0.14.2",
  "omnigraph-catalog",
  "omnigraph-compiler",
@@ -5814,6 +5816,7 @@ dependencies = [
  "toml",
  "tracing",
  "ulid",
+ "unicode-normalization",
  "url",
 ]
 
@@ -5921,6 +5924,7 @@ dependencies = [
 name = "omnigraph-reference"
 version = "0.15.1"
 dependencies = [
+ "libm",
  "omnigraph-compiler",
  "serde_json",
 ]

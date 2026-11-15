@@ -22,6 +22,7 @@ use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion::physical_plan::execution_plan::EmissionType;
+use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::{DeltaClass, SubqueryPredicate};
 use omnigraph_compiler::query::file::LoadStmtMode;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
@@ -852,7 +853,41 @@ impl Lower for Walk<'_, '_> {
         self.built(id, TargetCutExec::new(input, column, targets))
     }
 
-    fn score(&mut self, id: NodeId, binding: &str, property: &str, input: Plan) -> Lowers<Plan> {
+    fn score(
+        &mut self,
+        id: NodeId,
+        binding: &str,
+        property: &str,
+        kind: ScoreKind,
+        _query: &IRExpr,
+        input: Plan,
+    ) -> Lowers<Plan> {
+        if kind == ScoreKind::Bm25 {
+            let scores = self.lowering.lexical.scores(id).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "the exact `bm25` {id} of `${binding}.{property}` was not answered before the run"
+                ))
+            })?;
+            let name = format!("{binding}.{}", self.lowering.catalog.system_columns.id);
+            let schema = input.schema();
+            let hidden = format!("{HIDDEN}{name}");
+            let id_column = if schema.column_with_name(&hidden).is_some() {
+                hidden
+            } else if schema.column_with_name(&name).is_some() {
+                name
+            } else {
+                return Err(OmniError::manifest_internal(format!(
+                    "the exact `bm25`'s identity '{name}' is not in its input"
+                ))
+                .into());
+            };
+            let score = format!(
+                "{binding}.{}",
+                omnigraph_compiler::query::value::SCORE_COLUMN
+            );
+            let exec = ScoreExec::bm25(input, id_column, score, scores)?;
+            return self.built(id, exec);
+        }
         let column = format!("{binding}.{property}");
         let vector = self.lowering.values.vectors.get(&id).ok_or_else(|| {
             OmniError::manifest_internal(format!(

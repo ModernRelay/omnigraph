@@ -215,6 +215,12 @@ impl PlanSource for Recorded<'_> {
         self.source.gate_policy()
     }
 
+    /// Not recorded: it reads the accepted catalog, which a replay checks by
+    /// the schema digest.
+    fn full_text_declares_analyzer(&self, type_key: &str, property: &str) -> bool {
+        self.source.full_text_declares_analyzer(type_key, property)
+    }
+
     fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
         let coverage = self.source.full_text_coverage(type_key, property);
         self.read

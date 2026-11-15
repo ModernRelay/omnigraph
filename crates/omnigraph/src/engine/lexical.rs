@@ -13,6 +13,11 @@
 //! analyzer). The operator then reads each call as a Boolean column, the
 //! membership of the row's identity in that set, which a null or token-empty
 //! document never joins.
+//!
+//! A call over a field whose index declares an analyzer is answered by the
+//! exact lexical scan instead ([`super::lexical_scan`]), with no index read,
+//! and so is every exact `bm25` `Score` of the plan: its scores by identity,
+//! which the operator appends to the rows it keeps.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -20,6 +25,8 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use omnigraph_compiler::catalog::Catalog;
+use omnigraph_compiler::ir::core::ScoreKind;
+use omnigraph_compiler::ir::expr::ScalarFunc;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
 use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 use omnigraph_planner::{NodeId, PhysicalNode, PhysicalPlan};
@@ -36,6 +43,9 @@ const MEMBERSHIP: &str = "~lexical:";
 #[derive(Default)]
 pub(super) struct LexicalMembers {
     sets: HashMap<(String, IRExpr), Arc<HashSet<String>>>,
+    /// The `bm25_v1` score of every match of each exact `bm25` `Score` node,
+    /// by identity.
+    scores: HashMap<NodeId, Arc<HashMap<String, f64>>>,
     /// The charge the sets hold for the query's lifetime.
     _memory: Option<WorkMemory>,
 }
@@ -68,12 +78,43 @@ impl LexicalMembers {
                 }
             }
         }
-        if wanted.is_empty() {
+        let exact_scores: Vec<(NodeId, &str, &IRExpr)> = plan
+            .live()
+            .filter_map(|(id, node)| match node {
+                PhysicalNode::Score {
+                    type_name,
+                    kind: ScoreKind::Bm25,
+                    query,
+                    ..
+                } => Some((id, type_name.as_str(), query)),
+                _ => None,
+            })
+            .collect();
+        if wanted.is_empty() && exact_scores.is_empty() {
             return Ok(Self::default());
         }
         let snapshot = snapshot.ok_or_else(|| super::no_graph_storage("a full-text call"))?;
+        let mut scores = HashMap::new();
+        for (id, type_name, call) in exact_scores {
+            let (property, query) =
+                super::lexical_scan::query_of_call(catalog, type_name, call, params)?;
+            let scored =
+                super::lexical_scan::bm25(snapshot, catalog, type_name, &property, &query, &memory)
+                    .await?;
+            scores.insert(id, Arc::new(scored));
+        }
         let mut sets = HashMap::new();
         for (type_name, call) in wanted {
+            if let Some(property) = exact_property(catalog, &type_name, &call) {
+                let (_, query) =
+                    super::lexical_scan::query_of_call(catalog, &type_name, &call, params)?;
+                let ids = super::lexical_scan::members(
+                    snapshot, catalog, &type_name, &property, &query, &memory,
+                )
+                .await?;
+                sets.insert((type_name, call), Arc::new(ids));
+                continue;
+            }
             let query = super::scan::build_fts_query(&call, params)?.ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "the full-text call `{call}` does not search a property"
@@ -101,8 +142,15 @@ impl LexicalMembers {
         }
         Ok(Self {
             sets,
+            scores,
             _memory: Some(memory),
         })
+    }
+
+    /// The scores the exact `bm25` `Score` node `id` appends, by identity;
+    /// `None` for a lowering that does not run.
+    pub(super) fn scores(&self, id: NodeId) -> Option<Arc<HashMap<String, f64>>> {
+        self.scores.get(&id).map(Arc::clone)
     }
 
     /// `exprs` of node `id` with every full-text call read as its membership
@@ -280,6 +328,27 @@ fn substitute(expr: &IRExpr, rewrite: &mut impl FnMut(&IRExpr) -> Option<IRExpr>
             ty: ty.clone(),
         },
         other => other.clone(),
+    }
+}
+
+/// The property a `match_terms` call over `type_name` reads, when its index
+/// declares an analyzer and the exact lexical scan answers it.
+fn exact_property(catalog: &Catalog, type_name: &str, call: &IRExpr) -> Option<String> {
+    let IRExpr::Call {
+        func: ScalarFunc::MatchTerms { .. },
+        args,
+        ..
+    } = call
+    else {
+        return None;
+    };
+    match args.first()? {
+        IRExpr::PropAccess { property, .. }
+            if super::lexical_scan::declared_profile(catalog, type_name, property).is_some() =>
+        {
+            Some(property.clone())
+        }
+        _ => None,
     }
 }
 

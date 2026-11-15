@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::read_shape::{PatternStep, ReadShape};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::expr::ScalarFunc;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, is_fresh_variable};
 use omnigraph_compiler::query::codes::{P002, P004};
@@ -449,17 +450,23 @@ pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
     targets
 }
 
-/// Every full-text call reads its property's full-text index, whose analyzer
-/// (case folding, stemming) a segment carries: a trained one with postings or
-/// the untrained declaration every write records. Coverage may be full or
-/// partial, since Lance scans uncovered rows with that analyzer; an absent
-/// index means no segment records the analyzer at the pinned snapshot, and
-/// Lance would fall back to a bare, case-sensitive tokenizer, so the call is
-/// refused rather than answered differently. The type checker (`T27`)
+/// Every full-text call over a field whose index declares no analyzer reads
+/// that index, whose analyzer (case folding, stemming) a segment carries: a
+/// trained one with postings or the untrained declaration every write
+/// records. Coverage may be full or partial, since Lance scans uncovered rows
+/// with that analyzer; an absent index means no segment records the analyzer
+/// at the pinned snapshot, and Lance would fall back to a bare,
+/// case-sensitive tokenizer, so the call is refused rather than answered
+/// differently. A field that declares an analyzer is answered by the exact
+/// lexical scan, which instantiates the analyzer from the accepted schema,
+/// so a declared but unbuilt index answers. The type checker (`T27`)
 /// already required the declaration.
 fn require_full_text_indexes(ir: &ReadShape, source: &dyn PlanSource) -> Result<(), PlanError> {
     for (type_name, property) in full_text_targets(ir) {
         let type_key = format!("node:{type_name}");
+        if source.full_text_declares_analyzer(&type_key, &property) {
+            continue;
+        }
         if source.full_text_coverage(&type_key, &property) == FullTextCoverage::Absent {
             return Err(PlanError::FullTextIndexRequired {
                 index: format!("{type_name}.{property}"),
@@ -819,18 +826,25 @@ fn resolve_pipeline(
                 binding,
                 type_name,
                 property,
+                kind,
                 query,
             } => {
                 let input = bound(current, "score")?;
                 let schema = schema_of(plan, input)?;
                 let mut reads = vec![ColumnRef::property(binding, property)];
                 reads_of_expr(query, &mut reads);
+                // An exact `bm25` finds each row's score by its identity.
+                if *kind == ScoreKind::Bm25 {
+                    reads.push(ColumnRef::property(binding, IDENTITY_MEMBER));
+                }
+                reads.dedup();
                 plan.add(
                     LogicalNode::Score {
                         input,
                         binding: binding.clone(),
                         type_name: type_name.clone(),
                         property: property.clone(),
+                        kind: *kind,
                         query: query.clone(),
                         reads,
                     },
@@ -3113,6 +3127,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             binding: _,
             type_name: _,
             property: _,
+            kind: _,
             query: _,
             reads,
         } => out.extend(reads.iter().cloned()),
@@ -4411,6 +4426,7 @@ impl Lowering<'_> {
                 binding,
                 type_name,
                 property,
+                kind,
                 query,
                 ..
             } => {
@@ -4421,6 +4437,7 @@ impl Lowering<'_> {
                     binding: binding.clone(),
                     type_name: type_name.clone(),
                     property: property.clone(),
+                    kind: *kind,
                     query: query.clone(),
                 }))
             }

@@ -1290,7 +1290,7 @@ async fn commit_detached(
 /// Lance has no Unicode normalization step: the profile's NFC is not applied
 /// on this path, so text that is not already NFC tokenizes as written. How
 /// NFC reaches a native index is open in the RFC (Unresolved question 10).
-fn full_text_index_params(analysis: &FullTextBuild) -> Result<InvertedIndexParams> {
+pub(crate) fn full_text_index_params(analysis: &FullTextBuild) -> Result<InvertedIndexParams> {
     use omnigraph_compiler::schema::analysis::{AnalyzerFilter, AnalyzerTokenizer};
     let Some(profile) = analysis.profile else {
         return Ok(InvertedIndexParams::default());

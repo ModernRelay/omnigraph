@@ -145,6 +145,11 @@ const B_IN_PROGRESS: &[InProgress] = &[
         text: "query q($v: Vector(3), $s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(distance($all, $d.embedding, $v), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",
     },
     InProgress {
+        construct: "an exact bm25 as an rrf arm",
+        site: "an `rrf` arm over `bm25` on a field whose index declares an analyzer",
+        text: "query q($v: Vector(3), $s: String) { match { let $all = { match { $m: Memo } return { $m } }, from rrf(nearest($all, $m.embedding, $v, k: 3), bm25($all, $m.text, $s), k: 60) as $score } return { $m.slug } order { $score desc } limit 3 }",
+    },
+    InProgress {
         construct: "an rrf of three arms",
         site: "an `rrf` of other than two arms",
         text: "query q($v: Vector(3), $s: String, $t: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), bm25($all, $d.body, $t)) as $score } return { $d.title } order { $score desc } limit 3 }",
@@ -152,12 +157,12 @@ const B_IN_PROGRESS: &[InProgress] = &[
     // `ReadShape`: the elements of a pattern.
     InProgress {
         construct: "match_terms with an edit budget in a `let`",
-        site: "`match_terms` with an edit budget other than `max_edits: 0`",
+        site: "`match_terms` with an edit budget other than `max_edits: 0` over a field whose index declares no analyzer",
         text: "query q($s: String) { match { $d: Doc, let $m = match_terms($d.body, terms($s, mode: any, max_edits: 1)) } return { $d.title, $m } }",
     },
     InProgress {
         construct: "match_terms with an edit budget",
-        site: "`match_terms` with an edit budget other than `max_edits: 0`",
+        site: "`match_terms` with an edit budget other than `max_edits: 0` over a field whose index declares no analyzer",
         text: "query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 1)) return { $d.title } }",
     },
     InProgress {
@@ -600,7 +605,9 @@ const CLOSURE: &[Row] = &[
 /// The tests' schema with a node holding a `Blob`, which a write's
 /// assignment may read from a row.
 fn catalog() -> Catalog {
-    let schema = format!("{SCHEMA}\nnode File {{ name: String @key  data: Blob? }}\n");
+    let schema = format!(
+        "{SCHEMA}\nnode File {{ name: String @key  data: Blob? }}\nnode Memo {{ slug: String @key  text: String @index(fulltext, analyzer = \"standard_v1\")  embedding: Vector(3) @index }}\n"
+    );
     build_catalog(&parse_schema(&schema).expect("the schema parses")).unwrap()
 }
 

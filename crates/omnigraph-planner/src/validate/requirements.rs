@@ -345,9 +345,9 @@ pub struct Requirements {
     /// The names every `Union` node of the plan binds: one entry per arm
     /// after the first of each written `union`.
     pub(crate) unions: Vec<Vec<String>>,
-    /// Every `distance` of the query: the scored binding, its vector
-    /// property and the query, each one `Score` node of the plan.
-    pub(crate) scores: Vec<(String, String, IRExpr)>,
+    /// Every exact score of the query (`distance`, and `bm25` on a field
+    /// whose index declares an analyzer), each one `Score` node of the plan.
+    pub(crate) scores: Vec<ExactScore>,
     /// The value of every `let` that can fail, each one `Let` node of the
     /// plan.
     pub(crate) lets: Vec<IRExpr>,
@@ -383,6 +383,19 @@ pub struct Requirements {
     pub(crate) window: Option<Option<u64>>,
 }
 
+/// One exact score the query writes: the scored binding, its node type
+/// (whose entities are a `bm25` score's field corpus), the property, the
+/// kind and the query (`distance`'s vector, or the `match_terms` predicate an
+/// exact `bm25` retains).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExactScore {
+    pub(crate) binding: String,
+    pub(crate) type_name: String,
+    pub(crate) property: String,
+    pub(crate) kind: omnigraph_compiler::ir::core::ScoreKind,
+    pub(crate) query: IRExpr,
+}
+
 impl Requirements {
     pub(crate) fn derive(
         input: &AcceptInput<'_>,
@@ -413,10 +426,17 @@ impl Requirements {
             match op {
                 PatternStep::Score {
                     binding,
+                    type_name,
                     property,
+                    kind,
                     query,
-                    ..
-                } => scores.push((binding.clone(), property.clone(), query.clone())),
+                } => scores.push(ExactScore {
+                    binding: binding.clone(),
+                    type_name: type_name.clone(),
+                    property: property.clone(),
+                    kind: *kind,
+                    query: query.clone(),
+                }),
                 PatternStep::Let { value, .. } => lets.push(value.clone()),
                 PatternStep::Rank { key, window, .. } => {
                     rank_step = Some((key, *window));

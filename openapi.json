@@ -17052,7 +17052,7 @@
           },
           "read_work_limit": {
             "type": "integer",
-            "description": "how many results the expansions of one read may produce, every hop of every traversal together; exhaustion fails the read with an error naming it, never a partial result",
+            "description": "how much work one read may do: the results its expansions produce, every hop of every traversal together, and the tokens and term comparisons of its exact lexical scans; exhaustion fails the read with an error naming it, never a partial result",
             "maximum": 9223372036854775807,
             "minimum": 1
           },

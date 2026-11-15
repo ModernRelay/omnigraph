@@ -177,6 +177,147 @@ fn ranked() -> Fixture {
     Fixture::new(RANKED, &[("q", Literal::String("graph".into()))])
 }
 
+const DECLARED_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    body: String @index(fulltext, analyzer = "standard_v1")
+    title: String @index(fulltext, analyzer = "standard_v1")
+    year: I64
+}
+"#;
+
+const EXACT_BM25: &str = r#"query q($q: String) {
+    match { let $pop = { match { $d: Doc } where $d.year > 2000 return { $d } }, from bm25($pop, $d.body, terms($q, mode: all, max_edits: 1)) as $score }
+    return { $d.slug, $score as score }
+    order { $score desc }
+}"#;
+
+fn exact_bm25() -> Fixture {
+    Fixture::with_schema(
+        DECLARED_SCHEMA,
+        EXACT_BM25,
+        &[("q", Literal::String("graph".into()))],
+    )
+}
+
+/// The one exact `bm25` `Score` of `plan`.
+fn exact_score(plan: &mut PhysicalPlan) -> &mut PhysicalNode {
+    let [id] = node_ids(plan, |node| matches!(node, PhysicalNode::Score { .. }))[..] else {
+        panic!("the exact bm25 plans one Score");
+    };
+    plan.node_mut(id).unwrap()
+}
+
+/// An exact `bm25` plans a `Score` of kind `bm25` that retains its
+/// `match_terms` predicate; a plan scoring another kind, another predicate
+/// or another field is refused (search identity), and so is one whose
+/// retained predicate is not its field's `match_terms` (predicate
+/// retention), one scoring a type that declares no analyzer (scoring
+/// corpus) and a read of an `F64` `_score` no exact `bm25` produces (score
+/// origin).
+#[test]
+fn an_exact_bm25_is_one_score_retaining_its_predicate_over_its_field_corpus() {
+    use omnigraph_compiler::ir::core::ScoreKind;
+    let fixture = exact_bm25();
+    let plan = fixture.plan();
+    assert!(
+        node_ids(&plan, |node| matches!(
+            node,
+            PhysicalNode::Scan {
+                ranked: Some(_),
+                ..
+            }
+        ))
+        .is_empty(),
+        "an exact bm25 ranks no scan"
+    );
+    fixture
+        .accept(plan.clone())
+        .expect("the planned plan is accepted");
+
+    let mut distance = plan.clone();
+    if let PhysicalNode::Score { kind, .. } = exact_score(&mut distance) {
+        *kind = ScoreKind::Distance;
+    }
+    let (check, detail) = fixture.refused(distance);
+    assert_eq!(check, "search identity", "{detail}");
+
+    let mut no_edits = plan.clone();
+    if let PhysicalNode::Score { query, .. } = exact_score(&mut no_edits)
+        && let IRExpr::Call { args, .. } = query
+    {
+        args[2] = IRExpr::Literal(Literal::Integer(0), args[2].ty().clone());
+    }
+    let (check, detail) = fixture.refused(no_edits);
+    assert_eq!(check, "search identity", "{detail}");
+
+    let mut other_field = plan.clone();
+    if let PhysicalNode::Score { property, .. } = exact_score(&mut other_field) {
+        *property = "title".to_string();
+    }
+    let (check, detail) = fixture.refused(other_field);
+    assert_eq!(check, "search identity", "{detail}");
+
+    // A shape whose score keeps a constant instead of the field's
+    // `match_terms` is refused even where the query's own shape says so.
+    let mut dropped = exact_bm25();
+    let constant = IRExpr::Literal(
+        Literal::Bool(true),
+        omnigraph_compiler::types::ExprType::from_prop(
+            &omnigraph_compiler::types::PropType::scalar(
+                omnigraph_compiler::types::ScalarType::Bool,
+                false,
+            ),
+        ),
+    );
+    for step in &mut dropped.ir.pipeline {
+        if let crate::read_shape::PatternStep::Score { query, .. } = step {
+            *query = constant.clone();
+        }
+    }
+    let mut dropped_plan = plan.clone();
+    if let PhysicalNode::Score { query, .. } = exact_score(&mut dropped_plan) {
+        *query = constant;
+    }
+    let (check, detail) = dropped.refused(dropped_plan);
+    assert_eq!(check, "predicate retention", "{detail}");
+
+    let mut undeclared = exact_bm25();
+    undeclared.catalog = build_catalog(
+        &parse_schema(&DECLARED_SCHEMA.replace(
+            r#"body: String @index(fulltext, analyzer = "standard_v1")"#,
+            "body: String @index",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let (check, detail) = undeclared.refused(plan.clone());
+    assert_eq!(check, "scoring corpus", "{detail}");
+
+    // The score moved to another binding, predicate and all: the read's
+    // `$d._score` is then no exact `bm25`'s.
+    let elsewhere = |binding: &mut String, query: &mut IRExpr| {
+        *binding = "e".to_string();
+        if let IRExpr::Call { args, .. } = query
+            && let IRExpr::PropAccess { variable, .. } = &mut args[0]
+        {
+            *variable = "e".to_string();
+        }
+    };
+    let mut stray = exact_bm25();
+    for step in &mut stray.ir.pipeline {
+        if let crate::read_shape::PatternStep::Score { binding, query, .. } = step {
+            elsewhere(binding, query);
+        }
+    }
+    let mut stray_plan = plan;
+    if let PhysicalNode::Score { binding, query, .. } = exact_score(&mut stray_plan) {
+        elsewhere(binding, query);
+    }
+    let (check, detail) = stray.refused(stray_plan);
+    assert_eq!(check, "score origin", "{detail}");
+}
+
 #[test]
 fn the_planned_plans_are_accepted() {
     for fixture in [filtered(), ranked()] {
