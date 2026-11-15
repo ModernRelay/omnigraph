@@ -1270,6 +1270,11 @@ impl<'a> Shaper<'a> {
                         name: name.clone(),
                         type_name: ty.display_name().trim_end_matches('?').to_string(),
                         nullable: ty.nullable,
+                        default: read
+                            .defaults
+                            .iter()
+                            .find(|(declared, _)| declared == name)
+                            .map(|(_, value)| value.clone()),
                     },
                     ty: ExprType::from_prop(ty),
                 })

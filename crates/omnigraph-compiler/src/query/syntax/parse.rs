@@ -307,6 +307,7 @@ pub(crate) fn into_query_file(file: SourceFile) -> QueryFile {
                     name: p.name.clone(),
                     type_name: p.type_name.clone(),
                     nullable: p.nullable,
+                    default: p.default.as_ref().map(crate::query::check::default_value),
                 })
                 .collect(),
             write_mode: decl.write_mode.clone(),

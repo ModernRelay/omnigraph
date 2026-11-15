@@ -30,16 +30,18 @@ omnigraph query engineers --query queries.gq \
 ## Declarations and parameters
 
 ```text
-query <name>($required: String, $optional: I32?) { ... }
+query <name>($required: String, $optional: I32?, $min: I32 = 18) { ... }
 ```
 
-Parameter types use the schema scalar types. Every non-nullable declared
-parameter must be supplied; omission fails before query execution. A trailing
-`?` accepts `null` or an omitted value. `@description("...")` and
-`@instruction("...")` attach metadata for tool clients. An integer parameter
-carries its type's whole range: a `U64` takes `0` to `18446744073709551615`.
-A source declares each name once, compared case-sensitively as a call resolves
-it; a second declaration is `T83`, naming both: rename or delete the later one.
+Parameter types use the schema scalar types. A non-nullable parameter without
+a default must be supplied; omission fails before execution. A trailing `?`
+accepts `null` or an omitted value, which is null. `= value` declares a
+default, a literal of the type (`T3` otherwise), that an omitted parameter
+takes; a supplied value or an explicit `null` replaces it. `@description` and
+`@instruction` attach metadata for tool clients. An integer parameter carries
+its type's whole range: a `U64` takes `0` to `18446744073709551615`. A source
+declares each name once, compared case-sensitively as a call resolves it; a
+second declaration is `T83`, naming both: rename or delete the later one.
 
 ## Match patterns
 
@@ -92,8 +94,7 @@ to `null` makes every comparison on it null, and `is null` refuses a `Blob`.
 or a return alias. `$p.and` after a dot and `and: 1` in an assignment stay
 legal; `nothing` and `android` are ordinary identifiers.
 A bare name is never a value in a read (`Q018`): a property is `$x.name`, a
-parameter `$name` and a string `"name"`; the one bare name is a return alias in
-`order`.
+parameter `$name` and a string `"name"`; the one bare name is an `order` alias.
 Inside `match` any word is an edge name, reserved words included: `$i in $b`
 follows the edge `In` there and tests membership in `where` (`T7` for the
 wrong side); a [write](../mutations/index.md) selects the same way.
@@ -164,9 +165,8 @@ query prolific($least: I64) {
   and `contains` over a list, are `T7`, with the call or `in` as the fix.
 
 `NULL` never matches these predicates, and `%` and `_` are not wildcards. They
-are correct without an index, and a free-text String index does not accelerate
-them; use [full-text search](../search/index.md) for tokens, fuzzy matching and
-relevance.
+are correct without an index, and a free-text index does not speed them up;
+use [full-text search](../search/index.md) for tokens, fuzzy matching, relevance.
 
 ### System fields
 

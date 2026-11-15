@@ -295,6 +295,7 @@ fn typed_decl(catalog: &Catalog, unit: &HashMap<String, &Decl>, decl: &Decl) -> 
             CoreDecl::Read(Box::new(CoreRead {
                 name: decl.name.clone(),
                 params: r.params,
+                defaults: param_defaults(&decl.params),
                 term: r.rel.term,
                 result: r.rel.ty,
                 plan_budget: r.budget,
@@ -1403,6 +1404,24 @@ fn param_types(params: &[Param]) -> R<Vec<(String, PropType)>> {
     Ok(out)
 }
 
+/// The value a parameter's default writes, its sign applied.
+pub(crate) fn default_value(default: &ParamDefault) -> Literal {
+    match (&default.value, default.negative) {
+        (Literal::Integer(n), true) => Literal::Integer(-n),
+        (Literal::Float(f), true) => Literal::Float(-f),
+        (value, _) => value.clone(),
+    }
+}
+
+/// The declared defaults of `params`, each typed by [`param_types`] against
+/// its declaration first.
+fn param_defaults(params: &[Param]) -> Vec<(String, Literal)> {
+    params
+        .iter()
+        .filter_map(|p| Some((p.name.clone(), default_value(p.default.as_ref()?))))
+        .collect()
+}
+
 struct ReadOut {
     params: Vec<(String, PropType)>,
     rel: Rel,
@@ -1857,6 +1876,7 @@ impl Ctx<'_> {
         Ok(CoreWrite {
             name: decl.name.clone(),
             params,
+            defaults: param_defaults(&decl.params),
             groups,
             class: class.map_or(WriteClass::Constructive, |(c, _)| c),
             write_mode: decl.write_mode.clone(),
@@ -4142,15 +4162,7 @@ impl Ctx<'_> {
                 }
                 None => {
                     let d = decl.params[i].default.as_ref().unwrap();
-                    let mut lit = d.value.clone();
-                    if d.negative {
-                        lit = match lit {
-                            Literal::Integer(n) => Literal::Integer(-n),
-                            Literal::Float(f) => Literal::Float(-f),
-                            other => other,
-                        };
-                    }
-                    SExpr::new(SKind::Lit(lit), Ty::Value(pty.clone()))
+                    SExpr::new(SKind::Lit(default_value(d)), Ty::Value(pty.clone()))
                 }
             };
             bindings.push(v);

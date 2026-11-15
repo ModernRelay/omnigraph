@@ -1284,7 +1284,8 @@ A named mutation is parsed, checked, and lowered against one captured
 `MutationTarget`; execution reads that namespace directly. Binding completes
 and validates every stored parameter declaration before any statement runs,
 including unused declarations and mutations matching no rows. Missing required
-parameters are refused; omitted nullable parameters bind to null. Expected-head
+parameters are refused; an omitted parameter binds to its declared default,
+or to null when it is nullable and declares none. Expected-head
 checks run before parameter validation, and the request clock is sampled once
 across retries.
 

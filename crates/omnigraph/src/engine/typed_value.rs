@@ -12,12 +12,16 @@ use crate::error::{
     unwitnessed_graph_property_at_snapshot,
 };
 
-/// Fill omitted nullable declarations and refuse omitted required ones.
-/// Bound values, including the invocation's sampled clock, stay unchanged.
+/// Bind each omitted declaration to its declared default, an omitted
+/// nullable one without a default to null, and refuse an omitted required
+/// one. A supplied value, an explicit null included, and the invocation's
+/// sampled clock stay unchanged.
 pub(crate) fn fill_declared_params(params: &mut ParamMap, declared: &[IRParam]) -> Result<()> {
     for param in declared {
         if let Entry::Vacant(entry) = params.entry(param.declaration.name.clone()) {
-            if matches!(param.ty, ExprType::Value { nullable: true, .. }) {
+            if let Some(default) = &param.declaration.default {
+                entry.insert(default.clone());
+            } else if matches!(param.ty, ExprType::Value { nullable: true, .. }) {
                 entry.insert(Literal::Null);
             } else {
                 return Err(OmniError::manifest(format!(
@@ -30,8 +34,9 @@ pub(crate) fn fill_declared_params(params: &mut ParamMap, declared: &[IRParam]) 
     Ok(())
 }
 
-/// Validate every declaration at binding, including parameters the plan omits.
-/// The caller owns defaults and the single sampling of `now()`.
+/// Validate every declaration at binding, including parameters the plan omits
+/// and the defaults [`fill_declared_params`] bound. The caller owns the single
+/// sampling of `now()`.
 pub(crate) fn validate_params(params: &ParamMap, declared: &[IRParam]) -> Result<()> {
     fn dates(literal: &Literal) -> Result<()> {
         match literal {
@@ -1049,6 +1054,7 @@ mod tests {
                         name: "unused".into(),
                         type_name: prop.display_name(),
                         nullable: false,
+                        default: None,
                     },
                     ty: ExprType::from_prop(&prop),
                 };
@@ -1084,6 +1090,7 @@ mod tests {
                     name: "unused".into(),
                     type_name: "Vector(2)".into(),
                     nullable,
+                    default: None,
                 },
                 ty: scalar(ScalarType::Vector(2), nullable),
             };
@@ -1114,6 +1121,7 @@ mod tests {
                     name: "unused".into(),
                     type_name: "Blob".into(),
                     nullable: !nullable,
+                    default: None,
                 },
                 ty: scalar(ScalarType::Blob, nullable),
             };

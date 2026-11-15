@@ -2324,6 +2324,25 @@ query instants() {
     );
 }
 
+/// An omitted parameter is bound to its declared default at gather, so the
+/// value table carries the default and the replay reads it from there.
+#[tokio::test]
+async fn a_defaulted_parameter_replays_from_the_value_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let source = r#"
+query older($min: I64 = 35) {
+    match { $p: Person }
+    where $p.age > $min
+    return { $p.name }
+    order { $p.name }
+}
+"#;
+    let Replayed { result, plan, .. } = replayed(&db, source, "older", &ParamMap::new()).await;
+    assert_eq!(result.len(), 2, "{result:?}");
+    assert_eq!(plan.values.params.get("min"), Some(&Literal::Integer(35)));
+}
+
 /// A saved plan carrying a count cut the query does not require is invalid
 /// evidence, wherever the cut sits: a `Limit(0)` over the unfiltered count
 /// would replay as no rows where the query returns its one count row, and a

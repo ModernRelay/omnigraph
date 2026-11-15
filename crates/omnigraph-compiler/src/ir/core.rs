@@ -24,7 +24,7 @@
 
 use super::expr::IRExpr;
 use crate::query::file::MutationWriteMode;
-use crate::query::value::AggFunc;
+use crate::query::value::{AggFunc, Literal};
 use crate::traversal::EdgeSelection;
 use crate::types::{ExprType, PropType, ScalarType};
 
@@ -448,6 +448,9 @@ impl CoreNode {
 pub struct CoreRead {
     pub name: String,
     pub params: Vec<(String, PropType)>,
+    /// The declared default of each parameter that writes one, in
+    /// declaration order: the value binding uses when the caller omits it.
+    pub defaults: Vec<(String, Literal)>,
     pub term: Term,
     pub result: RelTy,
     /// `@budget(plan = n)`, or the compiler's constant.
@@ -497,6 +500,8 @@ pub enum WriteClass {
 pub struct CoreWrite {
     pub name: String,
     pub params: Vec<(String, PropType)>,
+    /// As [`CoreRead::defaults`].
+    pub defaults: Vec<(String, Literal)>,
     pub groups: Vec<WriteGroup>,
     pub class: WriteClass,
     pub write_mode: MutationWriteMode,
