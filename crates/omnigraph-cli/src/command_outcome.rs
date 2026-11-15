@@ -95,7 +95,7 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
         }),
         Command::Queries { command, .. } => match command {
             QueriesCommand::List { .. } => Some(Read),
-            QueriesCommand::Validate { .. } => None,
+            QueriesCommand::Validate { .. } | QueriesCommand::Fmt { .. } => None,
         },
         Command::Graphs { command, .. } => match command {
             GraphsCommand::List { .. } => Some(Read),

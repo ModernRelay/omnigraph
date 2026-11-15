@@ -78,4 +78,30 @@ pub(crate) enum QueriesCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Write query files in GQ's canonical spelling, never changing what a
+    /// query means.
+    ///
+    /// Formats each named `.gq` file and every `.gq` file under a named
+    /// directory in place, or reads stdin and writes stdout when no path or
+    /// `-` is given. It writes `exists { … }` for `count { … } > 0`, a flat
+    /// `union`, the ends of `<e>` and an alternation's members in name order,
+    /// no `asc`, no alias equal to its column's name, call options in the
+    /// registry's order without defaults, and `bm25` over a String for
+    /// `terms(q, mode: any)`; a short `match` on one line, a long one an
+    /// element per line. With `--schema`, `search`, `match_text` and `fuzzy`
+    /// over a field whose index declares an analyzer become `match_terms`.
+    /// No target or credential is read.
+    Fmt {
+        /// `.gq` files or directories; none, or `-`, reads stdin.
+        paths: Vec<PathBuf>,
+        /// Write nothing; exit 1 when a file is not in its canonical spelling.
+        #[arg(long)]
+        check: bool,
+        /// The schema the queries run against (`.pg`), which decides where an
+        /// older lexical call is `match_terms`.
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }

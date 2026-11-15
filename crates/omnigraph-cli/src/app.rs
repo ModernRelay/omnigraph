@@ -733,6 +733,27 @@ async fn run_bound(
             )
             .await;
         }
+        Command::Queries {
+            command:
+                commands::control::QueriesCommand::Fmt {
+                    paths,
+                    check,
+                    schema,
+                    json,
+                },
+        } => {
+            return commands::control::run_queries_fmt(
+                commands::control::FmtArgs {
+                    paths,
+                    check,
+                    schema,
+                    json,
+                },
+                input.reader,
+                stdout,
+                stderr,
+            );
+        }
         Command::Queries { command } => {
             return commands::control::run_queries(
                 command,

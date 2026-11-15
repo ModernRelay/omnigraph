@@ -13,9 +13,11 @@ use crate::operator;
 use crate::targets::TargetBinding;
 
 mod args;
+mod fmt;
 mod output;
 
 pub(crate) use args::{GraphsCommand, PolicyCommand, QueriesCommand};
+pub(crate) use fmt::{FmtArgs, run_queries_fmt};
 use output::{
     QueriesIssue, QueriesListItem, QueriesListOutput, QueriesParam, QueriesValidateOutput,
 };
@@ -56,6 +58,7 @@ pub(crate) async fn run_queries(
         QueriesCommand::List { json } => {
             execute_queries_list(&binding, scope.graph, json, stdout).await?;
         }
+        QueriesCommand::Fmt { .. } => unreachable!("`queries fmt` reads no target"),
     }
     Ok(Completion::success())
 }

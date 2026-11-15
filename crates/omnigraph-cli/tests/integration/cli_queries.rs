@@ -1789,3 +1789,122 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     assert!(stderr.contains("error[Q002]:"), "{stderr}");
     assert!(stderr.contains("fix: query name()"), "{stderr}");
 }
+
+/// `queries fmt` (docs/rfcs/2026-11-07-gq-3.md, section 6) on a file, a
+/// directory and stdin: `--check` writes nothing and exits 1 when a file
+/// would change, a run without it writes the canonical spelling in place,
+/// stdin is answered on stdout, `--json` reports every source, and a source
+/// that does not parse is refused with exit 1 and left as it was. No target
+/// is read: `--target` is refused.
+#[test]
+fn queries_fmt_checks_and_writes_files_directories_and_stdin() {
+    let dir = tempdir().unwrap();
+    let nested = dir.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    let loose = "// a note\nquery f() { match { $p: Person } where count { $q: Person, $p knows $q } > 0 return { $p as p } order { $p.name asc } }\n";
+    let canonical = "// a note\nquery f() {\n  match { $p: Person }\n  where exists { $q: Person, $p knows $q }\n  return { $p }\n  order { $p.name }\n}\n";
+    let file = nested.join("a.gq");
+    fs::write(&file, loose).unwrap();
+    let done = dir.path().join("b.gq");
+    fs::write(&done, canonical).unwrap();
+    fs::write(dir.path().join("notes.txt"), loose).unwrap();
+
+    // `--check` names the file that would change, writes nothing, exits 1.
+    let output = output_failure(cli().args(["queries", "fmt", "--check"]).arg(dir.path()));
+    assert_eq!(
+        stdout_string(&output),
+        format!("would reformat {}\n", file.display())
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), loose);
+    let output = output_failure(
+        cli()
+            .args(["queries", "fmt", "--check", "--json"])
+            .arg(&file)
+            .arg(&done),
+    );
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["status"], "error");
+    assert_eq!(report["changed"], 1);
+    assert_eq!(report["files"][0]["changed"], true);
+    assert_eq!(report["files"][0]["written"], false);
+    assert_eq!(report["files"][1]["changed"], false);
+
+    // Without it the file is written, and checking again passes.
+    let output = output_success(cli().args(["queries", "fmt"]).arg(dir.path()));
+    assert_eq!(
+        stdout_string(&output),
+        format!("formatted {}\n", file.display())
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), canonical);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+        loose
+    );
+    let output = output_success(cli().args(["queries", "fmt", "--check"]).arg(dir.path()));
+    assert_eq!(
+        stdout_string(&output),
+        "2 file(s) already in canonical spelling\n"
+    );
+
+    // Stdin is answered on stdout, with or without `-`.
+    for args in [vec!["queries", "fmt"], vec!["queries", "fmt", "-"]] {
+        let output = output_success(cli().args(&args).write_stdin(loose));
+        assert_eq!(stdout_string(&output), canonical);
+    }
+    let output = output_failure(
+        cli()
+            .args(["queries", "fmt", "--check", "-"])
+            .write_stdin(loose),
+    );
+    assert_eq!(stdout_string(&output), "would reformat -\n");
+
+    // A source that does not parse is refused where it fails and kept.
+    let broken = dir.path().join("broken.gq");
+    fs::write(&broken, "query f() { match { $p: Person } where }\n").unwrap();
+    let output = output_failure(cli().args(["queries", "fmt"]).arg(&broken));
+    assert!(
+        stderr_string(&output).starts_with(&format!("{}:1:40: parse error", broken.display())),
+        "{}",
+        stderr_string(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(&broken).unwrap(),
+        "query f() { match { $p: Person } where }\n"
+    );
+
+    // With the schema, an older lexical call over a field whose index
+    // declares an analyzer is written as `match_terms`; without it, kept.
+    let schema = dir.path().join("schema.pg");
+    fs::write(
+        &schema,
+        "node Doc { slug: String @key  title: String @index(fulltext, analyzer = \"english_v1\") }\n",
+    )
+    .unwrap();
+    let lexical = "query s($q: String) {\n  match { $d: Doc }\n  where search($d.title, $q)\n  return { $d.slug }\n}\n";
+    let output = output_success(cli().args(["queries", "fmt"]).write_stdin(lexical));
+    assert_eq!(stdout_string(&output), lexical);
+    let output = output_success(
+        cli()
+            .args(["queries", "fmt", "--schema"])
+            .arg(&schema)
+            .write_stdin(lexical),
+    );
+    assert_eq!(
+        stdout_string(&output),
+        lexical.replace(
+            "search($d.title, $q)",
+            "match_terms($d.title, terms($q, mode: any))"
+        )
+    );
+
+    let output = output_failure(
+        cli()
+            .args(["queries", "fmt", "--target", "graph"])
+            .arg(&file),
+    );
+    assert!(
+        stderr_string(&output).contains("queries fmt does not accept --target"),
+        "{}",
+        stderr_string(&output)
+    );
+}
