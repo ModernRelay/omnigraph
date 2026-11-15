@@ -268,7 +268,8 @@ means a declared user property named `id`; it is not an identity shorthand.
 `{"@id":"alice","name":"Alice"}`. It includes declared properties except
 Blob and Vector properties. Project `$p.@id` for just the identity or
 `$p.embedding` for a vector; Blob values require the Blob API. Bare edge
-bindings cannot be projected.
+bindings cannot be projected (`T86`); return their fields (`$k.@id`, `$k.@src`,
+`$k.@dst`, `$k.@type`, properties).
 
 Each projection needs a distinct result column name (`T25`): use aliases when
 expressions would collide. Aliases can be used in `order`, including after a

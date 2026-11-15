@@ -86,7 +86,11 @@ $k.@src, $k.@dst }`. Edge
 bindings are available only for a single hop. Alternatives share the same
 deduplication and shortest-distance search across all members. Bound edges are
 identified by canonical type plus ID, so equal IDs in different types remain
-distinct. An undirected self-loop appears once.
+distinct: `count(distinct $k)` counts them apart, and `order { $k }` sorts by
+type, then ID. An undirected self-loop appears once. A bound edge is read
+through its fields (`$k.@id`, `$k.@src`, `$k.@dst`, `$k.@type` and its
+properties); a result has no edge object, so `return { $k }` is not lowered in
+this release (`T86`).
 
 A bound edge property must exist on every member with the same base value type.
 Scalar/list shape and Vector dimensions must agree. It is nullable if any

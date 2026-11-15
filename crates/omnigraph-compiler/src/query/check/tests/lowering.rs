@@ -39,6 +39,7 @@ struct Row {
 /// owns it; this table's schema has no `Blob`).
 const B_IN_PROGRESS: &[&str] = &[
     "a node an optional introduces returned whole",
+    "an edge reference returned whole",
     "a ranking inside an inline read with its own order and limit",
     "a union arm returning an edge",
     "a union arm returning a value that reads the enclosing scope",
@@ -115,6 +116,15 @@ const CLOSURE: &[Row] = &[
             ),
             (
                 "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name } }",
+                Lowers,
+            ),
+            // "an edge reference returned whole"
+            (
+                "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }",
+                Refused("B"),
+            ),
+            (
+                "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $k.@id, $k.@src, $k.@dst } order { $k } }",
                 Lowers,
             ),
             // "a node an optional introduces returned whole"

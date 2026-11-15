@@ -296,7 +296,7 @@ that calls itself.
 |---|---|
 | `distance` as an `rrf` arm, two `rrf` arm windows that differ, `rrf` arms over two different populations | B |
 | A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope | B |
-| A node an `optional` introduces, returned whole | B |
+| A node an `optional` introduces, or an edge reference, returned whole | B |
 | A ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit` | B |
 | A block compared with another block's value, a block of several aggregates | B |
 | A full-text call (`search`, `fuzzy`, `match_text`, `match_terms`) read as a value in `return`, `order` or a block's aggregate | B |
