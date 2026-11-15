@@ -3475,16 +3475,20 @@ fn groups_or_cuts(term: &Term) -> bool {
     }
 }
 
-/// The outer columns a correlated term reads: its `Env` leaf's.
+/// The outer columns a correlated pattern reads: the `Env` leaf it starts
+/// from, along its first inputs. A nested scope's own `Env` (a block's, an
+/// `optional`'s, an inline read's) is off that path.
 fn env_columns(term: &Term) -> Vec<String> {
-    let mut pending = vec![term];
-    while let Some(term) = pending.pop() {
-        if let Term::Env(cols) = term {
-            return cols.iter().map(|c| c.name.clone()).collect();
+    let mut leaf = term;
+    loop {
+        match leaf {
+            Term::Env(cols) => return cols.iter().map(|c| c.name.clone()).collect(),
+            other => match other.children().first() {
+                Some(child) => leaf = child,
+                None => return Vec::new(),
+            },
         }
-        pending.extend(term.children());
     }
-    Vec::new()
 }
 
 /// `p` of an `optional { p }`, from the inner term the type checker writes

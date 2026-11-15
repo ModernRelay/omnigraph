@@ -9,7 +9,9 @@
 # notes: is evaluated as written, per outer row when it reads the enclosing
 # notes: scope and once otherwise: an outer `where` never widens its cut, an
 # notes: outer `limit` never becomes it, and a read grouped by no key is one
-# notes: row per outer row, `count` 0 where nothing matches.
+# notes: row per outer row, `count` 0 where nothing matches. A block in the
+# notes: inline read's `where` correlates on the inline read's names and
+# notes: leaves the inline read correlated on the enclosing ones.
 
 --- runner
 timeout_ms: 10000
@@ -110,6 +112,41 @@ query from_hides_the_names_it_does_not_return() {
 --- expect shape
 p.handle: String
 c.slug: String
+
+--- query
+query from_with_a_block_in_its_where() {
+    match {
+        $p: Person,
+        from { match { $q: Person, $p knows $q } where exists { $g: Person, $q knows $g } return { $q } },
+    }
+    return { $p.handle, $q.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada","q.handle":"bob"}
+
+--- expect shape
+p.handle: String
+q.handle: String
+
+--- query
+query from_grouped_with_a_block_in_its_where() {
+    match {
+        $p: Person,
+        from { match { $q: Person, $p knows $q } where exists { $g: Person, $q knows $g } return { count($q) as n } },
+    }
+    return { $p.handle, $n }
+}
+
+--- expect unordered
+{"n":0,"p.handle":"bob"}
+{"n":0,"p.handle":"cy"}
+{"n":0,"p.handle":"di"}
+{"n":1,"p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+n: I64?
 
 --- query
 query from_over_a_grouped_read() {
