@@ -115,7 +115,6 @@ query q() {
 }
 
 --- expect unordered
-{"p.handle":"ada","q.handle":"ada"}
 {"p.handle":"ada","q.handle":"bob"}
 {"p.handle":"ada","q.handle":"cy"}
 {"p.handle":"bob","q.handle":"ada"}

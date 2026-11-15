@@ -1296,6 +1296,10 @@ where
     };
     let budgeted = step.budgeted();
     let max = step.max_hops;
+    // The single hop returns a self-loop's start node; every other range
+    // never returns its start, through a cycle (the start is visited from
+    // the first hop) or a self-loop.
+    let single_hop = min_hops == 1 && max == 1;
 
     let mut active = match start_indexed {
         Some((datasets, pushdown)) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
@@ -1573,6 +1577,7 @@ where
                         added = added.saturating_add(WorkMemory::entry_bytes::<u32>());
                     }
                     if hop >= min_hops
+                        && (single_hop || !is_self)
                         && (neighbor as usize) < ids.len()
                         && seen_dst.insert(source_node_key(i, neighbor))
                     {

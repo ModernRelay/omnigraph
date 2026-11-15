@@ -417,9 +417,9 @@ const LOOP_DATA: &str = r#"{"type":"P","data":{"name":"a"}}
 {"edge":"Knows","id":"bb","from":"b","to":"b","data":{}}"#;
 
 #[test]
-fn expand_returns_its_source_only_through_a_self_loop() {
+fn expand_returns_its_source_only_through_a_self_loop_of_the_single_hop() {
     // a reaches itself through b in two hops, which `Expand` never returns;
-    // b's own loop is one hop, and is returned.
+    // b's own loop returns b to the single hop, and to no range.
     let (out, _) = rows_over(
         LOOPS,
         LOOP_DATA,
@@ -429,9 +429,17 @@ fn expand_returns_its_source_only_through_a_self_loop() {
         sorted(out),
         vec![
             json!({"p.name": "a", "q.name": "b"}),
-            json!({"p.name": "b", "q.name": "a"}),
-            json!({"p.name": "b", "q.name": "b"})
+            json!({"p.name": "b", "q.name": "a"})
         ]
+    );
+    let (out, _) = rows_over(
+        LOOPS,
+        LOOP_DATA,
+        "query q() { match { $p: P, $p knows $q } where $p.name = \"b\" return { $q.name } }",
+    );
+    assert_eq!(
+        sorted(out),
+        vec![json!({"q.name": "a"}), json!({"q.name": "b"})]
     );
     // Shortest distance: b is one hop from a, so not two.
     let (out, _) = rows_over(

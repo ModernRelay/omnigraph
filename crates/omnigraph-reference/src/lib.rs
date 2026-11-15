@@ -567,8 +567,9 @@ impl<'a> Interpreter<'a> {
                     // Set semantics over endpoint pairs: each node at its
                     // shortest distance, kept when that distance is in
                     // `min..=max`. The source sits at distance 0, so a
-                    // cycle never returns it; a self-loop edge is the one
-                    // hop that does, and the walk does not continue from it.
+                    // cycle never returns it; a self-loop edge returns it
+                    // only to the single hop, and the walk does not
+                    // continue from it.
                     let src_type = match get(&row, src) {
                         Some(Value::Ref { type_name, .. }) => type_name.clone(),
                         _ => String::new(),
@@ -597,7 +598,7 @@ impl<'a> Interpreter<'a> {
                         }
                         frontier = next;
                     }
-                    if self_loop && *min_hops <= 1 {
+                    if self_loop && *min_hops <= 1 && *max_hops == Some(1) {
                         distance.insert((src_type, id.clone()), 1);
                     }
                     let seen: BTreeMap<(String, String), u32> = distance

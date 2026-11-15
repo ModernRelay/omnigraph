@@ -75,8 +75,8 @@ the fix swaps the ends as for a single edge.
 
 Hop counts are shortest-path distances from the start node: `{2,2}` returns the
 nodes exactly two hops away. A node is never re-reached through its own
-self-loop or through a cycle back to it. The start node is returned only
-through its own self-loop, which counts as one hop, never through a cycle.
+self-loop or through a cycle back to it. The single hop returns the start
+node through its own self-loop; a range such as `{1,3}` never returns it.
 
 An unbound traversal has set semantics for endpoint pairs. Binding the edge
 returns one result per matching edge, so parallel edges remain distinct. An

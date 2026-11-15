@@ -2,6 +2,7 @@
 # red_on: 7f1233bb
 # notes: Alternatives preserve concrete edge type and identity, including equal IDs in different types and parallel edges.
 # notes: Unbound traversal uses distinct endpoint pairs and a shared shortest-distance frontier across all members.
+# notes: A range never returns its start node, so `a`'s self-loop does not return `a` under {1,3}.
 
 --- runner
 timeout_ms: 10000
@@ -127,7 +128,6 @@ query bounded_reachable_people() {
 }
 
 --- expect unordered
-{"destination":"a"}
 {"destination":"b"}
 {"destination":"c"}
 {"destination":"d"}
