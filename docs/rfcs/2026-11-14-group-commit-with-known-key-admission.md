@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on:
   - "Composition guard, engine half: a composed commit keeps only the markers every component carries, the change feed's one-transaction fast path and the merge's pure-insert proof accept it, and `lance_surface_guards.rs` pins a Blob v2 column through composition. The Lance half passes on Lance 13.0.0 (Part 3, The carried-over guard)."
   - "Batch-path seams exist before step 6, so that `failpoints.rs`, `detached_commit_matrix.rs` and DST can reach the batch path."
-  - "Admission and failure evidence: the admission matrix, the batch-path windows in `failpoints.rs` and `detached_commit_matrix.rs`, and the DST concurrent universe with batching on (every acknowledged write visible exactly once, one actor per commit, the collector oracle with batches in flight)."
+  - "Admission and failure evidence: the admission matrix, including its `@unique` and `@card` cells, the batch-path windows in `failpoints.rs` and `detached_commit_matrix.rs`, and the DST concurrent universe with batching on (every acknowledged write visible exactly once, one actor per commit, the collector oracle with batches in flight)."
   - "Batching forced on across the existing gates: the GQT corpus, the engine `integration`, `writes` and `failpoints` binaries, DST, and the RustFS and Azurite suites."
   - "Server maintenance admission: a served `optimize` is admitted while 64 or more writes are in flight. Today `DEFAULT_WRITE_OBSERVERS` (64, no override) refuses it with 429. This is a separate server fix that lands before the soak."
   - "Soak: 64 writers on one branch, RustFS behind toxiproxy at +30 ms, 60 minutes, a served `optimize` every minute and an embedded `index build` from a second process every minute. Every acknowledged write verified, every maintenance run published, writes/s in the last 5 minutes at least 80% of the first 5, peak RSS at 60 minutes at most 1.25x the 30-minute mark, and the known keys and the effect log within their byte budgets."
@@ -105,11 +105,14 @@ publish alone, as today:
 
 - Updates and deletes.
 - Writes that name an expected head (`--if-commit`).
-- Writes to a type with a `@unique` constraint on a property other than the
-  key, or an edge type with a bounded `@card`. These checks read other rows,
-  which another insert can change.
 - Writes to a table with a Blob column, until a test covers it.
 - A second attempt of a write that was sent back.
+
+Constraints do not exclude a write. Every check that the validator runs reads
+a known set of keys, and admission compares those keys (see below). For
+example, an insert into a type with `@unique(email)` reads the email values
+it adds. Two inserts with the same email cannot share a batch, and two with
+different emails can.
 
 A later step (step 7) can batch updates and deletes that name their rows by
 key. It lands only if its own measurement passes. Updates and deletes that
@@ -121,9 +124,13 @@ For each queued write, the leader must answer one question. Does the write
 give the same result on the newest version as on the version it read? The
 leader compares two sets to answer it.
 
-- The footprint of the write is the set of keys it read and wrote. For an
-  insert, this is its new keys (it proved them absent). For an edge, it also
-  holds the keys of the two endpoint nodes it found.
+- The footprint of the write is the set of keys it read and wrote. A key is
+  a value that one check compares:
+  - a row's id, which every insert reads (it proves the id absent);
+  - the values of a `@unique` column group, which the `@unique` check reads;
+  - an edge's endpoint node ids, which the endpoint check reads;
+  - an edge's source, which a `@card` check reads, because it counts the
+    edges of each source.
 - The effect log is an in-memory list of what each recent publication on the
   branch changed, by exact key.
 
@@ -139,7 +146,7 @@ If the leader cannot prove the write safe, it refuses it. A refused write
 prepares again under the branch gate and publishes alone, as today. It still
 finishes within two attempts.
 
-Three structural rules make the proof hold by construction, not by the care
+Four structural rules make the proof hold by construction, not by the care
 of each caller:
 
 1. Only the engine's one publication path writes the effect log. A
@@ -150,6 +157,10 @@ of each caller:
 3. The log does not reason across a gap. If a record does not continue from
    the record before it, the log starts again. Admission then never trusts a
    publication it did not see, for example one from another process.
+4. The footprint comes from the validator's own list of checks. Each kind of
+   check states the keys it reads, in one place that the compiler checks for
+   completeness. A new kind of check cannot join a batch until someone states
+   its keys.
 
 The prototype broke each of these rules under stress, and the result was
 duplicate keys and edges to deleted nodes. Part 2 lists every defect it had.
@@ -195,6 +206,9 @@ collector does not change.
     Today it refuses with 429.
 - Mixed workloads gain less. With 15% updates and deletes on the same table,
   the rate went from 3.0 to 9.0 writes/s, not to 100.
+- Edges under a bounded `@card` from one busy node serialize. Each such edge
+  reads the count of its source, so two of them from the same source never
+  share a batch. Edges from different sources still batch.
 - The gain is in one process. Another process's writes are not in the log,
   so the leader refuses the writes they can affect. One writer process per
   cluster is the supported topology today.
@@ -262,6 +276,9 @@ Each step leaves `main` shippable and adds its tests.
   share a commit?
 - Do you accept that batching requires a maintenance cadence, written in the
   user docs?
+- Do you accept the footprint taken from the validator's checks, so that
+  `@unique` and `@card` types batch? This is not measured yet. The stress
+  study kept its oracle for `@unique` but did not batch those types.
 - At step 8, does `group_commit` default to `on` everywhere, or only on the
   server? The recommendation is everywhere, because a writer that is alone
   forms a batch of one, which costs no more.
@@ -279,6 +296,8 @@ Part 3 gives the numbers for each.
   to a `__manifest` version.
 - Admission by table, not by key: batches nothing, because writers usually
   insert into the same table.
+- Exclude `@unique` and `@card` types by name: a hand-kept list lets a new
+  kind of check into batches unproven.
 - A timer that waits for more writers: slower, and adds latency.
 - Pipelined batches: more publications, but not more writes per second.
 - Bloom filters to compare keys: false matches refuse writes, and the
@@ -336,9 +355,10 @@ Code locations are on `main` at `4f7c2076`. Search by name if a line moved.
 | Write group | The queue and leader flag for one graph root and branch, shared by every handle of the root in the process | |
 | Batch | The entries one leader admits and publishes in one publication | |
 | Sent back | Refused at admission or by a lost compare-and-swap. The write prepares again under the gates | `PreEffectReprepares`, `crates/omnigraph/src/db/reprepare.rs` |
-| Footprint | Per table, the keys an entry read and the keys it wrote, plus endpoint ids read in endpoint node tables | |
+| Key space | The values that one check compares in one table: the table's ids, the tuples of one `@unique` column group, or an edge table's `src` or `dst` values | |
+| Footprint | Per key space, the keys an entry read and the keys it added or removed | Derived from `ValidateCheck` (`omnigraph-compiler` `src/ir/load.rs`) |
 | Effect log | Per write group, the in-memory records of recent publications on the branch | |
-| Record | One publication in the log: parent head, produced head, and one class per touched table | |
+| Record | One publication in the log: parent head, produced head, and one class per touched table, with keys per key space | |
 | Class | `inserted(ids)`, `touched(written ids)`, `row_preserving` or `changed` | `PublicationEffect` (new) |
 | Known keys | Process-wide map from a data file's resolved location to the exact keys this process wrote into it | |
 | Uncovered tail | The fragments the id index does not cover at a pinned version | |
@@ -372,9 +392,9 @@ a test pass.
    shared by every handle. Do not key it by actor or by handle. A batch holds
    one actor. (H2: groups keyed by actor made one actor's batches foreign to
    another's.)
-7. The footprint of an edge entry holds the endpoint ids it checked, in the
-   endpoint node tables. (H10: an edge was admitted across a delete of its
-   endpoint.)
+7. The footprint of an edge entry holds presence reads of the endpoint ids
+   it checked, in the endpoint node tables' id spaces. (H10: an edge was
+   admitted across a delete of its endpoint.)
 8. A sent-back entry prepares again under the gates and publishes alone, as a
    batch of one, and its publication is logged. (H5: ungated re-preparation
    lost the two-attempt bound, and 5 to 7% of writes returned
@@ -406,6 +426,13 @@ a test pass.
 16. Record known keys only from the absence-proven insert writer, and only
     when its staged write produced exactly one data file. Answer from the map
     only for a fragment with one data file, no deletion file and no overlay.
+17. Derive the footprint from the checks the judge runs, never from a list of
+    constraint kinds. Map each `ValidateCheck` to its key space through one
+    `match` with no wildcard arm. A check with no key form makes the entry
+    ineligible. `ValidateCheck` is not `#[non_exhaustive]`. Keep it so, and
+    pin the missing wildcard arm in `forbidden_apis.rs`. (Hazard: the earlier
+    revision excluded `@unique` and `@card` types by name, so a new kind of
+    cross-row check would have batched unproven.)
 
 ### Eligibility
 
@@ -428,10 +455,9 @@ takes today's path, which the branch gate serializes with batches.
    of its keys exists and the tail is small enough for the exact-id probe
    (`stage_keyed_write`, `crates/omnigraph/src/storage_layer.rs`). An upsert
    that matched a key is not insert-only.
-3. No written table declares a non-key `@unique` group, node or edge, and no
-   written edge table declares a bounded `@card`. Both read committed rows
-   that another insert can change (`validate.rs`; cardinality opens a fresh
-   live version).
+3. Every check the judge runs on each table it writes has a key form
+   (Footprint). Today only `RetainedEdges` has none, and only an overwrite
+   runs it, which rule 1 already excludes.
 4. No written table has a Blob column, until the composition guard covers one
    (step 3).
 5. It has no caller head precondition, no unattached base, and no `as commit`
@@ -439,15 +465,47 @@ takes today's path, which the branch gate serializes with batches.
    (#1397) can let such writes batch later.
 6. It is a first attempt. A second attempt publishes alone (Progress).
 
-The footprint, per table the entry touches:
+### Footprint
 
-- written keys: its inserted ids;
-- read keys: its inserted ids, whose absence it proved;
-- endpoint reads: in each endpoint node table, the endpoint ids whose
-  existence it checked.
+The judge already plans each write as a typed list of checks per table:
+`WriteTableIR.checks` from `lower_write_table`
+(`omnigraph-compiler` `src/ir/write.rs`), planned by `plan_write`
+(`crates/omnigraph/src/validate/plan.rs`). Each `ValidateCheck` names the
+committed table it consults. The footprint is derived from that same list, so
+the checks that decide an entry and the keys that admission compares have one
+source.
 
-Eligibility guarantees that nothing outside these sets decided the entry's
-outcome.
+A key space is the set of values one check compares in one table. A read is
+one of two kinds:
+
+- an absence read, which only an addition of that key can break;
+- a presence or count read, which an addition or a removal of that key can
+  break.
+
+| `ValidateCheck` | Key space | What the entry reads | What the entry adds |
+|---|---|---|---|
+| `Value` | None. It reads only the entry's own rows | Nothing | Nothing |
+| `Unique { role: Key }` | The table's ids. A `@key` group is id-backed, so the check reads only the delta (`unique_checks`, `ir/load.rs`). The absence read comes from the absence-proven writer (Eligibility rule 2), and every insert's footprint holds it | Absence of each id it inserts, from the writer | Those ids |
+| `Unique { role: Unique, columns }` | The tuples of `columns` in the table. A tuple that holds a null is exempt from the check, so it is no key (`match_unique_holders`, `validate/kernels.rs`) | Absence of each tuple it inserts | Those tuples |
+| `EdgeRi { endpoint, node_type }` | The ids of `node_type` | Presence of each endpoint id | Nothing |
+| `Cardinality { endpoint, .. }` | The edge table's values of `endpoint`. The compiler emits it only for a non-default `@card`, and always for `src` today | The count of each endpoint value its edges carry | Those endpoint values |
+| `SourceCardinality { edge_table, .. }` | `edge_table`'s `src` values | The count of each node id it inserts | Nothing |
+| `RetainedEdges { .. }` | No key form | The entry is ineligible | |
+
+An insert also adds its keys to every key space of its table, whether or not
+it runs a check there: its ids, its tuples for each `@unique` group, and, for
+an edge, its `src` and `dst` values. Another entry can read them.
+
+The claim the table must keep true: the result of each check depends only on
+the committed state of the keys it reads. A uniqueness check on tuple v
+depends only on whether a committed row holds v. A cardinality check on
+source s depends only on the number of committed edges whose source is s,
+which changes only by an addition or a removal of s in that space. A new
+`ValidateCheck` variant joins this table only with that argument written
+down.
+
+Known keys cover the id space only. A `@unique` check on other columns still
+reads committed rows as it does today, so its cost does not change.
 
 ### The batch
 
@@ -527,31 +585,32 @@ none.
    `revalidate_write_txn_carrying` (`crates/omnigraph/src/db/omnigraph.rs`),
    and it is how another process's maintenance is explained. Anything else is
    unexplained, and e is sent back.
-3. Untouched footprint. For each table in e's footprint, every effect in the
-   interval preserved rows, or wrote only keys outside e's read and written
-   keys there, and wrote no edge whose endpoint ids meet e's endpoint reads.
-   A `changed` effect on such a table fails the rule.
-4. Disjoint batch. No entry admitted earlier in this batch writes a key that
-   e reads or writes, or reads a key that e writes, in the same table.
+3. Untouched footprint. For every key e reads, no effect in the interval
+   added it, and, if e reads it for presence or a count, no effect removed
+   it. A row-preserving effect passes. A `changed` effect on a table that
+   holds a key space e reads fails the rule.
+4. Disjoint batch. No entry admitted earlier in this batch adds or removes a
+   key that e reads, and e adds or removes no key that an earlier entry
+   reads, in the same key space.
 
 A refused entry has made no effect of the batch.
 
-Why this is enough. An eligible entry's outcome depends on four facts only:
+Why this is enough. An eligible entry's outcome depends on three facts only:
 
 - the accepted schema and the registrations of the tables it touches;
-- the absence of its own ids from the tables it inserts into;
-- for an edge, the existence of its endpoint rows;
+- for each check it runs, the committed state of the keys that check reads:
+  the absence of its ids and tuples, the presence of its endpoints, and the
+  edge counts of its endpoint values;
 - checks over its own rows: types, required values, value constraints and
   computed embeddings.
 
 Eligibility removes every other read. An executed update or delete reads
-through a predicate, even one that matches nothing. A non-key `@unique` group
-reads other rows. A bounded `@card` counts a source's edges. An overwrite
-reads the whole table.
+through a predicate, even one that matches nothing. An overwrite reads the
+whole table.
 
-Rule 1 keeps the first fact. Rules 2 and 3 keep the next two: no effect since
-`He` inserted one of e's ids or deleted one of its endpoints. The last fact
-depends on nothing outside e. So e validates at `Hc` as it did at `He`, and
+Rule 1 keeps the first fact. Rules 2 and 3 keep the second: since `He`, no
+effect added a key e reads, and no effect removed a key e reads for presence
+or a count. The last fact depends on nothing outside e. So e validates at `Hc` as it did at `He`, and
 its staged effect is the one a fresh preparation at `Hc` would stage. Rule 4
 makes the members pairwise disjoint per table, so they commute, and every
 serial order on `Hc` yields the state the composed commit publishes. Every
@@ -566,12 +625,16 @@ strictly serializable.
 | An update or delete of other keys in the same table since the capture | Explained by rule 3. e is admitted |
 | Another process wrote, merged or deleted since the capture | Rule 2: unexplained |
 | A foreign insert of e's key behind a stale log record (H1) | Rule 2: the walk follows links only, and the log resets on a record that does not link |
-| An edge's endpoint deleted since the capture | Rule 3 (the delete's record holds the endpoint id, or the table is `changed`) or rule 2 |
+| An edge's endpoint deleted since the capture | Rule 3: the delete's record removes the id in the node table's id space, or the table is `changed`. Otherwise rule 2 |
 | A publication on a path that does not append to the log (H13) | Cannot happen: the door appends |
 | A schema apply, or the branch deleted and recreated | Rule 1 |
 | Write skew through a predicate scan of a table another entry writes | Eligibility: an executed update or delete is ineligible |
 | Insert `Left` and update `Right` against insert `Right` and update `Left`, from a base where neither exists (#785 review) | Eligibility, from `op_kinds` carried through staging |
-| Two edges with one non-key `@unique` value, or past a bounded `@card` | Eligibility |
+| Two entries insert one `@unique` tuple | Rule 4 in one batch, rule 3 across batches: both read its absence. The later rerun gets the uniqueness refusal |
+| An update moves a row's `@unique` tuple to v, beside an insert of v | Rule 3: the update's record adds v |
+| Two edges from one source under a bounded `@card` | Rule 4 in one batch, rule 3 across batches: both read the source's count. The later one is sent back and recounts |
+| A delete of an edge from s, beside an edge insert from s under a `@card` minimum | Rule 3: the delete's record removes s, which the insert reads as a count |
+| A node overwrite with retained edges | Eligibility: `RetainedEdges` has no key form, and an overwrite is not an insert |
 | `optimize` or an index build since the capture | Explained as row-preserving. Composition reads the current pin |
 | A stale batch capture | `ExactGraphHead` refuses the batch. The members are sent back |
 
@@ -579,7 +642,10 @@ strictly serializable.
 
 Each write group keeps an in-memory log. A record holds the head the
 publication built on (its parent), the head it produced, and one class per
-touched table.
+touched table. An exact class lists, for every key space of the table, the
+keys the publication added and the keys it removed. Every key space means
+the ids, each `@unique` group, and, for an edge table, `src` and `dst`, so
+that any entry's read can be judged against it.
 
 The door writes it. Every publication passes through a `GraphCoordinator`
 commit method (`commit_updates_with_actor`,
@@ -592,19 +658,23 @@ both facts in `forbidden_apis.rs`.
 
 The constructors, one per class:
 
-- `inserted(ids)`: only from an insert-only effect of the absence-proven
-  insert writer, with the ids of the key column it wrote.
-- `touched(written ids)`: only from a mutation's staging. Its keyed batches
-  carry every inserted, upserted or updated id. Its delete path records every
-  deleted id, cascaded edges included (`MutationStaging::record_deleted_ids`,
-  `exec/staging.rs`).
+- `inserted`: only from an insert-only effect of the absence-proven insert
+  writer. It adds the written rows' keys in every key space, read from the
+  staged rows. It removes nothing.
+- `touched`: only from a mutation's staging. It adds the keys of every
+  inserted, upserted or updated row image, and removes the keys of every
+  updated row's old image and every deleted row, cascaded edges included.
+  The delete path records deleted ids today
+  (`MutationStaging::record_deleted_ids`, `exec/staging.rs`). It must also
+  record the removed rows' `@unique` tuples and edge endpoints, which it can
+  project from the rows it matches. If it lacks them for a key space, the
+  class is `changed` for that table.
 - `row_preserving`: only from a staged chain whose Lance operations are all
   `Rewrite` or `CreateIndex`.
 - `changed`: takes nothing. Loads, merges, overwrites, schema evolution of a
   table, and everything else.
 
-Every record of an edge table also carries the endpoint ids of the edges it
-wrote. The classes fail closed. An incomplete footprint admits a write it
+The classes fail closed. An incomplete footprint admits a write it
 must refuse. A `changed` record only refuses more than it needs to.
 
 The log type enforces its links (rule 4). Logging every publication of the
@@ -618,7 +688,8 @@ table set, by a branch delete or recreate, by an outcome the read-back leaves
 in doubt, and by a process restart. Entries captured before then fail rule 2
 and are sent back.
 
-The log is bounded by K records and a byte budget for ids. It caches facts
+The log is bounded by K records and a byte budget for keys. A `@unique` tuple
+of long strings counts its bytes, and a record over the budget is `changed`. It caches facts
 about immutable, published commits, which invariant 12 permits. It is never
 commit authority: `ExactGraphHead` is.
 
@@ -876,21 +947,24 @@ against parameters or literals. Read the typed IR predicate
 evaluated only on the rows of those keys. The write must also:
 
 - assign no key, `src` or `dst` property;
-- meet rules 3 to 6 of Eligibility;
+- meet rules 3 to 6 of Eligibility, so every check it runs has a key form;
 - execute only key-addressed updates, deletes and inserts, recorded per
   operation as `op_kinds` are.
 
 An upsert that matched a present key counts as a key-addressed update of
 that key.
 
-The footprint. The read and written keys are the narrowed keys, whether or
-not a row matched, because a row's absence is read too. A node delete whose
-type has incident edge types also reads each incident edge table by
-endpoint, to cascade. Its footprint then holds the deleted node ids as
-endpoint reads, and its written keys are the edge ids the cascade found.
-Admission rules 3 and 4 already compare endpoint reads with the endpoint ids
-in edge records, so an edge insert to node `k` and a delete of `k` never
-share a batch.
+The footprint. The write reads the presence of its narrowed keys in the id
+space, whether or not a row matched, because a row's absence is read too. Its
+checks add their reads from the Footprint table: an update that sets a
+`@unique` column reads the absence of the new tuple. It removes the keys of
+the old row images in every key space and adds those of the new images. A
+node delete whose type has incident edge types also reads each incident edge
+table by endpoint, to cascade. That is a presence read of the deleted node
+ids in the edge table's `src` and `dst` spaces, and the cascade removes the
+edges it found in every key space. An edge insert to node `k` adds `k` in the
+edge table's endpoint space, so admission rules 3 and 4 keep it and a delete
+of `k` apart.
 
 Why this is enough. A key-addressed write's outcome depends on the accepted
 schema, the rows at its keys, and, for a cascading delete, the edges incident
@@ -913,7 +987,7 @@ same fragment. A guard would have to pin its deletion-file merge first.
 
 Evidence before it lands. The mixed-workload instrument at 16, 64 and 1,024
 writers with the step off and on, and matrix cells for: two updates of one
-key, an update and an insert of one key, a delete of node `k` beside an edge
+key, two updates that move different rows to one `@unique` tuple, an update and an insert of one key, a delete of node `k` beside an edge
 insert to `k` in one batch and across batches, a delete that matched nothing
 followed by an insert of that key, and an update whose other conjunct matches
 no row. It lands only if mixed-workload writes/s rise over step 6 and one
@@ -928,7 +1002,7 @@ writer stays within 10% of the ordinary path.
 | 4, a mutation publishes once | Each write is in exactly one publication, and its statements stay together. A publication can hold several writes of one actor. No text change |
 | 5, crash convergence | Unchanged: detached commits follow admission, carry the batch's witness and stay unreachable until the publication |
 | 7, physical acceleration | A composed append leaves an unindexed tail like any append. Known keys and the index warm-up are caches |
-| 8, integrity failures are loud | Every constraint an entry validated holds at publication, by admission. A constraint admission cannot carry forward makes the write ineligible |
+| 8, integrity failures are loud | Every constraint an entry validated holds at publication, by admission. A check with no key form makes the write ineligible |
 | 10, policy | Enforced per write at its `_as` entry point, before it queues |
 | 11, bounded and observable | Queue, batch, log, horizon and known keys are bounded. Send-backs are counted as re-preparations. Batch size, known-key probes and misses are counted |
 | 12, one source of truth | The log and the known keys cache immutable facts. The log has one writer, the door, and its classes are derived and fail closed. The queue holds requests, not manifest-derived state |
@@ -942,7 +1016,7 @@ branches are measured.
 | Step | Scope | Done when |
 |---|---|---|
 | 1. Known keys | The map, the byte bound with eviction, dropping files a `Rewrite` removed, the tail analysis once per version, and the cap lift | In-source `table_store` tests compare map and scan on every fragment shape (deletion file, column patch, compaction, unknown file, eviction). A tail past `KEYED_WRITE_MAX_ROWS` that the map answers stays on the absence-proven writer. `write_cost.rs` shows a keyed insert's requests flat as the tail grows. The DST cost golden records it at two tail lengths. `forbidden_apis.rs` pins that only the absence-proven writer records. No behavior change |
-| 2. Footprint | Carry `op_kinds` through staging and rewrite its doc comment to name the executed-operation class, with `strict_pre_stage_version_check` its one owner. Record validation reads, with endpoint ids. Give `StagedWrite` the exact inserted ids its doc comment describes, and carry a mutation's written ids to its publication. Define `PublicationEffect` and its four constructors. Make eligibility one function | In-source staging tests and `writes.rs`. No behavior change |
+| 2. Footprint | Carry `op_kinds` through staging and rewrite its doc comment to name the executed-operation class, with `strict_pre_stage_version_check` its one owner. Record validation reads, with endpoint ids. Give `StagedWrite` the exact inserted ids its doc comment describes, and carry a mutation's written ids to its publication. Derive the footprint from `ValidateCheck` through one wildcard-free `match`, and record removed rows' tuples and endpoints on the delete path. Define `PublicationEffect` and its four constructors, with keys per key space. Make eligibility one function | In-source staging tests, one per `ValidateCheck` arm, and `writes.rs`. `forbidden_apis.rs` pins the wildcard-free match. No behavior change |
 | 3. Composition | The sealed adapter, the engine half of the guard, the Blob case | `lance_surface_guards.rs`, `integration/changes.rs` (the feed's fast path), the merge owners (the pure-insert proof), `forbidden_apis.rs` |
 | 4. Maintenance carry | Index builds and `optimize`'s direct path carried over insert-only and row-preserving publications | `lance_surface_guards.rs` (`TransactionRebase` of `CreateIndex` and `Rewrite` over an insert-only `Update`), `failpoints.rs`, `detached_commit_matrix.rs` (a carried index build), the DST cost golden |
 | 5. Write group, batches of one | Queue per root and branch, lead handoff with drop guards, group-owned typed outcome, the log written by the door with its link rule, the gated second attempt, batch-path seams, cancellation, per-member evidence, the `group_commit` setting (default `off`), the instrument | `write_cost.rs` (a batch of one costs no more than today), `failpoints.rs` batch-outcome cells, `detached_commit_matrix.rs`, DST, `forbidden_apis.rs`, the GQT corpus with the setting on. Behavior unchanged |
@@ -968,7 +1042,18 @@ because `.gqt` cannot express them. The cells:
 - an entry parked across a foreign insert of its key behind a stale log
   record, and across another actor's batch (H1);
 - two handles of one process batch together;
-- non-key `@unique` and bounded `@card` stay on today's path;
+- two inserts of one `@unique` tuple, in one batch and across batches: one
+  publishes, the other is refused for uniqueness on its rerun;
+- inserts with different `@unique` tuples share one commit, and a tuple that
+  holds a null is no key, so two such inserts batch;
+- an insert of tuple v beside an update that moves another row to v;
+- two edges from one source under a bounded `@card` maximum, one batch and
+  across batches: the final count is within the bound;
+- an edge insert from s under a `@card` minimum, beside a delete of another
+  edge from s;
+- a node insert under `SourceCardinality` with its edges in the same write;
+- a unit test for each `ValidateCheck` arm, comparing the footprint with the
+  rows the judge read;
 - write skew through a predicate scan;
 - the `Left`/`Right` counterexample: one publishes, the other is sent back
   and reruns, and the rows are (1, 0) or (0, 1), never (0, 0);
@@ -1218,6 +1303,7 @@ test:
 | Pipelined batches (#1401 §5.5, #1399, #1400 C) | +70% publications/s at 16 writers on RustFS (4.85 to 8.25) with writes/s unchanged, because closed-loop throughput follows per-write latency. Stage A's detached commits carry the predecessor's parent head, which the collector would judge dead. Future work |
 | Probe-free capture for every writer (#1401 §5.7, #1400 B) | Safe for the compare-and-swap but not for a write's meaning: a query compiled against a replaced catalog failed terminally, a recreated branch's first attempt bound the dead incarnation, and a vanished `__manifest` lost its before-effect evidence. The supported form is #1350's holder skip |
 | Bloom filters as the admission test | False positives refused entries and cascaded |
+| Exclude `@unique` and bounded `@card` types from batches by name (the 2026-11-15 revision) | A hand-kept list of constraint kinds fails open: a new kind of cross-row check batches unproven until someone adds it. Deriving the footprint from `ValidateCheck` fails closed and lets these types batch |
 | Log writes outside the group as `changed` per table (the first draft) | Under a mixed workload every update or delete refuses the queue: 3.2 writes/s against 3.0 with batching off, and one write per batch at 1,024 writers. Exact footprints reach 9.0 |
 | Retry a refused entry ungated before the gated attempt | 32 ungated retries reached 8.0 writes/s on the mixed run, below exact footprints' 9.0, with no progress bound. One retry changed nothing |
 | Each caller appends its own publication to the log | One forgotten path makes every queued entry unexplained after each of its publications (H13) |
@@ -1320,6 +1406,13 @@ test:
     `with_transaction_file_disabled` is `pub(crate)` there.
   - Outside this RFC: O1 and H12 are fixes of their own, and the cap's cliff
     without known keys is on `main`.
+- 2026-11-15: Footprints derived from the validator's checks. The
+  eligibility rule that excluded non-key `@unique` and bounded `@card` types
+  is replaced by a key space per `ValidateCheck` variant, mapped by one match
+  with no wildcard arm. Reads are absence reads or presence and count reads.
+  Records list added and removed keys per key space. These types now batch.
+  Rule 17, the Footprint section and matrix cells added. Batching them is
+  not measured yet.
 - 2026-11-15: Restructured for two audiences. Part 1 explains the design to
   reviewers without context. Part 2 gives implementers the rules, each tied
   to the defect it prevents, code locations at `4f7c2076`, and done criteria
