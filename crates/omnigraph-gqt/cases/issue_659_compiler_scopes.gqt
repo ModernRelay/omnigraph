@@ -40,6 +40,8 @@ query later_endpoint_declaration() {
 person: String
 kind: String
 
+--- expect same as reference
+
 --- query
 query permuted_members() {
     match { $c $e:(employs | worksAt) $p, $c: Company } where $c.name = "acme"
@@ -52,6 +54,8 @@ query permuted_members() {
 --- expect shape
 person: String
 kind: String
+
+--- expect same as reference
 
 --- query
 query later_wildcard_declarations() {
@@ -66,6 +70,8 @@ query later_wildcard_declarations() {
 person: String
 kind: String
 
+--- expect same as reference
+
 --- query
 query later_inner_declaration() {
     match { $c: Company } where exists { $c * $p, $p: Person }
@@ -76,6 +82,8 @@ query later_inner_declaration() {
 
 --- expect shape
 company: String
+
+--- expect same as reference
 
 --- query
 query anonymous_destination_is_independent() {
@@ -88,6 +96,8 @@ query anonymous_destination_is_independent() {
 --- expect shape
 person: String
 
+--- expect same as reference
+
 --- query
 query anonymous_source_is_independent() {
     match { $_: Company, $p: Person, $_ knows $p } where $_.name = "idle" and $p.name = "x"
@@ -98,6 +108,8 @@ query anonymous_source_is_independent() {
 
 --- expect shape
 person: String
+
+--- expect same as reference
 
 --- query
 query named_reverse_not() {
@@ -110,6 +122,8 @@ query named_reverse_not() {
 --- expect shape
 company: String
 
+--- expect same as reference
+
 --- query
 query named_reverse_exists() {
     match { $c: Company } where exists { $p: Person, $p worksAt $c }
@@ -120,6 +134,8 @@ query named_reverse_exists() {
 
 --- expect shape
 company: String
+
+--- expect same as reference
 
 --- query
 query named_reverse_count() {
@@ -132,6 +148,8 @@ query named_reverse_count() {
 --- expect shape
 company: String
 
+--- expect same as reference
+
 --- query
 query named_child_string_argument() {
     match { $p: Person } where count(contains($f.name, "x")) { $f: Person, $p knows $f } > 0
@@ -142,6 +160,8 @@ query named_child_string_argument() {
 
 --- expect shape
 person: String
+
+--- expect same as reference
 
 --- query
 query named_unanchored() {
@@ -155,6 +175,8 @@ query named_unanchored() {
 --- expect shape
 p.name: String
 
+--- expect same as reference
+
 --- query
 query selected_unanchored() {
     match { $p: Person, let $xs = { match { $x: Person, $y: Person, $x (knows | likes) $y } return { $x, $y } }, from $xs }
@@ -167,6 +189,8 @@ query selected_unanchored() {
 --- expect shape
 p.name: String
 
+--- expect same as reference
+
 --- query
 query nested_unanchored() {
     match { $p: Person } where not exists { $x: Person, $y: Person, $x knows $y where $p.name = "p" }
@@ -177,6 +201,8 @@ query nested_unanchored() {
 
 --- expect shape
 p.name: String
+
+--- expect same as reference
 
 --- query
 query child_declaration_does_not_escape() {
@@ -198,6 +224,8 @@ query reverse_expand_selection() {
 person: String
 kind: String
 
+--- expect same as reference
+
 --- query
 query cycle_closing_selection() {
     match { $p: Person, $p (knows | likes) $f, $f (knows | likes) $p } where $p.name = "p"
@@ -207,6 +235,8 @@ query cycle_closing_selection() {
 
 --- expect shape
 person: String
+
+--- expect same as reference
 
 --- query
 query named_type_values() {
@@ -220,6 +250,8 @@ query named_type_values() {
 --- expect shape
 kind: String
 person: String
+
+--- expect same as reference
 
 --- query
 query undirected_cross_type_wildcard() {
@@ -247,6 +279,8 @@ query block_local_name_is_not_correlated() {
 person: String
 company: String
 
+--- expect same as reference
+
 --- query
 query block_local_name_not_block() {
     match { $p: Person, $x: Company } where not exists { $k: Person, $p knows $k } and $x.name = "idle"
@@ -258,6 +292,8 @@ query block_local_name_not_block() {
 --- expect shape
 person: String
 company: String
+
+--- expect same as reference
 
 --- query
 query undeclared_same_variable_cross_type() {
@@ -294,6 +330,8 @@ person: String
 kind: String
 id: String
 
+--- expect same as reference
+
 --- query
 query block_local_named_edge_does_not_capture_the_outer_edge() {
     match { $p: Person, $p $e:knows $f }
@@ -305,6 +343,8 @@ query block_local_named_edge_does_not_capture_the_outer_edge() {
 --- expect shape
 person: String
 id: String
+
+--- expect same as reference
 
 --- query
 query block_local_node_does_not_capture_the_outer_node() {
@@ -318,6 +358,8 @@ query block_local_node_does_not_capture_the_outer_node() {
 --- expect shape
 person: String
 company: String
+
+--- expect same as reference
 
 --- query
 query nested_local_names_remain_independent() {
@@ -338,6 +380,8 @@ query nested_local_names_remain_independent() {
 person: String
 company: String
 
+--- expect same as reference
+
 --- query
 query sibling_inner_names_keep_distinct_types() {
     match { $p: Person }
@@ -352,3 +396,5 @@ query sibling_inner_names_keep_distinct_types() {
 person: String
 --- expect plan
 result columns [person: String]
+
+--- expect same as reference

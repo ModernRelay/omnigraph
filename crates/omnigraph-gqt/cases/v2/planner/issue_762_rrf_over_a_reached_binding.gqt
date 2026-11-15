@@ -37,3 +37,5 @@ query ranked_destination() {
 {"d.slug":"d1"}
 --- expect shape
 d.slug: String
+
+--- expect same as reference

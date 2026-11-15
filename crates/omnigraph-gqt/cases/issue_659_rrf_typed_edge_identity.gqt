@@ -51,6 +51,8 @@ expand $p $q: selection alternation [Knows out, Likes out]
 rank fuse no row tiebreak
 sort tiebreak [$p, $q, $e.@type, $e.@id]
 
+--- expect same as reference
+
 --- query
 query fused_type_page() {
     match {
@@ -70,6 +72,8 @@ query fused_type_page() {
 --- expect shape
 edge_type: String
 edge_id: String
+
+--- expect same as reference
 
 --- query
 query fused_wildcard_type_page() {
@@ -96,3 +100,5 @@ edge_id: String
 expand $p $q: selection wildcard [Knows out, Likes out]
 rank fuse no row tiebreak
 sort tiebreak [$p, $q, $e.@type, $e.@id]
+
+--- expect same as reference

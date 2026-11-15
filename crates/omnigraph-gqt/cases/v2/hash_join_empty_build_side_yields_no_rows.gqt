@@ -34,6 +34,8 @@ query empty_build() {
 --- expect shape
 p.name: String
 q.name: String
+
+--- expect same as reference
 --- query
 set engine = v2;
 query empty_probe() {
@@ -44,6 +46,8 @@ query empty_probe() {
 --- expect unordered
 --- expect shape
 q.name: String
+
+--- expect same as reference
 --- query
 set engine = v2;
 query partial_build() {
@@ -57,6 +61,8 @@ query partial_build() {
 --- expect shape
 p.name: String
 q.name: String
+
+--- expect same as reference
 --- query
 set engine = v2;
 query every_hop() {
@@ -70,3 +76,5 @@ query every_hop() {
 --- expect shape
 p.name: String
 q.name: String
+
+--- expect same as reference

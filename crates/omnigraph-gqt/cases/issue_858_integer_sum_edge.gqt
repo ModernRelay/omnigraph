@@ -27,3 +27,5 @@ query edge_total() {
 total: F64
 --- expect plan
 aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
+
+--- expect same as reference
