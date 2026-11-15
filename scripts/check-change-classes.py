@@ -98,6 +98,9 @@ CLASSES = {
             # The benchmark fixture parity test executes a generated corpus
             # case; `GQT (ordinary)` covers it on cases-only changes too.
             "crates/omnigraph-bench/src/branch_merge.rs": "GQ Logic Tests (ordinary) + Test Workspace",
+            # The formatter's repository proof formats every corpus query;
+            # `GQT (ordinary)` runs it on `run_gqt`.
+            "crates/omnigraph-compiler/src/query/fmt_tests.rs": "GQ Logic Tests (ordinary) + Test Workspace",
         },
     ),
     "deployment": (
