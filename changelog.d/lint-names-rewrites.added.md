@@ -1,0 +1,1 @@
+- `lint` names count-block rewrites (`L203`–`L205`) and the `match_terms` spelling of `search`, `match_text` and `fuzzy` on an analyzer field (`L206`).

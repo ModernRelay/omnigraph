@@ -325,8 +325,9 @@ A refused file reports its refusal's code at `line <n>, column <c>`: a
 [branch statement](../branching/index.md) where declarations were expected is
 `Q004`, a refused [settings line](#session-settings) `Q003`, and `T83` too.
 `L201` warns of a nullable property no inspected update query sets; `L202` names
-the [analyzer](../search/analyzers.md) to declare on a full-text index. A refused
-query reports every refusal with its code and line, and exits nonzero on an error.
+the [analyzer](../search/analyzers.md) to declare on a full-text index; `L203` to
+`L206` name the rewrites of [`queries fmt`](formatting.md). A refused query
+reports every refusal with its code and line, and exits nonzero on an error.
 
 For every query that compiles successfully, JSON output includes an
 `operation` descriptor:

@@ -64,6 +64,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list` | List stored queries: a cluster root's registry (`--graph` narrows it to one graph), or one served graph's catalog, whose `--json` is the body of `GET /graphs/{id}/queries` | cluster or served |
 | `queries validate` | Type-check a cluster's applied query registry | cluster |
+| `queries fmt` | Write `.gq` files, a directory or stdin in canonical spelling without changing meaning; `--check` writes nothing ([Formatting](../queries/formatting.md)) | local |
 | `cluster validate/plan/apply/...` | Operate self-hosted declarative state; [deployment/recovery flags](../clusters/index.md) | config, server, explicit root |
 | `cluster create/list/members/pull/push/delete/undo-delete/token/operation/history/cancel` | Operate a managed cluster | profile or managed target |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |

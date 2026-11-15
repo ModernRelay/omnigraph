@@ -39,6 +39,7 @@ Lint returns:
 - `"status": "ok"` — all queries passed
 - `"errors": N` — count of type errors (exit 1 when nonzero)
 - `"warnings": N` — count of `L201` warnings (a nullable property that no update query sets)
+- `"infos": N` — `L202` (declare an analyzer profile), `L203` (`count { } > 0`, which `queries fmt` writes `exists`), `L204`/`L205` (`count { } >= 1` / `= 0`: write `exists` / `not exists`), `L206` (`search`/`match_text`/`fuzzy` over an analyzer field: the `match_terms` call)
 
 Run lint after every `.gq` or `.pg` edit. Wire into precommit.
 

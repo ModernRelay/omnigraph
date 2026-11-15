@@ -61,7 +61,7 @@ See [traversal](../../docs/user/queries/traversal.md) and
 
 ## The Seven Rules
 
-1. **Lint before commit** — `omnigraph lint --schema schema.pg --query queries/foo.gq` validates both sides against each other. No running repo required.
+1. **Lint before commit** — `omnigraph lint --schema schema.pg --query queries/foo.gq` validates both sides against each other. No running repo required. `omnigraph queries fmt --schema schema.pg queries/` writes the canonical spelling without changing meaning (`--check` to verify).
 2. **Plan before apply** — never run `schema apply` without a successful `schema plan` first. Apply is destructive; plan is free. (Cluster mode has the same rule with different verbs: `cluster plan` before `cluster apply` — the plan embeds the engine's real migration steps.)
 3. **Branches are for data; apply is for schema** — review bulk data loads on a feature branch then merge. Schema changes go straight to `main`: in cluster mode edit the `.pg` and run `cluster apply` (a server target deploys without restart; a direct root target requires stopped serving; a direct `schema apply` **refuses** a cluster-managed graph); for the managed service commit, `cluster push --target managed`, `cluster plan --target managed --rev <rev>`, then `cluster apply --target managed --plan <preview-id>`; `schema plan`/`apply` is for a non-cluster store.
 4. **Pick the right write command** — `mutate` for edits (typechecked, parameterized); `load` for bulk JSONL, local **or** remote, with a **required** `--mode` (`merge` upsert · `append` strict-insert · `overwrite` replaces only the node/edge types represented in the batch). `load --from <base>` forks a review branch in one shot; bare `load` needs an existing target branch.

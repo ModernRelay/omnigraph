@@ -114,6 +114,12 @@ is checked and from a parameter when it is bound.
 
 An `rrf` arm over `bm25` on such a field is not run in this release (`T86`).
 
+On a field that declares a profile, `search` and `match_text` are
+`match_terms(f, terms(q, mode: any))`, and `fuzzy` the same with its budget
+(two when unwritten): one query, which
+[`queries fmt --schema`](../queries/formatting.md) writes in the
+`match_terms` spelling and `lint` names (`L206`).
+
 On a field that declares no profile, `search`, `match_text`, `fuzzy` and
 `bm25` keep the behaviour of earlier releases: they read the index, `bm25`
 scores in `F32` with Lance's own BM25, and `fuzzy` expands each term through
