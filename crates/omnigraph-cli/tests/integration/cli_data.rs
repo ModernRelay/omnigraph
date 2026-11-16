@@ -1118,8 +1118,9 @@ fn scan_access(graph: &std::path::Path, query: &std::path::Path, branch: &str) -
 }
 
 /// `index build` builds the declared indexes a branch lacks (a type whose
-/// first rows land on the branch) and refreshes a BTREE whose coverage lags
-/// the branch's new rows, in one publication on that branch only. Full-text
+/// first rows land on the branch) and refreshes each BTREE and NGRAM whose
+/// coverage lags the branch's new rows, in one publication on that branch
+/// only. Full-text
 /// coverage is reported pending with the rebuild that refreshes it, and a
 /// second run publishes nothing.
 #[test]
@@ -1198,8 +1199,12 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
         built["indexes"],
         serde_json::json!([
             {"type_key": "node:Person", "property": "__id", "kind": "btree", "action": "refreshed"},
+            {"type_key": "node:Person", "property": "name", "kind": "btree", "action": "refreshed"},
+            {"type_key": "node:Person", "property": "name", "kind": "ngram", "action": "refreshed"},
             {"type_key": "node:Tag", "property": "__id", "kind": "btree", "action": "built"},
             {"type_key": "node:Tag", "property": "rank", "kind": "btree", "action": "built"},
+            {"type_key": "node:Tag", "property": "slug", "kind": "btree", "action": "built"},
+            {"type_key": "node:Tag", "property": "slug", "kind": "ngram", "action": "built"},
             {"type_key": "node:Tag", "property": "slug", "kind": "full_text", "action": "built"},
         ])
     );
