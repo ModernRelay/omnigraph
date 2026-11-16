@@ -1194,6 +1194,13 @@ struct Scope {
     future: HashSet<String>,
     /// Block aggregates produced while typing the current expression.
     block_buf: Vec<(Term, String, Agg)>,
+    /// A conjunct of the scope's `where` that can fail was placed: it and
+    /// every conjunct after it run after the scope's elements (A3).
+    failing_where: bool,
+    /// The guards around the expression being typed: an operand of `and`,
+    /// `or`, `if` or `coalesce` is evaluated only where these hold (A3), so
+    /// a block under them that can fail is evaluated only there too.
+    guards: Vec<Expr>,
     pending: Vec<Pending>,
     /// True inside an inline read or a called body: a binding reusing an
     /// outer name is `T68`, since it would silently become a filter.
@@ -1263,6 +1270,8 @@ impl Scope {
             declared_nodes: HashSet::new(),
             future: HashSet::new(),
             block_buf: Vec::new(),
+            failing_where: false,
+            guards: Vec::new(),
             pending: Vec::new(),
             inner,
             correlates: false,
@@ -2735,6 +2744,20 @@ impl Ctx<'_> {
                             continue;
                         };
                         let blocks = std::mem::take(&mut sc.block_buf);
+                        // A3: the conjuncts before the first one that can
+                        // fail may be placed below later elements; that one
+                        // and every one after it run after the scope's
+                        // elements, in written order.
+                        let fails =
+                            pred.can_fail || blocks.iter().any(|(inner, _, _)| inner.can_fail());
+                        if fails {
+                            sc.failing_where = true;
+                        }
+                        let at = if sc.failing_where {
+                            at.max(sc.binders)
+                        } else {
+                            at
+                        };
                         sc.push_filter(at, Step::Filter { blocks, pred });
                     }
                     sc.block_visible = None;
@@ -3155,6 +3178,9 @@ impl Ctx<'_> {
                 ty: c.ty.with_nullable(true),
             })
             .collect();
+        // An `optional` that can fail runs on every outer row: no conjunct of
+        // `where` is placed below it (A3).
+        let fails = term.can_fail();
         sc.push_binder(
             Step::Optional {
                 inner: term,
@@ -3163,6 +3189,9 @@ impl Ctx<'_> {
             },
             &nullable,
         );
+        if fails {
+            sc.fence = sc.binders;
+        }
         Ok(())
     }
 
@@ -3242,7 +3271,13 @@ impl Ctx<'_> {
             sc.col(f);
         }
         let cols = r.ty.cols.clone();
+        // A drawn relation that can fail runs on every row the elements
+        // before it produce: no conjunct of `where` is placed below it (A3).
+        let fails = r.term.can_fail();
         sc.push_binder(Step::Leaf(r.term), &cols);
+        if fails {
+            sc.fence = sc.binders;
+        }
         Ok(())
     }
 
@@ -5016,7 +5051,24 @@ impl Ctx<'_> {
                 ));
             }
             Expr::Block(b) => {
-                let (term, free, arg) = self.block_scope_arg(sc, b)?;
+                let (mut term, mut free, mut arg) = self.block_scope_arg(sc, b)?;
+                // A block that can fail, written under a guard, holds the
+                // guard as its first conjunct: it evaluates nothing on an
+                // outer row the guard does not select (A3).
+                if term.can_fail()
+                    && let Some(guard) = sc
+                        .guards
+                        .iter()
+                        .cloned()
+                        .reduce(|a, b| Expr::And(Box::new(a), Box::new(b)))
+                {
+                    let mut guarded = (**b).clone();
+                    guarded.pattern.predicate = Some(match guarded.pattern.predicate.take() {
+                        Some(own) => Expr::And(Box::new(guard), Box::new(own)),
+                        None => guard,
+                    });
+                    (term, free, arg) = self.block_scope_arg(sc, &guarded)?;
+                }
                 if free.is_empty() {
                     return Err(err(
                         T39,
@@ -5221,7 +5273,15 @@ impl Ctx<'_> {
             }
             Expr::And(l, r) | Expr::Or(l, r) => {
                 let a = self.expr(sc, l, sub);
+                // `a and b` evaluates `b` only where `a` is not false, `a or
+                // b` only where `a` is not true.
+                sc.guards.push(if matches!(e, Expr::And(..)) {
+                    lazy_coalesce(l, true)
+                } else {
+                    Expr::Not(Box::new(lazy_coalesce(l, false)))
+                });
                 let b = self.expr(sc, r, sub);
+                sc.guards.pop();
                 let (a, b) = self.both(sc, a, b)?;
                 let what = if matches!(e, Expr::And(..)) {
                     "`and`"
@@ -5267,7 +5327,7 @@ impl Ctx<'_> {
         // Every argument is typed, so a refusal in one does not hide an
         // independent refusal in another.
         let mut failed: Option<E> = None;
-        for a in &c.args {
+        for (position, a) in c.args.iter().enumerate() {
             match a {
                 Arg::Expr(e) => {
                     if matches!(e, Expr::Call(t) if t.name == "terms")
@@ -5275,7 +5335,35 @@ impl Ctx<'_> {
                     {
                         continue;
                     }
-                    match self.expr(sc, e, At::Value) {
+                    // The lazy rows evaluate an argument only where the ones
+                    // before it select it: `if`'s branches under their
+                    // condition, `coalesce`'s later arguments where every
+                    // earlier one is null.
+                    let earlier = |i: usize| match c.args.get(i) {
+                        Some(Arg::Expr(e)) => Some(e.clone()),
+                        _ => None,
+                    };
+                    let guard = match (name, position) {
+                        ("if", 1) => earlier(0).map(|cnd| lazy_coalesce(&cnd, false)),
+                        ("if", 2) => {
+                            earlier(0).map(|cnd| Expr::Not(Box::new(lazy_coalesce(&cnd, false))))
+                        }
+                        ("coalesce", p) if p > 0 => (0..p)
+                            .filter_map(earlier)
+                            .map(|before| Expr::IsNull {
+                                expr: Box::new(before),
+                                negated: false,
+                            })
+                            .reduce(|a, b| Expr::And(Box::new(a), Box::new(b))),
+                        _ => None,
+                    };
+                    let guarded = guard.is_some();
+                    sc.guards.extend(guard);
+                    let typed = self.expr(sc, e, At::Value);
+                    if guarded {
+                        sc.guards.pop();
+                    }
+                    match typed {
                         Ok(v) => args.push(v),
                         Err(e) => {
                             failed = Some(match failed.take() {
@@ -5718,6 +5806,20 @@ impl Step {
             Step::Optional { inner, .. } => 7 + 2 * inner.size(),
         }
     }
+}
+
+/// `coalesce(e, fallback)`: `e`, or the Boolean `fallback` where `e` is
+/// null, the guard an operand of a lazy row is evaluated under.
+fn lazy_coalesce(e: &Expr, fallback: bool) -> Expr {
+    Expr::Call(Call {
+        name: "coalesce".into(),
+        args: vec![
+            Arg::Expr(e.clone()),
+            Arg::Expr(Expr::Literal(Literal::Bool(fallback))),
+        ],
+        options: Vec::new(),
+        at: SourceSpan::default(),
+    })
 }
 
 /// Whether `t` holds a recursive reference or a fixpoint, whose typing

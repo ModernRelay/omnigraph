@@ -306,6 +306,24 @@ impl Term {
         Box::new(self)
     }
 
+    /// Whether an expression of the term can fail where it is evaluated:
+    /// such a term keeps its place among the elements (A3).
+    pub fn can_fail(&self) -> bool {
+        let own = match self {
+            Self::Filter { pred, .. } => pred.can_fail(),
+            Self::Project { items, .. } => items.iter().any(|(_, e)| e.can_fail()),
+            Self::Group { keys, aggs, .. } => {
+                keys.iter().any(|(_, e)| e.can_fail())
+                    || aggs
+                        .iter()
+                        .any(|(_, agg)| agg.arg.as_ref().is_some_and(IRExpr::can_fail))
+            }
+            Self::Order { keys, .. } => keys.iter().any(|(e, _)| e.can_fail()),
+            _ => false,
+        };
+        own || self.children().into_iter().any(Term::can_fail)
+    }
+
     /// The number of nodes in the expanded tree (the plan budget counts this,
     /// not the shared graph).
     pub fn size(&self) -> usize {

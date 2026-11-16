@@ -545,6 +545,10 @@ struct Facts {
     /// conjunct after it are evaluated after the elements, in written order,
     /// never in a scan below them.
     failing_filter: bool,
+    /// Whether an element that can fail (an `optional` holding a term that
+    /// can fail) was stated: every `where` conjunct after it is evaluated
+    /// after it, never pushed below it (A3).
+    failing_element: bool,
 }
 
 /// How many facts of each kind a scope had stated at one point.
@@ -609,6 +613,7 @@ impl Facts {
             checks: Vec::new(),
             // The segment's filters keep their written order.
             failing_filter: false,
+            failing_element: false,
         }
     }
 
@@ -630,6 +635,7 @@ impl Facts {
             inlined: _,
             checks,
             failing_filter,
+            failing_element,
         } = other;
         if !optionals.is_empty() || !unions.is_empty() || !optional_names.is_empty() {
             return Err(ShapeError::Internal(
@@ -661,6 +667,7 @@ impl Facts {
         self.traversals.extend(traversals);
         self.filters.extend(filters);
         self.failing_filter |= failing_filter;
+        self.failing_element |= failing_element;
         self.blocks.extend(blocks);
         self.types.extend(types);
         Ok(())
@@ -2151,6 +2158,7 @@ impl<'a> Shaper<'a> {
             }
         }
         facts.optional_names.extend(introduced);
+        facts.failing_element |= pattern.can_fail();
         facts.optionals.push(OptionalFact { inner });
         Ok(())
     }
@@ -2902,13 +2910,16 @@ impl<'a> Shaper<'a> {
         // `where`'s conjuncts filter in written order, each on the rows the
         // ones before it keep: a conjunct that can fail runs after every
         // element, and no conjunct after it is pushed below it.
-        if facts.failing_filter || pred.can_fail() {
+        if facts.failing_filter || facts.failing_element || pred.can_fail() {
             facts.failing_filter = true;
             // A block's semi-join is placed after the scope's filters, so a
             // conjunct written after a block that the last split does not
             // already order splits the facts: the block filters first.
             let split_blocks = facts.checks.last().map_or(0, |c| c.marks.blocks);
-            if facts.blocks.len() > split_blocks {
+            let split_optionals = facts.checks.last().map_or(0, |c| c.marks.optionals);
+            if facts.blocks.len() > split_blocks
+                || (facts.failing_element && facts.optionals.len() > split_optionals)
+            {
                 facts.checks.push(LetCheck {
                     name: None,
                     value: pred.clone(),

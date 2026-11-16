@@ -2205,18 +2205,29 @@ fn place_query_filters(
                 // An `optional`'s inner tree is a scope of its own: a filter
                 // written after it never moves into it, where it would keep
                 // the outer row with nulls instead of dropping it.
+                // One whose inner tree can fail runs on every outer row: no
+                // filter written after it moves below it (A3).
                 Some(
                     LogicalNode::AntiJoin { input, inner, .. }
                     | LogicalNode::OptionalJoin { input, inner, .. },
                 ) => {
                     scopes.push(*inner);
-                    stack.push(*input);
+                    if subtree_can_fail(plan, *inner) {
+                        scopes.push(*input);
+                    } else {
+                        stack.push(*input);
+                    }
                 }
                 // A correlated read's pattern is a scope of its own: a filter
-                // written after it never moves below its group or cut.
+                // written after it never moves below its group or cut, nor
+                // below its input when its pattern can fail.
                 Some(LogicalNode::Correlate { input, inner, .. }) => {
                     scopes.push(*inner);
-                    stack.extend(*input);
+                    if subtree_can_fail(plan, *inner) {
+                        scopes.extend(*input);
+                    } else {
+                        stack.extend(*input);
+                    }
                 }
                 // Each arm of a union binds the union's names: a filter
                 // written after it stays above it, and each arm's own
@@ -2298,6 +2309,31 @@ fn place_query_filters(
         }
     }
     fired
+}
+
+/// Whether a term of the subtree under `id` can fail where it is evaluated:
+/// a filter, a scan's pushed filter, or a `let` (which the plan holds only
+/// for a value that can fail).
+fn subtree_can_fail(plan: &LogicalPlan, id: LogicalId) -> bool {
+    let mut stack = vec![id];
+    while let Some(id) = stack.pop() {
+        let fails = match plan.node(id) {
+            Some(LogicalNode::Filter { conjuncts, .. }) => conjuncts.iter().any(IRExpr::can_fail),
+            Some(LogicalNode::TableScan { spec, .. }) => spec
+                .filter
+                .as_ref()
+                .is_some_and(|filter| filter.gq_filters().iter().any(IRExpr::can_fail)),
+            Some(LogicalNode::Let { .. }) => true,
+            _ => false,
+        };
+        if fails {
+            return true;
+        }
+        if let Some(node) = plan.node(id) {
+            stack.extend(node.inputs());
+        }
+    }
+    false
 }
 
 /// Adjacent `Filter` nodes of one scope become one node, the lower node's

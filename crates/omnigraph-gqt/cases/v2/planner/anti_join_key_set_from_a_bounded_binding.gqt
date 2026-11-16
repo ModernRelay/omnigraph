@@ -5,6 +5,8 @@
 # notes: excluded source's touchpoints, then their identities. Count, sum and bound-edge blocks
 # notes: keep each outer row by its key's matches. A block whose bindings carry no bound filter,
 # notes: and a block that reads another outer binding, stay `correlated`. Rows agree either way.
+# notes: A block holding a term that can fail stays `correlated`: run from the key it would evaluate
+# notes: the term on rows no outer row reaches.
 
 --- runner
 timeout_ms: 10000
@@ -301,5 +303,44 @@ repos: I64
 --- expect plan
 anti join $x: correlated
 not pass anti_join_strategy
+
+--- expect same as reference
+
+--- query
+query lookalikes_by_weight($channel: String, $exclude: String) {
+    match {
+        $c: Channel,
+        $s: Source,
+        $c channelWatchesSource $s,
+        $t: Touchpoint,
+        $t touchpointOnSource $s,
+        $x: ExternalID,
+        $t touchpointByIdentity $x,
+    }
+    where $c.slug = $channel
+      and $t.action = "star"
+      and not exists {
+        $s0: Source,
+        $t0: Touchpoint,
+        $t0 touchpointOnSource $s0,
+        $t0 touchpointByIdentity $x
+        where $s0.slug = $exclude and 10 / $t0.weight > 0
+    }
+    return { $x.slug, count($t) as repos }
+}
+
+--- params
+{"channel": "c1", "exclude": "excluded"}
+
+--- expect unordered
+{"x.slug": "x2", "repos": 2}
+{"x.slug": "x4", "repos": 1}
+
+--- expect shape
+x.slug: String
+repos: I64
+
+--- expect plan
+anti join $x: correlated
 
 --- expect same as reference
