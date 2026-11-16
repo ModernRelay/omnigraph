@@ -1,0 +1,388 @@
+# issue: none
+# traversal: auto
+# notes: `@index` on an enum or a Bool builds a BITMAP (docs/rfcs/2026-11-07-gq-3.md section 4, "Scalar indexes").
+# notes: Equality, `!=`, `in`, `is null` and a Boolean test probe it; every step's rows equal the reference
+# notes: interpreter's and an unindexed twin type's, and a null value never passes `!=` or `not`.
+# notes: The appended rows lie outside the index (partial coverage) and are still returned.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Task {
+    slug: String @key
+    status: enum(open, closed, blocked)? @index
+    done: Bool? @index
+}
+node PlainTask {
+    slug: String @key
+    status: enum(open, closed, blocked)?
+    done: Bool?
+}
+
+--- seed
+{"type": "Task", "data": {"slug": "t1", "status": "open", "done": true}}
+{"type": "Task", "data": {"slug": "t2", "status": "closed", "done": false}}
+{"type": "Task", "data": {"slug": "t3"}}
+{"type": "Task", "data": {"slug": "t4", "status": "blocked", "done": true}}
+{"type": "Task", "data": {"slug": "t5", "status": "open", "done": false}}
+{"type": "PlainTask", "data": {"slug": "t1", "status": "open", "done": true}}
+{"type": "PlainTask", "data": {"slug": "t2", "status": "closed", "done": false}}
+{"type": "PlainTask", "data": {"slug": "t3"}}
+{"type": "PlainTask", "data": {"slug": "t4", "status": "blocked", "done": true}}
+{"type": "PlainTask", "data": {"slug": "t5", "status": "open", "done": false}}
+
+--- query
+query status_equals_indexed() {
+    match { $t: Task }
+    where $t.status = "open"
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t1"}
+{"t.slug": "t5"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan Task as $t: access index_probe status bitmap
+
+--- expect same as reference
+
+--- query
+query status_equals_unindexed() {
+    match { $t: PlainTask }
+    where $t.status = "open"
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t1"}
+{"t.slug": "t5"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan PlainTask as $t: access sequential
+
+--- expect same as reference
+
+--- query
+query status_not_equal_indexed() {
+    match { $t: Task }
+    where $t.status != "open"
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t2"}
+{"t.slug": "t4"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan Task as $t: access index_probe status bitmap
+
+--- expect same as reference
+
+--- query
+query status_not_equal_unindexed() {
+    match { $t: PlainTask }
+    where $t.status != "open"
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t2"}
+{"t.slug": "t4"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan PlainTask as $t: access sequential
+
+--- expect same as reference
+
+--- query
+query status_in_list_indexed() {
+    match { $t: Task }
+    where $t.status in ["closed", "blocked"]
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t2"}
+{"t.slug": "t4"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan Task as $t: access index_probe status bitmap
+
+--- expect same as reference
+
+--- query
+query status_in_list_unindexed() {
+    match { $t: PlainTask }
+    where $t.status in ["closed", "blocked"]
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t2"}
+{"t.slug": "t4"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan PlainTask as $t: access sequential
+
+--- expect same as reference
+
+--- query
+query status_is_null_indexed() {
+    match { $t: Task }
+    where $t.status is null
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t3"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan Task as $t: access index_probe status bitmap
+
+--- expect same as reference
+
+--- query
+query status_is_null_unindexed() {
+    match { $t: PlainTask }
+    where $t.status is null
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t3"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan PlainTask as $t: access sequential
+
+--- expect same as reference
+
+--- query
+query done_true_indexed() {
+    match { $t: Task }
+    where $t.done = true
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t1"}
+{"t.slug": "t4"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan Task as $t: access index_probe done bitmap
+
+--- expect same as reference
+
+--- query
+query done_true_unindexed() {
+    match { $t: PlainTask }
+    where $t.done = true
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t1"}
+{"t.slug": "t4"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan PlainTask as $t: access sequential
+
+--- expect same as reference
+
+--- query
+query done_false_indexed() {
+    match { $t: Task }
+    where $t.done = false
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t2"}
+{"t.slug": "t5"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan Task as $t: access index_probe done bitmap
+
+--- expect same as reference
+
+--- query
+query done_false_unindexed() {
+    match { $t: PlainTask }
+    where $t.done = false
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t2"}
+{"t.slug": "t5"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan PlainTask as $t: access sequential
+
+--- expect same as reference
+
+--- query
+query not_done_indexed() {
+    match { $t: Task }
+    where not $t.done
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t2"}
+{"t.slug": "t5"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan Task as $t: access index_probe done bitmap
+
+--- expect same as reference
+
+--- query
+query not_done_unindexed() {
+    match { $t: PlainTask }
+    where not $t.done
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t2"}
+{"t.slug": "t5"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan PlainTask as $t: access sequential
+
+--- expect same as reference
+
+--- mutate
+query append_tasks() {
+    insert Task { slug: "t6", status: "open", done: true }
+    insert PlainTask { slug: "t6", status: "open", done: true }
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+query appended_status_equals_indexed() {
+    match { $t: Task }
+    where $t.status = "open"
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t1"}
+{"t.slug": "t5"}
+{"t.slug": "t6"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan Task as $t: access index_probe status bitmap
+
+--- expect same as reference
+
+--- query
+query appended_status_equals_unindexed() {
+    match { $t: PlainTask }
+    where $t.status = "open"
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t1"}
+{"t.slug": "t5"}
+{"t.slug": "t6"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan PlainTask as $t: access sequential
+
+--- expect same as reference
+
+--- query
+query appended_done_true_indexed() {
+    match { $t: Task }
+    where $t.done = true
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t1"}
+{"t.slug": "t4"}
+{"t.slug": "t6"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan Task as $t: access index_probe done bitmap
+
+--- expect same as reference
+
+--- query
+query appended_done_true_unindexed() {
+    match { $t: PlainTask }
+    where $t.done = true
+    return { $t.slug }
+}
+
+--- expect unordered
+{"t.slug": "t1"}
+{"t.slug": "t4"}
+{"t.slug": "t6"}
+
+--- expect shape
+t.slug: String
+
+--- expect plan
+scan PlainTask as $t: access sequential
+
+--- expect same as reference
