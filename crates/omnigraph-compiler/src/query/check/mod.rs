@@ -1508,6 +1508,32 @@ fn param_types(params: &[Param]) -> R<Vec<(String, PropType)>> {
             }
             let lt = literal_type(&lit)?;
             check_literal_type(&lit, &lt, &ty, &p.name)?;
+            // A default is a value of the declared type: in its range.
+            let in_range = match (&lit, ty.scalar, ty.list) {
+                (Literal::Integer(n), scalar, false)
+                    if matches!(
+                        scalar,
+                        ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64
+                    ) =>
+                {
+                    fits(*n, scalar)
+                }
+                (Literal::Float(f), ScalarType::F32, false) => {
+                    f.is_finite() && f.abs() <= f64::from(f32::MAX)
+                }
+                _ => true,
+            };
+            if !in_range {
+                return Err(err(
+                    T3,
+                    format!(
+                        "the default `{}` of `${}` is outside the range of {}",
+                        lit,
+                        p.name,
+                        ty.display_name()
+                    ),
+                ));
+            }
         }
         out.push((p.name.clone(), ty));
     }
@@ -4302,11 +4328,11 @@ impl Ctx<'_> {
                     }
                     let v = adapt(v, &Ty::Value(pty.clone()));
                     match &v.ty {
+                        // A nullable value, a nullable parameter of the
+                        // caller's included, is no value of a parameter
+                        // that is not.
                         Ty::Value(t)
-                            if types_compatible(t, pty)
-                                && (pty.nullable
-                                    || !t.nullable
-                                    || matches!(v.kind, SKind::Param(_))) => {}
+                            if types_compatible(t, pty) && (pty.nullable || !t.nullable) => {}
                         other => {
                             return Err(err(
                                 T7,
