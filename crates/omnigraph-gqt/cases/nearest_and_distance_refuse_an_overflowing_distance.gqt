@@ -1,0 +1,50 @@
+# issue: none
+# notes: `distance` and `nearest` apply one finiteness rule: a distance that overflows `F32`
+# notes: from finite components fails the read with `E3` under both. `nearest` reaches the
+# notes: overflowing row in its flat exact pass, where `+inf` cannot mean an unreached row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(2)
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"far","embedding":[3.0e38,3.0e38]}}
+{"type":"Doc","data":{"slug":"near","embedding":[0.0,0.0]}}
+
+--- query
+query nearest_overflows($q: Vector(2)) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $distance }
+    return { $d.slug }
+}
+--- params
+{"q": [-3.0e38, -3.0e38]}
+--- expect error: E3
+
+--- query
+query distance_overflows($q: Vector(2)) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, $q) as $distance }
+    return { $d.slug }
+}
+--- params
+{"q": [-3.0e38, -3.0e38]}
+--- expect error: E3
+
+--- query
+query nearest_within_range($q: Vector(2)) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
+    return { $d.slug }
+}
+--- params
+{"q": [1.0, 1.0]}
+--- expect unordered
+{"d.slug":"near"}
+--- expect shape
+d.slug: String

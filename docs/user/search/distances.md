@@ -40,6 +40,14 @@ distance; any other vector index, such as one built for another distance, a
 quantized one or an HNSW graph, is not used, and the scan ranks every row flat,
 which is exact and reads the whole column.
 
+Stored and query components must be finite. A distance that overflows `F32`
+from finite components, such as `l2` between vectors near `3e38` of opposite
+sign, fails the read with `E3`: `distance` fails on any such row, and `nearest`
+fails when such a row is among the targets it returns. A `cosine` or `dot`
+distance that overflows to an undefined value (infinity minus infinity) is
+dropped by `nearest`'s scan, as a zero vector under `cosine` is, while
+`distance` fails on it with `E3`.
+
 ## Zero vectors and `cosine`
 
 Cosine is undefined at a zero vector, so a `cosine` field refuses one:

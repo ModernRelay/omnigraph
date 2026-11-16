@@ -485,6 +485,21 @@ pub(super) async fn execute_node_scan(
                     || known_matches.is_some_and(|matches| rows >= matches)
                     || rows as u64 >= type_rows));
         if !use_index {
+            // The flat exact kNN reaches every admitted row, so a `+inf`
+            // there is a distance that overflowed `F32`, not an unreached
+            // row: refused as `distance` refuses it (`E3`).
+            if unreached {
+                return Err(OmniError::Compiler(
+                    omnigraph_compiler::error::CompilerError::query(
+                        omnigraph_compiler::query::diagnostic::QueryDiagnostic::execution(
+                            omnigraph_compiler::query::codes::E3,
+                            format!(
+                                "`nearest` over `{variable}` scored a distance that is not finite"
+                            ),
+                        ),
+                    ),
+                ));
+            }
             break (batches, attempt_memory);
         }
         let Some(policy) = policy else {
