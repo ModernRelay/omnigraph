@@ -4880,6 +4880,52 @@ async fn ivf_flat_and_flat_knn_score_cosine_and_dot_exactly() {
     }
 }
 
+// --- Guard: a profile's filters run in Lance's fixed order ---
+//
+// A full-text profile becomes `InvertedIndexParams` booleans, and Lance 13's
+// `InvertedIndexParams::build` applies them in one order: token length,
+// lowercase, stemmer, stop words, ASCII folding. `english_v1`'s stop list
+// holds each stop word's stem because the stemmer runs first, and folding
+// after stemming keeps `résumés` apart from `resumes`. A Lance release that
+// reorders the filters changes a released profile's tokens and turns this
+// red.
+
+#[test]
+fn inverted_params_lowercase_stem_then_remove_stop_words_then_fold() {
+    use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
+
+    let tokens = |params: &InvertedIndexParams, text: &str| -> Vec<String> {
+        let mut tokenizer: Box<dyn LanceTokenizer> = params.build().unwrap();
+        let mut stream = tokenizer.token_stream_for_doc(text);
+        let mut out = Vec::new();
+        while stream.advance() {
+            out.push(stream.token().text.clone());
+        }
+        out
+    };
+    let english = |stop: &str| {
+        InvertedIndexParams::default()
+            .base_tokenizer("simple".to_string())
+            .language("English")
+            .unwrap()
+            .max_token_length(None)
+            .lower_case(true)
+            .stem(true)
+            .remove_stop_words(true)
+            .custom_stop_words(Some(vec![stop.to_string()]))
+            .ascii_folding(true)
+    };
+    // The stop list meets stems: the stem removes `only`, the word does not.
+    assert!(tokens(&english("onli"), "only").is_empty());
+    assert_eq!(tokens(&english("only"), "only"), ["onli"]);
+    // Lowercase comes before the stemmer.
+    assert_eq!(tokens(&english("x"), "RUNNING"), ["run"]);
+    // Folding comes after the stemmer: the accented plural stems to the
+    // accented singular before folding.
+    assert_eq!(tokens(&english("x"), "résumés"), ["resume"]);
+    assert_eq!(tokens(&english("x"), "resumes"), ["resum"]);
+}
+
 // --- Guard: `distance` scores with the flat kNN's own kernel ---
 //
 // The engine's `distance` operator scores through
