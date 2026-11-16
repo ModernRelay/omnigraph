@@ -1475,30 +1475,9 @@ impl<'a> Shaper<'a> {
                     ty: r.score.1.clone(),
                 }
             }
-            IRExpr::Binary {
-                left,
-                op,
-                right,
-                ty,
-            } => IRExpr::Binary {
-                left: Box::new(self.item(left, aggs, ranking)?),
-                op: *op,
-                right: Box::new(self.item(right, aggs, ranking)?),
-                ty: ty.clone(),
-            },
-            IRExpr::Not(inner, ty) => {
-                IRExpr::Not(Box::new(self.item(inner, aggs, ranking)?), ty.clone())
-            }
-            IRExpr::IsNull { expr, negated, ty } => IRExpr::IsNull {
-                expr: Box::new(self.item(expr, aggs, ranking)?),
-                negated: *negated,
-                ty: ty.clone(),
-            },
-            IRExpr::Cast { expr, ty } => IRExpr::Cast {
-                expr: Box::new(self.item(expr, aggs, ranking)?),
-                ty: ty.clone(),
-            },
-            other => other.clone(),
+            // An aggregate reaches a return item under any operator: unary
+            // `-`, a call (`coalesce(sum(…), 0)`) and arithmetic alike.
+            other => other.try_map_children(|child| self.item(child, aggs, ranking))?,
         })
     }
 

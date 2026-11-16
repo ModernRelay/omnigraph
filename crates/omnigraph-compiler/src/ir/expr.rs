@@ -362,6 +362,111 @@ impl IRExpr {
         }
     }
 
+    /// The node with each direct child replaced by `f` of it, every other
+    /// field kept: the one walk a rewrite of some nodes falls back on, so no
+    /// variant is left unwalked.
+    pub fn try_map_children<E>(
+        &self,
+        mut f: impl FnMut(&Self) -> std::result::Result<Self, E>,
+    ) -> std::result::Result<Self, E> {
+        let mut b = |x: &Self| f(x).map(Box::new);
+        Ok(match self {
+            Self::PropAccess { .. }
+            | Self::Variable(_, _)
+            | Self::Param(_, _)
+            | Self::Literal(_, _)
+            | Self::AliasRef(_, _) => self.clone(),
+            Self::Nearest {
+                variable,
+                property,
+                query,
+                ty,
+            } => Self::Nearest {
+                variable: variable.clone(),
+                property: property.clone(),
+                query: b(query)?,
+                ty: ty.clone(),
+            },
+            Self::Bm25 { field, query, ty } => Self::Bm25 {
+                field: b(field)?,
+                query: b(query)?,
+                ty: ty.clone(),
+            },
+            Self::Aggregate {
+                func,
+                distinct,
+                arg,
+                signature,
+            } => Self::Aggregate {
+                func: *func,
+                distinct: *distinct,
+                arg: b(arg)?,
+                signature: signature.clone(),
+            },
+            Self::Binary {
+                left,
+                op,
+                right,
+                ty,
+            } => Self::Binary {
+                left: b(left)?,
+                op: *op,
+                right: b(right)?,
+                ty: ty.clone(),
+            },
+            Self::Not(inner, ty) => Self::Not(b(inner)?, ty.clone()),
+            Self::Cast { expr, ty } => Self::Cast {
+                expr: b(expr)?,
+                ty: ty.clone(),
+            },
+            Self::IsNull { expr, negated, ty } => Self::IsNull {
+                expr: b(expr)?,
+                negated: *negated,
+                ty: ty.clone(),
+            },
+            Self::Neg { expr, ty } => Self::Neg {
+                expr: b(expr)?,
+                ty: ty.clone(),
+            },
+            Self::Call { func, args, ty } => Self::Call {
+                func: *func,
+                args: args
+                    .iter()
+                    .map(&mut f)
+                    .collect::<std::result::Result<_, E>>()?,
+                ty: ty.clone(),
+            },
+        })
+    }
+
+    /// The direct children, in field order.
+    pub fn children(&self) -> Vec<&Self> {
+        match self {
+            Self::PropAccess { .. }
+            | Self::Variable(_, _)
+            | Self::Param(_, _)
+            | Self::Literal(_, _)
+            | Self::AliasRef(_, _) => Vec::new(),
+            Self::Nearest { query, .. } => vec![query],
+            Self::Bm25 { field, query, .. } => vec![field, query],
+            Self::Aggregate { arg, .. }
+            | Self::Not(arg, _)
+            | Self::IsNull { expr: arg, .. }
+            | Self::Neg { expr: arg, .. }
+            | Self::Cast { expr: arg, .. } => vec![arg],
+            Self::Binary { left, right, .. } => vec![left, right],
+            Self::Call { args, .. } => args.iter().collect(),
+        }
+    }
+
+    /// The node with every child replaced by one placeholder: two nodes
+    /// with equal heads differ at most in their children.
+    pub fn head(&self) -> Self {
+        let placeholder = Self::Literal(Literal::Null, boolean_type(true));
+        self.try_map_children(|_| Ok::<_, std::convert::Infallible>(placeholder.clone()))
+            .unwrap_or_else(|never| match never {})
+    }
+
     /// Visit each typed leaf without recursing on a user-sized expression tree.
     pub fn visit_leaves(&self, mut visit: impl FnMut(&Self)) {
         self.visit_nodes(|expr| {

@@ -1094,14 +1094,9 @@ pub(crate) fn rank_score(binding: &str, kind: RankKind) -> IRExpr {
 }
 
 pub(crate) fn contains_aggregate(expr: &IRExpr) -> bool {
-    match expr {
-        IRExpr::Aggregate { .. } => true,
-        IRExpr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
-        IRExpr::Not(inner, _)
-        | IRExpr::IsNull { expr: inner, .. }
-        | IRExpr::Cast { expr: inner, .. } => contains_aggregate(inner),
-        _ => false,
-    }
+    let mut found = false;
+    expr.visit_nodes(|node| found |= matches!(node, IRExpr::Aggregate { .. }));
+    found
 }
 
 /// The `Aggregate` node's items (group keys, plain aggregates, and each
@@ -1156,34 +1151,12 @@ fn hoist_aggregates(expr: &IRExpr, grouped: &mut Vec<IRProjection>) -> IRExpr {
             };
             IRExpr::AliasRef(column, ty)
         }
-        IRExpr::Binary {
-            left,
-            op,
-            right,
-            ty,
-        } => IRExpr::Binary {
-            left: Box::new(hoist_aggregates(left, grouped)),
-            op: *op,
-            right: Box::new(hoist_aggregates(right, grouped)),
-            ty: ty.clone(),
-        },
-        IRExpr::Not(inner, ty) => {
-            IRExpr::Not(Box::new(hoist_aggregates(inner, grouped)), ty.clone())
-        }
-        IRExpr::IsNull {
-            expr: inner,
-            negated,
-            ty,
-        } => IRExpr::IsNull {
-            expr: Box::new(hoist_aggregates(inner, grouped)),
-            negated: *negated,
-            ty: ty.clone(),
-        },
-        IRExpr::Cast { expr: inner, ty } => IRExpr::Cast {
-            expr: Box::new(hoist_aggregates(inner, grouped)),
-            ty: ty.clone(),
-        },
-        other => other.clone(),
+        // Under any operator: unary `-`, a call and arithmetic alike.
+        other => other
+            .try_map_children(|child| {
+                Ok::<_, std::convert::Infallible>(hoist_aggregates(child, grouped))
+            })
+            .unwrap_or_else(|never| match never {}),
     }
 }
 
