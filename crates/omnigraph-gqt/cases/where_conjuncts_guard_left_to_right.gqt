@@ -4,7 +4,9 @@
 # notes: conjunct that can fail runs on every row the conjuncts before it
 # notes: keep, whatever a later conjunct removes, so `bob` (age `-2147483648`)
 # notes: overflows `$p.age - 4` when it is written first, and is guarded when a
-# notes: conjunct that removes him is written first.
+# notes: conjunct that removes him is written first. A correlated block is a
+# notes: conjunct like any other: an `exists` written first guards the
+# notes: conjuncts after it, and one written after a failing conjunct does not.
 
 --- runner
 timeout_ms: 10000
@@ -20,10 +22,14 @@ node Person {
     age: I32
 }
 
+edge Knows: Person -> Person
+
 --- seed
 {"type":"Person","data":{"handle":"ada","age":36}}
 {"type":"Person","data":{"handle":"bob","age":-2147483648}}
 {"type":"Person","data":{"handle":"cy","age":20}}
+{"edge":"Knows","from":"ada","to":"cy"}
+{"edge":"Knows","from":"cy","to":"ada"}
 
 --- query
 query a_failing_conjunct_written_first_fails() {
@@ -67,6 +73,57 @@ query or_guards_where_the_left_is_true() {
 --- expect unordered
 {"p.handle":"ada"}
 {"p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query an_exists_written_first_keeps_the_row_out() {
+    match { $p: Person }
+    where exists { $q: Person, $p knows $q } and ($p.age - 4) < 35
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query a_count_block_written_first_keeps_the_row_out() {
+    match { $p: Person }
+    where count { $q: Person, $p knows $q } >= 1 and ($p.age - 4) < 35 and ($p.age * 2) > 0
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query a_failing_conjunct_before_an_exists_fails() {
+    match { $p: Person }
+    where ($p.age - 4) < 35 and exists { $q: Person, $p knows $q }
+    return { $p.handle }
+}
+
+--- expect error: E1
+
+--- query
+query a_failing_conjunct_between_two_blocks_runs_after_the_first() {
+    match { $p: Person }
+    where exists { $q: Person, $p knows $q } and ($p.age - 4) < 35 and not exists { $r: Person, $r knows $p where $r.age > 100 }
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
 {"p.handle":"cy"}
 
 --- expect shape

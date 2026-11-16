@@ -471,10 +471,12 @@ struct Marks {
     correlates: usize,
 }
 
-/// A `let` whose value can fail, at the point of the scope it was written.
+/// A step that splits a scope's facts at the point it was written: a `let`
+/// whose value can fail (`name` set), or a `where` conjunct that must filter
+/// after a correlated block stated before it (`name` unset).
 #[derive(Debug, Clone)]
 struct LetCheck {
-    name: String,
+    name: Option<String>,
     value: IRExpr,
     marks: Marks,
 }
@@ -1848,7 +1850,7 @@ impl<'a> Shaper<'a> {
                     substitute(&mut value, &facts.lets);
                     if value.can_fail() {
                         facts.checks.push(LetCheck {
-                            name: name.clone(),
+                            name: Some(name.clone()),
                             value: value.clone(),
                             marks: facts.marks(),
                         });
@@ -2342,7 +2344,7 @@ impl<'a> Shaper<'a> {
             bind_params(&mut value, bindings);
             if value.can_fail() {
                 facts.checks.push(LetCheck {
-                    name: column.clone(),
+                    name: Some(column.clone()),
                     value: value.clone(),
                     marks: facts.marks(),
                 });
@@ -2724,7 +2726,19 @@ impl<'a> Shaper<'a> {
         // element, and no conjunct after it is pushed below it.
         if facts.failing_filter || pred.can_fail() {
             facts.failing_filter = true;
-            facts.filters.push(pred.clone());
+            // A block's semi-join is placed after the scope's filters, so a
+            // conjunct written after a block that the last split does not
+            // already order splits the facts: the block filters first.
+            let split_blocks = facts.checks.last().map_or(0, |c| c.marks.blocks);
+            if facts.blocks.len() > split_blocks {
+                facts.checks.push(LetCheck {
+                    name: None,
+                    value: pred.clone(),
+                    marks: facts.marks(),
+                });
+            } else {
+                facts.filters.push(pred.clone());
+            }
             return Ok(());
         }
         // A filter over one binding's variable, written right after it, is
@@ -3097,9 +3111,12 @@ impl<'a> Shaper<'a> {
                 outer_physical_names,
                 fresh,
             )?;
-            pipeline.push(PatternStep::Let {
-                name: check.name.clone(),
-                value: check.value.clone(),
+            pipeline.push(match &check.name {
+                Some(name) => PatternStep::Let {
+                    name: name.clone(),
+                    value: check.value.clone(),
+                },
+                None => PatternStep::Filter(check.value.clone()),
             });
             from = check.marks;
         }
@@ -3796,6 +3813,13 @@ fn find_outer_var(facts: &Facts, outer_bound: &HashSet<String>) -> Option<String
             .iter()
             .flat_map(|b| b.filters.iter())
             .chain(facts.filters.iter())
+            .chain(
+                facts
+                    .checks
+                    .iter()
+                    .filter(|c| c.name.is_none())
+                    .map(|c| &c.value),
+            )
             .find_map(|f| {
                 let mut cols = Vec::new();
                 f.columns(&mut cols);
