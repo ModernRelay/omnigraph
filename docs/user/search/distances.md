@@ -53,7 +53,8 @@ dropped by `nearest`'s scan, as a zero vector under `cosine` is, while
 Cosine is undefined at a zero vector, so a `cosine` field refuses one:
 
 - A write that stores a zero vector in a `cosine` field (every component `0` or
-  `-0`) fails validation and changes nothing. This holds for loads, inserts,
+  `-0`, or so small, below about 3.7e-23, that its squared norm is zero in
+  `F32`) fails validation and changes nothing. This holds for loads, inserts,
   updates and edge properties. A null is not a vector and is accepted.
 - A zero query vector for a `cosine` field is refused before the read runs,
   under `distance` and `nearest` alike.

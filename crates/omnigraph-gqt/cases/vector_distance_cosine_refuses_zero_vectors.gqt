@@ -4,7 +4,8 @@
 # notes: validation and changes nothing, on a node and on an edge, by insert
 # notes: and by update; a zero query vector is refused before the read runs,
 # notes: under `distance` and `nearest` alike. A `dot` field takes a zero
-# notes: vector, stored or queried. A null is not a vector and passes.
+# notes: vector, stored or queried. A null is not a vector and passes. A vector whose squared norm is
+# notes: zero in F32 (every component below about 3.7e-23) is a zero vector to cosine too.
 
 --- runner
 timeout_ms: 10000
@@ -41,6 +42,14 @@ query add($s: String, $e: Vector(2)) { insert Doc { slug: $s, embedding: $e } }
 
 --- params
 {"s": "z", "e": [-0.0, 0.0]}
+
+--- expect error: Doc.embedding declares the cosine distance, which a zero vector leaves undefined
+
+--- mutate
+query add($s: String, $e: Vector(2)) { insert Doc { slug: $s, embedding: $e } }
+
+--- params
+{"s": "z", "e": [1e-30, 0.0]}
 
 --- expect error: Doc.embedding declares the cosine distance, which a zero vector leaves undefined
 
@@ -98,6 +107,20 @@ query scored($q: Vector(2)) {
 
 --- params
 {"q": [0.0, 0.0]}
+
+--- expect error: the query vector for 'Doc.embedding' is a zero vector
+
+--- query
+query scored_near_zero($q: Vector(2)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    return { $x.slug, $distance }
+}
+
+--- params
+{"q": [1e-30, -1e-30]}
 
 --- expect error: the query vector for 'Doc.embedding' is a zero vector
 

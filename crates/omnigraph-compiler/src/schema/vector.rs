@@ -106,9 +106,13 @@ impl fmt::Display for VectorDistance {
     }
 }
 
-/// Whether every component of `values` is zero (`-0.0` included).
+/// Whether `values` is a zero vector to `cosine`: its squared norm, summed
+/// in `F32` as the distance kernels sum it, is zero. Every zero component
+/// (`-0.0` included) makes one, and so does a vector whose components are
+/// all so small (below about 3.7e-23) that each square underflows: its norm
+/// is zero too, and its cosine would divide by it.
 pub fn is_zero_vector(values: &[f32]) -> bool {
-    values.iter().all(|value| *value == 0.0)
+    values.iter().map(|value| value * value).sum::<f32>() == 0.0
 }
 
 #[cfg(test)]
