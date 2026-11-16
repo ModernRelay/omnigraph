@@ -1,12 +1,14 @@
 //! A core write as the mutation executor runs it: one keyed statement per
 //! sink, group by group in order.
 //!
-//! A group's clauses select the rows its statements run over, in one of two
-//! forms. When they are a scan of the statements' target filtered by
-//! predicates a staged scan evaluates, the group lowers to staged statements
-//! directly: an `update` or `delete` takes the predicate as its selection,
-//! read together with the statements staged before it, and an `insert` after
-//! one runs once per row it matched. Every other group with clauses lowers
+//! A group's clauses select the rows its statements run over, evaluated
+//! once, before its first statement, in one of two forms. When they are a
+//! scan of the statements' target filtered by predicates a staged scan
+//! evaluates, and the group's one `update` or `delete` is its first
+//! statement, the group lowers to staged statements directly: the `update`
+//! or `delete` takes the predicate as its selection, read together with the
+//! groups staged before it, and an `insert` after it runs once per row it
+//! matched. Every other group with clauses lowers
 //! its selection to a read that the read planner shapes ([`ReadShape`]) and
 //! the engine runs against the snapshot the write captured. The read returns,
 //! per row, the identity of each `update` or `delete` variable and the value
@@ -213,8 +215,12 @@ enum Staged {
 /// the group needs a selection read: its clauses are more than a filtered
 /// scan, a filter holds a term a staged scan does not evaluate (a search
 /// predicate, arithmetic, a registry call), a statement names another
-/// variable, an assignment reads the row, or an `insert` comes before the
-/// statement whose rows it would count.
+/// variable, an assignment reads the row, an `insert` comes before the
+/// statement whose rows it would count, or more than one statement selects
+/// rows. Either form evaluates the selection once, before the group's first
+/// statement; they differ only in that a selection read sees the snapshot,
+/// so a group whose selection reads a table an earlier group changes is
+/// staged or refused, never read stale.
 fn staged(group: &WriteGroup) -> Option<Staged> {
     let mut conjuncts = Vec::new();
     let mut term = &group.input;
@@ -237,6 +243,19 @@ fn staged(group: &WriteGroup) -> Option<Staged> {
         c.columns(&mut cols);
     }
     if cols.iter().any(|c| c != var) || conjuncts.iter().any(|c| !stageable(c)) {
+        return None;
+    }
+    // A group's selection is evaluated once, before its first statement. A
+    // staged statement evaluates its predicate against the rows staged
+    // before it, so only a group whose one `update` or `delete` comes first
+    // is staged; with a second, the later one would select again, after the
+    // first's effects, and the selection read evaluates it once instead.
+    let selecting = group
+        .sinks
+        .iter()
+        .filter(|s| matches!(s, Sink::Update { .. } | Sink::Delete { .. }))
+        .count();
+    if selecting > 1 {
         return None;
     }
     let mut matched = false;

@@ -4,6 +4,8 @@
 # notes: and a `count {…} > n` block, a `let` and a `from`, assignments that read the row, an insert per selected row
 # notes: with bound endpoint references, and a selection that matches nothing. Two values one statement's rows give one
 # notes: entity's property are `E4`; a group whose selection reads a table an earlier group changes is not lowered in this release (`T86`).
+# notes: A group's selection is evaluated once, before its first statement: a later statement of the group
+# notes: updates the rows it selected, not the rows an earlier statement left matching or inserted.
 
 --- runner
 timeout_ms: 10000
@@ -205,3 +207,39 @@ query staff() { match { $p: Person, $p $k:worksAt $c } return { $p.name, $c.slug
 p.name: String
 c.slug: String
 k.role: String?
+
+--- mutate
+query add_eve() { insert Person { name: "eve", age: 1 } }
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query age_then_move() {
+  match { $p: Person } where $p.age = 1
+  update $p set { age: 2 }
+  update $p set { city: "lima" }
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- mutate
+query age_insert_then_move() {
+  match { $p: Person } where $p.city = "lima"
+  update $p set { age: 3 }
+  insert Person { name: "fay", city: "lima" }
+  update $p set { city: "quito" }
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- query
+query moved() { match { $p: Person } where $p.name = "eve" or $p.name = "fay" return { $p.name, $p.age, $p.city } }
+
+--- expect unordered
+{"p.age":3,"p.city":"quito","p.name":"eve"}
+{"p.city":"lima","p.name":"fay"}
+
+--- expect shape
+p.name: String
+p.age: I32?
+p.city: String?
