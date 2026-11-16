@@ -79,9 +79,11 @@ pub(crate) fn refusal(
     code: QueryCode,
     message: impl Into<String>,
     span: (usize, usize),
-    mut edits: Vec<TextEdit>,
+    edits: Vec<TextEdit>,
     applicability: Applicability,
 ) -> Refusal {
+    // A printed fix never holds two edits of one range.
+    let mut edits = non_overlapping(input.len(), &edits);
     let mut d = QueryDiagnostic::parse(code, message, Some(Position::at(input, span.0)));
     // A pest span may end after implicit whitespace; the construct ends at
     // its last token, and covers every edit that touches it.
@@ -125,6 +127,7 @@ pub(crate) fn refusal_note(
 /// The construct's text with the edits inside it applied; an edit outside it
 /// is printed after it.
 pub(crate) fn derive_fix(input: &str, span: (usize, usize), edits: &[TextEdit]) -> String {
+    let edits = non_overlapping(input.len(), edits);
     let (inside, outside): (Vec<&TextEdit>, Vec<&TextEdit>) = edits
         .iter()
         .partition(|e| e.start >= span.0 && e.end <= span.1);
@@ -147,13 +150,33 @@ pub(crate) fn derive_fix(input: &str, span: (usize, usize), edits: &[TextEdit]) 
     text
 }
 
-/// Apply non-overlapping edits to `input`.
+/// `edits` without overlaps, in source order: of two edits that overlap
+/// (one habit's deletion inside another's), the one that starts first and
+/// reaches furthest is kept, and an edit outside `input` is dropped, so
+/// applying the rest can never slice past the text.
+pub(crate) fn non_overlapping(input_len: usize, edits: &[TextEdit]) -> Vec<TextEdit> {
+    let mut sorted: Vec<&TextEdit> = edits
+        .iter()
+        .filter(|e| e.start <= e.end && e.end <= input_len)
+        .collect();
+    sorted.sort_by_key(|e| (e.start, std::cmp::Reverse(e.end)));
+    let mut kept: Vec<TextEdit> = Vec::new();
+    for e in sorted {
+        match kept.last() {
+            Some(last) if e.start < last.end || last == e => {}
+            _ => kept.push(e.clone()),
+        }
+    }
+    kept
+}
+
+/// Apply `edits` to `input`, overlaps resolved by [`non_overlapping`].
 pub fn apply_edits(input: &str, edits: &[TextEdit]) -> String {
     let mut out = input.to_string();
-    let mut sorted: Vec<&TextEdit> = edits.iter().collect();
-    sorted.sort_by_key(|e| std::cmp::Reverse((e.start, e.end)));
-    for e in sorted {
-        out.replace_range(e.start..e.end, &e.replacement);
+    for e in non_overlapping(input.len(), edits).iter().rev() {
+        if out.is_char_boundary(e.start) && out.is_char_boundary(e.end) {
+            out.replace_range(e.start..e.end, &e.replacement);
+        }
     }
     out
 }
@@ -238,7 +261,14 @@ fn recovered<T>(built: R<T>) -> Option<T> {
     match built {
         Ok(value) => Some(value),
         Err(refused) => {
-            RECOVERED.with(|r| r.borrow_mut().push(refused));
+            // The parse reports at most `MAX_PARSE_REFUSALS`; one past it
+            // still marks the build refused.
+            RECOVERED.with(|r| {
+                let mut recorded = r.borrow_mut();
+                if recorded.len() <= MAX_PARSE_REFUSALS {
+                    recorded.push(refused);
+                }
+            });
             None
         }
     }
@@ -369,7 +399,8 @@ pub fn parse_source_all(input: &str) -> (Option<SourceFile>, Vec<QueryDiagnostic
                 break;
             }
             Err(Refused::Builder(refusals)) => {
-                for refused in refusals {
+                let room = MAX_PARSE_REFUSALS.saturating_sub(out.len());
+                for refused in refusals.into_iter().take(room) {
                     let at = refused.span.map_or_else(
                         || refused.diagnostic.position.map_or(0, |p| p.byte as usize),
                         |(start, _)| start,
@@ -2423,7 +2454,7 @@ impl Pieces {
         for c in list.clone().into_inner() {
             match c.as_rule() {
                 Rule::missing_comma_rec => {
-                    gap = Some(input[..c.as_span().start()].trim_end().len());
+                    gap = Some(without_trailing_comments(&input[..c.as_span().start()]).len());
                 }
                 Rule::element => {
                     // A predicate written without a comma before it moves to
@@ -2580,7 +2611,8 @@ impl Pieces {
                     self.preds
                         .push(pred_text(&ik.clone().into_inner().next().unwrap()));
                 } else {
-                    self.elements.push(inner.as_str().trim().to_string());
+                    self.elements
+                        .push(without_trailing_comments(inner.as_str().trim()).to_string());
                 }
                 note_problem(
                     &mut self.problem,
@@ -2593,9 +2625,12 @@ impl Pieces {
             | Rule::from_clause
             | Rule::optional_block
             | Rule::binding
-            | Rule::traversal => self.elements.push(e.as_str().trim().to_string()),
+            | Rule::traversal => self
+                .elements
+                .push(without_trailing_comments(e.as_str().trim()).to_string()),
             _ => {
-                self.elements.push(e.as_str().trim().to_string());
+                self.elements
+                    .push(without_trailing_comments(e.as_str().trim()).to_string());
                 return true;
             }
         }
@@ -2618,6 +2653,41 @@ impl Pieces {
             out.push_str(&format!(" where {}", self.preds.join(" and ")));
         }
         out
+    }
+}
+
+/// `text` without the whitespace and comments that end it: a construct's
+/// span can hold the comment written after it, which a fix that writes the
+/// construct elsewhere, or a comma after it, must leave behind.
+fn without_trailing_comments(text: &str) -> &str {
+    let mut text = text.trim_end();
+    loop {
+        if let Some(open) = text.strip_suffix("*/").and_then(|t| t.rfind("/*")) {
+            text = text[..open].trim_end();
+            continue;
+        }
+        let line_start = text.rfind('\n').map_or(0, |n| n + 1);
+        let line = &text[line_start..];
+        // A `//` outside a string literal opens a comment to the line's end.
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut comment = None;
+        for (i, c) in line.char_indices() {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' if quoted => escaped = true,
+                '"' => quoted = !quoted,
+                '/' if !quoted && line[i..].starts_with("//") => {
+                    comment = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        match comment {
+            Some(i) => text = text[..line_start + i].trim_end(),
+            None => return text,
+        }
     }
 }
 
@@ -2769,12 +2839,20 @@ fn block_pattern(body: &Pair<Rule>) -> R<Pattern> {
 /// suggestion inserting every missing comma.
 fn missing_commas(list: &Pair<Rule>, what: &str) -> R<()> {
     let input = input_of(list);
-    let edits: Vec<TextEdit> = list
-        .clone()
-        .into_inner()
-        .filter(|c| c.as_rule() == Rule::missing_comma_rec)
-        .map(|c| {
-            let at = input[..c.as_span().start()].trim_end().len();
+    // The comma goes right after the item before the gap, never after a
+    // comment that follows it.
+    let items: Vec<Pair<Rule>> = list.clone().into_inner().collect();
+    let edits: Vec<TextEdit> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.as_rule() == Rule::missing_comma_rec)
+        .map(|(i, c)| {
+            let at = match i.checked_sub(1).map(|before| &items[before]) {
+                Some(before) => {
+                    before.as_span().start() + without_trailing_comments(before.as_str()).len()
+                }
+                None => without_trailing_comments(&input[..c.as_span().start()]).len(),
+            };
             edit(at, at, ",")
         })
         .collect();
@@ -3677,8 +3755,10 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                     terms.push(format!("{prev} {} {r}", pair[0].as_str()));
                     prev = r;
                 }
+                // Parenthesized: the comparison may be the operand of a
+                // `not`, which binds tighter than `and`.
                 return whole(
-                    terms.join(" and "),
+                    format!("({})", terms.join(" and ")),
                     "a comparison is not chained; write each with `and` (a chained `<` … `>` would read as an undirected traversal)",
                     Q012,
                     MACHINE,
@@ -3770,8 +3850,9 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
             let mut b = op.clone().into_inner();
             let lo = b.nth(1).unwrap().as_str().trim().to_string();
             let hi = b.nth(1).unwrap().as_str().trim().to_string();
+            // Parenthesized: the comparison may be the operand of a `not`.
             whole(
-                format!("{left_source} >= {lo} and {left_source} <= {hi}"),
+                format!("({left_source} >= {lo} and {left_source} <= {hi})"),
                 "`between` is SQL's; GQ writes the two comparisons",
                 Q014,
                 MACHINE,

@@ -1593,6 +1593,45 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query q() { match { $p: Person } return { $p.age as in_ } order { in_ desc } }"#,
     ),
     (
+        r#"a missing comma after an element that a comment follows"#,
+        "Q016",
+        r#"query q() {
+  match { $p: Person // the person
+    $q: Person }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person, $q: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"`between` under `not`"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person }
+  where not $p.age between 1 and 5
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person } where not ($p.age >= 1 and $p.age <= 5) return { $p.name } }"#,
+    ),
+    (
+        r#"a chained comparison under `not`"#,
+        "Q012",
+        r#"query q() {
+  match { $p: Person }
+  where not 1 < $p.age < 5
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person } where not (1 < $p.age and $p.age < 5) return { $p.name } }"#,
+    ),
+    (
+        r#"an `assert` inside a `returning`, two overlapping deletions"#,
+        "Q015",
+        r#"query w() {
+  insert Person { name: "a" }
+  returning { assert { match { $p: Person } return { $p } } }
+}"#,
+        r#"query w() { insert Person { name: "a" } }"#,
+    ),
+    (
         r#"a reserved alias beside a property whose name holds `order`"#,
         "Q005",
         r#"query q() {
@@ -2504,6 +2543,21 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query q() @budget(plan = 1000) { match { $p: Person } return { $p.name } }"#,
     ),
 ];
+
+/// One parse reports at most 256 refusals however many independent ones a
+/// source holds, from the grammar or from the builder (here 5000 return
+/// items, each a SQL alias).
+#[test]
+fn a_parse_reports_a_bounded_number_of_refusals() {
+    let items: Vec<String> = (0..5000).map(|i| format!("a{i} = $p.name")).collect();
+    let source = format!(
+        "query q() {{ match {{ $p: Person }} return {{ {} }} }}",
+        items.join(", ")
+    );
+    let refusals = super::parse::parse_source_all(&source).1;
+    assert!(!refusals.is_empty());
+    assert!(refusals.len() <= 256, "{}", refusals.len());
+}
 
 /// `text` as a source.
 pub(crate) fn as_source(text: &str) -> String {

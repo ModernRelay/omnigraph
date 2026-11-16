@@ -504,9 +504,8 @@ impl Tracked {
     }
 
     fn apply(&mut self, edits: &[TextEdit]) {
-        let mut sorted: Vec<&TextEdit> = edits.iter().collect();
-        sorted.sort_by_key(|e| std::cmp::Reverse((e.start, e.end)));
-        for e in sorted {
+        let sorted = super::parse::non_overlapping(self.text.len(), edits);
+        for e in sorted.iter().rev() {
             let bytes = e.replacement.as_bytes();
             self.text.splice(e.start..e.end, bytes.iter().copied());
             self.prov
