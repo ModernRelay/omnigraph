@@ -5225,6 +5225,78 @@ edge WorksAt: Human -> Company
     assert!(recovered.schema_source().contains("node Human"));
 }
 
+/// A changed analyzer replaces its column's full-text segments with an
+/// untrained one in a detached commit (`commit_full_text_redeclarations`);
+/// interrupted after that commit, the apply publishes nothing: the
+/// registration, the linear HEAD and the accepted analysis stay as they
+/// were, and the same handle's retry publishes the new analysis.
+#[tokio::test]
+#[serial]
+async fn schema_apply_analyzer_redeclaration_partial_effect_leaves_no_residue() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let schema = |analyzer: &str| {
+        format!(
+            "node Doc {{\n    slug: String @key\n    body: String @index(fulltext, analyzer = \"{analyzer}\")\n}}\n"
+        )
+    };
+    let db = helpers::session(Omnigraph::init(&uri, &schema("standard_v1")).await.unwrap());
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d1","body":"Runners were RUNNING"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+    let snapshot_before = helpers::snapshot_main(&db).await.unwrap();
+    let head_before = lance::Dataset::open(&node_table_uri(&db, "Doc").await)
+        .await
+        .unwrap()
+        .version()
+        .version;
+
+    {
+        let _failpoint = catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.fire_always();
+        let error = db
+            .apply_schema(&schema("english_v1"))
+            .await
+            .expect_err("the redeclaration's detached commit must be interrupted");
+        assert!(
+            error.to_string().contains("schema_apply.post_table_commit"),
+            "unexpected redeclaration error: {error}"
+        );
+    }
+    assert_no_recovery_sidecars(dir.path());
+    assert_no_staging_files(dir.path());
+    let snapshot = helpers::snapshot_main(&db).await.unwrap();
+    assert!(
+        snapshot
+            .dataset("node:Doc")
+            .unwrap()
+            .same_registration(snapshot_before.dataset("node:Doc").unwrap()),
+        "an unpublished redeclaration leaves the registration as it was"
+    );
+    let head = lance::Dataset::open(&node_table_uri(&db, "Doc").await)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        head, head_before,
+        "a detached redeclaration never moves HEAD"
+    );
+    assert!(db.schema_source().contains("standard_v1"));
+
+    db.apply_schema(&schema("english_v1"))
+        .await
+        .expect("the same handle's retry publishes the new analysis");
+    assert!(db.schema_source().contains("english_v1"));
+    drop(db);
+    let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert!(reopened.schema_source().contains("english_v1"));
+}
+
 #[tokio::test]
 #[serial]
 async fn schema_apply_partial_table_effect_leaves_no_residue() {

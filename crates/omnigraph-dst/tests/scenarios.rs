@@ -3437,6 +3437,79 @@ query nearest_docs($q: Vector(2)) {
     )
 }
 
+/// The storage calls of a schema apply that changes a full-text field's
+/// analyzer on a reopened handle: the redeclaration's detached commit
+/// (`commit_full_text_redeclarations`), which replaces the column's
+/// segments with an untrained one, and the one publication.
+fn analyzer_redeclaration_cost_rows(replay: &str) -> String {
+    let schema = |analyzer: &str| {
+        format!(
+            "node Doc {{\n    slug: String @key\n    body: String @index(fulltext, analyzer = \"{analyzer}\")\n}}\n"
+        )
+    };
+    const LABEL: &str = "SchemaApplyAnalyzerChange";
+
+    struct AnalyzerChange {
+        before: String,
+        after: String,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for AnalyzerChange {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_analyzer_setup");
+            let writer = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        &self.before,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            writer
+                .load_jsonl(
+                    r#"{"type":"Doc","data":{"slug":"d1","body":"Runners were RUNNING"}}
+{"type":"Doc","data":{"slug":"d2","body":"Cafe creme"}}"#,
+                    LoadMode::Overwrite,
+                )
+                .await
+                .unwrap();
+            writer.ensure_indices_as(None).await.unwrap();
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            omnigraph_dst::cost::set_label(LABEL);
+            db.apply_schema(&self.after).await.unwrap();
+            omnigraph_dst::cost::set_label("_analyzer_verify");
+            assert!(db.schema_source().contains("english_v1"));
+        }
+    }
+
+    labeled_cost_rows(
+        format!("shared-memory://dst-analyzer-cost-{replay}"),
+        &AnalyzerChange {
+            before: schema("standard_v1"),
+            after: schema("english_v1"),
+        },
+        LABEL,
+    )
+}
+
 /// Where each warm-read call goes: per label, the calls by realm (the
 /// `__manifest` dataset, `__history`, a graph table, or the control-object
 /// adapter), Lance directory and verb, at several history depths. Prints
@@ -4462,6 +4535,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&nearest_cost_rows("a"));
     table.push_str(&carried_write_cost_rows("a"));
     table.push_str(&writer_claim_cost_rows("a"));
+    table.push_str(&analyzer_redeclaration_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -4480,6 +4554,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&nearest_cost_rows("b"));
     table2.push_str(&carried_write_cost_rows("b"));
     table2.push_str(&writer_claim_cost_rows("b"));
+    table2.push_str(&analyzer_redeclaration_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"

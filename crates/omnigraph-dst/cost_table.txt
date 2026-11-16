@@ -181,3 +181,6 @@ InsertAfterOptimize          l.put        calls=6
 WriterClaim                  l.get        calls=7
 WriterClaim                  l.list       calls=2
 WriterClaim                  l.put        calls=3
+SchemaApplyAnalyzerChange    l.get        calls=8
+SchemaApplyAnalyzerChange    l.list       calls=4
+SchemaApplyAnalyzerChange    l.put        calls=8
