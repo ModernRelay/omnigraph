@@ -498,6 +498,28 @@ fn an_optional_tests_its_conjuncts_inside_its_inner_tree() {
     assert_eq!(check, "predicate origin", "{detail}");
 }
 
+/// Two `optional`s on one binding, one testing a conjunct and one testing
+/// none, are matched to the plan's two joins whatever order either lists
+/// them in: the planned plan is accepted.
+#[test]
+fn two_optionals_on_one_binding_match_their_own_joins() {
+    for query in [
+        r#"query q() {
+    match { $d: Doc, optional { $e: Doc, $d cites $e }, optional { $f: Doc, $d cites $f where $f.year > 2000 } }
+    return { $d.slug, $e.slug, $f.slug }
+}"#,
+        r#"query q() {
+    match { $d: Doc, optional { $f: Doc, $d cites $f where $f.year > 2000 }, optional { $e: Doc, $d cites $e } }
+    return { $d.slug, $e.slug, $f.slug }
+}"#,
+    ] {
+        let fixture = Fixture::new(query, &[]);
+        fixture
+            .accept(fixture.plan())
+            .unwrap_or_else(|error| panic!("{query}: {error:?}"));
+    }
+}
+
 /// An inline read with its own cut runs as one `Correlate` returning what
 /// the read returns, testing its own conjuncts in its inner tree: a read
 /// with another cut, or a plan that tests the read's conjunct after it,

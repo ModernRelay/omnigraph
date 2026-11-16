@@ -779,18 +779,37 @@ impl Requirements {
             .map(|(_, conjunct)| conjunct)
             .collect();
         let top_level: HashSet<&IRExpr> = self.eligibility.iter().collect();
-        for optional in &self.optionals {
-            let found = planned.iter().position(|(_, outer_var, nodes)| {
-                let tested: HashSet<IRExpr> = conjuncts(plan, nodes)
+        // Each query optional takes the plan optional on its binding that
+        // tests its conjuncts and the fewest others, the optionals writing
+        // the most conjuncts first, so two optionals on one binding (one
+        // testing a conjunct, one none) never take each other's join.
+        let mut required: Vec<&super::requirements::OptionalMatch> =
+            self.optionals.iter().collect();
+        required.sort_by_key(|optional| std::cmp::Reverse(optional.eligibility.len()));
+        let tested: Vec<HashSet<IRExpr>> = planned
+            .iter()
+            .map(|(_, _, nodes)| {
+                conjuncts(plan, nodes)
                     .into_iter()
                     .map(|(_, conjunct)| conjunct)
-                    .collect();
-                **outer_var == optional.outer_var
-                    && optional
-                        .eligibility
-                        .iter()
-                        .all(|conjunct| tested.contains(conjunct))
-            });
+                    .collect()
+            })
+            .collect();
+        let mut tested = tested;
+        for optional in required {
+            let found = planned
+                .iter()
+                .zip(&tested)
+                .enumerate()
+                .filter(|(_, ((_, outer_var, _), tested))| {
+                    **outer_var == optional.outer_var
+                        && optional
+                            .eligibility
+                            .iter()
+                            .all(|conjunct| tested.contains(conjunct))
+                })
+                .min_by_key(|(_, (_, tested))| tested.len())
+                .map(|(index, _)| index);
             let Some(index) = found else {
                 return Err(ValidationError::violated(
                     "predicate retention",
@@ -801,6 +820,7 @@ impl Requirements {
                 ));
             };
             planned.remove(index);
+            tested.remove(index);
             if let Some(leaked) = optional.eligibility.iter().find(|conjunct| {
                 tested_outside.contains(*conjunct) && !self.top_level_conjunct(conjunct, &top_level)
             }) {
