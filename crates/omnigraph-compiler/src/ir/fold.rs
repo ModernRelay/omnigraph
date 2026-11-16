@@ -86,7 +86,8 @@ fn kleene(left: &Literal, right: &Literal, absorbing: bool) -> Option<Literal> {
 
 /// A comparison with a null operand is null; list membership compares each
 /// element by `=`, lists compare by equality only, numbers across `Integer`
-/// and `Float`, floats in Arrow's total order.
+/// and `Float`, floats by IEEE comparison, so `-0.0 = 0.0` holds as it
+/// does when the engine evaluates it.
 fn compare(op: CompOp, left: &Literal, right: &Literal) -> Option<Literal> {
     if matches!(left, Literal::Null) || matches!(right, Literal::Null) {
         return Some(Literal::Null);
@@ -129,13 +130,15 @@ fn member(items: &[Literal], needle: &Literal) -> Option<Literal> {
 }
 
 /// The order of two scalar literals; `None` where the engine's parsers decide
-/// (Date, DateTime) or no order exists.
+/// (Date, DateTime) or no order exists, a NaN included. Floats compare as the
+/// engine compares them, `-0.0` equal to `0.0`; the total order that keeps
+/// them apart is grouping's, `distinct`'s and `order`'s, never a comparison's.
 fn ordering(left: &Literal, right: &Literal) -> Option<Ordering> {
     Some(match (left, right) {
         (Literal::Integer(l), Literal::Integer(r)) => l.cmp(r),
-        (Literal::Float(l), Literal::Float(r)) => l.total_cmp(r),
-        (Literal::Integer(l), Literal::Float(r)) => (*l as f64).total_cmp(r),
-        (Literal::Float(l), Literal::Integer(r)) => l.total_cmp(&(*r as f64)),
+        (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r)?,
+        (Literal::Integer(l), Literal::Float(r)) => (*l as f64).partial_cmp(r)?,
+        (Literal::Float(l), Literal::Integer(r)) => l.partial_cmp(&(*r as f64))?,
         (Literal::String(l), Literal::String(r)) => l.cmp(r),
         (Literal::Bool(l), Literal::Bool(r)) => l.cmp(r),
         _ => return None,
@@ -215,6 +218,22 @@ mod tests {
             ),
             (
                 compared(Literal::Float(2.0), CompOp::Ge, Literal::Integer(2)),
+                t.clone(),
+            ),
+            (
+                compared(Literal::Float(0.0), CompOp::Eq, Literal::Float(-0.0)),
+                t.clone(),
+            ),
+            (
+                compared(Literal::Float(-0.0), CompOp::Lt, Literal::Float(0.0)),
+                f.clone(),
+            ),
+            (
+                compared(
+                    Literal::List(vec![Literal::Float(-0.0)]),
+                    CompOp::Contains,
+                    Literal::Float(0.0),
+                ),
                 t.clone(),
             ),
             (

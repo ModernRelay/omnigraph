@@ -667,7 +667,9 @@ impl<'a> Interpreter<'a> {
                         .iter()
                         .map(|(_, e)| self.expr(e, &row, env))
                         .collect::<R<Vec<_>>>()?;
-                    match groups.iter_mut().find(|(k, _)| k == &key) {
+                    match groups.iter_mut().find(|(k, _)| {
+                        k.len() == key.len() && k.iter().zip(&key).all(|(p, q)| identical(p, q))
+                    }) {
                         Some((_, members)) => members.push(row),
                         None => groups.push((key, vec![row])),
                     }
@@ -965,7 +967,7 @@ impl<'a> Interpreter<'a> {
         let mut values = Vec::new();
         for row in rows {
             let v = self.expr(arg, row, env)?;
-            if v != Value::Null && !(agg.distinct && values.contains(&v)) {
+            if v != Value::Null && !(agg.distinct && values.iter().any(|w| identical(w, &v))) {
                 values.push(v);
             }
         }
@@ -1229,7 +1231,7 @@ impl<'a> Interpreter<'a> {
             IRExpr::IsNull { expr, negated, .. } => {
                 Value::Bool((self.expr(expr, row, env)? == Value::Null) != *negated)
             }
-            IRExpr::Cast { expr, ty } => cast(self.expr(expr, row, env)?, ty),
+            IRExpr::Cast { expr, ty } => cast(self.expr(expr, row, env)?, ty)?,
             IRExpr::Neg { expr, .. } => match self.expr(expr, row, env)? {
                 Value::Int(i) => Value::Int(-i),
                 Value::Float(f) => Value::Float(-f),
@@ -1422,7 +1424,22 @@ fn tie(a: &Row, b: &Row) -> Ordering {
 }
 
 fn same_row(a: &Row, b: &Row) -> bool {
-    a.len() == b.len() && a.iter().all(|(n, v)| get(b, n) == Some(v))
+    a.len() == b.len()
+        && a.iter()
+            .all(|(n, v)| get(b, n).is_some_and(|w| identical(v, w)))
+}
+
+/// Whether two values are one value, the identity grouping, `distinct` and
+/// `count(distinct)` read: two floats by the total order, so `-0.0` and
+/// `0.0` stay apart, where a comparison (`cmp_compared`) finds them equal.
+fn identical(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == Ordering::Equal,
+        (Value::List(x), Value::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| identical(p, q))
+        }
+        _ => a == b,
+    }
 }
 
 /// The order a comparison reads: the value order, except that two numbers
@@ -1524,12 +1541,36 @@ fn arith(op: ArithOp, l: Value, r: Value, ty: &ExprType) -> R<Value> {
             let (Some(a), Some(b)) = (a.as_f64(), b.as_f64()) else {
                 return Ok(Value::Null);
             };
-            let out = match op {
-                ArithOp::Add => a + b,
-                ArithOp::Sub => a - b,
-                ArithOp::Mul => a * b,
-                ArithOp::Div => a / b,
-                ArithOp::Rem => a % b,
+            // `-0.0` is a zero divisor too.
+            if matches!(op, ArithOp::Div | ArithOp::Rem) && b == 0.0 {
+                return Err(Refusal::Runtime("E2", "a divisor is zero".into()));
+            }
+            let single = matches!(
+                ty,
+                ExprType::Value {
+                    scalar: ScalarType::F32,
+                    ..
+                }
+            );
+            // An `F32` result is computed and rounded in `F32`, as the engine
+            // computes it, so its overflow and its equalities are `F32`'s.
+            let out = if single {
+                let (a, b) = (a as f32, b as f32);
+                f64::from(match op {
+                    ArithOp::Add => a + b,
+                    ArithOp::Sub => a - b,
+                    ArithOp::Mul => a * b,
+                    ArithOp::Div => a / b,
+                    ArithOp::Rem => a % b,
+                })
+            } else {
+                match op {
+                    ArithOp::Add => a + b,
+                    ArithOp::Sub => a - b,
+                    ArithOp::Mul => a * b,
+                    ArithOp::Div => a / b,
+                    ArithOp::Rem => a % b,
+                }
             };
             if !out.is_finite() {
                 return Err(Refusal::Runtime(
@@ -1542,20 +1583,24 @@ fn arith(op: ArithOp, l: Value, r: Value, ty: &ExprType) -> R<Value> {
     })
 }
 
-fn cast(v: Value, ty: &ExprType) -> Value {
+fn cast(v: Value, ty: &ExprType) -> R<Value> {
     let ExprType::Value { scalar, list, .. } = ty else {
-        return v;
+        return Ok(v);
     };
     let one = |v: Value| match (v, scalar) {
-        (Value::Int(i), ScalarType::F64) => Value::Float(i as f64),
-        (Value::Int(i), ScalarType::F32) => Value::Float(f64::from(i as f32)),
-        (Value::Float(f), ScalarType::F32) => Value::Float(f64::from(f as f32)),
-        // A float is never narrowed to an integer: a float literal is `F64`
-        // even when whole, and the integer it is compared with is cast.
-        (other, _) => other,
+        (Value::Int(i), ScalarType::F64) => Ok(Value::Float(i as f64)),
+        (Value::Int(i), ScalarType::F32) => Ok(Value::Float(f64::from(i as f32))),
+        (Value::Float(f), ScalarType::F32) => Ok(Value::Float(f64::from(f as f32))),
+        (
+            Value::Float(_),
+            ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64,
+        ) => unsupported("a cast of a float to an integer"),
+        (other, _) => Ok(other),
     };
     match v {
-        Value::List(items) if *list => Value::List(items.into_iter().map(one).collect()),
+        Value::List(items) if *list => Ok(Value::List(
+            items.into_iter().map(one).collect::<R<Vec<_>>>()?,
+        )),
         other => one(other),
     }
 }

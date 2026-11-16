@@ -16,6 +16,7 @@ const SCHEMA: &str = r#"
 node Person { name: String @key  age: I32?  city: String? }
 node Doc { slug: String @key  text: String @index(fulltext, analyzer = "standard_folded_v1")  title: String? @index(fulltext, analyzer = "standard_v1")  year: I32  embedding: Vector(2)? @index }
 node Note { slug: String @key  body: String @index(fulltext) }
+node Reading { slug: String @key  x: F64  y: F32 }
 edge Knows: Person -> Person { since: I64? }
 edge Wrote: Person -> Doc
 "#;
@@ -27,6 +28,9 @@ const DATA: &str = r#"{"type":"Person","data":{"name":"ann","age":30,"city":"Osl
 {"type":"Doc","data":{"slug":"d2","text":"needle needle hay","year":2021,"embedding":[1.0,0.0]}}
 {"type":"Doc","data":{"slug":"d3","text":"hay","year":2022,"embedding":[1.0,1.0]}}
 {"type":"Note","data":{"slug":"n1","body":"graph"}}
+{"type":"Reading","data":{"slug":"r1","x":0.0,"y":1.5}}
+{"type":"Reading","data":{"slug":"r2","x":-0.0,"y":3.0e38}}
+{"type":"Reading","data":{"slug":"r3","x":2.0,"y":0.5}}
 {"edge":"Knows","id":"k1","from":"ann","to":"bob","data":{"since":2001}}
 {"edge":"Knows","id":"k2","from":"bob","to":"cyd","data":{"since":2002}}
 {"edge":"Wrote","id":"w1","from":"ann","to":"d1","data":{}}
@@ -790,4 +794,73 @@ fn a_scan_of_a_type_the_export_does_not_carry_is_refused() {
         .run(&read)
         .unwrap_err();
     assert!(matches!(refused, Refusal::Unsupported(_)), "{refused:?}");
+}
+
+/// `-0.0` and `0.0` are one value to a comparison and two to grouping,
+/// `distinct` and `count(distinct)`, as the engine evaluates them.
+#[test]
+fn negative_zero_compares_equal_and_groups_apart() {
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $r: Reading } where $r.x = 0.0 return { $r.slug } }"
+        )),
+        vec![json!({"r.slug": "r1"}), json!({"r.slug": "r2"})]
+    );
+    assert_eq!(
+        rows("query q() { match { $r: Reading } return distinct { $r.x } }").len(),
+        3
+    );
+    assert_eq!(
+        rows("query q() { match { $r: Reading } return { $r.x, count($r) as n } }").len(),
+        3
+    );
+    assert_eq!(
+        rows("query q() { match { $r: Reading } return { count(distinct $r.x) as n } }"),
+        vec![json!({"n": 3})]
+    );
+}
+
+/// A float zero divisor, `-0.0` included, is `E2`, never a non-finite `E3`.
+#[test]
+fn a_float_zero_divisor_is_e2() {
+    for slug in ["r1", "r2"] {
+        let refused = run_refused(&format!(
+            "query q() {{ match {{ $r: Reading }} where $r.slug = \"{slug}\" return {{ 1.0 / $r.x as v }} }}"
+        ));
+        assert!(
+            matches!(refused, Refusal::Runtime("E2", _)),
+            "{slug}: {refused:?}"
+        );
+    }
+}
+
+/// `F32` arithmetic is computed in `F32`: a product finite in `F64`
+/// overflows `F32` and is `E3`.
+#[test]
+fn f32_arithmetic_overflows_in_f32() {
+    let refused = run_refused(
+        "query q() { match { $r: Reading } where $r.slug = \"r2\" return { $r.y * $r.y as v } }",
+    );
+    assert!(matches!(refused, Refusal::Runtime("E3", _)), "{refused:?}");
+    assert_eq!(
+        rows(
+            "query q() { match { $r: Reading } where $r.slug = \"r1\" return { $r.y * $r.y as v } }"
+        ),
+        vec![json!({"v": 2.25})]
+    );
+}
+
+/// A cast of a float to an integer is a form this interpreter does not
+/// evaluate, never a float passed through as the integer.
+#[test]
+fn a_float_cast_to_an_integer_is_refused() {
+    let ty = ExprType::from_prop(&omnigraph_compiler::types::PropType::scalar(
+        ScalarType::I64,
+        false,
+    ));
+    assert!(matches!(
+        cast(Value::Float(1.5), &ty),
+        Err(Refusal::Unsupported(_))
+    ));
+    assert!(matches!(cast(Value::Int(2), &ty), Ok(Value::Int(2))));
 }
