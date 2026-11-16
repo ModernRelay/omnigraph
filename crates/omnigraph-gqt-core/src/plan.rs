@@ -1443,7 +1443,8 @@ fn planned_nodes(node: &Value, out: &mut PlannedNodes) -> Result<(), String> {
 }
 
 /// The columns a serialized `Predicate` reads, rendered `binding.property`
-/// (`binding` alone for a whole node object), sorted and deduplicated.
+/// (`binding.@id` for a meta-field, `binding` alone for a whole node object),
+/// sorted and deduplicated.
 fn predicate_reads(predicate: &Value) -> Result<Vec<String>, String> {
     fn walk(predicate: &Value, out: &mut Vec<String>) -> Result<(), String> {
         let malformed = || format!("expect plan: unsupported or malformed predicate {predicate}");
@@ -1465,7 +1466,12 @@ fn predicate_reads(predicate: &Value) -> Result<Vec<String>, String> {
                         .filter(|name| identifier(name))
                         .ok_or_else(malformed)?;
                     out.push(match read.get("property") {
-                        Some(Value::String(property)) if identifier(property) => {
+                        // A meta-field read, the identity a lexical
+                        // predicate reads among them (`d.@id`).
+                        Some(Value::String(property))
+                            if identifier(property)
+                                || property.strip_prefix('@').is_some_and(identifier) =>
+                        {
                             format!("{binding}.{property}")
                         }
                         Some(Value::Null) => binding.to_string(),

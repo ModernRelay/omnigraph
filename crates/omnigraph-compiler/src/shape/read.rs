@@ -272,11 +272,7 @@ impl ReadShape {
     /// The shape of `read`, or the term this release's planner does not
     /// lower.
     pub fn of(read: &CoreRead, catalog: &Catalog) -> Result<Self, ShapeError> {
-        let mut shaper = Shaper::new(catalog, &read.name, &read.params);
-        node_owners(&read.term, &mut shaper.owners);
-        let mut read = read.clone();
-        shaper.canonical_lexical(&mut read.term);
-        shaper.read(&read)
+        Shaper::new(catalog, &read.name, &read.params).read(read)
     }
 
     /// The shape of the read declared as `name` in `source`, checked against
@@ -427,9 +423,6 @@ struct Shaper<'a> {
     catalog: &'a Catalog,
     name: &'a str,
     params: &'a [(String, PropType)],
-    /// The node types each node variable of the read takes, over every
-    /// scope; a full-text call's field is a property of its variable's type.
-    owners: HashMap<String, Vec<String>>,
 }
 
 /// The pattern facts of one scope, in the order the term states them.
@@ -852,47 +845,7 @@ impl<'a> Shaper<'a> {
             catalog,
             name,
             params,
-            owners: HashMap::new(),
         }
-    }
-
-    /// Whether `property` of the node variable `variable` declares an
-    /// analyzer profile on its full-text index: `Some(true)` when every
-    /// type the variable takes declares one, `Some(false)` when none does,
-    /// `None` when the types disagree or the variable is no stored node.
-    fn declared_analyzer(&self, variable: &str, property: &str) -> Option<bool> {
-        let types = self.owners.get(variable)?;
-        let mut declared = types.iter().map(|type_name| {
-            self.catalog
-                .node_types
-                .get(type_name)
-                .map(|node| node.full_text_profile(property).is_some())
-        });
-        let first = declared.next()??;
-        declared.all(|d| d == Some(first)).then_some(first)
-    }
-
-    /// Whether the full-text call `call` reads a field that declares an
-    /// analyzer: the exact lexical scan answers it.
-    fn exact_lexical(&self, call: &IRExpr) -> bool {
-        matches!(
-            call.lexical_predicate_field(),
-            Some(IRExpr::PropAccess { variable, property, .. })
-                if self.declared_analyzer(variable, property) == Some(true)
-        )
-    }
-
-    /// `term` with every `search`, `match_text` and `fuzzy` over a field
-    /// whose index declares an analyzer written as the `match_terms` it
-    /// means there (docs/rfcs/2026-11-07-gq-3.md, section 4, Migration):
-    /// `match_terms(f, terms(q, mode: any))`, with `fuzzy`'s edit budget, two
-    /// when unwritten. A field with no profile keeps the call as written.
-    fn canonical_lexical(&self, term: &mut Term) {
-        term_exprs_mut(term, &mut |expr| {
-            canonical_lexical_expr(expr, &|variable, property| {
-                self.declared_analyzer(variable, property) == Some(true)
-            })
-        });
     }
 
     /// A parameter's declared type.
@@ -1622,9 +1575,10 @@ impl<'a> Shaper<'a> {
                     exact: None,
                 }),
             )),
-            // On a field whose index declares an analyzer, `bm25` is the
-            // exact score: `bm25_v1` over the field corpus, keeping the rows
-            // its `terms(…)` value matches, a step over its population.
+            // `bm25` is the exact score: `bm25_v1` over the field corpus,
+            // keeping the rows its `terms(…)` value matches, a step over its
+            // population. Every full-text field has a profile, so the exact
+            // lexical scan answers it at every index state.
             Term::Score {
                 column,
                 property,
@@ -1632,7 +1586,7 @@ impl<'a> Shaper<'a> {
                 query: ScoreQuery::Lexical(lexical),
                 input,
                 out,
-            } if self.declared_analyzer(column, property) == Some(true) => Ok((
+            } => Ok((
                 self.population(input)?,
                 Some(Ranking {
                     key: IRExpr::PropAccess {
@@ -1652,57 +1606,11 @@ impl<'a> Shaper<'a> {
                             IRExpr::PropAccess {
                                 variable: column.clone(),
                                 property: property.clone(),
-                                ty: self.field_type(column, property),
+                                ty: self.field_type(input, column, property),
                             },
                             lexical,
                         ),
                     )),
-                }),
-            )),
-            // With no declared analyzer, the ranked scan's full-text query is
-            // today's any-term, zero-edit match; a `terms(…)` value asking for
-            // every term or for an edit budget would be scored over that
-            // wider membership.
-            Term::Score {
-                kind: ScoreKind::Bm25,
-                query:
-                    ScoreQuery::Lexical(LexicalQuery {
-                        mode_all,
-                        max_edits,
-                        ..
-                    }),
-                ..
-            } if *mode_all || !matches!(max_edits, IRExpr::Literal(Literal::Integer(0), _)) => {
-                Err(self.refuse_at(
-                    "`bm25` over a `terms(…)` value with `mode: all` or an edit budget other than 0",
-                    Construct::Element(FROM, None),
-                ))
-            }
-            Term::Score {
-                input,
-                column,
-                property,
-                kind: ScoreKind::Bm25,
-                query: ScoreQuery::Lexical(LexicalQuery { text, .. }),
-                out,
-            } => Ok((
-                self.population(input)?,
-                Some(Ranking {
-                    key: IRExpr::Bm25 {
-                        field: Box::new(IRExpr::PropAccess {
-                            variable: column.clone(),
-                            property: property.clone(),
-                            ty: scalar(ScalarType::String),
-                        }),
-                        query: Box::new(text.clone()),
-                        ty: scalar(ScalarType::F32),
-                    },
-                    out: out.clone(),
-                    column: column.clone(),
-                    score: (SCORE_COLUMN, scalar(ScalarType::F32)),
-                    descending: true,
-                    windows: Vec::new(),
-                    exact: None,
                 }),
             )),
             Term::Score {
@@ -1935,10 +1843,6 @@ impl<'a> Shaper<'a> {
             } => {
                 self.facts(input, facts)?;
                 for (name, value) in items {
-                    let at = Construct::Element(&[ElementKind::Let], Some(name.clone()));
-                    if self.holds_edit_tolerant_match(value) {
-                        return Err(self.refuse_at(EDIT_TOLERANT_MATCH, at));
-                    }
                     let mut value = value.clone();
                     substitute(&mut value, &facts.lets);
                     if value.can_fail() {
@@ -2773,9 +2677,6 @@ impl<'a> Shaper<'a> {
     }
 
     fn filter(&self, input: &Term, pred: &IRExpr, facts: &mut Facts) -> Result<(), ShapeError> {
-        if self.holds_edit_tolerant_match(pred) {
-            return Err(self.refuse(EDIT_TOLERANT_MATCH));
-        }
         // A triple whose ends were both bound: the expansion to a fresh name
         // and the identity filter tying it to the end.
         if let Term::Expand {
@@ -3323,7 +3224,6 @@ impl<'a> Shaper<'a> {
         }
         let mut deferred_set: HashSet<String> = HashSet::new();
         let mut component_visited: HashSet<&str> = HashSet::new();
-        let searched: HashSet<String> = facts.filters.iter().filter_map(search_subject).collect();
         let mut ranked_scans: Vec<(Option<&str>, &str, &str)> = Vec::new();
         let ranked_nodes: Vec<(&str, &str)> = ranked
             .iter()
@@ -3375,7 +3275,7 @@ impl<'a> Shaper<'a> {
                 .filter(|(var, _)| component_vars.contains(var) && !bound_vars.contains(*var))
                 .collect();
             let root = match ranked_here[..] {
-                [] => scan_root(&inner_bindings, reaches_outer, &searched),
+                [] => scan_root(&inner_bindings, reaches_outer),
                 [(var, type_name)] => {
                     let declared = inner_bindings.iter().position(|binding| *binding == var);
                     if declared.is_none() {
@@ -3665,10 +3565,7 @@ fn holds_lexical_call(expr: &IRExpr) -> bool {
             IRExpr::Aggregate { arg, .. } => pending.push(arg),
             IRExpr::Call { args, .. } => pending.extend(args),
             // The predicates themselves were taken above.
-            IRExpr::Search { .. }
-            | IRExpr::Fuzzy { .. }
-            | IRExpr::MatchText { .. }
-            | IRExpr::PropAccess { .. }
+            IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
             | IRExpr::Bm25 { .. }
             | IRExpr::Rrf { .. }
@@ -3701,41 +3598,13 @@ fn reference_identity(variable: &str, ty: &ExprType, id: &str) -> Option<Vec<IRE
     }
 }
 
-/// `match_terms` whose edit budget is not the literal `0`, over a field
-/// whose index declares no analyzer. Membership there runs Lance's
-/// full-text query, whose fuzzy expansion keeps a bounded number of
-/// expansions per term, so it is not the exact edit relation, and the RFC
-/// states the edit relation for declared analyzers only.
-const EDIT_TOLERANT_MATCH: &str = "`match_terms` with an edit budget other than `max_edits: 0` over a field whose index declares no analyzer";
-
 impl Shaper<'_> {
-    /// Whether `expr` holds a `match_terms` whose edit budget is not the
-    /// literal `0` (a parameter included, whose value is not known here)
-    /// over a field the exact lexical scan does not answer.
-    fn holds_edit_tolerant_match(&self, expr: &IRExpr) -> bool {
-        let mut found = false;
-        expr.visit_nodes(|node| {
-            if let IRExpr::Call {
-                func: crate::ir::expr::ScalarFunc::MatchTerms { .. },
-                args,
-                ..
-            } = node
-                && !matches!(args.get(2), Some(IRExpr::Literal(Literal::Integer(0), _)))
-                && !self.exact_lexical(node)
-            {
-                found = true;
-            }
-        });
-        found
-    }
-
-    /// The type a read of `variable.property` has: the declared property's,
-    /// a non-null String when the variable's type is not known here.
-    fn field_type(&self, variable: &str, property: &str) -> ExprType {
-        self.owners
-            .get(variable)
-            .and_then(|types| types.first())
-            .and_then(|type_name| self.catalog.node_types.get(type_name))
+    /// The type a read of `variable.property` has where `population` binds
+    /// `variable`: the declared property's, a non-null String when the
+    /// population binds no stored node of that name.
+    fn field_type(&self, population: &Term, variable: &str, property: &str) -> ExprType {
+        node_type_in(population, variable)
+            .and_then(|type_name| self.catalog.node_types.get(&type_name))
             .and_then(|node| node.properties.get(property))
             .map_or_else(|| scalar(ScalarType::String), ExprType::from_prop)
     }
@@ -3757,28 +3626,21 @@ fn match_terms_call(field: IRExpr, lexical: &LexicalQuery) -> IRExpr {
     }
 }
 
-/// The node types every node variable of `term` takes, over every scope.
-fn node_owners(term: &Term, out: &mut HashMap<String, Vec<String>>) {
-    let mut add = |variable: &str, type_name: &str| {
-        let types = out.entry(variable.to_string()).or_default();
-        if !types.iter().any(|t| t == type_name) {
-            types.push(type_name.to_string());
-        }
-    };
+/// The node type `variable` takes in `term`, the relation a ranking scores:
+/// the scan, traversal end or outer column that binds it there, looked up in
+/// that relation alone, so a name another scope reuses for another type is
+/// not read.
+fn node_type_in(term: &Term, variable: &str) -> Option<String> {
     match term {
-        Term::Unit | Term::RecRef { .. } => {}
-        Term::Env(cols) => {
-            for col in cols {
-                if let Ty::Node { type_name, .. } = &col.ty {
-                    add(&col.name, type_name);
-                }
-            }
-        }
-        Term::Scan { var, ty } => {
-            if let Ty::Node { type_name, .. } = ty {
-                add(var, type_name);
-            }
-        }
+        Term::Unit | Term::RecRef { .. } => None,
+        Term::Env(cols) => cols.iter().find_map(|col| match &col.ty {
+            Ty::Node { type_name, .. } if col.name == variable => Some(type_name.clone()),
+            _ => None,
+        }),
+        Term::Scan { var, ty } => match ty {
+            Ty::Node { type_name, .. } if var == variable => Some(type_name.clone()),
+            _ => None,
+        },
         Term::Expand {
             input,
             src,
@@ -3787,9 +3649,13 @@ fn node_owners(term: &Term, out: &mut HashMap<String, Vec<String>>) {
             dst_type,
             ..
         } => {
-            add(src, src_type);
-            add(dst, dst_type);
-            node_owners(input, out);
+            if dst == variable {
+                Some(dst_type.clone())
+            } else if src == variable {
+                Some(src_type.clone())
+            } else {
+                node_type_in(input, variable)
+            }
         }
         Term::Filter { input, .. }
         | Term::Project { input, .. }
@@ -3797,195 +3663,19 @@ fn node_owners(term: &Term, out: &mut HashMap<String, Vec<String>>) {
         | Term::Order { input, .. }
         | Term::Cut { input, .. }
         | Term::Score { input, .. }
-        | Term::ApproxTopK { input, .. } => node_owners(input, out),
+        | Term::ApproxTopK { input, .. } => node_type_in(input, variable),
         Term::Correlate { outer, inner } => {
-            node_owners(outer, out);
-            node_owners(inner, out);
+            node_type_in(inner, variable).or_else(|| node_type_in(outer, variable))
         }
-        Term::Union { left, right } => {
-            node_owners(left, out);
-            node_owners(right, out);
-        }
-        Term::Fuse { arms, .. } => arms.iter().for_each(|arm| node_owners(arm, out)),
-        Term::Fix { body, .. } | Term::Call { body, .. } => node_owners(body, out),
+        Term::Union { left, .. } => node_type_in(left, variable),
+        Term::Fuse { arms, .. } => arms.first().and_then(|arm| node_type_in(arm, variable)),
+        Term::Fix { body, .. } | Term::Call { body, .. } => node_type_in(body, variable),
     }
 }
 
-/// Apply `f` to every expression `term` holds, in every scope.
-fn term_exprs_mut(term: &mut Term, f: &mut dyn FnMut(&mut IRExpr)) {
-    match term {
-        Term::Unit | Term::Env(_) | Term::Scan { .. } | Term::RecRef { .. } => {}
-        Term::Expand { input, .. } | Term::Cut { input, .. } => term_exprs_mut(input, f),
-        Term::Filter { input, pred } => {
-            f(pred);
-            term_exprs_mut(input, f);
-        }
-        Term::Project { input, items, .. } => {
-            items.iter_mut().for_each(|(_, value)| f(value));
-            term_exprs_mut(input, f);
-        }
-        Term::Group { input, keys, aggs } => {
-            keys.iter_mut().for_each(|(_, key)| f(key));
-            aggs.iter_mut()
-                .filter_map(|(_, agg)| agg.arg.as_mut())
-                .for_each(&mut *f);
-            term_exprs_mut(input, f);
-        }
-        Term::Order { input, keys } => {
-            keys.iter_mut().for_each(|(key, _)| f(key));
-            term_exprs_mut(input, f);
-        }
-        Term::Score { input, query, .. } => {
-            match query {
-                ScoreQuery::Vector(query) => f(query),
-                ScoreQuery::Lexical(lexical) => {
-                    f(&mut lexical.text);
-                    f(&mut lexical.max_edits);
-                }
-            }
-            term_exprs_mut(input, f);
-        }
-        Term::ApproxTopK { input, query, .. } => {
-            f(query);
-            term_exprs_mut(input, f);
-        }
-        Term::Correlate { outer, inner } => {
-            term_exprs_mut(outer, f);
-            term_exprs_mut(inner, f);
-        }
-        Term::Union { left, right } => {
-            term_exprs_mut(left, f);
-            term_exprs_mut(right, f);
-        }
-        Term::Fuse { arms, .. } => arms.iter_mut().for_each(|arm| term_exprs_mut(arm, f)),
-        Term::Fix { body, .. } => term_exprs_mut(body, f),
-        Term::Call { bindings, body, .. } => {
-            bindings.iter_mut().for_each(|(_, value)| f(value));
-            term_exprs_mut(body, f);
-        }
-    }
-}
-
-/// `expr` with every `search`, `match_text` and `fuzzy` whose field
-/// `declared` holds rewritten to its `match_terms`.
-fn canonical_lexical_expr(expr: &mut IRExpr, declared: &dyn Fn(&str, &str) -> bool) {
-    let rewrite = match &*expr {
-        IRExpr::Search { field, query, .. } | IRExpr::MatchText { field, query, .. } => {
-            Some((field, query, None))
-        }
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-            ..
-        } => Some((field, query, Some(max_edits.as_deref()))),
-        _ => None,
-    }
-    .filter(|(field, _, _)| {
-        matches!(field.as_ref(), IRExpr::PropAccess { variable, property, .. }
-            if declared(variable, property))
-    })
-    .map(|(field, query, max_edits)| {
-        let max_edits = match max_edits {
-            None => IRExpr::Literal(Literal::Integer(0), scalar(ScalarType::I64)),
-            Some(None) => IRExpr::Literal(Literal::Integer(2), scalar(ScalarType::I64)),
-            Some(Some(budget)) => budget.clone(),
-        };
-        match_terms_call(
-            field.as_ref().clone(),
-            &LexicalQuery {
-                text: query.as_ref().clone(),
-                mode_all: false,
-                max_edits,
-            },
-        )
-    });
-    if let Some(call) = rewrite {
-        *expr = call;
-        return;
-    }
-    match expr {
-        IRExpr::Nearest { query, .. } => canonical_lexical_expr(query, declared),
-        IRExpr::Search { field, query, .. }
-        | IRExpr::MatchText { field, query, .. }
-        | IRExpr::Bm25 { field, query, .. } => {
-            canonical_lexical_expr(field, declared);
-            canonical_lexical_expr(query, declared);
-        }
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-            ..
-        } => {
-            canonical_lexical_expr(field, declared);
-            canonical_lexical_expr(query, declared);
-            if let Some(m) = max_edits {
-                canonical_lexical_expr(m, declared);
-            }
-        }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-            weights,
-            ..
-        } => {
-            canonical_lexical_expr(primary, declared);
-            canonical_lexical_expr(secondary, declared);
-            if let Some(k) = k {
-                canonical_lexical_expr(k, declared);
-            }
-            if let Some(w) = weights {
-                canonical_lexical_expr(w, declared);
-            }
-        }
-        IRExpr::Aggregate { arg, .. }
-        | IRExpr::Not(arg, _)
-        | IRExpr::IsNull { expr: arg, .. }
-        | IRExpr::Neg { expr: arg, .. }
-        | IRExpr::Cast { expr: arg, .. } => canonical_lexical_expr(arg, declared),
-        IRExpr::Binary { left, right, .. } => {
-            canonical_lexical_expr(left, declared);
-            canonical_lexical_expr(right, declared);
-        }
-        IRExpr::Call { args, .. } => args
-            .iter_mut()
-            .for_each(|arg| canonical_lexical_expr(arg, declared)),
-        IRExpr::Literal(_, _)
-        | IRExpr::Param(_, _)
-        | IRExpr::PropAccess { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::AliasRef(_, _) => {}
-    }
-}
-
-/// The variable a search predicate filter searches.
-fn search_subject(filter: &IRExpr) -> Option<String> {
-    let (call, CompOp::Eq, IRExpr::Literal(Literal::Bool(true), _)) = filter.comparison_parts()?
-    else {
-        return None;
-    };
-    match call {
-        IRExpr::Search { field, .. }
-        | IRExpr::Fuzzy { field, .. }
-        | IRExpr::MatchText { field, .. } => match field.as_ref() {
-            IRExpr::PropAccess { variable, .. } => Some(variable.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn scan_root(
-    inner_bindings: &[&str],
-    reaches_outer: bool,
-    searched: &HashSet<String>,
-) -> Option<usize> {
+fn scan_root(inner_bindings: &[&str], reaches_outer: bool) -> Option<usize> {
     if reaches_outer {
-        inner_bindings
-            .iter()
-            .position(|var| searched.contains(*var))
+        None
     } else {
         inner_bindings.first().map(|_| 0)
     }
@@ -4249,23 +3939,9 @@ fn reference_null_tests(expr: &mut IRExpr, id: &str, optional: &HashSet<String>)
     let recurse = |e: &mut IRExpr| reference_null_tests(e, id, optional);
     match expr {
         IRExpr::Nearest { query, .. } => recurse(query),
-        IRExpr::Search { field, query, .. }
-        | IRExpr::MatchText { field, query, .. }
-        | IRExpr::Bm25 { field, query, .. } => {
+        IRExpr::Bm25 { field, query, .. } => {
             recurse(field);
             recurse(query);
-        }
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-            ..
-        } => {
-            recurse(field);
-            recurse(query);
-            if let Some(m) = max_edits {
-                recurse(m);
-            }
         }
         IRExpr::Rrf {
             primary,
@@ -4373,23 +4049,9 @@ fn bind_params(expr: &mut IRExpr, bindings: &[(String, IRExpr)]) {
     let recurse = |e: &mut IRExpr| bind_params(e, bindings);
     match expr {
         IRExpr::Nearest { query, .. } => recurse(query),
-        IRExpr::Search { field, query, .. }
-        | IRExpr::MatchText { field, query, .. }
-        | IRExpr::Bm25 { field, query, .. } => {
+        IRExpr::Bm25 { field, query, .. } => {
             recurse(field);
             recurse(query);
-        }
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-            ..
-        } => {
-            recurse(field);
-            recurse(query);
-            if let Some(m) = max_edits {
-                recurse(m);
-            }
         }
         IRExpr::Rrf {
             primary,
@@ -4433,23 +4095,9 @@ fn substitute(expr: &mut IRExpr, lets: &HashMap<String, IRExpr>) {
             }
         }
         IRExpr::Nearest { query, .. } => substitute(query, lets),
-        IRExpr::Search { field, query, .. }
-        | IRExpr::MatchText { field, query, .. }
-        | IRExpr::Bm25 { field, query, .. } => {
+        IRExpr::Bm25 { field, query, .. } => {
             substitute(field, lets);
             substitute(query, lets);
-        }
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-            ..
-        } => {
-            substitute(field, lets);
-            substitute(query, lets);
-            if let Some(m) = max_edits {
-                substitute(m, lets);
-            }
         }
         IRExpr::Rrf {
             primary,
@@ -4486,23 +4134,9 @@ fn rename_expr(expr: &mut IRExpr, rename: &impl Fn(&mut String)) {
             rename(variable);
             rename_expr(query, rename);
         }
-        IRExpr::Search { field, query, .. }
-        | IRExpr::MatchText { field, query, .. }
-        | IRExpr::Bm25 { field, query, .. } => {
+        IRExpr::Bm25 { field, query, .. } => {
             rename_expr(field, rename);
             rename_expr(query, rename);
-        }
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-            ..
-        } => {
-            rename_expr(field, rename);
-            rename_expr(query, rename);
-            if let Some(m) = max_edits {
-                rename_expr(m, rename);
-            }
         }
         IRExpr::Rrf {
             primary,

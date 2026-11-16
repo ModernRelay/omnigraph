@@ -68,7 +68,6 @@ impl ScanExec {
                     &catalog,
                     &mode,
                     projection.as_ref(),
-                    &memory,
                 )
                 .await
                 .map_err(external)?;

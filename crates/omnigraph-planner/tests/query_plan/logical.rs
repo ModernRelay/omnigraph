@@ -1,4 +1,5 @@
 use super::*;
+use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
 
 /// Synthetic IR coverage: the executor currently rejects a secondary nearest
 /// ordering, so a real-source GQT case cannot exercise this demand rule.
@@ -99,15 +100,16 @@ fn metadata_count_rewrite_converges() {
 }
 
 #[test]
-fn search_expression_arms_attribute_field_and_nested_columns() {
+fn search_expression_arms_attribute_identity_field_and_nested_columns() {
     let op = ir(
         vec![scan("c")],
         vec![prop("c", "slug")],
         vec![IRExpr::Rrf {
-            primary: Box::new(IRExpr::Fuzzy {
-                field: Box::new(prop("c", "title")),
-                query: Box::new(prop("c", "probe")),
-                max_edits: Some(Box::new(prop("c", "edits"))),
+            primary: Box::new(IRExpr::Call {
+                func: ScalarFunc::MatchTerms {
+                    mode: TermsMode::Any,
+                },
+                args: vec![prop("c", "title"), prop("c", "probe"), prop("c", "edits")],
                 ty: value_type(ScalarType::Bool, false),
             }),
             secondary: Box::new(IRExpr::Bm25 {
@@ -123,10 +125,12 @@ fn search_expression_arms_attribute_field_and_nested_columns() {
             ty: value_type(ScalarType::F64, false),
         }],
     );
+    // A lexical predicate reads its binding's identity, not its field, which
+    // the exact lexical scan reads itself; its text and budget are read.
     let (plan, _) = planned(&op);
     assert_eq!(
         projection_of(&plan, "c"),
-        set(&["__id", "slug", "title", "probe", "edits", "body", "k_ref"])
+        set(&["__id", "slug", "probe", "edits", "body", "k_ref"])
     );
 }
 
@@ -161,95 +165,6 @@ fn rank_fuse_targets_read_the_node_object_in_both_arms() {
     let (plan, _) = planned(&op);
     assert_eq!(projection_of(&plan, "a"), object_columns());
     assert_eq!(projection_of(&plan, "b"), object_columns());
-}
-
-#[test]
-fn dependent_scan_pushes_exact_search_membership_but_keeps_fuzzy_and_correlations() {
-    let query = Box::new(IRExpr::Param(
-        "q".to_string(),
-        value_type(ScalarType::String, false),
-    ));
-    let expressions = [
-        (
-            IRExpr::Search {
-                field: Box::new(prop("b", "text")),
-                query: query.clone(),
-                ty: value_type(ScalarType::Bool, false),
-            },
-            true,
-        ),
-        (
-            IRExpr::MatchText {
-                field: Box::new(prop("b", "text")),
-                query: query.clone(),
-                ty: value_type(ScalarType::Bool, false),
-            },
-            true,
-        ),
-        (
-            IRExpr::Fuzzy {
-                field: Box::new(prop("b", "text")),
-                query,
-                max_edits: None,
-                ty: value_type(ScalarType::Bool, false),
-            },
-            false,
-        ),
-        (
-            IRExpr::Search {
-                field: Box::new(prop("b", "text")),
-                query: Box::new(prop("a", "probe")),
-                ty: value_type(ScalarType::Bool, false),
-            },
-            false,
-        ),
-    ];
-    for (expression, pushed) in expressions {
-        for embedded in [false, true] {
-            let filter = IRExpr::comparison(
-                expression.clone(),
-                CompOp::Eq,
-                IRExpr::Literal(Literal::Bool(true), value_type(ScalarType::Bool, false)),
-            );
-            let mut pipeline = vec![
-                scan("a"),
-                expand(
-                    "a",
-                    "b",
-                    if embedded {
-                        vec![filter.clone()]
-                    } else {
-                        vec![]
-                    },
-                ),
-            ];
-            if !embedded {
-                pipeline.push(PatternStep::Filter(filter));
-            }
-            let (plan, _) = planned(&ir(pipeline, vec![prop("b", "slug")], vec![]));
-            let destination = plan
-                .live()
-                .find_map(|(_, node)| match node {
-                    LogicalNode::TableScan {
-                        input: Some(_),
-                        spec,
-                    } => Some(spec),
-                    _ => None,
-                })
-                .expect("a dependent scan");
-            assert_eq!(
-                destination.filter.is_some(),
-                pushed,
-                "{expression:?}, embedded={embedded}"
-            );
-            assert_eq!(
-                plan.live()
-                    .any(|(_, node)| matches!(node, LogicalNode::Filter { .. })),
-                !pushed
-            );
-            assert_eq!(projection_of(&plan, "b"), set(&["__id", "slug", "text"]));
-        }
-    }
 }
 
 #[test]
@@ -301,23 +216,25 @@ fn sibling_negations_keep_destination_scan_filters_in_their_scopes() {
     assert_eq!(values, set(&["open", "closed"]));
 }
 
-/// A search filter whose query argument reads another binding is no scan
+/// A lexical predicate whose query argument reads another binding is no scan
 /// predicate of its field's binding: it stays where the query wrote it.
 #[test]
-fn a_search_filter_reading_a_second_binding_is_not_placed_on_a_root_scan() {
+fn a_lexical_filter_reading_a_second_binding_is_not_placed_on_a_root_scan() {
     let (plan, _) = planned(&ir(
         vec![
             scan("a"),
             scan("b"),
-            PatternStep::Filter(IRExpr::comparison(
-                IRExpr::Search {
-                    field: Box::new(prop("b", "text")),
-                    query: Box::new(prop("a", "probe")),
-                    ty: value_type(ScalarType::Bool, false),
+            PatternStep::Filter(IRExpr::Call {
+                func: ScalarFunc::MatchTerms {
+                    mode: TermsMode::Any,
                 },
-                CompOp::Eq,
-                IRExpr::Literal(Literal::Bool(true), value_type(ScalarType::Bool, false)),
-            )),
+                args: vec![
+                    prop("b", "text"),
+                    prop("a", "probe"),
+                    IRExpr::Literal(Literal::Integer(0), value_type(ScalarType::I64, false)),
+                ],
+                ty: value_type(ScalarType::Bool, false),
+            }),
         ],
         vec![prop("b", "slug")],
         vec![],

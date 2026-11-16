@@ -12,15 +12,19 @@
 //! non-finite stored component, query component or result is refused with
 //! `E3`.
 //!
-//! `bm25` on a field whose index declares an analyzer: every input row whose
-//! identity is among the exact lexical scan's matches leaves with its
-//! `bm25_v1` score appended under the binding's `_score` column, `F64`;
-//! every other row drops (its value is null, token-empty or does not match).
+//! `bm25`: every input row whose identity is among the exact lexical scan's
+//! matches leaves with its `bm25_v1` score appended under the binding's
+//! `_score` column, `F64`; every other row drops (its value is null,
+//! token-empty or does not match). The scan runs when the consumer first
+//! polls the operator, before its input is pulled
+//! ([`crate::engine::lexical`]).
 
 use std::fmt;
 use std::sync::Arc;
 
 use std::collections::HashMap;
+
+use crate::engine::lexical::{LexicalScore, answered_first};
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, RecordBatch,
@@ -44,6 +48,9 @@ use crate::error::{OmniError, Result};
 
 /// The refusal name the pool reports when a scored batch does not fit.
 const OUTPUT: &str = "score output";
+/// The refusal name the pool reports when the exact lexical scan's scores
+/// do not fit.
+const LEXICAL_SCAN: &str = "exact lexical scan";
 
 pub(crate) struct ScoreExec {
     input: Arc<dyn ExecutionPlan>,
@@ -57,22 +64,21 @@ pub(crate) struct ScoreExec {
 }
 
 /// What a score reads: the bound query vector of a `distance`, or the exact
-/// lexical scan's `bm25_v1` scores by identity.
+/// lexical scan whose `bm25_v1` scores it appends by identity.
 #[derive(Clone)]
 enum ScoreSource {
     Distance(Arc<Vec<f32>>, VectorDistance),
-    Bm25(Arc<HashMap<String, f64>>),
+    Bm25(Arc<LexicalScore>),
 }
 
 impl ScoreExec {
-    /// `bm25` on a field whose index declares an analyzer: the rows whose
-    /// identity column `id_column` names a key of `scores`, with its score
-    /// appended as `score`.
+    /// `bm25`: the rows whose identity column `id_column` names a match of
+    /// `scores`, with its score appended as `score`.
     pub(crate) fn bm25(
         input: Arc<dyn ExecutionPlan>,
         id_column: String,
         score: String,
-        scores: Arc<HashMap<String, f64>>,
+        scores: Arc<LexicalScore>,
     ) -> Result<Self> {
         let input_schema = input.schema();
         match input_schema
@@ -285,10 +291,8 @@ impl DisplayAs for ScoreExec {
             ),
             ScoreSource::Bm25(scores) => write!(
                 f,
-                "ScoreExec: {}=bm25_v1 of {} matches by {}",
-                self.score,
-                scores.len(),
-                self.column
+                "ScoreExec: {}=bm25_v1 ({scores:?}) by {}",
+                self.score, self.column
             ),
         }
     }
@@ -344,7 +348,13 @@ impl ExecutionPlan for ScoreExec {
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "ScoreExec has one partition");
         let column = self.input.schema().index_of(&self.column)?;
-        let input = self.input.execute(0, Arc::clone(&ctx))?;
+        let mut input = self.input.execute(0, Arc::clone(&ctx))?;
+        if let ScoreSource::Bm25(scores) = &self.source {
+            let mut scan = WorkMemory::new(Arc::clone(&ctx), LEXICAL_SCAN)?;
+            scan.set_metrics(self.metrics.clone());
+            let scores = Arc::clone(scores);
+            input = answered_first(input, async move { scores.answer(scan).await });
+        }
         let memory = WorkMemory::new(ctx, OUTPUT)?;
         let source = self.source.clone();
         let schema = self.schema();
@@ -353,7 +363,9 @@ impl ExecutionPlan for ScoreExec {
                 ScoreSource::Distance(query, distance) => {
                     scored(&batch, column, query, *distance, &schema)
                 }
-                ScoreSource::Bm25(scores) => lexically_scored(&batch, column, scores, &schema),
+                ScoreSource::Bm25(scores) => scores
+                    .scores()
+                    .and_then(|scores| lexically_scored(&batch, column, scores, &schema)),
             }
             .map_err(external)?;
             let lease = memory.child(OUTPUT)?;

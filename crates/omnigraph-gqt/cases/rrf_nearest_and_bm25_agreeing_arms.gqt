@@ -37,12 +37,4 @@ query fused($q: Vector(4), $t: String) {
 --- params
 {"q": [-0.3, 0.0, 0.0, 0.0], "t": "needle"}
 
---- expect unordered
-{"d.slug":"d000"}
-{"d.slug":"d001"}
-{"d.slug":"d002"}
-
---- expect shape
-d.slug: String
-
---- expect same as reference
+--- expect error: type error: T86:

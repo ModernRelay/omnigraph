@@ -276,6 +276,7 @@ query hits_legacy($q: String) {
 {"q": "pneumonoultramicroscopicsilicovolcanoconiosis"}
 
 --- expect unordered
+{"d.slug":"d3"}
 
 --- expect shape
 d.slug: String

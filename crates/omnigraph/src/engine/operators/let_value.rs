@@ -106,7 +106,15 @@ impl ExecutionPlan for LetExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "LetExec has one partition");
-        let input = self.input.execute(0, ctx)?;
+        let mut input = self.input.execute(0, Arc::clone(&ctx))?;
+        if let Some(lexical) = &self.lexical {
+            let mut scan = super::memory::WorkMemory::new(ctx, super::filter::LEXICAL_SCAN)?;
+            scan.set_metrics(self.metrics.clone());
+            let lexical = Arc::clone(lexical);
+            input = crate::engine::lexical::answered_first(input, async move {
+                lexical.answer(scan).await
+            });
+        }
         let value = self.value.clone();
         let params = Arc::clone(&self.params);
         let lexical = self.lexical.clone();

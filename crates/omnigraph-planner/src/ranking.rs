@@ -49,7 +49,9 @@ impl PlannedRanking {
 
 /// The ranking `plan` orders by, `None` when its order is no search.
 /// Acceptance admits one ranked scan in the query's order, or one fusion of
-/// two arms, and nothing else.
+/// two arms, and nothing else. A plan with neither ranks by its exact
+/// `bm25`, a `Score` node the exact lexical scan answers, which is always
+/// exhaustive.
 ///
 /// # Errors
 ///
@@ -59,9 +61,15 @@ pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, Pl
     let mut fusions = Vec::new();
     let mut ordered = Vec::new();
     let mut arms = Vec::new();
+    let mut exact_bm25 = Vec::new();
     for (id, node) in plan.live() {
         match node {
             PhysicalNode::RankFuse { arms, .. } => fusions.push(arms),
+            PhysicalNode::Score {
+                binding,
+                kind: omnigraph_compiler::ir::core::ScoreKind::Bm25,
+                ..
+            } => exact_bm25.push(binding.as_str()),
             PhysicalNode::Scan {
                 spec,
                 ranked: Some(ranked),
@@ -78,7 +86,15 @@ pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, Pl
     }
     let (by, binding, column, nearest_scans) =
         match (fusions.as_slice(), ordered.as_slice(), arms.as_slice()) {
-            ([], [], []) => return Ok(None),
+            ([], [], []) => match exact_bm25.as_slice() {
+                [binding] => (
+                    SearchFunction::Bm25,
+                    *binding,
+                    omnigraph_compiler::query::value::SCORE_COLUMN,
+                    Vec::new(),
+                ),
+                _ => return Ok(None),
+            },
             ([], [(id, kind, binding)], []) => (
                 search_function(*kind),
                 binding.ok_or_else(|| {

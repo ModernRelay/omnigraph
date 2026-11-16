@@ -118,7 +118,7 @@ s.slug: String
 d.slug: String
 --- expect plan
 scan Doc as $d: access id_lookup
-scan Doc as $d: filter reads [d.state, d.body]
+scan Doc as $d: filter reads [d.state]
 pass access_path
 
 --- query
@@ -142,7 +142,7 @@ s.slug: String
 d.slug: String
 --- expect plan
 scan Doc as $d: access id_lookup
-scan Doc as $d: filter reads [d.state, d.body]
+scan Doc as $d: filter reads [d.state]
 pass access_path
 
 --- query
@@ -188,5 +188,5 @@ s.slug: String
 d.slug: String
 --- expect plan
 scan Doc as $d: access id_lookup
-scan Doc as $d: filter reads [d.state, d.body, d.summary]
+scan Doc as $d: filter reads [d.state]
 pass access_path

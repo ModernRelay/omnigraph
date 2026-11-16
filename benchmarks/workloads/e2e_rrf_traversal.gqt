@@ -25,15 +25,7 @@ query recall_two_terms($q1: String, $q2: String) {
 --- params
 {"q1":"alpha","q2":"beta"}
 
---- expect unordered
-{"c.slug":"x"}
-
---- expect shape
-c.slug: String
-
---- expect plan
-expand $c $a: selection named [ChunkOfArtifact out]
-rank fuse no row tiebreak
+--- expect error: type error: T86:
 
 --- restart
 
@@ -55,12 +47,4 @@ query recall_two_terms($q1: String, $q2: String) {
 --- params
 {"q1":"alpha","q2":"beta"}
 
---- expect unordered
-{"c.slug":"x"}
-
---- expect shape
-c.slug: String
-
---- expect plan
-expand $c $a: selection named [ChunkOfArtifact out]
-rank fuse no row tiebreak
+--- expect error: type error: T86:

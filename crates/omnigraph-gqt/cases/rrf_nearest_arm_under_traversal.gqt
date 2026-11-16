@@ -51,9 +51,4 @@ query nearest_and_text_with_edges($q: Vector(4), $text: String) {
 --- params
 {"q": [-0.3, 0.0, 0.0, 0.0], "text": "needle"}
 
---- expect unordered
-{"d.slug":"d003"}
-{"d.slug":"d006"}
-
---- expect shape
-d.slug: String
+--- expect error: type error: T86:

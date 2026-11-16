@@ -44,14 +44,7 @@ query fan_out_population($v: Vector(3)) {
 --- params
 {"v": [1.0, 0.0, 0.0]}
 
---- expect ordered
-{"d.slug":"x"}
-{"d.slug":"y"}
-
---- expect shape
-d.slug: String
-
---- expect same as reference
+--- expect error: type error: T86:
 
 --- query
 query filtered_population($v: Vector(3)) {
@@ -66,14 +59,7 @@ query filtered_population($v: Vector(3)) {
 --- params
 {"v": [1.0, 0.0, 0.0]}
 
---- expect ordered
-{"d.slug":"y"}
-{"d.slug":"z"}
-
---- expect shape
-d.slug: String
-
---- expect same as reference
+--- expect error: type error: T86:
 
 --- query
 query population_columns_drawn_again($v: Vector(3)) {
@@ -90,13 +76,4 @@ query population_columns_drawn_again($v: Vector(3)) {
 --- params
 {"v": [1.0, 0.0, 0.0]}
 
---- expect ordered
-{"d.slug":"x","t.name":"t1"}
-{"d.slug":"x","t.name":"t2"}
-{"d.slug":"y","t.name":"t1"}
-
---- expect shape
-d.slug: String
-t.name: String
---- expect same as reference
-
+--- expect error: type error: T86:

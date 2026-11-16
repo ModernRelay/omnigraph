@@ -363,10 +363,9 @@ async fn doc_user_index_count(db: &Omnigraph) -> usize {
         .count()
 }
 
-/// RFC-022 data writes publish only their exact table effects. Declared FTS
-/// and vector indexes may therefore still be pending immediately after load;
-/// both retrieval modes (and their RRF composition) must remain logically
-/// correct through Lance's flat-search paths.
+/// An `rrf` arm over `bm25` is refused at type check (`T86`) before any
+/// index state matters; a `nearest` read degrades to the flat search while
+/// the declared indexes are pending after the load.
 #[tokio::test]
 #[serial]
 async fn deferred_indexes_do_not_block_hybrid_reads() {
@@ -382,15 +381,23 @@ async fn deferred_indexes_do_not_block_hybrid_reads() {
         0,
         "load must leave declared physical indexes to the reconciler"
     );
-    let result = query_main(
+    let error = query_main(
         &db,
         MOCK_SEARCH_QUERIES,
         "hybrid_search_vector",
         &vector_and_string_params("$vq", &mock_embedding("alpha", 4), "$tq", "alpha"),
     )
     .await
-    .expect("pending FTS/vector indexes must degrade to flat search");
-    assert_eq!(result_slugs(&result)[0], "alpha-doc");
+    .unwrap_err();
+    assert!(refuses_an_rrf_bm25_arm(&error), "{error}");
+}
+
+/// Whether `error` is the type checker's refusal of an `rrf` arm over `bm25`
+/// (`T86`): every full-text field has a profile, and fusion does not rank an
+/// exact `bm25` arm.
+fn refuses_an_rrf_bm25_arm(error: &omnigraph::error::OmniError) -> bool {
+    let text = error.to_string();
+    text.contains("T86") && text.contains("an `rrf` arm over `bm25`")
 }
 
 struct EnvGuard {
@@ -1962,25 +1969,23 @@ async fn rrf_with_string_nearest_matches_explicit_vector_under_mock_embeddings()
     let dir = tempfile::tempdir().unwrap();
     let db = init_mock_embedding_search_db(&dir).await;
 
-    let explicit = query_main(
-        &db,
-        MOCK_SEARCH_QUERIES,
-        "hybrid_search_vector",
-        &vector_and_string_params("$vq", &mock_embedding("alpha", 4), "$tq", "alpha"),
-    )
-    .await
-    .unwrap();
-    let embedded = query_main(
-        &db,
-        MOCK_SEARCH_QUERIES,
-        "hybrid_search_string",
-        &params(&[("$vq", "alpha"), ("$tq", "alpha")]),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(result_slugs(&embedded), result_slugs(&explicit));
-    assert_eq!(result_slugs(&embedded)[0], "alpha-doc");
+    // Both spellings of the vector arm meet the same refusal of the `bm25`
+    // arm (`T86`), before any embedding runs.
+    for (query, params) in [
+        (
+            "hybrid_search_vector",
+            vector_and_string_params("$vq", &mock_embedding("alpha", 4), "$tq", "alpha"),
+        ),
+        (
+            "hybrid_search_string",
+            params(&[("$vq", "alpha"), ("$tq", "alpha")]),
+        ),
+    ] {
+        let error = query_main(&db, MOCK_SEARCH_QUERIES, query, &params)
+            .await
+            .unwrap_err();
+        assert!(refuses_an_rrf_bm25_arm(&error), "{query}: {error}");
+    }
 }
 
 #[tokio::test]
@@ -2215,8 +2220,8 @@ async fn bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan() {
         probes
             .bm25_scan_rows
             .load(std::sync::atomic::Ordering::Relaxed),
-        20,
-        "the aggregate's single scan must cover every matching document"
+        0,
+        "an exact `bm25` runs no ranked full-text scan"
     );
 
     let batch = result.concat_batches().unwrap();
@@ -2232,8 +2237,8 @@ async fn bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan() {
     );
 }
 
-/// The rrf arms are never capped (PR #574 review). Pins one uncapped pass
-/// per arm; a reintroduced cap moves the scan-row count.
+/// An `rrf` over `bm25` arms is refused at type check (`T86`), so no arm
+/// scans.
 #[tokio::test]
 #[serial]
 async fn rrf_arms_scan_uncapped_in_one_pass() {
@@ -2246,14 +2251,9 @@ async fn rrf_arms_scan_uncapped_in_one_pass() {
     db.ensure_indices_as(None).await.unwrap();
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
-    // This test pins the POSTFILTER plan's invariants (uncapped one-pass
-    // corpus-wide arms). Force that plan: un-forced, the assertion couples
-    // to the prefilter gate's threshold (4/20 eligible merely happens to
-    // exceed the default ratio), and a retune or a different `rrf_plan`
-    // setting would flip it with a misleading cap-regression message.
     let postfilter_db = with_setting(&db, "rrf_plan", "force_postfilter");
     let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(probes.clone(), async {
+    let error = with_query_io_probes(probes.clone(), async {
         query_main(
             &postfilter_db,
             UNDERFILL_RRF_QUERY,
@@ -2263,23 +2263,13 @@ async fn rrf_arms_scan_uncapped_in_one_pass() {
         .await
     })
     .await
-    .unwrap();
-
-    // Each arm scans the full matched corpus exactly once (2 × 20).
+    .unwrap_err();
+    assert!(refuses_an_rrf_bm25_arm(&error), "{error}");
     assert_eq!(
         probes
             .bm25_scan_rows
             .load(std::sync::atomic::Ordering::Relaxed),
-        40,
-        "both rrf arms must scan every matching document in one pass"
-    );
-
-    // Both arms rank identically (the second repeats the term), so fusion preserves
-    // the tf order: the best-scoring edge-bearing chunks are 08 then 09.
-    assert_eq!(
-        result_slugs(&result),
-        vec!["chunk-08".to_string(), "chunk-09".to_string()],
-        "the fused limit must be filled, in rank order, from the edge-bearing chunks"
+        0
     );
 }
 
@@ -2369,26 +2359,22 @@ query uncapped_all($q: String) {
     );
 }
 
-// RRF fuses arms OTHER than the default nearest+bm25: two FTS arms (title+body).
-// Proves primary_var resolves when neither arm is `nearest`, and fusion runs.
+// An `rrf` of two `bm25` arms (title and body) is refused at type check
+// (`T86`).
 #[tokio::test]
 #[serial]
 async fn rrf_fuses_two_fts_fields() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_search_db(&dir).await;
-    let r = query_main(
+    let error = query_main(
         &db,
         SEARCH_QUERIES,
         "rrf_two_fts",
         &params(&[("$q", "learning")]),
     )
     .await
-    .unwrap();
-    assert_eq!(
-        result_slugs(&r),
-        vec!["dl-basics", "ml-intro", "rl-intro"],
-        "the title arm is an all-way tie, so v2's identity tie order fuses to dl/ml/rl"
-    );
+    .unwrap_err();
+    assert!(refuses_an_rrf_bm25_arm(&error), "{error}");
 }
 
 // RRF fuses two vector arms (no embedding creds — explicit vectors). A doc near
@@ -2471,9 +2457,15 @@ async fn mutation_with_deferred_index_coverage_remains_searchable() {
     }
 }
 
+/// No GQ query reads a full-text index: every lexical call is answered by the
+/// exact lexical scan, so removing every analyzer certificate changes no
+/// query's rows, at the head or at a historical version. A raw scan filter
+/// that reads the postings (`contains_tokens`) still needs a certified index
+/// and refuses with `FullTextIndexRebuildRequired` until the explicit
+/// rebuild writes new certificates.
 #[tokio::test]
 #[serial]
-async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads() {
+async fn uncertified_full_text_refuses_raw_token_filters_but_no_query() {
     use omnigraph::error::OmniError;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2483,74 +2475,19 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
     let entry = snapshot.dataset("node:Doc").unwrap();
     let dataset = snapshot.open_dataset("node:Doc").await.unwrap();
     let indices = dataset.load_indices().await.unwrap();
-    // Certify one RRF leg while the other has no proof. Deleting every proof
-    // alone cannot detect a gate that checks only the first full-text arm.
-    for (uncertified_column, healthy_query) in [("body", "text_search"), ("title", "phrase_search")]
-    {
-        let field = dataset.schema().field(uncertified_column).unwrap().id;
-        let index = indices
-            .iter()
-            .find(|index| {
-                index.fields.contains(&field)
-                    && index.files.as_ref().is_some_and(|files| {
-                        files
-                            .iter()
-                            .any(|file| file.path == "omnigraph_fts_compat.json")
-                    })
-            })
-            .unwrap();
-        let path = dir
-            .path()
-            .join(&entry.dataset_path)
-            .join("_indices")
-            .join(index.uuid.to_string())
-            .join("omnigraph_fts_compat.json");
-        let certificate = std::fs::read(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        // A fresh session must observe this deliberate out-of-band removal;
-        // immutable proofs already verified by a session may remain cached.
-        db = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
-        assert!(
-            query_main(
-                &db,
-                SEARCH_QUERIES,
-                healthy_query,
-                &params(&[("$q", "Learning")])
-            )
-            .await
-            .unwrap()
-            .num_rows()
-                > 0
-        );
-        let error = query_main(
-            &db,
-            SEARCH_QUERIES,
-            "rrf_two_fts",
-            &params(&[("$q", "Learning")]),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(error, OmniError::FullTextIndexRebuildRequired { index: ref name, .. } if name == &index.name),
-            "{uncertified_column}: {error}"
-        );
-        std::fs::write(path, certificate).unwrap();
-        assert!(
-            query_main(
-                &db,
-                SEARCH_QUERIES,
-                "rrf_two_fts",
-                &params(&[("$q", "Learning")])
-            )
-            .await
-            .unwrap()
-            .num_rows()
-                > 0,
-            "failed verification must not be cached"
-        );
-    }
-    // Simulate absent artifact provenance without changing rows, graph history,
-    // or index coverage. Actual saved-v10 bytes are tested in staged_tests.
+    let queries = ["text_search", "fuzzy_search", "phrase_search", "bm25_search"];
+    let rows = async |db: &Session| {
+        let mut out = Vec::new();
+        for query in queries {
+            let result = query_main(db, SEARCH_QUERIES, query, &params(&[("$q", "Learning")]))
+                .await
+                .unwrap();
+            out.push(result_slugs(&result));
+        }
+        out
+    };
+    let certified = rows(&db).await;
+    assert!(certified.iter().all(|slugs| !slugs.is_empty()), "{certified:?}");
     for index in indices.iter().filter(|index| {
         index.files.as_ref().is_some_and(|files| {
             files
@@ -2570,33 +2507,7 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
     db = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
     let original_rows = dataset.count_rows(None).await.unwrap();
     assert!(original_rows > 0);
-    for query in [
-        "text_search",
-        "fuzzy_search",
-        "phrase_search",
-        "bm25_search",
-        "rrf_two_fts",
-    ] {
-        let error = query_main(&db, SEARCH_QUERIES, query, &params(&[("$q", "Learning")]))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, OmniError::FullTextIndexRebuildRequired { .. }),
-            "{query}: {error}"
-        );
-    }
-    let error = query_main(
-        &db,
-        SEARCH_QUERIES,
-        "hybrid_search",
-        &vector_and_string_params("$vq", &[0.1, 0.2, 0.3, 0.4], "$tq", "Learning"),
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        matches!(error, OmniError::FullTextIndexRebuildRequired { .. }),
-        "{error}"
-    );
+    assert_eq!(rows(&db).await, certified, "no query reads a certificate");
     assert!(
         query_main(
             &db,
@@ -2609,6 +2520,16 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
         .num_rows()
             > 0
     );
+    let historical = db
+        .run_query_at(
+            old_manifest_version,
+            SEARCH_QUERIES,
+            "text_search",
+            &params(&[("$q", "Learning")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result_slugs(&historical), certified[0]);
 
     let mut scan = dataset.scan();
     scan.filter("contains_tokens(title, 'Learning')").unwrap();
@@ -2628,37 +2549,28 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
         .await
         .unwrap();
     assert!(!rebuilt.rebuilt_indexes.is_empty());
-    assert!(
-        query_main(
-            &db,
-            SEARCH_QUERIES,
-            "text_search",
-            &params(&[("$q", "Learning")])
-        )
+    assert_eq!(rows(&db).await, certified);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), original_rows);
+    let rebuilt_dataset = snapshot_main(&db)
         .await
         .unwrap()
-        .num_rows()
-            > 0
-    );
-    assert_eq!(dataset.count_rows(None).await.unwrap(), original_rows);
-    let error = db
-        .run_query_at(
-            old_manifest_version,
-            SEARCH_QUERIES,
-            "text_search",
-            &params(&[("$q", "Learning")]),
-        )
+        .open_dataset("node:Doc")
         .await
-        .unwrap_err();
+        .unwrap();
     assert!(
-        matches!(error, OmniError::FullTextIndexRebuildRequired { .. }),
-        "{error}"
+        rebuilt_dataset
+            .count_rows(Some("contains_tokens(title, 'Learning')".into()))
+            .await
+            .unwrap()
+            > 0
     );
 }
 
 /// A plain `nearest` over a type with full-text-indexed String columns runs no
-/// full-text validation; a full-text query over the same fixture runs one, so
-/// the zero is a skip and not a dead probe.
+/// full-text validation, and neither does a lexical query, which the exact
+/// lexical scan answers without reading an index; a raw `contains_tokens`
+/// filter over the same fixture runs one, so the zero is a skip and not a
+/// dead probe.
 #[tokio::test]
 #[serial]
 async fn plain_nearest_skips_the_full_text_validation() {
@@ -2700,9 +2612,30 @@ async fn plain_nearest_skips_the_full_text_validation() {
     .await
     .unwrap();
     assert!(text.num_rows() > 0);
+    assert_eq!(
+        probes.fts_validations.load(Ordering::Relaxed),
+        0,
+        "the exact lexical scan reads no index, so a lexical query validates none"
+    );
+
+    let probes = QueryIoProbes::default();
+    let dataset = snapshot_main(&db)
+        .await
+        .unwrap()
+        .open_dataset("node:Doc")
+        .await
+        .unwrap();
+    let matched = with_query_io_probes(probes.clone(), async {
+        dataset
+            .count_rows(Some("contains_tokens(title, 'Learning')".into()))
+            .await
+    })
+    .await
+    .unwrap();
+    assert!(matched > 0);
     assert!(
         probes.fts_validations.load(Ordering::Relaxed) > 0,
-        "a full-text query validates its index coverage"
+        "a raw token filter reads the postings, so it validates their certificate"
     );
 }
 
@@ -2844,19 +2777,18 @@ async fn full_text_analyzer_holds_after_first_rows_and_overwrites_issue_904() {
     );
 }
 
-/// A full-text call refuses a declared index that has no segment at the
-/// query's snapshot, rather than answering with Lance's bare, case-sensitive
-/// tokenizer: a table version written before writers declared the analyzer
-/// is this case, built here with a raw Lance append to the table's creation
-/// version, published without index work. Planning and explain refuse alike
-/// (`FullTextIndexRequired`, before any scan); building the declared index
-/// lifts the refusal, and the call then folds case.
+/// A full-text field whose index has no segment at the query's snapshot is
+/// answered by the exact lexical scan with its profile (`english_v1`, since
+/// the index names no analyzer), never by Lance's bare, case-sensitive
+/// tokenizer and never refused: a table version written with a raw Lance
+/// append to the table's creation version, published without index work, is
+/// this case. Planning and explain succeed, the call folds case, and the
+/// answer is the same after the declared index is built.
 #[cfg(feature = "failpoints")]
 #[tokio::test]
-async fn a_full_text_index_with_no_segment_refuses_the_call_issue_747() {
+async fn a_full_text_index_with_no_segment_answers_by_the_exact_scan_issue_747() {
     use lance::index::DatasetIndexExt;
     use omnigraph::db::ReadTarget;
-    use omnigraph::error::OmniError;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -2904,20 +2836,18 @@ async fn a_full_text_index_with_no_segment_refuses_the_call_issue_747() {
         .unwrap();
 
     let deep = params(&[("q", "deep")]);
-    let refused = |error: OmniError| match error {
-        OmniError::FullTextIndexRequired { index } => assert_eq!(index, "Doc.body"),
-        other => panic!("an index with no segment answered or failed otherwise: {other}"),
-    };
-    refused(
-        query_branch(&db, "main", ANALYZER_QUERIES, "docs", &deep)
-            .await
-            .unwrap_err(),
+    assert_eq!(
+        first_column_sorted(
+            &query_branch(&db, "main", ANALYZER_QUERIES, "docs", &deep)
+                .await
+                .unwrap()
+        ),
+        ["d1", "d2"],
+        "the exact scan folds case with no segment"
     );
-    refused(
-        db.explain_query(ReadTarget::branch("main"), ANALYZER_QUERIES, "docs", &deep)
-            .await
-            .unwrap_err(),
-    );
+    db.explain_query(ReadTarget::branch("main"), ANALYZER_QUERIES, "docs", &deep)
+        .await
+        .unwrap();
 
     db.ensure_indices_as(None).await.unwrap();
     assert_eq!(
@@ -2951,9 +2881,8 @@ query ranked($q: String) {
 "#;
 
 /// On a field whose index declares an analyzer, the exact lexical scan
-/// answers a table version that holds rows and no segment of the index, the
-/// state an undeclared field refuses with `FullTextIndexRequired`: the scan
-/// instantiates the analyzer from the accepted schema and reads no index, so
+/// answers a table version that holds rows and no segment of the index: the
+/// scan instantiates the analyzer from the accepted schema and reads no index, so
 /// matching and ranking answer before any index work, and alike after it.
 #[cfg(feature = "failpoints")]
 #[tokio::test]

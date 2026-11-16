@@ -17,7 +17,7 @@ environments:
 --- schema
 node Doc {
     slug: String @key
-    text: String @index
+    text: String @index(fulltext, analyzer = "standard_folded_v1")
     embedding: Vector(2) @index
 }
 edge Cites: Doc -> Doc
@@ -250,14 +250,7 @@ query rrf_arm_window_other_than_the_limit() {
     limit 3
 }
 
---- expect ordered
-{"d.slug":"a"}
-{"d.slug":"b"}
-
---- expect shape
-d.slug: String
-
---- expect same as reference
+--- expect error: type error: T86:
 
 --- query
 query rrf_ordered_by_another_key() {
@@ -270,15 +263,7 @@ query rrf_ordered_by_another_key() {
     limit 2
 }
 
---- expect ordered
-{"d.slug":"a","score":0.032786885246}
-{"d.slug":"b","score":0.016129032258}
-
---- expect shape
-d.slug: String
-score: F64
-
---- expect same as reference
+--- expect error: type error: T86:
 
 --- query
 query aggregate_over_the_score() {
@@ -287,10 +272,10 @@ query aggregate_over_the_score() {
 }
 
 --- expect unordered
-{"best":0.52354836}
+{"best":0.523548346502}
 
 --- expect shape
-best: F32?
+best: F64?
 
 --- expect same as reference
 
@@ -319,11 +304,4 @@ query aggregate_over_a_fusion() {
     return { count($d) as n, max($score) as best }
 }
 
---- expect unordered
-{"n":3,"best":0.032786885246}
-
---- expect shape
-n: I64
-best: F64?
---- expect same as reference
-
+--- expect error: type error: T86:

@@ -14,7 +14,8 @@ use super::*;
 
 const SCHEMA: &str = r#"
 node Person { name: String @key  age: I32?  city: String? }
-node Doc { slug: String @key  text: String @index  title: String? @index(fulltext, analyzer = "standard_v1")  year: I32  embedding: Vector(2)? @index }
+node Doc { slug: String @key  text: String @index(fulltext, analyzer = "standard_folded_v1")  title: String? @index(fulltext, analyzer = "standard_v1")  year: I32  embedding: Vector(2)? @index }
+node Note { slug: String @key  body: String @index(fulltext) }
 edge Knows: Person -> Person { since: I64? }
 edge Wrote: Person -> Doc
 "#;
@@ -25,6 +26,7 @@ const DATA: &str = r#"{"type":"Person","data":{"name":"ann","age":30,"city":"Osl
 {"type":"Doc","data":{"slug":"d1","text":"graph needle","title":"Graphs and Café","year":2020,"embedding":[0.0,1.0]}}
 {"type":"Doc","data":{"slug":"d2","text":"needle needle hay","year":2021,"embedding":[1.0,0.0]}}
 {"type":"Doc","data":{"slug":"d3","text":"hay","year":2022,"embedding":[1.0,1.0]}}
+{"type":"Note","data":{"slug":"n1","body":"graph"}}
 {"edge":"Knows","id":"k1","from":"ann","to":"bob","data":{"since":2001}}
 {"edge":"Knows","id":"k2","from":"bob","to":"cyd","data":{"since":2002}}
 {"edge":"Wrote","id":"w1","from":"ann","to":"d1","data":{}}
@@ -52,6 +54,21 @@ fn run(src: &str, params: &[(&str, Literal)]) -> (Vec<Json>, bool) {
     Interpreter::new(&catalog, &graph, &params)
         .run(&read)
         .unwrap()
+}
+
+/// The refusal of the one read in `src`.
+#[track_caller]
+fn run_refused(src: &str) -> Refusal {
+    let catalog = catalog();
+    let graph = Graph::from_export(&catalog, DATA).unwrap();
+    let decls = check_source(&catalog, src).unwrap();
+    let (_, outcome) = decls.into_iter().next().unwrap();
+    let CoreDecl::Read(read) = outcome.unwrap().core else {
+        panic!("a read")
+    };
+    Interpreter::new(&catalog, &graph, &HashMap::new())
+        .run(&read)
+        .unwrap_err()
 }
 
 #[track_caller]
@@ -249,11 +266,17 @@ fn score_keeps_matching_rows_with_their_bm25() {
 #[test]
 fn fuse_sums_reciprocal_ranks_over_the_arms() {
     let out = rows(
-        "query q() { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, [0.0, 1.0], k: 3), bm25($all, $d.text, \"needle\"), k: 60) as $score } return { $d.slug } order { $score desc } limit 3 }",
+        "query q() { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, [0.0, 1.0], k: 3), nearest($all, $d.embedding, [0.0, 0.9], k: 3), k: 60) as $score } return { $d.slug } order { $score desc } limit 3 }",
     );
-    // d1 is first in both arms; d2 is second in bm25 and third by distance.
-    assert_eq!(out[0], json!({"d.slug": "d1"}));
-    assert_eq!(out.len(), 3);
+    // d1 is first in both arms, d3 second, d2 third.
+    assert_eq!(
+        out,
+        vec![
+            json!({"d.slug": "d1"}),
+            json!({"d.slug": "d3"}),
+            json!({"d.slug": "d2"})
+        ]
+    );
 }
 
 #[test]
@@ -620,7 +643,7 @@ fn a_block_compares_with_a_scalar_of_the_outer_row() {
 #[test]
 fn fuse_yields_one_row_per_target_under_its_name() {
     let out = rows(
-        "query q() { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, [0.0, 1.0], k: 3), bm25($all, $d.text, \"needle hay\"), k: 60) as $fused } return { $d.slug } }",
+        "query q() { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, [0.0, 1.0], k: 3), nearest($all, $d.embedding, [1.0, 0.0], k: 3), k: 60) as $fused } return { $d.slug } }",
     );
     assert_eq!(
         sorted(out),
@@ -673,23 +696,34 @@ fn a_profile_fixes_folding_and_the_token_length_filter() {
     let catalog = catalog();
     // `standard_v1`: lowercase alone, so `café` stays and `graphs` is not
     // stemmed.
-    let standard = Analysis::of(&catalog, Some("Doc"), "title");
+    let standard = Analysis::of(&catalog, Some("Doc"), "title").unwrap();
     assert_eq!(
         standard.tokens("Graphs and Café").unwrap(),
         vec!["graphs", "and", "café"]
     );
-    // No profile is edition 2's analysis: folded, a token of 40 bytes or
-    // more dropped.
-    let edition_2 = Analysis::of(&catalog, Some("Doc"), "text");
+    // `standard_folded_v1`: folded, and no profile filters tokens by length.
+    let folded = Analysis::of(&catalog, Some("Doc"), "text").unwrap();
     let long = "x".repeat(40);
     assert_eq!(
-        edition_2.tokens(&format!("Café {long} crème")).unwrap(),
-        vec!["cafe", "creme"]
+        folded.tokens(&format!("Café {long} crème")).unwrap(),
+        vec!["cafe".to_string(), long.clone(), "creme".to_string()]
     );
     // A letter outside the folding table is refused, not guessed.
     assert!(matches!(
-        edition_2.tokens("Ωmega"),
+        folded.tokens("Ωmega"),
         Err(Refusal::Unsupported(_))
+    ));
+    // `english_v1`, the profile of an index that names none, stems and
+    // removes stop words, which this crate cannot do: refused.
+    assert!(matches!(
+        Analysis::of(&catalog, Some("Note"), "body"),
+        Err(Refusal::Unsupported(_))
+    ));
+    assert!(matches!(
+        run_refused(
+            "query q() { match { $n: Note } where match_terms($n.body, terms(\"graph\", mode: any)) return { $n.slug } }"
+        ),
+        Refusal::Unsupported(_)
     ));
 }
 

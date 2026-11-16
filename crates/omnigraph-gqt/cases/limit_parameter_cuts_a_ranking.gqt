@@ -12,7 +12,7 @@ environments:
 --- schema
 node Doc {
     slug: String @key
-    body: String @index
+    body: String @index(fulltext, analyzer = "standard_folded_v1")
 }
 
 --- seed

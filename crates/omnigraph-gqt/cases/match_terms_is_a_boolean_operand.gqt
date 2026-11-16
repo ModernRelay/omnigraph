@@ -18,7 +18,7 @@ environments:
 --- schema
 node Doc {
     slug: String @key
-    title: String? @index
+    title: String? @index(fulltext, analyzer = "standard_folded_v1")
     year: I64
 }
 node Person {

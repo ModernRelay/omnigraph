@@ -3250,7 +3250,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                 },
                 IndexBuildSpec::FullText {
                     column: "body".to_string(),
-                    analysis: Default::default(),
+                    analysis: crate::storage_layer::FullTextBuild::for_test(),
                 },
                 // Second index on the SAME column: independent builders share
                 // one snapshot, so explicit names avoid an uncommitted-name
@@ -3450,7 +3450,7 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
             &old,
             &[IndexBuildSpec::FullText {
                 column: "text".into(),
-                analysis: Default::default(),
+                analysis: crate::storage_layer::FullTextBuild::for_test(),
             }],
         )
         .await

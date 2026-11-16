@@ -462,10 +462,11 @@ pub struct PropertyIR {
     pub annotations: Vec<Annotation>,
     pub property_constraints: Vec<PropertyConstraintShape>,
     pub embed_source: Option<EmbedSourceIR>,
-    /// The full-text analysis its index declares beyond edition 2's
+    /// The full-text analysis its index declares beyond the defaults
     /// (`@index(fulltext, analyzer = ..., scorer = ...)`), bound to this
     /// property's identity: a rename keeps it, drop and re-add declares it
-    /// anew. Absent, and absent from the serialized IR, when edition 2's.
+    /// anew. Absent, and absent from the serialized IR, when the index
+    /// declares neither (`english_v1`, `bm25_v1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text: Option<FullTextAnalysis>,
     /// The distance a vector declares beyond `l2`: the resolved distance as
@@ -483,12 +484,11 @@ impl PropertyIR {
         self.distance.unwrap_or_default()
     }
 
-    /// The analyzer fingerprint of this property's declared profile, `None`
-    /// when its full-text index keeps edition 2's analysis.
-    pub fn full_text_fingerprint(&self) -> Option<String> {
-        self.full_text
-            .as_ref()
-            .and_then(|analysis| analysis.fingerprint(self.property_id.get()))
+    /// The analyzer fingerprint a full-text index on this property is
+    /// certified for: its declared analysis, `english_v1` and `bm25_v1`
+    /// where it declares none.
+    pub fn full_text_fingerprint(&self) -> String {
+        FullTextAnalysis::resolved(self.full_text.as_ref()).fingerprint(self.property_id.get())
     }
 }
 
@@ -2162,7 +2162,7 @@ mod tests {
         );
         assert!(accepted.features.contains(FEATURE_FULL_TEXT_ANALYSIS));
         let body = property(&accepted, "body");
-        let fingerprint = body.full_text_fingerprint().unwrap();
+        let fingerprint = body.full_text_fingerprint();
         assert_eq!(
             build_catalog_from_ir(&accepted).unwrap().node_types["Doc"].full_text_fingerprints["body"],
             fingerprint
@@ -2182,20 +2182,21 @@ mod tests {
         );
         assert_eq!(
             property(&renamed, "text").full_text_fingerprint(),
-            Some(fingerprint.clone())
+            fingerprint
         );
         let readded = evolve(
             r#"node Doc { slug: String @key text: String @index(fulltext, analyzer = "english_v1") }"#,
         );
-        let readded_fingerprint = property(&readded, "text").full_text_fingerprint().unwrap();
+        let readded_fingerprint = property(&readded, "text").full_text_fingerprint();
         assert_ne!(readded_fingerprint, fingerprint);
 
-        // Without a declaration the feature and the field are absent, so an
-        // edition 2 schema keeps its bytes.
-        let edition_2 = evolve(r#"node Doc { slug: String @key body: String @index(fulltext) }"#);
-        assert!(!edition_2.features.contains(FEATURE_FULL_TEXT_ANALYSIS));
-        assert!(!schema_ir_json(&edition_2).unwrap().contains("full_text"));
-        assert_eq!(property(&edition_2, "body").full_text_fingerprint(), None);
+        // Without a declaration the feature and the field are absent, so the
+        // schema keeps its bytes, and the field takes `english_v1`: the
+        // fingerprint is the declared profile's.
+        let omitted = evolve(r#"node Doc { slug: String @key body: String @index(fulltext) }"#);
+        assert!(!omitted.features.contains(FEATURE_FULL_TEXT_ANALYSIS));
+        assert!(!schema_ir_json(&omitted).unwrap().contains("full_text"));
+        assert_eq!(property(&omitted, "body").full_text_fingerprint(), fingerprint);
 
         // The feature set is derived: a hand-authored IR whose set disagrees
         // with its declarations is refused, and so is an unknown feature.

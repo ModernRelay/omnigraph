@@ -102,7 +102,7 @@ impl Binder<'_> {
 
     fn term(&self, term: &mut Term) -> Result<()> {
         match term {
-            Term::Filter { pred, .. } => *pred = search_compared(self.expr(pred)?),
+            Term::Filter { pred, .. } => *pred = self.expr(pred)?,
             Term::Project { items, .. } => {
                 for (_, e) in items {
                     *e = self.expr(e)?;
@@ -284,27 +284,6 @@ impl Binder<'_> {
                 args: args.iter().map(|a| self.expr(a)).collect::<Result<_>>()?,
                 ty: ty.clone(),
             },
-            IRExpr::Search { field, query, ty } => IRExpr::Search {
-                field: b(field)?,
-                query: b(query)?,
-                ty: ty.clone(),
-            },
-            IRExpr::MatchText { field, query, ty } => IRExpr::MatchText {
-                field: b(field)?,
-                query: b(query)?,
-                ty: ty.clone(),
-            },
-            IRExpr::Fuzzy {
-                field,
-                query,
-                max_edits,
-                ty,
-            } => IRExpr::Fuzzy {
-                field: b(field)?,
-                query: b(query)?,
-                max_edits: max_edits.as_deref().map(&b).transpose()?,
-                ty: ty.clone(),
-            },
             IRExpr::Aggregate {
                 func,
                 distinct,
@@ -318,24 +297,6 @@ impl Binder<'_> {
             },
             other => other.clone(),
         })
-    }
-}
-
-/// A search predicate standing alone as a filter, compared with `true`: the
-/// one shape a search filter has in a plan.
-fn search_compared(pred: IRExpr) -> IRExpr {
-    match pred {
-        call @ (IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }) => {
-            let truth = IRExpr::Literal(
-                Literal::Bool(true),
-                crate::types::ExprType::from_prop(&crate::types::PropType::scalar(
-                    crate::types::ScalarType::Bool,
-                    false,
-                )),
-            );
-            coerce::binary(call.clone(), BinaryOp::Compare(CompOp::Eq), truth).unwrap_or(call)
-        }
-        other => other,
     }
 }
 

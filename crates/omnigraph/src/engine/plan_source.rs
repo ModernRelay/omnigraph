@@ -295,13 +295,6 @@ impl PlanSource for QuerySource<'_> {
         }
     }
 
-    fn full_text_declares_analyzer(&self, type_key: &str, property: &str) -> bool {
-        type_key
-            .strip_prefix("node:")
-            .and_then(|type_name| self.catalog.node_types.get(type_name))
-            .is_some_and(|node| node.full_text_profile(property).is_some())
-    }
-
     fn canonical_key_id(
         &self,
         type_key: &str,
@@ -317,21 +310,6 @@ impl PlanSource for QuerySource<'_> {
         };
         canonical_key_id_of(self.catalog, type_key, literal, value.ty())
             .map_err(|error| PlanError::Internal(error.to_string()))
-    }
-
-    fn scan_runtime_input(
-        &self,
-        scan: &omnigraph_planner::ScanSpec,
-    ) -> Option<omnigraph_planner::RuntimeInput> {
-        scan.filter
-            .as_ref()
-            .is_some_and(|predicate| {
-                predicate
-                    .gq_filters()
-                    .iter()
-                    .any(super::search::is_search_filter)
-            })
-            .then_some(omnigraph_planner::RuntimeInput::SearchFilter)
     }
 
     fn index_split<'a>(
@@ -538,7 +516,6 @@ fn unsupported_query(diagnostic: Box<omnigraph_compiler::QueryDiagnostic>) -> Om
 fn plan_error(error: PlanError) -> OmniError {
     match error {
         PlanError::Unsupported(diagnostic) => unsupported_query(diagnostic),
-        PlanError::FullTextIndexRequired { index } => OmniError::FullTextIndexRequired { index },
         other => no_plan(other),
     }
 }
@@ -643,7 +620,6 @@ impl KeyIds for CatalogKeys<'_> {
 fn unaccepted(reason: Unrouted) -> OmniError {
     match reason {
         Unrouted::UnsupportedQuery { diagnostic } => unsupported_query(diagnostic),
-        Unrouted::FullTextIndexRequired { index } => OmniError::FullTextIndexRequired { index },
         Unrouted::ValidationExhausted { limit, value } => OmniError::ResourceLimitExceeded {
             resource: format!("plan validation {limit}"),
             limit: value,

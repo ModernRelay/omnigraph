@@ -530,9 +530,6 @@ fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a st
         IRExpr::IsNull { expr, .. } => first_unbound_param(expr, params),
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)

@@ -502,7 +502,7 @@ async fn rrf_fusion_refuses_its_own_allocations_and_releases_both_legs() {
             r#"
 node Doc {
     slug: String @key
-    text: String @index
+    embedding: Vector(2)
 }
 "#,
         )
@@ -513,7 +513,7 @@ node Doc {
     for doc in 0..5_000 {
         seed.push_str(
             &serde_json::json!({"type":"Doc", "data":{
-                "slug":format!("d{doc:05}"), "text":"needle filler"
+                "slug":format!("d{doc:05}"), "embedding":[doc as f32, 1.0]
             }})
             .to_string(),
         );
@@ -522,13 +522,13 @@ node Doc {
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices_as(None).await.unwrap();
     let v2 = with_setting(&db, "engine", "v2");
-    let source = r#"query fused($q: String) {
-        match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $q), bm25($all, $d.text, "needle needle"), k: 60) as $score, $d: Doc }
+    let source = r#"query fused($q: Vector(2)) {
+        match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 5000), nearest($all, $d.embedding, [5000.0, 1.0], k: 5000), k: 60) as $score, $d: Doc }
         return { $d.slug }
         order { $score desc }
         limit 5000
     }"#;
-    let values = params(&[("q", "needle")]);
+    let values = vector_param("q", &[0.0, 1.0]);
     let mut fusion_refused = false;
     for limit in [256 * 1024, 512 * 1024, MIB, 2 * MIB, 4 * MIB, 8 * MIB] {
         let probes = QueryMemoryProbes::default();
@@ -707,6 +707,7 @@ fn one_blocking_worker_completes_rrf_expand_and_nonbulk_negation() {
 node Person {
     name: String @key
     text: String @index
+    embedding: Vector(2)
 }
 edge Knows: Person -> Person
 "#,
@@ -715,9 +716,9 @@ edge Knows: Person -> Person
             .unwrap(),
         );
         db.load_jsonl(
-            r#"{"type":"Person","data":{"name":"a","text":"needle"}}
-{"type":"Person","data":{"name":"b","text":"needle"}}
-{"type":"Person","data":{"name":"c","text":"needle"}}
+            r#"{"type":"Person","data":{"name":"a","text":"needle","embedding":[0.0,1.0]}}
+{"type":"Person","data":{"name":"b","text":"needle","embedding":[1.0,1.0]}}
+{"type":"Person","data":{"name":"c","text":"needle","embedding":[2.0,1.0]}}
 {"edge":"Knows","from":"a","to":"b"}
 {"edge":"Knows","from":"b","to":"c"}"#,
             LoadMode::Overwrite,
@@ -727,8 +728,8 @@ edge Knows: Person -> Person
         db.ensure_indices_as(None).await.unwrap();
         let v2 = with_setting(&db, "engine", "v2");
         let queries = r#"
-query fused($q: String) {
-    match { let $all = { match { $p: Person } return { $p } }, from rrf(bm25($all, $p.text, $q), bm25($all, $p.text, "needle needle"), k: 60) as $score, $p: Person, $p knows $friend }
+query fused($q: Vector(2)) {
+    match { let $all = { match { $p: Person } return { $p } }, from rrf(nearest($all, $p.embedding, $q, k: 3), nearest($all, $p.embedding, [2.0, 1.0], k: 3), k: 60) as $score, $p: Person, $p knows $friend }
     return { $p.name }
     order { $score desc }
     limit 2
@@ -744,7 +745,7 @@ query without_matching_friend() {
             std::time::Duration::from_secs(5),
             with_query_memory_probes(
                 probes.clone(),
-                query_main(&v2, queries, "fused", &params(&[("q", "needle")])),
+                query_main(&v2, queries, "fused", &vector_param("q", &[0.0, 1.0])),
             ),
         )
         .await

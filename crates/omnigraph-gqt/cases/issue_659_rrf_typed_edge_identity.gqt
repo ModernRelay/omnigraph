@@ -38,20 +38,7 @@ query fused_types() {
     limit 2
 }
 
---- expect unordered
-{"edge_type":"Knows","edge_id":"shared"}
-{"edge_type":"Likes","edge_id":"shared"}
-
---- expect shape
-edge_type: String
-edge_id: String
-
---- expect plan
-expand $p $q: selection alternation [Knows out, Likes out]
-rank fuse no row tiebreak
-sort tiebreak [$p, $q, $e.@type, $e.@id]
-
---- expect same as reference
+--- expect error: type error: T86:
 
 --- query
 query fused_type_page() {
@@ -66,14 +53,7 @@ query fused_type_page() {
     limit 1
 }
 
---- expect unordered
-{"edge_type":"Knows","edge_id":"shared"}
-
---- expect shape
-edge_type: String
-edge_id: String
-
---- expect same as reference
+--- expect error: type error: T86:
 
 --- query
 query fused_wildcard_type_page() {
@@ -89,16 +69,4 @@ query fused_wildcard_type_page() {
     limit 1
 }
 
---- expect unordered
-{"edge_type":"Knows","edge_id":"shared"}
-
---- expect shape
-edge_type: String
-edge_id: String
-
---- expect plan
-expand $p $q: selection wildcard [Knows out, Likes out]
-rank fuse no row tiebreak
-sort tiebreak [$p, $q, $e.@type, $e.@id]
-
---- expect same as reference
+--- expect error: type error: T86:

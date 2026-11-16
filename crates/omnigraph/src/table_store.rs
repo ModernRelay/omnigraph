@@ -78,7 +78,7 @@ use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, skip};
 use crate::storage_layer::{
-    BLOB_READ_IO_BUFFER_BYTES, FullTextBuild, FullTextColumn, IndexBuildSpec,
+    BLOB_READ_IO_BUFFER_BYTES, FullTextColumn, IndexBuildSpec,
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, PendingScanBudget,
     ProvenInsertChunk,
 };
@@ -1408,24 +1408,49 @@ async fn commit_detached(
         .map_err(|error| OmniError::storage(error).unpublished())
 }
 
-/// The Lance parameters a full-text segment is built with. Edition 2's index
-/// analysis is Lance's default, as before any profile existed, so no
-/// existing graph changes rows. A declared profile sets every parameter
-/// explicitly (docs/rfcs/2026-11-07-gq-3.md section 4: no unspecified Lance
-/// default is part of a profile), including the posting block size and
+/// The posting block size every full-text build sets.
+const FULL_TEXT_BLOCK_SIZE: u32 = 128;
+/// The inverted-list format every full-text build sets.
+const FULL_TEXT_POSTING_FORMAT: lance_index::scalar::inverted::InvertedListFormatVersion =
+    lance_index::scalar::inverted::InvertedListFormatVersion::V2;
+
+/// What every full-text build's postings hold, recorded in the segment's
+/// certificate beside the field's fingerprint: no Unicode normalization
+/// (Lance has none, so a profile's NFC is not applied to the postings), the
+/// block size and format [`full_text_index_params`] sets, and no positions.
+pub(crate) fn native_full_text_build() -> fts_compat::NativeBuild {
+    fts_compat::NativeBuild {
+        normalization: fts_compat::NativeNormalization::None,
+        block_size: FULL_TEXT_BLOCK_SIZE,
+        posting_format: match FULL_TEXT_POSTING_FORMAT {
+            lance_index::scalar::inverted::InvertedListFormatVersion::V1 => 1,
+            lance_index::scalar::inverted::InvertedListFormatVersion::V2 => 2,
+            lance_index::scalar::inverted::InvertedListFormatVersion::V3 => 3,
+        },
+        positions: false,
+    }
+}
+
+/// The Lance parameters `profile` builds a full-text segment with, and the
+/// exact lexical scan's tokenizer. Every parameter is set explicitly
+/// (docs/rfcs/2026-11-07-gq-3.md section 4: no unspecified Lance default is
+/// part of a profile), including the stop list, which is the profile's
+/// checked-in list, never Lance's default, and the posting block size and
 /// format, so neither Lance's defaults nor `LANCE_FTS_FORMAT_VERSION` can
-/// change it. Lance 13 applies its filters in the order
+/// change it. Term positions are not stored: they are a build option of the
+/// index, not part of the profile. Lance 13 applies its filters in the order
 /// `max_token_length`, lowercase, stemmer, stop words, ASCII folding
-/// (`InvertedIndexParams::build`), which is every profile's order.
+/// (`InvertedIndexParams::build`), which is every profile's order
+/// (`lance_surface_guards.rs::fts_profile_filters_run_in_the_profile_order`).
 ///
 /// Lance has no Unicode normalization step: the profile's NFC is not applied
-/// on this path, so text that is not already NFC tokenizes as written. How
-/// NFC reaches a native index is open in the RFC (Unresolved question 10).
-pub(crate) fn full_text_index_params(analysis: &FullTextBuild) -> Result<InvertedIndexParams> {
+/// on this path, so text that is not already NFC tokenizes as written. The
+/// exact lexical scan normalizes before it tokenizes; how NFC reaches a
+/// native index is open in the RFC (Unresolved question 10).
+pub(crate) fn full_text_index_params(
+    profile: omnigraph_compiler::schema::analysis::AnalyzerProfile,
+) -> Result<InvertedIndexParams> {
     use omnigraph_compiler::schema::analysis::{AnalyzerFilter, AnalyzerTokenizer};
-    let Some(profile) = analysis.profile else {
-        return Ok(InvertedIndexParams::default());
-    };
     let pipeline = profile.pipeline();
     let tokenizer = match pipeline.tokenizer {
         AnalyzerTokenizer::Simple => "simple",
@@ -1442,7 +1467,11 @@ pub(crate) fn full_text_index_params(analysis: &FullTextBuild) -> Result<Inverte
     .lower_case(has(|filter| matches!(filter, AnalyzerFilter::Lowercase)))
     .stem(has(|filter| matches!(filter, AnalyzerFilter::Stem(_))))
     .remove_stop_words(has(|filter| matches!(filter, AnalyzerFilter::StopWords(_))))
-    .custom_stop_words(None)
+    .custom_stop_words(
+        pipeline
+            .stop_words()
+            .map(|words| words.iter().map(|word| (*word).to_string()).collect()),
+    )
     .ascii_folding(has(|filter| matches!(filter, AnalyzerFilter::AsciiFolding)))
     .ngram_min_length(3)
     .ngram_max_length(3)
@@ -1451,8 +1480,8 @@ pub(crate) fn full_text_index_params(analysis: &FullTextBuild) -> Result<Inverte
     .split_on_numerics(false)
     .preserve_original(false)
     .index_operators(false)
-    .format_version(lance_index::scalar::inverted::InvertedListFormatVersion::V2)
-    .block_size(128)
+    .format_version(FULL_TEXT_POSTING_FORMAT)
+    .block_size(FULL_TEXT_BLOCK_SIZE as usize)
     .map_err(|error| {
         OmniError::manifest_internal(format!(
             "the {profile} full-text parameters are invalid: {error}"
@@ -5000,7 +5029,7 @@ impl TableStore {
         let mut fields = HashSet::new();
         for column in columns {
             let name = column.column.as_str();
-            let params = full_text_index_params(&column.analysis)?;
+            let params = full_text_index_params(column.analysis.profile)?;
             let mut builder_ds = ds.clone();
             let mut segment = builder_ds
                 .create_index_builder(&[name], IndexType::Inverted, &params)
@@ -5014,8 +5043,13 @@ impl TableStore {
                         error,
                     )
                 })?;
-            fts_compat::write_certificate(ds, &mut segment, column.analysis.fingerprint.as_deref())
-                .await?;
+            fts_compat::write_certificate(
+                ds,
+                &mut segment,
+                &column.analysis.fingerprint,
+                native_full_text_build(),
+            )
+            .await?;
             fields.extend(segment.fields.iter().copied());
             new_indices.push(segment);
         }
@@ -6260,7 +6294,7 @@ impl TableStore {
                     builder.replace(true).execute_uncommitted().await
                 }
                 IndexBuildSpec::FullText { column, analysis } => {
-                    let params = full_text_index_params(analysis)?;
+                    let params = full_text_index_params(analysis.profile)?;
                     ds_clone
                         .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
                         .replace(true)
@@ -6297,7 +6331,12 @@ impl TableStore {
                 )));
             }
             if let IndexBuildSpec::FullText { analysis, .. } = spec {
-                fts_compat::write_certificate(ds, &mut new_idx, analysis.fingerprint.as_deref())
+                fts_compat::write_certificate(
+                    ds,
+                    &mut new_idx,
+                    &analysis.fingerprint,
+                    native_full_text_build(),
+                )
                     .await?;
                 full_text_fields.extend(new_idx.fields.iter().copied());
             }

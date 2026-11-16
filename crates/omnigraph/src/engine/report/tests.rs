@@ -11,7 +11,7 @@ use arrow_array::{Array, StringArray};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::settings::SessionSettings;
-use omnigraph_planner::{AccessPath, NodeId, PhysicalNode, PhysicalPlan, RankKind, RankScope};
+use omnigraph_planner::{AccessPath, NodeId, PhysicalNode, PhysicalPlan, RankScope};
 
 use super::{ExecutionReport, Ran, ReportRow, RowStatus};
 use crate::Session;
@@ -962,14 +962,14 @@ query by_text($t: String) {
     order { $score desc }
     limit 3
 }
-query fused($t: String, $q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
+query fused($q: Vector(4)) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, [1.0, 0.0, 0.0, 0.0], k: 3), k: 60) as $score, $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 3
 }
-query fused_then_slug($t: String, $q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
+query fused_then_slug($q: Vector(4)) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, [1.0, 0.0, 0.0, 0.0], k: 3), k: 60) as $score, $d: Doc }
     return { $d.slug }
     order { $score desc, $d.slug }
     limit 3
@@ -991,18 +991,17 @@ async fn doc_graph(dir: &tempfile::TempDir) -> Session {
     graph(dir, DOC_SCHEMA, &seed).await
 }
 
+/// An exact `bm25` is a `Score` over its population's scan, then a sort,
+/// a projection and a limit, one operator each.
 #[tokio::test]
-async fn a_ranked_scan_a_sort_a_projection_and_a_limit_build_one_operator_each() {
+async fn a_score_a_sort_a_projection_and_a_limit_build_one_operator_each() {
     let dir = tempfile::tempdir().unwrap();
     let db = doc_graph(&dir).await;
     let (rows, run) = run(&db, DOC_QUERIES, "by_text", &text("t", "needle")).await;
     assert_eq!(rows, 3);
     assert_covers(&run);
-    let scan = node_id(&run.plan, |node| {
-        node.ranked()
-            .is_some_and(|ranked| ranked.kind == RankKind::Bm25)
-    });
-    assert_eq!(operator(&run, scan), "ScanExec");
+    let score = node_id(&run.plan, |node| matches!(node, PhysicalNode::Score { .. }));
+    assert_eq!(operator(&run, score), "ScoreExec");
     let sort = node_id(&run.plan, |node| matches!(node, PhysicalNode::Sort { .. }));
     assert_eq!(
         operator(&run, sort),
@@ -1077,8 +1076,7 @@ async fn a_hydrating_top_k_builds_one_operator_above_its_limit() {
 async fn a_rank_fuse_is_one_operator_over_two_arm_scans() {
     let dir = tempfile::tempdir().unwrap();
     let db = doc_graph(&dir).await;
-    let mut params = text("t", "needle");
-    params.extend(vector("q", &[0.0, 0.0, 0.0, 0.0]));
+    let params = vector("q", &[0.0, 0.0, 0.0, 0.0]);
     let (rows, run) = run(&db, DOC_QUERIES, "fused", &params).await;
     assert_eq!(rows, 3);
     assert_covers(&run);
@@ -1244,4 +1242,64 @@ query pairs() {
             assert!(run.report.spills(row.id).is_empty(), "{row:?}");
         }
     }
+}
+
+const LEXICAL_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    body: String @index(fulltext)
+}
+"#;
+
+const LEXICAL_SEED: &[&str] = &[
+    r#"{"type":"Doc","data":{"slug":"a","body":"graph engines run"}}"#,
+    r#"{"type":"Doc","data":{"slug":"b","body":"vector search"}}"#,
+    r#"{"type":"Doc","data":{"slug":"c","body":"the and of"}}"#,
+];
+
+/// The exact lexical scan runs inside its node's operator, when the operator
+/// first runs: the report's `lexical` entry for the node counts the rows the
+/// scan read and the tokens they analyzed to (`english_v1` drops every word
+/// of "the and of"), for a `match_terms` filter and for an exact `bm25`
+/// alike. A node that never runs, below a `Limit` of 0, scans nothing.
+#[tokio::test]
+async fn the_exact_lexical_scan_runs_in_its_operator_and_reports_rows_and_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = graph(&dir, LEXICAL_SCHEMA, LEXICAL_SEED).await;
+    let source = r#"
+query filtered($q: String) {
+    match { $d: Doc } where match_terms($d.body, terms($q, mode: any))
+    return { $d.slug }
+}
+query ranked($q: String) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $q) as $score }
+    return { $d.slug, $score }
+    order { $score desc }
+}
+query nothing($q: String) {
+    match { $d: Doc } where match_terms($d.body, terms($q, mode: any))
+    return { $d.slug }
+    limit 0
+}
+"#;
+    let scanned = |run: &Captured, wanted: fn(&PhysicalNode) -> bool| {
+        let id = node_id(&run.plan, wanted);
+        run.report.lexical_scans(id)
+    };
+    let (rows, filtered) = run(&db, source, "filtered", &text("q", "engine")).await;
+    assert_eq!(rows, 1);
+    let found = scanned(&filtered, |node| matches!(node, PhysicalNode::Filter { .. }));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0].1.rows, found[0].1.tokens), (3, 5));
+
+    let (rows, ranked) = run(&db, source, "ranked", &text("q", "vector")).await;
+    assert_eq!(rows, 1);
+    let found = scanned(&ranked, |node| matches!(node, PhysicalNode::Score { .. }));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0].1.rows, found[0].1.tokens), (3, 5));
+
+    let (rows, nothing) = run(&db, source, "nothing", &text("q", "engine")).await;
+    assert_eq!(rows, 0);
+    let found = scanned(&nothing, |node| matches!(node, PhysicalNode::Filter { .. }));
+    assert!(found.is_empty(), "{found:?}");
 }

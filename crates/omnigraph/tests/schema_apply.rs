@@ -3496,13 +3496,15 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
     assert_eq!(search("summary").await, ["d3"]);
 }
 
-// Declaring, changing or removing a full-text analyzer is a schema change
-// applied in place (docs/rfcs/2026-11-07-gq-3.md section 4, Schema: Text): the
-// column's segments are replaced in the apply's publication by one built with
-// the declared profile and certified with the field's analyzer fingerprint, so
-// a certificate of the old analysis does not establish the new one; the
-// reconciler rebuilds the postings once, with the profile. A rename keeps the
-// fingerprint and the index.
+// Changing a full-text field's profile is a schema change applied in place
+// (docs/rfcs/2026-11-07-gq-3.md section 4, Schema: Text): the column's
+// segments are replaced in the apply's publication by one built with the
+// profile and certified with the field's analyzer fingerprint, so a
+// certificate of the old analysis does not establish the new one; the
+// reconciler rebuilds the postings once, with the profile. An index without
+// `analyzer` is `english_v1`, so writing that profile out, or dropping it,
+// changes no index. A rename keeps the fingerprint and the index. A reader
+// that holds no schema (a raw scan filter) accepts any certified analysis.
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
@@ -3565,13 +3567,20 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
         )
     };
 
-    // Edition 2's analysis stems and folds, and its certificate names no
-    // fingerprint.
+    // An index without `analyzer` is `english_v1`: it stems and folds, and
+    // its certificate names that profile's fingerprint.
     assert_eq!(search("body", "run").await, ["d1"]);
     assert_eq!(search("body", "cafe").await, ["d2"]);
     let (edition_2, edition_2_segments) = segments("body").await;
     assert_eq!(edition_2_segments.len(), 1);
-    assert_eq!(fingerprint("body"), None);
+    let default_english = fingerprint("body").expect("every full-text field has a fingerprint");
+    omnigraph_core::fts_compat::verify_index(
+        &edition_2,
+        &edition_2_segments[0],
+        Some(&default_english),
+    )
+    .await
+    .unwrap();
     omnigraph_core::fts_compat::verify_index(&edition_2, &edition_2_segments[0], None)
         .await
         .unwrap();
@@ -3616,9 +3625,9 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
         )
         .await
     ));
-    assert!(rebuild_required(
-        omnigraph_core::fts_compat::verify_index(&declared, &declared_segments[0], None).await
-    ));
+    omnigraph_core::fts_compat::verify_index(&declared, &declared_segments[0], None)
+        .await
+        .unwrap();
     // `standard_v1` lowercases but neither stems nor folds.
     assert_eq!(search("body", "run").await, Vec::<String>::new());
     assert_eq!(search("body", "running").await, ["d1"]);
@@ -3660,6 +3669,7 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
     assert!(db.apply_schema(&english).await.unwrap().applied);
     let english_fingerprint = fingerprint("text").unwrap();
     assert_ne!(english_fingerprint, standard);
+    assert_eq!(english_fingerprint, default_english);
     let (changed, changed_segments) = segments("text").await;
     assert_eq!(changed_segments.len(), 1);
     assert_ne!(changed_segments[0].uuid, built_segments[0].uuid);
@@ -3673,20 +3683,22 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
     assert_eq!(search("text", "run").await, ["d1"]);
     assert_eq!(search("text", "cafe").await, ["d2"]);
 
-    // Removing the analyzer returns the field to edition 2's analysis, a
-    // certificate without a fingerprint.
-    assert!(
-        db.apply_schema(&schema("text", "@index(fulltext)", ""))
-            .await
-            .unwrap()
-            .applied
-    );
-    assert_eq!(fingerprint("text"), None);
-    let (removed, removed_segments) = segments("text").await;
-    assert_eq!(removed_segments.len(), 1);
-    omnigraph_core::fts_compat::verify_index(&removed, &removed_segments[0], None)
+    // Dropping the written `english_v1` leaves the field `english_v1`: the
+    // declaration changes, and the fingerprint and the index stay.
+    db.apply_schema(&schema("text", "@index(fulltext)", ""))
         .await
         .unwrap();
+    assert_eq!(fingerprint("text"), Some(english_fingerprint.clone()));
+    let (removed, removed_segments) = segments("text").await;
+    assert_eq!(removed_segments.len(), 1);
+    assert_eq!(removed_segments[0].uuid, changed_segments[0].uuid);
+    omnigraph_core::fts_compat::verify_index(
+        &removed,
+        &removed_segments[0],
+        Some(&english_fingerprint),
+    )
+    .await
+    .unwrap();
     assert_eq!(search("text", "run").await, ["d1"]);
 }
 

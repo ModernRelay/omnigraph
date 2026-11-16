@@ -67,9 +67,6 @@ pub(super) struct Lowering<'a> {
     pub(super) graph_index: &'a Arc<GraphIndexHandle>,
     pub(super) catalog: &'a Arc<Catalog>,
     pub(super) load: Option<&'a LoadFacts>,
-    /// The full-text calls the plan evaluates as Boolean operands, answered
-    /// before the run; empty for a lowering that does not run.
-    pub(super) lexical: super::lexical::LexicalMembers,
 }
 
 pub(super) struct Lowered {
@@ -119,18 +116,23 @@ impl<'a> Lowering<'a> {
             graph_index: &context.graph_index,
             catalog: context.catalog,
             load: context.load,
-            lexical: super::lexical::LexicalMembers::default(),
         }
     }
 
+    /// What an exact lexical scan of this lowering reads.
+    fn lexical_source(&self) -> super::lexical::LexicalSource {
+        super::lexical::LexicalSource::new(self.snapshot, self.catalog, self.params())
+    }
+
     /// The expressions of node `id` with their full-text calls read as
-    /// membership columns, and those columns.
+    /// membership columns, and those columns, which the node's operator
+    /// answers when it runs.
     fn lexical(
         &self,
         id: NodeId,
         exprs: &[IRExpr],
-    ) -> (Vec<IRExpr>, Option<Arc<super::lexical::LexicalColumns>>) {
-        self.lexical.columns(self.plan, id, exprs, self.catalog)
+    ) -> Result<(Vec<IRExpr>, Option<Arc<super::lexical::LexicalColumns>>)> {
+        self.lexical_source().columns(self.plan, id, exprs)
     }
 
     fn node(&self, id: NodeId) -> Result<&'a PhysicalNode> {
@@ -859,15 +861,17 @@ impl Lower for Walk<'_, '_> {
         binding: &str,
         property: &str,
         kind: ScoreKind,
-        _query: &IRExpr,
+        query: &IRExpr,
         input: Plan,
     ) -> Lowers<Plan> {
         if kind == ScoreKind::Bm25 {
-            let scores = self.lowering.lexical.scores(id).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "the exact `bm25` {id} of `${binding}.{property}` was not answered before the run"
+            let PhysicalNode::Score { type_name, .. } = self.lowering.node(id)? else {
+                return Err(OmniError::manifest_internal(format!(
+                    "the score {id} of `${binding}.{property}` is not a Score node"
                 ))
-            })?;
+                .into());
+            };
+            let scores = self.lowering.lexical_source().score(type_name, query);
             let name = format!("{binding}.{}", self.lowering.catalog.system_columns.id);
             let schema = input.schema();
             let hidden = format!("{HIDDEN}{name}");
@@ -920,7 +924,7 @@ impl Lower for Walk<'_, '_> {
     }
 
     fn let_value(&mut self, id: NodeId, name: &str, value: &IRExpr, input: Plan) -> Lowers<Plan> {
-        let (mut value, lexical) = self.lowering.lexical(id, std::slice::from_ref(value));
+        let (mut value, lexical) = self.lowering.lexical(id, std::slice::from_ref(value))?;
         let exec = LetExec::new(
             input,
             name.to_string(),
@@ -1003,7 +1007,7 @@ impl Lower for Walk<'_, '_> {
         if !self.proven_empty {
             self.in_memory_filters += filters.len();
         }
-        let (filters, lexical) = self.lowering.lexical(id, filters);
+        let (filters, lexical) = self.lowering.lexical(id, filters)?;
         let filter = FilterExec::new(input, filters, Arc::clone(self.lowering.params()), lexical);
         self.built(id, filter)
     }
@@ -1477,9 +1481,6 @@ impl Lower for Walk<'_, '_> {
                 (
                     IRExpr::PropAccess { .. }
                     | IRExpr::Nearest { .. }
-                    | IRExpr::Search { .. }
-                    | IRExpr::Fuzzy { .. }
-                    | IRExpr::MatchText { .. }
                     | IRExpr::Bm25 { .. }
                     | IRExpr::Rrf { .. }
                     | IRExpr::Variable(_, _)
@@ -1502,9 +1503,6 @@ impl Lower for Walk<'_, '_> {
                 (
                     IRExpr::PropAccess { .. }
                     | IRExpr::Nearest { .. }
-                    | IRExpr::Search { .. }
-                    | IRExpr::Fuzzy { .. }
-                    | IRExpr::MatchText { .. }
                     | IRExpr::Bm25 { .. }
                     | IRExpr::Rrf { .. }
                     | IRExpr::Variable(_, _)
@@ -1591,9 +1589,6 @@ impl Lower for Walk<'_, '_> {
                     })?
                 }
                 IRExpr::Nearest { .. }
-                | IRExpr::Search { .. }
-                | IRExpr::Fuzzy { .. }
-                | IRExpr::MatchText { .. }
                 | IRExpr::Bm25 { .. }
                 | IRExpr::Rrf { .. }
                 | IRExpr::Variable(_, _)
@@ -1787,9 +1782,6 @@ fn aggregate_argument(
         }
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
@@ -1841,9 +1833,6 @@ fn hidden_columns(
             IRExpr::AliasRef(_, _) => {}
             expr if computed_key(expr) => {}
             IRExpr::Nearest { .. }
-            | IRExpr::Search { .. }
-            | IRExpr::Fuzzy { .. }
-            | IRExpr::MatchText { .. }
             | IRExpr::Bm25 { .. }
             | IRExpr::Rrf { .. }
             | IRExpr::Variable(_, _)

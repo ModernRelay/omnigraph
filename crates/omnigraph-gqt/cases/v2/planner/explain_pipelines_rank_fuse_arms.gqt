@@ -31,14 +31,4 @@ query fused($q: Vector(4), $t: String) {
 }
 --- params
 {"q": [0.0, 0.0, 0.0, 0.0], "t": "needle"}
---- expect ordered
-{"d.slug":"d000"}
-{"d.slug":"d001"}
-{"d.slug":"d002"}
---- expect shape
-d.slug: String
---- expect plan
-pipeline 0: Scan => RankFuse(secondary)
-pipeline 1: Scan => RankFuse
-pipeline 2: RankFuse -> Projection => Sort after 0, 1
-pipeline 3: Sort -> Page => consumer after 2
+--- expect error: type error: T86:

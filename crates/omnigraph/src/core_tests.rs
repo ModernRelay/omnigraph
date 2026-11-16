@@ -30,10 +30,9 @@ mod fts_compat_tests {
 
         // (profile, stem, stop words, ASCII folding)
         let cases = [
-            (Some(AnalyzerProfile::StandardV1), false, false, false),
-            (Some(AnalyzerProfile::StandardFoldedV1), false, false, true),
-            (Some(AnalyzerProfile::EnglishV1), true, true, true),
-            (None, true, true, true),
+            (AnalyzerProfile::StandardV1, false, false, false),
+            (AnalyzerProfile::StandardFoldedV1, false, false, true),
+            (AnalyzerProfile::EnglishV1, true, true, true),
         ];
         for (profile, stem, stop_words, folding) in cases {
             let directory = tempfile::tempdir().unwrap();
@@ -50,7 +49,7 @@ mod fts_compat_tests {
             .unwrap();
             TableStore::write_dataset(uri, batch).await.unwrap();
             let dataset = store.open_dataset_head(uri, None).await.unwrap();
-            let fingerprint = profile.map(|profile| format!("sha256:{profile}"));
+            let fingerprint = format!("sha256:{profile}");
             let staged = store
                 .stage_create_indices(
                     &dataset,
@@ -88,22 +87,36 @@ mod fts_compat_tests {
             assert!(!details.with_position, "{profile:?}");
             assert_eq!(details.block_size, Some(128), "{profile:?}");
             assert_eq!(details.code_config, None, "{profile:?}");
-            // Edition 2's 40-byte token filter; no profile filters by length.
-            let max_token_length = if profile.is_some() { None } else { Some(40) };
-            assert_eq!(details.max_token_length, max_token_length, "{profile:?}");
-            if profile.is_some() {
-                assert_eq!(details.posting_format_version, Some(2), "{profile:?}");
-            }
-            verify_index(&dataset, &index, fingerprint.as_deref())
+            // No profile filters by length; the stop list is the profile's
+            // own, never Lance's default.
+            assert_eq!(details.max_token_length, None, "{profile:?}");
+            assert_eq!(details.posting_format_version, Some(2), "{profile:?}");
+            // The manifest's index details carry no stop list; the build's
+            // parameters, which Lance writes into the index's own metadata,
+            // name the profile's list, never Lance's default.
+            let params = serde_json::to_value(
+                crate::table_store::full_text_index_params(profile).unwrap(),
+            )
+            .unwrap();
+            let stop_list = profile.pipeline().stop_words().map(|words| {
+                words
+                    .iter()
+                    .map(|word| serde_json::Value::from(*word))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                params["custom_stop_words"],
+                stop_list.map_or(serde_json::Value::Null, serde_json::Value::Array),
+                "{profile:?}"
+            );
+            verify_index(&dataset, &index, Some(&fingerprint))
                 .await
                 .unwrap();
-            let other = match fingerprint {
-                Some(_) => None,
-                None => Some("sha256:english_v1"),
-            };
+            // A reader that holds no schema accepts the certified analysis.
+            verify_index(&dataset, &index, None).await.unwrap();
             assert!(
                 matches!(
-                    verify_index(&dataset, &index, other).await,
+                    verify_index(&dataset, &index, Some("sha256:another")).await,
                     Err(OmniError::FullTextIndexRebuildRequired { .. })
                 ),
                 "{profile:?}"
@@ -164,7 +177,7 @@ mod fts_compat_tests {
                 &dataset,
                 &[IndexBuildSpec::FullText {
                     column: "body".into(),
-                    analysis: Default::default(),
+                    analysis: crate::storage_layer::FullTextBuild::for_test(),
                 }],
             )
             .await

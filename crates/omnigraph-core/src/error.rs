@@ -318,16 +318,6 @@ pub enum OmniError {
         remedy = FULL_TEXT_REBUILD_COMMAND
     )]
     FullTextIndexRebuildRequired { index: String, reason: String },
-    /// A full-text call reads a declared full-text index that has no segment
-    /// at the query's snapshot, so no segment carries the index's analyzer
-    /// and Lance would match with a bare, case-sensitive tokenizer. Refused
-    /// before any scan rather than answered differently; `index` is
-    /// `Type.property`.
-    #[error(
-        "full-text index '{index}' has no segment at this snapshot; build it with {remedy} (historical snapshots are unchanged)",
-        remedy = INDEX_BUILD_COMMAND
-    )]
-    FullTextIndexRequired { index: String },
     /// The exact staged-commit adapter proved that Lance contention was
     /// effect-free. This operation-local signal lets RFC-023 distinguish a
     /// safe key-fence re-evaluation from an arbitrary storage failure; generic

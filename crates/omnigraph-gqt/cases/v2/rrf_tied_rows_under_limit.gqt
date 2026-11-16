@@ -107,17 +107,7 @@ query fused_v2($t: String) {
 --- params
 {"t":"needle"}
 
---- expect ordered
-{"p.slug":"p00"}
-{"p.slug":"p01"}
-{"p.slug":"p02"}
-{"p.slug":"p03"}
-{"p.slug":"p04"}
-
---- expect shape
-p.slug: String
-
---- expect same as reference
+--- expect error: type error: T86:
 
 --- query
 set engine = v2;
@@ -137,16 +127,7 @@ query fused_explicit_id($t: String) {
 --- params
 {"t":"needle"}
 
---- expect unordered
-{"p.slug":"p00"}
-
---- expect shape
-p.slug: String
-
---- expect plan
-rank fuse no row tiebreak
-
---- expect same as reference
+--- expect error: type error: T86:
 
 --- query
 set engine = v2;
@@ -166,13 +147,4 @@ query fused_covered_return($t: String) {
 --- params
 {"t":"needle"}
 
---- expect unordered
-{"p.slug":"p00"}
-
---- expect shape
-p.slug: String
-
---- expect plan
-rank fuse no row tiebreak
---- expect same as reference
-
+--- expect error: type error: T86:

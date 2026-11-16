@@ -9,10 +9,9 @@ use crate::engine::operators::LookupSpec;
 use crate::engine::operators::memory::WorkMemory;
 use crate::engine::operators::shape::{BatchSender, Flow, Streamed};
 use crate::engine::scan::{
-    ScanColumns, SearchColumns, add_null_blob_columns, conjoin_fts_queries, hconcat_batches,
+    ScanColumns, SearchColumns, add_null_blob_columns, hconcat_batches,
     id_in_list_expr, ir_expr_to_df_expr,
 };
-use crate::engine::search::search_filter_query;
 use crate::error::OmniError;
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{Schema, SchemaRef};
@@ -285,11 +284,8 @@ async fn hydrate_nodes(
         .string(ids.iter().map(String::len).sum())
         .map_err(|error| memory.error(error))?;
     let mut filter_expr = id_in_list_expr(ids, catalog.system_columns.id);
-    let mut queries = Vec::new();
     for filter in dst_filters {
-        if let Some(query) = search_filter_query(filter, params)? {
-            queries.push(query);
-        } else if let Some(expr) = ir_expr_to_df_expr(filter, params, Some(&node_type.arrow_schema))
+        if let Some(expr) = ir_expr_to_df_expr(filter, params, Some(&node_type.arrow_schema))
         {
             crate::instrumentation::record_pushed_filter_exprs(1);
             filter_expr = filter_expr.and(expr);
@@ -299,7 +295,6 @@ async fn hydrate_nodes(
             )));
         }
     }
-    let fts = conjoin_fts_queries(queries);
     let projection = columns.read_projection();
     let plan = crate::table_store::TableStore::scan_plan_with(
         &ds,
@@ -309,16 +304,6 @@ async fn hydrate_nodes(
         |scanner| {
             scanner.filter_expr(filter_expr);
             scanner.prefilter(true);
-            if let Some(query) = fts {
-                scanner
-                    .full_text_search(
-                        query,
-                        crate::db::omnigraph::table_ops::declared_analyzers(node_type),
-                    )
-                    .map_err(|error| {
-                        OmniError::storage_context("destination full-text search", error)
-                    })?;
-            }
             Ok(())
         },
     )

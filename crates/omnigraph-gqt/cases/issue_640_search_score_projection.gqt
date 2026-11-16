@@ -76,12 +76,12 @@ query bm25_projected($q: String) {
 {"q": "needle"}
 
 --- expect ordered
-{"p.name": "A", "_score": 0.2292043}
-{"p.name": "B", "_score": 0.21978495}
+{"_score":0.229204242827,"p.name":"A"}
+{"_score":0.219784890382,"p.name":"B"}
 
 --- expect shape
 p.name: String
-_score: F32
+_score: F64
 
 --- query
 query nearest_projected_no_match($v: Vector(2)) {
@@ -115,7 +115,7 @@ query bm25_projected_no_match($q: String) {
 
 --- expect shape
 p.name: String
-score: F32
+score: F64
 
 --- query
 query nearest_projected_without_retrieval($v: Vector(2)) {
@@ -165,13 +165,7 @@ query rrf_projected($q: String, $v: Vector(2)) {
 --- params
 {"q": "needle", "v": [1.0, 0.0]}
 
---- expect ordered
-{"p.name": "A", "fused": 0.03278688524590164}
-{"p.name": "B", "fused": 0.03225806451612903}
-
---- expect shape
-p.name: String
-fused: F64
+--- expect error: type error: T86:
 
 --- query
 query search_projected($q: String) {

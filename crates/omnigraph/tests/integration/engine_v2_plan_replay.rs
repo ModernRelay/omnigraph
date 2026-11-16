@@ -72,78 +72,19 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
         order { $score desc }
         limit 1
     }"#;
-    let first = db
+    // Fusion does not rank an exact `bm25` arm: the read is refused at type
+    // check (`T86`), before a plan or a row tie-break exists.
+    let Err(error) = db
         .query_inspected("main", query, "selected_page", &ParamMap::new())
         .await
-        .unwrap();
-    // Both rows are the hub's: the tie rule orders them by `$q` before `$e`.
-    let expected =
-        vec![serde_json::json!({"edge_type":"Likes","edge_id":"shared","target":smaller})];
-    assert_eq!(rows_of(&first.result), expected);
-    let encoded: Value =
-        serde_json::from_slice(&first.replay_envelope(query, "selected_page")).unwrap();
-    let restored = serde_json::to_vec(&encoded).unwrap();
-    let replay = db.replay_bound_plan("main", &restored).await.unwrap();
-    assert_eq!(rows_of(&replay.result), expected);
-    // The population's selected edge and its end key the fusion's rows:
-    // names its read binds without returning, renamed apart.
-    let saved_keys = |plan: &Value| -> Vec<Value> {
-        plan["plan"]["body"]["plan"]["slots"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|node| node["node"] == "RankFuseWithTiebreak")
-            .expect("the saved plan carries a RankFuse")["row_tiebreak"]
-            .as_array()
-            .expect("the saved RankFuse carries a row_tiebreak list")
-            .clone()
+    else {
+        panic!("an `rrf` over `bm25` arms ran");
     };
-    let expected_keys = saved_keys(&encoded);
-    let [type_key, edge_key, node_key] = <[Value; 3]>::try_from(expected_keys.clone())
-        .unwrap_or_else(|keys| panic!("the edge's type and id, then its end's id: {keys:?}"));
-    assert_eq!(
-        [&type_key, &edge_key, &node_key].map(|key| key["property"].clone()),
-        ["@type", "@id", "@id"].map(Value::from)
+    let text = error.to_string();
+    assert!(
+        text.contains("T86") && text.contains("an `rrf` arm over `bm25`"),
+        "{text}"
     );
-    for (mutation, altered_keys) in [
-        ("missing type", vec![edge_key.clone(), node_key.clone()]),
-        ("missing edge ID", vec![type_key.clone(), node_key.clone()]),
-        ("missing node ID", vec![type_key.clone(), edge_key.clone()]),
-        (
-            "reordered type and ID",
-            vec![edge_key.clone(), type_key.clone(), node_key.clone()],
-        ),
-        (
-            "duplicate ID",
-            vec![type_key, edge_key.clone(), edge_key, node_key],
-        ),
-    ] {
-        let mut altered = encoded.clone();
-        let keys = altered["plan"]["body"]["plan"]["slots"]
-            .as_array_mut()
-            .unwrap()
-            .iter_mut()
-            .find(|node| node["node"] == "RankFuseWithTiebreak")
-            .expect("the saved plan carries a RankFuse")["row_tiebreak"]
-            .as_array_mut()
-            .expect("the saved RankFuse carries a row_tiebreak list");
-        assert_eq!(*keys, expected_keys);
-        *keys = altered_keys;
-        let altered = serde_json::to_vec(&altered).unwrap();
-        let error = match db.replay_bound_plan("main", &altered).await {
-            Err(error) => error,
-            Ok(replay) => panic!(
-                "{mutation}: incomplete RankFuse row_tiebreak must refuse; replay returned {:?}",
-                rows_of(&replay.result)
-            ),
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("incomplete or noncanonical row_tiebreak"),
-            "{mutation}: {error}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -599,8 +540,8 @@ query window_then_where($q: Vector(4)) {
     return { $d.slug }
     order { $d.slug }
 }
-query fused($t: String, $q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60, weights: [2.0, 1.0]) as $score, $d: Doc }
+query fused($r: Vector(4), $q: Vector(4)) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $r, k: 3), k: 60, weights: [2.0, 1.0]) as $score, $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 3
@@ -1199,7 +1140,7 @@ async fn saved_ranked_score_refuses_owner_and_type_drift() {
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
     let params = ParamMap::from([
-        ("t".into(), Literal::String("needle".into())),
+        ("r".into(), Literal::List(vec![Literal::Float(1.0); 4])),
         ("q".into(), Literal::List(vec![Literal::Float(0.0); 4])),
     ]);
     let first = db
@@ -1480,7 +1421,10 @@ async fn a_window_ladder_replays_the_same_rungs() {
 async fn a_fusion_replays() {
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
-    let mut params = ParamMap::from([("t".to_string(), Literal::String("needle".to_string()))]);
+    let mut params = ParamMap::from([(
+        "r".to_string(),
+        Literal::List(vec![Literal::Float(1.0); 4]),
+    )]);
     params.insert("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]));
     let Replayed {
         result,
@@ -1496,8 +1440,8 @@ async fn a_fusion_replays() {
         .collect();
     assert_eq!(
         kinds,
-        ["gate", "probes"],
-        "the fusion's gate records one verdict, then its nearest arm its probe attempts: {search:#?}"
+        ["gate", "probes", "probes"],
+        "the fusion's gate records one verdict, then each nearest arm its probe attempts: {search:#?}"
     );
 
     // A predicate the query never wrote, placed above the fusion rather than
@@ -1620,8 +1564,8 @@ async fn a_read_reports_its_ranking() {
     use omnigraph_compiler::result::{Ranking, SearchFunction};
 
     const RANKED: &str = r#"
-query two_texts($a: String, $b: String) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $a), bm25($all, $d.text, $b), k: 60) as $score, $d: Doc }
+query two_vectors($q: Vector(4), $r: Vector(4)) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $r, k: 3), k: 60) as $score, $d: Doc }
     return {
         $d.slug,
         $score as fused,
@@ -1665,21 +1609,21 @@ query unranked() {
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
     let vector = Literal::List(vec![Literal::Float(0.0); 4]);
-    let texts = ParamMap::from([
-        ("a".to_string(), Literal::String("needle".to_string())),
-        ("b".to_string(), Literal::String("3".to_string())),
+    let vectors = ParamMap::from([
+        ("q".to_string(), vector.clone()),
+        ("r".to_string(), Literal::List(vec![Literal::Float(1.0); 4])),
     ]);
     let needle = ParamMap::from([("a".to_string(), Literal::String("needle".to_string()))]);
     let closest = ParamMap::from([("q".to_string(), vector.clone())]);
     let mixed = ParamMap::from([
-        ("t".to_string(), Literal::String("needle".to_string())),
+        ("r".to_string(), Literal::List(vec![Literal::Float(1.0); 4])),
         ("q".to_string(), vector),
     ]);
     for (source, name, params, expected) in [
         (
             RANKED,
-            "two_texts",
-            &texts,
+            "two_vectors",
+            &vectors,
             ranking(SearchFunction::Rrf, &["fused", "again"]),
         ),
         (
@@ -2658,11 +2602,10 @@ async fn an_envelope_of_another_version_asks_for_the_query_again() {
     }
 }
 
-/// A replay re-establishes the full-text coverage its plan records from the
-/// pinned snapshot instead of trusting the envelope: an envelope claiming
-/// full coverage of a partially indexed property, with its bm25 scan and
-/// derivation switched to filter before scoring, is refused, since that run
-/// would change BM25 scores.
+/// An exact `bm25` reads no full-text index, so its plan records no
+/// full-text coverage and replays to the run's rows over a partially indexed
+/// property; an envelope that claims a coverage no ranked scan reads is
+/// refused at the door.
 #[tokio::test]
 async fn a_replay_rechecks_recorded_full_text_coverage() {
     const SOURCE: &str = r#"query recent($t: String) {
@@ -2699,6 +2642,7 @@ async fn a_replay_rechecks_recorded_full_text_coverage() {
         .query_inspected(ReadTarget::branch("main"), SOURCE, "recent", &params)
         .await
         .unwrap();
+    assert!(run.plan.plan.assumptions().full_text.is_empty());
     let envelope = run.replay_envelope(SOURCE, "recent");
     let honest = db
         .replay_bound_plan(ReadTarget::branch("main"), &envelope)
@@ -2706,32 +2650,25 @@ async fn a_replay_rechecks_recorded_full_text_coverage() {
         .unwrap();
     assert_eq!(rows_of(&honest.result), rows_of(&run.result));
     let mut forged: Value = serde_json::from_slice(&envelope).unwrap();
-    let mut placements = 0;
+    let mut assumptions = 0;
     edit_objects(&mut forged, &mut |object| {
-        if object.get("eligibility") == Some(&Value::from("after_scoring")) {
-            object.insert("eligibility".to_string(), Value::from("before_scoring"));
-            placements += 1;
-        }
-        if let Some(Value::Object(coverage)) = object.get_mut("full_text") {
-            for recorded in coverage.values_mut() {
-                *recorded = Value::from("full");
-            }
+        if object.contains_key("gate_policy") && object.contains_key("datasets") {
+            object.insert(
+                "full_text".to_string(),
+                serde_json::json!({ "node:Doc.text": "full" }),
+            );
+            assumptions += 1;
         }
     });
-    assert_eq!(placements, 2, "the scan and its derivation step");
-    let error = db
-        .replay_bound_plan(
+    assert_eq!(assumptions, 1, "the plan's assumptions");
+    assert!(
+        db.replay_bound_plan(
             ReadTarget::branch("main"),
             &serde_json::to_vec(&forged).unwrap(),
         )
         .await
-        .err()
-        .expect("a forged coverage claim must be refused");
-    assert!(
-        matches!(&error, OmniError::Manifest(manifest)
-            if manifest.kind == omnigraph::error::ManifestErrorKind::BadRequest)
-            && error.to_string().contains("full-text coverage"),
-        "{error}"
+        .is_err(),
+        "a recorded coverage no scan read is refused"
     );
 }
 

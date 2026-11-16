@@ -118,8 +118,6 @@ impl ScanExec {
                 let schema = scan_output_schema(
                     &type_name,
                     &binding,
-                    &filters,
-                    &params,
                     &catalog,
                     mode,
                     projection.as_ref(),

@@ -287,10 +287,7 @@ fn staged(group: &WriteGroup) -> Option<Staged> {
 /// call.
 fn stageable(e: &IRExpr) -> bool {
     match e {
-        IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
-        | IRExpr::Neg { .. }
+        IRExpr::Neg { .. }
         | IRExpr::Call { .. }
         | IRExpr::Binary {
             op: BinaryOp::Arith(_),

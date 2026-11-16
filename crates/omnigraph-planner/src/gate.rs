@@ -215,12 +215,6 @@ impl PlanSource for Recorded<'_> {
         self.source.gate_policy()
     }
 
-    /// Not recorded: it reads the accepted catalog, which a replay checks by
-    /// the schema digest.
-    fn full_text_declares_analyzer(&self, type_key: &str, property: &str) -> bool {
-        self.source.full_text_declares_analyzer(type_key, property)
-    }
-
     fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
         let coverage = self.source.full_text_coverage(type_key, property);
         self.read
@@ -238,23 +232,9 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             out.insert(name.clone());
         }
         IRExpr::Nearest { query, .. } => params_of_expr(query, out),
-        IRExpr::Search { field, query, .. }
-        | IRExpr::MatchText { field, query, .. }
-        | IRExpr::Bm25 { field, query, .. } => {
+        IRExpr::Bm25 { field, query, .. } => {
             params_of_expr(field, out);
             params_of_expr(query, out);
-        }
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-            ..
-        } => {
-            params_of_expr(field, out);
-            params_of_expr(query, out);
-            if let Some(max_edits) = max_edits {
-                params_of_expr(max_edits, out);
-            }
         }
         IRExpr::Rrf {
             primary,
@@ -328,10 +308,6 @@ pub enum Unrouted {
     /// branch merge): the plan's `Validate` is built and decided here and run
     /// by the executor's judge; the write itself never enters a plan.
     WriteOnExecutor { kind: &'static str },
-    /// A full-text call reads a declared index with no segment at the
-    /// pinned snapshot (`PlanError::FullTextIndexRequired`): a conflict the
-    /// engine returns with its typed detail.
-    FullTextIndexRequired { index: String },
 }
 
 impl Unrouted {
@@ -341,7 +317,6 @@ impl Unrouted {
         match error {
             PlanError::Unsupported(diagnostic) => Self::UnsupportedQuery { diagnostic },
             PlanError::Source { detail } => Self::SourceError { message: detail },
-            PlanError::FullTextIndexRequired { index } => Self::FullTextIndexRequired { index },
             other => Self::PlannerError {
                 message: other.to_string(),
             },
@@ -361,7 +336,6 @@ impl Unrouted {
             Self::SourceError { .. } => "source_error",
             Self::ModeOnExecutor { .. } => "mode_on_executor",
             Self::WriteOnExecutor { .. } => "write_on_executor",
-            Self::FullTextIndexRequired { .. } => "full_text_index_required",
         }
     }
 
@@ -387,9 +361,6 @@ impl Unrouted {
             }
             Self::ModeOnExecutor { mode } => json!({ "kind": self.kind(), "mode": mode }),
             Self::WriteOnExecutor { kind } => json!({ "kind": self.kind(), "write": kind }),
-            Self::FullTextIndexRequired { index } => {
-                json!({ "kind": self.kind(), "index": index })
-            }
         }
     }
 }

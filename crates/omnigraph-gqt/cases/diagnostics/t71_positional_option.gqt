@@ -1,5 +1,5 @@
 # issue: none
-# notes: The compiler refuses an edit budget written positionally with `T71`; nothing executes.
+# notes: The compiler refuses an option written positionally, `nearest`'s window here, with `T71`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $d: Doc } where match_terms($d.body, terms("graf", any, 2)) return { $d.title } }
+query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, 3) as $distance } return { $d.title } }
 
 --- expect error: type error: T71:

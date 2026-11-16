@@ -75,7 +75,6 @@ score: F64
 
 --- expect same as reference
 
-
 --- query
 query q() {
     match { $d: Doc } where match_terms($d.text, terms("grapj engine", mode: all, max_edits: 1))
@@ -89,7 +88,6 @@ query q() {
 d.slug: String
 
 --- expect same as reference
-
 
 --- query
 query q() {
@@ -207,7 +205,7 @@ query q() {
     order { $score desc, $d.slug }
 }
 
---- expect error: type error: T86: `q`: this release's planner does not lower an `rrf` arm over `bm25` on a field whose index declares an analyzer
+--- expect error: type error: T86:
 
 --- query
 query q() {

@@ -11,7 +11,6 @@ use datafusion::prelude::{Expr, col, lit as df_lit};
 use datafusion::scalar::ScalarValue;
 use lance_core::ROW_ADDR;
 use lance_index::scalar::FullTextSearchQuery;
-use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
 
 /// `id IN (ids)` as one structured DataFusion `Expr` — the scan-pushdown
 /// shape shared by `hydrate_nodes` and the rrf prefilter gate's arm push.
@@ -34,13 +33,13 @@ pub(crate) fn id_in_list_expr(ids: &[String], id_col: &str) -> datafusion::prelu
 }
 
 /// Lance batches a pipelined read decodes ahead, which the pool does not see.
-const PIPELINED_READAHEAD: usize = 2;
+pub(super) const PIPELINED_READAHEAD: usize = 2;
 
 /// Bytes Lance may hold fetched and not yet decoded for one pipelined read,
 /// which the pool does not see either. Lance's default is 32 MiB per I/O
 /// thread (2 GiB on a cloud store), read ahead of a consumer that may stop
 /// after its first batch; two 32 MiB pages keep its throughput.
-const PIPELINED_IO_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const PIPELINED_IO_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One node scan resolved before any Lance read: the dataset, the pushed
 /// filter (the literal filters, a gate's eligible set, a BM25 filter's member
@@ -112,11 +111,6 @@ impl<'n> NodeRead<'n> {
         catalog: &'n Catalog,
         binding_columns: Option<&NeededColumns>,
     ) -> Result<Self> {
-        if filters.iter().any(is_search_filter) {
-            return Err(OmniError::manifest_internal(
-                "search predicates require runtime scan access",
-            ));
-        }
         let node_type = &catalog.node_types[type_name];
         let columns = ScanColumns::new(node_type, SearchColumns::default(), binding_columns);
         Self::validate(
@@ -149,7 +143,6 @@ impl<'n> NodeRead<'n> {
         catalog: &'n Catalog,
         search_mode: &SearchMode,
         binding_columns: Option<&NeededColumns>,
-        memory: &WorkMemory,
     ) -> Result<Self> {
         let table_key = format!("node:{}", type_name);
         let ds = snapshot.open_lance_dataset(&table_key).await?;
@@ -178,58 +171,19 @@ impl<'n> NodeRead<'n> {
             });
         }
 
-        let ranking = search_mode.bm25.as_ref();
-        let mut hoisted_fts_queries: Vec<FullTextSearchQuery> = Vec::new();
-        for filter in filters {
-            let Some(query) = search_filter_query(filter, params)? else {
-                continue;
-            };
-            let ranked_matches_only = match ranking {
-                Some(target) => {
-                    search_filter_is_ranking(filter, &target.property, &target.text, params)?
-                }
-                None => false,
-            };
-            if !ranked_matches_only {
-                hoisted_fts_queries.push(query);
-            }
-        }
-        let (fts_query, member_ids) = match (ranking, conjoin_fts_queries(hoisted_fts_queries)) {
-            (
-                Some(Bm25Target {
-                    property: prop,
-                    text,
-                }),
-                filter_query,
-            ) => {
-                let ids = match filter_query {
-                    Some(query) => Some(
-                        search_filter_member_ids(
-                            &ds,
-                            node_type,
-                            filter_expr.as_ref(),
-                            query,
-                            catalog.system_columns.id,
-                            memory,
-                        )
-                        .await?,
-                    ),
-                    None => None,
-                };
-                let ranking_query = FullTextSearchQuery::new(text.clone())
+        // A ranked full-text scan is an `rrf` arm's: its query is the arm's
+        // text over its property.
+        let fts_query = match search_mode.bm25.as_ref() {
+            Some(Bm25Target {
+                property: prop,
+                text,
+            }) => Some(
+                FullTextSearchQuery::new(text.clone())
                     .with_column(prop.clone())
-                    .map_err(|error| OmniError::storage_context("fts with_column", error))?;
-                (Some(ranking_query), ids)
-            }
-            (None, filter_query) => (filter_query, None),
+                    .map_err(|error| OmniError::storage_context("fts with_column", error))?,
+            ),
+            None => None,
         };
-        if let Some(ids) = &member_ids {
-            let in_list = id_in_list_expr(ids, catalog.system_columns.id);
-            filter_expr = Some(match filter_expr {
-                Some(expr) => expr.and(in_list),
-                None => in_list,
-            });
-        }
         let columns = ScanColumns::new(
             node_type,
             SearchColumns {
@@ -239,7 +193,7 @@ impl<'n> NodeRead<'n> {
             binding_columns,
         );
         let proven_empty =
-            search_mode.answer_proven_empty || member_ids.as_ref().is_some_and(Vec::is_empty);
+            search_mode.answer_proven_empty;
         if !proven_empty {
             record_node_scan_projection(columns.read_projection().as_deref());
         }
@@ -348,7 +302,6 @@ pub(super) async fn execute_node_scan(
         catalog,
         search_mode,
         binding_columns,
-        memory,
     )
     .await?;
     let node_type = read.node_type;
@@ -656,111 +609,8 @@ pub(super) async fn execute_node_scan(
     Ok(scan_result)
 }
 
-fn search_filter_is_ranking(
-    filter: &IRExpr,
-    property: &str,
-    text: &str,
-    params: &ParamMap,
-) -> Result<bool> {
-    Ok(match search_call(filter) {
-        Some(IRExpr::Search { field, query, .. } | IRExpr::MatchText { field, query, .. }) => {
-            extract_property(field).as_deref() == Some(property)
-                && resolve_to_string(query, params)? == text
-        }
-        Some(
-            IRExpr::PropAccess { .. }
-            | IRExpr::Nearest { .. }
-            | IRExpr::Fuzzy { .. }
-            | IRExpr::Bm25 { .. }
-            | IRExpr::Rrf { .. }
-            | IRExpr::Variable(_, _)
-            | IRExpr::Param(_, _)
-            | IRExpr::Literal(_, _)
-            | IRExpr::Aggregate { .. }
-            | IRExpr::AliasRef(_, _)
-            | IRExpr::Binary { .. }
-            | IRExpr::Not(_, _)
-            | IRExpr::Cast { .. }
-            | IRExpr::Neg { .. }
-            | IRExpr::Call { .. }
-            | IRExpr::IsNull { .. },
-        )
-        | None => false,
-    })
-}
 
-/// Filter membership without adding the filter's score to the BM25 ranking.
-pub(super) async fn search_filter_member_ids(
-    dataset: &Dataset,
-    node_type: &omnigraph_compiler::catalog::NodeType,
-    filter: Option<&Expr>,
-    query: FullTextSearchQuery,
-    id_column: &str,
-    memory: &WorkMemory,
-) -> Result<Vec<String>> {
-    let plan = crate::table_store::TableStore::scan_plan_with(
-        dataset,
-        Some(&[id_column]),
-        None,
-        false,
-        |scanner| {
-            if let Some(filter) = filter {
-                scanner.filter_expr(filter.clone());
-                scanner.prefilter(true);
-            }
-            scanner
-                .full_text_search(
-                    query,
-                    crate::db::omnigraph::table_ops::declared_analyzers(node_type),
-                )
-                .map_err(|error| OmniError::storage_context("full_text_search", error))?;
-            Ok(())
-        },
-    )
-    .await?;
-    let work = memory
-        .child("search filter membership")
-        .map_err(|error| memory.error(error))?;
-    let (_, stream) = work.stream(plan).map_err(|error| memory.error(error))?;
-    let batches = work
-        .collect(stream)
-        .await
-        .map_err(|error| memory.error(error))?;
-    let mut ids = Vec::new();
-    for batch in batches {
-        let column = batch
-            .column_by_name(id_column)
-            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-            .ok_or_else(|| {
-                OmniError::manifest_internal("search membership has no identity column")
-            })?;
-        memory
-            .entries::<String>(column.len())
-            .map_err(|error| memory.error(error))?;
-        for id in column.iter().flatten() {
-            memory.grow(id.len()).map_err(|error| memory.error(error))?;
-            ids.push(id.to_owned());
-        }
-    }
-    Ok(ids)
-}
 
-/// Every search predicate of one scan as the one full-text query a Lance
-/// scanner takes: a lone query as is, several as a boolean query every
-/// member of which must match (a scanner keeps its last `full_text_search`
-/// only, so two calls would drop all but the last predicate).
-pub(super) fn conjoin_fts_queries(
-    queries: Vec<lance_index::scalar::FullTextSearchQuery>,
-) -> Option<lance_index::scalar::FullTextSearchQuery> {
-    use lance_index::scalar::inverted::query::{BooleanQuery, Occur};
-    match queries.len() {
-        0 => None,
-        1 => queries.into_iter().next(),
-        _ => Some(lance_index::scalar::FullTextSearchQuery::new_query(
-            BooleanQuery::new(queries.into_iter().map(|query| (Occur::Must, query.query))).into(),
-        )),
-    }
-}
 
 /// The columns one node scan reads and emits. Blob properties are never `.gq`
 /// read values: typecheck refuses projecting, filtering, ordering or
@@ -887,8 +737,6 @@ impl<'n> ScanColumns<'n> {
 pub(super) fn scan_output_schema(
     type_name: &str,
     variable: &str,
-    filters: &[IRExpr],
-    params: &ParamMap,
     catalog: &Catalog,
     search_mode: &SearchMode,
     binding_columns: Option<&NeededColumns>,
@@ -897,10 +745,7 @@ pub(super) fn scan_output_schema(
         .query_node_type(type_name)
         .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
     let nearest = search_mode.nearest.is_some();
-    let mut scores_fts = search_mode.bm25.is_some();
-    for filter in filters {
-        scores_fts |= search_filter_query(filter, params)?.is_some();
-    }
+    let scores_fts = search_mode.bm25.is_some();
     let columns = ScanColumns::new(
         node_type,
         SearchColumns {
@@ -966,119 +811,6 @@ pub(super) fn add_null_blob_columns(
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(OmniError::arrow_internal)
 }
 
-/// Build a full-text query, refusing invalid supplied constant values.
-pub(super) fn build_fts_query(
-    expr: &IRExpr,
-    params: &ParamMap,
-) -> Result<Option<lance_index::scalar::FullTextSearchQuery>> {
-    let (prop, query) = match expr {
-        IRExpr::Search { field, query, .. } | IRExpr::MatchText { field, query, .. } => {
-            let Some(prop) = extract_property(field) else {
-                return Ok(None);
-            };
-            let q = resolve_to_string(query, params)?;
-            (prop, lance_index::scalar::FullTextSearchQuery::new(q))
-        }
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-            ty: _,
-        } => {
-            let Some(prop) = extract_property(field) else {
-                return Ok(None);
-            };
-            let q = resolve_to_string(query, params)?;
-            let edits = match max_edits.as_deref() {
-                Some(expr) => u32::try_from(resolve_to_int(expr, params)?)
-                    .map_err(|_| OmniError::manifest("fuzzy max_edits must fit U32"))?,
-                None => 2,
-            };
-            (
-                prop,
-                lance_index::scalar::FullTextSearchQuery::new_fuzzy(q, Some(edits)),
-            )
-        }
-        // `match_terms(field, terms(text, mode:, max_edits: 0))`: Lance's
-        // zero-edit match query, every analyzed query term required
-        // (`Operator::And`) or any one (`Operator::Or`). An edit budget is
-        // refused at type check (`T86`): Lance's fuzzy expansion keeps a
-        // bounded number of expansions, so it is not the exact relation.
-        IRExpr::Call {
-            func: ScalarFunc::MatchTerms { mode },
-            args,
-            ..
-        } => {
-            let [field, text, max_edits] = args.as_slice() else {
-                return Ok(None);
-            };
-            let Some(prop) = extract_property(field) else {
-                return Ok(None);
-            };
-            if resolve_to_int(max_edits, params)? != 0 {
-                return Err(OmniError::manifest(
-                    "`match_terms` with an edit budget is not answered by this release",
-                ));
-            }
-            let operator = match mode {
-                TermsMode::All => lance_index::scalar::inverted::query::Operator::And,
-                TermsMode::Any => lance_index::scalar::inverted::query::Operator::Or,
-            };
-            let q = resolve_to_string(text, params)?;
-            (
-                prop,
-                lance_index::scalar::FullTextSearchQuery::new_query(
-                    lance_index::scalar::inverted::query::MatchQuery::new(q)
-                        .with_operator(operator)
-                        .into(),
-                ),
-            )
-        }
-        IRExpr::PropAccess { .. }
-        | IRExpr::Nearest { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::Param(_, _)
-        | IRExpr::Literal(_, _)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(_, _)
-        | IRExpr::Binary { .. }
-        | IRExpr::Not(_, _)
-        | IRExpr::Cast { .. }
-        | IRExpr::Neg { .. }
-        | IRExpr::Call { .. }
-        | IRExpr::IsNull { .. } => return Ok(None),
-    };
-    query
-        .with_column(prop)
-        .map(Some)
-        .map_err(|error| OmniError::storage_context("full_text_search", error))
-}
-
-/// Extract the property name from a PropAccess expression.
-pub(super) fn extract_property(expr: &IRExpr) -> Option<String> {
-    match expr {
-        IRExpr::PropAccess { property, .. } => Some(property.clone()),
-        IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::Param(_, _)
-        | IRExpr::Literal(_, _)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(_, _)
-        | IRExpr::Binary { .. }
-        | IRExpr::Not(_, _)
-        | IRExpr::Cast { .. }
-        | IRExpr::Neg { .. }
-        | IRExpr::Call { .. }
-        | IRExpr::IsNull { .. } => None,
-    }
-}
 
 /// Evaluate a constant in its stored type and require a non-null String.
 pub(super) fn resolve_to_string(expr: &IRExpr, params: &ParamMap) -> Result<String> {
@@ -1152,9 +884,6 @@ pub(crate) fn ir_expr_to_df_expr(
     params: &ParamMap,
     schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
-    if is_search_filter(expr) {
-        return None;
-    }
     expr.check_types().ok()?;
     split_on_repeatedly_tested_columns(typed_expr_to_df_expr(expr, params)?, schema)
 }
@@ -1316,8 +1045,7 @@ fn repeatedly_tested_columns(expr: &datafusion::prelude::Expr) -> Vec<String> {
 /// columns repeatedly, the one reason [`ir_expr_to_df_expr`] refuses a
 /// predicate it can otherwise express.
 pub(crate) fn exceeds_null_split_columns(expr: &IRExpr, params: &ParamMap) -> bool {
-    !is_search_filter(expr)
-        && expr.check_types().is_ok()
+    expr.check_types().is_ok()
         && typed_expr_to_df_expr(expr, params).is_some_and(|lowered| {
             repeatedly_tested_columns(&lowered).len() > MAX_NULL_SPLIT_COLUMNS
         })
@@ -1374,9 +1102,6 @@ fn typed_expr_to_df_expr(expr: &IRExpr, params: &ParamMap) -> Option<datafusion:
         IRExpr::Literal(literal, ty) => literal_to_expr(literal, ty),
         IRExpr::Param(name, ty) => literal_to_expr(params.get(name)?, ty),
         IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)

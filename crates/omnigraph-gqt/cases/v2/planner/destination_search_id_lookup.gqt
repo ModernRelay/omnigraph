@@ -69,7 +69,7 @@ query one_destination_search() {
 d.slug: String
 --- expect plan
 scan Doc as $d: access id_lookup
-scan Doc as $d: filter reads [d.body]
+scan Doc as $d: no filter
 
 --- query
 set engine = v2;
@@ -84,4 +84,4 @@ query two_destination_searches() {
 d.slug: String
 --- expect plan
 scan Doc as $d: access id_lookup
-scan Doc as $d: filter reads [d.body, d.summary]
+scan Doc as $d: no filter

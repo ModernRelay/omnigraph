@@ -225,7 +225,6 @@ fn each_access_variant_maps_to_one_scanner_flag() {
         RuntimeInput::Nearest,
         RuntimeInput::FullText,
         RuntimeInput::EligibleIds,
-        RuntimeInput::SearchFilter,
         RuntimeInput::JoinFilter,
         RuntimeInput::DynamicExpression,
     ] {
@@ -273,7 +272,6 @@ fn failure_and_cancellation_publish_no_partial_plan() {
 fn runtime_absent_and_uncovering_catalogs_skip_split_and_replay_keeps_legacy_default() {
     let mut source = source();
     for reason in [
-        RuntimeInput::SearchFilter,
         RuntimeInput::EligibleIds,
         RuntimeInput::JoinFilter,
         RuntimeInput::DynamicExpression,

@@ -17,10 +17,13 @@ use super::external;
 use super::memory::WorkMemory;
 use super::shape::{Mapped, Streaming};
 use crate::engine::expr::{evaluate_filter, evaluate_filter_where, kept_rows};
-use crate::engine::lexical::LexicalColumns;
+use crate::engine::lexical::{LexicalColumns, answered_first};
 
 /// The refusal name the pool reports when a filtered batch does not fit.
 const OUTPUT: &str = "filter output";
+/// The refusal name the pool reports when an exact lexical scan's matches
+/// do not fit.
+pub(super) const LEXICAL_SCAN: &str = "exact lexical scan";
 
 /// Every one of `filters` evaluated over `batch`, conjoined into one mask
 /// (a null drops the row, as a false does); `None` when there is no filter.
@@ -136,7 +139,13 @@ impl ExecutionPlan for FilterExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "FilterExec has one partition");
-        let input = self.input.execute(0, Arc::clone(&ctx))?;
+        let mut input = self.input.execute(0, Arc::clone(&ctx))?;
+        if let Some(lexical) = &self.lexical {
+            let mut scan = WorkMemory::new(Arc::clone(&ctx), LEXICAL_SCAN)?;
+            scan.set_metrics(self.metrics.clone());
+            let lexical = Arc::clone(lexical);
+            input = answered_first(input, async move { lexical.answer(scan).await });
+        }
         let memory = WorkMemory::new(ctx, OUTPUT)?;
         let filters = self.filters.clone();
         let params = Arc::clone(&self.params);

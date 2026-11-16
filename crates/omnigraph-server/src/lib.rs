@@ -552,7 +552,6 @@ enum ApiErrorDetails {
     ChangeDiffRefusal(api::ChangeDiffRefusalOutput),
     BranchStartRefusal(api::BranchStartRefusalOutput),
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
-    FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
     /// Whether a 401 followed a presented bearer credential. The challenge
     /// layer renders it as `WWW-Authenticate`; the body carries nothing.
@@ -588,9 +587,9 @@ impl ApiErrorDetails {
             | Self::BranchStartRefusal(_)
             | Self::Diagnostic(_)
             | Self::Unauthenticated(_) => DetailClass::Refusal,
-            Self::RecoveryRequired(_)
-            | Self::FullTextIndexRebuildRequired(_)
-            | Self::FullTextIndexRequired(_) => DetailClass::Recovery,
+            Self::RecoveryRequired(_) | Self::FullTextIndexRebuildRequired(_) => {
+                DetailClass::Recovery
+            }
             Self::BlobRange(_) | Self::ChangeFeedGap(_) | Self::ChangeDiffRefusal(_) => {
                 DetailClass::Read
             }
@@ -1823,16 +1822,6 @@ impl ApiError {
                 )));
                 response
             }
-            error @ OmniError::FullTextIndexRequired { .. } => {
-                let mut response = Self::conflict(error.to_string());
-                let OmniError::FullTextIndexRequired { index } = error else {
-                    unreachable!()
-                };
-                response.details = Some(Box::new(ApiErrorDetails::FullTextIndexRequired(
-                    api::FullTextIndexRequiredOutput { index },
-                )));
-                response
-            }
             // Caller-side continuation fault (decode, checksum, or scope). The
             // "change cursor rejected: " prefix is a stable contract so raw
             // HTTP clients can tell it from a genuine retention gap.
@@ -2177,9 +2166,6 @@ impl ApiError {
                 ApiErrorDetails::FullTextIndexRebuildRequired(value) => {
                     output.full_text_index_rebuild_required = Some(value)
                 }
-                ApiErrorDetails::FullTextIndexRequired(value) => {
-                    output.full_text_index_required = Some(value)
-                }
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
                 ApiErrorDetails::Unauthenticated(_) => {}
             }
@@ -2265,28 +2251,6 @@ mod api_error_tests {
         let ordinary: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(ordinary.code, Some(ErrorCode::Conflict));
         assert!(ordinary.full_text_index_rebuild_required.is_none());
-    }
-
-    #[tokio::test]
-    async fn a_full_text_index_with_no_segment_returns_required_conflict() {
-        let response = ApiError::from_omni(OmniError::FullTextIndexRequired {
-            index: "Doc.title".into(),
-        })
-        .into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 8192)
-            .await
-            .unwrap();
-        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.code, Some(ErrorCode::Conflict));
-        assert!(error.error.contains("has no segment"), "{}", error.error);
-        assert!(
-            error.error.contains("omnigraph index build"),
-            "{}",
-            error.error
-        );
-        assert_eq!(error.full_text_index_required.unwrap().index, "Doc.title");
-        assert!(error.full_text_index_rebuild_required.is_none());
     }
 
     #[tokio::test]

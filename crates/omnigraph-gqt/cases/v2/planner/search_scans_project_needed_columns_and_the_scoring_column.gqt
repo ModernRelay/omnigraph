@@ -142,7 +142,7 @@ query bm25_slug($q: String) {
 d.slug: String
 
 --- expect plan
-scan Doc as $d: ranked bm25
+pipeline 0: Scan -> Score -> Projection => Sort
 scan Doc as $d: columns [__id, slug]
 
 --- query

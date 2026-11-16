@@ -221,55 +221,10 @@ fn named_expr<'e>(returns: &'e [IRProjection], key: &'e IRExpr) -> &'e IRExpr {
     }
 }
 
-/// Every full-text call the query writes over a field whose index declares
-/// no analyzer reads its property's index at the pinned snapshot, so the
-/// plan records that index's coverage, and the coverage holds a segment
-/// (full or partial; an untrained declaration carries the analyzer too).
-/// Replay re-derives every recorded coverage from the pinned dataset, so a
-/// saved plan can neither omit the fact nor claim a segment the snapshot
-/// lacks. A field that declares an analyzer is answered by the exact lexical
-/// scan, which reads no index, so its coverage is no prerequisite.
-fn check_full_text_indexes(
-    plan: &PhysicalPlan,
-    input: &AcceptInput<'_>,
-    budget: &mut Budget,
-) -> Result<(), ValidationError> {
-    let targets = crate::optimizer::full_text_targets(input.ir);
-    budget.visit(u64::try_from(targets.len()).unwrap_or(u64::MAX))?;
-    for (type_name, property) in targets {
-        if declares_analyzer(input, &type_name, &property) {
-            continue;
-        }
-        let key = Assumptions::full_text_key(&format!("node:{type_name}"), &property);
-        match plan.assumptions().full_text.get(&key) {
-            Some(FullTextCoverage::Full | FullTextCoverage::Partial) => {}
-            recorded => {
-                return Err(ValidationError::violated(
-                    "prerequisite",
-                    format!(
-                        "a full-text call reads the index of `{type_name}.{property}` under recorded coverage {recorded:?}; it needs a recorded index segment"
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Whether `type_name.property`'s full-text index declares an analyzer
-/// profile in the accepted catalog.
-fn declares_analyzer(input: &AcceptInput<'_>, type_name: &str, property: &str) -> bool {
-    input
-        .catalog
-        .node_types
-        .get(type_name)
-        .is_some_and(|node| node.full_text_profile(property).is_some())
-}
-
-/// An exact `bm25` is `bm25_v1` of a declared field over its field corpus:
+/// An exact `bm25` is `bm25_v1` of a full-text field over its field corpus:
 /// its retained predicate is `match_terms` over the scored `$binding.property`
 /// (the membership, evaluated before any cut), and the corpus type declares
-/// an analyzer and the ranking scorer on that property.
+/// a full-text index with the ranking scorer on that property.
 fn check_exact_bm25(score: &ExactScore, input: &AcceptInput<'_>) -> Result<(), ValidationError> {
     let retained = matches!(
         &score.query,
@@ -297,14 +252,14 @@ fn check_exact_bm25(score: &ExactScore, input: &AcceptInput<'_>) -> Result<(), V
         .node_types
         .get(&score.type_name)
         .is_some_and(|node| {
-            node.full_text_profile(&score.property).is_some()
+            node.has_full_text_index(&score.property)
                 && node.full_text_scorer(&score.property) == FullTextScorer::Bm25V1
         });
     if !corpus {
         return Err(ValidationError::violated(
             "scoring corpus",
             format!(
-                "the exact `bm25` scores `{}.{}`, whose index declares no analyzer with the `bm25_v1` scorer",
+                "the exact `bm25` scores `{}.{}`, which declares no full-text index with the `bm25_v1` scorer",
                 score.type_name, score.property
             ),
         ));
@@ -365,7 +320,6 @@ impl Requirements {
         self.check_unions(plan, &top)?;
         self.check_scores(plan, &top, input)?;
         self.check_lets(plan, &top)?;
-        check_full_text_indexes(plan, input, budget)?;
         self.check_search(plan)?;
         self.check_row_cuts(plan, budget)?;
         self.check_returns(plan, &top, budget)?;

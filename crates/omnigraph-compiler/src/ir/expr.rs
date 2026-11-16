@@ -140,10 +140,7 @@ fn contains_aggregate_or_search(expr: &IRExpr) -> bool {
             | IRExpr::Cast { expr: arg, .. } => pending.push(arg),
             IRExpr::Binary { left, right, .. } => pending.extend([left.as_ref(), right.as_ref()]),
             IRExpr::Call { args, .. } => pending.extend(args),
-            IRExpr::Search { .. }
-            | IRExpr::MatchText { .. }
-            | IRExpr::Fuzzy { .. }
-            | IRExpr::PropAccess { .. }
+            IRExpr::PropAccess { .. }
             | IRExpr::Variable(_, _)
             | IRExpr::Param(_, _)
             | IRExpr::Literal(_, _) => {}
@@ -307,9 +304,6 @@ impl IRExpr {
     /// included (a score, not a predicate).
     pub fn lexical_predicate_field(&self) -> Option<&IRExpr> {
         match self {
-            Self::Search { field, .. }
-            | Self::Fuzzy { field, .. }
-            | Self::MatchText { field, .. } => Some(field),
             Self::Call {
                 func: ScalarFunc::MatchTerms { .. },
                 args,
@@ -324,9 +318,6 @@ impl IRExpr {
         match self {
             Self::PropAccess { ty, .. }
             | Self::Nearest { ty, .. }
-            | Self::Search { ty, .. }
-            | Self::Fuzzy { ty, .. }
-            | Self::MatchText { ty, .. }
             | Self::Bm25 { ty, .. }
             | Self::Rrf { ty, .. }
             | Self::Binary { ty, .. }
@@ -402,19 +393,8 @@ impl IRExpr {
                 | Self::Literal(_, _)
                 | Self::AliasRef(_, _) => {}
                 Self::Nearest { query, .. } => pending.push(query),
-                Self::Search { field, query, .. }
-                | Self::MatchText { field, query, .. }
-                | Self::Bm25 { field, query, .. } => {
+                Self::Bm25 { field, query, .. } => {
                     pending.extend([field.as_ref(), query.as_ref()])
-                }
-                Self::Fuzzy {
-                    field,
-                    query,
-                    max_edits,
-                    ..
-                } => {
-                    pending.extend([field.as_ref(), query.as_ref()]);
-                    pending.extend(max_edits.as_deref());
                 }
                 Self::Rrf {
                     primary,
@@ -456,19 +436,8 @@ impl IRExpr {
                 | Self::Literal(_, _)
                 | Self::AliasRef(_, _) => {}
                 Self::Nearest { query, .. } => pending.push(query),
-                Self::Search { field, query, .. }
-                | Self::MatchText { field, query, .. }
-                | Self::Bm25 { field, query, .. } => {
+                Self::Bm25 { field, query, .. } => {
                     pending.extend([field.as_ref(), query.as_ref()])
-                }
-                Self::Fuzzy {
-                    field,
-                    query,
-                    max_edits,
-                    ..
-                } => {
-                    pending.extend([field.as_ref(), query.as_ref()]);
-                    pending.extend(max_edits.as_deref());
                 }
                 Self::Rrf {
                     primary,
@@ -512,19 +481,8 @@ impl IRExpr {
                     pending.push(query);
                 }
                 Self::Param(_, _) | Self::Literal(_, _) => {}
-                Self::Search { field, query, .. }
-                | Self::MatchText { field, query, .. }
-                | Self::Bm25 { field, query, .. } => {
+                Self::Bm25 { field, query, .. } => {
                     pending.extend([query.as_ref(), field.as_ref()])
-                }
-                Self::Fuzzy {
-                    field,
-                    query,
-                    max_edits,
-                    ..
-                } => {
-                    pending.extend(max_edits.as_deref());
-                    pending.extend([query.as_ref(), field.as_ref()]);
                 }
                 Self::Rrf {
                     primary,
@@ -573,9 +531,6 @@ impl IRExpr {
             | Self::Literal(_, ty)
             | Self::AliasRef(_, ty) => Some(ty),
             Self::Nearest { .. }
-            | Self::Search { .. }
-            | Self::Fuzzy { .. }
-            | Self::MatchText { .. }
             | Self::Bm25 { .. }
             | Self::Rrf { .. }
             | Self::Aggregate { .. }
@@ -628,9 +583,7 @@ impl IRExpr {
                     }
                     pending.push(query);
                 }
-                Self::Search { field, query, ty }
-                | Self::MatchText { field, query, ty }
-                | Self::Bm25 { field, query, ty } => {
+                Self::Bm25 { field, query, ty } => {
                     let result = if matches!(expr, Self::Bm25 { .. }) {
                         ScalarType::F32
                     } else {
@@ -643,24 +596,6 @@ impl IRExpr {
                         return Err(bad("search operands must be scalar String"));
                     }
                     pending.extend([field.as_ref(), query.as_ref()]);
-                }
-                Self::Fuzzy {
-                    field,
-                    query,
-                    max_edits,
-                    ty,
-                } => {
-                    expect(ty, boolean_type(false))?;
-                    if !scalar_is(field.ty(), ScalarType::String)
-                        || !scalar_is(query.ty(), ScalarType::String)
-                        || max_edits
-                            .as_ref()
-                            .is_some_and(|value| !integer_type(value.ty()))
-                    {
-                        return Err(bad("fuzzy operands violate their stored types"));
-                    }
-                    pending.extend([field.as_ref(), query.as_ref()]);
-                    pending.extend(max_edits.as_deref());
                 }
                 Self::Rrf {
                     primary,
@@ -944,28 +879,6 @@ impl std::fmt::Display for IRExpr {
                 query,
                 ty: _,
             } => write!(f, "nearest(${variable}.{property}, {query})"),
-            IRExpr::Search {
-                field,
-                query,
-                ty: _,
-            } => write!(f, "search({field}, {query})"),
-            IRExpr::Fuzzy {
-                field,
-                query,
-                max_edits: None,
-                ty: _,
-            } => write!(f, "fuzzy({field}, {query})"),
-            IRExpr::Fuzzy {
-                field,
-                query,
-                max_edits: Some(max_edits),
-                ty: _,
-            } => write!(f, "fuzzy({field}, {query}, {max_edits})"),
-            IRExpr::MatchText {
-                field,
-                query,
-                ty: _,
-            } => write!(f, "match_text({field}, {query})"),
             IRExpr::Bm25 {
                 field,
                 query,
@@ -1328,86 +1241,6 @@ mod render_tests {
         };
         assert_eq!(count.to_string(), "count($f)");
         for (expression, expected) in [
-            (
-                IRExpr::Search {
-                    field: Box::new(prop("d", "text")),
-                    query: Box::new(IRExpr::Param(
-                        "q".into(),
-                        ExprType::from_prop(&PropType::scalar(
-                            crate::types::ScalarType::String,
-                            false,
-                        )),
-                    )),
-                    ty: crate::types::ExprType::Value {
-                        scalar: crate::types::ScalarType::Bool,
-                        list: false,
-                        nullable: false,
-                    },
-                },
-                "search($d.text, $q)",
-            ),
-            (
-                IRExpr::MatchText {
-                    field: Box::new(prop("d", "text")),
-                    query: Box::new(IRExpr::Param(
-                        "q".into(),
-                        ExprType::from_prop(&PropType::scalar(
-                            crate::types::ScalarType::String,
-                            false,
-                        )),
-                    )),
-                    ty: crate::types::ExprType::Value {
-                        scalar: crate::types::ScalarType::Bool,
-                        list: false,
-                        nullable: false,
-                    },
-                },
-                "match_text($d.text, $q)",
-            ),
-            (
-                IRExpr::Fuzzy {
-                    field: Box::new(prop("d", "text")),
-                    query: Box::new(IRExpr::Param(
-                        "q".into(),
-                        ExprType::from_prop(&PropType::scalar(
-                            crate::types::ScalarType::String,
-                            false,
-                        )),
-                    )),
-                    max_edits: None,
-                    ty: crate::types::ExprType::Value {
-                        scalar: crate::types::ScalarType::Bool,
-                        list: false,
-                        nullable: false,
-                    },
-                },
-                "fuzzy($d.text, $q)",
-            ),
-            (
-                IRExpr::Fuzzy {
-                    field: Box::new(prop("d", "text")),
-                    query: Box::new(IRExpr::Param(
-                        "q".into(),
-                        ExprType::from_prop(&PropType::scalar(
-                            crate::types::ScalarType::String,
-                            false,
-                        )),
-                    )),
-                    max_edits: Some(Box::new(IRExpr::Literal(
-                        Literal::Integer(2),
-                        crate::types::ExprType::from_prop(&crate::types::PropType::scalar(
-                            crate::types::ScalarType::I64,
-                            false,
-                        )),
-                    ))),
-                    ty: crate::types::ExprType::Value {
-                        scalar: crate::types::ScalarType::Bool,
-                        list: false,
-                        nullable: false,
-                    },
-                },
-                "fuzzy($d.text, $q, 2)",
-            ),
             (
                 IRExpr::AliasRef(
                     "score".into(),
@@ -1868,22 +1701,6 @@ pub enum IRExpr {
     Nearest {
         variable: String,
         property: String,
-        query: Box<IRExpr>,
-        ty: ExprType,
-    },
-    Search {
-        field: Box<IRExpr>,
-        query: Box<IRExpr>,
-        ty: ExprType,
-    },
-    Fuzzy {
-        field: Box<IRExpr>,
-        query: Box<IRExpr>,
-        max_edits: Option<Box<IRExpr>>,
-        ty: ExprType,
-    },
-    MatchText {
-        field: Box<IRExpr>,
         query: Box<IRExpr>,
         ty: ExprType,
     },

@@ -1,7 +1,7 @@
 # issue: 747
 # red_on: 2026-10-17, this branch with the T27 check removed: step 1 failed with `FullTextIndexRequired` (the column has no segment) instead of T27; main 764fb422 has neither check and answers it case-sensitively (#747).
 # notes: Additional red run on 2026-10-22, main 9d92f397: step 7 falsely refused Note.title instead of searching the sibling block's Doc.title.
-# notes: A full-text call (`search`, `fuzzy`, `match_text`, `bm25`) reads its property's full-text index, whose analyzer folds case and stems. On a String property the schema does not index, Lance would scan with a bare, case-sensitive tokenizer, so `"deep"` matched only `"deep dive"`; the type checker now refuses each call there (T27), from the schema alone. On the indexed property both spellings match both rows.
+# notes: A full-text call (`match_terms`, `bm25`) needs its property's full-text index declaration, which gives the field its profile (`english_v1` here, since the index names no analyzer). On a String property the schema does not index there is no profile to analyze with, so the type checker refuses each call (T27), from the schema alone. On the indexed property `english_v1` folds case, so both spellings match both rows.
 # notes: Sibling blocks may reuse a local name for different types. The sibling queries
 # notes: differ only in the second block's local name: both must check Doc.title and return
 # notes: the same people. Note has no title, so flattening the scopes falsely refuses Note.title.
@@ -43,7 +43,7 @@ query searched($q: String) {
 }
 --- params
 {"q": "deep"}
---- expect error: T27: `search` needs a full-text index on `Doc.notes`
+--- expect error: T27: `match_terms` needs a full-text index on `Doc.notes`
 
 --- query
 query fuzzed($q: String) {
@@ -52,7 +52,7 @@ query fuzzed($q: String) {
 }
 --- params
 {"q": "deep"}
---- expect error: T27: `fuzzy` needs a full-text index on `Doc.notes`
+--- expect error: T27: `match_terms` needs a full-text index on `Doc.notes`
 
 --- query
 query matched($q: String) {
@@ -61,7 +61,7 @@ query matched($q: String) {
 }
 --- params
 {"q": "deep"}
---- expect error: T27: `match_text` needs a full-text index on `Doc.notes`
+--- expect error: T27: `match_terms` needs a full-text index on `Doc.notes`
 
 --- query
 query ranked($q: String) {

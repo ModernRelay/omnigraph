@@ -51,9 +51,6 @@ pub(crate) fn evaluate_constant(expr: &IRExpr, params: &ParamMap) -> Result<Lite
                 .ok_or_else(|| OmniError::manifest(format!("parameter '{name}' not provided")))?,
             IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
-            | IRExpr::Search { .. }
-            | IRExpr::Fuzzy { .. }
-            | IRExpr::MatchText { .. }
             | IRExpr::Bm25 { .. }
             | IRExpr::Rrf { .. }
             | IRExpr::Variable(_, _)
@@ -285,9 +282,6 @@ fn fold_expr(expr: &IRExpr, params: &ParamMap) -> Result<IRExpr> {
         },
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
@@ -316,9 +310,6 @@ pub(super) fn is_constant(expr: &IRExpr) -> bool {
         IRExpr::IsNull { expr, .. } | IRExpr::Cast { expr, .. } => is_constant(expr),
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)

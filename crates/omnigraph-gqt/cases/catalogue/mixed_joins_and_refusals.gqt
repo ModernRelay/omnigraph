@@ -75,4 +75,4 @@ query search_operators($q: String) {
 --- params
 {"q":"scan"}
 
---- expect error: T27: `match_text` needs a full-text index on `@Operator.name`
+--- expect error: T27: `match_terms` needs a full-text index on `@Operator.name`

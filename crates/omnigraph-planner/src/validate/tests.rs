@@ -162,10 +162,10 @@ const FILTERED: &str = r#"query q($min: I64) {
     limit 2
 }"#;
 
-const RANKED: &str = r#"query q($q: String) {
-    match { let $pop = { match { $d: Doc } where $d.year > 2000 return { $d } }, from bm25($pop, $d.title, $q) as $score }
+const RANKED: &str = r#"query q($v: Vector(2)) {
+    match { let $pop = { match { $d: Doc } where $d.year > 2000 return { $d } }, from nearest($pop, $d.embedding, $v, k: 3) as $score }
     return { $d.slug, $score as score }
-    order { $score desc, $d.year }
+    order { $score, $d.year }
     limit 3
 }"#;
 
@@ -174,7 +174,13 @@ fn filtered() -> Fixture {
 }
 
 fn ranked() -> Fixture {
-    Fixture::new(RANKED, &[("q", Literal::String("graph".into()))])
+    Fixture::new(
+        RANKED,
+        &[(
+            "v",
+            Literal::List(vec![Literal::Float(0.0), Literal::Float(1.0)]),
+        )],
+    )
 }
 
 const DECLARED_SCHEMA: &str = r#"
@@ -212,8 +218,7 @@ fn exact_score(plan: &mut PhysicalPlan) -> &mut PhysicalNode {
 /// `match_terms` predicate; a plan scoring another kind, another predicate
 /// or another field is refused (search identity), and so is one whose
 /// retained predicate is not its field's `match_terms` (predicate
-/// retention), one scoring a type that declares no analyzer (scoring
-/// corpus) and a read of an `F64` `_score` no exact `bm25` produces (score
+/// retention), one scoring a field that does not rank (scoring corpus) and a read of an `F64` `_score` no exact `bm25` produces (score
 /// origin).
 #[test]
 fn an_exact_bm25_is_one_score_retaining_its_predicate_over_its_field_corpus() {
@@ -286,7 +291,7 @@ fn an_exact_bm25_is_one_score_retaining_its_predicate_over_its_field_corpus() {
     undeclared.catalog = build_catalog(
         &parse_schema(&DECLARED_SCHEMA.replace(
             r#"body: String @index(fulltext, analyzer = "standard_v1")"#,
-            "body: String @index",
+            r#"body: String @index(fulltext, scorer = "none")"#,
         ))
         .unwrap(),
     )
@@ -320,12 +325,17 @@ fn an_exact_bm25_is_one_score_retaining_its_predicate_over_its_field_corpus() {
 
 #[test]
 fn the_planned_plans_are_accepted() {
-    for fixture in [filtered(), ranked()] {
+    let fixture = filtered();
+    let accepted = fixture
+        .accept(fixture.plan())
+        .expect("a planned plan is accepted");
+    assert_eq!(accepted.scope(), ValidationScope::ExactSubset);
+    assert!(accepted.evidence().derivation().is_some());
+    for fixture in [ranked(), exact_bm25()] {
         let accepted = fixture
             .accept(fixture.plan())
             .expect("a planned plan is accepted");
-        assert_eq!(accepted.scope(), ValidationScope::ExactSubset);
-        assert!(accepted.evidence().derivation().is_some());
+        assert_eq!(accepted.scope(), ValidationScope::InvariantsOnly);
     }
     let outside = Fixture::new(
         r#"query q() {
@@ -363,12 +373,6 @@ fn the_derivations_record_every_rule() {
         rules(&filtered().derivation().unwrap()),
         [
             "absorb", "absorb", "prune", "lower", "lower", "lower", "lower"
-        ]
-    );
-    assert_eq!(
-        rules(&ranked().derivation().unwrap()),
-        [
-            "absorb", "prune", "lower", "rank", "lower", "lower", "lower"
         ]
     );
 }
@@ -417,35 +421,6 @@ fn a_scan_pruned_below_its_readers_is_refused() {
         Err(ValidationError::Violated { check, detail }) => {
             assert_eq!(check, "exact subset");
             assert!(detail.contains("drops `year`"), "{detail}");
-        }
-        other => panic!("{other:?}"),
-    }
-}
-
-#[test]
-fn a_bm25_rank_before_scoring_needs_full_coverage() {
-    let mut fixture = ranked();
-    fixture.source = std::mem::take(&mut fixture.source).with_full_text_coverage(
-        "node:Doc",
-        "title",
-        crate::source::FullTextCoverage::Full,
-    );
-    let traced = fixture.traced();
-    let accepted = fixture
-        .accept_with(traced.optimized.physical.clone(), traced.derivation())
-        .expect("full coverage admits filtering before scoring");
-    assert_eq!(accepted.scope(), ValidationScope::ExactSubset);
-    let derivation = traced.derivation();
-    let mut plan = traced.optimized.physical;
-    let mut assumptions = plan.assumptions().clone();
-    assumptions.full_text.insert(
-        crate::physical::Assumptions::full_text_key("node:Doc", "title"),
-        crate::source::FullTextCoverage::Partial,
-    );
-    plan.set_assumptions(assumptions);
-    match fixture.accept_with(plan, derivation) {
-        Err(ValidationError::Violated { check, detail }) => {
-            assert_eq!(check, "prerequisite", "{detail}");
         }
         other => panic!("{other:?}"),
     }
@@ -821,14 +796,23 @@ fn drop_first_sort_key(plan: &mut PhysicalPlan) {
 /// search-led aggregate by its written keys then every group key.
 #[test]
 fn fused_and_grouped_searches_sort_as_the_query_requires() {
-    let q = [("q", Literal::String("graph".into()))];
+    let vectors = [
+        (
+            "v",
+            Literal::List(vec![Literal::Float(0.0), Literal::Float(1.0)]),
+        ),
+        (
+            "w",
+            Literal::List(vec![Literal::Float(1.0), Literal::Float(0.0)]),
+        ),
+    ];
     let fused = Fixture::new(
-        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60) as $score, $d: Doc } return { $d.slug } order { $score desc, $d.slug desc } limit 2 }",
-        &q,
+        "query q($v: Vector(2), $w: Vector(2)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), nearest($all, $d.embedding, $w, k: 3), k: 60) as $score, $d: Doc } return { $d.slug } order { $score desc, $d.slug desc } limit 2 }",
+        &vectors,
     );
     let grouped = Fixture::new(
-        "query q($q: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $q) as $score } return { $d.open, count($d) as n } order { n desc } }",
-        &q,
+        "query q($v: Vector(2)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 3) as $score } return { $d.open, count($d) as n } order { n desc } }",
+        &vectors[..1],
     );
     for fixture in [fused, grouped] {
         let plan = fixture.plan();
@@ -896,8 +880,10 @@ fn another_query_argument_fails_search_identity() {
             ..
         }) = plan.node_mut(id)
         {
-            ranked.query =
-                IRExpr::Literal(Literal::String("other".into()), ranked.query.ty().clone());
+            ranked.query = IRExpr::Literal(
+                Literal::List(vec![Literal::Float(1.0), Literal::Float(1.0)]),
+                ranked.query.ty().clone(),
+            );
         }
     }
     let (check, detail) = fixture.refused(plan);
@@ -918,10 +904,19 @@ fn fusion_weights(plan: &mut PhysicalPlan) -> &mut Option<IRExpr> {
 fn other_fusion_weights_fail_search_identity() {
     let fused = |weights: &str| {
         format!(
-            "query q($q: String) {{ match {{ let $all = {{ match {{ $d: Doc }} return {{ $d }} }}, from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60{weights}) as $score, $d: Doc }} return {{ $d.slug }} order {{ $score desc }} limit 2 }}"
+            "query q($v: Vector(2), $w: Vector(2)) {{ match {{ let $all = {{ match {{ $d: Doc }} return {{ $d }} }}, from rrf(nearest($all, $d.embedding, $v, k: 3), nearest($all, $d.embedding, $w, k: 3), k: 60{weights}) as $score, $d: Doc }} return {{ $d.slug }} order {{ $score desc }} limit 2 }}"
         )
     };
-    let params = [("q", Literal::String("needle".into()))];
+    let params = [
+        (
+            "v",
+            Literal::List(vec![Literal::Float(0.0), Literal::Float(1.0)]),
+        ),
+        (
+            "w",
+            Literal::List(vec![Literal::Float(1.0), Literal::Float(0.0)]),
+        ),
+    ];
     let weighted = Fixture::new(&fused(", weights: [1.0, 5.0]"), &params);
     let mut plan = weighted.plan();
     let written = fusion_weights(&mut plan).clone();
@@ -945,23 +940,6 @@ fn other_fusion_weights_fail_search_identity() {
     *fusion_weights(&mut plan) = written;
     let (check, detail) = unweighted.refused(plan);
     assert_eq!(check, "search identity", "{detail}");
-}
-
-#[test]
-fn a_capped_bm25_scan_fails_the_row_cut() {
-    let fixture = ranked();
-    let mut plan = fixture.plan();
-    for id in node_ids(&plan, |node| node.ranked().is_some()) {
-        if let Some(PhysicalNode::Scan {
-            ranked: Some(ranked),
-            ..
-        }) = plan.node_mut(id)
-        {
-            ranked.fetch = Some(3);
-        }
-    }
-    let (check, detail) = fixture.refused(plan);
-    assert_eq!(check, "row cut", "{detail}");
 }
 
 /// A `nearest` window drawn as a pattern step is a cut of its `k` targets:
@@ -1374,7 +1352,7 @@ fn a_score_read_from_another_column_fails_the_projection() {
         if let Some(PhysicalNode::Projection { return_exprs, .. }) = plan.node_mut(id) {
             return_exprs[1].expr = IRExpr::PropAccess {
                 variable: "d".to_string(),
-                property: "_distance".to_string(),
+                property: "year".to_string(),
                 ty: return_exprs[1].expr.ty().clone(),
             };
         }
@@ -1487,15 +1465,6 @@ fn a_prepass_off_the_required_hops_fails_the_declared_policy() {
     }
 }
 
-#[test]
-fn a_bm25_scan_with_a_nearest_policy_fails_the_declared_policy() {
-    let fixture = ranked();
-    let mut plan = fixture.plan();
-    ranked_access(&mut plan).policy = Some(crate::physical::NearestPolicy::DEFAULT);
-    let (check, detail) = fixture.refused(plan);
-    assert_eq!(check, "declared policy", "{detail}");
-}
-
 /// The scope one query is accepted under.
 fn scope_of(query: &str, params: &[(&str, Literal)]) -> ValidationScope {
     let fixture = Fixture::new(query, params);
@@ -1517,7 +1486,6 @@ fn membership_admits_the_fragment_and_nothing_else() {
         "query q() { match { $d: Doc } where ($d.rank is null or $d.rank > 2) return { $d.slug, $d.rank } }",
         "query q() { match { $d: Doc } where $d.open return { $d.title as t } order { $d.year desc, $d.title } limit 4 }",
         "query q($t: String) { match { $d: Doc } where $d.title = $t return { $d.slug } limit 0 }",
-        "query q($q: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $q) as $score } return { $score as s, $d.slug } order { $score desc, $d.slug desc } limit 2 }",
     ];
     for query in members {
         let params = [
@@ -1550,13 +1518,18 @@ fn membership_admits_the_fragment_and_nothing_else() {
         "query q() { match { $d: Doc } return { $d.slug } order { $d.score } }",
         "query q() { match { $d: Doc } where match_terms($d.title, terms(\"g\", mode: any)) return { $d.slug } }",
         "query q($v: Vector(2)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 2) as $distance } return { $d.slug } order { $distance } limit 2 }",
-        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60) as $score, $d: Doc } return { $d.slug } order { $score desc } limit 2 }",
+        "query q($q: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $q) as $score } return { $score as s, $d.slug } order { $score desc, $d.slug desc } limit 2 }",
+        "query q($v: Vector(2), $w: Vector(2)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 2), nearest($all, $d.embedding, $w, k: 2), k: 60) as $score, $d: Doc } return { $d.slug } order { $score desc } limit 2 }",
     ];
     for query in outside {
         let params = [
             (
                 "v",
                 Literal::List(vec![Literal::Float(0.0), Literal::Float(1.0)]),
+            ),
+            (
+                "w",
+                Literal::List(vec![Literal::Float(1.0), Literal::Float(0.0)]),
             ),
             ("q", Literal::String("graph".into())),
         ];
@@ -1794,12 +1767,12 @@ fn a_distinct_return_sorts_its_groups() {
     }
 }
 
-/// A full-text call reads its property's index segment, which carries the
-/// analyzer: planning refuses an absent one with the typed conflict (for a
-/// search filter and for a bm25 order alike), and acceptance refuses a plan
-/// that records no coverage, or an absent one, for a call it makes.
+/// Every full-text field has a profile, so the exact lexical scan answers a
+/// lexical predicate at every index state: an absent index plans, the plan
+/// is accepted, and it records no index coverage for the call
+/// (docs/rfcs/2026-11-07-gq-3.md, section 4: no `FullTextIndexRequired`).
 #[test]
-fn a_full_text_call_needs_a_recorded_index_segment() {
+fn a_full_text_call_plans_at_every_index_state() {
     use crate::source::FullTextCoverage;
     let search = r#"query q($q: String) {
     match { $d: Doc } where match_terms($d.title, terms($q, mode: any))
@@ -1813,98 +1786,29 @@ fn a_full_text_call_needs_a_recorded_index_segment() {
     match { $p: Doc }
     where not exists {
         $d: Doc, $p cites $d
-        where not exists { $x: Doc, $d cites $x where match_terms($d.title, terms($q, mode: any)) }
+        where not exists { $x: Doc, $d cites $x where match_terms($d.title, terms($q, mode: any, max_edits: 2)) }
     }
     return { $p.slug }
 }"#;
     for query in [search, RANKED, inherited, nested] {
-        let mut fixture = Fixture::new(query, &[("q", Literal::String("graph".into()))]);
-        fixture.source = std::mem::take(&mut fixture.source).with_full_text_coverage(
-            "node:Doc",
-            "title",
+        for coverage in [
             FullTextCoverage::Absent,
-        );
-        match crate::gate::plan_traced(&fixture.ir, &fixture.source, &BOUNDS, false).err() {
-            Some(crate::gate::Unrouted::FullTextIndexRequired { index }) => {
-                assert_eq!(index, "Doc.title", "{query}")
-            }
-            other => panic!("{query}: an absent index plans: {other:?}"),
-        }
-    }
-
-    let fixture = Fixture::new(search, &[("q", Literal::String("graph".into()))]);
-    let plan = fixture.plan();
-    let key = crate::physical::Assumptions::full_text_key("node:Doc", "title");
-    assert_eq!(
-        plan.assumptions().full_text.get(&key),
-        Some(&FullTextCoverage::Partial),
-        "planning records the coverage a search filter reads"
-    );
-    fixture
-        .accept(plan.clone())
-        .expect("a recorded segment is accepted");
-    for recorded in [None, Some(FullTextCoverage::Absent)] {
-        let mut edited = plan.clone();
-        let mut assumptions = edited.assumptions().clone();
-        match recorded {
-            None => assumptions.full_text.remove(&key),
-            Some(coverage) => assumptions.full_text.insert(key.clone(), coverage),
-        };
-        edited.set_assumptions(assumptions);
-        let (check, detail) = fixture.refused(edited);
-        assert_eq!(check, "prerequisite", "{recorded:?}: {detail}");
-        assert!(detail.contains("Doc.title"), "{detail}");
-    }
-
-    // Sibling blocks have independent local bindings. Each `$d.title`
-    // needs its own type's coverage, even when the other sibling has it.
-    let schema = format!(
-        "{SCHEMA}\nnode Note {{ slug: String @key title: String @index }}\nedge Annotates: Doc -> Note"
-    );
-    let query = r#"query q($q: String) {
-    match { $p: Doc }
-    where not exists { $d: Doc, $p cites $d where match_terms($d.title, terms($q, mode: any)) }
-      and not exists { $d: Note, $p annotates $d where match_terms($d.title, terms($q, mode: any)) }
-    return { $p.slug }
-}"#;
-    let mut fixture =
-        Fixture::with_schema(&schema, query, &[("q", Literal::String("graph".into()))]);
-    fixture.source = std::mem::take(&mut fixture.source).with_edge_version("Annotates", 1);
-    let plan = fixture.plan();
-    fixture
-        .accept(plan.clone())
-        .expect("both sibling blocks' recorded segments are accepted");
-    for type_name in ["Doc", "Note"] {
-        let type_key = format!("node:{type_name}");
-        let key = crate::physical::Assumptions::full_text_key(&type_key, "title");
-        let index = format!("{type_name}.title");
-        for recorded in [None, Some(FullTextCoverage::Absent)] {
-            let mut edited = plan.clone();
-            let mut assumptions = edited.assumptions().clone();
-            match recorded {
-                None => assumptions.full_text.remove(&key),
-                Some(coverage) => assumptions.full_text.insert(key.clone(), coverage),
-            };
-            edited.set_assumptions(assumptions);
-            let (check, detail) = fixture.refused(edited);
-            assert_eq!(check, "prerequisite", "{index}: {recorded:?}: {detail}");
-            assert!(detail.contains(&index), "{detail}");
-        }
-        fixture.source = std::mem::take(&mut fixture.source).with_full_text_coverage(
-            &type_key,
-            "title",
-            FullTextCoverage::Absent,
-        );
-        match crate::gate::plan_traced(&fixture.ir, &fixture.source, &BOUNDS, false).err() {
-            Some(crate::gate::Unrouted::FullTextIndexRequired { index: refused }) => {
-                assert_eq!(refused, index)
-            }
-            other => panic!("{index}: an absent sibling's index plans: {other:?}"),
-        }
-        fixture.source = std::mem::take(&mut fixture.source).with_full_text_coverage(
-            &type_key,
-            "title",
             FullTextCoverage::Partial,
-        );
+            FullTextCoverage::Full,
+        ] {
+            let mut fixture = Fixture::new(query, &[("q", Literal::String("graph".into()))]);
+            fixture.source = std::mem::take(&mut fixture.source).with_full_text_coverage(
+                "node:Doc", "title", coverage,
+            );
+            let plan = fixture.plan();
+            assert!(
+                plan.assumptions().full_text.is_empty(),
+                "{query}: {:?}",
+                plan.assumptions().full_text
+            );
+            fixture
+                .accept(plan)
+                .unwrap_or_else(|error| panic!("{query} under {coverage:?}: {error:?}"));
+        }
     }
 }

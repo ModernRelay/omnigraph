@@ -297,14 +297,6 @@ pub trait PlanSource {
         FullTextCoverage::Partial
     }
 
-    /// Whether `property`'s full-text index on the table `type_key` names
-    /// declares an analyzer profile: the exact lexical scan instantiates
-    /// that analyzer from the accepted schema and answers whether or not an
-    /// index exists.
-    fn full_text_declares_analyzer(&self, _type_key: &str, _property: &str) -> bool {
-        false
-    }
-
     /// The fingerprint of the catalogue table `type_key` names at this source:
     /// its rows and schema as the running binary derives them, so a plan records
     /// what it read and a replay checks it. `None` for a source with no catalogue.
@@ -318,8 +310,7 @@ pub trait PlanSource {
 /// applied before scoring: Lance scores the unindexed fragments flat, from
 /// statistics over the rows the filter admits. A segment of any coverage,
 /// even the untrained declaration every write records, carries the index's
-/// analyzer to the rows it does not cover; an absent index refuses every
-/// full-text call on the property (`PlanError::FullTextIndexRequired`).
+/// analyzer to the rows it does not cover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FullTextCoverage {

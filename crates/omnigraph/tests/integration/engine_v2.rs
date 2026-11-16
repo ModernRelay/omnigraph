@@ -721,7 +721,7 @@ async fn explain_search_uses_vector_params_without_initializing_embeddings() {
             true,
         ),
         (
-            "let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60) as $score",
+            "let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 1), nearest($all, $d.embedding, [1.0, 0.0, 0.0, 0.0], k: 1), k: 60) as $score",
             "$score desc",
             "Vector(4)",
             vector_param("q", &[0.0; 4]),
@@ -735,7 +735,7 @@ async fn explain_search_uses_vector_params_without_initializing_embeddings() {
             false,
         ),
         (
-            "let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60) as $score",
+            "let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 1), nearest($all, $d.embedding, [1.0, 0.0, 0.0, 0.0], k: 1), k: 60) as $score",
             "$score desc",
             "String",
             params(&[("q", "a")]),
@@ -786,11 +786,11 @@ async fn rrf_order_runs_a_cross_join_over_multiple_probe_batches() {
     use arrow_array::StringArray;
     use std::fmt::Write;
 
-    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    n: I64\n    text: String @index\n}\nnode Probe {\n    slug: String @key\n    n: I64\n}\n";
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    n: I64\n    embedding: Vector(2)\n}\nnode Probe {\n    slug: String @key\n    n: I64\n}\n";
     const PROBE_ROWS: usize = 8193;
     let mut seed = String::from(
-        "{\"type\": \"Doc\", \"data\": {\"slug\": \"best\", \"n\": 8192, \"text\": \"needle needle needle needle filler\"}}\n\
-         {\"type\": \"Doc\", \"data\": {\"slug\": \"worse\", \"n\": 0, \"text\": \"needle filler\"}}\n",
+        "{\"type\": \"Doc\", \"data\": {\"slug\": \"best\", \"n\": 8192, \"embedding\": [0.0, 0.0]}}\n\
+         {\"type\": \"Doc\", \"data\": {\"slug\": \"worse\", \"n\": 0, \"embedding\": [3.0, 4.0]}}\n",
     );
     for n in 0..PROBE_ROWS {
         writeln!(
@@ -807,12 +807,12 @@ async fn rrf_order_runs_a_cross_join_over_multiple_probe_batches() {
     );
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     let db = with_setting(&db, "engine", "v2");
-    let source = "query fused($t: String) {\n    match {\n      let $all = { match { $d: Doc } return { $d } },\n      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, \"needle needle\"), k: 60) as $score,\n      $d: Doc,\n      $p: Probe,\n    }\n    where $d.n = $p.n\n    return { $d.slug }\n    order { $score desc }\n    limit 1\n}";
+    let source = "query fused($t: Vector(2)) {\n    match {\n      let $all = { match { $d: Doc } return { $d } },\n      from rrf(nearest($all, $d.embedding, $t, k: 2), nearest($all, $d.embedding, [0.5, 0.5], k: 2), k: 60) as $score,\n      $d: Doc,\n      $p: Probe,\n    }\n    where $d.n = $p.n\n    return { $d.slug }\n    order { $score desc }\n    limit 1\n}";
     let result = query_main(
         &db,
         &format!("explain {source}"),
         "fused",
-        &params(&[("t", "needle")]),
+        &vector_param("t", &[0.0, 0.0]),
     )
     .await
     .unwrap();
@@ -844,7 +844,7 @@ async fn rrf_order_runs_a_cross_join_over_multiple_probe_batches() {
     let probes = omnigraph::instrumentation::QueryMemoryProbes::default();
     omnigraph::instrumentation::with_query_memory_probes(
         probes.clone(),
-        query_main(&db, source, "fused", &params(&[("t", "needle")])),
+        query_main(&db, source, "fused", &vector_param("t", &[0.0, 0.0])),
     )
     .await
     .unwrap();

@@ -1,6 +1,7 @@
 # issue: none
-# notes: Search orders preserve contains and residual filters in cross joins over ranked scans.
-# notes: An unranked search filter on the texts, or a ranking of the needles, keeps the contains join.
+# notes: A ranked scan (`nearest`, an `rrf` arm) keeps contains and residual filters in a cross join.
+# notes: An exact `bm25` scores the joined rows above the scans, so it keeps the contains join, as an
+# notes: unranked lexical filter on the texts does.
 # red_on: 2026-09-26, pre-fix ranked contains join: `contains join 2: its right scan 1 carries no runtime filter`.
 
 --- runner
@@ -44,9 +45,8 @@ query bm25_order() {
 p.pid: String
 
 --- expect plan
-cross join $p.text contains $m.number
-scan Passage as $p: no runtime filter
-scan Passage as $p: ranked bm25
+contains join $p.text contains $m.number
+scan Passage as $p: runtime filter text
 
 --- query
 set engine = v2;
@@ -86,17 +86,7 @@ query rrf_order() {
     limit 10
 }
 
---- expect unordered
-{"p.pid":"p"}
-
---- expect shape
-p.pid: String
-
---- expect plan
-cross join $p.text contains $m.number
-scan Passage as $p: no runtime filter
-scan Passage as $p: ranked nearest fetch 10
-scan Passage as $p: ranked bm25
+--- expect error: type error: T86:
 
 --- query
 set engine = v2;
@@ -138,4 +128,3 @@ p.pid: String
 --- expect plan
 contains join $p.text contains $m.number
 scan Passage as $p: runtime filter text
-scan Matter as $m: ranked bm25

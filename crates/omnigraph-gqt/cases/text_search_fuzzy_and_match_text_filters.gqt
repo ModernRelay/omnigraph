@@ -85,6 +85,8 @@ query fuzzy_search($q: String) {
 {"q": "Introductio"}
 
 --- expect unordered
+{"d.slug":"ml-intro","d.title":"Introduction to Machine Learning"}
+{"d.slug":"rl-intro","d.title":"Reinforcement Learning Introduction"}
 
 --- expect shape
 d.slug: String

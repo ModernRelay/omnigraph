@@ -783,6 +783,9 @@ impl<'a> Interpreter<'a> {
                             rows.push(row);
                         }
                     }
+                    // An empty population scores nothing, whatever the field's
+                    // analysis.
+                    (ScoreKind::Bm25, ScoreQuery::Lexical(_)) if input.rows.is_empty() => {}
                     (ScoreKind::Bm25, ScoreQuery::Lexical(lex)) => {
                         let scorer = self.bm25(&input.rows, column, property, lex, env)?;
                         for mut row in input.rows {
@@ -1079,7 +1082,7 @@ impl<'a> Interpreter<'a> {
             Some(Value::Ref { type_name, .. }) => Some(type_name.clone()),
             _ => None,
         });
-        let analysis = Analysis::of(self.catalog, type_name.as_deref(), property);
+        let analysis = Analysis::of(self.catalog, type_name.as_deref(), property)?;
         let mut corpus = Vec::new();
         for e in type_name
             .as_deref()
@@ -1116,12 +1119,12 @@ impl<'a> Interpreter<'a> {
 
     /// The analysis of the property `field` reads: the profile its owner's
     /// full-text index declares.
-    fn field_analysis(&self, field: &IRExpr, row: &Row, env: &Row) -> Analysis {
+    fn field_analysis(&self, field: &IRExpr, row: &Row, env: &Row) -> R<Analysis> {
         let IRExpr::PropAccess {
             variable, property, ..
         } = field
         else {
-            return Analysis::of(self.catalog, None, "");
+            return unsupported(format!("a lexical call over `{field}`, not a property"));
         };
         let owner = match get(row, variable).or_else(|| get(env, variable)) {
             Some(Value::Ref {
@@ -1147,7 +1150,7 @@ impl<'a> Interpreter<'a> {
         row: &Row,
         env: &Row,
     ) -> R<Value> {
-        let analysis = self.field_analysis(field, row, env);
+        let analysis = self.field_analysis(field, row, env)?;
         let q = match self.expr(query, row, env)? {
             Value::Str(q) => analysis.tokens(&q)?,
             _ => return Ok(Value::Null),
@@ -1318,18 +1321,6 @@ impl<'a> Interpreter<'a> {
             }
             // `search` and `match_text` are `terms(q, mode: any)`; `fuzzy`
             // adds an edit budget, two when unwritten (section 4, Migration).
-            IRExpr::Search { field, query, .. } | IRExpr::MatchText { field, query, .. } => {
-                self.lexical(field, query, false, 0, row, env)?
-            }
-            IRExpr::Fuzzy {
-                field,
-                query,
-                max_edits,
-                ..
-            } => {
-                let max_edits = self.max_edits(max_edits.as_deref(), 2, row, env)?;
-                self.lexical(field, query, false, max_edits, row, env)?
-            }
             IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } | IRExpr::Rrf { .. } => {
                 return unsupported("a ranking as a scalar");
             }
@@ -1569,40 +1560,46 @@ fn cast(v: Value, ty: &ExprType) -> Value {
     }
 }
 
-/// The analysis of a full-text property (section 4, Schema: Text): the
-/// declared profile's pipeline, or, with no profile, edition 2's index
-/// analysis. Lowercasing, the simple tokenizer, the token-length filter and
-/// ASCII folding are evaluated; English stemming and stop words are not,
-/// since the RFC names no stemmer revision or stop-word list, and neither is
-/// NFC, which needs Unicode data this crate does not carry.
+/// The analysis of a full-text property (section 4, Schema: Text): its
+/// profile's pipeline, `english_v1` where the index names none. Lowercasing,
+/// the simple tokenizer, the token-length filter and ASCII folding are
+/// evaluated. A profile that stems or removes stop words (`english_v1`) is
+/// refused: this crate carries no stemmer, and its stop list holds stems,
+/// so neither can be applied alone. NFC is not applied either, since it
+/// needs Unicode data this crate does not carry.
 #[derive(Debug, Clone, Copy)]
 struct Analysis {
     fold: bool,
-    /// Tokens of this many bytes or more are dropped.
+    /// Tokens of this many bytes or more are dropped, as Lance's token-length
+    /// filter drops them.
     max_bytes: Option<usize>,
 }
 
 impl Analysis {
-    fn of(catalog: &Catalog, owner: Option<&str>, property: &str) -> Self {
+    fn of(catalog: &Catalog, owner: Option<&str>, property: &str) -> R<Self> {
         use omnigraph_compiler::schema::analysis::AnalyzerFilter;
-        let profile = owner
+        let Some(profile) = owner
             .and_then(|t| catalog.node_types.get(t))
-            .and_then(|t| t.full_text_profile(property));
-        match profile {
-            Some(profile) => {
-                let pipeline = profile.pipeline();
-                Self {
-                    fold: pipeline.filters.contains(&AnalyzerFilter::AsciiFolding),
-                    max_bytes: pipeline.max_token_length.map(|n| n + 1),
-                }
-            }
-            // Edition 2's analysis: English stemming, stop words, ASCII
-            // folding and a 40-byte token filter.
-            None => Self {
-                fold: true,
-                max_bytes: Some(40),
-            },
+            .and_then(|t| t.full_text_profile(property))
+        else {
+            return unsupported(format!(
+                "a lexical call over `{property}`, which has no full-text profile"
+            ));
+        };
+        let pipeline = profile.pipeline();
+        if pipeline
+            .filters
+            .iter()
+            .any(|f| matches!(f, AnalyzerFilter::Stem(_) | AnalyzerFilter::StopWords(_)))
+        {
+            return unsupported(format!(
+                "the {profile} profile, whose stemmer this crate does not carry"
+            ));
         }
+        Ok(Self {
+            fold: pipeline.filters.contains(&AnalyzerFilter::AsciiFolding),
+            max_bytes: pipeline.max_token_length,
+        })
     }
 
     /// The analyzed tokens of `text`: split on every character that is not

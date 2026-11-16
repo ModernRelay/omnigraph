@@ -90,10 +90,10 @@ pub struct NodeType {
     /// Maps @embed target property -> its source text property + recorded model.
     pub embed_sources: HashMap<String, EmbedSource>,
     /// The full-text analysis each property's `@index(fulltext, ...)` declares
-    /// beyond edition 2's; a property absent here keeps edition 2's index
-    /// analysis and ranks with the default scorer.
+    /// beyond the defaults; a property absent here takes `english_v1` and
+    /// ranks with `bm25_v1`.
     pub full_text_analysis: HashMap<String, FullTextAnalysis>,
-    /// The analyzer fingerprint of each property with a declared profile. Only
+    /// The analyzer fingerprint of each property with a full-text index. Only
     /// a catalog built from accepted IR carries them, since the fingerprint
     /// binds the property's stable identity.
     pub full_text_fingerprints: HashMap<String, String>,
@@ -114,12 +114,13 @@ impl NodeType {
             .unwrap_or_default()
     }
 
-    /// The profile `property`'s full-text index declares, `None` for edition
-    /// 2's index analysis.
+    /// The profile `property`'s full-text index applies: the declared one,
+    /// `english_v1` when it declares none. `None` for a property with no
+    /// full-text index.
     pub fn full_text_profile(&self, property: &str) -> Option<AnalyzerProfile> {
-        self.full_text_analysis
-            .get(property)
-            .and_then(|analysis| analysis.analyzer)
+        self.has_full_text_index(property).then(|| {
+            FullTextAnalysis::resolved(self.full_text_analysis.get(property)).profile()
+        })
     }
 
     /// The scorer `property`'s full-text index declares: the default unless it
@@ -225,6 +226,10 @@ pub struct EdgeType {
     pub unique_constraints: Vec<Vec<String>>,
     /// Index declarations on edge properties
     pub indices: Vec<Vec<String>>,
+    /// The analyzer fingerprint of each property with a full-text index. An
+    /// edge property declares no analysis, so it takes `english_v1` and
+    /// `bm25_v1`. Only a catalog built from accepted IR carries them.
+    pub full_text_fingerprints: HashMap<String, String>,
     /// The distance each vector property declares beyond `l2`.
     pub vector_distances: HashMap<String, VectorDistance>,
     pub blob_properties: HashSet<String>,
@@ -654,6 +659,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     key,
                     unique_constraints,
                     indices: edge_indices,
+                    full_text_fingerprints: HashMap::new(),
                     vector_distances: declared_distances(&edge.properties),
                     blob_properties,
                     arrow_schema: Arc::new(Schema::new(fields)),
@@ -782,6 +788,19 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 }
             }
         }
+        // Every full-text field has a profile, so every one has a fingerprint.
+        let full_text_fingerprints: HashMap<String, String> = node
+            .properties
+            .iter()
+            .filter(|property| {
+                indices
+                    .iter()
+                    .any(|columns| matches!(columns.as_slice(), [c] if *c == property.name))
+                    && properties.get(&property.name).and_then(PropType::index_kind)
+                        == Some(crate::types::PropIndexKind::FullText)
+            })
+            .map(|property| (property.name.clone(), property.full_text_fingerprint()))
+            .collect();
         let mut fields = vec![Field::new(system_columns.id, DataType::Utf8, false)];
         fields.extend(node.properties.iter().map(|property| {
             Field::new(
@@ -815,15 +834,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                             .map(|analysis| (property.name.clone(), analysis))
                     })
                     .collect(),
-                full_text_fingerprints: node
-                    .properties
-                    .iter()
-                    .filter_map(|property| {
-                        property
-                            .full_text_fingerprint()
-                            .map(|fingerprint| (property.name.clone(), fingerprint))
-                    })
-                    .collect(),
+                full_text_fingerprints,
                 vector_distances: ir_distances(&node.properties),
                 blob_properties,
                 arrow_schema: Arc::new(Schema::new(fields)),
@@ -954,6 +965,18 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 properties,
                 key,
                 unique_constraints,
+                full_text_fingerprints: edge
+                    .properties
+                    .iter()
+                    .filter(|property| {
+                        indices
+                            .iter()
+                            .any(|columns| matches!(columns.as_slice(), [c] if *c == property.name))
+                            && property.prop_type.index_kind()
+                                == Some(crate::types::PropIndexKind::FullText)
+                    })
+                    .map(|property| (property.name.clone(), property.full_text_fingerprint()))
+                    .collect(),
                 indices,
                 vector_distances: ir_distances(&edge.properties),
                 blob_properties,

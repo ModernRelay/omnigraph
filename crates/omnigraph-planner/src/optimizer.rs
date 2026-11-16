@@ -8,11 +8,10 @@ use std::sync::Arc;
 use crate::read_shape::{PatternStep, ReadShape};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use omnigraph_compiler::ir::core::ScoreKind;
-use omnigraph_compiler::ir::expr::ScalarFunc;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, is_fresh_variable};
 use omnigraph_compiler::query::codes::{P002, P004};
 use omnigraph_compiler::query::file::LoadStmtMode;
-use omnigraph_compiler::query::value::{AggFunc, CompOp, Literal};
+use omnigraph_compiler::query::value::AggFunc;
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 use omnigraph_compiler::types::{Direction, ExprType};
@@ -308,180 +307,11 @@ pub fn write_count_schema() -> SchemaRef {
 /// Stage 1, pass 1 for a GQ query: the flat `PatternStep` pipeline folded into a
 /// tree, then a leading search function, the `return`, the remaining
 /// `order` keys and the `limit` above it.
-/// The node properties the query's full-text calls read the index of, as
-/// `(type name, property)`, first appearance first: `search`, `fuzzy` and
-/// `match_text` in any filter (correlated blocks included), and `bm25` in the
-/// leading order key or either arm of an `rrf()` there. Planning checks each
-/// one's coverage (`require_full_text_indexes`) and acceptance requires the
-/// plan to record it. Block-local bindings stay within their lexical scope;
-/// nested blocks inherit their parent's bindings, never a sibling's locals.
-pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
-    fn bindings(ops: &[PatternStep], out: &mut HashMap<String, String>) {
-        for op in ops {
-            match op {
-                PatternStep::NodeScan {
-                    variable,
-                    type_name,
-                    filters: _,
-                } => {
-                    out.insert(variable.clone(), type_name.clone());
-                }
-                PatternStep::Expand {
-                    dst_var, dst_type, ..
-                } => {
-                    out.insert(dst_var.clone(), dst_type.clone());
-                }
-                // An `optional`'s names are in scope after it, and a
-                // correlated read's references.
-                PatternStep::Optional { inner, .. } | PatternStep::Correlate { inner, .. } => {
-                    bindings(inner, out)
-                }
-                PatternStep::Union { arms, .. } => arms.iter().for_each(|arm| bindings(arm, out)),
-                PatternStep::AntiJoin { .. }
-                | PatternStep::Filter(_)
-                | PatternStep::Rank { .. }
-                | PatternStep::Score { .. }
-                | PatternStep::Let { .. } => {}
-            }
-        }
-    }
-    fn calls(expr: &IRExpr, types: &HashMap<String, String>, out: &mut Vec<(String, String)>) {
-        match expr {
-            IRExpr::Search { field, .. }
-            | IRExpr::Fuzzy { field, .. }
-            | IRExpr::MatchText { field, .. }
-            | IRExpr::Bm25 { field, .. } => {
-                if let IRExpr::PropAccess {
-                    variable, property, ..
-                } = field.as_ref()
-                {
-                    if let Some(type_name) = types.get(variable) {
-                        let target = (type_name.clone(), property.clone());
-                        if !out.contains(&target) {
-                            out.push(target);
-                        }
-                    }
-                }
-            }
-            IRExpr::Rrf {
-                primary, secondary, ..
-            } => {
-                calls(primary, types, out);
-                calls(secondary, types, out);
-            }
-            IRExpr::Binary { left, right, .. } => {
-                calls(left, types, out);
-                calls(right, types, out);
-            }
-            IRExpr::Call {
-                func: ScalarFunc::MatchTerms { .. },
-                args,
-                ..
-            } => {
-                if let Some(IRExpr::PropAccess {
-                    variable, property, ..
-                }) = args.first()
-                    && let Some(type_name) = types.get(variable)
-                {
-                    let target = (type_name.clone(), property.clone());
-                    if !out.contains(&target) {
-                        out.push(target);
-                    }
-                }
-            }
-            IRExpr::Call { args, .. } => args.iter().for_each(|arg| calls(arg, types, out)),
-            IRExpr::Not(inner, _)
-            | IRExpr::Cast { expr: inner, .. }
-            | IRExpr::Neg { expr: inner, .. }
-            | IRExpr::IsNull { expr: inner, .. } => calls(inner, types, out),
-            IRExpr::PropAccess { .. }
-            | IRExpr::Nearest { .. }
-            | IRExpr::Variable(..)
-            | IRExpr::Param(..)
-            | IRExpr::Literal(..)
-            | IRExpr::Aggregate { .. }
-            | IRExpr::AliasRef(..) => {}
-        }
-    }
-    fn filter_calls(
-        ops: &[PatternStep],
-        types: &HashMap<String, String>,
-        out: &mut Vec<(String, String)>,
-    ) {
-        for op in ops {
-            match op {
-                PatternStep::NodeScan { filters, .. }
-                | PatternStep::Expand {
-                    dst_filters: filters,
-                    ..
-                } => filters.iter().for_each(|filter| calls(filter, types, out)),
-                PatternStep::Filter(filter) | PatternStep::Rank { key: filter, .. } => {
-                    calls(filter, types, out)
-                }
-                PatternStep::Score { .. } | PatternStep::Let { .. } => {}
-                PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
-                    let mut inner_types = types.clone();
-                    bindings(inner, &mut inner_types);
-                    filter_calls(inner, &inner_types, out);
-                }
-                PatternStep::Correlate { inner, read, .. } => {
-                    let mut inner_types = types.clone();
-                    bindings(inner, &mut inner_types);
-                    filter_calls(inner, &inner_types, out);
-                    read.exprs().for_each(|expr| calls(expr, &inner_types, out));
-                }
-                PatternStep::Union { arms, .. } => {
-                    for arm in arms {
-                        let mut arm_types = HashMap::new();
-                        bindings(arm, &mut arm_types);
-                        filter_calls(arm, &arm_types, out);
-                    }
-                }
-            }
-        }
-    }
-    let mut types = HashMap::new();
-    bindings(&ir.pipeline, &mut types);
-    let mut targets = Vec::new();
-    filter_calls(&ir.pipeline, &types, &mut targets);
-    if let Some(leading) = ir.order_by.first() {
-        calls(&leading.expr, &types, &mut targets);
-    }
-    targets
-}
-
-/// Every full-text call over a field whose index declares no analyzer reads
-/// that index, whose analyzer (case folding, stemming) a segment carries: a
-/// trained one with postings or the untrained declaration every write
-/// records. Coverage may be full or partial, since Lance scans uncovered rows
-/// with that analyzer; an absent index means no segment records the analyzer
-/// at the pinned snapshot, and Lance would fall back to a bare,
-/// case-sensitive tokenizer, so the call is refused rather than answered
-/// differently. A field that declares an analyzer is answered by the exact
-/// lexical scan, which instantiates the analyzer from the accepted schema,
-/// so a declared but unbuilt index answers. The type checker (`T27`)
-/// already required the declaration.
-fn require_full_text_indexes(ir: &ReadShape, source: &dyn PlanSource) -> Result<(), PlanError> {
-    for (type_name, property) in full_text_targets(ir) {
-        let type_key = format!("node:{type_name}");
-        if source.full_text_declares_analyzer(&type_key, &property) {
-            continue;
-        }
-        if source.full_text_coverage(&type_key, &property) == FullTextCoverage::Absent {
-            return Err(PlanError::FullTextIndexRequired {
-                index: format!("{type_name}.{property}"),
-            });
-        }
-    }
-    Ok(())
-}
-
 fn resolve_query(
     plan: &mut LogicalPlan,
     ir: &ReadShape,
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
-    require_full_text_indexes(ir, source)?;
     if ir.has_edge_selections() {
         let limit = source.traversal_work_limit().ok_or_else(|| {
             PlanError::refused(
@@ -831,9 +661,14 @@ fn resolve_pipeline(
             } => {
                 let input = bound(current, "score")?;
                 let schema = schema_of(plan, input)?;
-                let mut reads = vec![ColumnRef::property(binding, property)];
+                // `distance` reads the vector; an exact `bm25` finds each
+                // row's score by its identity, the retained `match_terms`
+                // reading only that (`reads_of_expr`).
+                let mut reads = Vec::new();
+                if *kind == ScoreKind::Distance {
+                    reads.push(ColumnRef::property(binding, property));
+                }
                 reads_of_expr(query, &mut reads);
-                // An exact `bm25` finds each row's score by its identity.
                 if *kind == ScoreKind::Bm25 {
                     reads.push(ColumnRef::property(binding, IDENTITY_MEMBER));
                 }
@@ -1793,6 +1628,20 @@ fn sort_tiebreak(
 /// Every column an expression reads. `count($v)` reads the identity alone;
 /// an alias, a parameter and a literal read nothing.
 pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
+    // A lexical predicate reads its binding's identity: the exact lexical
+    // scan reads the field from the table itself and answers each row by its
+    // identity, so its input never carries the field for it.
+    if let IRExpr::Call {
+        func: omnigraph_compiler::ir::expr::ScalarFunc::MatchTerms { .. },
+        args,
+        ..
+    } = expr
+        && let Some(IRExpr::PropAccess { variable, .. }) = args.first()
+    {
+        out.push(ColumnRef::property(variable, IDENTITY_MEMBER));
+        args[1..].iter().for_each(|arg| reads_of_expr(arg, out));
+        return;
+    }
     match expr {
         IRExpr::Binary { left, right, .. } => {
             reads_of_expr(left, out);
@@ -1820,23 +1669,9 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
             out.push(ColumnRef::property(variable, property));
             reads_of_expr(query, out);
         }
-        IRExpr::Search { field, query, .. }
-        | IRExpr::MatchText { field, query, .. }
-        | IRExpr::Bm25 { field, query, .. } => {
+        IRExpr::Bm25 { field, query, .. } => {
             reads_of_expr(field, out);
             reads_of_expr(query, out);
-        }
-        IRExpr::Fuzzy {
-            field,
-            max_edits,
-            query,
-            ..
-        } => {
-            reads_of_expr(field, out);
-            reads_of_expr(query, out);
-            if let Some(max_edits) = max_edits {
-                reads_of_expr(max_edits, out);
-            }
         }
         IRExpr::Rrf {
             primary,
@@ -2596,30 +2431,14 @@ fn coalesce_filters(plan: &mut LogicalPlan, filters: &[LogicalId]) {
     }
 }
 
-/// Where one conjunct of a scope goes, if anywhere: a search conjunct to the
-/// scan of its field's binding (exact membership on dependent scans too), a
-/// scalar conjunct on one binding to the read that can evaluate it.
+/// Where one conjunct of a scope goes, if anywhere: a scalar conjunct on one
+/// binding to the read that can evaluate it.
 fn placement_target(
     filter: &IRExpr,
     scans: &HashMap<String, LogicalId>,
     dependent_scans: &HashMap<String, LogicalId>,
     source: &dyn PlanSource,
 ) -> Option<LogicalId> {
-    if let Some(field) = search_filter_field(filter) {
-        let IRExpr::PropAccess { variable, .. } = field else {
-            return None;
-        };
-        let mut reads = Vec::new();
-        reads_of_expr(filter, &mut reads);
-        if reads.iter().any(|read| read.binding != *variable) {
-            return None;
-        }
-        return scans.get(variable).copied().or_else(|| {
-            dependent_scan_filter_pushable(filter, variable, source)
-                .then(|| dependent_scans.get(variable).copied())
-                .flatten()
-        });
-    }
     let mut reads = Vec::new();
     reads_of_expr(filter, &mut reads);
     let mut bindings: Vec<&str> = reads.iter().map(|read| read.binding.as_str()).collect();
@@ -2744,50 +2563,6 @@ fn searched_side_right(
         (right, left)
     } else {
         (left, right)
-    }
-}
-
-/// A dependent scan evaluates one-binding scalar predicates and exact text
-/// membership. Fuzzy and ranked retrieval retain their existing execution
-/// contract; a dependent read must not create a top-k window per input batch.
-fn dependent_scan_filter_pushable(filter: &IRExpr, binding: &str, source: &dyn PlanSource) -> bool {
-    let mut reads = Vec::new();
-    reads_of_expr(filter, &mut reads);
-    if reads.iter().any(|read| read.binding != binding) {
-        return false;
-    }
-    match search_filter_call(filter) {
-        Some(IRExpr::Search { field, .. } | IRExpr::MatchText { field, .. }) => {
-            matches!(field.as_ref(), IRExpr::PropAccess { variable, .. } if variable == binding)
-        }
-        Some(_) => false,
-        None => source.filter_pushable(filter),
-    }
-}
-
-/// The full-text call of a membership conjunct (`search`, `fuzzy`,
-/// `match_text`): the left operand of the `= true` comparison the compiler
-/// builds for a call standing alone, which a scan answers by its matches.
-/// Any other use of a call, under `not` or `or` or compared with anything
-/// else, is an ordinary Boolean operand that a `Filter` evaluates.
-fn search_filter_call(filter: &IRExpr) -> Option<&IRExpr> {
-    match filter.comparison_parts()? {
-        (
-            call @ (IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }),
-            CompOp::Eq,
-            IRExpr::Literal(Literal::Bool(true), _),
-        ) => Some(call),
-        _ => None,
-    }
-}
-
-/// The field of a full-text membership conjunct ([`search_filter_call`]).
-fn search_filter_field(filter: &IRExpr) -> Option<&IRExpr> {
-    match search_filter_call(filter)? {
-        IRExpr::Search { field, .. }
-        | IRExpr::Fuzzy { field, .. }
-        | IRExpr::MatchText { field, .. } => Some(field.as_ref()),
-        _ => None,
     }
 }
 
@@ -3003,10 +2778,7 @@ fn lexical_bindings(expr: &IRExpr, out: &mut Vec<String>) {
         | IRExpr::IsNull { expr: inner, .. } => lexical_bindings(inner, out),
         IRExpr::Call { args, .. } => args.iter().for_each(|arg| lexical_bindings(arg, out)),
         // The predicates themselves were taken above.
-        IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
-        | IRExpr::PropAccess { .. }
+        IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }

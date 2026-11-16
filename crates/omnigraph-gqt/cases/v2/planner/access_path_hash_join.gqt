@@ -1,10 +1,10 @@
 # issue: none
 # notes: A dense traversal (4 sources, 8 edges, 6 docs: the frontier estimate
 # notes: saturates at the table) reads the destination table once as the build
-# notes: side of a `HashJoin` node; the scalar filter and the searches stay
-# notes: inside that one read, two searches conjoined. Rows and multiplicity are the
-# notes: per-batch id lookup's. The last step is the same two searches on a
-# notes: root scan: the build side is a root scan, so it conjoins them too.
+# notes: side of a `HashJoin` node; the scalar filter stays inside that one read,
+# notes: and the lexical predicates are a `Filter` the exact lexical scan answers.
+# notes: Rows and multiplicity are the per-batch id lookup's. The last step is the
+# notes: same two predicates over a root scan.
 
 --- runner
 timeout_ms: 10000
@@ -63,7 +63,7 @@ s.slug: String
 d.slug: String
 --- expect plan
 hash join $d
-scan Doc as $d: filter reads [d.state, d.body]
+scan Doc as $d: filter reads [d.state]
 pass access_path
 
 --- query
@@ -87,7 +87,7 @@ s.slug: String
 d.slug: String
 --- expect plan
 hash join $d
-scan Doc as $d: filter reads [d.state, d.body]
+scan Doc as $d: filter reads [d.state]
 pass access_path
 
 --- query
@@ -133,7 +133,7 @@ s.slug: String
 d.slug: String
 --- expect plan
 hash join $d
-scan Doc as $d: filter reads [d.state, d.body, d.summary]
+scan Doc as $d: filter reads [d.state]
 pass access_path
 
 --- query
@@ -152,4 +152,4 @@ query root_scan_two_searches() {
 --- expect shape
 d.slug: String
 --- expect plan
-scan Doc as $d: filter reads [d.state, d.body, d.summary]
+scan Doc as $d: filter reads [d.state]

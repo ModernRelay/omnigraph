@@ -913,30 +913,11 @@ pub(super) fn validate_plan_values(
                     query,
                     ty: _,
                 } => pending.push(query),
-                IRExpr::Search {
-                    field,
-                    query,
-                    ty: _,
-                }
-                | IRExpr::MatchText {
-                    field,
-                    query,
-                    ty: _,
-                }
-                | IRExpr::Bm25 {
+                IRExpr::Bm25 {
                     field,
                     query,
                     ty: _,
                 } => pending.extend([field.as_ref(), query.as_ref()]),
-                IRExpr::Fuzzy {
-                    field,
-                    query,
-                    max_edits,
-                    ty: _,
-                } => {
-                    pending.extend([field.as_ref(), query.as_ref()]);
-                    pending.extend(max_edits.as_deref());
-                }
                 IRExpr::Rrf {
                     primary,
                     secondary,
@@ -976,8 +957,7 @@ pub(super) fn validate_plan_values(
             }
         }
         for filter in pushed_filters {
-            if !is_search_filter(filter)
-                && super::scan::ir_expr_to_df_expr(filter, params, None).is_none()
+            if super::scan::ir_expr_to_df_expr(filter, params, None).is_none()
             {
                 return Err(OmniError::manifest_internal(
                     "stored pushed filter cannot execute its recorded expression",

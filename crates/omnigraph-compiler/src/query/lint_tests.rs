@@ -670,57 +670,6 @@ fn selected_scopes_contribute_every_read_fact_issue_659() {
     }
 }
 
-/// `L202` names the profile to declare on a full-text index written without
-/// one, `english_v1` being the closest to edition 2's analysis; a declared
-/// profile and the index a String `@key` implies draw no finding.
-#[test]
-fn l202_names_the_profile_for_a_full_text_index_without_an_analyzer() {
-    let output = lint_query_file(
-        &catalog(
-            r#"
-node Doc {
-slug: String @key
-title: String @index
-body: String @index(fulltext)
-text: String @index(fulltext, analyzer = "standard_v1")
-note: String @index(fulltext, scorer = "none")
-}
-"#,
-        ),
-        "query q() { match { $d: Doc } return { $d.slug } }",
-        "/tmp/queries.gq",
-        QueryLintSchemaSource::file("/tmp/schema.pg"),
-    );
-    let findings = output
-        .findings
-        .iter()
-        .map(|finding| {
-            (
-                finding.code.as_str(),
-                finding.severity,
-                finding.property.as_deref().unwrap(),
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        findings,
-        vec![
-            ("L202", QueryLintSeverity::Info, "body"),
-            ("L202", QueryLintSeverity::Info, "note"),
-            ("L202", QueryLintSeverity::Info, "title"),
-        ]
-    );
-    assert!(
-        output.findings[0]
-            .message
-            .contains(r#"`@index(fulltext, analyzer = "english_v1")` being the closest"#),
-        "{}",
-        output.findings[0].message
-    );
-    assert_eq!((output.infos, output.warnings, output.errors), (3, 0, 0));
-    assert_eq!(output.status, QueryLintStatus::Ok);
-}
-
 /// The count-block rewrites lint names (docs/rfcs/2026-11-07-gq-3.md,
 /// sections 5 and 6), each at the block's position and with its fix: `L203`
 /// for `count { } > 0`, a canonical form whose fix keeps the typed IR, and

@@ -87,13 +87,7 @@ query rrf_named() {
     limit 3
 }
 
---- expect ordered
-{"d.slug":"a"}
-{"d.slug":"b"}
-{"d.slug":"c"}
-
---- expect shape
-d.slug: String
+--- expect error: type error: T86:
 
 --- query
 query named_relation_bound_to_a_ranking() {

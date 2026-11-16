@@ -281,8 +281,6 @@ pub enum NodeMirror {
         binding: String,
         type_name: String,
         property: String,
-        /// Absent in a plan saved before `bm25` scored exactly: `distance`.
-        #[serde(default)]
         kind: ScoreKindMirror,
         query: ExprMirror,
     },
@@ -1741,22 +1739,6 @@ pub enum ExprMirror {
         query: Box<ExprMirror>,
         ty: ExprType,
     },
-    Search {
-        field: Box<ExprMirror>,
-        query: Box<ExprMirror>,
-        ty: ExprType,
-    },
-    Fuzzy {
-        field: Box<ExprMirror>,
-        query: Box<ExprMirror>,
-        max_edits: Option<Box<ExprMirror>>,
-        ty: ExprType,
-    },
-    MatchText {
-        field: Box<ExprMirror>,
-        query: Box<ExprMirror>,
-        ty: ExprType,
-    },
     Bm25 {
         field: Box<ExprMirror>,
         query: Box<ExprMirror>,
@@ -1848,27 +1830,6 @@ impl From<&IRExpr> for ExprMirror {
             } => Self::Nearest {
                 variable: variable.clone(),
                 property: property.clone(),
-                query: boxed(query),
-                ty: ty.clone(),
-            },
-            IRExpr::Search { field, query, ty } => Self::Search {
-                field: boxed(field),
-                query: boxed(query),
-                ty: ty.clone(),
-            },
-            IRExpr::Fuzzy {
-                field,
-                query,
-                max_edits,
-                ty,
-            } => Self::Fuzzy {
-                field: boxed(field),
-                query: boxed(query),
-                max_edits: max_edits.as_deref().map(boxed),
-                ty: ty.clone(),
-            },
-            IRExpr::MatchText { field, query, ty } => Self::MatchText {
-                field: boxed(field),
                 query: boxed(query),
                 ty: ty.clone(),
             },
@@ -1974,27 +1935,6 @@ impl From<ExprMirror> for IRExpr {
             } => Self::Nearest {
                 variable,
                 property,
-                query: unboxed(*query),
-                ty,
-            },
-            ExprMirror::Search { field, query, ty } => Self::Search {
-                field: unboxed(*field),
-                query: unboxed(*query),
-                ty,
-            },
-            ExprMirror::Fuzzy {
-                field,
-                query,
-                max_edits,
-                ty,
-            } => Self::Fuzzy {
-                field: unboxed(*field),
-                query: unboxed(*query),
-                max_edits: max_edits.map(|inner| unboxed(*inner)),
-                ty,
-            },
-            ExprMirror::MatchText { field, query, ty } => Self::MatchText {
-                field: unboxed(*field),
                 query: unboxed(*query),
                 ty,
             },

@@ -1365,7 +1365,7 @@ impl StagedMutation {
             let declared_full_text = crate::db::omnigraph::table_ops::declared_full_text_columns(
                 &txn.catalog,
                 &table_key,
-            );
+            )?;
             let (detached, identity) = db
                 .storage()
                 .commit_staged_detached(dataset, staged_write, witness, &declared_full_text)

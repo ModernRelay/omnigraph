@@ -1890,25 +1890,6 @@ mod result_contract {
                 query: Box::new(text()),
                 ty: ty(ScalarType::F32, false),
             },
-            IRExpr::Search {
-                field: Box::new(property()),
-                query: Box::new(text()),
-                ty: ty(ScalarType::Bool, false),
-            },
-            IRExpr::Fuzzy {
-                field: Box::new(property()),
-                query: Box::new(text()),
-                max_edits: Some(Box::new(IRExpr::Literal(
-                    Literal::Integer(1),
-                    ty(ScalarType::I64, false),
-                ))),
-                ty: ty(ScalarType::Bool, false),
-            },
-            IRExpr::MatchText {
-                field: Box::new(property()),
-                query: Box::new(text()),
-                ty: ty(ScalarType::Bool, false),
-            },
             rank(),
             IRExpr::Rrf {
                 primary: Box::new(rank()),

@@ -329,9 +329,6 @@ fn evaluate_boolean(
         }
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
@@ -525,9 +522,6 @@ pub(super) fn evaluate_expr(
         }
         IRExpr::AliasRef(name, _) => alias_column(batch, name)?,
         IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
@@ -745,9 +739,6 @@ pub(super) fn evaluate_projection(
         | IRExpr::Call { .. } => Ok((expr.to_string(), evaluate_expr(wide_batch, expr, params)?)),
         IRExpr::AliasRef(name, _) => Ok((name.clone(), alias_column(wide_batch, name)?)),
         IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
         | IRExpr::Aggregate { .. } => Err(OmniError::manifest(format!(

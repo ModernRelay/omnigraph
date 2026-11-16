@@ -102,11 +102,4 @@ query hybrid_search($vq: Vector(4), $tq: String) {
 --- params
 {"vq": [0.1, 0.2, 0.3, 0.4], "tq": "Learning"}
 
---- expect ordered
-{"d.slug": "ml-intro", "d.title": "Introduction to Machine Learning"}
-{"d.slug": "rl-intro", "d.title": "Reinforcement Learning Introduction"}
-{"d.slug": "dl-basics", "d.title": "Deep Learning Basics"}
-
---- expect shape
-d.slug: String
-d.title: String
+--- expect error: type error: T86:

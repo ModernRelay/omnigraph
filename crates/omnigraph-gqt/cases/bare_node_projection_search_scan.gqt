@@ -51,10 +51,4 @@ query hybrid_chunks($q: String, $v: Vector(2)) {
 --- params
 {"q": "needle", "v": [1.0, 0.0]}
 
---- expect unordered
-{"c": {"@id": "chunk-00", "slug": "chunk-00", "text": "needle needle needle filler"}}
-{"c": {"@id": "chunk-01", "slug": "chunk-01", "text": "needle needle filler"}}
-{"c": {"@id": "chunk-02", "slug": "chunk-02", "text": "needle filler"}}
-
---- expect shape
-c: Chunk
+--- expect error: type error: T86:

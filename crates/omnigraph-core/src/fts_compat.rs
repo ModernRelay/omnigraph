@@ -20,10 +20,11 @@ pub const CERTIFICATE_FILE: &str = "omnigraph_fts_compat.json";
 // This names analyzer semantics, not the running Lance release. The audited
 // Lance 13 default analyzer remains compatible with certificates written on 11.
 pub const ANALYZER_GENERATION: &str = "lance11.0.0-frostem1.20260821.3-v1";
-/// A certificate of edition 2's analysis: the analyzer generation alone.
+/// A certificate of Lance's default analysis, written before every
+/// full-text field had a profile: the analyzer generation alone.
 const FORMAT_VERSION: u32 = 1;
-/// A certificate of a declared analyzer profile: the generation and the
-/// field's analyzer fingerprint.
+/// A certificate of an analyzer profile: the generation, the field's
+/// analyzer fingerprint and the native pipeline the postings were built with.
 const FORMAT_VERSION_FINGERPRINT: u32 = 2;
 pub const MAX_CERTIFICATE_BYTES: u64 = 64 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 4096;
@@ -36,16 +37,48 @@ struct Certificate {
     analyzer_generation: String,
     artifact_digest: String,
     /// The analyzer fingerprint of the profile the field declared when the
-    /// index was built (format 2); absent for edition 2's analysis (format 1).
+    /// index was built (format 2); absent for Lance's default analysis
+    /// (format 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     analyzer_fingerprint: Option<String>,
+    /// The pipeline Lance built the postings with (format 2), which is not
+    /// the profile the fingerprint names: Lance has no Unicode normalization
+    /// step, so a profile's NFC is not applied to the postings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native: Option<NativeBuild>,
+}
+
+/// What a full-text index's postings were built with, as built: recorded in
+/// its certificate beside the field's analyzer fingerprint, never in the
+/// fingerprint (docs/rfcs/2026-11-07-gq-3.md, section 4: whether an index
+/// stores term positions is a build option of the index). A native path that
+/// reads the postings is qualified against these facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeBuild {
+    /// The Unicode normalization applied before tokenization: `none`.
+    pub normalization: NativeNormalization,
+    /// Lance's posting block size.
+    pub block_size: u32,
+    /// Lance's inverted-list format version.
+    pub posting_format: u32,
+    /// Whether the postings store term positions.
+    pub positions: bool,
+}
+
+/// The Unicode normalization a native full-text build applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeNormalization {
+    None,
 }
 
 /// The analyzer fingerprint each full-text column's accepted schema declares
 /// (`@index(fulltext, analyzer = ...)`, docs/rfcs/2026-11-07-gq-3.md section
-/// 4). A column absent here declares edition 2's index analysis. The accepted
-/// schema chooses the analysis; an index proves it only by a certificate
-/// naming the same fingerprint, so a certificate of another analysis refuses.
+/// 4). The accepted schema chooses the analysis; an index proves it only by a
+/// certificate naming the same fingerprint, so a certificate of another
+/// analysis refuses. A column absent here is read by a caller that holds no
+/// schema (a raw scan filter): any certified analysis is accepted there.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeclaredAnalyzers(BTreeMap<String, String>);
 
@@ -54,7 +87,7 @@ impl DeclaredAnalyzers {
         Self(fingerprints.into_iter().collect())
     }
 
-    /// The fingerprint `column` declares, `None` for edition 2's analysis.
+    /// The fingerprint `column` declares, `None` when the caller holds none.
     pub fn fingerprint(&self, column: &str) -> Option<&str> {
         self.0.get(column).map(String::as_str)
     }
@@ -85,11 +118,12 @@ impl CacheKey for VerifiedCertificateKey {
 /// The returned file inventory participates in Lance's native index lifecycle.
 ///
 /// `fingerprint` is the analyzer fingerprint of the profile the segment was
-/// built with, `None` for edition 2's analysis.
+/// built with, `native` the pipeline Lance built its postings with.
 pub async fn write_certificate(
     dataset: &Dataset,
     index: &mut IndexMetadata,
-    fingerprint: Option<&str>,
+    fingerprint: &str,
+    native: NativeBuild,
 ) -> Result<()> {
     let files = inventory(index)?;
     if files.iter().any(|file| file.path == CERTIFICATE_FILE) || index.base_id.is_some() {
@@ -99,15 +133,12 @@ pub async fn write_certificate(
         ));
     }
     let certificate = Certificate {
-        format_version: if fingerprint.is_some() {
-            FORMAT_VERSION_FINGERPRINT
-        } else {
-            FORMAT_VERSION
-        },
+        format_version: FORMAT_VERSION_FINGERPRINT,
         index_uuid: index.uuid.to_string(),
         analyzer_generation: ANALYZER_GENERATION.to_owned(),
         artifact_digest: artifact_digest(index, &files)?,
-        analyzer_fingerprint: fingerprint.map(str::to_owned),
+        analyzer_fingerprint: Some(fingerprint.to_owned()),
+        native: Some(native),
     };
     let payload = serde_json::to_vec(&certificate).map_err(|error| {
         OmniError::manifest_internal(format!("encode FTS certificate: {error}"))
@@ -145,9 +176,10 @@ pub async fn write_certificate(
 }
 
 /// Verify one exact snapshot-selected FTS index segment before using it:
-/// its certificate must name this engine's analyzer generation and `expected`,
-/// the analyzer fingerprint the field's accepted schema declares (`None` for
-/// edition 2's analysis).
+/// its certificate must name this engine's analyzer generation and, when
+/// `expected` is the analyzer fingerprint the field's accepted schema
+/// declares, that fingerprint. With `expected` `None`, a caller that holds no
+/// schema, the certificate may name any analysis.
 pub async fn verify_index(
     dataset: &Dataset,
     index: &IndexMetadata,
@@ -250,10 +282,10 @@ fn verification_key(
     ] {
         hash_bytes(&mut digest, field.as_bytes());
     }
-    // The proof is of one analysis: a field that declares another must read
-    // the certificate again and refuse.
+    // The proof is of one expectation: a field that declares another
+    // analysis must read the certificate again and refuse.
     match expected {
-        None => digest.update(FORMAT_VERSION.to_le_bytes()),
+        None => digest.update(b"any"),
         Some(fingerprint) => {
             digest.update(FORMAT_VERSION_FINGERPRINT.to_le_bytes());
             hash_bytes(&mut digest, fingerprint.as_bytes());
@@ -308,8 +340,9 @@ fn verify_payload(
     match (
         certificate.format_version,
         &certificate.analyzer_fingerprint,
+        &certificate.native,
     ) {
-        (FORMAT_VERSION, None) | (FORMAT_VERSION_FINGERPRINT, Some(_)) => {}
+        (FORMAT_VERSION, None, None) | (FORMAT_VERSION_FINGERPRINT, Some(_), Some(_)) => {}
         _ => {
             return Err(rebuild_required(
                 index,
@@ -317,17 +350,12 @@ fn verify_payload(
             ));
         }
     }
-    if certificate.analyzer_fingerprint.as_deref() != expected {
+    if let Some(expected) = expected
+        && certificate.analyzer_fingerprint.as_deref() != Some(expected)
+    {
         return Err(rebuild_required(
             index,
-            match expected {
-                Some(_) => {
-                    "index was not built with the analyzer the field declares; rebuild it with the declared profile"
-                }
-                None => {
-                    "index was built with a declared analyzer profile the field no longer declares"
-                }
-            },
+            "index was not built with the analyzer the field declares; rebuild it with the declared profile",
         ));
     }
     if certificate.index_uuid != index.uuid.to_string() {
@@ -599,6 +627,7 @@ mod tests {
             analyzer_generation: ANALYZER_GENERATION.into(),
             artifact_digest: digest.clone(),
             analyzer_fingerprint: None,
+            native: None,
         })
         .unwrap();
         verify_payload(&index, &valid.to_string(), &digest, None).unwrap();
@@ -628,35 +657,57 @@ mod tests {
     }
 
     /// A field's declared analyzer is established only by a format-2
-    /// certificate naming its fingerprint: a certificate of edition 2's
-    /// analysis, of another profile, or of a profile the field no longer
-    /// declares refuses.
+    /// certificate naming its fingerprint and the native pipeline built: a
+    /// certificate of Lance's default analysis, of another profile, or with
+    /// either part missing refuses. A reader that holds no schema accepts
+    /// any certified analysis.
     #[test]
     fn certificate_establishes_only_the_declared_analyzer_fingerprint() {
         let index = index();
         let digest = digest(&index);
-        let certificate = |format_version, fingerprint: Option<&str>| {
-            serde_json::to_string(&Certificate {
-                format_version,
-                index_uuid: index.uuid.to_string(),
-                analyzer_generation: ANALYZER_GENERATION.into(),
-                artifact_digest: digest.clone(),
-                analyzer_fingerprint: fingerprint.map(str::to_owned),
-            })
-            .unwrap()
+        let native = NativeBuild {
+            normalization: NativeNormalization::None,
+            block_size: 128,
+            posting_format: 2,
+            positions: false,
         };
-        let english = certificate(FORMAT_VERSION_FINGERPRINT, Some("sha256:english"));
+        let certificate =
+            |format_version, fingerprint: Option<&str>, native: Option<NativeBuild>| {
+                serde_json::to_string(&Certificate {
+                    format_version,
+                    index_uuid: index.uuid.to_string(),
+                    analyzer_generation: ANALYZER_GENERATION.into(),
+                    artifact_digest: digest.clone(),
+                    analyzer_fingerprint: fingerprint.map(str::to_owned),
+                    native,
+                })
+                .unwrap()
+            };
+        let english = certificate(
+            FORMAT_VERSION_FINGERPRINT,
+            Some("sha256:english"),
+            Some(native),
+        );
         verify_payload(&index, &english, &digest, Some("sha256:english")).unwrap();
-        let edition_2 = certificate(FORMAT_VERSION, None);
+        verify_payload(&index, &english, &digest, None).unwrap();
+        let default_analysis = certificate(FORMAT_VERSION, None, None);
+        verify_payload(&index, &default_analysis, &digest, None).unwrap();
         for (payload, expected) in [
             (&english, Some("sha256:standard")),
-            (&english, None),
-            (&edition_2, Some("sha256:english")),
+            (&default_analysis, Some("sha256:english")),
             (
-                &certificate(FORMAT_VERSION, Some("sha256:english")),
+                &certificate(FORMAT_VERSION, Some("sha256:english"), None),
                 Some("sha256:english"),
             ),
-            (&certificate(FORMAT_VERSION_FINGERPRINT, None), None),
+            (&certificate(FORMAT_VERSION_FINGERPRINT, None, None), None),
+            (
+                &certificate(FORMAT_VERSION_FINGERPRINT, Some("sha256:english"), None),
+                Some("sha256:english"),
+            ),
+            (
+                &certificate(FORMAT_VERSION, None, Some(native)),
+                None,
+            ),
         ] {
             assert!(
                 matches!(

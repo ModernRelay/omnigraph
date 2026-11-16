@@ -1,32 +1,29 @@
-//! Full-text calls (`search`, `fuzzy`, `match_text`, `match_terms`) as
-//! Boolean operands.
+//! `match_terms` as a Boolean operand, and the exact `bm25` of a `Score`
+//! node, answered by the exact lexical scan ([`super::lexical_scan`]) inside
+//! the operator of their plan node.
 //!
-//! A call standing alone as a conjunct is answered by its binding's scan as
-//! membership in the call's matches. Anywhere else, under `not` or `or`,
-//! compared with a value or inside `coalesce`, it is the Boolean "this row
-//! is among the call's matches", which a `Filter` or a `let` evaluates (the
-//! planner keeps such a conjunct off a join's own conjuncts). Before the plan
-//! is lowered, each such call is answered once against its node type's table
-//! at the pinned snapshot, by the same full-text query the scan runs and with
-//! no filter, so the matches are the property's whole match set whatever the
-//! index's coverage (Lance scans uncovered fragments with the index's
-//! analyzer). The operator then reads each call as a Boolean column, the
-//! membership of the row's identity in that set, which a null or token-empty
-//! document never joins.
-//!
-//! A call over a field whose index declares an analyzer is answered by the
-//! exact lexical scan instead ([`super::lexical_scan`]), with no index read,
-//! and so is every exact `bm25` `Score` of the plan: its scores by identity,
-//! which the operator appends to the rows it keeps.
+//! Every full-text field has a profile, so every lexical call is answered by
+//! the exact scan, at every index state, and no full-text index is read
+//! (docs/rfcs/2026-11-07-gq-3.md, section 4). A `Filter` or `Let` reads each
+//! call as a Boolean column, the membership of the row's identity in the
+//! call's matches, which a null or token-empty document never joins; a
+//! `Score` appends each matching row's `bm25_v1` score. The operator runs the
+//! scan when its consumer first polls it, before it pulls its input, so a
+//! node that never runs (below a `Limit` of 0, say) scans nothing. The scan
+//! reads the field's table at the pinned snapshot under the engine's scan
+//! tuning, charges what it holds to the query's pool, charges its work to
+//! the read's work budget, and records the rows it read and the tokens it
+//! analyzed on its node's operator, which the execution report carries.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::StreamExt;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::core::ScoreKind;
-use omnigraph_compiler::ir::expr::ScalarFunc;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
 use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 use omnigraph_planner::{NodeId, PhysicalNode, PhysicalPlan};
@@ -38,178 +35,182 @@ use super::{OmniError, Result, Snapshot};
 /// while it evaluates; no GQ alias or `binding.property` name starts with it.
 const MEMBERSHIP: &str = "~lexical:";
 
-/// Every full-text call the plan evaluates as a Boolean operand, answered:
-/// the matching identities of its node type's table, by node type and call.
-#[derive(Default)]
-pub(super) struct LexicalMembers {
-    sets: HashMap<(String, IRExpr), Arc<HashSet<String>>>,
-    /// The `bm25_v1` score of every match of each exact `bm25` `Score` node,
-    /// by identity.
-    scores: HashMap<NodeId, Arc<HashMap<String, f64>>>,
-    /// The charge the sets hold for the query's lifetime.
-    _memory: Option<WorkMemory>,
+/// The metric counting the rows an operator's exact lexical scans read.
+pub(crate) const SCAN_ROWS_METRIC: &str = "lexical_scan_rows";
+/// The metric counting the tokens an operator's exact lexical scans analyzed.
+pub(crate) const SCAN_TOKENS_METRIC: &str = "lexical_scan_tokens";
+
+/// What an exact lexical scan reads: the pinned snapshot, the accepted
+/// catalog and the bound parameters. `None` snapshot for a lowering with no
+/// graph storage, which refuses when the scan runs.
+#[derive(Clone)]
+pub(crate) struct LexicalSource {
+    snapshot: Option<Snapshot>,
+    catalog: Arc<Catalog>,
+    params: Arc<ParamMap>,
 }
 
-impl LexicalMembers {
-    /// Answer every full-text operand of `plan` at `snapshot`, charging the
-    /// match sets to `memory`.
-    pub(super) async fn resolve(
-        plan: &PhysicalPlan,
-        params: &ParamMap,
+impl LexicalSource {
+    pub(super) fn new(
         snapshot: Option<&Snapshot>,
-        catalog: &Catalog,
-        memory: WorkMemory,
-    ) -> Result<Self> {
-        let mut wanted: Vec<(String, IRExpr)> = Vec::new();
-        for (id, node) in plan.live() {
-            for expr in operand_exprs(node) {
-                let mut calls = Vec::new();
-                calls_of(expr, &mut calls);
-                for call in calls {
-                    let Some(type_name) = call_type(plan, id, call) else {
-                        return Err(OmniError::manifest_internal(format!(
-                            "the full-text call `{call}` reads a binding no input of node {id} introduces"
-                        )));
-                    };
-                    let key = (type_name, call.clone());
-                    if !wanted.contains(&key) {
-                        wanted.push(key);
-                    }
-                }
-            }
+        catalog: &Arc<Catalog>,
+        params: &Arc<ParamMap>,
+    ) -> Self {
+        Self {
+            snapshot: snapshot.cloned(),
+            catalog: Arc::clone(catalog),
+            params: Arc::clone(params),
         }
-        let exact_scores: Vec<(NodeId, &str, &IRExpr)> = plan
-            .live()
-            .filter_map(|(id, node)| match node {
-                PhysicalNode::Score {
-                    type_name,
-                    kind: ScoreKind::Bm25,
-                    query,
-                    ..
-                } => Some((id, type_name.as_str(), query)),
-                _ => None,
-            })
-            .collect();
-        if wanted.is_empty() && exact_scores.is_empty() {
-            return Ok(Self::default());
-        }
-        let snapshot = snapshot.ok_or_else(|| super::no_graph_storage("a full-text call"))?;
-        let mut scores = HashMap::new();
-        for (id, type_name, call) in exact_scores {
-            let (property, query) =
-                super::lexical_scan::query_of_call(catalog, type_name, call, params)?;
-            let scored =
-                super::lexical_scan::bm25(snapshot, catalog, type_name, &property, &query, &memory)
-                    .await?;
-            scores.insert(id, Arc::new(scored));
-        }
-        let mut sets = HashMap::new();
-        for (type_name, call) in wanted {
-            if let Some(property) = exact_property(catalog, &type_name, &call) {
-                let (_, query) =
-                    super::lexical_scan::query_of_call(catalog, &type_name, &call, params)?;
-                let ids = super::lexical_scan::members(
-                    snapshot, catalog, &type_name, &property, &query, &memory,
-                )
-                .await?;
-                sets.insert((type_name, call), Arc::new(ids));
-                continue;
-            }
-            let query = super::scan::build_fts_query(&call, params)?.ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "the full-text call `{call}` does not search a property"
-                ))
-            })?;
-            let dataset = snapshot
-                .open_lance_dataset(&format!("node:{type_name}"))
-                .await?;
-            let node_type = catalog.node_types.get(&type_name).ok_or_else(|| {
-                OmniError::manifest_internal(format!("unknown node type '{type_name}'"))
-            })?;
-            let ids = super::scan::search_filter_member_ids(
-                &dataset,
-                node_type,
-                None,
-                query,
-                catalog.system_columns.id,
-                &memory,
-            )
-            .await?;
-            memory
-                .entries::<String>(ids.len())
-                .map_err(|error| memory.error(error))?;
-            sets.insert((type_name, call), Arc::new(ids.into_iter().collect()));
-        }
-        Ok(Self {
-            sets,
-            scores,
-            _memory: Some(memory),
-        })
     }
 
-    /// The scores the exact `bm25` `Score` node `id` appends, by identity;
-    /// `None` for a lowering that does not run.
-    pub(super) fn scores(&self, id: NodeId) -> Option<Arc<HashMap<String, f64>>> {
-        self.scores.get(&id).map(Arc::clone)
+    fn snapshot(&self) -> Result<&Snapshot> {
+        self.snapshot
+            .as_ref()
+            .ok_or_else(|| super::no_graph_storage("a full-text call"))
     }
 
-    /// `exprs` of node `id` with every full-text call read as its membership
-    /// column, and the columns the operator adds to read them; `None` when no
-    /// expression holds a call. A call this set did not answer, as in a
-    /// lowering for explain alone, is left as written.
+    /// `exprs` of node `id` with every full-text call read as a membership
+    /// column, and the columns the operator adds and answers; `None` when no
+    /// expression holds a call.
     pub(super) fn columns(
         &self,
         plan: &PhysicalPlan,
         id: NodeId,
         exprs: &[IRExpr],
-        catalog: &Catalog,
-    ) -> (Vec<IRExpr>, Option<Arc<LexicalColumns>>) {
+    ) -> Result<(Vec<IRExpr>, Option<Arc<LexicalColumns>>)> {
         let mut columns: Vec<LexicalColumn> = Vec::new();
+        let mut failed = None;
         let mut rewrite = |call: &IRExpr| -> Option<IRExpr> {
-            let type_name = call_type(plan, id, call)?;
-            let ids = self.sets.get(&(type_name, call.clone()))?;
-            let binding = call_binding(call)?;
+            if failed.is_some() {
+                return None;
+            }
             let hidden = match columns.iter().position(|column| column.call == *call) {
                 Some(position) => columns[position].hidden.clone(),
                 None => {
-                    let hidden = format!("{MEMBERSHIP}{}", columns.len());
-                    columns.push(LexicalColumn {
-                        call: call.clone(),
-                        hidden: hidden.clone(),
-                        id_column: format!("{binding}.{}", catalog.system_columns.id),
-                        ids: Arc::clone(ids),
-                    });
-                    hidden
+                    let column = (|| {
+                        let type_name = call_type(plan, id, call).ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "the full-text call `{call}` reads a binding no input of node {id} introduces"
+                            ))
+                        })?;
+                        let binding = call_binding(call).ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "the full-text call `{call}` does not search a property of a binding"
+                            ))
+                        })?;
+                        Ok::<_, OmniError>(LexicalColumn {
+                            call: call.clone(),
+                            type_name,
+                            hidden: format!("{MEMBERSHIP}{}", columns.len()),
+                            id_column: format!("{binding}.{}", self.catalog.system_columns.id),
+                            ids: OnceLock::new(),
+                        })
+                    })();
+                    match column {
+                        Ok(column) => {
+                            let hidden = column.hidden.clone();
+                            columns.push(column);
+                            hidden
+                        }
+                        Err(error) => {
+                            failed = Some(error);
+                            return None;
+                        }
+                    }
                 }
             };
             Some(IRExpr::AliasRef(hidden, membership_type()))
         };
-        let exprs = exprs
+        let exprs: Vec<IRExpr> = exprs
             .iter()
             .map(|expr| substitute(expr, &mut rewrite))
             .collect();
-        let columns = (!columns.is_empty()).then(|| Arc::new(LexicalColumns { columns }));
-        (exprs, columns)
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        let columns = (!columns.is_empty()).then(|| {
+            Arc::new(LexicalColumns {
+                source: self.clone(),
+                columns,
+                held: Mutex::new(None),
+            })
+        });
+        Ok((exprs, columns))
+    }
+
+    /// The exact `bm25` of the `Score` node of `type_name` whose retained
+    /// predicate is `call`, answered when its operator runs.
+    pub(super) fn score(&self, type_name: &str, call: &IRExpr) -> Arc<LexicalScore> {
+        Arc::new(LexicalScore {
+            source: self.clone(),
+            type_name: type_name.to_string(),
+            call: call.clone(),
+            scores: OnceLock::new(),
+            held: Mutex::new(None),
+        })
     }
 }
 
-/// The membership columns one operator reads, added to each input batch
-/// while it evaluates and never emitted.
-#[derive(Debug)]
+/// The membership columns one operator reads, answered once when it first
+/// runs, added to each input batch while it evaluates and never emitted.
 pub(crate) struct LexicalColumns {
+    source: LexicalSource,
     columns: Vec<LexicalColumn>,
+    /// The charge the answered sets hold for the operator's lifetime.
+    held: Mutex<Option<WorkMemory>>,
 }
 
-#[derive(Debug)]
 struct LexicalColumn {
     call: IRExpr,
+    type_name: String,
     hidden: String,
     /// The `binding.<id>` column of the batch holding the row's identity.
     id_column: String,
-    ids: Arc<HashSet<String>>,
+    ids: OnceLock<Arc<HashSet<String>>>,
+}
+
+impl std::fmt::Debug for LexicalColumns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.columns.iter().map(|column| column.call.to_string()))
+            .finish()
+    }
 }
 
 impl LexicalColumns {
+    /// Run the exact lexical scan of every column not yet answered, charging
+    /// the match sets to `memory`, which also counts the rows read and the
+    /// tokens analyzed.
+    pub(crate) async fn answer(&self, memory: WorkMemory) -> Result<()> {
+        if self.columns.iter().all(|column| column.ids.get().is_some()) {
+            return Ok(());
+        }
+        let snapshot = self.source.snapshot()?;
+        for column in &self.columns {
+            if column.ids.get().is_some() {
+                continue;
+            }
+            let (property, query) = super::lexical_scan::query_of_call(
+                &self.source.catalog,
+                &column.type_name,
+                &column.call,
+                &self.source.params,
+            )?;
+            let ids = super::lexical_scan::members(
+                snapshot,
+                &self.source.catalog,
+                &column.type_name,
+                &property,
+                &query,
+                &memory,
+            )
+            .await?;
+            let _ = column.ids.set(Arc::new(ids));
+        }
+        *super::operators::memory::locked(&self.held) = Some(memory);
+        Ok(())
+    }
+
     /// `batch` with each membership column appended: true where the row's
     /// identity is among the call's matches, false elsewhere.
     pub(crate) fn widen(&self, batch: &RecordBatch) -> Result<RecordBatch> {
@@ -217,6 +218,12 @@ impl LexicalColumns {
         let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
         let mut arrays: Vec<ArrayRef> = batch.columns().to_vec();
         for column in &self.columns {
+            let set = column.ids.get().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "the full-text call `{}` was evaluated before its scan ran",
+                    column.call
+                ))
+            })?;
             let ids = batch
                 .column_by_name(&column.id_column)
                 .and_then(|array| array.as_any().downcast_ref::<StringArray>())
@@ -227,7 +234,7 @@ impl LexicalColumns {
                     ))
                 })?;
             let member: BooleanArray = (0..ids.len())
-                .map(|row| Some(ids.is_valid(row) && column.ids.contains(ids.value(row))))
+                .map(|row| Some(ids.is_valid(row) && set.contains(ids.value(row))))
                 .collect();
             fields.push(Field::new(&column.hidden, DataType::Boolean, false));
             arrays.push(Arc::new(member));
@@ -237,49 +244,76 @@ impl LexicalColumns {
     }
 }
 
+/// The exact `bm25` of one `Score` node: the `bm25_v1` score of every match
+/// by identity, answered once when the operator first runs.
+pub(crate) struct LexicalScore {
+    source: LexicalSource,
+    type_name: String,
+    call: IRExpr,
+    scores: OnceLock<Arc<HashMap<String, f64>>>,
+    held: Mutex<Option<WorkMemory>>,
+}
+
+impl std::fmt::Debug for LexicalScore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bm25 of {} over `{}`", self.type_name, self.call)
+    }
+}
+
+impl LexicalScore {
+    /// Run the exact lexical scan once, charging the scores to `memory`.
+    pub(crate) async fn answer(&self, memory: WorkMemory) -> Result<()> {
+        if self.scores.get().is_some() {
+            return Ok(());
+        }
+        let snapshot = self.source.snapshot()?;
+        let (property, query) = super::lexical_scan::query_of_call(
+            &self.source.catalog,
+            &self.type_name,
+            &self.call,
+            &self.source.params,
+        )?;
+        let scores = super::lexical_scan::bm25(
+            snapshot,
+            &self.source.catalog,
+            &self.type_name,
+            &property,
+            &query,
+            &memory,
+        )
+        .await?;
+        let _ = self.scores.set(Arc::new(scores));
+        *super::operators::memory::locked(&self.held) = Some(memory);
+        Ok(())
+    }
+
+    /// The score of the match `id`; `None` for an identity that does not
+    /// match. An error before the scan ran.
+    pub(crate) fn scores(&self) -> Result<&HashMap<String, f64>> {
+        self.scores.get().map(|scores| scores.as_ref()).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "the exact `bm25` over `{}` was read before its scan ran",
+                self.call
+            ))
+        })
+    }
+}
+
+/// `input`, preceded by `answer`: the consumer's first poll runs `answer`
+/// before the input is pulled, and an error it returns is the stream's.
+pub(crate) fn answered_first<F>(input: SendableRecordBatchStream, answer: F) -> SendableRecordBatchStream
+where
+    F: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let schema = input.schema();
+    let first = futures::stream::once(answer).filter_map(|answered| async move {
+        answered.err().map(|error| Err(super::operators::external(error)))
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, first.chain(input)))
+}
+
 fn membership_type() -> ExprType {
     ExprType::from_prop(&PropType::scalar(ScalarType::Bool, false))
-}
-
-/// The expressions of `node` whose full-text calls an operator evaluates.
-fn operand_exprs(node: &PhysicalNode) -> Vec<&IRExpr> {
-    match node {
-        PhysicalNode::Filter { filters, .. } => filters.iter().collect(),
-        PhysicalNode::Let { value, .. } => vec![value],
-        _ => Vec::new(),
-    }
-}
-
-/// Every full-text call in `expr`.
-fn calls_of<'e>(expr: &'e IRExpr, out: &mut Vec<&'e IRExpr>) {
-    if expr.lexical_predicate_field().is_some() {
-        out.push(expr);
-        return;
-    }
-    match expr {
-        IRExpr::Binary { left, right, .. } => {
-            calls_of(left, out);
-            calls_of(right, out);
-        }
-        IRExpr::Not(inner, _)
-        | IRExpr::Cast { expr: inner, .. }
-        | IRExpr::Neg { expr: inner, .. }
-        | IRExpr::IsNull { expr: inner, .. } => calls_of(inner, out),
-        IRExpr::Call { args, .. } => args.iter().for_each(|arg| calls_of(arg, out)),
-        // The predicates themselves were taken above.
-        IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
-        | IRExpr::PropAccess { .. }
-        | IRExpr::Nearest { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
-        | IRExpr::Variable(..)
-        | IRExpr::Param(..)
-        | IRExpr::Literal(..)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(..) => {}
-    }
 }
 
 /// `expr` with every full-text call `rewrite` answers replaced by its answer.
@@ -328,27 +362,6 @@ fn substitute(expr: &IRExpr, rewrite: &mut impl FnMut(&IRExpr) -> Option<IRExpr>
             ty: ty.clone(),
         },
         other => other.clone(),
-    }
-}
-
-/// The property a `match_terms` call over `type_name` reads, when its index
-/// declares an analyzer and the exact lexical scan answers it.
-fn exact_property(catalog: &Catalog, type_name: &str, call: &IRExpr) -> Option<String> {
-    let IRExpr::Call {
-        func: ScalarFunc::MatchTerms { .. },
-        args,
-        ..
-    } = call
-    else {
-        return None;
-    };
-    match args.first()? {
-        IRExpr::PropAccess { property, .. }
-            if super::lexical_scan::declared_profile(catalog, type_name, property).is_some() =>
-        {
-            Some(property.clone())
-        }
-        _ => None,
     }
 }
 

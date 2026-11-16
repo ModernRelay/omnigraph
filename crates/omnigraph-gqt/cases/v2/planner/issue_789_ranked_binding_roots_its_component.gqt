@@ -16,7 +16,7 @@ node Person {
 }
 node Doc {
     slug: String @key
-    body: String @index
+    body: String @index(fulltext, analyzer = "standard_folded_v1")
     embedding: Vector(2) @index
 }
 edge Knows: Person -> Doc
@@ -54,7 +54,7 @@ query bm25_on_an_undeclared_destination() {
 --- expect shape
 d.slug: String
 --- expect plan
-scan Doc as $d: ranked bm25
+pipeline 1: Scan -> Expand -> HashJoin(probe) -> Score -> Projection => Sort after 0
 
 --- expect same as reference
 --- query
@@ -74,7 +74,7 @@ query bm25_two_hops_from_the_source() {
 x.slug: String
 d.slug: String
 --- expect plan
-scan Doc as $d: ranked bm25
+pipeline 2: Scan -> Expand -> HashJoin(probe) -> Expand -> HashJoin(probe) -> Score -> Projection => Sort after 0, 1
 
 --- expect same as reference
 --- query
@@ -92,7 +92,7 @@ query bm25_on_a_traversal_source() {
 --- expect shape
 d.slug: String
 --- expect plan
-scan Doc as $d: ranked bm25
+pipeline 1: Scan -> Expand -> HashJoin(probe) -> Score -> Projection => Sort after 0
 
 --- expect same as reference
 --- query
@@ -111,6 +111,6 @@ query bm25_over_an_undirected_traversal() {
 --- expect shape
 d.slug: String
 --- expect plan
-scan Doc as $d: ranked bm25
+pipeline 1: Scan -> Expand -> HashJoin(probe) -> Score -> Projection => Sort after 0
 
 --- expect same as reference

@@ -6567,16 +6567,16 @@ query vector_search_string($q: String) {
     );
 }
 
-/// A ranked read's envelope reports its ranking: the fusion, the direction
-/// its score orders, that two `bm25` arms score every match, and both
-/// columns that read the fused score; since the object is compared whole, no
-/// parameter value appears. An unranked read carries none.
+/// A ranked read's envelope reports its ranking: the exact `bm25`, the
+/// direction its score orders, that it scores every match, and both columns
+/// that read the score; since the object is compared whole, no parameter
+/// value appears. An unranked read carries none.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_envelope_reports_its_ranking() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    title: String @index\n}\n";
     const QUERIES: &str = r#"
-query fused($a: String, $b: String) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $a), bm25($all, $d.title, $b), k: 60) as $score, $d: Doc }
+query fused($a: String) {
+    match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.title, $a) as $score }
     return {
         $d.slug,
         $score as fused,
@@ -6612,7 +6612,7 @@ query unranked() {
             &json!({
                 "query": QUERIES,
                 "name": "fused",
-                "params": {"a": "needle", "b": "guide"}
+                "params": {"a": "needle guide"}
             }),
         ),
     )
@@ -6621,7 +6621,7 @@ query unranked() {
     assert_eq!(
         body["ranking"],
         json!({
-            "by": "rrf",
+            "by": "bm25",
             "order": "descending",
             "exhaustive": true,
             "score_columns": ["fused", "again"]

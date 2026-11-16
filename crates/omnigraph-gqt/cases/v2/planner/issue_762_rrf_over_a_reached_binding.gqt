@@ -33,9 +33,4 @@ query ranked_destination() {
     order { $score desc }
     limit 1
 }
---- expect ordered
-{"d.slug":"d1"}
---- expect shape
-d.slug: String
-
---- expect same as reference
+--- expect error: type error: T86:

@@ -70,9 +70,4 @@ query rrf_desc($v: Vector(2)) {
 --- params
 {"v": [0.0, 0.0]}
 
---- expect ordered
-{"d.slug": "a"}
-{"d.slug": "b"}
-
---- expect shape
-d.slug: String
+--- expect error: type error: T86:

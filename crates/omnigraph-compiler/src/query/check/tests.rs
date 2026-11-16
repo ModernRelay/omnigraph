@@ -559,7 +559,7 @@ fn a_relation_function_over_zero_and_two_node_columns() {
         vec![
             ("p.name".to_string(), "String".to_string()),
             ("d.title".to_string(), "String".to_string()),
-            ("score".to_string(), "F32".to_string()),
+            ("score".to_string(), "F64".to_string()),
         ]
     );
     // A bare field name is refused at its word, and the suggestion names the
@@ -1114,7 +1114,7 @@ fn the_ranking_functions_type_their_result_columns() {
     let c = ok(
         "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s, mode: any, max_edits: 0)) as $score } return { $score } }",
     );
-    assert_eq!(cols(&c)[0], ("score".into(), "F32".into()));
+    assert_eq!(cols(&c)[0], ("score".into(), "F64".into()));
     // `rrf` yields the target and `score` only: the population's other
     // columns are gone after fusion.
     let fused = "let $docs = { match { $p: Person, $d: Doc, $p authored $d } return { $p, $d } },
@@ -1849,7 +1849,7 @@ fn a_ranked_from_names_its_score() {
     let c = ok(&format!(
         "query q($s: String) {{ match {{ {pop}, from bm25($pop, $d.body, $s) as $relevance }} return {{ $relevance }} }}"
     ));
-    assert_eq!(cols(&c)[0], ("relevance".into(), "F32".into()));
+    assert_eq!(cols(&c)[0], ("relevance".into(), "F64".into()));
     let c = ok(&format!(
         "query q($v: Vector(3)) {{ match {{ {pop}, from distance($pop, $d.embedding, $v) as $exact }} return {{ $exact }} }}"
     ));

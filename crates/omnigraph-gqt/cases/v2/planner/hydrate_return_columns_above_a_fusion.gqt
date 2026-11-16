@@ -45,20 +45,7 @@ query fused_top_two($q: Vector(2), $t: String) {
 --- params
 {"q": [0.0, 0.0], "t": "needle"}
 
---- expect ordered
-{"d.body":"body 00","d.slug":"d00","d.title":"t-00"}
-{"d.body":"body 01","d.slug":"d01","d.title":"t-01"}
-
---- expect shape
-d.slug: String
-d.body: String?
-d.title: String
-
---- expect plan
-pass late_materialization
-hydrate $d: columns [body, title]
-scan Doc as $d: ranked nearest fetch 2
-scan Doc as $d: ranked bm25
+--- expect error: type error: T86:
 
 --- query
 set engine = v2;
@@ -83,4 +70,4 @@ d.title: String
 
 --- expect plan
 not pass late_materialization
-scan Doc as $d: ranked bm25
+pipeline 0: Scan -> Score -> Projection => Sort

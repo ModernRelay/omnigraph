@@ -20,18 +20,6 @@ pub(crate) fn expr(root: &IRExpr) -> Value {
                 let (op, children): (&'static str, Vec<&IRExpr>) = match expr {
                     IRExpr::PropAccess { .. } => ("property", vec![]),
                     IRExpr::Nearest { query, .. } => ("nearest", vec![query]),
-                    IRExpr::Search { field, query, .. } => ("search", vec![field, query]),
-                    IRExpr::Fuzzy {
-                        field,
-                        query,
-                        max_edits,
-                        ..
-                    } => {
-                        let mut args = vec![field.as_ref(), query.as_ref()];
-                        args.extend(max_edits.as_deref());
-                        ("fuzzy", args)
-                    }
-                    IRExpr::MatchText { field, query, .. } => ("match_text", vec![field, query]),
                     IRExpr::Bm25 { field, query, .. } => ("bm25", vec![field, query]),
                     IRExpr::Rrf {
                         primary,
@@ -186,24 +174,6 @@ mod tests {
         assert_eq!(tree["args"][0]["args"][0]["type"], "I32");
         assert_eq!(tree["args"][1]["gq"], "$right");
         assert_eq!(tree["args"][1]["args"][0]["type"], "U32");
-        let fuzzy = IRExpr::Fuzzy {
-            field: Box::new(IRExpr::PropAccess {
-                variable: "p".into(),
-                property: "name".into(),
-                ty: ty(ScalarType::String, false),
-            }),
-            query: Box::new(IRExpr::Param("query".into(), ty(ScalarType::String, false))),
-            max_edits: Some(Box::new(IRExpr::Literal(
-                Literal::Integer(2),
-                ty(ScalarType::I64, false),
-            ))),
-            ty: ty(ScalarType::Bool, false),
-        };
-        let tree = expr(&fuzzy);
-        assert_eq!(tree["args"].as_array().unwrap().len(), 3);
-        assert_eq!(tree["args"][0]["gq"], "$p.name");
-        assert_eq!(tree["args"][1]["gq"], "$query");
-        assert_eq!(tree["args"][2]["gq"], "2");
     }
 
     #[test]

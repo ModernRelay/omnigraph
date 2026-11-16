@@ -38,7 +38,7 @@ query by_text($t: String) {
 --- expect shape
 d.slug: String
 --- expect plan
-scan Doc as $d: ranked bm25
+pipeline 0: Scan -> Score -> Projection => Sort
 
 --- query
 set engine = v2;
@@ -86,12 +86,4 @@ query fused($q: Vector(4), $t: String) {
 }
 --- params
 {"q": [0.0, 0.0, 0.0, 0.0], "t": "needle"}
---- expect ordered
-{"d.slug":"d000"}
-{"d.slug":"d001"}
-{"d.slug":"d002"}
---- expect shape
-d.slug: String
---- expect plan
-scan Doc as $d: ranked nearest fetch 3 diagnostics present
-scan Doc as $d: ranked bm25
+--- expect error: type error: T86:

@@ -65,6 +65,48 @@ pub(crate) struct ReportRow {
     /// never part of the row itself.
     #[serde(skip)]
     spill: Option<SpillRow>,
+    /// What the pass's exact lexical scans read, as the pass's entry for
+    /// the report's own `lexical` list, moved there when the row is
+    /// recorded; never part of the row itself.
+    #[serde(skip)]
+    lexical: Option<LexicalRow>,
+}
+
+/// What one operator's exact lexical scans read in one pass: the rows of
+/// the field's table and the tokens their values analyzed to
+/// ([`super::lexical`]). A scan's cost, kept apart from `rows`, which
+/// replays compare, like spills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct LexicalScanned {
+    pub(crate) rows: u64,
+    pub(crate) tokens: u64,
+}
+
+impl LexicalScanned {
+    /// The exact lexical scans counted in `metrics`; `None` when the
+    /// operator ran none.
+    pub(super) fn read(metrics: &datafusion::physical_plan::metrics::MetricsSet) -> Option<Self> {
+        let count = |name: &str| {
+            metrics
+                .sum_by_name(name)
+                .map(|value| value.as_usize() as u64)
+        };
+        let rows = count(super::lexical::SCAN_ROWS_METRIC)?;
+        Some(Self {
+            rows,
+            tokens: count(super::lexical::SCAN_TOKENS_METRIC).unwrap_or(0),
+        })
+    }
+}
+
+/// The exact lexical scans of one node's operator in the overfetch pass
+/// `rung`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct LexicalRow {
+    id: NodeId,
+    rung: usize,
+    #[serde(flatten)]
+    scanned: LexicalScanned,
 }
 
 /// What one operator wrote to scratch files in one pass: DataFusion's
@@ -110,6 +152,7 @@ impl ReportRow {
         actual_rows: u64,
         drained: Option<bool>,
         spilled: Option<Spilled>,
+        lexical: Option<LexicalScanned>,
     ) -> Self {
         Self {
             id,
@@ -126,6 +169,7 @@ impl ReportRow {
                 drained,
             }],
             spill: spilled.map(|spilled| SpillRow { id, rung, spilled }),
+            lexical: lexical.map(|scanned| LexicalRow { id, rung, scanned }),
         }
     }
 }
@@ -208,6 +252,10 @@ pub struct ExecutionReport {
     /// kept apart from `rows`, which replays compare.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     spill: Vec<SpillRow>,
+    /// One entry per operator pass that ran an exact lexical scan, in the
+    /// order recorded: the rows it read and the tokens it analyzed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    lexical: Vec<LexicalRow>,
 }
 
 impl ExecutionReport {
@@ -223,6 +271,16 @@ impl ExecutionReport {
             .iter()
             .filter(|spill| spill.id == id)
             .map(|spill| (spill.rung, spill.spilled))
+            .collect()
+    }
+
+    /// The `lexical` entries of node `id`, as `(rung, scanned)`.
+    #[cfg(test)]
+    pub(crate) fn lexical_scans(&self, id: NodeId) -> Vec<(usize, LexicalScanned)> {
+        self.lexical
+            .iter()
+            .filter(|row| row.id == id)
+            .map(|row| (row.rung, row.scanned))
             .collect()
     }
 
@@ -267,6 +325,9 @@ impl ExecutionReport {
         for mut row in pass {
             if let Some(spill) = row.spill.take() {
                 self.spill.push(spill);
+            }
+            if let Some(lexical) = row.lexical.take() {
+                self.lexical.push(lexical);
             }
             match self.rows.iter_mut().find(|met| met.id == row.id) {
                 None => self.rows.push(row),

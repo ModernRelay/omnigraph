@@ -1765,7 +1765,7 @@ async fn apply_optimize_table_effects(
     let base = work.initial_snapshot;
     let witness = work.witness;
     let source_bytes = work.source_bytes;
-    let declared_full_text = super::table_ops::declared_full_text_columns(catalog, &table_key);
+    let declared_full_text = super::table_ops::declared_full_text_columns(catalog, &table_key)?;
     fail(&OPTIMIZE_BEFORE_COMPACT)?;
     let options = CompactionOptions::default();
     let mut chain = Vec::new();

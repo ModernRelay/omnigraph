@@ -534,9 +534,9 @@ where
         let accepted = super::table_ops::declared_full_text_columns(
             accepted_catalog.as_ref(),
             source_table_key,
-        );
+        )?;
         let columns: Vec<FullTextColumn> =
-            super::table_ops::declared_full_text_columns(&desired_catalog, table_key)
+            super::table_ops::declared_full_text_columns(&desired_catalog, table_key)?
                 .into_iter()
                 .filter(|column| {
                     let source = renames
@@ -569,9 +569,9 @@ where
         let accepted = super::table_ops::declared_full_text_columns(
             accepted_catalog.as_ref(),
             source_table_key,
-        );
+        )?;
         let columns: Vec<FullTextColumn> =
-            super::table_ops::declared_full_text_columns(&desired_catalog, &table_key)
+            super::table_ops::declared_full_text_columns(&desired_catalog, &table_key)?
                 .into_iter()
                 .filter(|column| {
                     !accepted
@@ -884,7 +884,7 @@ where
                             &super::table_ops::declared_full_text_columns(
                                 &desired_catalog,
                                 table_key,
-                            ),
+                            )?,
                         )
                         .await?;
                     (detached, Some(transaction))
@@ -972,7 +972,7 @@ where
             // rewrites whole fragments, Blob payloads included, as compaction
             // does.
             let declared =
-                super::table_ops::declared_full_text_columns(&desired_catalog, table_key);
+                super::table_ops::declared_full_text_columns(&desired_catalog, table_key)?;
             let mut tip_transaction = None;
             // #721: fragments whose deleted rows hold a null in a column about
             // to become required are rewritten first, deletions materialized,

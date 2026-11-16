@@ -333,7 +333,6 @@ pub enum RuntimeInput {
     Nearest,
     FullText,
     EligibleIds,
-    SearchFilter,
     JoinFilter,
     DynamicExpression,
 }

@@ -60,7 +60,7 @@ query destination_search() {
 d.slug: String
 --- expect plan
 hash join $d
-scan Doc as $d: filter reads [d.body]
+scan Doc as $d: no filter
 
 --- query
 set engine = v2;
@@ -79,7 +79,7 @@ query destination_match_text() {
 d.slug: String
 --- expect plan
 hash join $d
-scan Doc as $d: filter reads [d.body]
+scan Doc as $d: no filter
 
 --- query
 set engine = v2;
@@ -97,7 +97,7 @@ query scalar_and_two_destination_searches() {
 d.slug: String
 --- expect plan
 hash join $d
-scan Doc as $d: filter reads [d.state, d.body, d.summary]
+scan Doc as $d: filter reads [d.state]
 
 --- query
 set engine = v2;
@@ -113,7 +113,7 @@ query two_searches_on_one_property() {
 d.slug: String
 --- expect plan
 hash join $d
-scan Doc as $d: filter reads [d.state, d.body]
+scan Doc as $d: filter reads [d.state]
 
 --- query
 set engine = v2;
@@ -130,7 +130,7 @@ e.slug: String
 --- expect plan
 hash join $d
 scan Doc as $d: filter reads [d.state]
-scan Doc as $e: filter reads [e.body]
+scan Doc as $e: no filter
 
 --- query
 set engine = v2;
@@ -149,7 +149,7 @@ query limit_counts_surviving_paths() {
 d.slug: String
 --- expect plan
 hash join $d
-scan Doc as $d: filter reads [d.state, d.body, d.summary]
+scan Doc as $d: filter reads [d.state]
 
 --- query
 set engine = v2;
@@ -163,7 +163,7 @@ query empty_source_destination_search() {
 d.slug: String
 --- expect plan
 hash join $d
-scan Doc as $d: filter reads [d.body]
+scan Doc as $d: no filter
 
 --- query
 set engine = v2;
@@ -177,4 +177,4 @@ query destination_search_has_no_matches() {
 d.slug: String
 --- expect plan
 hash join $d
-scan Doc as $d: filter reads [d.body]
+scan Doc as $d: no filter

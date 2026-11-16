@@ -3841,19 +3841,11 @@ impl Ctx<'_> {
             }
             ScoreQueryId::Vector(q)
         };
-        // `distance` is `F32`. `bm25` on a field whose index declares an
-        // analyzer is `bm25_v1`, `F64` (section 2); on a field with edition
-        // 2's analysis it keeps the `F32` score Lance's index produces.
-        let declared = kind == ScoreKind::Bm25
-            && self
-                .catalog
-                .query_node_type(&type_name)
-                .is_some_and(|n| n.full_text_profile(&property).is_some());
+        // `distance` is `F32`; `bm25` is `bm25_v1`, `F64` (section 4).
         let out_ty = Ty::scalar(
-            if declared {
-                ScalarType::F64
-            } else {
-                ScalarType::F32
+            match kind {
+                ScoreKind::Bm25 => ScalarType::F64,
+                ScoreKind::Distance => ScalarType::F32,
             },
             false,
         );

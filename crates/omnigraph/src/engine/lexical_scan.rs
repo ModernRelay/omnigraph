@@ -2,30 +2,35 @@
 //! lexical query", "bm25_v1" and "Exact execution and qualified
 //! acceleration").
 //!
-//! A field whose full-text index declares an analyzer profile is answered
-//! here, at every coverage state, without reading the index: the analyzer is
-//! instantiated from the accepted schema's profile whether or not an index
-//! exists, so a declared but unbuilt index answers. The scan streams the
-//! field's table at the pinned snapshot, normalizes each value to NFC,
-//! tokenizes it with the profile's pipeline (Lance's own builder, so the
-//! tokens are the ones the profile's index would hold) and evaluates the
-//! `terms` relation: every (`all`) or some (`any`) distinct analyzed query
+//! Every full-text field has a profile (`english_v1` where its index names
+//! none), and every lexical call is answered here, at every coverage state,
+//! without reading the index: the analyzer is instantiated from the accepted
+//! schema's profile whether or not an index exists, so a declared but unbuilt
+//! index answers. The scan streams the field's table at the pinned snapshot
+//! under the engine's scan tuning, normalizes each value to NFC, tokenizes it
+//! with the profile's pipeline (Lance's own builder with the profile's
+//! explicit parameters, so the tokens are the ones the profile's index would
+//! hold; the query through Lance's search path, the documents through its
+//! document path) and evaluates the `terms` relation: every (`all`) or some (`any`) distinct analyzed query
 //! term has a stored term within the edit budget, the edit distance counting
 //! one per inserted, deleted or substituted Unicode scalar value, so a
 //! transposition costs two. A null or token-empty value never matches.
 //!
 //! `bm25` scores the matches with `bm25_v1` in `F64`: the statistics are the
-//! field corpus, every entity of the table with a non-empty analyzed value,
-//! before any graph or property filter; alternatives within a term's budget
+//! field corpus, every entity of the table whose value holds at least one
+//! analyzed term, before any graph or property filter; alternatives within a term's budget
 //! share its group's IDF, the best of them weighted `1`, `1/2` or `1/4` by
 //! its edits; parts add in ascending UTF-8 query-term order with no
 //! reassociation; the IDF uses `libm`'s `log1p`; counts are checked `u64`.
 //!
 //! Query bytes, distinct query terms and value bytes are bounded before the
 //! text is normalized (NFC can expand UTF-8) or tokenized, and every analyzed
-//! token and term comparison is charged against the read's work budget; the
-//! results the scan keeps are charged to the query's memory. Exhaustion is a
-//! typed failure, never a partial answer.
+//! token and term comparison is charged against the read's work budget; what
+//! one value's analysis holds, its normalized text and its distinct terms, is
+//! charged to the query's memory while it is held, and the results the scan
+//! keeps for the operator's lifetime. Exhaustion is a typed failure, never a
+//! partial answer. The rows read and tokens analyzed are counted on the
+//! operator ([`super::lexical::SCAN_ROWS_METRIC`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -67,24 +72,24 @@ impl Analyzer {
     /// The analyzer `profile` names, built from the parameters its index is
     /// built with.
     pub(crate) fn of(profile: AnalyzerProfile) -> Result<Self> {
-        let params =
-            crate::table_store::full_text_index_params(&crate::storage_layer::FullTextBuild {
-                profile: Some(profile),
-                fingerprint: None,
-            })?;
+        let params = crate::table_store::full_text_index_params(profile)?;
         let tokenizer = params.build().map_err(|error| {
             OmniError::manifest_internal(format!("the {profile} analyzer does not build: {error}"))
         })?;
         Ok(Self { tokenizer })
     }
 
-    /// Every analyzed token of `text` into `token`, in order. `text` and its
-    /// NFC form hold at most `limit` bytes; `resource` names that bound.
+    /// Every analyzed token of `text` into `token`, in order, through Lance's
+    /// search path for a `query` and its document path otherwise. `text` and
+    /// its NFC form hold at most `limit` bytes; `resource` names that bound.
+    /// `normalized` is told the bytes of an NFC copy before it is built.
     fn analyze(
         &mut self,
         text: &str,
         limit: usize,
         resource: &'static str,
+        query: bool,
+        mut normalized: impl FnMut(usize) -> Result<()>,
         mut token: impl FnMut(&str) -> Result<()>,
     ) -> Result<()> {
         if text.len() > limit {
@@ -94,10 +99,11 @@ impl Analyzer {
                 text.len() as u64,
             ));
         }
-        let normalized;
+        let copy;
         let text = if is_nfc_quick(text.chars()) == IsNormalized::Yes {
             text
         } else {
+            normalized(text.len())?;
             let mut out = String::with_capacity(text.len());
             for c in text.nfc() {
                 if out.len() + c.len_utf8() > limit {
@@ -109,10 +115,14 @@ impl Analyzer {
                 }
                 out.push(c);
             }
-            normalized = out;
-            normalized.as_str()
+            copy = out;
+            copy.as_str()
         };
-        let mut stream = self.tokenizer.token_stream_for_doc(text);
+        let mut stream = if query {
+            self.tokenizer.token_stream_for_search(text)
+        } else {
+            self.tokenizer.token_stream_for_doc(text)
+        };
         while stream.advance() {
             token(&stream.token().text)?;
         }
@@ -146,7 +156,7 @@ impl LexicalQuery {
             .filter(|edits| *edits <= MAX_EDITS)
             .ok_or_else(|| type_error(T71, format!("`max_edits: {max_edits}` is outside 0..=2")))?;
         let mut terms: Vec<String> = Vec::new();
-        analyzer.analyze(text, QUERY_MAX_BYTES, "lexical_query_bytes", |token| {
+        analyzer.analyze(text, QUERY_MAX_BYTES, "lexical_query_bytes", true, |_| Ok(()), |token| {
             if let Err(at) = terms.binary_search_by(|term| term.as_str().cmp(token)) {
                 if terms.len() == QUERY_MAX_TERMS {
                     return Err(OmniError::resource_limit(
@@ -270,30 +280,62 @@ impl Hits {
     }
 }
 
-/// The scan of one field: its table at the snapshot, its analyzer and the
-/// memory and work it charges.
+/// The scan of one field: its table at the snapshot, its analyzer, the
+/// memory and work it charges, and the rows and tokens it read.
 struct FieldScan<'a> {
     analyzer: Analyzer,
     query: &'a LexicalQuery,
     memory: &'a WorkMemory,
+    /// What one value's analysis holds while it is held, released after
+    /// each row.
+    document: WorkMemory,
+    rows: u64,
+    tokens: u64,
 }
 
-impl FieldScan<'_> {
-    /// `text` analyzed: `None` when it holds no token.
+impl<'a> FieldScan<'a> {
+    fn new(analyzer: Analyzer, query: &'a LexicalQuery, memory: &'a WorkMemory) -> Result<Self> {
+        let document = memory
+            .child("exact lexical scan value")
+            .map_err(|error| memory.error(error))?;
+        Ok(Self {
+            analyzer,
+            query,
+            memory,
+            document,
+            rows: 0,
+            tokens: 0,
+        })
+    }
+
+    /// `text` analyzed: `None` when it holds no token. Its NFC copy and its
+    /// distinct terms are charged to the query's memory until [`Self::row_done`].
     fn document(&mut self, text: &str) -> Result<Option<Document>> {
         let mut counts: HashMap<String, u64> = HashMap::new();
         let mut len = 0u64;
-        self.analyzer
-            .analyze(text, VALUE_MAX_BYTES, "lexical_value_bytes", |token| {
+        let memory = &self.document;
+        self.analyzer.analyze(
+            text,
+            VALUE_MAX_BYTES,
+            "lexical_value_bytes",
+            false,
+            |bytes| memory.string(bytes).map_err(|error| memory.error(error)),
+            |token| {
                 len = checked(len, 1, "a value's token count")?;
                 match counts.get_mut(token) {
                     Some(count) => *count = checked(*count, 1, "a term's occurrences")?,
                     None => {
+                        memory
+                            .string(token.len())
+                            .and_then(|()| memory.entries::<(String, u64)>(1))
+                            .map_err(|error| memory.error(error))?;
                         counts.insert(token.to_string(), 1);
                     }
                 }
                 Ok(())
-            })?;
+            },
+        )?;
+        self.tokens = self.tokens.saturating_add(len);
         if len == 0 {
             return Ok(None);
         }
@@ -303,6 +345,21 @@ impl FieldScan<'_> {
         let mut terms: Vec<(String, u64)> = counts.into_iter().collect();
         terms.sort_unstable();
         Ok(Some(Document { terms, len }))
+    }
+
+    /// Release what one row's analysis held, and count the row.
+    fn row_done(&mut self) {
+        self.rows = self.rows.saturating_add(1);
+        self.document.shrink_to(0);
+    }
+
+    /// Count the rows read and the tokens analyzed on the operator.
+    fn report(&self) {
+        let usize_of = |count: u64| usize::try_from(count).unwrap_or(usize::MAX);
+        self.memory
+            .metric(super::lexical::SCAN_ROWS_METRIC, usize_of(self.rows));
+        self.memory
+            .metric(super::lexical::SCAN_TOKENS_METRIC, usize_of(self.tokens));
     }
 
     /// The stored alternatives of `document` within each query term's
@@ -328,6 +385,15 @@ impl FieldScan<'_> {
         self.memory
             .charge_produced(comparisons)
             .map_err(|error| self.memory.error(error))?;
+        let longest = document
+            .terms
+            .iter()
+            .map(|(stored, _)| stored.len())
+            .max()
+            .unwrap_or(0);
+        self.document
+            .entries::<char>(longest)
+            .map_err(|error| self.document.error(error))?;
         for (stored, occurrences) in &document.terms {
             let stored: Vec<char> = stored.chars().collect();
             for (term, hits) in query.chars.iter().zip(&mut by_term) {
@@ -371,12 +437,21 @@ async fn scan_field(
     let dataset = snapshot
         .open_lance_dataset(&format!("node:{type_name}"))
         .await?;
+    // The engine's scan tuning: the query's batch rows and bytes, bounded
+    // read-ahead and I/O buffer, never Lance's defaults or the environment.
+    let (rows, bytes) = (memory.batch_rows(), memory.batch_bytes());
     let plan = crate::table_store::TableStore::scan_plan_with(
         &dataset,
         Some(&[id_column, property]),
         None,
         false,
-        |_| Ok(()),
+        |scanner| {
+            scanner.batch_size(rows);
+            scanner.batch_size_bytes(bytes as u64);
+            scanner.batch_readahead(super::scan::PIPELINED_READAHEAD);
+            scanner.io_buffer_size(super::scan::PIPELINED_IO_BUFFER_BYTES);
+            Ok(())
+        },
     )
     .await?;
     let batches = memory
@@ -467,11 +542,7 @@ pub(crate) async fn members(
     query: &LexicalQuery,
     memory: &WorkMemory,
 ) -> Result<HashSet<String>> {
-    let mut scan = FieldScan {
-        analyzer: field_analyzer(catalog, type_name, property)?,
-        query,
-        memory,
-    };
+    let mut scan = FieldScan::new(field_analyzer(catalog, type_name, property)?, query, memory)?;
     let mut ids = HashSet::new();
     scan_field(
         snapshot,
@@ -480,13 +551,15 @@ pub(crate) async fn members(
         property,
         memory,
         |id, value| {
-            let Some(value) = value else {
-                return Ok(());
+            let matched = match value {
+                Some(value) => match scan.document(value)? {
+                    Some(document) => scan.hits(&document)?.matched(query.all),
+                    None => false,
+                },
+                None => false,
             };
-            let Some(document) = scan.document(value)? else {
-                return Ok(());
-            };
-            if scan.hits(&document)?.matched(query.all) {
+            scan.row_done();
+            if matched {
                 memory
                     .string(id.len())
                     .map_err(|error| memory.error(error))?;
@@ -499,6 +572,7 @@ pub(crate) async fn members(
         },
     )
     .await?;
+    scan.report();
     Ok(ids)
 }
 
@@ -569,11 +643,7 @@ pub(crate) async fn bm25(
     query: &LexicalQuery,
     memory: &WorkMemory,
 ) -> Result<HashMap<String, f64>> {
-    let mut scan = FieldScan {
-        analyzer: field_analyzer(catalog, type_name, property)?,
-        query,
-        memory,
-    };
+    let mut scan = FieldScan::new(field_analyzer(catalog, type_name, property)?, query, memory)?;
     let mut corpus = Corpus {
         holding: vec![0; query.terms.len()],
         ..Corpus::default()
@@ -586,10 +656,14 @@ pub(crate) async fn bm25(
         property,
         memory,
         |id, value| {
-            let Some(value) = value else {
-                return Ok(());
+            let document = match value {
+                Some(value) => scan.document(value)?,
+                None => None,
             };
-            let Some(document) = scan.document(value)? else {
+            // A null value, or one with no analyzed term, is outside the
+            // field corpus.
+            let Some(document) = document else {
+                scan.row_done();
                 return Ok(());
             };
             corpus.documents = checked(corpus.documents, 1, "the field corpus size")?;
@@ -614,10 +688,12 @@ pub(crate) async fn bm25(
                     hits: hits.by_term,
                 });
             }
+            scan.row_done();
             Ok(())
         },
     )
     .await?;
+    scan.report();
     let idf = corpus.idf();
     memory
         .entries::<(String, f64)>(matches.len())
@@ -707,6 +783,55 @@ mod tests {
         assert_eq!(query.terms(), ["engin", "run"]);
     }
 
+    /// The query is analyzed through Lance's search path and documents
+    /// through its document path; under every profile the two give the same
+    /// tokens, so a query term and the stored term it names agree.
+    #[test]
+    fn the_search_and_document_paths_analyze_alike_under_every_profile() {
+        let texts = [
+            "Running engines, résumés and resumes",
+            "The only way: very human beings!",
+            "Straße CAFÉ naïve 42 a1b2",
+            "don't you've they're",
+        ];
+        for profile in AnalyzerProfile::ALL {
+            let mut analyzer = Analyzer::of(profile).unwrap();
+            for text in texts {
+                let mut tokens = |query: bool| {
+                    let mut out = Vec::new();
+                    analyzer
+                        .analyze(text, QUERY_MAX_BYTES, "lexical_query_bytes", query, |_| Ok(()), |token| {
+                            out.push(token.to_string());
+                            Ok(())
+                        })
+                        .unwrap();
+                    out
+                };
+                let search = tokens(true);
+                assert_eq!(search, tokens(false), "{profile}: {text}");
+            }
+        }
+    }
+
+    /// `english_v1` removes each stop word and its stem: `only` and `very`
+    /// stem to `onli` and `veri`, which the list holds, so a query of them
+    /// has no searchable term; a word whose stem is a stop word drops too,
+    /// so "human beings" analyzes to `human`.
+    #[test]
+    fn english_v1_removes_stop_words_and_their_stems() {
+        let mut english = Analyzer::of(AnalyzerProfile::EnglishV1).unwrap();
+        for text in ["only", "very", "only very because", "why during any"] {
+            let error = LexicalQuery::analyze(&mut english, text, false, 0).unwrap_err();
+            assert!(error.to_string().contains("T20"), "{text}: {error}");
+        }
+        let query = LexicalQuery::analyze(&mut english, "human beings", false, 0).unwrap();
+        assert_eq!(query.terms(), ["human"]);
+        // The standard profiles remove no stop word.
+        let mut standard = Analyzer::of(AnalyzerProfile::StandardV1).unwrap();
+        let query = LexicalQuery::analyze(&mut standard, "only very", false, 0).unwrap();
+        assert_eq!(query.terms(), ["only", "very"]);
+    }
+
     /// NFC comes before tokenization: a decomposed `é` and a composed one
     /// are one term, and a combining mark is not a separator.
     #[test]
@@ -752,7 +877,14 @@ mod tests {
         }
         let value = "a".repeat(VALUE_MAX_BYTES + 1);
         let error = analyzer
-            .analyze(&value, VALUE_MAX_BYTES, "lexical_value_bytes", |_| Ok(()))
+            .analyze(
+                &value,
+                VALUE_MAX_BYTES,
+                "lexical_value_bytes",
+                false,
+                |_| Ok(()),
+                |_| Ok(()),
+            )
             .unwrap_err();
         match error {
             OmniError::ResourceLimitExceeded {

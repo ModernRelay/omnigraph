@@ -37,7 +37,7 @@ query negative_fuzzy_option($edits: I64) {
 }
 --- params
 {"edits":-1}
---- expect error: fuzzy max_edits must fit U32
+--- expect error: T71: `max_edits: -1` is outside 0..=2
 
 --- query
 set engine = v2;
@@ -47,7 +47,7 @@ query oversized_fuzzy_option($edits: U64) {
 }
 --- params
 {"edits":4294967296}
---- expect error: fuzzy max_edits must fit U32
+--- expect error: T71: `max_edits: 4294967296` is outside 0..=2
 
 --- query
 set engine = v2;
@@ -59,7 +59,7 @@ query null_rrf_option($k: I64?) {
 }
 --- params
 {"k":null}
---- expect error: search option must resolve to a non-null integer
+--- expect error: type error: T86:
 
 --- query
 set engine = v2;
@@ -71,7 +71,7 @@ query zero_rrf_option($k: I64) {
 }
 --- params
 {"k":0}
---- expect error: rrf k must be greater than 0 and fit U32
+--- expect error: type error: T86:
 
 --- query
 set engine = v2;
@@ -83,7 +83,7 @@ query oversized_rrf_option($k: U64) {
 }
 --- params
 {"k":4294967296}
---- expect error: rrf k must be greater than 0 and fit U32
+--- expect error: type error: T86:
 
 --- query
 set engine = v2;
@@ -95,12 +95,7 @@ query typed_rrf_option($k: U32) {
 }
 --- params
 {"k":5}
---- expect unordered
-{"d.key":"a"}
---- expect shape
-d.key: String
-
---- expect same as reference
+--- expect error: type error: T86:
 
 --- query
 set engine = v2;

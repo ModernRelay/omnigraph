@@ -796,68 +796,9 @@ pub(super) enum NearestGatePlan {
     ProvenEmpty,
 }
 
-/// The full-text search call a conjunct compares: the left operand of a
-/// comparison-rooted conjunct when it is `search`, `fuzzy` or `match_text`.
-/// The compiler lowers a bare call and `call = true` to that one shape.
-pub(super) fn search_call(filter: &IRExpr) -> Option<&IRExpr> {
-    match filter.comparison_parts()?.0 {
-        call @ (IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }) => {
-            Some(call)
-        }
-        IRExpr::PropAccess { .. }
-        | IRExpr::Nearest { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::Param(_, _)
-        | IRExpr::Literal(_, _)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(_, _)
-        | IRExpr::Binary { .. }
-        | IRExpr::Not(_, _)
-        | IRExpr::Cast { .. }
-        | IRExpr::Neg { .. }
-        | IRExpr::Call { .. }
-        | IRExpr::IsNull { .. } => None,
-    }
-}
 
-/// Whether a conjunct's left operand is a full-text search call.
-pub(super) fn is_search_filter(filter: &IRExpr) -> bool {
-    search_call(filter).is_some()
-}
 
-/// Whether `filter` is a full-text search call compared to `true`: the one
-/// search shape a scan answers, as membership in the call's matches.
-pub(crate) fn is_positive_search_filter(filter: &IRExpr) -> bool {
-    matches!(
-        filter.comparison_parts(),
-        Some((call, CompOp::Eq, IRExpr::Literal(Literal::Bool(true), _)))
-            if matches!(call, IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. })
-    )
-}
 
-/// The full-text query of a scan's search conjunct; `None` for every other
-/// conjunct. A search call in any other comparison, or one whose property or
-/// query text does not resolve, is refused by the root and dependent scans alike.
-pub(crate) fn search_filter_query(
-    filter: &IRExpr,
-    params: &ParamMap,
-) -> Result<Option<lance_index::scalar::FullTextSearchQuery>> {
-    let Some(call) = search_call(filter) else {
-        return Ok(None);
-    };
-    if is_positive_search_filter(filter)
-        && let Some(query) = build_fts_query(call, params)?
-    {
-        return Ok(Some(query));
-    }
-    Err(OmniError::manifest(format!(
-        "unsupported search filter `{filter}`: a scan answers search(), fuzzy() and \
-         match_text() only as a bare call or compared to true, over a property and a \
-         string query"
-    )))
-}
 
 /// The columns the plan's scan projection names for one bound variable
 /// (`projection_pushdown`); a scan with no projection reads every
@@ -1449,16 +1390,10 @@ mod ann_probe_budget_tests {
 
 #[cfg(test)]
 mod typed_search_value_tests {
-    use super::{NearestQuery, resolve_nearest_query, resolve_rrf_k, search_filter_query};
-    use crate::engine::scan::{
-        build_fts_query, resolve_to_int, resolve_to_string, scan_output_schema,
-    };
-    use crate::engine::search::SearchMode;
-    use lance_index::scalar::inverted::query::FtsQuery;
-    use omnigraph_compiler::catalog::build_catalog;
+    use super::{NearestQuery, resolve_nearest_query, resolve_rrf_k};
+    use crate::engine::scan::{resolve_to_int, resolve_to_string};
     use omnigraph_compiler::ir::{IRExpr, ParamMap};
-    use omnigraph_compiler::query::value::{CompOp, Literal};
-    use omnigraph_compiler::schema::parser::parse_schema;
+    use omnigraph_compiler::query::value::Literal;
     use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 
     fn scalar(kind: ScalarType, nullable: bool) -> ExprType {
@@ -1475,22 +1410,6 @@ mod typed_search_value_tests {
         }
     }
 
-    fn fuzzy(max_edits: Option<IRExpr>) -> IRExpr {
-        IRExpr::Fuzzy {
-            field: Box::new(IRExpr::PropAccess {
-                variable: "d".into(),
-                property: "text".into(),
-                ty: scalar(ScalarType::String, false),
-            }),
-            query: Box::new(IRExpr::Literal(
-                Literal::String("needle".into()),
-                scalar(ScalarType::String, false),
-            )),
-            max_edits: max_edits.map(Box::new),
-            ty: scalar(ScalarType::Bool, false),
-        }
-    }
-
     #[test]
     fn cast_search_options_execute_nondefault_values() {
         let params = ParamMap::new();
@@ -1498,15 +1417,6 @@ mod typed_search_value_tests {
         k.check_types().unwrap();
         assert_eq!(resolve_rrf_k(Some(&k), &params).unwrap(), 5);
         assert_eq!(resolve_rrf_k(None, &params).unwrap(), 60);
-        for (max_edits, expected) in [(Some(widened_integer(1)), 1), (None, 2)] {
-            let call = fuzzy(max_edits);
-            call.check_types().unwrap();
-            let FtsQuery::Match(query) = build_fts_query(&call, &params).unwrap().unwrap().query
-            else {
-                panic!("expected fuzzy match query");
-            };
-            assert_eq!(query.fuzziness, Some(expected));
-        }
     }
 
     #[test]
@@ -1529,8 +1439,6 @@ mod typed_search_value_tests {
 
     #[test]
     fn supplied_invalid_search_options_refuse_before_empty_scan_execution() {
-        let catalog =
-            build_catalog(&parse_schema("node Doc { text: String @index }").unwrap()).unwrap();
         let params = ParamMap::new();
         for option in [
             IRExpr::Literal(Literal::Null, scalar(ScalarType::I64, true)),
@@ -1542,34 +1450,9 @@ mod typed_search_value_tests {
             IRExpr::Param("missing".into(), scalar(ScalarType::I64, false)),
         ] {
             assert!(resolve_rrf_k(Some(&option), &params).is_err());
-            let call = fuzzy(Some(option));
-            call.check_types().unwrap();
-            let filter = IRExpr::comparison(
-                call,
-                CompOp::Eq,
-                IRExpr::Literal(Literal::Bool(true), scalar(ScalarType::Bool, false)),
-            );
-            assert!(search_filter_query(&filter, &params).is_err());
-            assert!(
-                scan_output_schema(
-                    "Doc",
-                    "d",
-                    &[filter],
-                    &params,
-                    &catalog,
-                    &SearchMode::default(),
-                    None
-                )
-                .is_err()
-            );
         }
         let zero = IRExpr::Literal(Literal::Integer(0), scalar(ScalarType::I64, false));
         assert!(resolve_rrf_k(Some(&zero), &params).is_err());
-        assert!(
-            build_fts_query(&fuzzy(Some(zero)), &params)
-                .unwrap()
-                .is_some()
-        );
     }
 
     #[test]

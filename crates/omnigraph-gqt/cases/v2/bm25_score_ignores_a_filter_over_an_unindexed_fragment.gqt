@@ -1,9 +1,9 @@
 # issue: none
-# notes: A BM25 score is the retrieval's, not the filter's (RFC 0047, "Checked rewrites for exact
-# notes: search"). The seed is indexed, so the filter may run before scoring. The insert lands in a
-# notes: fragment no full-text segment covers, which Lance scores flat from statistics over the rows
-# notes: its prefilter admits; under that partial coverage the plan applies the filter after scoring,
-# notes: so `t1` scores the same with and without a filter that excludes `t2`, the other new row.
+# notes: A `bm25_v1` score is the retrieval's, not the filter's: its statistics are the field corpus,
+# notes: taken before any graph or property filter (docs/rfcs/2026-11-07-gq-3.md, section 4). The
+# notes: insert lands in a fragment no full-text segment covers; the exact lexical scan reads no index,
+# notes: so `t1` scores the same with and without a filter that excludes `t2`, the other new row, at
+# notes: every index state.
 
 --- runner
 timeout_ms: 10000
@@ -31,16 +31,16 @@ query covered() {
 }
 
 --- expect ordered
-{"d.slug":"d1","score":0.43445715}
-{"d.slug":"d2","score":0.43445715}
+{"d.slug":"d1","score":0.434457136278}
+{"d.slug":"d2","score":0.434457136278}
 
 --- expect shape
 d.slug: String
-score: F32
+score: F64
 
 --- expect plan
-scan Doc as $d: ranked bm25 eligibility before_scoring
-validation scope exact_subset
+pipeline 0: Scan -> Score -> Projection => Sort
+validation scope invariants_only
 
 --- mutate
 query tail() {
@@ -57,14 +57,14 @@ query unfiltered() {
 }
 
 --- expect ordered
-{"d.slug":"t2","score":0.46573505}
-{"d.slug":"d1","score":0.43445715}
-{"d.slug":"d2","score":0.43445715}
-{"d.slug":"t1","score":0.3903352}
+{"d.slug":"t2","score":0.465734971433}
+{"d.slug":"t1","score":0.390335146763}
+{"d.slug":"d1","score":0.325757640865}
+{"d.slug":"d2","score":0.325757640865}
 
 --- expect shape
 d.slug: String
-score: F32
+score: F64
 
 --- query
 query filtered() {
@@ -74,14 +74,14 @@ query filtered() {
 }
 
 --- expect ordered
-{"d.slug":"d1","score":0.43445715}
-{"d.slug":"d2","score":0.43445715}
-{"d.slug":"t1","score":0.3903352}
+{"d.slug":"t1","score":0.390335146763}
+{"d.slug":"d1","score":0.325757640865}
+{"d.slug":"d2","score":0.325757640865}
 
 --- expect shape
 d.slug: String
-score: F32
+score: F64
 
 --- expect plan
-scan Doc as $d: ranked bm25 eligibility after_scoring
-validation scope exact_subset
+pipeline 0: Scan -> Score -> Projection => Sort
+validation scope invariants_only

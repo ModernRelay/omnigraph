@@ -252,15 +252,26 @@ pub enum IndexBuildSpec {
 }
 
 /// The analysis a full-text segment is built with: the profile the column's
-/// accepted schema declares, or edition 2's index analysis (Lance's default)
-/// when it declares none (docs/rfcs/2026-11-07-gq-3.md section 4).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// accepted schema applies (`english_v1` where it names none) and the
+/// fingerprint the segment's certificate records
+/// (docs/rfcs/2026-11-07-gq-3.md section 4). Both are required, so no segment
+/// is built without the fingerprint its certificate needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FullTextBuild {
-    /// `None` builds edition 2's index analysis.
-    pub profile: Option<omnigraph_compiler::schema::analysis::AnalyzerProfile>,
-    /// The analyzer fingerprint the segment's certificate records; `Some`
-    /// exactly when `profile` is.
-    pub fingerprint: Option<String>,
+    pub profile: omnigraph_compiler::schema::analysis::AnalyzerProfile,
+    pub fingerprint: String,
+}
+
+#[cfg(test)]
+impl FullTextBuild {
+    /// `english_v1` with a fixed fingerprint, for a test that builds an index
+    /// outside a catalog.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            profile: omnigraph_compiler::schema::analysis::AnalyzerProfile::EnglishV1,
+            fingerprint: "sha256:test".to_string(),
+        }
+    }
 }
 
 /// One column carrying a declared full-text index, with its analysis.

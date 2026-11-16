@@ -646,25 +646,6 @@ fn expression_mirror_preserves_every_typed_interior_and_nested_cast() {
             query: Box::new(text()),
             ty: value_type(ScalarType::F32, false),
         },
-        IRExpr::Search {
-            field: field(),
-            query: Box::new(text()),
-            ty: value_type(ScalarType::Bool, false),
-        },
-        IRExpr::Fuzzy {
-            field: field(),
-            query: Box::new(text()),
-            max_edits: Some(Box::new(IRExpr::Literal(
-                Literal::Integer(1),
-                value_type(ScalarType::I64, false),
-            ))),
-            ty: value_type(ScalarType::Bool, false),
-        },
-        IRExpr::MatchText {
-            field: field(),
-            query: Box::new(text()),
-            ty: value_type(ScalarType::Bool, false),
-        },
         rank(),
         IRExpr::Rrf {
             primary: Box::new(rank()),
