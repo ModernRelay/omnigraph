@@ -3066,6 +3066,98 @@ async fn conditional_update_and_delete_races_return_precondition_failed_before_e
     );
 }
 
+const CARD_RACE_SCHEMA: &str = r#"
+node Task { name: String @key }
+node Agent { name: String @key }
+edge HeldBy: Task -> Agent @card(0..1)
+"#;
+
+const CARD_RACE_SEED: &str = r#"{"type":"Task","data":{"name":"task-0"}}
+{"type":"Agent","data":{"name":"a"}}
+{"type":"Agent","data":{"name":"b"}}"#;
+
+const CARD_RACE_MUTATIONS: &str = r#"
+query hold($task: String, $agent: String) {
+    insert HeldBy { from: $task, to: $agent }
+}
+"#;
+
+/// Issue #1424: two conditional writers read the same head and each insert
+/// the one edge a `@card(0..1)` allows. The loser passed its precondition
+/// before the winner published, so its live `@card` count sees the winner's
+/// edge; that read is past the caller's head, and the loser must report its
+/// failed precondition (412 on the server), not a `@card` violation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn conditional_edge_insert_that_loses_the_race_fails_its_precondition_issue_1424() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), CARD_RACE_SCHEMA)
+            .await
+            .unwrap(),
+    ));
+    db.load_jsonl(CARD_RACE_SEED, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let read_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_EXECUTE_PRE_VALIDATE);
+    let loser = {
+        let db = Arc::clone(&db);
+        let read_head = read_head.clone();
+        tokio::spawn(async move {
+            db.mutate_as_with_expected_head(
+                "main",
+                CARD_RACE_MUTATIONS,
+                "hold",
+                &params(&[("$task", "task-0"), ("$agent", "a")]),
+                None,
+                Some(&read_head),
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    db.mutate_as_with_expected_head(
+        "main",
+        CARD_RACE_MUTATIONS,
+        "hold",
+        &params(&[("$task", "task-0"), ("$agent", "b")]),
+        None,
+        Some(&read_head),
+    )
+    .await
+    .expect("the winner's precondition holds");
+    let winner_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    rendezvous.release();
+
+    let err = loser
+        .await
+        .unwrap()
+        .expect_err("the loser's precondition must fail");
+    assert!(!rendezvous.timed_out(), "the loser stayed parked");
+    match err {
+        OmniError::PreconditionFailed {
+            branch,
+            expected,
+            actual,
+        } => {
+            assert_eq!(branch, "main");
+            assert_eq!(expected, read_head);
+            assert_eq!(actual.as_deref(), Some(winner_head.as_str()));
+        }
+        other => panic!("the losing conditional write must be PreconditionFailed, got: {other}"),
+    }
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "main").await.unwrap(),
+        winner_head,
+        "the loser must not commit"
+    );
+    assert_eq!(count_rows(&db, "edge:HeldBy").await, 1);
+}
+
 /// A fresh named branch needs its inherited lineage fallback because it has no
 /// exact branch-head row. If that second read fails after opening the
 /// replacement manifest, the warm handle must keep its previous manifest and
