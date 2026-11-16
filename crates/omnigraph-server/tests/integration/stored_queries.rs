@@ -1269,9 +1269,24 @@ async fn registry_rewritten_away_from_reserved_words_reloads_without_quarantine(
         }),
         "{details:?}"
     );
+    // The refusal carries what an upgrade rewrites from: its code, where it
+    // fails, and its fix with the byte-range edits (the alias and the order
+    // key renamed).
     assert!(
         details.iter().any(|detail| {
-            detail.contains("stored query 'by_and'") && detail.contains("cannot be a return alias")
+            detail.contains("stored query 'by_and'")
+                && detail.contains("error[Q005] at line 1, column ")
+                && detail.contains("cannot be a return alias")
+                && detail.contains("edits: bytes ")
+                && detail.matches("\"and_\"").count() == 2
+        }),
+        "{details:?}"
+    );
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains("stored query 'clear_flag'")
+                && detail.contains("error[")
+                && detail.contains(" at line 1, column ")
         }),
         "{details:?}"
     );

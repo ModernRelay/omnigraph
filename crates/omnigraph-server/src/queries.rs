@@ -89,11 +89,41 @@ pub struct LoadError {
 }
 
 impl std::fmt::Display for LoadError {
+    /// The refusal as the upgrade contract states it: the query, the code,
+    /// where it fails, the message, the fix and its byte-range edits, so an
+    /// agent or a person rewrites a stored source from the boot log alone.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.query {
-            Some(name) => write!(f, "stored query '{name}': {}", self.message),
-            None => write!(f, "stored query registry: {}", self.message),
+            Some(name) => write!(f, "stored query '{name}': ")?,
+            None => write!(f, "stored query registry: ")?,
         }
+        let Some(diagnostic) = &self.diagnostic else {
+            return write!(f, "{}", self.message);
+        };
+        write!(f, "error[{}]", diagnostic.code)?;
+        if let Some(at) = &diagnostic.position {
+            write!(f, " at line {}, column {}", at.line, at.column)?;
+        }
+        write!(f, ": {}", diagnostic.message)?;
+        if let Some(fix) = &diagnostic.fix {
+            write!(f, "; fix: {fix}")?;
+        }
+        if let Some(suggestion) = &diagnostic.suggestion {
+            let edits: Vec<String> = suggestion
+                .edits
+                .iter()
+                .map(|edit| {
+                    format!(
+                        "bytes {}..{} -> {:?}",
+                        edit.start, edit.end, edit.replacement
+                    )
+                })
+                .collect();
+            if !edits.is_empty() {
+                write!(f, "; edits: {}", edits.join(", "))?;
+            }
+        }
+        Ok(())
     }
 }
 
