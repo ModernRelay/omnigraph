@@ -13,8 +13,9 @@ supersedes: []
 superseded_by: []
 blocked_on:
   - "Composition guard, engine half: a composed commit keeps only the markers every component carries, the change feed's one-transaction fast path and the merge's pure-insert proof accept it, and `lance_surface_guards.rs` pins a Blob v2 column through composition. The Lance half passes on Lance 13.0.0 (Part 3, The carried-over guard)."
+  - "Commit attribution: an amendment of RFC 0068 for the commit record's write list, with its decision on the format stamp. Step 3 needs it, and batching of several actors needs step 3."
   - "Batch-path seams exist before step 6, so that `failpoints.rs`, `detached_commit_matrix.rs` and DST can reach the batch path."
-  - "Admission and failure evidence: the admission matrix, including its `@unique` and `@card` cells, the batch-path windows in `failpoints.rs` and `detached_commit_matrix.rs`, and the DST concurrent universe with batching on (every acknowledged write visible exactly once, one actor per commit, the collector oracle with batches in flight)."
+  - "Admission and failure evidence: the admission matrix, including its `@unique` and `@card` cells, the batch-path windows in `failpoints.rs` and `detached_commit_matrix.rs`, and the DST concurrent universe with batching on (every acknowledged write visible exactly once and attributed to its own actor, the collector oracle with batches in flight)."
   - "Batching forced on across the existing gates: the GQT corpus, the engine `integration`, `writes` and `failpoints` binaries, DST, and the RustFS and Azurite suites."
   - "Server maintenance admission: a served `optimize` is admitted while 64 or more writes are in flight. Today `DEFAULT_WRITE_OBSERVERS` (64, no override) refuses it with 429. This is a separate server fix that lands before the soak."
   - "Soak: 64 writers on one branch, RustFS behind toxiproxy at +30 ms, 60 minutes, a served `optimize` every minute and an embedded `index build` from a second process every minute. Every acknowledged write verified, every maintenance run published, writes/s in the last 5 minutes at least 80% of the first 5, peak RSS at 60 minutes at most 1.25x the 30-minute mark, and the known keys and the effect log within their byte budgets."
@@ -90,13 +91,20 @@ for many writes), which PostgreSQL, MySQL and RocksDB also use.
 Writes that arrive during a publication form the next batch. There is no
 timer, so a writer that is alone is never delayed.
 
-Batching moves the limit to a second place: the check that a new key does not
-exist yet. That check reads every data file the id index does not cover yet,
-and each write adds one such file. So the check gets slower with each write.
-The second part of this RFC is the known keys. This is an in-memory record of
-the keys that this process wrote into each data file. A data file never
-changes after it is written, so the record stays correct for that file. The
-check then reads memory instead of storage for those files.
+Batching moves the limit to a second place: the checks that read committed
+rows, above all the check that a new key does not exist yet. An index answers
+that check for most data files. But each write adds one data file that no
+index covers yet. Today the check reads those files with a filter that it
+copies once per file. Past 8,192 ids it reads the whole table instead, and
+the rate falls to 0 writes/s. This RFC makes that read bounded, then cheap:
+
+- The check reads only the key columns of the files that no index covers, in
+  one pass, and compares the values in memory. Its cost grows with those
+  files, not with the table, and it has no cliff.
+- The known keys are an in-memory record of the keys that this process wrote
+  into each data file, for every kind of key that a check compares. A data
+  file never changes after it is written, so the record stays correct for
+  that file. The check then reads memory instead of storage for those files.
 
 ### Which writes join a batch
 
@@ -113,6 +121,9 @@ a known set of keys, and admission compares those keys (see below). For
 example, an insert into a type with `@unique(email)` reads the email values
 it adds. Two inserts with the same email cannot share a batch, and two with
 different emails can.
+
+The actor does not exclude a write either. Writes of different actors share a
+batch, and the commit records each write with its own actor.
 
 A later step (step 7) can batch updates and deletes that name their rows by
 key. It lands only if its own measurement passes. Updates and deletes that
@@ -174,20 +185,25 @@ collector does not change.
 
 - Acknowledgement does not change. A write returns only after its data is
   durable and visible on its branch.
-- Concurrent writes by one actor on one branch can share one graph commit.
-  Each receipt names that commit. `commit list`, the change feed and the diff
+- Concurrent writes on one branch can share one graph commit, also when
+  different actors send them. Each receipt names that commit. `commit list`, the change feed and the diff
   show one commit that holds all of the writes. Each write still reports its
   own affected counts.
 - Two writes that one client sends one after the other never share a commit,
   because the second starts after the first returns.
-- A commit holds the writes of one actor only.
+- A commit records each of its writes with its actor and the rows it wrote.
+  The change feed reports each row with the actor that wrote it. A commit
+  that holds one write looks as it does today.
 - A batch makes one commit, whose parent is the head the batch built on. The
   states between its writes were never a branch head, so no one can read
   them.
 - A new session setting, `group_commit`, is `off` or `on`. It stays `off`
   until the gates in `blocked_on` pass.
-- No storage format, wire format or API changes. An older binary reads a
-  batch commit as an ordinary commit.
+- The commit record gains a list of writes. This is a storage format change
+  (Attribution in Part 2), so it needs its own decision on the format stamp.
+  A commit that holds one write is stored as today. A commit's `actor_id`
+  names the actor when all of its writes have the same one, and is empty
+  otherwise. The commit and change-feed responses gain the list.
 
 ### What it does not fix
 
@@ -209,6 +225,9 @@ collector does not change.
 - Edges under a bounded `@card` from one busy node serialize. Each such edge
   reads the count of its source, so two of them from the same source never
   share a batch. Edges from different sources still batch.
+- A `@unique` group with no index costs a read of the whole table's group
+  columns per write, as it does today. A decision below proposes that
+  `@unique` implies an index, as `@key` does.
 - The gain is in one process. Another process's writes are not in the log,
   so the leader refuses the writes they can affect. One writer process per
   cluster is the supported topology today.
@@ -258,10 +277,11 @@ processes, and maintenance.
 
 Each step leaves `main` shippable and adds its tests.
 
-1. Known keys, with no behavior change.
+1. Key lookups: the bounded read of uncovered files, and the known keys for
+   every kind of key. No behavior change.
 2. The footprint recorded on each staged write, with no behavior change.
 3. Composition of several inserts into one table commit, with its Lance
-   guard.
+   guard, and the commit record's list of writes.
 4. Maintenance that can land while writes publish.
 5. The write group with batches of one, with behavior unchanged.
 6. Batching of inserts, behind the setting.
@@ -272,8 +292,11 @@ Each step leaves `main` shippable and adds its tests.
 ### Decisions for reviewers
 
 - Do you accept the reworded invariant 3?
-- Do you accept the commit grain change: concurrent writes of one actor can
-  share a commit?
+- Do you accept the commit grain change: concurrent writes of different
+  actors can share a commit, which records each write's actor and rows? It
+  changes the commit record format. Batches of several actors are not
+  measured yet.
+- Do you accept that `@unique` implies an index on its group, as `@key` does?
 - Do you accept that batching requires a maintenance cadence, written in the
   user docs?
 - Do you accept the footprint taken from the validator's checks, so that
@@ -298,6 +321,8 @@ Part 3 gives the numbers for each.
   insert into the same table.
 - Exclude `@unique` and `@card` types by name: a hand-kept list lets a new
   kind of check into batches unproven.
+- Batches of one actor only: no format change, but no gain when each agent
+  writes with its own token, because most batches then hold one write.
 - A timer that waits for more writers: slower, and adds latency.
 - Pipelined batches: more publications, but not more writes per second.
 - Bloom filters to compare keys: false matches refuse writes, and the
@@ -317,8 +342,10 @@ Read these first:
   tags, distributed write, row-ID lineage, object stores and Blob v2
   ([lance.md](../dev/lance.md)). Also the Lance source for
   `io/commit.rs` (`do_commit_detached_transaction`), `lance-table`
-  `transaction/manifest_build.rs` and `transaction/row_version.rs`.
-- The four RFCs under Depends on.
+  `transaction/manifest_build.rs` and `transaction/row_version.rs`, and
+  `dataset/scanner.rs` (`fast_search`, `with_fragments`).
+- The four RFCs under Depends on, and [RFC 0068](0068-graph-commit-record.md)
+  for the commit record.
 - The stress report, `research/group-commit-stress/REPORT.md` on fork branch
   `research/group-commit-stress` at `155911f0`, and the defect table below.
 
@@ -360,8 +387,10 @@ Code locations are on `main` at `4f7c2076`. Search by name if a line moved.
 | Effect log | Per write group, the in-memory records of recent publications on the branch | |
 | Record | One publication in the log: parent head, produced head, and one class per touched table, with keys per key space | |
 | Class | `inserted(ids)`, `touched(written ids)`, `row_preserving` or `changed` | `PublicationEffect` (new) |
-| Known keys | Process-wide map from a data file's resolved location to the exact keys this process wrote into it | |
-| Uncovered tail | The fragments the id index does not cover at a pinned version | |
+| Write list | The commit record's list of the writes a commit holds: each write's actor and, per table, the range of stable row ids its rows received | `GraphCommit`, `omnigraph-catalog` `src/commit_graph.rs` |
+| Known keys | Process-wide map from a data file's resolved location to the exact keys this process wrote into it, per key space | |
+| Uncovered tail | The fragments that the index of a key space's column does not cover at a pinned version | |
+| Key lookup | A check's read of committed keys: covered fragments through the index only, the tail from the known keys or one scan of its key columns | |
 
 ### Rules that must hold
 
@@ -390,8 +419,8 @@ a test pass.
    S3 soak the rate fell from 122 to 2.35 writes/s and did not recover.)
 6. Keep one write group per graph root and branch, in `WriteQueueManager`,
    shared by every handle. Do not key it by actor or by handle. A batch holds
-   one actor. (H2: groups keyed by actor made one actor's batches foreign to
-   another's.)
+   entries of any actors (rule 19). (H2: groups keyed by actor made one
+   actor's batches foreign to another's.)
 7. The footprint of an edge entry holds presence reads of the endpoint ids
    it checked, in the endpoint node tables' id spaces. (H10: an edge was
    admitted across a delete of its endpoint.)
@@ -423,9 +452,10 @@ a test pass.
 15. Acknowledge nothing before the publication is durable and visible. A lost
     acknowledgement counts only when the publisher's read-back finds the
     batch's commit.
-16. Record known keys only from the absence-proven insert writer, and only
-    when its staged write produced exactly one data file. Answer from the map
-    only for a fragment with one data file, no deletion file and no overlay.
+16. Record known keys only from the absence-proven insert writer, only when
+    its staged write produced exactly one data file, and for every key space
+    of its table, from the rows it wrote. Answer from the map only for a
+    fragment with one data file, no deletion file and no overlay.
 17. Derive the footprint from the checks the judge runs, never from a list of
     constraint kinds. Map each `ValidateCheck` to its key space through one
     `match` with no wildcard arm. A check with no key form makes the entry
@@ -433,6 +463,14 @@ a test pass.
     pin the missing wildcard arm in `forbidden_apis.rs`. (Hazard: the earlier
     revision excluded `@unique` and `@card` types by name, so a new kind of
     cross-row check would have batched unproven.)
+18. Never plan a key list per uncovered fragment. A key lookup reads the
+    covered fragments through the index only, and reads the uncovered tail's
+    key columns once, matching in memory. No row cap applies. (C1: past
+    `KEYED_WRITE_MAX_ROWS`, every keyed insert read the whole table, 0
+    writes/s, and the cliff returned in every cold process.)
+19. Record every member in the commit's write list, with its own actor and
+    its row-id range per table, read from the committed manifests before the
+    publication. Never credit a batch to one member's actor.
 
 ### Eligibility
 
@@ -504,17 +542,15 @@ which changes only by an addition or a removal of s in that space. A new
 `ValidateCheck` variant joins this table only with that argument written
 down.
 
-Known keys cover the id space only. A `@unique` check on other columns still
-reads committed rows as it does today, so its cost does not change.
+Each check reads its key space through one key lookup (Key lookups), and the
+known keys cover every key space.
 
 ### The batch
 
 A writer that submits while no batch is publishing leads. It publishes the
 batch that holds its own entry, on its own task. Then it hands the lead to the
-next waiting entry, or clears the flag when none waits. A batch takes, in
-arrival order, the queued entries of its first entry's actor. Entries of
-other actors keep their places, and the oldest of them leads next. A member
-sent back takes the branch gate for its second attempt in its turn, so a
+next waiting entry, or clears the flag when none waits. A batch takes the
+queued entries in arrival order, whatever their actors. A member sent back takes the branch gate for its second attempt in its turn, so a
 writer that just published cannot overtake the writers it made stale (#784).
 
 The `group_commit` session setting is process-scoped, `off` or `on`. `off`
@@ -540,7 +576,8 @@ The leader runs these steps.
    in parallel.
 5. Publish through the unchanged publisher: one dataset update per table, the
    expected versions at `Hc` for every table in the admitted footprints, one
-   lineage intent with the batch's actor, and `ExactGraphHead` on `Hc`.
+   lineage intent whose write list names each member's actor and rows
+   (Attribution), and `ExactGraphHead` on `Hc`.
 6. Warm each new table version's index metadata into the shared Lance session
    while the publication is in flight. Lance 13's detached commit skips
    `record_successful_commit`. Without the warm-up, the next writer's
@@ -741,32 +778,98 @@ What Lance 13 does not guarantee, so the engine must:
 - A bound on manifest growth. Every member adds one fragment, and the
   manifest lists them all.
 
+### Attribution
+
+A batch can hold writes of several actors, so its commit records each write.
+
+- `GraphCommit` (`omnigraph-catalog` `src/commit_graph.rs`) gains `writes`:
+  one entry per member, in batch order. Each entry holds the member's actor
+  and, for each table it inserted into, the half-open range of stable row
+  ids that its rows received.
+- `actor_id` names the actor when every write has the same one, and is empty
+  otherwise. A commit that holds one write leaves `writes` empty and is
+  stored as today.
+- The ranges are exact. Composition concatenates the members' fragments in
+  batch order. Lance 13 gives each fragment without a row-id sequence the
+  next ids from the manifest's counter, in fragment order (`assign_row_ids`,
+  `lance-table` `transaction/row_version.rs`). So each member's rows hold one
+  contiguous range per table. The leader reads the ranges from the committed
+  detached manifests before the publication, and the composition guard pins
+  the contiguity.
+- Stable row ids survive compaction and updates, so the ranges attribute
+  rows at every later version.
+- The change feed (`changes/model.rs`) reports each row that a batch commit
+  inserted with the actor of the write whose range holds its `_rowid`.
+- The list counts toward the commit record's byte budget. Admission stops
+  adding members when the next one would exceed it.
+- Policy does not change. Each member was authorized as its own actor at its
+  `_as` entry point before it queued, and the batch publishes nothing else.
+- Format. The list changes the `__manifest` record layout. It needs an
+  amendment of [RFC 0068](0068-graph-commit-record.md) and a decision on the
+  stamp ([versioning](../dev/versioning.md)) before step 3 lands.
+  Per-write idempotency (#513) can later add a write id to the same entry.
+
+### Key lookups
+
+Every committed read that a footprint check makes is a key lookup in one key
+space: the absence of ids (`first_existing_id` and `existing_id_count`,
+`table_store.rs`), the holders of `@unique` tuples (`unique_holders`,
+`crates/omnigraph/src/validate.rs`), the presence of endpoint ids, and the
+edge count per source. A lookup reads in two parts at the pinned version:
+
+1. The covered fragments, through the index on the key space's column, index
+   only. Lance's `fast_search` restricts a filtered scan with an index query
+   to the indexed fragments.
+2. The uncovered tail. A fragment that the known keys answer is read from
+   memory. The others are read in one scan restricted to them
+   (`Scanner::with_fragments`) that projects only the key columns. The
+   values are matched against an in-memory set of the wanted keys.
+
+Today the probe plans one copy of its key list per uncovered fragment. So
+`stage_keyed_write` (`table_store.rs`) takes the probe only while fragments
+times ids stay within `KEYED_WRITE_MAX_ROWS` (8,192). Past that, every keyed
+insert becomes Lance's insert-capable merge, which joins against every id of
+the table: 0 writes/s (C1, on `main` today). The two-part lookup plans no key
+list over the tail, so the cap goes. Its cost is the uncovered rows' key
+columns, which grows with the tail and not with the table, and it falls to
+memory where the known keys answer. A cold process, a restart and the files
+of another process therefore cost a bounded read, not the cliff.
+`coverage_validate_access` (`omnigraph-planner` `src/cost.rs`) chooses the
+two-part lookup under partial coverage instead of a whole-table scan.
+
+The ids, `src` and `dst` always have a BTREE. A `@unique` group has an index
+only when the schema declares one: `@key` implies an index and `@unique` does
+not (`omnigraph-compiler` `src/catalog/mod.rs`). Without one, part 1 reads
+the whole table's group columns, as the uniqueness check does today. So
+`@unique` is to imply an index on its group's first column, as `@key` does
+(a decision in Part 1). Index maintenance builds single-column indexes only,
+so a composite group narrows on its first column and matches the rest in
+memory. The index is derived state (invariant 7). A missing or lagging index
+changes cost, never a result.
+
 ### Known keys
 
 A process-wide map from a data file's resolved object location (dataset
-root, base and path) to the exact set of key values this process wrote into
-it.
+root, base and path) to the exact keys this process wrote into it, per key
+space of its table: the ids, each `@unique` group's tuples with the id of
+the row that holds each, and an edge table's `src` and `dst` values with
+their counts.
 
 Filling. `stage_absence_proven_strict_insert` fills it when its staged write
 produced exactly one data file, the usual shape of a keyed batch (at most
-8,192 rows). It records the ids from the key column it wrote, after the file
-is written and before any manifest can name it. No other writer records.
+8,192 rows). It records every key space from the rows it wrote, after the
+file is written and before any manifest can name it. No other writer records.
 
-Reading. `first_existing_id` (`storage_layer.rs`) and `existing_id_count`
-(`table_store.rs`) use it when every fragment of the uncovered tail at the
-pinned version has exactly one data file that the map knows, and no deletion
-file and no overlay. The probe then scans only the indexed fragments (Lance
-`fast_search`) and answers the tail from memory. Otherwise it scans as today.
+Reading. A key lookup (Key lookups) answers an uncovered fragment from the
+map when the fragment has exactly one data file that the map knows, and no
+deletion file and no overlay. Every other uncovered fragment goes to the
+lookup's tail scan.
 
 Two rules keep the read cheap as the tail grows:
 
-- Lift the tail cap when the map answers the whole tail. `stage_keyed_write`
-  proves absence only while uncovered fragments times ids stay within
-  `KEYED_WRITE_MAX_ROWS` (8,192, `storage_layer.rs`). Past that, every keyed
-  insert becomes a full-table merge join: 0 writes/s (C1, on `main` today).
-  The cap bounds the `IN` lists a scan of the tail plans, and a tail answered
-  from memory plans none. In the stress study the lift took 27–36 to 126–136
-  writes/s on release binaries past the cliff.
+- No tail cap. The key lookup removes it for every tail (rule 18). In the
+  stress study, lifting it where the map answered the whole tail took 27–36
+  to 126–136 writes/s on release binaries past the cliff.
 - Compute the tail analysis once per table version. Which fragments are
   uncovered, and whether the map knows all of them, is a fact about one
   pinned version. Share it across probes instead of computing it three times
@@ -781,14 +884,13 @@ Schema evolution keeps the file's ids: a `Merge` adding nullable columns
 writes no data file, and a `Project` keeps the key column's file. The
 system-column upgrade renames the column without rewriting the file.
 
-The probe falls back to the scan for:
+A fragment goes to the tail scan for:
 
 - a fragment with a deletion file (the map reports deleted rows as
   present: a false `KeyConflict`, or an upsert taken for an update);
 - a second data file (a column patch) or an overlay;
 - a file the map does not know (another process wrote it, compaction, a load
-  or a merge rewrote it, the entry was evicted, or the process restarted);
-- a table without an id index.
+  or a merge rewrote it, the entry was evicted, or the process restarted).
 
 Another handle of the same process is not a bypass, because the map is
 process-wide. A recreated branch or a restored backup cannot make an entry
@@ -999,11 +1101,11 @@ writer stays within 10% of the ordinary path.
 |---|---|
 | 2, one publication door | Unchanged: one compare-and-swap per batch, through the unchanged publisher |
 | 3, one coherent accepted view | Reworded at step 6 (Part 1). `AGENTS.md` working-memory line 2 becomes: "A query or write attempt uses one coherent accepted snapshot; a write may publish on a later one only by proving everything it read unchanged. A retry starts fresh rather than mixing old and new authority." |
-| 4, a mutation publishes once | Each write is in exactly one publication, and its statements stay together. A publication can hold several writes of one actor. No text change |
+| 4, a mutation publishes once | Each write is in exactly one publication, and its statements stay together. A publication can hold several writes, of any actors, each in the write list. No text change |
 | 5, crash convergence | Unchanged: detached commits follow admission, carry the batch's witness and stay unreachable until the publication |
-| 7, physical acceleration | A composed append leaves an unindexed tail like any append. Known keys and the index warm-up are caches |
+| 7, physical acceleration | A composed append leaves an unindexed tail like any append. Known keys and the index warm-up are caches. The index that `@unique` implies is derived |
 | 8, integrity failures are loud | Every constraint an entry validated holds at publication, by admission. A check with no key form makes the write ineligible |
-| 10, policy | Enforced per write at its `_as` entry point, before it queues |
+| 10, policy | Enforced per write at its `_as` entry point, before it queues. The write list attributes each write to its own actor |
 | 11, bounded and observable | Queue, batch, log, horizon and known keys are bounded. Send-backs are counted as re-preparations. Batch size, known-key probes and misses are counted |
 | 12, one source of truth | The log and the known keys cache immutable facts. The log has one writer, the door, and its classes are derived and fail closed. The queue holds requests, not manifest-derived state |
 | Deny-list | The write group is process-local and is not fencing: the compare-and-swap and the writer epoch remain the cross-process fences. No job queue, no silent retry, no acknowledgement before durable visibility |
@@ -1015,9 +1117,9 @@ branches are measured.
 
 | Step | Scope | Done when |
 |---|---|---|
-| 1. Known keys | The map, the byte bound with eviction, dropping files a `Rewrite` removed, the tail analysis once per version, and the cap lift | In-source `table_store` tests compare map and scan on every fragment shape (deletion file, column patch, compaction, unknown file, eviction). A tail past `KEYED_WRITE_MAX_ROWS` that the map answers stays on the absence-proven writer. `write_cost.rs` shows a keyed insert's requests flat as the tail grows. The DST cost golden records it at two tail lengths. `forbidden_apis.rs` pins that only the absence-proven writer records. No behavior change |
+| 1. Key lookups and known keys | The two-part key lookup for every key space with the cap removed, the map for every key space, the byte bound with eviction, dropping files a `Rewrite` removed, the tail analysis once per version, and the index that `@unique` implies | In-source `table_store` and `validate` tests compare map, tail scan and full scan on every fragment shape (deletion file, column patch, compaction, unknown file, eviction). A tail past `KEYED_WRITE_MAX_ROWS` stays on the absence-proven writer, with the map and without it. `write_cost.rs` shows a keyed insert's requests flat as the tail grows when the map answers, bounded by the tail in a cold process, and a `@unique` insert reading no committed rows outside the tail. The DST cost golden records it at two tail lengths. `forbidden_apis.rs` pins that only the absence-proven writer records. No behavior change |
 | 2. Footprint | Carry `op_kinds` through staging and rewrite its doc comment to name the executed-operation class, with `strict_pre_stage_version_check` its one owner. Record validation reads, with endpoint ids. Give `StagedWrite` the exact inserted ids its doc comment describes, and carry a mutation's written ids to its publication. Derive the footprint from `ValidateCheck` through one wildcard-free `match`, and record removed rows' tuples and endpoints on the delete path. Define `PublicationEffect` and its four constructors, with keys per key space. Make eligibility one function | In-source staging tests, one per `ValidateCheck` arm, and `writes.rs`. `forbidden_apis.rs` pins the wildcard-free match. No behavior change |
-| 3. Composition | The sealed adapter, the engine half of the guard, the Blob case | `lance_surface_guards.rs`, `integration/changes.rs` (the feed's fast path), the merge owners (the pure-insert proof), `forbidden_apis.rs` |
+| 3. Composition and attribution | The sealed adapter, the engine half of the guard, the Blob case, and the write list after its format decision | `lance_surface_guards.rs` (including one contiguous row-id range per member), `integration/changes.rs` (the feed's fast path, and each row's actor), the merge owners (the pure-insert proof), the catalog tests (the write list's round trip and byte budget), `forbidden_apis.rs` |
 | 4. Maintenance carry | Index builds and `optimize`'s direct path carried over insert-only and row-preserving publications | `lance_surface_guards.rs` (`TransactionRebase` of `CreateIndex` and `Rewrite` over an insert-only `Update`), `failpoints.rs`, `detached_commit_matrix.rs` (a carried index build), the DST cost golden |
 | 5. Write group, batches of one | Queue per root and branch, lead handoff with drop guards, group-owned typed outcome, the log written by the door with its link rule, the gated second attempt, batch-path seams, cancellation, per-member evidence, the `group_commit` setting (default `off`), the instrument | `write_cost.rs` (a batch of one costs no more than today), `failpoints.rs` batch-outcome cells, `detached_commit_matrix.rs`, DST, `forbidden_apis.rs`, the GQT corpus with the setting on. Behavior unchanged |
 | 6. Batching of inserts | Admission and composition in the batch, exact footprints for publications outside it, setting still off by default. Invariant 3, `AGENTS.md` and `docs/dev/writes.md` change. Measure one data file per batch | The admission matrix, `failpoints.rs`, DST, RustFS and Azurite suites, all with batching forced on |
@@ -1059,7 +1161,10 @@ because `.gqt` cannot express them. The cells:
   and reruns, and the rows are (1, 0) or (0, 1), never (0, 0);
 - an expected head publishes alone, including the first write on a fresh
   named branch;
-- two actors make two commits;
+- two actors share one commit, and the change feed reports each row with
+  its own actor;
+- a cold process with a tail past `KEYED_WRITE_MAX_ROWS` stays on the
+  absence-proven writer;
 - a publication by `optimize`, a merge or another handle between capture and
   batch;
 - `group_commit = off` matches today.
@@ -1085,7 +1190,7 @@ Other owners:
   writer through every window, fault and recovery actor.
 - DST: the concurrent universe (`crates/omnigraph-dst/src/concurrent.rs`,
   `dst_concurrent_*`) with batching on and the collector oracle, which checks
-  every acknowledged write visible once and one actor per commit. The
+  every acknowledged write visible once and attributed to its actor. The
   storage-cost golden gains a batch row.
 - Instrument: #1401's `concurrent_write_throughput.rs` lands at step 5 as an
   `instrument:` ignored test. It owns the soak and the instrument gate until
@@ -1311,15 +1416,18 @@ test:
 | A dedicated publisher task | A child producer no owned operation owns, invisible to `--measure` and `.gqt` `order:` (#785) |
 | A record log in front of `__manifest` (#1399) | One conditional put per publication and +32% at 64 writers in its setting, but it rewords invariants 2, 5 and 12 and overlaps RFC 0068. Future work, in its own RFC |
 | RFC 0068's commit record | Lowers the per-publication cost and composes with this RFC: one record per batch |
-| Batches across actors | Needs per-write attribution in the commit, a format change that belongs with per-write idempotency (#513) |
+| Batches of one actor only (the earlier revisions) | Needs no format change, but gains nothing when each agent writes with its own token: most batches then hold one write. Attribution by row-id range costs a few bytes per member |
+| A tail cap with known keys as the only way past it (the earlier revisions) | Throughput depended on process memory: after a restart, or for another process's files, the cliff came back until `optimize` covered the tail |
 
 ### Compatibility and reversibility
 
-- Storage: none. Commit, head and registration rows are unchanged, and an
-  older binary reads a batch commit as an ordinary commit.
-- Wire and API: none.
-- Behavior: the commit grain under concurrent writes by one actor, documented
-  with the rollout step that enables it.
+- Storage: the commit record's write list (Attribution), with its own
+  RFC 0068 amendment and stamp decision. Head and registration rows are
+  unchanged. A commit that holds one write is stored as today.
+- Wire and API: the commit and change-feed responses gain the write list.
+  Existing fields keep their meaning for a commit with one actor.
+- Behavior: the commit grain under concurrent writes, documented with the
+  rollout step that enables it.
 - Reversal: `group_commit = off` restores today's path. The known keys leave
   no durable trace.
 
@@ -1355,7 +1463,7 @@ test:
     `DataOverlay`.
 - Broader batching: updates and deletes by predicate, Append and Merge loads
   with exact ids, admission across foreign commits by reading their change
-  sets, and per-write attribution for cross-actor batches (#513).
+  sets, and per-write idempotency ids in the write list (#513).
 
 ### Decision log
 
@@ -1417,3 +1525,11 @@ test:
   reviewers without context. Part 2 gives implementers the rules, each tied
   to the defect it prevents, code locations at `4f7c2076`, and done criteria
   per step. Part 3 holds the evidence. No design change.
+- 2026-11-15: Batches across actors, and cost by design. A batch takes
+  entries of any actors, and the commit's write list attributes each
+  member's rows by stable row-id range (Attribution, rule 19). This is a
+  format change that blocks step 3. Every committed key read becomes a
+  two-part key lookup with no row cap (rule 18), so a cold process pays a
+  bounded tail read instead of the C1 cliff. Known keys cover every key
+  space, and `@unique` is proposed to imply an index. None of these is
+  measured yet.
