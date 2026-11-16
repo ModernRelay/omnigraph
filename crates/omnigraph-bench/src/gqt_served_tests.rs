@@ -36,7 +36,7 @@ const NO_SERVED_DOOR: [&str; 6] = [
     "e2e-query-destination-search",
     "e2e-nearest-prefilter",
     "e2e-nearest-nprobes-one",
-    "e2e-rrf-traversal",
+    "e2e-rrf-exact-traversal",
     "e2e-traversal-selective-csr",
     "e2e-traversal-selective-indexed",
 ];

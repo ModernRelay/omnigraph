@@ -1,5 +1,5 @@
 # issue: none
-# notes: A fusion of two exact `bm25` arms with a traversal after it and the exact winner x. One operation on a fresh handle is timed; checks and restart are outside the timer.
+# notes: A fusion of two exact `bm25` arms (the exact lexical scan, not an index-ranked order) with a traversal after it and the exact winner x; named apart from the index-ranked workload it replaced, whose timings it does not continue. One operation on a fresh handle is timed; checks and restart are outside the timer.
 
 --- runner
 timeout_ms: 60000

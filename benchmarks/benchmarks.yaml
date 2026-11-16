@@ -526,9 +526,9 @@ scenarios:
           order { $distance }
           limit 3
       }
-- id: e2e-rrf-traversal
+- id: e2e-rrf-exact-traversal
   fixture: fixtures/e2e_rrf_traversal.gqt
-  workload: workloads/e2e_rrf_traversal.gqt
+  workload: workloads/e2e_rrf_exact_traversal.gqt
   measured_step:
     ordinal: 1
     text: |
@@ -773,7 +773,7 @@ groups:
   - e2e-branch-first-write
   - e2e-nearest-prefilter
   - e2e-nearest-nprobes-one
-  - e2e-rrf-traversal
+  - e2e-rrf-exact-traversal
   aws-xfs-process-cold:
   - branch-merge-d50-process-cold
   aws-xfs-history64:

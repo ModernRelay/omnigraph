@@ -54,7 +54,7 @@ a warm-up read, the measured read, a `--- restart` and a verification read, and
 on the server the restart is the long-running lifecycle's no-op (a step
 receipt with no door opened). Six of the group's scenarios have no served door:
 `e2e-query-destination-search`, `e2e-nearest-prefilter`,
-`e2e-nearest-nprobes-one` and `e2e-rrf-traversal` need indexes (search,
+`e2e-nearest-nprobes-one` and `e2e-rrf-exact-traversal` need indexes (search,
 nearest and RRF), and `e2e-traversal-selective-csr` and
 `e2e-traversal-selective-indexed` pin a traversal path; a served run of those
 is refused by name before any request. The served point of a scenario is

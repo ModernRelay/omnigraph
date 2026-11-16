@@ -21,7 +21,7 @@ const END_TO_END: [(&str, StepKind); 14] = [
     ("e2e-branch-first-write", StepKind::Mutate),
     ("e2e-nearest-prefilter", StepKind::Query),
     ("e2e-nearest-nprobes-one", StepKind::Query),
-    ("e2e-rrf-traversal", StepKind::Query),
+    ("e2e-rrf-exact-traversal", StepKind::Query),
 ];
 const QUERY_SHAPES: [&str; 14] = [
     "e2e-query-scan",
@@ -380,7 +380,7 @@ scenario_tests!(
         end_to_end_e2e_branch_first_write => "e2e-branch-first-write",
         end_to_end_e2e_nearest_prefilter => "e2e-nearest-prefilter",
         end_to_end_e2e_nearest_nprobes_one => "e2e-nearest-nprobes-one",
-        end_to_end_e2e_rrf_traversal => "e2e-rrf-traversal",
+        end_to_end_e2e_rrf_exact_traversal => "e2e-rrf-exact-traversal",
     ]
 );
 
