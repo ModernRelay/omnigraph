@@ -153,8 +153,7 @@ unsupported. Pattern:
 2. Apply
 3. Backfill via a `mutate` or `load --mode merge`
 4. Promote it: change `new_prop: String?` to `new_prop: String` and apply. The
-   apply reads the stored rows first and refuses, changing nothing, while any
-   live row still holds a null (OG-MF-104); see the constraints section below.
+   constraints section below says when that apply is refused.
 
 ### Enum widening is a supported apply
 
