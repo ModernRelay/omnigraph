@@ -60,40 +60,84 @@ Use your own skills directory if you are not Claude Code. If the exported
 `SKILL.md` differs from the copy you are reading, follow the exported one from
 here on (see [version-matched skill](commands.md#version-matched-skill)).
 
-## 3. Ask what the graph is for
+Check that your agent can see the exported skill before going on. If it reads
+skills only when it starts, tell the user the exact step to resume, for
+example: restart the agent in this directory and say "continue the Omnigraph
+onboarding from step 3".
 
-Ask the user one question: what should this graph hold, and who or what will
-read and write it? Typical answers:
+## 3. Find the use case
 
-| The user wants | Start from |
-|---|---|
-| A shared memory for a team and its agents: decisions, claims, action items with their sources | the `company-brain` cookbook |
-| A personal knowledge base: projects, people, notes | the `second-brain` cookbook |
-| A work queue for coding agents | the `beads` cookbook |
-| Issues, decisions, specs and releases of a software project | the `dev-graph` cookbook |
-| Market or competitive research | the `industry-intel` or `pharma-intel` cookbook |
-| Deals and portfolio tracking | the `vc-os` cookbook |
-| Requirements, budgets and verification of a hardware program | the `hardware-program` cookbook |
-| Something else | a schema of their own (step 4) |
+Users arrive in one of two states: they already know what the graph is for, or
+they want to see what it can do first. Do not make the second kind invent a use
+case on the spot, and do not walk the first kind through a catalogue.
 
-The [cookbooks](https://github.com/ModernRelay/omnigraph-cookbooks) are full
-cluster deployments with seed data, stored queries and policies. If one fits,
-tell the user, and offer either to follow its README or to start with the small
-local graph below and grow it. Start small unless they ask for the full
-deployment.
+If the user's request or the project you are in already says what the graph is
+for (for example "set up Omnigraph for our sales notes"), take that as the use
+case and go to 3a. Otherwise ask one question: do they already have something
+in mind for the graph, or would they like to see what people build with it?
 
-The cookbooks pin a CLI and server release, named at the top of their README.
-Follow a cookbook only when `omnigraph version` reports that release, or after
-installing it ([release channels](../../../docs/user/install.md#release-channels) shows how to
-pin a version). Otherwise borrow its schema and queries for the local graph
-below.
+### 3a. They have a use case
+
+Ask what the graph should hold, who or what will read and write it, and two or
+three questions they want it to answer. The questions become the queries of
+step 4. If a cookbook in the table under 3b is close, say so: its schema is a
+starting point to trim, not a template to adopt whole.
+
+### 3b. They want to see what is possible
+
+Show this table and ask them to pick one, or to describe their own once they
+have seen the options (then continue with 3a):
+
+| Use case | What it holds | A question it answers | Cookbook |
+|---|---|---|---|
+| Company brain | Teams, projects, what people said and decided, who owes what, with the exact quote behind each | Who owes what, and which words is each decision based on? | `company-brain` |
+| Second brain | People, places, projects, notes, tasks, habits and media | What did Sarah recommend that I haven't read yet? | `second-brain` |
+| Agent work queue | Issues for coding agents, what waits on what, who claimed it | What work is ready, and who has it? | `beads` |
+| Software project | Issues, epics, decisions, specs, PRs and releases | What's ready to work on, and what's blocking everything else? | `dev-graph` |
+| Market research | Signals and the patterns they form or contradict | Which signals contradict this pattern? | `industry-intel` |
+| Competitive intelligence | Trials, filings and deals, weighed against your own assumptions | Which signals contradict my thesis? | `pharma-intel` |
+| Venture capital | Deal flow, diligence, decisions, portfolio and network | Which questions are still open on this deal? | `vc-os` |
+| Hardware program | Requirements, architecture, budgets, tests, risks and reviews | Does the mass budget still close? | `hardware-program` |
+
+When they pick one, offer to load it so they can see a real graph before
+designing their own. Every [cookbook](https://github.com/ModernRelay/omnigraph-cookbooks)
+folder has `schema.pg`, `queries/` and `seed.jsonl`, with `seed.md` describing
+the seed. Copy the chosen one into a new project directory:
+
+```bash
+mkdir my-graph && cd my-graph
+git clone --depth 1 https://github.com/ModernRelay/omnigraph-cookbooks /tmp/omnigraph-cookbooks
+cp -R /tmp/omnigraph-cookbooks/second-brain/{schema.pg,queries,seed.jsonl,seed.md} .
+```
+
+Then lint, create and load it as in steps 4 and 5, with the cookbook's files in
+place of new ones, and run two or three of its read queries that answer
+questions like the one in the table. Afterwards ask whether to keep it as the
+starting point, trimmed to what they need, or to start fresh in step 4 with
+what they have learned. Either way, ask the 3a questions before step 4.
+
+### Cookbook versions
+
+The cookbooks are full cluster deployments with seed data, stored queries and
+policies. Start with the small local graph in this guide unless the user asks
+for the full deployment. Each cookbook pins a CLI and server release, named at
+the top of its README. Follow its README only when `omnigraph version` reports
+that release, or after installing it
+([release channels](../../../docs/user/install.md#release-channels) shows how to pin a
+version). Its schema and queries can still be borrowed for a local graph; if
+`lint` refuses them on the installed CLI, tell the user and fix them or start
+from step 4.
+
+Whichever path you took, note the use case and the user's questions: step 8
+writes them into the project's agent file.
 
 ## 4. Design a first schema
 
-In a new project directory, write two files.
+In a new project directory, write two files. If the user kept a cookbook in
+step 3b, edit its files instead: drop the types their questions don't need.
 
-First the questions, as `.gq` queries in `queries.gq`: three to five reads the
-user will actually run. Then the schema in `schema.pg` with the node and edge
+First the questions, as `.gq` queries in `queries.gq`: the user's questions
+from step 3, three to five reads they will actually run. Then the schema in `schema.pg` with the node and edge
 types those queries need, each node with a stable `@key`. Keep it small: a
 first schema has a handful of types, and adding types and nullable properties
 later is cheap. Follow the [design flow](schema-design.md#design-flow) and the
@@ -186,12 +230,62 @@ Check each command's `--help` if the installed CLI differs. See
 
 ## 8. Leave the project ready for the next session
 
-- Write a short `CLAUDE.md` (or `AGENTS.md`) in the project: where the schema,
-  queries and graph live, the `--target`, and the rules from this skill that
-  matter for it.
+The graph is only useful if every later session uses it: an agent that does
+not know about it answers from memory and keeps facts in chat or notes, and the
+graph falls out of date. Write an agent file that makes it the canonical store
+for what it holds.
+
+- Write `AGENTS.md` in the project, which most coding agents read, and for
+  Claude Code a `CLAUDE.md` whose only line is `@AGENTS.md`. Adapt this
+  section, filling in the use case, the user's questions from step 3, the
+  cookbook it started from if any, and the real paths and `--target`:
+
+  ```markdown
+  ## Omnigraph: the canonical store for <what it holds>
+
+  <One sentence on what the graph is for.> It answers questions such as:
+  <the user's questions>. Facts about <people, projects, decisions…> live in
+  the graph at `--target ./graph.omni`, not in chat, notes or this file.
+
+  - Read the schema before any query or write:
+    `omnigraph schema show --target ./graph.omni`. Use only the types,
+    properties and edges it declares. Queries are in `queries.gq`.
+  - Pull context first: when a request touches anything the graph holds,
+    query it and answer from what it returns. If it returns nothing, say so
+    instead of guessing.
+  - Suggest recording what is new: when the user mentions a fact the graph
+    should hold, or you find one it lacks or contradicts, offer to add it.
+    Look the entity up by its key before creating another.
+  - Write on a branch, never straight to main: `omnigraph branch create
+    agent/<topic> --target ./graph.omni`, then `mutate` or `load` with
+    `--branch agent/<topic>`. Show the user `omnigraph branch diff
+    agent/<topic> --target ./graph.omni`, and merge with `omnigraph branch
+    merge agent/<topic> --into main --delete-branch --target ./graph.omni`
+    only after they approve.
+  - Load the omnigraph skill (`omnigraph skill show`) before changing the
+    schema, bulk loading, or retrying a write whose outcome is unknown.
+  ```
+
+- If the graph should be the canonical store outside this project too, as a
+  second brain or a company brain usually is, offer to add the same section to
+  the user's global agent file (`~/.claude/CLAUDE.md` for Claude Code,
+  `~/.codex/AGENTS.md` for Codex), with the graph's absolute path as the
+  `--target`. Ask first: it changes every session they run.
 - Add `.env.omni`, `.claude/` and `*.omni/` to `.gitignore`; commit
-  `schema.pg`, `queries.gq`, `seed.jsonl` and the agent file (see
+  `schema.pg`, `queries.gq`, `seed.jsonl` and the agent files (see
   [what to commit](../SKILL.md#what-to-commit)).
+
+Do not tell the user setup is complete until each of these holds, and say
+which one fails if one does:
+
+- `omnigraph version` runs in a new shell, not only in this session's `PATH`.
+- The exported skill is in a directory your agent loads skills from.
+- `omnigraph lint --schema schema.pg --query <file>` passes for every query
+  file (`queries.gq`, or each file in a cookbook's `queries/`).
+- Each query from step 4 returns rows from the graph.
+- `AGENTS.md` names the use case and the `--target`, and carries the
+  canonical-store rules: read the schema, pull context first, suggest writes,
+  write on a branch.
 
 ## 9. Next steps
 
