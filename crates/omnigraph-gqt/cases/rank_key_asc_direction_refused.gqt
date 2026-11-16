@@ -47,15 +47,15 @@ query bm25_asc() {
 --- expect error: T65: `bm25` is a relation function; a ranking is drawn with `from`, and its score is a column
 
 --- query
-query rrf_asc($v: Vector(2)) {
+query rrf_asc($v: Vector(2), $w: Vector(2)) {
     match { $d: Doc }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $v), bm25($d.text, "needle")) asc }
+    order { rrf(nearest($d.embedding, $v), nearest($d.embedding, $w)) asc }
     limit 2
 }
 
 --- params
-{"v": [0.0, 0.0]}
+{"v": [0.0, 0.0], "w": [1.0, 0.0]}
 
 --- expect error: T65: `rrf` is a relation function; a ranking is drawn with `from`, and its score is a column
 

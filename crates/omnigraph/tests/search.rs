@@ -2368,7 +2368,12 @@ async fn rrf_fuses_two_fts_fields() {
     let db = init_search_db(&dir).await;
     let error = query_main(
         &db,
-        SEARCH_QUERIES,
+        r#"query rrf_two_fts($q: String) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $q), bm25($all, $d.body, $q), k: 60) as $score, $d: Doc }
+    return { $d.slug, $d.title }
+    order { $score desc }
+    limit 3
+}"#,
         "rrf_two_fts",
         &params(&[("$q", "learning")]),
     )
