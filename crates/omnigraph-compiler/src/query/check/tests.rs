@@ -2,11 +2,13 @@
 //! 10, "Type-check tests"), the RFC's examples type-checked, and one repair
 //! per type-level refusal shape.
 
-use super::{CheckedDecl, check_source, type_source};
+use super::{CheckedDecl, SExpr, SKind, Step, apply, check_source, count_rows, type_source};
 use crate::catalog::{Catalog, build_catalog};
 use crate::ir::core::*;
 use crate::query::syntax::parse::parse_source;
+use crate::query::value::Literal;
 use crate::schema::parser::parse_schema;
+use crate::types::ScalarType;
 
 /// The schema of the RFC's section 8 in today's `.pg` spelling (a String's
 /// full-text index is `@index`), with the section 6 example's revisions and
@@ -780,7 +782,21 @@ fn a_run_of_optionals_grows_the_term_linearly() {
 /// 2^30 nodes first.
 #[test]
 fn a_plan_budget_overrun_stops_as_the_term_is_built() {
-    let start = std::time::Instant::now();
+    // The size the refusal reports: the first term over the 4096-node
+    // budget, at most one doubling past it, never the 2^30 nodes of the
+    // whole expansion.
+    let reported = |m: &str| -> usize {
+        let at = m
+            .find("alone has ")
+            .map(|i| i + "alone has ".len())
+            .or_else(|| m.find("expands to ").map(|i| i + "expands to ".len()))
+            .unwrap_or_else(|| panic!("no size in {m}"));
+        m[at..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no size in {m}"))
+    };
     let mut nested = String::from("$q30: Person, $q29 knows $q30");
     for i in (1..30).rev() {
         nested = format!(
@@ -795,6 +811,7 @@ fn a_plan_budget_overrun_stops_as_the_term_is_built() {
         "T70",
     );
     assert!(m.contains("plan budget"), "{m}");
+    assert!(reported(&m) < 3 * 4096, "{m}");
     let mut reads = vec!["query r30() { match { $p: Person } return { $p } }".to_string()];
     for i in (0..30).rev() {
         reads.push(format!(
@@ -806,11 +823,52 @@ fn a_plan_budget_overrun_stops_as_the_term_is_built() {
     reads.reverse();
     let m = refused(&reads.join("\n"), "T70");
     assert!(m.contains("plan budget") && m.contains("r1 → r2"), "{m}");
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(20),
-        "{:?}",
-        start.elapsed()
+    assert!(reported(&m) < 3 * 4096, "{m}");
+}
+
+/// [`Step::added`] counts exactly the nodes [`apply`] adds above a present
+/// term, for every kind of step.
+#[test]
+fn a_step_counts_the_nodes_it_adds() {
+    let truth = SExpr::new(
+        SKind::Lit(Literal::Bool(true)),
+        Ty::scalar(ScalarType::Bool, false),
     );
+    let falsity = SExpr::new(
+        SKind::Lit(Literal::Bool(false)),
+        Ty::scalar(ScalarType::Bool, false),
+    );
+    let block = || vec![(Term::Env(Vec::new()), "c".to_string(), count_rows())];
+    let leaf = Term::Correlate {
+        outer: Term::Unit.boxed(),
+        inner: Term::Env(Vec::new()).boxed(),
+    };
+    let steps = vec![
+        Step::Leaf(leaf.clone()),
+        Step::Filter {
+            blocks: block(),
+            pred: truth.clone(),
+        },
+        Step::Filter {
+            blocks: Vec::new(),
+            pred: falsity.clone(),
+        },
+        Step::Let {
+            blocks: block(),
+            name: "v".into(),
+            value: falsity,
+        },
+        Step::Optional {
+            inner: leaf,
+            new_cols: Vec::new(),
+            env: Vec::new(),
+        },
+    ];
+    for step in steps {
+        let added = step.added();
+        let built = apply(Some(Term::Unit), step, &mut 0).size() - 1;
+        assert_eq!(added, built);
+    }
 }
 
 #[test]

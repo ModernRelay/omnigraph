@@ -2569,12 +2569,12 @@ impl Ctx<'_> {
     }
 
     /// `step` applied to `acc`, whose size is `size`, and the result charged
-    /// ([`Self::charge`]): the nodes the step adds are its fold over a
-    /// one-node term, so `acc` is not walked again.
+    /// ([`Self::charge`]): the nodes the step adds ([`Step::added`]) are
+    /// counted from the step itself, so `acc` is not walked again.
     fn charged(&mut self, acc: Option<Term>, step: Step, size: &mut usize) -> R<Term> {
         *size = match acc {
             None => 0,
-            Some(_) => *size + apply(Some(Term::Unit), step.clone(), &mut self.fresh).size() - 1,
+            Some(_) => *size + step.added(),
         };
         let term = apply(acc, step, &mut self.fresh);
         if *size == 0 {
@@ -5665,6 +5665,27 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
     }
 }
 
+impl Step {
+    /// How many nodes [`apply`] adds above a present `acc`, read from the
+    /// step without building them.
+    fn added(&self) -> usize {
+        let blocks = |blocks: &[(Term, String, Agg)]| {
+            blocks.iter().map(|(t, ..)| 2 + t.size()).sum::<usize>()
+        };
+        match self {
+            Step::Leaf(t) => 1 + t.size(),
+            Step::Expand { semi, .. } => 1 + usize::from(semi.is_some()),
+            Step::Filter { blocks: b, pred } => {
+                blocks(b) + usize::from(!matches!(pred.kind, SKind::Lit(Literal::Bool(true))))
+            }
+            Step::Let { blocks: b, .. } => blocks(b) + 1,
+            // Correlate, Union, Project, Filter, Correlate, the row, Group,
+            // and the inner term twice.
+            Step::Optional { inner, .. } => 7 + 2 * inner.size(),
+        }
+    }
+}
+
 /// The column names a term produces (types are not needed by the fold).
 fn output_columns(t: &Term) -> Vec<String> {
     match t {
@@ -6326,7 +6347,10 @@ fn arith(op: ArithOp, l: SExpr, r: SExpr) -> R<SExpr> {
 /// The common type of two numeric scalars: one type keeps it, an integer
 /// with a float is `F64` (as is `F32` beside `F64`), a narrower integer of
 /// one signedness widens to the wider, `U32` with a signed integer is `I64`,
-/// and `U64` with a signed integer has none.
+/// and `U64` with a signed integer has none. This is the join of a value
+/// that becomes a column (arithmetic, `if`, `coalesce`); a comparison of
+/// `U64` with a signed integer meets in the internal exact carrier instead
+/// (`ir::coerce::common_numeric`), which never appears in a result.
 fn numeric_join(a: ScalarType, b: ScalarType) -> Option<ScalarType> {
     let float = |s| matches!(s, ScalarType::F32 | ScalarType::F64);
     let signed = |s| matches!(s, ScalarType::I32 | ScalarType::I64);
