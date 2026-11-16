@@ -428,3 +428,89 @@ fn non_ascii_mutations_never_panic_and_position_at_characters() {
         })
         .unwrap();
 }
+
+/// Every recursive production meets the nesting bound before anything
+/// recurses: a long chain of unary minus, arithmetic, concatenation, a
+/// comparison chain, `not` in any spelling, `NOT`/`!` and `AND`/`OR`/`&&`
+/// (which the habit rewrite reparses as `not`, `and` and `or`) and nested
+/// `case` is refused `Q006`, on the stack a query thread has, where the
+/// unbounded recursion of the parse, the check or the drop of the tree would
+/// abort the process. A chain under the bound still compiles there.
+#[test]
+fn every_recursive_production_is_bounded_before_it_recurses() {
+    use crate::query::depth::QUERY_THREAD_STACK_BYTES;
+    fn filter(expr: &str) -> String {
+        format!("query q() {{ match {{ $p: Person }} where {expr} return {{ $p.name }} }}")
+    }
+    type Shape = (&'static str, fn(usize) -> String);
+    let shapes: [Shape; 13] = [
+        ("unary minus", |n| {
+            filter(&format!("$p.age > {}1", "-".repeat(n)))
+        }),
+        ("spaced unary minus", |n| {
+            filter(&format!("$p.age > {}1", "- ".repeat(n)))
+        }),
+        ("sum", |n| {
+            filter(&format!("$p.age > {}1", "1 + ".repeat(n)))
+        }),
+        ("difference", |n| {
+            filter(&format!("$p.age > {}1", "1 - ".repeat(n)))
+        }),
+        ("product", |n| {
+            filter(&format!("$p.age > {}1", "1 * ".repeat(n)))
+        }),
+        ("concatenation", |n| {
+            filter(&format!("$p.name = {}\"a\"", "\"a\" || ".repeat(n)))
+        }),
+        ("comparison chain", |n| {
+            filter(&format!("{}2", "1 < ".repeat(n)))
+        }),
+        ("NOT run", |n| {
+            filter(&format!("{}$p.age > 1", "NOT ".repeat(n)))
+        }),
+        ("! run", |n| {
+            filter(&format!("{}($p.age > 1)", "!".repeat(n)))
+        }),
+        ("OR chain", |n| {
+            filter(&vec!["$p.age > 1"; n + 1].join(" OR "))
+        }),
+        ("&& chain", |n| {
+            filter(&vec!["$p.age > 1"; n + 1].join(" && "))
+        }),
+        ("nested case", |n| {
+            filter(&format!(
+                "$p.age > {}1{}",
+                "case when true then ".repeat(n),
+                " end".repeat(n)
+            ))
+        }),
+        ("not, minus and brackets mixed", |n| {
+            filter(&format!(
+                "{}$p.age > 1{}",
+                "not -(".repeat(n),
+                ")".repeat(n)
+            ))
+        }),
+    ];
+    let outcome = std::thread::Builder::new()
+        .stack_size(QUERY_THREAD_STACK_BYTES)
+        .spawn(move || {
+            let mut wrong = Vec::new();
+            for (shape, build) in shapes {
+                let refused = pass(&build(100_000));
+                if refused.len() != 1 || refused[0].code.as_str() != "Q006" {
+                    wrong.push(format!("{shape} at 100000: {refused:?}"));
+                }
+                // Under the bound, the same shape is not refused Q006.
+                let accepted = pass(&build(10));
+                if accepted.iter().any(|d| d.code.as_str() == "Q006") {
+                    wrong.push(format!("{shape} at 10: {accepted:?}"));
+                }
+            }
+            wrong
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(outcome.is_empty(), "{outcome:#?}");
+}

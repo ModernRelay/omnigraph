@@ -7,20 +7,26 @@
 //! so its operators are levels too. This module bounds the depth with one
 //! linear scan over the bytes, before any recursion: it skips string
 //! literals and comments as the grammar does, opens a level at `(`, `{` and
-//! `[`, charges a level for each `not` in a run of adjacent `not`s, and
-//! charges each `and`/`or` to the total. The estimate never undercounts the
-//! tree a source can build; it overcounts operators of sibling clauses that
-//! share a level, which only matters for a source near the bound.
+//! `[`, charges a level for each prefix operator in a run of adjacent ones
+//! (`not` in any case, `!`, a unary `-`) and for each nested `case`, charges
+//! each `and`/`or` (in any case, and `&&`) to the total, and charges the
+//! longest run of binary operators (arithmetic, `||`, comparisons) between
+//! two `and`/`or`s. Every spelling the habit rewrite turns into an operator
+//! is counted as that operator, so the rewrite's reparse meets the same
+//! bound. The estimate never undercounts the tree a source can build; it
+//! overcounts operators of sibling clauses that share a level, which only
+//! matters for a source near the bound.
 
 use super::codes::Q006;
 use super::diagnostic::{Position, QueryDiagnostic};
 
-/// The deepest nesting of brackets and adjacent `not`s a query source may
-/// hold. Each such level costs several frames in the grammar alone.
+/// The deepest nesting of brackets, `case`s and adjacent prefix operators a
+/// query source may hold. Each such level costs several frames in the grammar alone.
 pub const MAX_QUERY_NESTING: usize = 64;
 
 /// The deepest expression a query source may build, counting every
-/// `and`/`or` of a chain as one level on top of the nesting. A long `or`
+/// `and`/`or` of a chain and every operator of an arithmetic or comparison
+/// chain as one level on top of the nesting. A long `or`
 /// chain over one property is written `$p.name in [...]`, which is one level
 /// whatever its length.
 pub const MAX_QUERY_EXPRESSION_DEPTH: usize = 256;
@@ -35,14 +41,22 @@ pub const QUERY_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
 struct Level {
-    /// The `not` run directly before this level's opening bracket.
+    /// The prefix-operator run directly before this level's opening bracket.
     lead: usize,
-    /// The longest run of adjacent `not` keywords at this level.
+    /// The longest run of adjacent prefix operators (`not`, `!`, a unary
+    /// `-`) at this level.
     nots: usize,
-    /// The `not` run in progress, ended by any other token.
+    /// The `case` expressions at this level, each nesting its branches.
+    cases: usize,
+    /// The prefix-operator run in progress, ended by any other token.
     run: usize,
-    /// `and`/`or` operators at this level.
+    /// `and`/`or` operators at this level, plus the longest run of binary
+    /// operators between two of them.
     chain: usize,
+    /// The binary-operator run in progress, ended by `and`/`or` or `,`.
+    ops: usize,
+    /// The longest binary-operator run at this level.
+    ops_max: usize,
     /// The deepest completed child, in nesting and in total.
     child_nesting: usize,
     child_total: usize,
@@ -64,19 +78,19 @@ pub(crate) fn check_query_nesting(input: &str) -> Result<(), QueryDiagnostic> {
         Err(Exceeded::Nesting(byte)) => (
             byte,
             format!(
-                "the query nests deeper than {MAX_QUERY_NESTING} levels: every bracket and every `not` in a row is one level"
+                "the query nests deeper than {MAX_QUERY_NESTING} levels: every bracket, every `case` and every `not`, `!` or unary `-` in a row is one level"
             ),
         ),
         Err(Exceeded::Total(byte)) => (
             byte,
             format!(
-                "the query builds an expression deeper than {MAX_QUERY_EXPRESSION_DEPTH} levels: every bracket, every `not` in a row and every `and`/`or` is one level"
+                "the query builds an expression deeper than {MAX_QUERY_EXPRESSION_DEPTH} levels: every bracket, every `not` in a row, every `and`/`or` and every operator of an arithmetic or comparison chain is one level"
             ),
         ),
     };
     Err(
         QueryDiagnostic::parse(Q006, message, Some(Position::at(input, byte))).with_fix(
-            "write a long `or` chain over one property as `$p.name in [...]`, and split deep nesting into simpler predicates",
+            "write a long `or` chain over one property as `$p.name in [...]`, and split deep nesting or a long arithmetic chain into simpler predicates",
         ),
     )
 }
@@ -90,15 +104,45 @@ fn measure(
 ) -> Result<(usize, usize), Exceeded> {
     let bytes = input.as_bytes();
     let mut stack = vec![Level::default()];
-    // Sums over the open levels: brackets, `lead` and `nots` in `nesting`,
+    // Sums over the open levels: brackets, `lead`, `nots` and `cases` in `nesting`,
     // and `chain` on top of them in `total`.
     let mut nesting = 0usize;
     let mut total = 0usize;
     let mut deepest = (0usize, 0usize);
     let mut i = 0;
+    // Whether the last token ended an operand, which makes a `-` binary.
+    let mut after_operand = false;
     while i < bytes.len() {
         let start = i;
         let level = stack.last_mut().expect("the root level stays");
+        // A prefix operator lengthens the run; it is a level once the run
+        // passes the longest at this level.
+        let prefix = |level: &mut Level, nesting: &mut usize, total: &mut usize| {
+            level.run += 1;
+            if level.run > level.nots {
+                level.nots = level.run;
+                *nesting += 1;
+                *total += 1;
+            }
+        };
+        // A binary operator lengthens the operator run; it is a level once
+        // the run passes the longest at this level.
+        let binary = |level: &mut Level, total: &mut usize| {
+            level.run = 0;
+            level.ops += 1;
+            if level.ops > level.ops_max {
+                level.ops_max = level.ops;
+                level.chain += 1;
+                *total += 1;
+            }
+        };
+        // `and`/`or` ends the operator run and is a level of its own.
+        let logical = |level: &mut Level, total: &mut usize| {
+            level.run = 0;
+            level.ops = 0;
+            level.chain += 1;
+            *total += 1;
+        };
         match bytes[i] {
             b' ' | b'\t' | b'\r' | b'\n' => {
                 i += 1;
@@ -119,6 +163,7 @@ fn measure(
                     i += if bytes[i] == b'\\' { 2 } else { 1 };
                 }
                 i += 1;
+                after_operand = true;
             }
             b'(' | b'{' | b'[' => {
                 let lead = std::mem::take(&mut level.run);
@@ -129,12 +174,13 @@ fn measure(
                 nesting += lead + 1;
                 total += lead + 1;
                 i += 1;
+                after_operand = false;
             }
             b')' | b'}' | b']' => {
                 level.run = 0;
                 if stack.len() > 1 {
                     let child = stack.pop().expect("a bracket level is open");
-                    let own = child.lead + 1 + child.nots;
+                    let own = child.lead + 1 + child.nots + child.cases;
                     nesting -= own;
                     total -= own + child.chain;
                     let parent = stack.last_mut().expect("the root level stays");
@@ -144,33 +190,78 @@ fn measure(
                         .max(own + child.chain + child.child_total);
                 }
                 i += 1;
+                after_operand = true;
             }
-            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'0'..=b'9' => {
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 // `$not`, `@and` and `$p.or` are names, not operators.
                 let operator = start == 0 || !matches!(bytes[start - 1], b'$' | b'@' | b'.');
-                match &bytes[start..i] {
-                    b"not" if operator => {
-                        level.run += 1;
-                        if level.run > level.nots {
-                            level.nots = level.run;
-                            nesting += 1;
-                            total += 1;
-                        }
-                    }
-                    b"and" | b"or" if operator => {
-                        level.run = 0;
-                        level.chain += 1;
-                        total += 1;
-                    }
-                    _ => level.run = 0,
+                let word = &bytes[start..i];
+                after_operand = true;
+                if operator && word.eq_ignore_ascii_case(b"not") {
+                    prefix(level, &mut nesting, &mut total);
+                    after_operand = false;
+                } else if operator
+                    && (word.eq_ignore_ascii_case(b"and") || word.eq_ignore_ascii_case(b"or"))
+                {
+                    logical(level, &mut total);
+                    after_operand = false;
+                } else if operator && word.eq_ignore_ascii_case(b"case") {
+                    // A `case` nests its branches without a bracket; it is
+                    // charged as a level that stays open.
+                    level.run = 0;
+                    level.cases += 1;
+                    nesting += 1;
+                    total += 1;
+                    after_operand = false;
+                } else if operator
+                    && [&b"when"[..], b"then", b"else"]
+                        .iter()
+                        .any(|w| word.eq_ignore_ascii_case(w))
+                {
+                    level.run = 0;
+                    level.ops = 0;
+                    after_operand = false;
+                } else {
+                    level.run = 0;
                 }
+            }
+            b'&' if bytes.get(i + 1) == Some(&b'&') => {
+                logical(level, &mut total);
+                i += 2;
+                after_operand = false;
+            }
+            b'!' if bytes.get(i + 1) != Some(&b'=') => {
+                prefix(level, &mut nesting, &mut total);
+                i += 1;
+                after_operand = false;
+            }
+            b'-' if !after_operand => {
+                prefix(level, &mut nesting, &mut total);
+                i += 1;
+            }
+            b'-' | b'+' | b'*' | b'/' | b'%' | b'|' | b'<' | b'>' | b'=' | b'!' | b'~' => {
+                // One operator, however many characters it is spelled with
+                // (`<=`, `!=`, `=~`, `||`, an arrow's `->`).
+                i += 1;
+                while i < bytes.len() && matches!(bytes[i], b'|' | b'<' | b'>' | b'=' | b'~') {
+                    i += 1;
+                }
+                binary(level, &mut total);
+                after_operand = false;
+            }
+            b',' | b';' | b':' => {
+                level.run = 0;
+                level.ops = 0;
+                i += 1;
+                after_operand = false;
             }
             _ => {
                 level.run = 0;
                 i += 1;
+                after_operand = false;
             }
         }
         let top = stack.last().expect("the root level stays");
@@ -231,7 +322,7 @@ mod tests {
                 )
             }),
             ("list literals", |n| {
-                format!("$p.age in {}1{}", "[".repeat(n), "]".repeat(n))
+                format!("$p.age > {}1{}", "[".repeat(n), "]".repeat(n))
             }),
         ];
         for (shape, build) in nesting_shapes {
@@ -258,7 +349,10 @@ mod tests {
         let quiet = filter(
             "$p.age > 1 // ((((( not not or and\n /* [[[[ or or */ $p.name = \"(((( \\\" not or\" $not = $p.or",
         );
-        assert_eq!(depth(&quiet), base);
+        assert_eq!(
+            depth(&quiet),
+            depth(&filter("$p.age > 1 $p.name = \"x\" $not = $p.or"))
+        );
         let siblings = filter(&vec!["not $p.age > 1"; 100].join("\n"));
         assert_eq!(depth(&siblings).0, base.0 + 1);
     }

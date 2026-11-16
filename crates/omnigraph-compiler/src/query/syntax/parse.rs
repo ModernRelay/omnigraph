@@ -347,6 +347,11 @@ const MAX_PARSE_REFUSALS: usize = 256;
 /// a refusal of name resolution), and its tree is still returned so that the
 /// type checker reports the declarations' own refusals beside them.
 pub fn parse_source_all(input: &str) -> (Option<SourceFile>, Vec<QueryDiagnostic>) {
+    // The nesting bound before the grammar recurses, whichever door the
+    // source came in by.
+    if let Err(refused) = crate::query::depth::check_query_nesting(input) {
+        return (None, vec![refused]);
+    }
     let mut text = input.to_string();
     let mut out: Vec<QueryDiagnostic> = Vec::new();
     // The text before the last neutralization and the region it replaced.

@@ -653,6 +653,10 @@ pub(crate) fn with_habits(
             s < region.1.max(region.0 + 1) && region.0 < e.max(s + 1)
         })
     };
+    // The rewritten text meets the nesting bound before it is reparsed.
+    if crate::query::depth::check_query_nesting(&t1).is_err() {
+        return refusal(input, lead.code, lead.message, lead_span, e1, applicability);
+    }
     let r2 = match reparse(&t1).into_iter().find(within) {
         Some(r2) if !r2.edits().is_empty() => r2,
         _ => return refusal(input, lead.code, lead.message, lead_span, e1, applicability),

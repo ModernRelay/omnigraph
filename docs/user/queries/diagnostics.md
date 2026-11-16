@@ -179,7 +179,7 @@ expected format instead, without an edit.
 | `Q003` | A settings statement is refused: unknown setting, value outside its row, or a process setting in a request. |
 | `Q004` | A branch, commit, show or explain statement is misplaced or malformed. |
 | `Q005` | A declaration body is refused; `expected` names the construct. |
-| `Q006` | The source nests too deeply, checked before the grammar runs: more than 64 levels of brackets and adjacent `not`s, or an expression deeper than 256 levels when each `and`/`or` of a chain also counts one. Write a long `or` chain over one property as `$p.name in [...]`. |
+| `Q006` | The source nests too deeply, checked before the grammar runs: more than 64 levels of brackets, `case`s and adjacent prefix operators (`not`, `!`, unary `-`), or an expression deeper than 256 levels when each `and`/`or` of a chain and each operator of an arithmetic or comparison chain also counts one. Write a long `or` chain over one property as `$p.name in [...]`. |
 | `Q007` | A traversal is written with an arrow; the fix is the triple. |
 | `Q008` | An `update` or `delete` statement carries a `where`; the fix is the group's `match` and `where`, as in `match { $x: Person } where $x.email = $e  delete $x`. |
 | `Q009` | `mutation` is not a declaration keyword; the fix is `query`. |
