@@ -1,6 +1,6 @@
 # issue: none
 # traversal: auto
-# notes: narrow_key walks top-level conjuncts only; a key equality under or/not, a != comparison, or an and nested inside an or is never narrowed, and two key equalities stay a conjunction whichever comes first.
+# notes: narrow_key walks top-level conjuncts only; a key equality under or/not, a != comparison, or an and nested inside an or is never narrowed, and two key equalities stay a conjunction whichever comes first. A negative literal before the key equality is no term that can fail, so it does not keep the equality out of the scan.
 
 --- runner
 timeout_ms: 10000
@@ -105,6 +105,19 @@ query repeated() {
 }
 --- expect unordered
 {"p.age":11}
+--- expect shape
+p.age: I32
+--- expect plan
+pass key_to_id
+
+--- query
+set engine = v2;
+query after_a_negative_literal() {
+    match { $p: Person } where $p.age > -1 and $p.slug = "beta"
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":22}
 --- expect shape
 p.age: I32
 --- expect plan

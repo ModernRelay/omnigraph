@@ -515,8 +515,14 @@ impl IRExpr {
         let mut pending = vec![self];
         while let Some(expr) = pending.pop() {
             match expr {
-                Self::Neg { .. }
-                | Self::Binary {
+                // A negated literal fails only where its negation leaves its
+                // type (`-` of the smallest integer); its value is known.
+                Self::Neg { expr: inner, ty } => match inner.as_ref() {
+                    Self::Literal(Literal::Float(_), _) => {}
+                    Self::Literal(Literal::Integer(n), _) if negation_fits(*n, ty) => {}
+                    _ => return true,
+                },
+                Self::Binary {
                     op: BinaryOp::Arith(_),
                     ..
                 } => return true,
@@ -1726,6 +1732,23 @@ pub enum IRExpr {
 /// section 2). A comparison row (`contains`, `starts_with`), a search
 /// predicate and `now()` keep their own nodes; these are the rows with no
 /// other spelling.
+/// Whether `-n` is a value of `ty`'s integer type: a negated literal that
+/// cannot overflow.
+pub fn negation_fits(n: i128, ty: &ExprType) -> bool {
+    let Some(negated) = n.checked_neg() else {
+        return false;
+    };
+    match ty {
+        ExprType::Value { scalar, .. } => match scalar {
+            ScalarType::I32 => i32::try_from(negated).is_ok(),
+            ScalarType::I64 => i64::try_from(negated).is_ok(),
+            ScalarType::F32 | ScalarType::F64 => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarFunc {
     /// `if(c, a, b)`: `a` where `c` is true, else `b` (`b` for a null `c`).

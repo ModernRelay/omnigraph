@@ -77,7 +77,16 @@ pub enum SKind {
 impl SExpr {
     pub fn new(kind: SKind, ty: Ty) -> Self {
         let can_fail = match &kind {
-            SKind::Arith { .. } | SKind::Neg(_) => true,
+            SKind::Arith { .. } => true,
+            // A negated literal's value is known: it fails only where the
+            // negation leaves its type.
+            SKind::Neg(inner) => match (&inner.kind, &ty) {
+                (SKind::Lit(Literal::Float(_)), _) => false,
+                (SKind::Lit(Literal::Integer(n)), Ty::Value(t)) => {
+                    !crate::ir::expr::negation_fits(*n, &crate::types::ExprType::from_prop(t))
+                }
+                _ => true,
+            },
             SKind::Cmp { left, right, .. }
             | SKind::And(left, right)
             | SKind::Or(left, right)
