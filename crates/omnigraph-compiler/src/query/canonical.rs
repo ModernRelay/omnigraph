@@ -1,4 +1,4 @@
-//! The non-canonical forms lint names (docs/rfcs/2026-11-07-gq-3.md,
+//! The non-canonical forms lint names (the GQ 3 RFC,
 //! section 6, "Canonical forms"), each with the canonical form as its fix.
 //!
 //! The list is the RFC's, and complete. Each canonical form has the typed IR

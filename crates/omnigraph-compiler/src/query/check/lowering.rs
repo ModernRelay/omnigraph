@@ -1,4 +1,4 @@
-//! The release's lowering admission (docs/rfcs/2026-11-07-gq-3.md, section
+//! The release's lowering admission (the GQ 3 RFC, section
 //! 5): a declaration the type checker accepts must lower. The shapers in
 //! [`crate::shape`] are the one statement of what lowers; a term they do not
 //! lower is refused here with `T86` at the construct it was written as,

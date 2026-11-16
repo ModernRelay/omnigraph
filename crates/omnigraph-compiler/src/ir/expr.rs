@@ -1728,7 +1728,7 @@ pub enum IRExpr {
     },
 }
 
-/// The scalar registry rows an expression calls (docs/rfcs/2026-11-07-gq-3.md,
+/// The scalar registry rows an expression calls (the GQ 3 RFC,
 /// section 2). A comparison row (`contains`, `starts_with`), a search
 /// predicate and `now()` keep their own nodes; these are the rows with no
 /// other spelling.

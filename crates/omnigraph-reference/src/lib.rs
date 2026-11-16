@@ -1,4 +1,4 @@
-//! A reference interpreter of the core IR (docs/rfcs/2026-11-07-gq-3.md,
+//! A reference interpreter of the core IR (the GQ 3 RFC,
 //! section 2), the GQT corpus's differential oracle.
 //!
 //! It evaluates a checked [`CoreRead`] directly from the operator table:

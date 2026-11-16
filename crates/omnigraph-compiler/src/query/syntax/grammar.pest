@@ -1,4 +1,4 @@
-// The GQ grammar (`.gq` files): docs/rfcs/2026-11-07-gq-3.md, section 7.
+// The GQ grammar (`.gq` files): the GQ 3 RFC, section 7.
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }

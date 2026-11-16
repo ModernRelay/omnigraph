@@ -1,7 +1,7 @@
 //! The interpreter is an oracle only while it shares nothing with what it
 //! checks: it reads the compiler's core IR and a JSONL export, never the
 //! planner, the engine or Lance. `libm` is the math library `bm25_v1`'s
-//! numeric profile names (docs/rfcs/2026-11-07-gq-3.md, section 4), so the
+//! numeric profile names (the GQ 3 RFC, section 4), so the
 //! oracle computes the IDF with the same `log1p` the RFC fixes.
 
 use std::path::Path;

@@ -1,4 +1,4 @@
-//! The names a refusal of an unknown name lists (docs/rfcs/2026-11-07-gq-3.md,
+//! The names a refusal of an unknown name lists (the GQ 3 RFC,
 //! section 5): up to five of the right kind, nearest the written name first,
 //! each with its type, so that an agent picks the name it meant from the
 //! diagnostic alone.

@@ -1,5 +1,5 @@
 //! Arithmetic and the scalar registry rows over Arrow arrays
-//! (docs/rfcs/2026-11-07-gq-3.md, section 2).
+//! (the GQ 3 RFC, section 2).
 //!
 //! Each arithmetic term `can_fail`: an integer overflow (`E1`), a zero divisor
 //! (`E2`) and a non-finite float result (`E3`) refuse the row with a typed

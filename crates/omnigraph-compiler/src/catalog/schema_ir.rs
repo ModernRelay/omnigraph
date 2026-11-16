@@ -56,14 +56,14 @@ pub const FEATURE_EDGE_KEYS: &str = "edge-keys";
 
 /// Feature name: a property's full-text index declares an analyzer profile or
 /// a scorer (`@index(fulltext, analyzer = ..., scorer = ...)`,
-/// docs/rfcs/2026-11-07-gq-3.md section 4). Derived from the declarations at
+/// the GQ 3 RFC, section 4). Derived from the declarations at
 /// every accept; a binary that does not know it would build and certify the
 /// field's index with edition 2's analysis and rank a `scorer = "none"` field,
 /// so it refuses the IR instead.
 pub const FEATURE_FULL_TEXT_ANALYSIS: &str = "full-text-analysis";
 
 /// Feature name: a vector property declares a distance other than `l2`
-/// (`Vector(n, distance = "cosine" | "dot")`, docs/rfcs/2026-11-07-gq-3.md
+/// (`Vector(n, distance = "cosine" | "dot")`, the GQ 3 RFC
 /// section 4). Derived from the declarations at every accept; a binary that
 /// does not know it would score, rank and index the field by `l2` and admit
 /// a zero vector into a `cosine` field, so it refuses the IR instead.

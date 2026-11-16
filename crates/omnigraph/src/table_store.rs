@@ -1453,7 +1453,7 @@ pub(crate) fn native_full_text_build() -> fts_compat::NativeBuild {
 
 /// The Lance parameters `profile` builds a full-text segment with, and the
 /// exact lexical scan's tokenizer. Every parameter is set explicitly
-/// (docs/rfcs/2026-11-07-gq-3.md section 4: no unspecified Lance default is
+/// (the GQ 3 RFC, section 4: no unspecified Lance default is
 /// part of a profile), including the stop list, which is the profile's
 /// checked-in list, never Lance's default, and the posting block size and
 /// format, so neither Lance's defaults nor `LANCE_FTS_FORMAT_VERSION` can

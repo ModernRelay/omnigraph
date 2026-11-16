@@ -3497,7 +3497,7 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
 }
 
 // Changing a full-text field's profile is a schema change applied in place
-// (docs/rfcs/2026-11-07-gq-3.md section 4, Schema: Text): the column's
+// (the GQ 3 RFC, section 4, Schema: Text): the column's
 // segments are replaced in the apply's publication by one built with the
 // profile and certified with the field's analyzer fingerprint, so a
 // certificate of the old analysis does not establish the new one; the
@@ -4610,7 +4610,7 @@ async fn issue_721_edge_property_promotes_to_required() {
     .expect_err("an edge without why is refused");
 }
 
-// A vector field's distance changes in place (docs/rfcs/2026-11-07-gq-3.md
+// A vector field's distance changes in place (the GQ 3 RFC
 // section 4, Schema: Vectors): the apply is metadata-only, reads score and
 // rank by the new distance from the exact scan while the index on disk was
 // built for the old one, which is never used, and the reconciler rebuilds the

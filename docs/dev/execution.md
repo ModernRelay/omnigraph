@@ -1271,7 +1271,7 @@ internal error.
 
 ### Fusion: one operator over any ranked arm
 
-`rrf(arm, …)` is the core's `Fuse` (docs/rfcs/2026-11-07-gq-3.md, section 4,
+`rrf(arm, …)` is the core's `Fuse` (the GQ 3 RFC, section 4,
 Fusion). The shaper writes `PatternStep::Fuse` with 2 to 16 `FuseArm`s, each
 a pipeline from nothing and its `ArmRank`: `nearest` (the arm's steps end on
 its `Rank` window, the steps `Shaper::ranking_steps` writes for the same

@@ -1,5 +1,5 @@
 //! The components of one scope's pattern and the product rule
-//! (docs/rfcs/2026-11-07-gq-3.md, the derived forms and "Added: two elements
+//! (the GQ 3 RFC, the derived forms and "Added: two elements
 //! of `match`"): two patterns that share no variable multiply their rows by a
 //! product, which a scope admits only when every component but one is
 //! key-pinned, a single node binding whose every `@key` property, or whose

@@ -18,8 +18,9 @@ the construct to use, not the rule broken; with no fix, the decision is named.
 | `further` | The other refusals of the same compile pass, in source order, each in this shape. |
 
 The one-line `error` text is the code and the expectation in the legacy form
-(`parse error: …`, `type error: T33: …`, `plan error: P002: …`); the other
-fields travel beside it.
+(`parse error: …`, `type error: T6: …`, `plan error: P002: …`); the other
+fields travel beside it. Codes that moved in GQ 3 are listed in
+[Upgrading queries to GQ 3](upgrading-to-gq3.md#moved-error-codes).
 
 ## Every refusal in one pass
 

@@ -9897,7 +9897,7 @@ async fn column_patch_keeps_blob_files_row_ids_and_key_index_coverage_issue_1264
 // ─── Scalar index kinds beside BTREE: BITMAP, LABEL_LIST and NGRAM ──────────
 //
 // `@index` builds a BITMAP for an enum or `Bool`, a LABEL_LIST for a list and
-// an NGRAM beside the BTREE of a String (docs/rfcs/2026-11-07-gq-3.md section
+// an NGRAM beside the BTREE of a String (the GQ 3 RFC, section
 // 4, docs/dev/lance.md). The engine pushes the predicates below to Lance
 // unchanged and relies on Lance's scanner returning the scan's rows with or
 // without the index; these guards pin that per kind on a stable-row-ID V2_2

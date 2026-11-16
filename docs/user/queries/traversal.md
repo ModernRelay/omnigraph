@@ -123,10 +123,12 @@ see the setting for the cost and batching rules.
 
 Each `$_` is a distinct anonymous node: two anonymous traversals from one
 variable are independent, so a source with two neighbors matches two by two
-rows. Binding a variable a second time (`$p: Person` after `$p` is already
-bound, at the top level or inside `not exists { }`) constrains the same rows;
-it never introduces a second `$p`, so `not exists { $p: Person where $p.name =
-"bob" }` is "`$p` is not bob". Variable names beginning with `__` are reserved.
+rows. Binding a variable a second time in `match` (`$p: Person` after `$p` is
+already bound there) constrains the same rows; it never introduces a second
+`$p`. Inside a block, an `optional` or an inline read, binding a name the
+enclosing scope holds is `T68` ([inner scopes](#inner-scopes)): `not exists {
+$p: Person where $p.name = "bob" }` is refused with the fix `not ($p.name =
+"bob")`. Variable names beginning with `__` are reserved.
 
 Bare traversal names begin with a lowercase letter (`worksAt` for the declared
 edge `WorksAt`); edge lookup itself is case-insensitive. Any word is an edge

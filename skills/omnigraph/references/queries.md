@@ -11,6 +11,7 @@
 - Filter operators
 - Mutations
 - Branch statements
+- Upgrading from the older syntax
 - Naming convention
 - Aliases over raw queries
 
@@ -224,8 +225,9 @@ Rules: composes with the undirected form (`$a $w:<related> $b`) and inside
 `not exists { }`. A bound traversal returns **one row per matching edge**, so
 parallel edges between the same endpoints appear individually (unbound
 traversals keep set-of-pairs semantics). Rejected with `T23`: binding a
-`{min,max}` multi-hop, rebinding a taken variable name, or projecting bare
-`$w` (project a property instead).
+`{min,max}` multi-hop, or rebinding a taken variable name (inside a block, an
+`optional` or an inline read that is `T68`). Returning bare `$w` is `T86`:
+return its fields (`$w.@id`, `$w.@src`, a property) instead.
 
 Composes with hop bounds (`$a <knows>{1,3} $b`) and `not exists { }` ("no edge in
 either direction"). Asymmetric edges (e.g. `Comment -> Issue`) are rejected at
@@ -285,7 +287,7 @@ bindings cannot be projected (`T86`); return their fields (`$k.@id`, `$k.@src`,
 Each projection needs a distinct result column name (`T25`): use aliases when
 expressions would collide. Aliases can be used in `order`, including after a
 leading score key (`order { $distance, title }`), but cannot be projected again
-in `return` (`T36`). On ungrouped rows any expression may be an order key, returned
+in `return`: a bare name there is not a value (`Q018`). On ungrouped rows any expression may be an order key, returned
 or not; a node or edge reference sorts by its identity (`order { $p }` by
 `$p.@id`, an edge over several types by `@type`, then `@id`). Over grouped rows (an aggregate or `return distinct`) an order key must
 be a `return` item or its alias, such as `order { count($f) desc }` after
@@ -600,6 +602,40 @@ takes `--branch` as its target), and has no `--delete-branch` form: follow a
 merge with `branch delete`. `lint` and stored-query registries reject statement files.
 Outcome and receipt semantics differ from data mutations; see
 [`changes.md`](changes.md#branch-statements).
+
+## Upgrading from the Older Syntax
+
+The release parses GQ 3 only; nothing converts old text. A stored query that
+no longer compiles keeps its graph from serving, and the boot log, `queries
+validate --json` and `cluster plan --json` give its code, position, fix and
+byte edits. Rewrite from the fix and this map:
+
+| Older form | GQ 3 | Code |
+|---|---|---|
+| `mutation name(…)` | `query name(…)` | `Q009` |
+| a filter in `match`; `$x: T { p: v }` | `match { $x: T } where $x.p = v and …` | `Q017`, `Q010` |
+| items separated by whitespace | commas | `Q016` |
+| `not { P }` | `not exists { P }` in `where` | `Q012` |
+| `not exists { $p: Person where φ }` (re-mentions an outer binding) | `not (φ)`, or `not coalesce(φ, false)` when φ can be null | `T68` |
+| a block's or `optional`'s triple naming a new variable | bind it inside: `count { $c: Company, $p worksAt $c }` | `T84` |
+| `$c worksAt $p` against `WorksAt: Person -> Company` | `$p worksAt $c` | `T82` |
+| `$x.t contains "g"`, list `$x.tags contains "r"`, `$x.t starts_with "O"` | `contains($x.t, "g")`, `"r" in $x.tags`, `starts_with($x.t, "O")` | `T7` |
+| `search(f, q)`, `match_text(f, q)`, `fuzzy(f, q[, n])` | `match_terms(f, terms(q, mode: any))`, fuzzy with `max_edits: 2` (or `n`) | `T6` |
+| `delete T where p = v`, `update T set { … } where …` | `match { $x: T } where $x.p = v  delete $x` / `update $x set { … }`; `from`/`to` are `$x.@src`/`$x.@dst` | `Q008` |
+| `order { nearest($d.e, $q) } limit n` | `match { let $pop = { match { $d: Doc } where φ return { $d } }, from nearest($pop, $d.e, $q, k: n) as $distance } … order { $distance } limit n` | `T65` |
+| `order { bm25($d.t, $q) }` | `from bm25($pop, $d.t, $q) as $score` … `order { $score desc }` | `T65` |
+| `order { rrf(nearest(…), bm25(…), 60) }` | `let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, …, k: n), bm25($all, …), k: 60) as $score` | `T65` |
+| unaliased ranking in `return` (column `d._distance`, `d._score`) | `$distance as _distance`, `$score as _score` (`bm25` scores are now `F64`) | `T65` |
+
+Moved codes: `T2` (unknown property in a read) and `T11` in a write's `where`
+are `T6`; list equality in braces `T3` is `T7`; an aggregate call in a filter
+(`T7`, `T44`) is `T8`; a block compared with a value of another type (`T40`)
+is `T7`; a bare edge binding returned (`T23`) and a full-text call in
+`return` (`T35`) are `T86`; `T32`/`T33`/`T54` are `T65`; `T58` is `T9`;
+`T59` is `T75`; a bare name (`T45`, `T36`) is `Q018`; `lint` parse refusals
+carry their own `Q…` code instead of `Q000`. A read named after a function or
+element keyword is `T74`; over grouped rows every order key must be returned
+(`T42`). The full map is the user guide's "Upgrading queries to GQ 3" page.
 
 ## Naming Convention
 

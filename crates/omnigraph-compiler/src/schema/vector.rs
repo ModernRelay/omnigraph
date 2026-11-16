@@ -1,6 +1,6 @@
 //! The distance a vector property declares:
 //! `Vector(n, distance = "l2" | "cosine" | "dot")`
-//! (docs/rfcs/2026-11-07-gq-3.md, section 4, Schema: Vectors).
+//! (the GQ 3 RFC, section 4, Schema: Vectors).
 //!
 //! `distance(…)` and `nearest(…)` both read the field's declared distance;
 //! an omitted distance is `l2`, edition 2's meaning, so no accepted schema

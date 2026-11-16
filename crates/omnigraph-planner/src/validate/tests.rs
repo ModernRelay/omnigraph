@@ -1994,7 +1994,7 @@ fn a_distinct_return_sorts_its_groups() {
 /// Every full-text field has a profile, so the exact lexical scan answers a
 /// lexical predicate at every index state: an absent index plans, the plan
 /// is accepted, and it records no index coverage for the call
-/// (docs/rfcs/2026-11-07-gq-3.md, section 4: no `FullTextIndexRequired`).
+/// (the GQ 3 RFC, section 4: no `FullTextIndexRequired`).
 #[test]
 fn a_full_text_call_plans_at_every_index_state() {
     use crate::source::FullTextCoverage;

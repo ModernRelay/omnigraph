@@ -234,7 +234,7 @@ impl std::fmt::Display for ScalarType {
 }
 
 /// One index a one-column `@index` or `@key` declaration builds on a node
-/// property (docs/rfcs/2026-11-07-gq-3.md section 4, "Scalar indexes"): a
+/// property (the GQ 3 RFC, section 4, "Scalar indexes"): a
 /// BTREE for equality, ranges and order, a BITMAP for an enum or `Bool`, a
 /// LABEL_LIST for a list's `in`, an NGRAM for a String's `contains`, the
 /// full-text inverted index, or a vector index.

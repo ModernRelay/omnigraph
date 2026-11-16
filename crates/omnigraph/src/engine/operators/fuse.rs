@@ -1,4 +1,4 @@
-//! `FuseExec`: `rrf(arm, …)`, the core's `Fuse` (docs/rfcs/2026-11-07-gq-3.md,
+//! `FuseExec`: `rrf(arm, …)`, the core's `Fuse` (the GQ 3 RFC,
 //! section 4, Fusion). Each arm is the plan subtree the same ranking runs
 //! standing alone, whose rows arrive in the arm's rank order (a `nearest`
 //! window's distance order, an exact score's sort, an ordered read's own

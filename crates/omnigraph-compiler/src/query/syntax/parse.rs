@@ -1,4 +1,4 @@
-//! The parser (docs/rfcs/2026-11-07-gq-3.md, sections 5, 6 and 7).
+//! The parser (the GQ 3 RFC, sections 5, 6 and 7).
 //!
 //! [`parse_source`] parses a source into the surface tree ([`super`]). Every refusal is a [`Refusal`]: a
 //! diagnostic whose `suggestion` holds byte-range edits of the original

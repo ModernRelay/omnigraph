@@ -1,4 +1,4 @@
-//! The product rule (docs/rfcs/2026-11-07-gq-3.md, the derived forms and
+//! The product rule (the GQ 3 RFC, the derived forms and
 //! "Added: two elements of `match`"): two patterns that share no variable
 //! multiply their rows by a product only when every component but one is
 //! pinned to one row by a `@key` equality in `where`, and are otherwise

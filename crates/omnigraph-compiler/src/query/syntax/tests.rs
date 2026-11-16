@@ -1,4 +1,4 @@
-//! The parser tests of docs/rfcs/2026-11-07-gq-3.md, section 10
+//! The parser tests of the GQ 3 RFC, section 10
 //! ("Compiler parser tests"), the rule-set pin, and one repair per refusal
 //! shape.
 

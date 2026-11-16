@@ -9,6 +9,15 @@ format, and every cluster-managed graph below v14, is refused and takes the
 Start with the [0.13 → 0.14 checklist](upgrade-0.14.md) for fleet,
 CLI configuration, HTTP/MCP, and client compatibility changes.
 
+## Query language (GQ 3)
+
+This release parses GQ 3 only. A stored query or `.gq` file written for an
+earlier release fails to compile, and a stored query that fails keeps its
+graph from serving. Before upgrading, run `omnigraph queries validate --json`
+and `omnigraph cluster plan --json`, then rewrite each refused source from
+[Upgrading queries to GQ 3](../queries/upgrading-to-gq3.md) and the fix each
+refusal prints. Nothing converts a source automatically.
+
 ## Storage upgrade
 
 `omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v17 in place, and stamps a v14, v15 or v16 graph to v17 in place by the route `stamp-v14-to-v17`: one metadata-only commit per live branch still below v17, main first, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again.

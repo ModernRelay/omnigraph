@@ -670,7 +670,7 @@ fn selected_scopes_contribute_every_read_fact_issue_659() {
     }
 }
 
-/// The count-block rewrites lint names (docs/rfcs/2026-11-07-gq-3.md,
+/// The count-block rewrites lint names (the GQ 3 RFC,
 /// sections 5 and 6), each at the block's position and with its fix: `L203`
 /// for `count { } > 0`, a canonical form whose fix keeps the typed IR, and
 /// `L204` and `L205` for the rows-equal `count { } >= 1` and

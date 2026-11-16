@@ -1,1 +1,0 @@
-- An inline read whose `where` holds a block (`from { match { $q: Person, $p knows $q } where exists { … } return { $q } }`) stays correlated on the enclosing names instead of joining every outer row.

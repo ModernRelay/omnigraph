@@ -1,4 +1,4 @@
-//! The exact lexical scan (docs/rfcs/2026-11-07-gq-3.md, section 4, "The
+//! The exact lexical scan (the GQ 3 RFC, section 4, "The
 //! lexical query", "bm25_v1" and "Exact execution and qualified
 //! acceleration").
 //!

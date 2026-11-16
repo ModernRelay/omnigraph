@@ -1,4 +1,4 @@
-//! The typed core IR (docs/rfcs/2026-11-07-gq-3.md, section 2).
+//! The typed core IR (the GQ 3 RFC, section 2).
 //!
 //! The type checker ([`crate::query::check`]) lowers every
 //! declaration into one [`Term`] tree over the thirteen core operators, the

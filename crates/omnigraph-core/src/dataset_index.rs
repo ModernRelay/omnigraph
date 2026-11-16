@@ -430,7 +430,7 @@ pub async fn user_indices_for_column(ds: &Dataset, column: &str) -> Result<Vec<I
 }
 
 /// A scalar index family Omnigraph builds on a declared property
-/// (docs/rfcs/2026-11-07-gq-3.md section 4): BTREE for equality, ranges and
+/// (the GQ 3 RFC, section 4): BTREE for equality, ranges and
 /// order, BITMAP for an enum or `Bool`, LABEL_LIST for a list's membership and
 /// NGRAM for a String's substring test. Every family is derived acceleration;
 /// a fold rebuilds an index whole in its own family.

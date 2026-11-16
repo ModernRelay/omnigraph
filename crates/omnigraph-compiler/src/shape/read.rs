@@ -1,4 +1,4 @@
-//! A core read as the planner lowers it (docs/rfcs/2026-11-07-gq-3.md,
+//! A core read as the planner lowers it (the GQ 3 RFC,
 //! section 11, "One IR").
 //!
 //! The type checker types one core term per read ([`CoreRead`]). [`ReadShape::of`] decomposes it into what the logical
@@ -170,7 +170,7 @@ pub enum PatternStep {
         inner: Vec<PatternStep>,
         read: InnerRead,
     },
-    /// `from rrf(arm, …)`, the core's `Fuse` (docs/rfcs/2026-11-07-gq-3.md,
+    /// `from rrf(arm, …)`, the core's `Fuse` (the GQ 3 RFC,
     /// section 4, Fusion): each arm is its own pipeline from nothing, the
     /// steps the same ranking would take standing alone, ending on the rows
     /// it ranks; every arm binds `target`, a node of `target_type`. Each arm
@@ -247,7 +247,7 @@ impl ArmRank {
 }
 
 /// What a `from` over an inline read with its own aggregate, `distinct`,
-/// `order` or `limit` returns (docs/rfcs/2026-11-07-gq-3.md, section 3: an
+/// `order` or `limit` returns (the GQ 3 RFC, section 3: an
 /// inner `order` and `limit` belong to the inner read, so an outer `where`
 /// never widens the inner cut and an outer `limit` never becomes it).
 ///

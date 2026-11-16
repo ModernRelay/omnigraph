@@ -1,5 +1,5 @@
 //! `LetExec`: a `let` whose value can fail, the core's `Project` adding one
-//! column (docs/rfcs/2026-11-07-gq-3.md, section 3). The value is evaluated
+//! column (the GQ 3 RFC, section 3). The value is evaluated
 //! on every input row, so a failure (`E1`, `E2`, `E3`) refuses the read on
 //! the rows the elements before the `let` produce, whatever `where` later
 //! removes (A3); every row passes through unchanged, in input order. The

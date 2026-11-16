@@ -2,13 +2,14 @@
 
 A `.gq` file contains named, typed queries. Read queries match graph patterns
 and return columns; mutation queries use the same declaration form and are
-covered in [Mutations](../mutations/index.md). A file may instead hold exactly
-one statement, never beside a query declaration: a branch statement (`branch
-create`, `delete`, `merge`, `list`, `diff`, or `merge-base`; see [Branches,
-Commits, and History](../branching/index.md)), a `show` statement, or an
-`explain` statement, which answers the plan a read query would run under
-instead of its rows (see [Explain](explain.md)). Any of them may open with
-[session settings](#session-settings) lines, the settings `show` prints.
+covered in [Mutations](../mutations/index.md). A file may instead hold one
+statement, never beside a declaration: a branch statement (`branch create`,
+`delete`, `merge`, `list`, `diff`, or `merge-base`; see [Branches, Commits, and
+History](../branching/index.md)) or `show`. An `explain` statement, which
+answers a read's plan instead of its rows ([Explain](explain.md)), ends its
+file, after any declarations its read calls. Any of them may open with [session
+settings](#session-settings) lines. A source written before GQ 3 no longer
+compiles: see [Upgrading queries to GQ 3](upgrading-to-gq3.md).
 
 ```gq
 query engineers($title: String) @description("People with a title") {
@@ -324,10 +325,9 @@ omnigraph lint --query queries.gq --schema schema.pg --json
 
 A refused file reports its refusal's code at `line <n>, column <c>`: a
 [branch statement](../branching/index.md) where declarations were expected is
-`Q004`, a refused [settings line](#session-settings) `Q003`, and `T83` too.
-[Lint](lint.md) lists its findings, among them the canonical forms it names
-with their fix. A refused query reports every refusal with its code and line,
-and exits nonzero on an error.
+`Q004`, a refused [settings line](#session-settings) `Q003`, and `T83` too. A
+refused query reports every refusal with its code and line, and exits nonzero
+on an error; [Lint](lint.md) lists the findings, canonical forms included.
 
 For every query that compiles successfully, JSON output includes an
 `operation` descriptor:

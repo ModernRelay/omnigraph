@@ -50,7 +50,7 @@ struct Certificate {
 
 /// What a full-text index's postings were built with, as built: recorded in
 /// its certificate beside the field's analyzer fingerprint, never in the
-/// fingerprint (docs/rfcs/2026-11-07-gq-3.md, section 4: whether an index
+/// fingerprint (the GQ 3 RFC, section 4: whether an index
 /// stores term positions is a build option of the index). A native path that
 /// reads the postings is qualified against these facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +74,7 @@ pub enum NativeNormalization {
 }
 
 /// The analyzer fingerprint each full-text column's accepted schema declares
-/// (`@index(fulltext, analyzer = ...)`, docs/rfcs/2026-11-07-gq-3.md section
+/// (`@index(fulltext, analyzer = ...)`, the GQ 3 RFC, section
 /// 4). The accepted schema chooses the analysis; an index proves it only by a
 /// certificate naming the same fingerprint, so a certificate of another
 /// analysis refuses. A column absent here is read by a caller that holds no

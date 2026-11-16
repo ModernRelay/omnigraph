@@ -1,4 +1,4 @@
-//! The release's lowering admission (docs/rfcs/2026-11-07-gq-3.md, section
+//! The release's lowering admission (the GQ 3 RFC, section
 //! 5, "A read the type checker accepts, the planner lowers"): a term the
 //! planner does not lower is `T86` at its construct, naming the stage that
 //! adds it, and the closure table is the test. Every freeze-list row of

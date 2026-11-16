@@ -23,7 +23,7 @@ codes! {
     Q004 = "a branch, commit, show or explain statement is misplaced or malformed";
     Q005 = "a declaration body is refused";
     Q006 = "the source nests deeper than the compiler accepts";
-    // docs/rfcs/2026-11-07-gq-3.md section 5: each refusal names the
+    // The GQ 3 RFC, section 5: each refusal names the
     // construct and carries a byte-range suggestion wherever one edit set
     // makes the text legal.
     Q007 = "a traversal is written with an arrow; the fix is the triple";
@@ -73,7 +73,7 @@ codes! {
     T35 = "a search predicate cannot be projected";
     T36 = "an alias cannot be projected";
     // T38 is withdrawn: a lexical predicate is a Boolean operand like any
-    // other (docs/rfcs/2026-11-07-gq-3.md, section 5).
+    // other (the GQ 3 RFC, section 5).
     T39 = "an exists or aggregate block must reference an outer-bound variable";
     T40 = "an aggregate block argument or comparison value is invalid";
     T41 = "a filter or Boolean expression has invalid operands";
@@ -94,8 +94,9 @@ codes! {
     T56 = "distinct does not apply to an aggregated return";
     T57 = "distinct applies only to count";
     T58 = "a Boolean return item compares aggregates with constants only";
+    // T59 is no longer raised: `rrf` arms that rank two bindings are T75.
     T59 = "an rrf() ranks two bindings one traversal connects";
-    // docs/rfcs/2026-11-07-gq-3.md section 5. T60 to T64, T66 and T67 are
+    // The GQ 3 RFC, section 5. T60 to T64, T66 and T67 are
     // unallocated.
     T65 = "a ranking is written as a call in order or return; it is a relation function";
     T68 = "a name drawn into scope, or bound inside an inline read, a block or an optional, is already in scope";
@@ -117,12 +118,12 @@ codes! {
     T84 = "a name an inner scope, a block, an optional or an inline read, uses in a triple without binding it";
     T85 = "a `from` over a relation carrying an unnamed score without `as`, or an `as` on a `from` whose relation carries none";
     T86 = "a term this release's planner does not lower; the message names the stage that adds it";
-    // docs/rfcs/2026-11-07-gq-3.md section 4, Errors: `scorer = "none"`
+    // The GQ 3 RFC, section 4, Errors: `scorer = "none"`
     // allows matching and makes a ranking call on the field a type error.
     T87 = "a ranking call on a field whose full-text index declares `scorer = \"none\"`";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
-    // the binding it ranks, and `rrf()` arms one traversal connects are T59.
+    // the binding it ranks, and `rrf` arms that rank two bindings are T75.
     P002 = "an edge alternation or wildcard traversal needs a finite traversal work limit";
     P003 = "the traversal work limit is out of range or recorded twice";
     P004 = "an edge alternation or wildcard traversal cannot run in CSR traversal mode";
@@ -131,13 +132,13 @@ codes! {
     // arrives unlowered is a defect.
     P006 = "a type-checked term arrived at the planner unlowered: a defect, never a refusal";
 
-    // Execution (docs/rfcs/2026-11-07-gq-3.md section 10): an arithmetic
+    // Execution (the GQ 3 RFC, section 10): an arithmetic
     // term refused a row; the failure keeps its place in the plan.
     E1 = "integer arithmetic overflowed its type";
     E2 = "a divisor is zero";
     E3 = "a float result is not finite";
     // A write statement's rows give one entity's property two values
-    // (docs/rfcs/2026-11-07-gq-3.md section 2, the sinks).
+    // (the GQ 3 RFC, section 2, the sinks).
     E4 = "one statement's rows give one entity's property two values";
 }
 

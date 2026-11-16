@@ -361,7 +361,7 @@ fn lint_update_coverage(
 }
 
 /// The non-canonical forms of every declaration of the source
-/// (docs/rfcs/2026-11-07-gq-3.md, section 6), each with its canonical form
+/// (the GQ 3 RFC, section 6), each with its canonical form
 /// as the fix: `L203` and `L206` to `L211` keep the typed IR, `L204` and
 /// `L205` only the rows.
 fn lint_canonical_forms(query_source: &str) -> Vec<QueryLintFinding> {

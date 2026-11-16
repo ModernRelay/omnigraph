@@ -3027,7 +3027,7 @@ query update_one() {
 }
 
 /// The scalar index kinds `@index` builds beside BTREE
-/// (docs/rfcs/2026-11-07-gq-3.md section 4): one reconciliation that builds
+/// (the GQ 3 RFC, section 4): one reconciliation that builds
 /// an enum's and a `Bool`'s BITMAP, a list's LABEL_LIST and a String's
 /// NGRAM, BTREE and full-text index together (`ScalarKindsBuild`), then on a
 /// reopened handle one read probing each kind: an enum equality through the

@@ -1,4 +1,4 @@
-//! The diagnostics protocol (docs/rfcs/2026-11-07-gq-3.md, section 5): a
+//! The diagnostics protocol (the GQ 3 RFC, section 5): a
 //! compile returns every independent refusal in one pass, in source order,
 //! each with its span, and a refusal of an unknown name lists up to five
 //! nearest names of the right kind with their types.

@@ -291,6 +291,24 @@ pre-v11 branch owned) is reclaimed by `cleanup` rather than healed in place.
 
 ## Mutation and Load
 
+A mutation runs its groups in order, one keyed statement per sink
+(`omnigraph-compiler` `shape/write.rs` owns the rule). A group's `match …
+where` selects the rows its statements run over, evaluated once, before the
+group's first statement. When the selection is a scan of the statements'
+target filtered by predicates a staged scan evaluates, and the group's one
+`update` or `delete` is its first statement, that statement takes the
+predicate as its selection, read together with the groups staged before it,
+and an `insert` after it runs once per row it matched. Every other group with
+a selection, a group of two or more `update` or `delete` statements included,
+runs it as a read that the read planner shapes, against the snapshot the
+write captured: the read returns, per row, the identity of each `update` or
+`delete` variable and the value of each assignment that reads the row, the
+statement then selects exactly those identities, and an `insert` runs once
+per row. An `insert` with no selection runs once. A selection read sees the
+snapshot, not the statements staged before it, so a group whose selection
+reads a table an earlier group of the write changes, and an assignment that
+reads a Blob from a row, are refused at type check (`T86`).
+
 `MutationStaging` accumulates read-your-writes batches and delete predicates
 in memory. It performs all type, value, uniqueness, endpoint, cardinality, and
 resource validation before staging. `stage_all` opens each touched table at

@@ -1,5 +1,5 @@
 //! Parse, print, parse again over generated declarations
-//! (docs/rfcs/2026-11-07-gq-3.md, section 10).
+//! (the GQ 3 RFC, section 10).
 //!
 //! The generator builds random read and write declarations from the
 //! grammar: bindings, triples in every traversal form, `let`, `from` over

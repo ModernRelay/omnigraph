@@ -46,7 +46,7 @@ pub use ir::ParamMap;
 /// `(2, 2)` adds the `as commit` clause and the `commit publish` / `commit drop`
 /// statements (`docs/rfcs/2026-10-10-unpublished-graph-commits.md`);
 /// `(2, 3)` adds `branch create <name> from commit "<id>"`;
-/// `(3, 0)` is GQ 3 (`docs/rfcs/2026-11-07-gq-3.md`), which replaces the
+/// `(3, 0)` is GQ 3, which replaces the
 /// language whole.
 pub const GQ_LANGUAGE_VERSION: (u16, u16) = (3, 0);
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};

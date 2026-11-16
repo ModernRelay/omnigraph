@@ -1,4 +1,4 @@
-//! Parse recovery (docs/rfcs/2026-11-07-gq-3.md, section 5): after a parse
+//! Parse recovery (the GQ 3 RFC, section 5): after a parse
 //! refusal the parser resumes at the next element, item, statement or
 //! declaration boundary, so the independent parse refusals of one source are
 //! all reported.

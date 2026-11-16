@@ -1,4 +1,4 @@
-//! The type checker (docs/rfcs/2026-11-07-gq-3.md, sections 2, 3 and 5).
+//! The type checker (the GQ 3 RFC, sections 2, 3 and 5).
 //!
 //! It reads the parse tree ([`crate::query::syntax`]) of one source unit and
 //! types every declaration into the core IR ([`crate::ir::core`]), or
@@ -418,7 +418,7 @@ fn infix_string(op: InfixStringOp, at: &SourceSpan, list: bool) -> QueryDiagnost
 /// `search`, `match_text` and `fuzzy`, which are not registry rows: each is
 /// refused with the `match_terms` call that keeps its any-term membership,
 /// `fuzzy`'s edit budget (two when unwritten) its `max_edits`
-/// (docs/rfcs/2026-11-07-gq-3.md, section 4, Migration). A call of two
+/// (the GQ 3 RFC, section 4, Migration). A call of two
 /// arguments, with no option but `fuzzy`'s `max_edits`, gets the fix as an
 /// edit over the call.
 fn removed_lexical_call(c: &Call) -> QueryDiagnostic {

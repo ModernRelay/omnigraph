@@ -1,4 +1,4 @@
-//! The type checker's tests (docs/rfcs/2026-11-07-gq-3.md, section
+//! The type checker's tests (the GQ 3 RFC, section
 //! 10, "Type-check tests"), the RFC's examples type-checked, and one repair
 //! per type-level refusal shape.
 
@@ -597,7 +597,7 @@ fn a_ranked_column_whose_property_is_not_declared() {
 }
 
 /// `scorer = "none"` allows matching and makes a ranking call on the field a
-/// type error, `T87`, wherever the ranking is written (docs/rfcs/2026-11-07-gq-3.md
+/// type error, `T87`, wherever the ranking is written (the GQ 3 RFC
 /// section 4, Errors). No call takes an analyzer: analysis comes from the
 /// accepted schema alone, so an analyzer option is an unknown option (`T71`).
 #[test]

@@ -1,6 +1,6 @@
 //! Full-text analysis declared on a String property:
 //! `@index(fulltext, analyzer = "<profile>", scorer = "<scorer>")`
-//! (docs/rfcs/2026-11-07-gq-3.md, section 4, Schema: Text).
+//! (the GQ 3 RFC, section 4, Schema: Text).
 //!
 //! A profile names one immutable pipeline. Every setting of it is spelled
 //! here, so no unspecified substrate default is part of the contract; a
@@ -117,7 +117,7 @@ impl AnalyzerPipeline {
 /// would miss the stop words the stemmer changes (`onli`, `veri`, `becaus`,
 /// …); the stems are listed too. The list is passed to Lance explicitly,
 /// never taken from its default, and the profile's descriptor records its
-/// digest (docs/rfcs/2026-11-07-gq-3.md, section 4, Schema: Text).
+/// digest (the GQ 3 RFC, section 4, Schema: Text).
 pub const ENGLISH_V1_STOP_WORDS: &[&str] = &[
     "a",
     "about",

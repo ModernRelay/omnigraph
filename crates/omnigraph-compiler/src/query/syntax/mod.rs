@@ -1,4 +1,4 @@
-//! The surface tree (docs/rfcs/2026-11-07-gq-3.md, sections 3, 6 and 7):
+//! The surface tree (the GQ 3 RFC, sections 3, 6 and 7):
 //! what the parser builds and the type checker ([`super::check`]) reads.
 //! The front door hands each declaration on as a
 //! [`super::file::QueryDecl`] carrying this tree

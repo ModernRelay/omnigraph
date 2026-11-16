@@ -1,5 +1,5 @@
 //! The foreign-habit table of the query front end
-//! (docs/rfcs/2026-11-07-gq-3.md, section 5).
+//! (the GQ 3 RFC, section 5).
 //!
 //! Some habits an agent brings from other languages are lexical: a grammar
 //! rule cannot hold them without admitting them (a single-quoted string,

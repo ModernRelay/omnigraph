@@ -1,7 +1,7 @@
 # Explain
 
 `explain` before a read declaration returns the query's v2 plan instead of
-its rows, regardless of the selected execution engine; before a `load csv`
+its rows; before a `load csv`
 statement it returns the load's plan ([explaining a load statement](explain-load.md)).
 It is a statement, one per file, after any declarations: the read it
 explains may call the reads declared before it, and nothing follows it. The query is compiled and planned
@@ -243,7 +243,7 @@ documents only before it) carry a pipeline `id` and `depends_on`, with
 `physical_plan` node ids; an operator's emission is set by the shape wrapper
 the engine builds its stream through, the one the planner's cut names, so the
 printed pipelines are the executed ones. Saved physical
-plans use a `bound_plan_version: 12` envelope whose `body` contains `plan` and
+plans use a `bound_plan_version: 13` envelope whose `body` contains `plan` and
 `values`. Unversioned plans and other versions are refused with a regeneration
 instruction, including plans without traversal nodes.
 

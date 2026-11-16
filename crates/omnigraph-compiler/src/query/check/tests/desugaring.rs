@@ -1,5 +1,5 @@
 //! The desugaring-uniqueness test and the closure table as a test
-//! (docs/rfcs/2026-11-07-gq-3.md, section 10).
+//! (the GQ 3 RFC, section 10).
 //!
 //! The first lowers every surface form of section 3 through the checker and compares its core term with the term the derived-forms table
 //! of section 2 names, built here directly; then it lowers every form and

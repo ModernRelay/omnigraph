@@ -4,7 +4,7 @@
 //!
 //! Every full-text field has a profile, so every lexical call is answered by
 //! the exact scan, at every index state, and no full-text index is read
-//! (docs/rfcs/2026-11-07-gq-3.md, section 4). A `Filter` or `Let` reads each
+//! (the GQ 3 RFC, section 4). A `Filter` or `Let` reads each
 //! call as a Boolean column, the membership of the row's identity in the
 //! call's matches, which a null or token-empty document never joins; a
 //! `Score` appends each matching row's `bm25_v1` score. The operator runs the

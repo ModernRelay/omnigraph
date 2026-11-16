@@ -1,6 +1,6 @@
 //! Coverage for `build_indices_on_dataset_for_catalog`'s per-property index
 //! dispatch: which scalar/vector indexes each `@index`/`@key` column gets
-//! (docs/rfcs/2026-11-07-gq-3.md section 4, "Scalar indexes").
+//! (the GQ 3 RFC, section 4, "Scalar indexes").
 //!
 //! Orderable scalars get a BTREE, so `SnapshotDataset::index_coverage` (the
 //! helper the traversal chooser uses) reports `Indexed`. An enum or `Bool`

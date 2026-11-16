@@ -261,7 +261,7 @@ pub enum IndexBuildSpec {
 /// The analysis a full-text segment is built with: the profile the column's
 /// accepted schema applies (`english_v1` where it names none) and the
 /// fingerprint the segment's certificate records
-/// (docs/rfcs/2026-11-07-gq-3.md section 4). Both are required, so no segment
+/// (the GQ 3 RFC, section 4). Both are required, so no segment
 /// is built without the fingerprint its certificate needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FullTextBuild {

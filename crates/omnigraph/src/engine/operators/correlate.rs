@@ -1,6 +1,6 @@
 //! `CorrelateExec`: `from` an inline read with its own aggregate,
 //! `distinct`, `order` or `limit`, the core's `Correlate` over the read's
-//! `Group`, `Order` and `Cut` (docs/rfcs/2026-11-07-gq-3.md, sections 2 and
+//! `Group`, `Order` and `Cut` (the GQ 3 RFC, sections 2 and
 //! 3). The read's inner tree runs once: correlated, over the outer batch
 //! tagged with each row's index from the slot this operator fills before
 //! executing it (as an `optional`'s does), so each inner row names the

@@ -679,7 +679,7 @@ pub enum LogicalNode {
         reads: Vec<ColumnRef>,
         leads: bool,
     },
-    /// `from rrf(arm, …)` (docs/rfcs/2026-11-07-gq-3.md, section 4,
+    /// `from rrf(arm, …)` (the GQ 3 RFC, section 4,
     /// Fusion): each arm's subtree yields rows binding `target` in its
     /// rank order; the node yields one row per target any arm selected, the
     /// target's columns and `Σ weight / (k + rank)` over the arms that

@@ -1068,7 +1068,7 @@ physical_nodes! {
         outer_var: String,
     } => "OuterReference" []
         shape: PipelineShape::Streaming, sides: vec![], cut: None, order: None;
-    /// `from rrf(arm, …)` (docs/rfcs/2026-11-07-gq-3.md, section 4,
+    /// `from rrf(arm, …)` (the GQ 3 RFC, section 4,
     /// Fusion): each arm's subtree yields rows binding `target` in its rank
     /// order, each target ranked at its first row from 1; one row leaves
     /// per target any arm selected, carrying the target's columns from the

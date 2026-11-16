@@ -1,4 +1,4 @@
-//! A checked declaration as the planner lowers it (docs/rfcs/2026-11-07-gq-3.md,
+//! A checked declaration as the planner lowers it (the GQ 3 RFC,
 //! section 5: "A read the type checker accepts, the planner lowers").
 //!
 //! [`read::ReadShape::of`] decomposes a core read into the steps the logical
@@ -14,7 +14,7 @@
 pub mod read;
 pub mod write;
 
-/// The stage of the programme (docs/rfcs/2026-11-07-gq-3.md, section 11,
+/// The stage of the programme (the GQ 3 RFC, section 11,
 /// "Sequence") that adds the lowering of a term this release's planner
 /// refuses. A relation parameter (stage RP) and a path (stage Path) start at
 /// tokens this release's parser refuses, so no type-checked term names them.

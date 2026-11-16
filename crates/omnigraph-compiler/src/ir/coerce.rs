@@ -211,7 +211,7 @@ pub fn cast_expr_allowed(expr: &IRExpr, target: &ExprType) -> bool {
 /// Whether a literal takes the other operand's domain: it must round-trip
 /// there, and a float literal never takes an integer domain. A float literal
 /// is `F64` even when its value is a whole number, so an integer compared
-/// with one is cast to `F64` (docs/rfcs/2026-11-07-gq-3.md, section 2).
+/// with one is cast to `F64` (the GQ 3 RFC, section 2).
 fn literal_narrows(value: &Literal, source: Domain, target: Domain) -> bool {
     let float_source = matches!(source, Domain::Scalar(ScalarType::F32 | ScalarType::F64));
     let integer_target = matches!(

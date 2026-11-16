@@ -14,7 +14,7 @@ mod fts_compat_tests {
 
     /// A declared profile builds its segment with every Lance parameter set
     /// from the profile table, none left to a Lance default
-    /// (docs/rfcs/2026-11-07-gq-3.md section 4), and certifies the field's
+    /// (the GQ 3 RFC, section 4), and certifies the field's
     /// analyzer fingerprint; edition 2's analysis keeps Lance's default
     /// parameters and a certificate without a fingerprint.
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! The printed fixes converge (docs/rfcs/2026-11-07-gq-3.md, section 5):
+//! The printed fixes converge (the GQ 3 RFC, section 5):
 //! for every step of the corpus that expects an error and whose source the
 //! compiler refuses, applying every machine-applicable suggestion of one
 //! compile pass at once reparses, strictly shrinks the refusals, never undoes
