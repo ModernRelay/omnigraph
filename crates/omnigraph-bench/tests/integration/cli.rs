@@ -662,6 +662,43 @@ fn suite_run_refuses_debug_wall_clock_measurement_before_fixture_setup() {
 }
 
 #[test]
+#[cfg(not(debug_assertions))]
+fn the_read_through_route_runs_the_production_loop() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(repository_root())
+        .args(["run", "tiny-read", "--config"])
+        .arg(repository_root().join("benchmarks/benchmarks.yaml"))
+        .arg("--dataset-cache")
+        .arg(directory.path().join("cache"))
+        .args([
+            "--local-route",
+            "read-through",
+            "--repetitions",
+            "2",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "{result}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(result["local_route"], "read-through", "{result}");
+    let runs = result["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "{result}");
+    assert_eq!(runs[0]["durable_record"], false, "{result}");
+    let samples = runs[0]["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 2, "{result}");
+    for sample in samples {
+        assert_eq!(sample["outcome"], "expectations-passed", "{sample}");
+    }
+}
+
+#[test]
 fn suite_run_checks_selection_before_execution_guards() {
     Command::cargo_bin("omnigraph-bench")
         .expect("benchmark binary")

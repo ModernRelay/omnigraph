@@ -620,6 +620,50 @@ fn served_preflight_rejects_incompatible_selection_before_acquisition() {
             std::io::ErrorKind::WouldBlock
         );
     }
+
+    let output = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(directory.path())
+        .timeout(std::time::Duration::from_secs(10))
+        .args([
+            "run",
+            "query-shapes-served",
+            "--config",
+            config.to_str().unwrap(),
+            "--server",
+            &url,
+            "--graph",
+            "bench",
+            "--server-receipt",
+            "receipt.json",
+            "--dataset-cache",
+            "cache",
+            "--local-route",
+            "read-through",
+            "--repetitions",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["diagnostics"][0]["code"], "invalid_run_input",
+        "{result}"
+    );
+    assert!(
+        result["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("a local route applies to engine-target scenarios only"),
+        "{result}"
+    );
+    assert!(!directory.path().join("cache").exists());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[test]

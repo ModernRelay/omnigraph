@@ -361,6 +361,7 @@ mod tests {
                 path: "graph.archive".into(),
                 message: "a recovery is pending".into(),
                 detail: None,
+                storage_failure: None,
             }],
             config_digest: None,
             state_revision: 1,

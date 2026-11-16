@@ -133,6 +133,18 @@ impl PreparationStorageAdapter {
 
 #[async_trait]
 impl StorageAdapter for PreparationStorageAdapter {
+    fn binding(&self) -> Option<omnigraph::storage::CapturedStorageBinding> {
+        self.inner.binding()
+    }
+
+    fn io_scope(&self) -> Option<omnigraph::storage::StorageIoScope> {
+        self.inner.io_scope()
+    }
+
+    fn read_through_mount(&self) -> Option<omnigraph::storage::ReadThroughMount> {
+        self.inner.read_through_mount()
+    }
+
     async fn read_text(&self, uri: &str) -> omnigraph::error::Result<String> {
         self.inner.read_text(uri).await
     }

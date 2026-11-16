@@ -6,10 +6,12 @@ use crate::dataset_cache::DatasetManifestV1;
 use crate::gqt_case::{
     BoundGqt, DatasetBuildPlan, PlannedGqt, SERVED_READ_KINDS, Target, engine_preparation,
 };
-use crate::gqt_evidence::{PreparationProofV2, RepetitionInputV2};
+use crate::gqt_evidence::{LocalRoute, LocalRouteKind, PreparationProofV2, RepetitionInputV2};
 use crate::gqt_served::{ServedInput, ServerDeploymentReceiptV1};
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
-use crate::reset::{MetadataDigest, PhysicalDigest, TraversalLimits, verify_metadata_shape};
+use crate::reset::{
+    MetadataDigest, PhysicalDigest, TraversalLimits, verify_metadata_shape_skipping,
+};
 use crate::runner::{
     BuildEvidence, ControlCallObservation, ControlSnapshot, LogicalStoreCallObservation,
     MeasurementSignals, RunnerError, RunnerResult, WallClockSummary,
@@ -125,6 +127,9 @@ pub struct RunOptions {
     pub no_build: bool,
     pub fixture_bindings: Vec<String>,
     pub served: Option<ServedInput>,
+    /// How each embedded repetition reaches its fixture. Anything but
+    /// [`LocalRouteKind::Direct`] is a comparison run and is not archived.
+    pub local_route: LocalRouteKind,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunExecution {
@@ -162,8 +167,40 @@ struct Generation {
     counts: Arc<StorageReadCounts>,
     gate: Option<PreparationWriteGate>,
 }
-fn generation(uri: &str, guarded: bool) -> RunnerResult<Generation> {
-    let storage = omnigraph::storage::storage_for_uri(uri).map_err(|e| failure(e.to_string()))?;
+/// Run `future` to completion on a thread of its own, for a caller that is
+/// not async and may be running on a runtime's thread.
+fn block_on_own_thread<T: Send>(future: impl Future<Output = T> + Send) -> RunnerResult<T> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .map(|runtime| runtime.block_on(future))
+            })
+            .join()
+    })
+    .map_err(|_| failure("storage open panicked"))?
+    .map_err(failure)
+}
+fn generation(uri: &str, route: &LocalRoute, guarded: bool) -> RunnerResult<Generation> {
+    let storage = match route {
+        LocalRoute::Direct => omnigraph::storage::storage_for_uri(uri),
+        LocalRoute::ObjectStore => omnigraph::storage::storage_for_uri_scoped(
+            uri,
+            omnigraph::storage::StorageIoScope::new(),
+        ),
+        LocalRoute::ReadThrough { base_root } => {
+            let base_uri = base_root
+                .to_str()
+                .ok_or_else(|| failure("the template's path is not UTF-8"))?;
+            block_on_own_thread(omnigraph::storage::storage_read_through_scoped(
+                base_uri,
+                uri,
+                omnigraph::storage::StorageIoScope::new(),
+            ))?
+        }
+    }
+    .map_err(|e| failure(e.to_string()))?;
     let (storage, gate) = if guarded {
         let (s, g) = guard_preparation_writes(storage, uri);
         (s, Some(g))
@@ -180,6 +217,7 @@ fn generation(uri: &str, guarded: bool) -> RunnerResult<Generation> {
 struct LocalInstrumentation {
     root: PathBuf,
     uri: String,
+    route: LocalRoute,
     metadata: MetadataDigest,
     generation: Generation,
     baseline: Option<ControlSnapshot>,
@@ -267,7 +305,7 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
                     .validate_preparation()
                     .map_err(failure)?;
             }
-            local.generation = generation(&local.uri, preparing)?;
+            local.generation = generation(&local.uri, &local.route, preparing)?;
         }
         if ordinal == self.selected {
             if !preparing {
@@ -279,8 +317,19 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
                 ));
             }
             if let Some(local) = &state.local {
-                verify_metadata_shape(&local.root, &local.metadata, TraversalLimits::default())
-                    .map_err(failure)?;
+                let skip = match local.route {
+                    LocalRoute::ReadThrough { .. } => {
+                        Some(omnigraph::storage::ReadThroughMount::RESERVED_DIRECTORY)
+                    }
+                    LocalRoute::Direct | LocalRoute::ObjectStore => None,
+                };
+                verify_metadata_shape_skipping(
+                    &local.root,
+                    &local.metadata,
+                    TraversalLimits::default(),
+                    skip,
+                )
+                .map_err(failure)?;
             }
             self.signals.lock().unwrap().ready()?;
             state.ready = true;
@@ -460,6 +509,7 @@ impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
 pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
     repetition: u32,
     root: &Path,
+    route: &LocalRoute,
     input: &PhysicalDigest,
     metadata: &MetadataDigest,
     bound: &BoundGqt,
@@ -479,7 +529,7 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
         ..Default::default()
     };
     with_query_io_probes(probes, async {
-        let generation = generation(uri, true)?;
+        let generation = generation(uri, route, true)?;
         let db = tokio::time::timeout(
             Duration::from_millis(case.runner.timeout_ms),
             Omnigraph::open_with_storage(uri, generation.storage.clone()),
@@ -502,6 +552,7 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
             state: Mutex::new(HostState::new(Some(LocalInstrumentation {
                 root: root.into(),
                 uri: uri.into(),
+                route: route.clone(),
                 metadata: metadata.clone(),
                 generation,
                 baseline: None,
@@ -1061,7 +1112,10 @@ fn execute_owned(
     let mut build = None;
     let acquisition = (|| -> RunnerResult<()> {
         for repetition in 1..=run.repetitions {
-            let metadata = lease.restore()?;
+            let metadata = match options.local_route {
+                LocalRouteKind::ReadThrough => lease.empty_active()?,
+                LocalRouteKind::Direct | LocalRouteKind::ObjectStore => lease.restore()?,
+            };
             let scratch = lease.root.join(format!("worker-scratch-{repetition:08}"));
             std::fs::create_dir(&scratch).map_err(|e| failure(e.to_string()))?;
             let input = crate::gqt_supervisor::SupervisionInput {
@@ -1077,6 +1131,7 @@ fn execute_owned(
                     repetition_root: lease.active.clone(),
                     physical_digest: lease.physical().clone(),
                     metadata_digest: metadata.clone(),
+                    route: options.local_route.over(&lease.template),
                 },
                 deadline: plan
                     .definition
@@ -1123,6 +1178,9 @@ fn execute_owned(
                 }
             }
         }
+        if options.local_route == LocalRouteKind::ReadThrough {
+            lease.verify_template_bytes()?;
+        }
         lease.verify()?;
         Ok(())
     })();
@@ -1167,6 +1225,11 @@ pub fn validate_run_options(plan: &PlannedGqt, options: &RunOptions) -> RunnerRe
             if options.no_build || !options.fixture_bindings.is_empty() {
                 return Err(failure(
                     "served graphs are pre-provisioned; local dataset acquisition options do not apply",
+                ));
+            }
+            if options.local_route != LocalRouteKind::Direct {
+                return Err(failure(
+                    "served graphs are reached through their server; a local route applies to engine-target scenarios only",
                 ));
             }
             let bound = input.receipt.bind(plan).map_err(failure)?;

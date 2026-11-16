@@ -139,7 +139,7 @@ impl FrozenSource {
         if self.text.len() > MAX_SOURCE_BYTES || sha256_bytes(self.text.as_bytes()) != self.sha256 {
             return Err("GQT source digest or size does not match frozen input".into());
         }
-        omnigraph_gqt_core::parse_case(&self.stem, &self.text)
+        omnigraph_gqt_core::parse_case(&self.stem, &self.text).map_err(String::from)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +229,7 @@ fn validate_recipe(recipe: &DatasetRecipe) -> Result<Case, String> {
         }
     };
     admit_environment(&case)?;
+    case.admit_lasting_store()?;
     Ok(case)
 }
 pub fn dataset_file(
@@ -604,6 +605,7 @@ pub(crate) fn admit_target_queries(
             }
         }
     }
+    case.admit_lasting_store()?;
     if case.fixture.is_some() {
         return Err("queries must omit schema and seed".into());
     }

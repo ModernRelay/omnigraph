@@ -327,12 +327,12 @@ records on record ends, neighbouring partitions meet at one record end, and
 the validation puts the slices back in source order, so the rows and their
 order are those of a single parser. A boundary the neighbours cannot agree on
 (inside a quoted field, or after an empty line) refuses that run, and the
-same plan reruns as one partition. Delete staging remains serial. This affects preparation only—one request still
-publishes exactly one graph commit.
+same plan reruns as one partition. Delete staging remains serial. This affects
+preparation only—one request still publishes exactly one graph commit.
 
-A stale strict update, delete, or overwrite can return `read_set_conflict`.
-Refresh the branch and retry deliberately. A `key_conflict` means an append or
-strict insert found an existing id; it never silently becomes an upsert.
+A write overtaken before it takes effect, an update or delete included, reruns on the new head; it returns
+`read_set_conflict` only if the branch was recreated, the schema changed, or another process kept overtaking
+it. A `key_conflict` means an append or strict insert found an existing id; it never silently becomes an upsert.
 
 If a write returns `recovery_required`, do not immediately resubmit it. Reopen
 the graph read-write or restart the server, then retry from a fresh branch head.

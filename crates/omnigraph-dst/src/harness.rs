@@ -687,6 +687,12 @@ pub struct Scenario {
     /// quarantine deferred. Gated like `wide` so every pre-existing pinned
     /// seed keeps its exact op stream; composes with either die.
     pub schema_ops: bool,
+    /// writer-claim workload: one more die face emitting `WriterClaim` on a
+    /// uniformly sampled live branch, gated like `schema_ops` so no pinned
+    /// seed moves. Refused together with faults or a scheduled crash. The
+    /// process's holders outlive a universe, so each universe with this face
+    /// takes a root no earlier one in the process claimed on.
+    pub writer_claims: bool,
     /// LIVENESS mode: judge every failed op's aftermath on the SAME live
     /// handle instead of reopening — the whole universe runs on one handle,
     /// like a real client under a fault storm, and the report's `reopens`
@@ -1172,6 +1178,11 @@ pub struct UniverseReport {
     /// successes) — evidence the `schema_ops` workload reached the
     /// schema_apply/schema_reload families (0 without `Scenario::schema_ops`).
     pub schema_applies: usize,
+    /// `WriterClaim` ops that succeeded (0 without `Scenario::writer_claims`).
+    pub writer_claims: usize,
+    /// mutations, loads and merges that changed the model of a branch the
+    /// process had claimed: the fence check passing for the holder.
+    pub writes_on_claimed: usize,
     /// write-handle reopens performed while judging failures (reconcile and
     /// crash recovery). A `Scenario::keep_handle` universe must report zero:
     /// the whole storm ran on one live handle.
@@ -1344,6 +1355,9 @@ struct BranchSlot {
     /// engine's second-merge base is lineage-dependent; the model stays out
     /// of that ambiguity). It may still be mutated and is eventually deleted.
     merged: bool,
+    /// The process claimed this incarnation's writer epoch. Evidence only:
+    /// `render` does not read it.
+    claimed: bool,
 }
 
 /// The differential model made branch-aware: main plus one replica per live
@@ -1355,6 +1369,8 @@ struct WorldModel {
     /// Row-id counter shared by every branch, so a row minted on one side
     /// of a fork never collides with one minted on the other.
     edge_rows_minted: EdgeRowId,
+    /// [`BranchSlot::claimed`] for main.
+    main_claimed: bool,
 }
 
 impl WorldModel {
@@ -1369,6 +1385,7 @@ impl WorldModel {
             main,
             branches,
             edge_rows_minted,
+            ..
         } = self;
         let model = if branch == "main" {
             main
@@ -1397,6 +1414,20 @@ impl WorldModel {
         let mut names = vec!["main".to_string()];
         names.extend(self.branches.keys().cloned());
         names
+    }
+    fn is_claimed(&self, branch: &str) -> bool {
+        if branch == "main" {
+            self.main_claimed
+        } else {
+            self.branches.get(branch).is_some_and(|slot| slot.claimed)
+        }
+    }
+    fn claim(&mut self, branch: &str) {
+        if branch == "main" {
+            self.main_claimed = true;
+        } else {
+            self.branches.get_mut(branch).expect("live branch").claimed = true;
+        }
     }
     fn render(&self) -> WorldState {
         self.branch_names()
@@ -1578,6 +1609,17 @@ fn sample_op(rng: &mut SplitMix64, model: &Model, next_ver: &mut i64, hostile: b
     }
 }
 
+/// One full optimize run, whose failed table is the run's failure to the
+/// oracles: an op must finish every table it considers.
+pub(crate) async fn optimize_to_completion(db: &Session) -> OmniResult<()> {
+    let report = Box::pin(db.optimize_as(None, omnigraph::db::OptimizeRequest::default())).await?;
+    match report.tables.into_iter().find_map(|stat| stat.failure) {
+        Some(failure) => Err(std::sync::Arc::try_unwrap(failure)
+            .unwrap_or_else(|shared| OmniError::manifest_internal(shared.to_string()))),
+        None => Ok(()),
+    }
+}
+
 async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
     match op {
         Op::InsertV { name, age, ver } => mutate_on(
@@ -1634,12 +1676,15 @@ async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
         )
         .await
         .map(|_| ()),
-        Op::Optimize => Box::pin(db.optimize()).await.map(|_| ()),
+        Op::Optimize => optimize_to_completion(db).await,
         Op::Cleanup => {
-            let stats = Box::pin(db.cleanup(omnigraph::db::CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: None,
-            }))
+            let stats = Box::pin(db.cleanup_as(
+                omnigraph::db::CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: None,
+                },
+                None,
+            ))
             .await?;
             let deferred: BTreeMap<String, String> = stats
                 .iter()
@@ -1655,7 +1700,7 @@ async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
                 .insert(db.uri().to_string(), deferred);
             Ok(())
         }
-        Op::EnsureIndices => Box::pin(db.ensure_indices()).await.map(|_| ()),
+        Op::EnsureIndices => Box::pin(db.ensure_indices_as(None)).await.map(|_| ()),
         Op::SchemaAddProperty { count } => Box::pin(db.apply_schema(&schema_with_extras(*count)))
             .await
             .map(|_| ()),
@@ -1775,6 +1820,11 @@ enum WorldOp {
         branch: String,
         people: Vec<(String, i64, i64)>,
     },
+    /// `claim_branch_writer(branch)`, sampled only under
+    /// `Scenario::writer_claims`.
+    WriterClaim {
+        branch: String,
+    },
 }
 
 /// The most extra optional properties one universe's schema-op face may
@@ -1796,11 +1846,12 @@ fn sample_world_op(
     hostile: bool,
     wide: bool,
     schema_ops: bool,
+    writer_claims: bool,
     schema_extras: &mut usize,
     fresh_load: &mut usize,
 ) -> WorldOp {
     let base = if wide { 16 } else { 12 };
-    let die = rng.below(base + u64::from(schema_ops));
+    let die = rng.below(base + u64::from(schema_ops) + u64::from(writer_claims));
     if schema_ops && die == base {
         // The schema face: one more optional property, monotone (`count` is
         // cumulative, so every apply is additive over the last — never a
@@ -1819,6 +1870,11 @@ fn sample_world_op(
         let branch = names[rng.below(names.len() as u64) as usize].clone();
         let op = sample_op(rng, world.state_of(&branch), next_ver, hostile);
         return WorldOp::Data { branch, op };
+    }
+    if writer_claims && die == base + u64::from(schema_ops) {
+        let names = world.branch_names();
+        let branch = names[rng.below(names.len() as u64) as usize].clone();
+        return WorldOp::WriterClaim { branch };
     }
     match die {
         // Rolls 12|13 are the mid-life load family. (Roll 12 was the
@@ -2112,6 +2168,17 @@ async fn exec_world_op(db: &Session, wop: &WorldOp) -> OmniResult<()> {
                 .await
                 .map(|_| ())
         }
+        WorldOp::WriterClaim { branch } => {
+            let first = Box::pin(db.claim_branch_writer(branch)).await?;
+            let again = Box::pin(db.claim_branch_writer(branch)).await?;
+            if (first, again) == (1, 1) {
+                Ok(())
+            } else {
+                Err(OmniError::manifest_internal(format!(
+                    "writer claim on {branch:?} answered {first} then {again}, expected 1 and 1"
+                )))
+            }
+        }
     }
 }
 
@@ -2132,6 +2199,7 @@ fn apply_world(world: &mut WorldModel, wop: &WorldOp) {
                     state: world.main.clone(),
                     base: world.main.clone(),
                     merged: false,
+                    claimed: false,
                 },
             );
         }
@@ -2173,9 +2241,23 @@ fn apply_world(world: &mut WorldModel, wop: &WorldOp) {
                     state,
                     base: world.main.clone(),
                     merged: false,
+                    claimed: false,
                 },
             );
         }
+        WorldOp::WriterClaim { branch } => world.claim(branch),
+    }
+}
+
+/// The branch a successful `wop` publishes data on: a mutation's or a load's
+/// own branch, main for a merge, none for every other op.
+fn published_branch(wop: &WorldOp) -> Option<&str> {
+    match wop {
+        WorldOp::Data { branch, op } if is_mutation_op(op) || is_load_op(op) => {
+            Some(branch.as_str())
+        }
+        WorldOp::BranchMerge { .. } => Some("main"),
+        _ => None,
     }
 }
 
@@ -2188,6 +2270,7 @@ fn apply_fork_only(world: &mut WorldModel, wop: &WorldOp) {
                 state: world.main.clone(),
                 base: world.main.clone(),
                 merged: false,
+                claimed: false,
             },
         );
     }
@@ -5234,6 +5317,7 @@ fn op_targets_live(world: &WorldModel, wop: &WorldOp) -> bool {
         WorldOp::BranchDelete { name } => world.branches.contains_key(name),
         WorldOp::BranchCreate { name } => !world.branches.contains_key(name),
         WorldOp::LoadFork { .. } => true,
+        WorldOp::WriterClaim { branch } => world.state_of_opt(branch).is_some(),
     }
 }
 
@@ -5410,6 +5494,16 @@ pub fn run_universe_caught(root: &str, sc: &Scenario) -> std::thread::Result<Uni
                 || sc.recovery_crash.is_some())),
         "keep_handle is a live-handle liveness mode; a crash universe has no handle to keep"
     );
+    assert!(
+        !(sc.writer_claims
+            && (sc.faults.is_some()
+                || sc.crash_at.is_some()
+                || sc.crash_on_match.is_some()
+                || sc.setup_crash.is_some()
+                || sc.die_at_write.is_some()
+                || sc.recovery_crash.is_some())),
+        "writer_claims runs without faults and crashes: a failed claim changes no rendered state, so no failure path can arbitrate it"
+    );
     println!(
         "dst universe [root={root} seed={} ops={} crash={:?} setup_crash={:?} crash_on_match={:?} faults={} kill={:?}]",
         sc.seed,
@@ -5555,6 +5649,8 @@ impl UniverseScenario<RustResources> for Scenario {
         let mut client_retries = 0usize;
         let mut maintenance_reruns = 0usize;
         let mut schema_applies = 0usize;
+        let mut writer_claims = 0usize;
+        let mut writes_on_claimed = 0usize;
         let mut reconcile_verdicts: Vec<(String, String, String)> = Vec::new();
         let known_issues: Vec<String> = Vec::new();
         // attributed detections — op failures whose reads
@@ -5619,6 +5715,7 @@ impl UniverseScenario<RustResources> for Scenario {
                         sc.hostile,
                         sc.wide,
                         sc.schema_ops,
+                        sc.writer_claims,
                         &mut schema_extras,
                         &mut fresh_load,
                     );
@@ -6129,9 +6226,18 @@ impl UniverseScenario<RustResources> for Scenario {
                         let prior_data = (engine_effects_injected > 0
                             && matches!(&wop, WorldOp::Data { op, .. } if is_mutation_op(op) || is_load_op(op)))
                             .then(|| world.render());
+                        if matches!(&wop, WorldOp::WriterClaim { .. }) {
+                            writer_claims += 1;
+                        }
+                        let on_claimed = published_branch(&wop)
+                            .filter(|branch| world.is_claimed(branch))
+                            .map(|_| world.render());
                         apply_world(&mut world, &wop);
                         if prior_data.is_some_and(|before| before != world.render()) {
                             writes_after_engine_effect += 1;
+                        }
+                        if on_claimed.is_some_and(|before| before != world.render()) {
+                            writes_on_claimed += 1;
                         }
                     }
                     Err(err) => {
@@ -6432,7 +6538,7 @@ impl UniverseScenario<RustResources> for Scenario {
         tokio::time::resume();
         let lively = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            Box::pin(db.ensure_indices()),
+            Box::pin(db.ensure_indices_as(None)),
         )
         .await;
         tokio::time::pause();
@@ -6699,6 +6805,8 @@ impl UniverseScenario<RustResources> for Scenario {
             acks_lost,
             lance_acks_lost,
             schema_applies,
+            writer_claims,
+            writes_on_claimed,
             reopens,
             client_retries,
             maintenance_reruns,

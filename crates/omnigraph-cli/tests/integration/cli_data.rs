@@ -1253,13 +1253,13 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
 
 #[test]
 fn maintenance_refuses_server_targets_before_network() {
+    // `optimize` runs served maintenance on a server target; the rest are
+    // direct-storage commands.
     let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
     for command in [
-        &["optimize"][..],
-        &["index", "build"],
+        &["index", "build"][..],
         &["index", "rebuild", "--kind", "full-text"],
         &["rebuild-full-text-indexes"],
-        &["repair"],
         &["cleanup"],
         &["upgrade"],
     ] {
@@ -1278,6 +1278,49 @@ fn maintenance_refuses_server_targets_before_network() {
         assert!(server.requests().is_empty());
     }
     server.assert_complete();
+}
+
+/// `--timeout` bounds every wait, the submission included: a server that
+/// answers the submission only after the deadline does not hold the CLI,
+/// which names the operation and exits as in doubt.
+#[test]
+fn optimize_timeout_bounds_a_stalled_submission() {
+    use std::io::BufRead;
+    let server = crate::support::managed_http::IntentApiFixture::graph_with_response_delay(
+        vec![crate::support::managed_http::IntentReply::json(
+            202,
+            serde_json::json!({"lookup": "found", "operation": {"state": "accepted"}}),
+        )],
+        std::time::Duration::from_secs(8),
+    );
+    let mut child = crate::support::cli_process()
+        .args(["optimize", "--timeout", "1", "--target"])
+        .fixture_target(&server.origin)
+        .args(["--graph", "knowledge"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Timed from the submission, so the process's own start-up (slow on a
+    // freshly linked binary) does not count against the deadline.
+    let mut submitted = None;
+    let mut stderr = String::new();
+    for line in std::io::BufReader::new(child.stderr.take().unwrap()).lines() {
+        let line = line.unwrap();
+        if line.starts_with("operation id:") {
+            submitted = Some(std::time::Instant::now());
+        }
+        stderr.push_str(&line);
+        stderr.push('\n');
+    }
+    let status = child.wait().unwrap();
+    let waited = submitted.expect("the CLI names the operation").elapsed();
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    assert!(
+        waited < std::time::Duration::from_secs(5),
+        "the deadline bounds the submission: {waited:?}"
+    );
+    assert!(stderr.contains("stopped waiting"), "{stderr}");
 }
 
 #[test]
@@ -1367,41 +1410,6 @@ fn index_rebuild_requires_a_kind_issue_840() {
 }
 
 #[test]
-fn repair_json_reports_noop_on_clean_graph() {
-    let temp = tempdir().unwrap();
-    let graph = graph_path(temp.path());
-    init_graph(&graph);
-    load_fixture(&graph);
-
-    let output = output_success(
-        cli()
-            .arg("repair")
-            .arg("--json")
-            .arg("--target")
-            .arg(&graph),
-    );
-    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-
-    assert!(payload.get("confirm").is_none());
-    assert!(payload.get("force").is_none());
-    assert_eq!(payload["graph_manifest_version"], Value::Null);
-    assert!(payload.get("manifest_version").is_none());
-    assert!(payload.get("tables").is_none());
-    let datasets = payload["datasets"].as_array().unwrap();
-    assert_eq!(datasets.len(), 4);
-    assert!(datasets.iter().all(|dataset| {
-        dataset["classification"] == "no_drift" && dataset["action"] == "no_op"
-    }));
-
-    let human = stdout_string(&output_success(
-        cli().arg("repair").arg("--target").arg(&graph),
-    ));
-    assert!(human.contains("4 datasets"), "{human}");
-    assert!(human.contains("node type 'Person'"), "{human}");
-    assert!(!human.contains("node:Person"), "{human}");
-}
-
-#[test]
 fn index_rebuild_json_noops_without_full_text_properties_issue_840() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -1452,47 +1460,71 @@ fn index_rebuild_json_noops_without_full_text_properties_issue_840() {
     assert_eq!(manifest_dataset_version(&graph), version_before);
 }
 
+/// A linear commit a foreign Lance writer put above a table's last linear
+/// version is listed by a confirmed `cleanup` (under `foreign_versions` in
+/// JSON, by name in the human report), never deleted and never adopted; the
+/// removed `repair` command is refused as a usage error.
 #[test]
-fn repair_reports_foreign_drift_and_refuses_removed_flags() {
+fn cleanup_lists_a_foreign_commit_without_deleting_or_adopting_it() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
     load_fixture(&graph);
-    let graph_manifest_before = manifest_dataset_version(&graph);
-    let (table_manifest_before, table_head_before) = forge_person_foreign_commit(&graph);
+    let (_, foreign_head) = forge_person_foreign_commit(&graph);
+    let people = || {
+        parse_stdout_json(&output_success(
+            cli()
+                .arg("query")
+                .arg("--target")
+                .arg(&graph)
+                .arg("--query")
+                .arg(fixture("test.gq"))
+                .arg("total_people")
+                .arg("--json"),
+        ))["rows"]
+            .clone()
+    };
+    let rows_before = people();
 
-    let output = output_success(
-        cli()
-            .arg("repair")
-            .arg("--json")
-            .arg("--target")
-            .arg(&graph),
-    );
-    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["graph_manifest_version"], Value::Null);
-    let person = payload["datasets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|dataset| dataset["type_key"] == "node:Person")
-        .unwrap();
-    assert_eq!(person["classification"], "foreign_drift");
-    assert_eq!(person["action"], "no_op");
-    assert_eq!(person["published_dataset_version"], table_manifest_before);
-    assert_eq!(person["lance_head_version"], table_head_before);
-    assert!(
-        person["operations"][0]
-            .as_str()
-            .is_some_and(|operation| operation.contains("foreign linear version")),
-        "{}",
-        person["operations"]
-    );
-    assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
-    for flag in ["--confirm", "--force"] {
-        let refused = output_failure(cli().arg("repair").arg(flag).arg("--target").arg(&graph));
-        assert_eq!(refused.status.code(), Some(64));
-        assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
+    for _ in 0..2 {
+        let cleaned = parse_stdout_json(&output_success(
+            cli()
+                .args(["cleanup", "--keep", "1", "--confirm", "--json", "--target"])
+                .arg(&graph),
+        ));
+        let person = cleaned["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dataset| dataset["type_key"] == "node:Person")
+            .unwrap();
+        assert_eq!(person["error"], Value::Null, "{person}");
+        assert_eq!(
+            person["foreign_versions"],
+            serde_json::json!([foreign_head]),
+            "every run lists the foreign commit and none deletes it: {person}"
+        );
     }
+    let human = stdout_string(&output_success(
+        cli()
+            .args(["cleanup", "--keep", "1", "--confirm", "--target"])
+            .arg(&graph),
+    ));
+    assert!(
+        human.contains(&format!(
+            "node type 'Person': foreign Lance versions {foreign_head} kept, never read or adopted"
+        )),
+        "the human report names the foreign commit: {human}"
+    );
+    assert_eq!(
+        people(),
+        rows_before,
+        "reads resolve the pin, never the foreign commit"
+    );
+
+    let refused = output_failure(cli().arg("repair").arg("--target").arg(&graph));
+    assert_eq!(refused.status.code(), Some(64), "{refused:?}");
+    assert!(refused.stdout.is_empty());
 }
 
 #[test]

@@ -576,6 +576,7 @@ defaults: {target: local, profile: work}
             vec!["access"],
             vec!["queries", "list"],
             vec!["mcp"],
+            vec!["optimize"],
         ] {
             for target in ["server", "cluster"] {
                 let mut args = args.clone();
@@ -583,11 +584,7 @@ defaults: {target: local, profile: work}
                 assert!(selected(&args, &input, dir.path()).is_ok(), "{args:?}");
             }
         }
-        for args in [
-            vec!["optimize"],
-            vec!["queries", "validate"],
-            vec!["policy", "validate"],
-        ] {
+        for args in [vec!["queries", "validate"], vec!["policy", "validate"]] {
             for target in ["server", "cluster"] {
                 let mut args = args.clone();
                 args.extend(["--target", target]);
@@ -646,7 +643,6 @@ defaults: {target: local, profile: work}
                 "1",
                 "--confirm",
             ],
-            vec!["repair", "--graph", "knowledge"],
             vec!["rebuild-full-text-indexes", "--graph", "knowledge"],
         ] {
             let mut args = args;

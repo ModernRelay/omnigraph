@@ -37,7 +37,7 @@ pub(crate) struct ProtocolVersionsOutput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct InternalSchemaOutput {
-    /// The stamp this binary's publications write.
+    /// The stamp of a graph this binary creates, the highest it writes.
     pub(crate) writes: u32,
     /// The inclusive range of stamps normal open serves, lowest first.
     pub(crate) serves: [u32; 2],

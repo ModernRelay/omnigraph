@@ -17,7 +17,7 @@ pub(crate) use crate::commands::history::{BranchCommand, ChangesCommand, CommitC
 use crate::commands::history::{DiffArgs, SnapshotArgs};
 pub(crate) use crate::commands::maintenance::IndexCommand;
 use crate::commands::maintenance::{
-    CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
+    CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, UpgradeArgs,
 };
 use crate::commands::query::{AliasArgs, CatalogueArgs, MutateArgs, QueryArgs};
 pub(crate) use crate::commands::schema::SchemaCommand;
@@ -145,7 +145,7 @@ pub(crate) enum Command {
     /// Initialize a new graph from a schema
     Init(InitArgs),
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
-    /// the current format this binary serves (v16); other formats are rebuilt by export and load
+    /// the current format this binary serves (v17); other formats are rebuilt by export and load
     Upgrade(UpgradeArgs),
     /// Compact small Lance fragments in every backing dataset of the graph
     Optimize(OptimizeArgs),
@@ -157,8 +157,6 @@ pub(crate) enum Command {
     /// Deprecated spelling of `index rebuild --kind full-text`
     #[command(hide = true)]
     RebuildFullTextIndexes(RebuildFullTextIndexesArgs),
-    /// Diagnose foreign Lance HEAD movement without adopting it.
-    Repair(RepairArgs),
     /// Remove old Lance versions from every backing dataset of the graph (destructive)
     Cleanup(CleanupArgs),
     /// Validate queries against a schema (offline) or repo (repo-backed).

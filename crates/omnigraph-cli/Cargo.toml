@@ -61,7 +61,6 @@ predicates = "3"
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 lance = { workspace = true }
-lance-index = { workspace = true }
 
 [lints]
 workspace = true

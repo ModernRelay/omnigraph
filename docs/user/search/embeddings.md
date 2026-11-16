@@ -35,6 +35,19 @@ The default OpenRouter model is `openai/text-embedding-3-large`. The direct
 OpenAI default is `text-embedding-3-large`; Gemini defaults to
 `gemini-embedding-2`.
 
+## Outbound requests
+
+Apart from its storage, embedding is the only outbound request the server
+makes: it happens when a query's `nearest` takes text rather than a vector, and
+goes to the provider endpoint with that provider's key. Stored vectors are never
+re-embedded by the server, and loads do not call a provider. To run with no
+outbound requests at all, bind no `embedding_provider` and leave
+`OPENROUTER_API_KEY`, `OPENAI_API_KEY` and `GEMINI_API_KEY` unset in the
+server's environment, along with `OMNIGRAPH_EMBED_PROVIDER`: a text `nearest`
+then fails, and every other query is unaffected. Pass vectors as `nearest`
+parameters instead. The mock provider also makes no request, but its vectors
+are not real embeddings.
+
 ## Cluster configuration
 
 Cluster-served graphs select a named provider in `cluster.yaml`:

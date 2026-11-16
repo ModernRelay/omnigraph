@@ -836,3 +836,48 @@ pub async fn s3_graph(name: &str) -> Option<omnigraph::Session> {
         .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 seed load failed");
     Some(db)
 }
+
+/// The store-agnostic body of the writer epoch cost gate, over two graphs of
+/// one history: an insert on a bound branch its process holds issues the
+/// requests of an insert on a branch nobody claimed, less the head probes it
+/// skips. Byte counts are left out, since a claimed branch's `__manifest`
+/// holds one more row.
+pub async fn assert_branch_claim_adds_no_request_to_a_write(
+    unclaimed: &omnigraph::Session,
+    held: &omnigraph::Session,
+) {
+    let requests = |io: &IoCounts| {
+        [
+            io.data_reads,
+            io.data_writes,
+            io.data_open_count,
+            io.manifest_reads,
+            io.manifest_writes,
+            io.manifest_scan_count,
+            io.internal_open_count,
+        ]
+    };
+    let mut writes = Vec::new();
+    for (db, claims) in [(unclaimed, false), (held, true)] {
+        if claims {
+            assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+        }
+        measure_insert(db, "claim_cost_warm").await;
+        writes.push(measure_insert(db, "claim_cost_measured").await);
+    }
+    let (plain, owned) = (&writes[0], &writes[1]);
+    eprintln!("write requests: unclaimed {plain:?}, held {owned:?}");
+    assert_eq!(
+        requests(owned),
+        requests(plain),
+        "a write on a held branch issues the requests of a write on an unclaimed one"
+    );
+    assert!(
+        plain.version_probes > 0,
+        "an unclaimed branch is probed: {plain:?}"
+    );
+    assert_eq!(
+        owned.version_probes, 0,
+        "a held bound branch is not probed: {owned:?}"
+    );
+}

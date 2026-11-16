@@ -120,7 +120,7 @@ lands while the write is in flight makes it start again from the new head and
 check again, so a stale ETag fails instead of overwriting the newer value; a
 write without a precondition replaces whatever is current. A schema apply or a
 delete and recreate of the branch landing in that window refuses the write
-with a conflict instead.
+instead, over HTTP a `409` `read_set_conflict`.
 
 The returned ETag is the one a read at the returned commit reports. When a call
 fails after its commit became durable, for example because its acknowledgement

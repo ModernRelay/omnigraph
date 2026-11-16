@@ -13,6 +13,13 @@ pub(super) fn registry(scope: StorageIoScope) -> Arc<ObjectStoreRegistry> {
     let registry = ObjectStoreRegistry::default();
     #[cfg(feature = "dst")]
     super::object_store_seam::hook(&registry);
+    wrap_providers(&registry, scope);
+    Arc::new(registry)
+}
+
+/// Put the scope over every provider `registry` holds for the schemes it
+/// covers, whatever those providers already wrap.
+pub(super) fn wrap_providers(registry: &ObjectStoreRegistry, scope: StorageIoScope) {
     for scheme in ["file", "file-object-store", "s3", "az", "abfss"] {
         if let Some(inner) = registry.get_provider(scheme) {
             registry.insert(
@@ -24,7 +31,6 @@ pub(super) fn registry(scope: StorageIoScope) -> Arc<ObjectStoreRegistry> {
             );
         }
     }
-    Arc::new(registry)
 }
 
 #[derive(Debug)]

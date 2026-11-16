@@ -1361,6 +1361,16 @@ jobs:
             settings::tests::s3_bootstrap_handoff_serves_empty_then_deploys_first_graph \
             -- --exact --nocapture --test-threads=1 2>&1 | tee -a "$test_log"
 
+          # The GQT runner's `--base` cases (the graph shallow clone RFC's
+          # first four observations) against the bucket. The runner's crate
+          # is outside the four-package resolve above, so this is its own
+          # build.
+          cargo test --locked \
+            -p omnigraph-gqt \
+            --test runner_dispatch \
+            clone_cases_run_against_a_bucket \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+
           if grep -Eiq \
             "SKIP public_physical_ref_token_rejects_s3_same_version_aba|skipping s3 " \
             "$test_log"
@@ -1376,6 +1386,20 @@ jobs:
             s3_storage::s3_adapter_conditional_writes_contract \
             s3_storage::s3_schema_apply_migrates_live_graph \
             s3_storage::s3_fresh_branch_traversal_reuses_main_graph_index_with_etags \
+            s3_storage::durable_deletes_survive_a_reopen_and_stay_in_their_own_clone_root \
+            s3_storage::a_durable_store_keeps_its_whiteouts_out_of_sight \
+            s3_storage::durable_refuses_a_base_that_is_itself_a_clone_root \
+            s3_storage::durable_refuses_a_base_that_holds_an_object_at_the_reserved_name \
+            s3_storage::a_clone_root_carries_the_reserved_directory_from_its_first_build \
+            s3_storage::a_stop_between_the_whiteout_and_the_delete_leaves_the_key_deleted_or_untouched \
+            s3_storage::an_update_and_a_delete_of_one_base_object_take_turns \
+            s3_storage::a_create_and_a_delete_of_one_base_object_take_turns \
+            s3_storage::a_rename_of_a_base_object_is_refused_and_one_of_a_clone_object_runs \
+            s3_storage::create_after_a_durable_delete_holds_across_reopens \
+            s3_storage::racing_updates_of_a_base_object_over_a_clone_root_admit_one \
+            s3_storage::s3_read_through_adapter_masks_the_base_and_leaves_its_listing_as_it_was \
+            s3_storage::s3_open_clone_reads_the_base_and_writes_only_its_own_prefix \
+            clone_cases_run_against_a_bucket \
             public_physical_ref_token_rejects_s3_same_version_aba \
             s3::server_opens_s3_graph_directly_and_serves_snapshot_and_read \
             s3::server_boots_cluster_from_bare_storage_uri_and_serves_query \

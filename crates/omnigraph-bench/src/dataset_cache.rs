@@ -152,6 +152,22 @@ impl DatasetLease {
             .verify_unchanged()
             .map_err(|e| error(e.to_string()))
     }
+    /// An empty active root beside the verified template: the layer a
+    /// repetition reads the template through, in place of a restored copy.
+    pub fn empty_active(&self) -> RunnerResult<MetadataDigest> {
+        self.verify()?;
+        self.remove_active()?;
+        std::fs::create_dir(&self.active).map_err(|e| error(e.to_string()))?;
+        reset::digest_metadata_tree(&self.active, TraversalLimits::default())
+            .map_err(|e| error(e.to_string()))
+    }
+    /// Read every byte of the template and require the digest it was frozen
+    /// with: the proof that repetitions which opened it in place left it alone.
+    pub fn verify_template_bytes(&self) -> RunnerResult<()> {
+        reset::verify_physical_tree(&self.template, self.physical(), TraversalLimits::default())
+            .map(|_| ())
+            .map_err(|e| error(format!("template bytes changed: {e}")))
+    }
     pub fn verify(&self) -> RunnerResult<()> {
         self.validate_ownership()?;
         validate_manifest_evidence(&self.manifest).map_err(error)?;

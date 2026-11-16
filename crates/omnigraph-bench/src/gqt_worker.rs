@@ -145,11 +145,13 @@ async fn execute_request(
             repetition_root,
             physical_digest,
             metadata_digest,
+            route,
             ..
         } => {
             execute_gqt_rep_signaled(
                 request.repetition,
                 repetition_root,
+                route,
                 physical_digest,
                 metadata_digest,
                 &validated,
@@ -213,7 +215,9 @@ fn validate_worker_case(request: &WorkerRequestV2) -> RunnerResult<ValidatedCase
             )
         })?;
     if let crate::gqt_protocol::RepetitionInputV2::Embedded {
-        repetition_root, ..
+        repetition_root,
+        route,
+        ..
     } = &request.execution
     {
         let root = std::fs::canonicalize(repetition_root)
@@ -223,6 +227,16 @@ fn validate_worker_case(request: &WorkerRequestV2) -> RunnerResult<ValidatedCase
                 "worker_protocol_error",
                 "worker scratch root must be a sibling of the repetition store",
             ));
+        }
+        if let crate::gqt_evidence::LocalRoute::ReadThrough { base_root } = route {
+            let base = std::fs::canonicalize(base_root)
+                .map_err(|e| RunnerError::new("worker_protocol_error", e.to_string()))?;
+            if base.parent() != root.parent() {
+                return Err(RunnerError::new(
+                    "worker_protocol_error",
+                    "the template read through must be a sibling of the repetition store",
+                ));
+            }
         }
     }
     let mut entries = std::fs::read_dir(&worker_scratch_root).map_err(|error| {

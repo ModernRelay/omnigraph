@@ -117,6 +117,11 @@ enum Command {
         server_args: ServerArgs,
         #[arg(long)]
         archive: Option<PathBuf>,
+        /// Engine-target route to the fixture: `direct` (a restored copy),
+        /// `object-store` (that copy, all I/O through the object store) or
+        /// `read-through` (the frozen template, nothing restored; no record).
+        #[arg(long, default_value = "direct", conflicts_with = "archive")]
+        local_route: omnigraph_bench::gqt_evidence::LocalRouteKind,
         #[arg(long)]
         json: bool,
     },
@@ -612,6 +617,7 @@ async fn main() -> ExitCode {
             fixtures,
             server_args,
             archive,
+            local_route,
             json,
         } => {
             let served = match server_args.resolve() {
@@ -670,6 +676,7 @@ async fn main() -> ExitCode {
                         no_build,
                         fixture_bindings: fixtures,
                         worker_executable: std::env::current_exe().ok(),
+                        local_route,
                         ..Default::default()
                     },
                     archive,
@@ -741,6 +748,7 @@ async fn main() -> ExitCode {
                     no_build,
                     fixture_bindings: fixtures,
                     worker_executable: std::env::current_exe().ok(),
+                    local_route,
                     ..Default::default()
                 },
                 archive,
@@ -1288,6 +1296,7 @@ async fn run_suite(command: SuiteCommand) -> ExitCode {
                 no_build,
                 fixture_bindings: fixtures,
                 worker_executable: std::env::current_exe().ok(),
+                local_route: Default::default(),
             };
             if let Some(file) = file {
                 return run_suite_execution(&file, case.as_deref(), options, archive, json).await;
@@ -1776,6 +1785,8 @@ async fn run_resolved_suite(
         runner_output_version: RUNNER_OUTPUT_VERSION,
         suite: suite.definition.name,
         suite_path: suite.suite_path,
+        local_route: (options.local_route != Default::default())
+            .then(|| options.local_route.name()),
         completed_run_count,
         runs: diagnostic_runs,
         durable_archive: recording.map(|recording| DurableArchiveOutput {
@@ -1798,6 +1809,9 @@ struct SuiteRunOutput {
     suite: String,
     #[serde(serialize_with = "serialize_path_buf_lossy")]
     suite_path: PathBuf,
+    /// Present when the run did not take the direct route to its fixture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_route: Option<&'static str>,
     completed_run_count: usize,
     /// Present only for diagnostic, non-archive execution. Durable archive
     /// records already own the complete raw repetitions.
@@ -2515,6 +2529,7 @@ mod tests {
             runner_output_version: RUNNER_OUTPUT_VERSION,
             suite: "suite".to_string(),
             suite_path: PathBuf::from("suite.yaml"),
+            local_route: None,
             completed_run_count: 1,
             runs: None,
             durable_archive: Some(DurableArchiveOutput {

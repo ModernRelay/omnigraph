@@ -243,7 +243,7 @@ fn inspect_source(
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .ok_or("GQT filename must be UTF-8")?;
-                    parse_case(stem, &text)
+                    parse_case(stem, &text).map_err(String::from)
                 });
             parsed
                 .and_then(|case| {

@@ -1123,7 +1123,7 @@ fn prepared_store_under_dst_runs_seams_on_the_view_ignores_foreign_files_and_ref
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!output.status.success());
-    assert!(text.contains("prepared store holds a symlink"), "{text}");
+    assert!(text.contains("the base holds a symlink"), "{text}");
     std::fs::remove_file(root.join("loop")).unwrap();
     runtime.block_on(async {
         let db = omnigraph::db::Omnigraph::open(&uri).await.unwrap();
@@ -1671,4 +1671,280 @@ fn measure_counts_schema_contract_requests_issue_817() {
         0,
         "a read probes its branch's freshness once"
     );
+}
+
+/// Every object under a root with its size and ETag, sorted by key: a
+/// `file://` directory through `LocalFileSystem`, an `s3://` prefix through
+/// the storage crate's test helper.
+fn listing(runtime: &tokio::runtime::Runtime, uri: &str) -> Vec<(String, u64, Option<String>)> {
+    use futures::TryStreamExt;
+    use object_store::ObjectStore;
+    let store: std::sync::Arc<dyn ObjectStore> = match uri.strip_prefix("file://") {
+        Some(dir) => {
+            std::sync::Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir).unwrap())
+        }
+        None => omnigraph_storage::read_through_contract::s3_prefix_store(uri).unwrap(),
+    };
+    let mut rows: Vec<_> = runtime
+        .block_on(
+            store
+                .list(None)
+                .map_ok(|meta| (meta.location.to_string(), meta.size, meta.e_tag))
+                .try_collect(),
+        )
+        .unwrap();
+    rows.sort();
+    rows
+}
+
+/// The sorted `Person` names a handle over `uri` answers on `branch`: the
+/// graph there, or with `base` the clone of that base rooted there.
+fn person_names(
+    runtime: &tokio::runtime::Runtime,
+    uri: &str,
+    base: Option<&str>,
+    branch: &str,
+) -> Vec<String> {
+    runtime.block_on(async {
+        let db = match base {
+            Some(base) => omnigraph::db::Omnigraph::open_clone(base, uri).await,
+            None => omnigraph::db::Omnigraph::open(uri).await,
+        }
+        .unwrap();
+        let rows = omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default())
+            .query(
+                omnigraph::db::ReadTarget::branch(branch),
+                "query all() { match { $p: Person } return { $p.name } }",
+                "all",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .to_rust_json()
+            .unwrap();
+        let mut names: Vec<String> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["p.name"].as_str().unwrap().to_owned())
+            .collect();
+        names.sort();
+        names
+    })
+}
+
+/// The cases under `tests/fixtures/runner/clone/`: the first, with `--store`
+/// alone, gives the base its branch `feature`; the four observations run with
+/// `--base`, three on one clone root and the fourth on another.
+fn run_clone_cases(
+    runtime: &tokio::runtime::Runtime,
+    base: &str,
+    clone_a: &str,
+    clone_b: &str,
+    storage: &str,
+    artifacts: &Path,
+) {
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::init(base, "node Person { name: String @key }")
+            .await
+            .unwrap();
+        omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default())
+            .load_jsonl(
+                "{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}",
+                omnigraph::loader::LoadMode::Overwrite,
+            )
+            .await
+            .unwrap();
+    });
+    let cases = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner/clone");
+    let run = |case: &str, store: &str, base: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"));
+        command.arg(cases.join(case)).args(["--store", store]);
+        if let Some(base) = base {
+            command.args(["--base", base]);
+        }
+        let output = command
+            .args(["--target", "omnigraph-engine", "--storage", storage])
+            .arg("--artifacts")
+            .arg(artifacts)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{case} on {store}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (_, summary) = report(&output);
+        assert_eq!(summary["attempts"][0]["input"]["store"], store);
+        match base {
+            Some(base) => assert_eq!(summary["attempts"][0]["input"]["base"], base),
+            None => assert!(summary["attempts"][0]["input"]["base"].is_null()),
+        }
+    };
+    run("the_base_holds_a_feature_branch.gqt", base, None);
+    let before = listing(runtime, base);
+    for (case, clone) in [
+        ("a_new_clone_answers_as_its_base.gqt", clone_a),
+        ("writes_behave_as_on_an_ordinary_root.gqt", clone_a),
+        ("a_later_open_finds_the_clones_own_state.gqt", clone_a),
+        ("two_clones_of_one_base_are_independent.gqt", clone_b),
+    ] {
+        run(case, clone, Some(base));
+    }
+    assert_eq!(
+        listing(runtime, base),
+        before,
+        "the base's listing and ETags are as they were"
+    );
+    assert_eq!(person_names(runtime, base, None, "main"), ["alice"]);
+    assert_eq!(
+        person_names(runtime, base, None, "feature"),
+        ["alice", "dave"]
+    );
+    assert_eq!(
+        person_names(runtime, clone_a, Some(base), "main"),
+        ["alice", "bob"]
+    );
+    assert_eq!(
+        person_names(runtime, clone_b, Some(base), "main"),
+        ["alice", "carol"]
+    );
+    assert_eq!(
+        person_names(runtime, clone_b, Some(base), "feature"),
+        ["alice", "dave"]
+    );
+}
+
+#[test]
+fn clone_cases_run_over_a_local_base() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["base", "clone-a", "clone-b"] {
+        std::fs::create_dir(dir.path().join(name)).unwrap();
+    }
+    let uri = |name: &str| format!("file://{}/{name}", dir.path().display());
+    run_clone_cases(
+        &runtime,
+        &uri("base"),
+        &uri("clone-a"),
+        &uri("clone-b"),
+        "local-filesystem",
+        dir.path(),
+    );
+}
+
+#[test]
+fn clone_cases_run_against_a_bucket() {
+    let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
+        eprintln!("skipping s3 clone cases: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+    let prefix = std::env::var("OMNIGRAPH_S3_TEST_PREFIX")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "omnigraph-itests".to_string());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = format!("s3://{bucket}/{prefix}/gqt-clone/{unique}");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    run_clone_cases(
+        &runtime,
+        &format!("{root}/base"),
+        &format!("{root}/clone-a"),
+        &format!("{root}/clone-b"),
+        "s3-compatible",
+        dir.path(),
+    );
+    runtime.block_on(async {
+        omnigraph::storage::storage_for_uri(&root)
+            .unwrap()
+            .delete_prefix(&root)
+            .await
+            .unwrap();
+    });
+}
+
+/// A case cannot name the paths and file kinds `--check` is handed.
+#[test]
+fn check_reports_a_path_that_names_no_case_and_checks_the_rest() {
+    const CLEAN: &str = r#"# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+--- expect shape
+name: String
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let clean = dir.path().join("clean.gqt");
+    std::fs::write(&clean, CLEAN).unwrap();
+    let refused_twice = dir.path().join("refused_twice.gqt");
+    std::fs::write(
+        &refused_twice,
+        CLEAN
+            .replace("timeout_ms: 10000", "timeout_ms: soon")
+            .replace("--- expect unordered", "--- expect sorted"),
+    )
+    .unwrap();
+    let check = |json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"));
+        command.arg("--check");
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .args([&empty, &clean, &refused_twice])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            "2 errors in 1 of 2 files; 1 path names no case"
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let text = check(false);
+    for line in [
+        format!("{0}: invalid_case: no .gqt case under {0}", empty.display()),
+        format!("ok {}", clean.display()),
+        format!("{}:2: runner_config: ", refused_twice.display()),
+        format!("{}:10: unknown_expect_mode: ", refused_twice.display()),
+    ] {
+        assert!(text.contains(&line), "{line}: {text}");
+    }
+    let objects: Vec<serde_json::Value> = check(true)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let codes: Vec<Vec<&str>> = objects
+        .iter()
+        .map(|object| {
+            object["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|error| error["code"].as_str().unwrap())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            vec!["invalid_case"],
+            vec![],
+            vec!["runner_config", "unknown_expect_mode"]
+        ]
+    );
+    assert_eq!(objects[0]["path"], empty.display().to_string());
 }

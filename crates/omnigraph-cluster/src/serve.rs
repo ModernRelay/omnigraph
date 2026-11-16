@@ -397,13 +397,13 @@ async fn cluster_graph_impl(
 
 /// Resolve a graph's **storage URI** (`<root>/graphs/<id>.omni`) from a cluster's
 /// applied state ledger — the lightweight path for storage-plane maintenance
-/// (`optimize`/`repair`/`cleanup`).
+/// (`optimize`/`cleanup`).
 ///
 /// Unlike [`read_serving_snapshot`], this deliberately does NOT validate catalog
 /// payloads or recovery readiness: maintenance only needs the derivable graph
 /// root, and must not be blocked by an unrelated corrupt policy/query blob or a
 /// pending recovery sweep — a degraded cluster is exactly when an operator
-/// reaches for `repair`. It reads the state ledger, confirms the graph is in the
+/// reaches for maintenance. It reads the state ledger, confirms the graph is in the
 /// applied revision, and returns `graph_root(id)`.
 ///
 /// `cluster` is a config directory or a storage-root URI (`s3://…` or

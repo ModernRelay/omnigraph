@@ -1,0 +1,1 @@
+- On a table with an `id` index, a one-row keyed `insert`, `update ... where <key> = v` or `load --mode merge` reads its rows through the index while the unindexed tail is small.
