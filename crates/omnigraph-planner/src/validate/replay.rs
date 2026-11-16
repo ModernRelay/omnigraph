@@ -25,11 +25,15 @@ use crate::bound::BoundPlan;
 pub const REPLAY_VERSION: u32 = 1;
 
 /// The catalogue of checks and rewrite rules acceptance applies. A rule id
-/// keeps its meaning within one version.
-pub const RULES_VERSION: u32 = 2;
+/// keeps its meaning within one version. Version 3: GQ 3's node kinds
+/// (`TargetCut`, `Score`, `Let`, `Union`, `OptionalJoin`, `Correlate`,
+/// `Fuse`) and their checks, each conjunct held to its region among them.
+pub const RULES_VERSION: u32 = 3;
 
-/// The compiler and operator semantics a plan was built under.
-pub const SEMANTICS_VERSION: u32 = 2;
+/// The compiler and operator semantics a plan was built under. Version 3:
+/// GQ 3, the language of `match` and `where`, its core operators and A3's
+/// evaluation order.
+pub const SEMANTICS_VERSION: u32 = 3;
 
 /// The query a saved plan came from: its source and declaration name. Its
 /// parameter values are the plan's own bound values.
@@ -278,6 +282,27 @@ mod tests {
     /// A version is read before the rest: an unsupported one asks for the
     /// query again even when the body would not decode, and a missing header
     /// is no envelope.
+    /// An envelope saved by a build before GQ 3 (rules and semantics
+    /// version 2) holds a plan of another language and another catalogue of
+    /// node kinds and checks: it asks for the query again, never decodes as
+    /// invalid evidence.
+    #[test]
+    fn an_edition_2_envelope_asks_for_the_query_again() {
+        let mut value = serde_json::to_value(envelope()).unwrap();
+        value["rules_version"] = serde_json::json!(2);
+        value["semantics_version"] = serde_json::json!(2);
+        value["plan"] = serde_json::json!({ "node": "RankFuse" });
+        let refusal = decode_replay(
+            &serde_json::to_vec(&value).unwrap(),
+            ValidationLimits::DEFAULT,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refusal, ReplayRefusal::ReplanRequired { .. }),
+            "{refusal:?}"
+        );
+    }
+
     #[test]
     fn versions_are_checked_before_the_body() {
         for field in ["replay_version", "rules_version", "semantics_version"] {

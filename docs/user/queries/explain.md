@@ -234,7 +234,8 @@ overfetch `rung`. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
 `Executed::profile`). The row schema is `explain_version` 9 (version 9
-replaced the two-arm `RankFuse` node with `Fuse`; version 8 added the
+replaced the two-arm `RankFuse` node with `Fuse` and added `TargetCut`,
+`Score`, `Let`, `Union`, `OptionalJoin` and `Correlate`; version 8 added the
 `DeltaSource` node a staged write's plan starts from): `pipelines`
 entries (on every planner document since version 7, on diff and merge
 documents only before it) carry a pipeline `id` and `depends_on`, with

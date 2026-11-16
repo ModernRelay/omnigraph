@@ -31,8 +31,10 @@ use crate::validate::ValidationSummary;
 /// Version 8: the write node kind `DeltaSource` was added (a write's staged
 /// delta of one table, the leaf under its `Validate`), and `operation`
 /// carries `write` and `committed` for a write.
-/// Version 9: the node kind `RankFuse` was removed and `Fuse` added, a
-/// fusion of 2 to 16 arm subtrees, each naming how it ranks its targets.
+/// Version 9 (GQ 3): the node kind `RankFuse` was removed and `Fuse` added,
+/// a fusion of 2 to 16 arm subtrees, each naming how it ranks its targets,
+/// and the node kinds `TargetCut`, `Score`, `Let`, `Union`, `OptionalJoin`
+/// and `Correlate` were added.
 pub const EXPLAIN_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
