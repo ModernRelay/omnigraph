@@ -98,13 +98,10 @@ A query runs against one resolved `ReadTarget`:
    profile is drawn the same way, a `Score` of kind `bm25`: its query is the
    `match_terms(field, terms(…))` predicate the score retains, so its rows are
    the matches and its column `<binding>._score` (`F64`), read by the
-   identity column the node adds to its reads. The type checker types every
-   `search`, `match_text` and `fuzzy` over such a field as the `match_terms`
-   it means (`mode: any`, `fuzzy`'s budget or 2), one typed term for both
-   spellings, which is why `queries fmt` may write either as the other
-   (the shaper repeats the rewrite for an interface-typed binding whose
-   implementations all declare a profile), so every full-text call there is
-   a `Filter` or `Let` operand answered
+   identity column the node adds to its reads. Before the shaper places
+   anything, every `search`, `match_text` and `fuzzy` over such a field is
+   rewritten to the `match_terms` it means (`mode: any`, `fuzzy`'s budget or
+   2), so every full-text call there is a `Filter` or `Let` operand answered
    by the exact lexical scan (below), and `match_terms` with an edit budget is
    lowered only there. Plan acceptance also requires each such `Score` to
    retain the `match_terms` of its own field (predicate retention), to score a
@@ -227,9 +224,7 @@ types to the same edge selection from the same bound end, except where both
 ends are bound: the semi-join `Expand` then starts at the written source, so
 the core term's orientation flips while the shaper's plan stays the same. An
 undirected triple, a selection with at least one member resolved `Out` and a
-selection with no member are not refused. An undirected triple's ends are read
-smaller written name first, whichever is bound, so its core term never depends
-on the order they were written in; that is the order `queries fmt` writes.
+selection with no member are not refused.
 
 A ranked `from` names its score with `as` (`check/mod.rs`, `drawn_rel`). The
 ranking's term carries the written name as its `out` (`Score`, `ApproxTopK`,

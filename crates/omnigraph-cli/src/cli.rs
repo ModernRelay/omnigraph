@@ -175,7 +175,7 @@ pub(crate) enum Command {
     Cleanup(CleanupArgs),
     /// Validate queries against a schema (offline) or repo (repo-backed).
     Lint(LintArgs),
-    /// Operate on the server-side stored-query registry (`queries:`), or format query files.
+    /// Operate on the server-side stored-query registry (`queries:`).
     Queries {
         #[command(subcommand)]
         command: QueriesCommand,

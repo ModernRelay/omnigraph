@@ -9,14 +9,9 @@ use crate::query::descriptor::{QueryOperationDescriptor, describe_query_operatio
 use crate::query::diagnostic::{QueryDiagnostic, QueryDiagnosticKind};
 use crate::query::file::QueryDecl;
 use crate::query::parser::parse_query_diagnostic;
-use crate::query::value::CompOp;
 
 const L201_CODE: &str = "L201";
 const L202_CODE: &str = "L202";
-const L203_CODE: &str = "L203";
-const L204_CODE: &str = "L204";
-const L205_CODE: &str = "L205";
-const L206_CODE: &str = "L206";
 const HARDCODED_MUTATION_WARNING: &str =
     "mutation declares no params; hardcoded mutations are easy to miss";
 
@@ -98,6 +93,10 @@ pub struct QueryLintFinding {
     pub severity: QueryLintSeverity,
     pub code: String,
     pub message: String,
+    /// The text that replaces the finding's construct, for a finding that
+    /// names a canonical form.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,7 +183,7 @@ pub fn lint_query_file(
 
             let mut findings = lint_update_coverage(catalog, &coverage);
             findings.extend(lint_undeclared_analyzers(catalog));
-            findings.extend(lint_rewrites(catalog, query_source));
+            findings.extend(lint_canonical_forms(query_source));
             findings.sort_by(findings_cmp);
 
             let errors = results
@@ -239,6 +238,7 @@ pub fn lint_query_file(
                     severity: QueryLintSeverity::Error,
                     code,
                     message,
+                    fix: None,
                     type_name: None,
                     property: None,
                     query_names: Vec::new(),
@@ -352,6 +352,7 @@ fn lint_update_coverage(
                     "{}.{} exists in schema but no update query sets it",
                     type_name, property_name
                 ),
+                fix: None,
                 type_name: Some(type_name.clone()),
                 property: Some(property_name),
                 query_names: type_coverage.query_names.iter().cloned().collect(),
@@ -389,6 +390,7 @@ fn lint_undeclared_analyzers(catalog: &Catalog) -> Vec<QueryLintFinding> {
                 message: format!(
                     "{type_name}.{property_name}'s full-text index declares no analyzer and keeps edition 2's index analysis; declare a profile, `@index(fulltext, analyzer = \"{closest}\")` being the closest (it differs by the 40-byte token filter and NFC)"
                 ),
+                fix: None,
                 type_name: Some(type_name.clone()),
                 property: Some(property_name.clone()),
                 query_names: Vec::new(),
@@ -398,16 +400,11 @@ fn lint_undeclared_analyzers(catalog: &Catalog) -> Vec<QueryLintFinding> {
     findings
 }
 
-/// The rewrites lint names (docs/rfcs/2026-11-07-gq-3.md, section 5):
-///
-/// - `L203`: `count { P } > 0`, which `queries fmt` writes `exists { P }`;
-/// - `L204` and `L205`: `count { P } >= 1` and `count { P } = 0`, with the
-///   rows of `exists { P }` and `not exists { P }` but another typed IR, so
-///   the formatter does not apply them;
-/// - `L206`: a `search`, `match_text` or `fuzzy` call over a field whose
-///   index declares an analyzer, which is the `match_terms` call
-///   `queries fmt` writes there.
-fn lint_rewrites(catalog: &Catalog, query_source: &str) -> Vec<QueryLintFinding> {
+/// The non-canonical forms of every declaration of the source
+/// (docs/rfcs/2026-11-07-gq-3.md, section 6), each with its canonical form
+/// as the fix: `L203` and `L206` to `L211` keep the typed IR, `L204` and
+/// `L205` only the rows.
+fn lint_canonical_forms(query_source: &str) -> Vec<QueryLintFinding> {
     use crate::query::syntax::{Body, Decl};
     let Ok(file) = crate::query::syntax::parse::parse_source(query_source) else {
         return Vec::new();
@@ -417,78 +414,36 @@ fn lint_rewrites(catalog: &Catalog, query_source: &str) -> Vec<QueryLintFinding>
         Body::Explain { before, decl } => before.iter().chain([decl.as_ref()]).collect(),
         Body::Statement(_) => Vec::new(),
     };
-    let finding = |code: &str, message: String, decl: &str| QueryLintFinding {
-        severity: QueryLintSeverity::Info,
-        code: code.to_string(),
-        message,
-        type_name: None,
-        property: None,
-        query_names: vec![decl.to_string()],
-    };
-    let (_, rewrites) = crate::query::fmt::lexical_rewrites(catalog, &file);
     let mut findings = Vec::new();
     for decl in decls {
-        for (at, operator, bound) in count_comparisons(decl) {
-            let position = format!("line {}, column {}", at.line, at.column);
-            let (code, message) = match (operator, bound) {
-                (CompOp::Gt, 0) => (
-                    L203_CODE,
-                    format!(
-                        "{position}: `count {{ … }} > 0` is `exists {{ … }}`, the same typed IR; `queries fmt` writes it"
-                    ),
-                ),
-                (CompOp::Ge, 1) => (
-                    L204_CODE,
-                    format!(
-                        "{position}: `count {{ … }} >= 1` has the rows of `exists {{ … }}`, which says it directly"
-                    ),
-                ),
-                (CompOp::Eq, 0) => (
-                    L205_CODE,
-                    format!(
-                        "{position}: `count {{ … }} = 0` has the rows of `not exists {{ … }}`, which says it directly"
-                    ),
-                ),
-                _ => continue,
+        for form in crate::query::canonical::canonical_forms(decl) {
+            let position = form
+                .position
+                .map(|at| format!("line {}, column {}: ", at.line, at.column))
+                .unwrap_or_default();
+            let message = if form.same_ir {
+                format!(
+                    "{position}`{}` is `{}`, the same typed IR",
+                    form.written, form.fix
+                )
+            } else {
+                format!(
+                    "{position}`{}` has the rows of `{}`, which says it directly",
+                    form.written, form.fix
+                )
             };
-            findings.push(finding(code, message, &decl.name));
-        }
-        for rewrite in rewrites.iter().filter(|r| r.decl == decl.name) {
-            findings.push(finding(
-            L206_CODE,
-            format!(
-                "`{}` is `{}` over a field whose index declares an analyzer; `queries fmt --schema` writes it",
-                rewrite.from, rewrite.to
-            ),
-            &rewrite.decl,
-            ));
+            findings.push(QueryLintFinding {
+                severity: QueryLintSeverity::Info,
+                code: form.code.to_string(),
+                message,
+                fix: Some(form.fix),
+                type_name: None,
+                property: None,
+                query_names: vec![decl.name.clone()],
+            });
         }
     }
     findings
-}
-
-/// Every `count { P } <op> <integer>` of `decl`, a block count with no
-/// argument compared with an integer literal: where it was written, the
-/// operator and the integer.
-fn count_comparisons(
-    decl: &crate::query::syntax::Decl,
-) -> Vec<(crate::query::diagnostic::Position, CompOp, i128)> {
-    use crate::query::syntax::{BlockFunc, Expr};
-    use crate::query::value::{AggFunc, Literal};
-    let mut out = Vec::new();
-    crate::query::fmt::visit_decl_exprs(decl, &mut |e| {
-        if let Expr::Compare {
-            op, left, right, ..
-        } = e
-            && let (Expr::Block(b), Expr::Literal(Literal::Integer(n))) =
-                (left.as_ref(), right.as_ref())
-            && b.func == BlockFunc::Agg(AggFunc::Count)
-            && b.arg.is_none()
-        {
-            out.push((b.at.position, *op, *n));
-        }
-    });
-    out
 }
 
 /// Whether `property` carries a written one-column `@index`, beyond the

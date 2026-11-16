@@ -755,14 +755,13 @@ const FORMS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The formatter's list (section 6): each pair is (non-canonical form,
-/// canonical form), the rewrite `queries fmt` performs without changing the
-/// typed IR. The five collisions of the clause-list surface (a property map
+/// Lint's list of canonical forms (section 6): each pair is (non-canonical
+/// form, canonical form), with the same typed IR. The five collisions of the clause-list surface (a property map
 /// beside its equality, `not { }` beside `not exists { }`, a top-level `and`
 /// beside two filter clauses, a filter's position among the clauses, and
 /// `return` items with and without commas) are spellings the grammar no
 /// longer has.
-const FORMATTER: &[(&str, &str)] = &[
+const CANONICAL_FORMS: &[(&str, &str)] = &[
     ("count_gt_0", "exists"),
     ("union_nested", "union_flat"),
     ("alternation_reordered", "alternation"),
@@ -780,17 +779,17 @@ const FORMATTER: &[(&str, &str)] = &[
 ];
 
 /// Lint's rows-equal rewrites (section 5): equal rows, because a count is a
-/// non-negative integer, but a different typed IR, so `fmt` does not apply
-/// them.
+/// non-negative integer, but a different typed IR, so they are the author's
+/// choice rather than canonical forms.
 const LINT_ONLY: &[(&str, &str)] = &[("count_ge_1", "exists"), ("count_eq_0", "not_exists")];
 
 /// A6's one standing exception: a literal and a reference to the same value.
 const LITERAL_AND_REFERENCE: &[(&str, &str)] = &[("let_rel_then_from", "from_inline")];
 
-/// The canonical form `fmt` writes for `id`.
+/// The canonical form lint names for `id`.
 fn canonical(id: &str) -> &str {
     let mut id = id;
-    while let Some((_, to)) = FORMATTER
+    while let Some((_, to)) = CANONICAL_FORMS
         .iter()
         .chain(LITERAL_AND_REFERENCE)
         .find(|(from, _)| *from == id)
@@ -800,12 +799,67 @@ fn canonical(id: &str) -> &str {
     id
 }
 
+/// Lint names each non-canonical form of the list with its canonical form as
+/// the fix, and each rows-equal rewrite with its own code; it names nothing
+/// on a canonical spelling. The fix lowers to the canonical form's term.
 #[test]
-fn two_forms_share_a_term_only_when_the_formatter_names_one() {
+fn lint_names_each_non_canonical_form_with_its_canonical_fix() {
+    use crate::query::lint::{QueryLintSchemaSource, lint_query_file};
+    let source = |id: &str| FORMS.iter().find(|(i, _)| *i == id).unwrap().1;
+    let named = |src: &str| -> Vec<(String, String)> {
+        lint_query_file(
+            &catalog(),
+            src,
+            "/tmp/q.gq",
+            QueryLintSchemaSource::file("/tmp/s.pg"),
+        )
+        .findings
+        .into_iter()
+        .filter_map(|f| f.fix.map(|fix| (f.code, fix)))
+        .collect()
+    };
+    for (from, to) in CANONICAL_FORMS.iter().chain(LINT_ONLY) {
+        if from.ends_with("_declared") || from.starts_with("fuzzy_") {
+            continue;
+        }
+        let found = named(source(from));
+        assert_eq!(found.len(), 1, "{from}: {found:?}");
+        let (_, fix) = &found[0];
+        let rewritten = source(from).replace(
+            &found_written(source(from), &found[0].0),
+            fix,
+        );
+        assert_eq!(lower(&rewritten), lower(source(to)), "{from} -> {rewritten}");
+        assert_eq!(named(source(to)), Vec::new(), "{to}");
+    }
+}
+
+/// The text of `src` the finding `code` names: the construct its fix
+/// replaces, as written.
+fn found_written(src: &str, code: &str) -> String {
+    use crate::query::lint::{QueryLintSchemaSource, lint_query_file};
+    let finding = lint_query_file(
+        &catalog(),
+        src,
+        "/tmp/q.gq",
+        QueryLintSchemaSource::file("/tmp/s.pg"),
+    )
+    .findings
+    .into_iter()
+    .find(|f| f.code == code)
+    .unwrap();
+    let message = finding.message;
+    let start = message.find('`').unwrap() + 1;
+    let end = start + message[start..].find("` ").unwrap();
+    message[start..end].to_string()
+}
+
+#[test]
+fn two_forms_share_a_term_only_when_lint_names_one_canonical() {
     let lowered: Vec<(&str, CoreDecl)> = FORMS.iter().map(|(id, src)| (*id, lower(src))).collect();
     let term = |id: &str| &lowered.iter().find(|(i, _)| *i == id).unwrap().1;
-    // Every collision is two spellings the formatter writes one way (or A6's
-    // literal and reference); a new one fails here.
+    // Every collision is two spellings lint's list of canonical forms names
+    // (or A6's literal and reference); a new one fails here.
     let mut unlisted = BTreeSet::new();
     for (i, (a, ta)) in lowered.iter().enumerate() {
         for (b, tb) in &lowered[..i] {
@@ -815,9 +869,9 @@ fn two_forms_share_a_term_only_when_the_formatter_names_one() {
         }
     }
     assert_eq!(unlisted, BTreeSet::new(), "collisions no list names");
-    // Every formatter row is a collision: the formatter never changes the
-    // typed IR.
-    for (from, to) in FORMATTER.iter().chain(LITERAL_AND_REFERENCE) {
+    // Every canonical form is a collision: its fix never changes the typed
+    // IR.
+    for (from, to) in CANONICAL_FORMS.iter().chain(LITERAL_AND_REFERENCE) {
         assert_eq!(term(from), term(to), "{from} -> {to}");
     }
     // Lint's rows are not: they change the IR, which is why they are lint's.

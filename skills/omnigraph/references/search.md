@@ -268,9 +268,7 @@ the same rows and none is refused with `full_text_index_required`.
 `match_terms($d.f, terms($q, mode: all | any, max_edits: 0..=2))` matches a
 query term to a stored term within the budget (one edit per inserted, deleted
 or substituted character; a swap costs two); `search` and `match_text` mean
-`mode: any`, and `fuzzy` adds its budget (2 when unwritten), the same typed
-query, which `queries fmt --schema` writes as `match_terms` and `lint` names
-(`L206`); write `match_terms` in new text. `bm25` there is
+`mode: any`, and `fuzzy` adds its budget (2 when unwritten). `bm25` there is
 `bm25_v1`, an `F64` scored against the whole field (every entity with a
 non-empty value, before filters), so a filter never changes a surviving
 row's score; the plan shows a `Score` node, not a ranked scan. `rrf` with such

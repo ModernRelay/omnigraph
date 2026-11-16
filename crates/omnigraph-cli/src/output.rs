@@ -2511,6 +2511,7 @@ mod tests {
                 severity,
                 code: "L000".to_string(),
                 message: message.to_string(),
+                fix: None,
                 type_name: None,
                 property: None,
                 query_names: Vec::new(),

@@ -121,9 +121,6 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
             command: QueriesCommand::List { .. },
         } => RootOrServedGraph,
         Command::Queries {
-            command: QueriesCommand::Fmt { .. },
-        } => Local,
-        Command::Queries {
             command: QueriesCommand::Validate { .. },
         }
         | Command::Policy { .. } => Root,
@@ -657,7 +654,6 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Queries { command } => match command {
             QueriesCommand::Validate { .. } => "queries validate",
             QueriesCommand::List { .. } => "queries list",
-            QueriesCommand::Fmt { .. } => "queries fmt",
         },
         Command::Snapshot(_) => "snapshot",
         Command::Export(_) => "export",

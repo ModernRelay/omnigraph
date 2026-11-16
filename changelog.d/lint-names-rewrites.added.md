@@ -1,1 +1,3 @@
-- `lint` names count-block rewrites (`L203`–`L205`) and the `match_terms` spelling of `search`, `match_text` and `fuzzy` on an analyzer field (`L206`).
+- `lint` names every canonical form with its fix (`L203`, `L206` to `L211`) and the rows-equal count rewrites (`L204`, `L205`). See [lint][lint].
+
+[lint]: ../docs/user/queries/lint.md

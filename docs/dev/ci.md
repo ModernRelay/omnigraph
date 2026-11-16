@@ -58,10 +58,8 @@ case arming a seam turns the guard red where the PR can see it. The fixture
 parity test in `crates/omnigraph-bench/src/branch_merge.rs` also reads
 `generated_branch_merge_dataset.gqt` from the corpus. `GQT (ordinary)` runs
 it with the other benchmark unit tests on `run_gqt`, including cases-only
-changes, while `Test Workspace` covers it on engine input. The formatter's
-repository proof in `crates/omnigraph-compiler/src/query/fmt_tests.rs` formats
-every corpus query; `GQT (ordinary)` runs it on `run_gqt` and `Test Workspace`
-on engine input. No crate reads a deployment file. `scripts/check-change-classes.py` keeps the
+changes, while `Test Workspace` covers it on engine input. No crate reads a deployment
+file. `scripts/check-change-classes.py` keeps the
 literal-spelling half of this true: it replays the classifier over fixture
 diffs and fails when a string literal in a Rust or TOML file under `crates/`
 or `tools/` spells a class path (root-relative or `../`-relative) without the

@@ -58,7 +58,7 @@ pub use query::diagnostic::{
     Applicability, Extra, Position, QueryCode, QueryDiagnostic, QueryDiagnosticKind, RelatedSpan,
     Stage, Suggestion, TextEdit,
 };
-pub use query::fmt::{Formatted, format_source};
+
 pub use query::lint::{
     QueryLintFinding, QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult,
     QueryLintSchemaSource, QueryLintSchemaSourceKind, QueryLintSeverity, QueryLintStatus,

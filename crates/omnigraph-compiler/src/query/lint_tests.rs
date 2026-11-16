@@ -721,23 +721,18 @@ note: String @index(fulltext, scorer = "none")
     assert_eq!(output.status, QueryLintStatus::Ok);
 }
 
-/// The rewrites lint names (docs/rfcs/2026-11-07-gq-3.md, section 5): `L203`
-/// for `count { } > 0`, which `queries fmt` writes `exists`; `L204` and
-/// `L205` for the rows-equal `count { } >= 1` and `count { } = 0`, which the
-/// formatter leaves because they change the typed IR; `L206` for an older
-/// lexical call over a field whose index declares an analyzer, and none over
-/// a field that keeps edition 2's analysis, where `L202` names the profile.
+/// The count-block rewrites lint names (docs/rfcs/2026-11-07-gq-3.md,
+/// sections 5 and 6), each at the block's position and with its fix: `L203`
+/// for `count { } > 0`, a canonical form whose fix keeps the typed IR, and
+/// `L204` and `L205` for the rows-equal `count { } >= 1` and
+/// `count { } = 0`, whose fix changes the IR. A count compared with another
+/// bound draws none. Findings about queries keep source order.
 #[test]
-fn l203_to_l206_name_the_rewrites_of_count_blocks_and_the_older_lexical_calls() {
+fn l203_to_l205_name_the_count_block_rewrites_with_their_fixes() {
     let output = lint_query_file(
         &catalog(
             r#"
 node Person { name: String @key }
-node Doc {
-slug: String @key
-title: String @index(fulltext, analyzer = "english_v1")
-body: String @index(fulltext)
-}
 edge Knows: Person -> Person
 "#,
         ),
@@ -756,11 +751,6 @@ query none() {
   where count { $q: Person, $p knows $q } = 0 and count { $q: Person, $q knows $p } > 1
   return { $p.name }
 }
-query lexical($s: String) {
-  match { $d: Doc }
-  where fuzzy($d.title, $s) and search($d.body, $s)
-  return { $d.slug }
-}
 "#,
         "/tmp/queries.gq",
         QueryLintSchemaSource::file("/tmp/schema.pg"),
@@ -768,8 +758,14 @@ query lexical($s: String) {
     let findings = output
         .findings
         .iter()
-        .filter(|f| f.code != "L202")
-        .map(|f| (f.code.as_str(), f.query_names.join(","), f.message.as_str()))
+        .map(|f| {
+            (
+                f.code.as_str(),
+                f.query_names.join(","),
+                f.message.as_str(),
+                f.fix.as_deref(),
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         findings,
@@ -777,22 +773,20 @@ query lexical($s: String) {
             (
                 "L203",
                 "some".to_string(),
-                "line 3, column 9: `count { … } > 0` is `exists { … }`, the same typed IR; `queries fmt` writes it",
+                "line 3, column 9: `count { $q: Person, $p knows $q } > 0` is `exists { $q: Person, $p knows $q }`, the same typed IR",
+                Some("exists { $q: Person, $p knows $q }"),
             ),
             (
                 "L204",
                 "at_least_one".to_string(),
-                "line 8, column 9: `count { … } >= 1` has the rows of `exists { … }`, which says it directly",
+                "line 8, column 9: `count { $q: Person, $p knows $q } >= 1` has the rows of `exists { $q: Person, $p knows $q }`, which says it directly",
+                Some("exists { $q: Person, $p knows $q }"),
             ),
             (
                 "L205",
                 "none".to_string(),
-                "line 13, column 9: `count { … } = 0` has the rows of `not exists { … }`, which says it directly",
-            ),
-            (
-                "L206",
-                "lexical".to_string(),
-                "`fuzzy($d.title, $s)` is `match_terms($d.title, terms($s, mode: any, max_edits: 2))` over a field whose index declares an analyzer; `queries fmt --schema` writes it",
+                "line 13, column 9: `count { $q: Person, $p knows $q } = 0` has the rows of `not exists { $q: Person, $p knows $q }`, which says it directly",
+                Some("not exists { $q: Person, $p knows $q }"),
             ),
         ]
     );

@@ -216,15 +216,6 @@ jobs:
           RUSTFLAGS: ""
         run: cargo test -p omnigraph-seams --locked --timings --test failpoint_names_guard
 
-      # The formatter's repository proof formats every query of the case
-      # corpus and requires its typed IR unchanged, so a cases-only diff can
-      # change its verdict while `Test Workspace` is skipped.
-      - name: Format every query the case corpus holds
-        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'ordinary'
-        env:
-          RUSTFLAGS: ""
-        run: cargo test -p omnigraph-compiler --locked --timings --lib query::fmt::tests::formatting_the_repository_keeps_every_typed_ir_and_is_idempotent -- --exact
-
       # The workspace .cargo/config.toml enables the seeded Tokio runtime
       # from any directory; these steps run from the repo root.
       - name: Run complete GQ logic tests with DST

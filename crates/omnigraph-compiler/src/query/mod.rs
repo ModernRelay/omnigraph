@@ -1,10 +1,10 @@
+mod canonical;
 pub mod check;
 pub mod codes;
 pub mod depth;
 pub mod descriptor;
 pub mod diagnostic;
 pub mod file;
-pub mod fmt;
 pub mod lint;
 pub mod parser;
 pub mod syntax;

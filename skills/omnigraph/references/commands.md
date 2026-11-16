@@ -48,7 +48,7 @@ prints the exact flags of the installed binary.
 | `index` | `build` `rebuild` | Build a branch's missing or lagging indexes; replace its full-text indexes |
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
-| `queries` | `validate` `list` `fmt` | Check a cluster's stored queries; list a cluster's or a served graph's; format `.gq` files |
+| `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
 | `organization` | `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
@@ -403,25 +403,6 @@ managed target selects with `--graph` or its `default_graph`; there `--json` pri
 `GET /graphs/{graph_id}/queries`.
 Distinct from `lint`, which validates authoring source. See
 [`stored-queries.md`](stored-queries.md).
-
-```bash
-omnigraph queries fmt queries/                    # rewrite every .gq file in place
-omnigraph queries fmt --check queries/            # write nothing; exit 1 if one would change
-omnigraph queries fmt < draft.gq                  # stdin to stdout
-omnigraph queries fmt --schema schema.pg queries/ # also search/match_text/fuzzy -> match_terms
-```
-
-`fmt` is local: no target or credential. It never changes a query's typed
-meaning: `count { P } > 0` becomes `exists { P }`, a `union` nested first is
-flattened, `<e>` ends and alternation members are sorted, `asc` and an alias
-equal to its column name are dropped, options take the registry's order
-without defaults, `bm25` over `terms(q, mode: any)` takes the String. With
-`--schema`, `search`, `match_text` and `fuzzy` over a field whose index
-declares an analyzer become `match_terms(f, terms(q, mode: any[, max_edits:
-n]))`. A short `match` stays on one line, a long one takes an element per
-line with a trailing comma. A declaration with a comment inside it is kept
-as written. `--json` reports `status`, `changed`, `errors` and each file;
-see [formatting](../../../docs/user/queries/formatting.md).
 
 ## Operator Config & Credentials
 

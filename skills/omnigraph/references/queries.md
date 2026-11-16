@@ -39,7 +39,7 @@ Lint returns:
 - `"status": "ok"` — all queries passed
 - `"errors": N` — count of type errors (exit 1 when nonzero)
 - `"warnings": N` — count of `L201` warnings (a nullable property that no update query sets)
-- `"infos": N` — `L202` (declare an analyzer profile), `L203` (`count { } > 0`, which `queries fmt` writes `exists`), `L204`/`L205` (`count { } >= 1` / `= 0`: write `exists` / `not exists`), `L206` (`search`/`match_text`/`fuzzy` over an analyzer field: the `match_terms` call)
+- `"infos": N` — `L202` (declare an analyzer profile) and the canonical forms, each finding with its `fix`: `L203` (`count { } > 0` → `exists`), `L206` (nested `union` → flat), `L207` (`<e>` ends and alternation members in name order), `L208` (drop `asc`), `L209` (drop an alias equal to its column), `L210` (options in registry order, defaults dropped), `L211` (`bm25` over `terms(q, mode: any)` → the String); `L204`/`L205` (`count { } >= 1` / `= 0`: same rows as `exists` / `not exists`, your choice). Write the canonical form
 
 Run lint after every `.gq` or `.pg` edit. Wire into precommit.
 

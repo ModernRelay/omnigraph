@@ -960,9 +960,9 @@ pub(crate) enum OptionDefault {
 }
 
 /// The options of each registry row that takes options, in the registry's
-/// order, with the default each takes when it is omitted: the order
-/// `queries fmt` writes, dropping an option equal to its default
-/// (section 6).
+/// order, with the default each takes when it is omitted: lint's canonical
+/// form of a call writes its options in this order and drops an option
+/// equal to its default (`L210`, section 6).
 pub(crate) const REGISTRY_OPTIONS: &[(&str, &[(&str, OptionDefault)])] = &[
     (
         "nearest",
@@ -2828,8 +2828,8 @@ impl Ctx<'_> {
         }
         // `<e>` matches either direction, so its ends are read in one order,
         // the smaller written name first, whichever end is bound: the typed
-        // term never depends on the order they were written in, which is
-        // the order `queries fmt` writes (section 6).
+        // term never depends on the order they were written in; lint names
+        // the other order (`L207`, section 6).
         if t.undirected && written.dst < written.src {
             std::mem::swap(&mut t.src, &mut t.dst);
         }
@@ -7570,4 +7570,4 @@ mod traversal;
 pub use scalar::{SExpr, SKind, Terms};
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;
