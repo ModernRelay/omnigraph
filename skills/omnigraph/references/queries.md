@@ -417,9 +417,11 @@ then `and`, then `not`); comparisons do not chain. A comparison with a null
 operand is null and a filter keeps only true rows, so `not ($p.age > 30)`
 skips null ages; add `or $p.age is null` to keep them. GQ has no `null`
 literal: `$p.x = null` is a parse error. On a list property, `in` tests
-membership (`"rust" in $p.tags`). A float literal is `F64` even when whole:
-`$p.n = 9007199254740992.0` compares an `I64` as `F64`, where integers above
-2^53 round together; write the integer literal to compare exactly. A bare name is not a value (`Q018`): write
+membership (`"rust" in $p.tags`). Beside an integer property a float
+literal is `F64` even when whole (beside an `F32` property it takes `F32` when
+exactly representable): `$p.n = 9007199254740992.0` compares an `I64` as `F64`,
+where integers above 2^53 round together; write the integer literal to compare
+exactly. A bare name is not a value (`Q018`): write
 `$p.name`, `$name` or `"name"`.
 
 Both String predicates are functions, exact and case-sensitive:

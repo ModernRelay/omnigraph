@@ -105,7 +105,7 @@ query within($q: Vector(4), $r: F64) {
 }
 ```
 
-`distance` is not an `rrf` arm in this release (`T86`).
+`distance` is not lowered as an `rrf` arm (`T86`).
 
 Vectors are ranked by the field's declared distance, `l2`, `cosine` or `dot`
 ([Vector distances](distances.md)); `cosine` refuses a zero vector, stored or

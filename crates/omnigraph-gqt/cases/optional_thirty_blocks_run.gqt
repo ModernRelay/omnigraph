@@ -2,8 +2,7 @@
 # notes: Thirty `optional` blocks in one read type, plan and run: the core
 # notes: writes the elements before an `optional` once (`Correlate(R, Union(p,
 # notes: Project(Filter(Env, ¬ exists p), nulls)))`), so the term grows by the
-# notes: same number of nodes with each block. The earlier form wrote them
-# notes: twice, and eight blocks were over the plan budget.
+# notes: same number of nodes with each block, never doubling it.
 
 --- runner
 timeout_ms: 10000

@@ -122,7 +122,7 @@ table's physical row count before each scan, even for a selective neighborhood;
 see the setting for the cost and batching rules.
 
 Each `$_` is a distinct anonymous node: two anonymous traversals from one
-variable are independent, so a source with two neighbours matches two by two
+variable are independent, so a source with two neighbors matches two by two
 rows. Binding a variable a second time (`$p: Person` after `$p` is already
 bound, at the top level or inside `not exists { }`) constrains the same rows;
 it never introduces a second `$p`, so `not exists { $p: Person where $p.name =
@@ -216,7 +216,7 @@ query employers() {
 
 A traversal written after the optional may start from a name it introduces;
 a row where that name is null has no match there. Returning a node the
-optional introduces whole, `return { $c }`, is not lowered in this release
+optional introduces whole, `return { $c }`, is not lowered
 (`T86`). It prints no fix: returning the node's properties instead runs, but
 with other result columns.
 
@@ -276,7 +276,7 @@ query friends_and_oldest() {
 ```
 
 A ranking (`nearest`, `bm25`, `rrf`, `distance`) inside such a read is not
-run in this release (`T86`).
+lowered (`T86`).
 
 `from union(a, b, …)` joins the bag union of its arms, each an inline read:
 every row of every arm, duplicates kept (`return distinct` removes them). The

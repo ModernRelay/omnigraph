@@ -1,5 +1,5 @@
 # issue: none
-# notes: Every form the planner lowers since the reference interpreter was written, each over
+# notes: Every form the planner lowers beyond the core operators, each over
 # notes: rows that stress its rule (a null, a parallel edge, a self-loop, a duplicate, a tie),
 # notes: compared with the reference interpreter: `optional`, `union` (positional names, an
 # notes: arm's own cut, an outer name), a call bound in the caller's scope, a `let` that `if`

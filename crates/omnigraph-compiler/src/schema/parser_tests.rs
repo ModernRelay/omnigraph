@@ -1937,8 +1937,8 @@ fn full_text_index_refuses_unknown_options_profiles_scorers_and_types() {
 }
 
 /// `@index(fulltext)` after a property is that property's index; on a type
-/// that also declares a property named `fulltext` the text once read as a
-/// body-level index on it, so it is refused instead of changing meaning.
+/// that also declares a property named `fulltext` the text also reads as a
+/// body-level index on it, so it is refused instead of read either way.
 #[test]
 fn full_text_index_after_a_property_is_refused_beside_a_property_named_fulltext() {
     let error = parse_schema("node Doc { fulltext: String\n body: String @index(fulltext) }")

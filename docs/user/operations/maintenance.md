@@ -63,7 +63,7 @@ Optimize runs beside live writers: a write that lands on a table while its
 compaction is staged fails the run with a read-set conflict, and the next run
 re-plans from the new state. A write prepared before an optimize published goes
 ahead, or prepares again once, holding writes off, if it changes a row the run
-moved; none reports a conflict for it. Lance compacts neighbouring fragments only when the
+moved; none reports a conflict for it. Lance compacts neighboring fragments only when the
 same indexes cover them, so a table whose index coverage was uneven before a run
 may coalesce fully only on the next run, after the rebuilt coverage is in place.
 
@@ -121,8 +121,8 @@ keep their indexes, and a branch with nothing to do publishes nothing. The
 default branch is `main`. As with optimize, a write that lands on a table while
 its batch is staged fails the run with a read-set conflict; run it again. Vector
 properties with no vectors yet and full-text coverage stay pending: only `index
-rebuild --kind full-text` refreshes full-text coverage, and queries match
-uncovered rows with the index's analyzer meanwhile.
+rebuild --kind full-text` refreshes full-text coverage. No query reads that
+coverage: matching and ranking read the rows with the field's profile.
 
 JSON reports `branch`, `graph_commit_id` (null for a no-op), `indexes` with each
 `type_key`, `property` (the indexed column, `__id` for the identity index),

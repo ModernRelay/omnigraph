@@ -1,4 +1,4 @@
-//! Engine v2 behaviour that differs from the frozen engine v1 by design.
+//! Engine behavior a query runs by design: the v2 plan nodes and their operators.
 
 use arrow_array::{Array, Int64Array};
 use serial_test::serial;

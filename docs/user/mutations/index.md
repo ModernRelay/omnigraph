@@ -323,9 +323,9 @@ run written by its own writer, and the files are published in input order, so
 the table's files are the ones a single writer would have produced. It is also
 the most streams that parse the overwrite's source: each parse partition owns
 an equal byte range of the source, reads it in 8 MiB pieces and cuts its
-records on record ends, neighbouring partitions meet at one record end, and
+records on record ends, neighboring partitions meet at one record end, and
 the validation puts the slices back in source order, so the rows and their
-order are those of a single parser. A boundary the neighbours cannot agree on
+order are those of a single parser. A boundary the neighbors cannot agree on
 (inside a quoted field, or after an empty line) refuses that run, and the
 same plan reruns as one partition. Delete staging remains serial. This affects
 preparation only—one request still publishes exactly one graph commit.

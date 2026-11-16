@@ -2799,8 +2799,6 @@ fn keyword_filter(k: &Pair<Rule>) -> Option<Refusal> {
     Some(refusal_note(input, Q018, message, span, note))
 }
 
-/// Cypher's `… WITH x, agg AS n …`: the elements before it become an inline
-/// read whose `return` is the `with` items, drawn with `from`.
 /// `$a knows*{1,3} $b` drops the star; `$a knows* $b` has no bounds to keep,
 /// so its note shows a range.
 fn star_range(input: &str, triple: &Pair<Rule>) -> Refusal {
@@ -2829,6 +2827,8 @@ fn star_range(input: &str, triple: &Pair<Rule>) -> Refusal {
     }
 }
 
+/// Cypher's `… WITH x, agg AS n …`: the elements before it become an inline
+/// read whose `return` is the `with` items, drawn with `from`.
 fn with_clause(input: &str, before: &[Pair<Rule>], with: &Pair<Rule>) -> Refusal {
     let items: Vec<&str> = with
         .clone()

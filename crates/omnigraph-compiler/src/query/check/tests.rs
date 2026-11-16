@@ -750,9 +750,8 @@ fn optional_served() {
 
 /// `optional { p }` writes the elements before it once,
 /// `Correlate(R, Union(p, Project(Filter(Env, ¬ exists p), nulls)))`, so a
-/// run of optionals grows the term by the same number of nodes each; the
-/// earlier form wrote `R` twice and doubled the term with each one, and a
-/// read held at most seven.
+/// run of optionals grows the term by the same number of nodes each, never
+/// doubling it.
 #[test]
 fn a_run_of_optionals_grows_the_term_linearly() {
     let read = |n: usize| {

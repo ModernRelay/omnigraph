@@ -559,7 +559,7 @@ Design for both halves of retrieval.
   omission.
 - **Precision**: specific edge types and filterable properties (time, status,
   source kind, confidence) let an agent take exactly the part of a
-  neighbourhood it needs; a generic `RelatedTo` edge or a hub node returns
+  neighborhood it needs; a generic `RelatedTo` edge or a hub node returns
   everything and therefore nothing. Make retrievable units the size of an
   answer (a claim, a segment), not a whole document.
 - **Together**: traverse to scope the candidate set completely, then rank

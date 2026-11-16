@@ -9,7 +9,7 @@
 # notes: carry the row address. Steps 7-9 insert d12 on a branch and read the
 # notes: top two there: d12 from the fragment the branch wrote, d11 from the one
 # notes: it shares with main, both in the table's own base. Every rows step on
-# notes: main is compared with engine v1.
+# notes: main is compared with the reference interpreter.
 
 --- runner
 timeout_ms: 10000

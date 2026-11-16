@@ -86,7 +86,7 @@ also have a single-property shorthand.
 | `@key(p, ...)` | node or edge | The property tuple identifies the entity; its id is derived from it. Key properties must be non-null scalar values. An edge key must include both `@src` and `@dst`, and a key may be declared only when the type is created. |
 | `@unique(p, ...)` | node or edge | No two entities may share the property tuple. Edge constraints may include `@src` and `@dst`. |
 | `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness. |
-| `@index(fulltext, analyzer = "…", scorer = "…")` | a node's String property | Declares the property's full-text index with its analyzer profile (`standard_v1`, `standard_folded_v1` or `english_v1`) and scorer (`bm25_v1`, the default, or `none`). Without `analyzer` it keeps the default analysis earlier releases used. See [Analyzers and scorers](../search/analyzers.md). |
+| `@index(fulltext, analyzer = "…", scorer = "…")` | a node's String property | Declares the property's full-text index with its analyzer profile (`standard_v1`, `standard_folded_v1` or `english_v1`) and scorer (`bm25_v1`, the default, or `none`). Without `analyzer` it takes `english_v1`. See [Full-text analyzers](../search/analyzers.md). |
 | `@range(p, min..max)` | node | Restricts a numeric property, or each element of a numeric list, to an inclusive range; either bound may be omitted. Values compare with the bounds exactly at any magnitude, and a decimal bound on an integer property admits the integers on its side: `@range(n, -2.5..2.5)` admits -2 through 2. |
 | `@check(p, "regex")` | node | Requires a String property to match the expression. |
 | `@card(min..max)` | edge | Bounds how many edges of the type start at each source node; omit `max` for an unbounded range, as in `@card(1..)`. The default is unbounded from zero. See [Edge cardinality](#edge-cardinality). |
@@ -236,7 +236,7 @@ A changed full-text analyzer replaces the property's index in the same
 publication with one built for the new analysis; `omnigraph index build`
 builds its postings; matching and ranking read the rows with the new analysis
 whatever the index's state (see
-[Analyzers and scorers](../search/analyzers.md)). A changed vector distance
+[Full-text analyzers](../search/analyzers.md)). A changed vector distance
 writes no table: the index built for the old distance is no longer used, reads
 answer from the exact scan, and `omnigraph index build` replaces the index (see
 [Vector distances](../search/distances.md#changing-a-distance)).

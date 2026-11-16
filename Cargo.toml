@@ -75,6 +75,9 @@ lance-table = "=13.0.0"
 lance-tokenizer = "=13.0.0"
 frostem = { version = "=1.20260821.3", default-features = false }
 stop-words = { version = "=0.10.0", default-features = false }
+# The exact lexical scan's NFC (every profile normalizes before it tokenizes):
+# a change to its Unicode data changes which values match and their scores,
+# so it needs the same audit as the analyzer pins above.
 unicode-normalization = "=0.1.25"
 # `bm25_v1` computes its IDF with this `log1p` (docs/rfcs/2026-11-07-gq-3.md,
 # section 4); a change moves scores in their last bits and needs review.

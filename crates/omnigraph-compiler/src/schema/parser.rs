@@ -1212,7 +1212,7 @@ fn validate_property_annotations(
 
 /// `@index(fulltext)` after a property is that property's full-text index.
 /// On a type that also declares a property named `fulltext`, the same text
-/// once read as a body-level index on that property, so it is refused rather
+/// also reads as a body-level index on that property, so it is refused rather
 /// than read either way: the fix is `@index` on the property it means.
 fn refuse_ambiguous_full_text_index(type_name: &str, properties: &[PropDecl]) -> Result<()> {
     if !properties

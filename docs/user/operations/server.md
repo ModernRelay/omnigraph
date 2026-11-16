@@ -110,7 +110,7 @@ every action to every token, reads included: bearer tokens are not scoped to
 graphs, so a permit there would reach every graph that lacks a policy. Apply a
 [graph policy](policy.md) to each graph a token should reach. Setting
 `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` in the server's environment restores
-the earlier behaviour, in which every static token may `read` every graph
+the earlier behavior, in which every static token may `read` every graph
 without a policy; the server logs a warning at startup when it is set.
 
 ### Assert the actor

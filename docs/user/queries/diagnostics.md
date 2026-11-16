@@ -135,7 +135,7 @@ expected format instead, without an edit.
 
 - **CLI, human formats** (`table`, `kv`, `csv`): the form above on stderr,
   then `HTTP 400` when served and the `disposition` line, exit status 1, with no
-  colour codes and no backtrace footer.
+  color codes and no backtrace footer.
 - **CLI, machine formats**: `--json` and `--format json` print the API's error
   body pretty with its `disposition`, `--format jsonl` prints it as one line, and
   `--format toon` prints that same body as TOON. All of them go on stdout with

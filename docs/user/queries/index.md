@@ -69,9 +69,9 @@ expression is true, so `not ($p.age > 30)` skips rows whose `age` is null.
 
 Numeric comparisons choose their types before execution: an integer literal
 takes the property's type when it fits, a float literal an `F32` property's
-when exactly representable, else both use a common numeric type. A float
-literal is `F64` even when whole, so `9007199254740993` equals
-`9007199254740992.0`. Parameters use their declared type. An `F32` property
+when exactly representable, else both use a common numeric type. Beside an
+integer property a float literal is `F64` even when whole: an `I64` holding
+`9007199254740993` equals the literal `9007199254740992.0`. Parameters use their declared type. An `F32` property
 storing `0.1` differs from the literal `0.1`; `0.5` compares exactly. These
 rules hold for list membership and a write's filters, in a scan or in memory.
 Mixed signed and `U64` values keep integer precision. A literal outside its
@@ -199,8 +199,8 @@ by its `from`'s `as` (`T85`). Each gives one column named by its alias or
 expression (`$p.name` gives `p.name`; a score drawn `as $s` gives `s`); duplicates are
 refused (`T25`).
 
-Integer `sum` accumulates exactly in 128 bits and rounds once to `F64`; `avg`
-uses a floating-point accumulator. `min` and `max` accept numeric, `String`,
+Integer `sum` accumulates exactly in 128 bits and rounds once to `F64`, integer
+`avg` divides that total once, and a float `sum` or `avg` uses `F64`. `min` and `max` accept numeric, `String`,
 `Bool`, `Date`, or `DateTime` columns and keep their type (false before true,
 dates chronologically). With no matches, an aggregate-only return gives one row
 (`count` 0, the rest null); a return that also projects a group value gives no rows.
@@ -247,7 +247,7 @@ score, including through traversals, ranking the binding the ranking names
 whichever binding its population declares first
 ([details](../search/index.md#ranking-a-traversal-reached-binding)). A
 `nearest` window `k` and the `limit` are separate values. `limit` takes an integer literal or parameter, `limit $k`, bound to a non-negative count when the read runs. A ranking written as a call in `order` or `return` is refused (`T65`); a search
-predicate in `return` is not lowered in this release (`T86`).
+predicate in `return` is not lowered (`T86`).
 
 For aggregate or DISTINCT returns, the ranking selects the input population;
 it does not order the output, and its score is not an order key (`T42`); with

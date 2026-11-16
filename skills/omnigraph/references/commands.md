@@ -359,8 +359,8 @@ writers, preserve a verified whole-store backup, and rebuild every live branch
 that needs search when moving from uncertified pre-Lance-11 indexes. Certified
 Lance 11 indexes remain compatible under Lance 13 and need no rebuild solely
 for that dependency change. Do not mix fleets across an incompatible analyzer
-transition. Rebuilds use default English analysis, replacing custom tokenizer
-settings; JSON `warnings` reports this for actual work. Check the selected
+transition. Rebuilds use each property's analyzer profile (`english_v1` where
+none is declared), replacing custom tokenizer settings; JSON `warnings` reports this for actual work. Check the selected
 `branch`, `graph_commit_id`, and `rebuilt_indexes`; an empty list/null commit is
 a no-op, not a migration of other branches or historical snapshots. `--as` is
 actor attribution and does not install server policy on direct access.
