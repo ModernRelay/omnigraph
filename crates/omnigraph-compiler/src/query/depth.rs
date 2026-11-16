@@ -39,6 +39,23 @@ pub const MAX_QUERY_EXPRESSION_DEPTH: usize = 256;
 /// sixty terms.
 pub const QUERY_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
+/// Run `f` on a thread with [`QUERY_THREAD_STACK_BYTES`] of stack and return
+/// its result, a panic in it resumed on the caller. A binary's `main` runs
+/// its runtime's `block_on` through this: the future `block_on` drives runs
+/// on the calling thread, whose stack the runtime's `thread_stack_size` does
+/// not set, and a CLI compiles its query there.
+pub fn on_query_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let spawned = std::thread::Builder::new()
+        .name("omnigraph-main".into())
+        .stack_size(QUERY_THREAD_STACK_BYTES)
+        .spawn(f);
+    let handle =
+        spawned.unwrap_or_else(|error| panic!("the query thread could not be spawned: {error}"));
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 #[derive(Default)]
 struct Level {
     /// The prefix-operator run directly before this level's opening bracket.
@@ -355,6 +372,32 @@ mod tests {
         );
         let siblings = filter(&vec!["not $p.age > 1"; 100].join("\n"));
         assert_eq!(depth(&siblings).0, base.0 + 1);
+    }
+
+    /// A source at the bounds compiles on the stack [`on_query_stack`]
+    /// gives, from a caller whose own stack is far smaller, as a binary's
+    /// main thread can be.
+    #[test]
+    fn a_source_at_the_bounds_compiles_on_the_query_stack() {
+        let source = filter(&format!(
+            "{} or {}",
+            nested(MAX_QUERY_NESTING - 8),
+            vec!["$p.age > 1"; 180].join(" or ")
+        ));
+        assert!(check_query_nesting(&source).is_ok());
+        let parsed = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                on_query_stack(move || {
+                    crate::query::syntax::parse::parse_source_all(&source)
+                        .1
+                        .is_empty()
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(parsed);
     }
 
     #[test]

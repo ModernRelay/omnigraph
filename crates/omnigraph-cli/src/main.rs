@@ -17,7 +17,13 @@ fn main() -> Result<std::process::ExitCode> {
         .display_env_section(false)
         .display_location_section(false)
         .install()?;
-    let code = match runtime.block_on(omnigraph_cli::app::run_from(std::env::args_os())) {
+    // The future `block_on` drives runs on the calling thread: it gets the
+    // query stack too, since the CLI compiles its query there.
+    let (runtime, outcome) = omnigraph_compiler::query::depth::on_query_stack(move || {
+        let outcome = runtime.block_on(omnigraph_cli::app::run_from(std::env::args_os()));
+        (runtime, outcome)
+    });
+    let code = match outcome {
         Ok(completion) => completion.code(),
         Err(error) => {
             // Reported as returning it from `main` would, but with the exit
