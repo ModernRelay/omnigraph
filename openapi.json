@@ -17028,7 +17028,7 @@
           },
           "read_work_limit": {
             "type": "integer",
-            "description": "how much work one read may do: the rows its expansions and joins produce, the pairs a product forms, the neighbors a hop range examines, every traversal together, and the tokens and term comparisons of its exact lexical scans; exhaustion fails the read with an error naming it, never a partial result",
+            "description": "how much work one read may do: the results its expansions and joins produce, the pairs a product forms, the neighbors a hop range examines, every traversal together, and the tokens and term comparisons of its exact lexical scans; exhaustion fails the read with an error naming it, never a partial result",
             "maximum": 9223372036854775807,
             "minimum": 1
           },

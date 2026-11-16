@@ -191,7 +191,7 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = traversal_work_limit_schema)]
     pub traversal_work_limit: Option<i64>,
-    /// `read_work_limit`: how much work one read may do, the rows its
+    /// `read_work_limit`: how much work one read may do, the results its
     /// expansions and joins produce, the pairs a product forms, the
     /// neighbors a hop range examines and the tokens and term comparisons
     /// of its exact lexical scans, at least `1`; an `i64` like
