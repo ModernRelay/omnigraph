@@ -111,12 +111,12 @@ const B_IN_PROGRESS: &[InProgress] = &[
     InProgress {
         construct: "a full-text call read as a value",
         site: "a full-text call read as a value in `return`",
-        text: "query q($s: String) { match { $d: Doc } return { $d.title, search($d.body, $s) as hit } }",
+        text: "query q($s: String) { match { $d: Doc } return { $d.title, match_terms($d.body, terms($s, mode: any)) as hit } }",
     },
     InProgress {
         construct: "a full-text call as an order key",
         site: "a full-text call read as a value in `order`",
-        text: "query q($s: String) { match { $d: Doc } return { $d.title } order { search($d.body, $s) } }",
+        text: "query q($s: String) { match { $d: Doc } return { $d.title } order { match_terms($d.body, terms($s, mode: any)) } }",
     },
     // `ReadShape`: rankings and fusion.
     InProgress {
@@ -205,7 +205,7 @@ const B_IN_PROGRESS: &[InProgress] = &[
     InProgress {
         construct: "a full-text call in a block's aggregate",
         site: "a full-text call read as a value in a block's aggregate",
-        text: "query q($s: String) { match { $p: Person } where sum(if(search($d.body, $s), 1, 0)) { $d: Doc, $p authored $d } > 0 return { $p.name } }",
+        text: "query q($s: String) { match { $p: Person } where sum(if(match_terms($d.body, terms($s, mode: any)), 1, 0)) { $d: Doc, $p authored $d } > 0 return { $p.name } }",
     },
     // `WriteShape`.
     InProgress {
@@ -465,11 +465,11 @@ const CLOSURE: &[Row] = &[
             // `not` and `or`, compared with a value, inside `coalesce`, in a
             // filter over two bindings and in a block's `where`.
             (
-                "query q($s: String) { match { $d: Doc, $p: Person, $p authored $d } where not search($d.body, $s) or $p.age > 30 or fuzzy($d.body, $s, max_edits: 1) = false or not coalesce(match_text($d.body, $s), false) return { $d.title } }",
+                "query q($s: String) { match { $d: Doc, $p: Person, $p authored $d } where not match_terms($d.body, terms($s, mode: any)) or $p.age > 30 or match_terms($d.body, terms($s, mode: any, max_edits: 1)) = false or not coalesce(match_terms($d.body, terms($s, mode: any)), false) return { $d.title } }",
                 Lowers,
             ),
             (
-                "query q($s: String) { match { $p: Person } where not exists { $d: Doc, $p authored $d where not search($d.body, $s) } return { $p.name } }",
+                "query q($s: String) { match { $p: Person } where not exists { $d: Doc, $p authored $d where not match_terms($d.body, terms($s, mode: any)) } return { $p.name } }",
                 Lowers,
             ),
             // `match_terms` is the same operand, with every term required or
@@ -489,7 +489,7 @@ const CLOSURE: &[Row] = &[
             ),
             // "a full-text call read as a value"
             (
-                "query q($s: String) { match { $d: Doc } return { $d.title, search($d.body, $s) as hit } }",
+                "query q($s: String) { match { $d: Doc } return { $d.title, match_terms($d.body, terms($s, mode: any)) as hit } }",
                 Refused("B"),
             ),
         ],
@@ -864,7 +864,7 @@ fn t86_is_at_the_construct() {
     // A block whose aggregate reads a full-text call is refused at the
     // block.
     let d = refused(
-        "query q($s: String) { match { $p: Person } where sum(if(search($d.body, $s), 1, 0)) { $d: Doc, $p authored $d } > 0 return { $p.name } }",
+        "query q($s: String) { match { $p: Person } where sum(if(match_terms($d.body, terms($s, mode: any)), 1, 0)) { $d: Doc, $p authored $d } > 0 return { $p.name } }",
     );
     assert_eq!(d.position.map(|p| p.column), Some(50), "{d}");
     // A write group whose selection reads a table an earlier group changes

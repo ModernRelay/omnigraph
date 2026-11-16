@@ -31,7 +31,7 @@ node Doc {
 --- query
 query hits_standard($q: String) {
     match { $d: Doc }
-    where search($d.standard, $q)
+    where match_terms($d.standard, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -47,7 +47,7 @@ d.slug: String
 --- query
 query hits_folded($q: String) {
     match { $d: Doc }
-    where search($d.folded, $q)
+    where match_terms($d.folded, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -63,7 +63,7 @@ d.slug: String
 --- query
 query hits_english($q: String) {
     match { $d: Doc }
-    where search($d.english, $q)
+    where match_terms($d.english, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -79,7 +79,7 @@ d.slug: String
 --- query
 query hits_legacy($q: String) {
     match { $d: Doc }
-    where search($d.legacy, $q)
+    where match_terms($d.legacy, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -95,7 +95,7 @@ d.slug: String
 --- query
 query hits_standard($q: String) {
     match { $d: Doc }
-    where search($d.standard, $q)
+    where match_terms($d.standard, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -110,7 +110,7 @@ d.slug: String
 --- query
 query hits_folded($q: String) {
     match { $d: Doc }
-    where search($d.folded, $q)
+    where match_terms($d.folded, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -125,7 +125,7 @@ d.slug: String
 --- query
 query hits_english($q: String) {
     match { $d: Doc }
-    where search($d.english, $q)
+    where match_terms($d.english, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -141,7 +141,7 @@ d.slug: String
 --- query
 query hits_legacy($q: String) {
     match { $d: Doc }
-    where search($d.legacy, $q)
+    where match_terms($d.legacy, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -157,7 +157,7 @@ d.slug: String
 --- query
 query hits_standard($q: String) {
     match { $d: Doc }
-    where search($d.standard, $q)
+    where match_terms($d.standard, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -172,7 +172,7 @@ d.slug: String
 --- query
 query hits_folded($q: String) {
     match { $d: Doc }
-    where search($d.folded, $q)
+    where match_terms($d.folded, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -188,7 +188,7 @@ d.slug: String
 --- query
 query hits_english($q: String) {
     match { $d: Doc }
-    where search($d.english, $q)
+    where match_terms($d.english, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -204,7 +204,7 @@ d.slug: String
 --- query
 query hits_legacy($q: String) {
     match { $d: Doc }
-    where search($d.legacy, $q)
+    where match_terms($d.legacy, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -220,7 +220,7 @@ d.slug: String
 --- query
 query hits_standard($q: String) {
     match { $d: Doc }
-    where search($d.standard, $q)
+    where match_terms($d.standard, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -236,7 +236,7 @@ d.slug: String
 --- query
 query hits_folded($q: String) {
     match { $d: Doc }
-    where search($d.folded, $q)
+    where match_terms($d.folded, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -252,7 +252,7 @@ d.slug: String
 --- query
 query hits_english($q: String) {
     match { $d: Doc }
-    where search($d.english, $q)
+    where match_terms($d.english, terms($q, mode: any))
     return { $d.slug }
 }
 
@@ -268,7 +268,7 @@ d.slug: String
 --- query
 query hits_legacy($q: String) {
     match { $d: Doc }
-    where search($d.legacy, $q)
+    where match_terms($d.legacy, terms($q, mode: any))
     return { $d.slug }
 }
 

@@ -39,7 +39,7 @@ edge Wrote: Person -> Doc
 --- query
 query not_searched() {
     match { $d: Doc }
-    where not search($d.title, "graph")
+    where not match_terms($d.title, terms("graph", mode: any))
     return { $d.slug }
 }
 
@@ -55,7 +55,7 @@ d.slug: String
 --- query
 query searched_or_old() {
     match { $d: Doc }
-    where search($d.title, "graph") or $d.year < 2000
+    where match_terms($d.title, terms("graph", mode: any)) or $d.year < 2000
     return { $d.slug }
 }
 
@@ -72,7 +72,7 @@ d.slug: String
 --- query
 query searched_compared_with_false() {
     match { $d: Doc }
-    where search($d.title, "graph") = false
+    where match_terms($d.title, terms("graph", mode: any)) = false
     return { $d.slug }
 }
 
@@ -88,7 +88,7 @@ d.slug: String
 --- query
 query not_matched_text() {
     match { $d: Doc }
-    where not match_text($d.title, "engines")
+    where not match_terms($d.title, terms("engines", mode: any))
     return { $d.slug }
 }
 
@@ -105,7 +105,7 @@ d.slug: String
 --- query
 query fuzzed() {
     match { $d: Doc }
-    where fuzzy($d.title, "grph", max_edits: 1)
+    where match_terms($d.title, terms("grph", mode: any, max_edits: 1))
     return { $d.slug }
 }
 
@@ -121,7 +121,7 @@ d.slug: String
 --- query
 query not_fuzzed() {
     match { $d: Doc }
-    where not fuzzy($d.title, "grph", max_edits: 1)
+    where not match_terms($d.title, terms("grph", mode: any, max_edits: 1))
     return { $d.slug }
 }
 
@@ -137,7 +137,7 @@ d.slug: String
 --- query
 query not_coalesced() {
     match { $d: Doc }
-    where not coalesce(search($d.title, "graph"), false)
+    where not coalesce(match_terms($d.title, terms("graph", mode: any)), false)
     return { $d.slug }
 }
 
@@ -153,7 +153,7 @@ d.slug: String
 --- query
 query searched_or_another_binding() {
     match { $p: Person, $d: Doc, $p wrote $d }
-    where search($d.title, "graph") or $p.name = "bob"
+    where match_terms($d.title, terms("graph", mode: any)) or $p.name = "bob"
     return { $p.name, $d.slug }
 }
 
@@ -170,7 +170,7 @@ d.slug: String
 --- query
 query wrote_nothing_else() {
     match { $p: Person }
-    where not exists { $d: Doc, $p wrote $d where not search($d.title, "graph") }
+    where not exists { $d: Doc, $p wrote $d where not match_terms($d.title, terms("graph", mode: any)) }
     return { $p.name }
 }
 
@@ -195,7 +195,7 @@ query twins() {
 --- query
 query not_searched_after_insert() {
     match { $d: Doc }
-    where not search($d.title, "graph")
+    where not match_terms($d.title, terms("graph", mode: any))
     return { $d.slug }
 }
 
@@ -213,7 +213,7 @@ d.slug: String
 --- query
 query searched_or_old_after_insert() {
     match { $d: Doc }
-    where search($d.title, "graph") or $d.year < 2000
+    where match_terms($d.title, terms("graph", mode: any)) or $d.year < 2000
     return { $d.slug }
 }
 
@@ -232,7 +232,7 @@ d.slug: String
 --- query
 query not_matched_text_after_insert() {
     match { $d: Doc }
-    where not match_text($d.title, "engines")
+    where not match_terms($d.title, terms("engines", mode: any))
     return { $d.slug }
 }
 
@@ -250,7 +250,7 @@ d.slug: String
 
 --- mutate
 query backdate_unsearched() {
-    match { $d: Doc } where not search($d.title, "graph") and $d.year < 2000
+    match { $d: Doc } where not match_terms($d.title, terms("graph", mode: any)) and $d.year < 2000
     update $d set { year: 1990 }
 }
 

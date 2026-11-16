@@ -176,7 +176,7 @@ fused: F64
 --- query
 query search_projected($q: String) {
     match { $p: Person }
-    return { $p.name, search($p.bio, $q) as hit }
+    return { $p.name, match_terms($p.bio, terms($q, mode: any)) as hit }
 }
 
 --- params

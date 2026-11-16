@@ -1548,7 +1548,7 @@ fn membership_admits_the_fragment_and_nothing_else() {
         "query q() { match { $d: Doc } return { $d } }",
         "query q() { match { $d: Doc } return { $d.@id } }",
         "query q() { match { $d: Doc } return { $d.slug } order { $d.score } }",
-        "query q() { match { $d: Doc } where search($d.title, \"g\") return { $d.slug } }",
+        "query q() { match { $d: Doc } where match_terms($d.title, terms(\"g\", mode: any)) return { $d.slug } }",
         "query q($v: Vector(2)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 2) as $distance } return { $d.slug } order { $distance } limit 2 }",
         "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60) as $score, $d: Doc } return { $d.slug } order { $score desc } limit 2 }",
     ];
@@ -1802,18 +1802,18 @@ fn a_distinct_return_sorts_its_groups() {
 fn a_full_text_call_needs_a_recorded_index_segment() {
     use crate::source::FullTextCoverage;
     let search = r#"query q($q: String) {
-    match { $d: Doc } where search($d.title, $q)
+    match { $d: Doc } where match_terms($d.title, terms($q, mode: any))
     return { $d.slug }
 }"#;
     let inherited = r#"query q($q: String) {
-    match { $d: Doc } where not exists { $x: Doc, $d cites $x where search($d.title, $q) }
+    match { $d: Doc } where not exists { $x: Doc, $d cites $x where match_terms($d.title, terms($q, mode: any)) }
     return { $d.slug }
 }"#;
     let nested = r#"query q($q: String) {
     match { $p: Doc }
     where not exists {
         $d: Doc, $p cites $d
-        where not exists { $x: Doc, $d cites $x where search($d.title, $q) }
+        where not exists { $x: Doc, $d cites $x where match_terms($d.title, terms($q, mode: any)) }
     }
     return { $p.slug }
 }"#;
@@ -1863,8 +1863,8 @@ fn a_full_text_call_needs_a_recorded_index_segment() {
     );
     let query = r#"query q($q: String) {
     match { $p: Doc }
-    where not exists { $d: Doc, $p cites $d where search($d.title, $q) }
-      and not exists { $d: Note, $p annotates $d where search($d.title, $q) }
+    where not exists { $d: Doc, $p cites $d where match_terms($d.title, terms($q, mode: any)) }
+      and not exists { $d: Note, $p annotates $d where match_terms($d.title, terms($q, mode: any)) }
     return { $p.slug }
 }"#;
     let mut fixture =

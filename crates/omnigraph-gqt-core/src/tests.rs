@@ -1492,7 +1492,7 @@ fn accepts_empty_expect_body_as_empty_result_assertion() {
 #[test]
 fn search_construct_sets_the_index_decision() {
     let schema = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Doc {\n    slug: String @key\n    text: String @index\n}\n";
-    let query = "--- query\nquery q($q: String) {\n    match { $d: Doc }\n    where search($d.text, $q)\n    return { $d.slug }\n}\n";
+    let query = "--- query\nquery q($q: String) {\n    match { $d: Doc }\n    where match_terms($d.text, terms($q, mode: any))\n    return { $d.slug }\n}\n";
     let text = format!(
         "{HDR}{schema}--- seed\n{query}--- params\n{{\"q\": \"needle\"}}\n--- expect unordered\n--- expect shape\nd.slug: String\n"
     );
@@ -2900,7 +2900,7 @@ async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
 
 #[test]
 fn refuses_ordered_expect_with_an_aggregate_in_return() {
-    let query = "--- query\nquery q($t: String) {\n    match { let $pop = { match { $p: Person }\n        where search($p.name, $t) return { $p } }, from bm25($pop, $p.name, $t) as $score }\n    \
+    let query = "--- query\nquery q($t: String) {\n    match { let $pop = { match { $p: Person }\n        where match_terms($p.name, terms($t, mode: any)) return { $p } }, from bm25($pop, $p.name, $t) as $score }\n    \
                  return { count($p) as total }\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
     assert!(refusal("x", &text).contains("order` clause"));

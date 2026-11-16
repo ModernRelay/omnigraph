@@ -51,7 +51,7 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 const RANKED_JOIN_QUERY: &str = r#"
 query recall_join($q: String) {
     match {
-      let $pop = { match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } where search($c.text, $q) return { $c, $a } },
+      let $pop = { match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } where match_terms($c.text, terms($q, mode: any)) return { $c, $a } },
       from bm25($pop, $c.text, $q) as $score,
     }
     return { $c.slug, $a.slug, $a.name }
@@ -61,7 +61,7 @@ query recall_join($q: String) {
 
 query recall_no_join($q: String) {
     match {
-      let $pop = { match { $c: Chunk } where search($c.text, $q) return { $c } },
+      let $pop = { match { $c: Chunk } where match_terms($c.text, terms($q, mode: any)) return { $c } },
       from bm25($pop, $c.text, $q) as $score,
     }
     return { $c.slug }

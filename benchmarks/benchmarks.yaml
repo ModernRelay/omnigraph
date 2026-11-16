@@ -541,7 +541,7 @@ scenarios:
             $a: Artifact,
             $c chunkOfArtifact $a,
           }
-          where search($c.text, $q1)
+          where match_terms($c.text, terms($q1, mode: any))
           return { $c.slug }
           order { $score desc }
           limit 1
@@ -672,7 +672,7 @@ scenarios:
     text: |
       --- query
       query destination_search() {
-          match { $p: Person, $p knows $q } where search($q.body, "needle")
+          match { $p: Person, $p knows $q } where match_terms($q.body, terms("needle", mode: any))
           return { $q.name }
       }
 - id: e2e-traversal-hop1

@@ -309,12 +309,12 @@ fn an_inner_scope_binds_a_name_new_to_it_and_reads_an_outer_one() {
     // only re-mentions the binding to search it is that search, negated. A
     // full-text call is never null, so no `coalesce` is needed.
     repaired(
-        "query q($s: String) { match { $d: Doc } where not exists { $d: Doc where search($d.body, $s) } return { $d } }",
+        "query q($s: String) { match { $d: Doc } where not exists { $d: Doc where match_terms($d.body, terms($s, mode: any)) } return { $d } }",
         "T68",
-        "query q($s: String) { match { $d: Doc } where not (search($d.body, $s)) return { $d } }",
+        "query q($s: String) { match { $d: Doc } where not (match_terms($d.body, terms($s, mode: any))) return { $d } }",
     );
     ok(
-        "query q($s: String) { match { $d: Doc } where not search($d.body, $s) or $d.year > 1 return { $d } }",
+        "query q($s: String) { match { $d: Doc } where not match_terms($d.body, terms($s, mode: any)) or $d.year > 1 return { $d } }",
     );
     // An inline read may not rebind an outer name.
     refused(
@@ -635,7 +635,7 @@ fn a_ranking_over_an_unranked_full_text_field_and_no_query_analyzer() {
         }
         // Matching on the same field is admitted.
         let src = format!(
-            "query q($s: String) {{ match {{ $d: Doc }} where match_terms($d.{field}, terms($s)) and search($d.{field}, $s) return {{ $d.slug }} }}"
+            "query q($s: String) {{ match {{ $d: Doc }} where match_terms($d.{field}, terms($s)) and match_terms($d.{field}, terms($s, mode: any)) return {{ $d.slug }} }}"
         );
         assert!(first(&src).is_none(), "{src}");
     }
@@ -1608,6 +1608,44 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
   return { $p.name }
 }"#,
         r#"query q() { match { $p: Person } where starts_with($p.name, "A") return { $p.name } }"#,
+    ),
+    // `search`, `match_text` and `fuzzy` are not registry rows; each fix is
+    // the `match_terms` call with its membership.
+    (
+        r#"search"#,
+        "T6",
+        r#"query q($s: String) {
+  match { $d: Doc } where search($d.body, $s)
+  return { $d.title }
+}"#,
+        r#"query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any)) return { $d.title } }"#,
+    ),
+    (
+        r#"match_text"#,
+        "T6",
+        r#"query q($s: String) {
+  match { $d: Doc } where not match_text($d.body, $s)
+  return { $d.title }
+}"#,
+        r#"query q($s: String) { match { $d: Doc } where not match_terms($d.body, terms($s, mode: any)) return { $d.title } }"#,
+    ),
+    (
+        r#"fuzzy without a budget"#,
+        "T6",
+        r#"query q($s: String) {
+  match { $d: Doc } where fuzzy($d.body, $s)
+  return { $d.title }
+}"#,
+        r#"query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 2)) return { $d.title } }"#,
+    ),
+    (
+        r#"fuzzy with a budget"#,
+        "T6",
+        r#"query q($s: String) {
+  match { $d: Doc } where fuzzy($d.body, $s, max_edits: 1)
+  return { $d.title }
+}"#,
+        r#"query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 1)) return { $d.title } }"#,
     ),
     (
         r#"an unknown annotation"#,

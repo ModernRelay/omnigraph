@@ -512,6 +512,10 @@ pub struct Call {
     pub name: String,
     pub args: Vec<Arg>,
     pub options: Vec<(String, Expr)>,
+    /// Where the call was written, from its name to its closing parenthesis:
+    /// where a fix that replaces the whole call writes. No part of tree
+    /// equality.
+    pub at: SourceSpan,
 }
 
 #[derive(Debug, Clone, PartialEq)]

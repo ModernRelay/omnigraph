@@ -52,7 +52,7 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 set engine = v2;
 query recall($q: String) {
     match {
-      let $pop = { match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } where search($c.text, $q) return { $c, $a } },
+      let $pop = { match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } where match_terms($c.text, terms($q, mode: any)) return { $c, $a } },
       from bm25($pop, $c.text, $q) as $score,
     }
     return { $c.slug, $a.slug }

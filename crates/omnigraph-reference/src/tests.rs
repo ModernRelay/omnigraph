@@ -637,7 +637,7 @@ fn lexical_predicates_match_any_term_and_a_null_document_never() {
     // `search` is any-term: d1 holds `graph`, d2 and d3 `hay`.
     assert_eq!(
         sorted(rows(
-            "query q() { match { $d: Doc } where search($d.text, \"graph hay\") return { $d.slug } }"
+            "query q() { match { $d: Doc } where match_terms($d.text, terms(\"graph hay\", mode: any)) return { $d.slug } }"
         )),
         vec![
             json!({"d.slug": "d1"}),
@@ -649,20 +649,20 @@ fn lexical_predicates_match_any_term_and_a_null_document_never() {
     // d2 and d3.
     assert_eq!(
         sorted(rows(
-            "query q() { match { $d: Doc } where not search($d.title, \"graphs\") return { $d.slug } }"
+            "query q() { match { $d: Doc } where not match_terms($d.title, terms(\"graphs\", mode: any)) return { $d.slug } }"
         )),
         vec![json!({"d.slug": "d2"}), json!({"d.slug": "d3"})]
     );
     // One edit reaches `needle`; none does not.
     assert_eq!(
         sorted(rows(
-            "query q() { match { $d: Doc } where fuzzy($d.text, \"neadle\", max_edits: 1) return { $d.slug } }"
+            "query q() { match { $d: Doc } where match_terms($d.text, terms(\"neadle\", mode: any, max_edits: 1)) return { $d.slug } }"
         )),
         vec![json!({"d.slug": "d1"}), json!({"d.slug": "d2"})]
     );
     assert_eq!(
         rows(
-            "query q() { match { $d: Doc } where fuzzy($d.text, \"neadle\", max_edits: 0) return { $d.slug } }"
+            "query q() { match { $d: Doc } where match_terms($d.text, terms(\"neadle\", mode: any)) return { $d.slug } }"
         ),
         Vec::<Json>::new()
     );

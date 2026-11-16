@@ -3425,7 +3425,7 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
         let db = &db;
         async move {
             let source = format!(
-                "query docs($q: String) {{ match {{ $d: Doc }} where search($d.{column}, $q) return {{ $d.slug }} }}"
+                "query docs($q: String) {{ match {{ $d: Doc }} where match_terms($d.{column}, terms($q, mode: any)) return {{ $d.slug }} }}"
             );
             first_column_sorted(
                 &query_main(db, &source, "docs", &params(&[("q", "deep")]))
@@ -3528,7 +3528,7 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
         let db = &db;
         async move {
             let source = format!(
-                "query docs($q: String) {{ match {{ $d: Doc }} where search($d.{column}, $q) return {{ $d.slug }} }}"
+                "query docs($q: String) {{ match {{ $d: Doc }} where match_terms($d.{column}, terms($q, mode: any)) return {{ $d.slug }} }}"
             );
             first_column_sorted(
                 &query_main(db, &source, "docs", &params(&[("q", term)]))

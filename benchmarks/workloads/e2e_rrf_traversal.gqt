@@ -16,7 +16,7 @@ query recall_two_terms($q1: String, $q2: String) {
       $a: Artifact,
       $c chunkOfArtifact $a,
     }
-    where search($c.text, $q1)
+    where match_terms($c.text, terms($q1, mode: any))
     return { $c.slug }
     order { $score desc }
     limit 1
@@ -46,7 +46,7 @@ query recall_two_terms($q1: String, $q2: String) {
       $a: Artifact,
       $c chunkOfArtifact $a,
     }
-    where search($c.text, $q1)
+    where match_terms($c.text, terms($q1, mode: any))
     return { $c.slug }
     order { $score desc }
     limit 1

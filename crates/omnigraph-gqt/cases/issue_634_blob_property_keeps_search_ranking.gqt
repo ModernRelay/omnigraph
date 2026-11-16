@@ -24,7 +24,7 @@ node Chunk {
 --- query
 query ranked($q: String) {
     match {
-      let $pop = { match { $c: Chunk } where search($c.text, $q) return { $c } },
+      let $pop = { match { $c: Chunk } where match_terms($c.text, terms($q, mode: any)) return { $c } },
       from bm25($pop, $c.text, $q) as $score,
     }
     return { $c.slug }

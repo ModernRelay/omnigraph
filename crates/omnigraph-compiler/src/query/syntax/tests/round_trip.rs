@@ -184,6 +184,7 @@ fn call(depth: u32) -> BoxedStrategy<Call> {
             name,
             args,
             options,
+            at: SourceSpan::default(),
         })
         .boxed()
 }

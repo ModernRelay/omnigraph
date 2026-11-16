@@ -245,23 +245,6 @@ fn call_to_ir(func: &str, args: &[SExpr], options: &[(String, SExpr)], ty: ExprT
                 ty,
             }
         }
-        "search" => {
-            let (field, query) = pair();
-            IRExpr::Search { field, query, ty }
-        }
-        "match_text" => {
-            let (field, query) = pair();
-            IRExpr::MatchText { field, query, ty }
-        }
-        "fuzzy" => {
-            let (field, query) = pair();
-            IRExpr::Fuzzy {
-                field,
-                query,
-                max_edits: option("max_edits").map(|e| Box::new(e.to_ir())),
-                ty,
-            }
-        }
         "now" => IRExpr::Param(NOW_PARAM_NAME.to_string(), ty),
         "match_terms" => {
             let mode = match option("mode").map(|e| &e.kind) {

@@ -28,7 +28,7 @@ query ranked($q: String) { match { let $pop = { match { $d: Doc } return { $d } 
 --- expect error: type error: T87:
 
 --- query
-query matched($q: String) { match { $d: Doc } where search($d.body, $q) return { $d.slug } }
+query matched($q: String) { match { $d: Doc } where match_terms($d.body, terms($q, mode: any)) return { $d.slug } }
 
 --- params
 {"q": "run"}

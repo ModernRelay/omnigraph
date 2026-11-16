@@ -109,7 +109,7 @@ d.slug: String
 
 --- query
 query q() {
-    match { $d: Doc } where not search($d.text, "graph vectors")
+    match { $d: Doc } where not match_terms($d.text, terms("graph vectors", mode: any))
     return { $d.slug }
 }
 

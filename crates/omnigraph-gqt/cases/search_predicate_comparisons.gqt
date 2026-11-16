@@ -23,7 +23,7 @@ node Doc {
 --- query
 set engine = v2;
 query compared_with_false() {
-    match { $d: Doc } where search($d.text, "needle") = false
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) = false
     return { $d.slug }
 }
 
@@ -38,7 +38,7 @@ d.slug: String
 --- query
 set engine = v2;
 query not_equal_to_true() {
-    match { $d: Doc } where search($d.text, "needle") != true
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) != true
     return { $d.slug }
 }
 
@@ -53,7 +53,7 @@ d.slug: String
 --- query
 set engine = v2;
 query less_than_true() {
-    match { $d: Doc } where search($d.text, "needle") < true
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) < true
     return { $d.slug }
 }
 
@@ -68,7 +68,7 @@ d.slug: String
 --- query
 set engine = v2;
 query compared_with_a_parameter($enabled: Bool) {
-    match { $d: Doc } where search($d.text, "needle") = $enabled
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) = $enabled
     return { $d.slug }
 }
 
@@ -86,7 +86,7 @@ d.slug: String
 --- query
 set engine = v2;
 query true_compared_with_it() {
-    match { $d: Doc } where true = search($d.text, "needle")
+    match { $d: Doc } where true = match_terms($d.text, terms("needle", mode: any))
     return { $d.slug }
 }
 
@@ -101,7 +101,7 @@ d.slug: String
 --- query
 set engine = v2;
 query match_text_compared_with_false() {
-    match { $d: Doc } where match_text($d.text, "needle") = false
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) = false
     return { $d.slug }
 }
 
@@ -116,7 +116,7 @@ d.slug: String
 --- query
 set engine = v2;
 query fuzzy_compared_with_false() {
-    match { $d: Doc } where fuzzy($d.text, "needle") = false
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any, max_edits: 2)) = false
     return { $d.slug }
 }
 
@@ -131,7 +131,7 @@ d.slug: String
 --- query
 set engine = v2;
 query accepted_joined_by_and() {
-    match { $d: Doc } where search($d.text, "needle") and $d.slug = "d"
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) and $d.slug = "d"
     return { $d.slug }
 }
 

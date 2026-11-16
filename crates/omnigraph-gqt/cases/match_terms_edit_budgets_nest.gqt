@@ -219,7 +219,7 @@ d.slug: String
 --- query
 query fuzzy_means_two_edits() {
     match { $d: Doc }
-    where fuzzy($d.title, "beta")
+    where match_terms($d.title, terms("beta", mode: any, max_edits: 2))
     return { $d.slug }
 }
 
@@ -237,7 +237,7 @@ d.slug: String
 --- query
 query fuzzy_with_its_budget() {
     match { $d: Doc }
-    where fuzzy($d.title, "beta", max_edits: 1)
+    where match_terms($d.title, terms("beta", mode: any, max_edits: 1))
     return { $d.slug }
 }
 
@@ -254,7 +254,7 @@ d.slug: String
 --- query
 query search_means_any_term() {
     match { $d: Doc }
-    where search($d.title, "abcd beta") or match_text($d.title, "crème")
+    where match_terms($d.title, terms("abcd beta", mode: any)) or match_terms($d.title, terms("crème", mode: any))
     return { $d.slug }
 }
 

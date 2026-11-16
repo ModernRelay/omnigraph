@@ -3467,6 +3467,8 @@ fn relation(pair: Pair<Rule>) -> R<RelExpr> {
 }
 
 fn call(pair: Pair<Rule>) -> R<Call> {
+    let span = pair.as_span();
+    let at = SourceSpan::of(span.get_input(), span.start(), span.end());
     let mut name = String::new();
     let mut args = Vec::new();
     let mut options = Vec::new();
@@ -3518,6 +3520,7 @@ fn call(pair: Pair<Rule>) -> R<Call> {
         name,
         args,
         options,
+        at,
     })
 }
 

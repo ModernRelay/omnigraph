@@ -160,7 +160,7 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 const UNDERFILL_AGG_QUERY: &str = r#"
 query recall_count($q: String) {
     match {
-      let $pop = { match { $c: Chunk } where search($c.text, $q) return { $c } },
+      let $pop = { match { $c: Chunk } where match_terms($c.text, terms($q, mode: any)) return { $c } },
       from bm25($pop, $c.text, $q) as $score,
     }
     return { count($c) as total }
@@ -176,7 +176,7 @@ query recall_rrf($q: String) {
       $c: Chunk,
       $c chunkOfArtifact $a,
     }
-    where search($c.text, $q)
+    where match_terms($c.text, terms($q, mode: any))
     return { $c.slug, $a.slug }
     order { $score desc }
     limit 2
@@ -2292,7 +2292,7 @@ async fn capped_bm25_matches_uncapped_prefix_on_partially_covered_index() {
     const PREFIX_QUERIES: &str = r#"
 query capped($q: String) {
     match {
-      let $pop = { match { $c: Chunk } where search($c.text, $q) return { $c } },
+      let $pop = { match { $c: Chunk } where match_terms($c.text, terms($q, mode: any)) return { $c } },
       from bm25($pop, $c.text, $q) as $score,
     }
     return { $c.slug }
@@ -2302,7 +2302,7 @@ query capped($q: String) {
 
 query uncapped_all($q: String) {
     match {
-      let $pop = { match { $c: Chunk } where search($c.text, $q) return { $c } },
+      let $pop = { match { $c: Chunk } where match_terms($c.text, terms($q, mode: any)) return { $c } },
       from bm25($pop, $c.text, $q) as $score,
     }
     return { $c.slug }
@@ -2780,11 +2780,11 @@ node Note {
 
 const ANALYZER_QUERIES: &str = r#"
 query docs($q: String) {
-    match { $d: Doc } where search($d.body, $q)
+    match { $d: Doc } where match_terms($d.body, terms($q, mode: any))
     return { $d.slug }
 }
 query notes($q: String) {
-    match { $n: Note } where search($n.body, $q)
+    match { $n: Note } where match_terms($n.body, terms($q, mode: any))
     return { $n.slug }
 }
 "#;

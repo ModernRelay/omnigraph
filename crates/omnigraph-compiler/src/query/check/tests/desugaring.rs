@@ -724,30 +724,8 @@ const FORMS: &[(&str, &str)] = &[
         "query f() { match { $p: Person } return { $p.age as a } }",
     ),
     (
-        "fuzzy_default",
-        "query f($s: String) { match { $d: Doc } where fuzzy($d.body, $s) return { $d } }",
-    ),
-    (
-        "fuzzy_two_edits",
-        "query f($s: String) { match { $d: Doc } where fuzzy($d.body, $s, max_edits: 2) return { $d } }",
-    ),
-    // Over a field whose index declares an analyzer the three older lexical
-    // calls are the `match_terms` they mean (section 4, Migration).
-    (
-        "search_declared",
-        "query f($s: String) { match { $n: Note } where search($n.text, $s) return { $n } }",
-    ),
-    (
-        "match_text_declared",
-        "query f($s: String) { match { $n: Note } where match_text($n.text, $s) return { $n } }",
-    ),
-    (
         "match_terms_any",
         "query f($s: String) { match { $n: Note } where match_terms($n.text, terms($s, mode: any)) return { $n } }",
-    ),
-    (
-        "fuzzy_declared",
-        "query f($s: String) { match { $n: Note } where fuzzy($n.text, $s) return { $n } }",
     ),
     (
         "match_terms_any_two_edits",
@@ -768,14 +746,10 @@ const CANONICAL_FORMS: &[(&str, &str)] = &[
     ("undirected_ends_swapped", "undirected"),
     ("undirected_both_bound_swapped", "undirected_both_bound"),
     ("undirected_alternation_swapped", "undirected_alternation"),
-    ("search_declared", "match_terms_any"),
-    ("match_text_declared", "match_terms_any"),
-    ("fuzzy_declared", "match_terms_any_two_edits"),
     ("order_asc", "order_default"),
     ("alias_same_name", "no_alias"),
     ("bm25_terms_any", "bm25_string"),
     ("rrf_k_60", "rrf_default_k"),
-    ("fuzzy_two_edits", "fuzzy_default"),
 ];
 
 /// Lint's rows-equal rewrites (section 5): equal rows, because a count is a
@@ -819,9 +793,6 @@ fn lint_names_each_non_canonical_form_with_its_canonical_fix() {
         .collect()
     };
     for (from, to) in CANONICAL_FORMS.iter().chain(LINT_ONLY) {
-        if from.ends_with("_declared") || from.starts_with("fuzzy_") {
-            continue;
-        }
         let found = named(source(from));
         assert_eq!(found.len(), 1, "{from}: {found:?}");
         let (_, fix) = &found[0];

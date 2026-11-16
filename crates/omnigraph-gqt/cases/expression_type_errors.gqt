@@ -84,7 +84,7 @@ query property_leaf_in_a_where() {
 
 --- mutate
 query search_in_a_mutation_where() {
-    match { $x: Person } where search($x.text, "hello")
+    match { $x: Person } where match_terms($x.text, terms("hello", mode: any))
     update $x set { adult: true }
 }
 

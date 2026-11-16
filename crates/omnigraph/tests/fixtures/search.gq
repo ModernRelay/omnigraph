@@ -1,18 +1,18 @@
 query text_search($q: String) {
     match { $d: Doc }
-    where search($d.title, $q)
+    where match_terms($d.title, terms($q, mode: any))
     return { $d.slug, $d.title }
 }
 
 query fuzzy_search($q: String) {
     match { $d: Doc }
-    where fuzzy($d.title, $q, max_edits: 2)
+    where match_terms($d.title, terms($q, mode: any, max_edits: 2))
     return { $d.slug, $d.title }
 }
 
 query phrase_search($q: String) {
     match { $d: Doc }
-    where match_text($d.body, $q)
+    where match_terms($d.body, terms($q, mode: any))
     return { $d.slug, $d.title }
 }
 

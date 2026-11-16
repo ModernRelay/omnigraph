@@ -48,7 +48,7 @@ edge Links: Source -> Doc
 set engine = v2;
 query open_needles() {
     match { $s: Source, $s links $d, $d: Doc }
-    where $d.state = "open" and search($d.body, "needle")
+    where $d.state = "open" and match_terms($d.body, terms("needle", mode: any))
     return { $s.slug, $d.slug }
 }
 --- expect unordered
@@ -70,7 +70,7 @@ pass access_path
 set engine = v2;
 query member_needles($states: [String]) {
     match { $s: Source, $s links $d }
-    where $d.state in $states and search($d.body, "needle")
+    where $d.state in $states and match_terms($d.body, terms("needle", mode: any))
     return { $s.slug, $d.slug }
 }
 --- params
@@ -119,8 +119,8 @@ set engine = v2;
 query open_needle_beacons() {
     match { $s: Source, $s links $d, $d: Doc }
     where $d.state = "open"
-      and search($d.body, "needle")
-      and match_text($d.summary, "beacon")
+      and match_terms($d.body, terms("needle", mode: any))
+      and match_terms($d.summary, terms("beacon", mode: any))
     return { $s.slug, $d.slug }
 }
 --- expect unordered
@@ -141,8 +141,8 @@ set engine = v2;
 query root_scan_two_searches() {
     match { $d: Doc }
     where $d.state = "open"
-      and search($d.body, "needle")
-      and match_text($d.summary, "beacon")
+      and match_terms($d.body, terms("needle", mode: any))
+      and match_terms($d.summary, terms("beacon", mode: any))
     return { $d.slug }
 }
 --- expect unordered

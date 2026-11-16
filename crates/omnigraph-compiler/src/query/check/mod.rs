@@ -414,6 +414,63 @@ fn infix_string(op: InfixStringOp, at: &SourceSpan, list: bool) -> QueryDiagnost
     diagnostic
 }
 
+/// `search`, `match_text` and `fuzzy`, which are not registry rows: each is
+/// refused with the `match_terms` call that keeps its any-term membership,
+/// `fuzzy`'s edit budget (two when unwritten) its `max_edits`
+/// (docs/rfcs/2026-11-07-gq-3.md, section 4, Migration). A call of two
+/// arguments, with no option but `fuzzy`'s `max_edits`, gets the fix as an
+/// edit over the call.
+fn removed_lexical_call(c: &Call) -> QueryDiagnostic {
+    use crate::query::syntax::print;
+    let name = c.name.as_str();
+    let budget = match c.options.as_slice() {
+        [] if name == "fuzzy" => Some(Some("2".to_string())),
+        [] => Some(None),
+        [(o, v)] if name == "fuzzy" && o == "max_edits" => Some(match v {
+            Expr::Literal(Literal::Integer(0)) => None,
+            v => Some(print::expr(v)),
+        }),
+        _ => None,
+    };
+    let operands = match c.args.as_slice() {
+        [Arg::Expr(field), Arg::Expr(query)] => Some((print::expr(field), print::expr(query))),
+        _ => None,
+    };
+    let message = format!(
+        "`{name}` is not a registry row; the lexical predicate is `match_terms(field, terms(text, mode: any{}))`",
+        if name == "fuzzy" {
+            ", max_edits: n"
+        } else {
+            ""
+        }
+    );
+    let (Some(budget), Some((field, query))) = (budget, operands) else {
+        return QueryDiagnostic::typecheck(T6, message).with_fix(format!(
+            "match_terms(<field>, terms(<text>, mode: any{}))",
+            if name == "fuzzy" { ", max_edits: 2" } else { "" }
+        ));
+    };
+    let replacement = match budget {
+        Some(n) => format!("match_terms({field}, terms({query}, mode: any, max_edits: {n}))"),
+        None => format!("match_terms({field}, terms({query}, mode: any))"),
+    };
+    let mut diagnostic = QueryDiagnostic::typecheck(T6, message)
+        .with_fix(replacement.clone())
+        .with_suggestion(Suggestion {
+            applicability: Applicability::MachineApplicable,
+            edits: vec![TextEdit {
+                start: c.at.start,
+                end: c.at.end,
+                replacement,
+            }],
+        });
+    if c.at.end > c.at.start {
+        diagnostic.position = Some(c.at.position);
+        diagnostic.end = Some(c.at.end_position);
+    }
+    diagnostic
+}
+
 /// The score column a ranking term appends: the term is a ranking, drawn
 /// directly or through a named relation.
 /// The name `T85`'s fix gives a ranking function's score.
@@ -935,9 +992,6 @@ const RELATION_ROWS: &[&str] = &["distance", "nearest", "bm25", "rrf", "union"];
 const SCALAR_ROWS: &[&str] = &[
     "contains",
     "starts_with",
-    "search",
-    "fuzzy",
-    "match_text",
     "match_terms",
     "terms",
     "now",
@@ -982,7 +1036,6 @@ pub(crate) const REGISTRY_OPTIONS: &[(&str, &[(&str, OptionDefault)])] = &[
             ("max_edits", OptionDefault::Integer(0)),
         ],
     ),
-    ("fuzzy", &[("max_edits", OptionDefault::Integer(2))]),
 ];
 
 /// Words a registry row may never be named (section 5).
@@ -5169,6 +5222,9 @@ impl Ctx<'_> {
                 format!("draw it with `from {name}(…)`, or aggregate over it in a block"),
             ));
         }
+        if matches!(name, "search" | "match_text" | "fuzzy") {
+            return Err(E::D(removed_lexical_call(c)));
+        }
         if AGGREGATES.contains(&name) {
             return Err(err(
                 T8,
@@ -5299,81 +5355,6 @@ impl Ctx<'_> {
                     },
                     ty,
                 )
-            }
-            "search" | "match_text" | "fuzzy" => {
-                if args.len() != 2 {
-                    return Err(err(
-                        T71,
-                        format!(
-                            "`{name}` takes a field and a query; an edit budget is the option `max_edits:`"
-                        ),
-                    ));
-                }
-                search_field(self, &args)?;
-                if !string(&args[1].ty) {
-                    return Err(err(T19, format!("`{name}`'s query is a String")));
-                }
-                let mut options = Vec::new();
-                for (o, v) in &c.options {
-                    if name == "fuzzy" && o == "max_edits" {
-                        if let Expr::Literal(Literal::Integer(n)) = v
-                            && !(0..=2).contains(n)
-                        {
-                            return Err(err(T71, format!("`max_edits: {n}` is outside 0..=2")));
-                        }
-                        options.push((o.clone(), self.expr(sc, v, At::Value)?));
-                    } else {
-                        let admits = if name == "fuzzy" {
-                            "max_edits (integer)"
-                        } else {
-                            "none"
-                        };
-                        return Err(err(
-                            T71,
-                            format!("`{name}` has no option `{o}`; it admits {admits}"),
-                        ));
-                    }
-                }
-                if name == "fuzzy" && options.is_empty() {
-                    // `fuzzy(f, q)` with no budget is two edits, as today.
-                    options.push(("max_edits".into(), int_lit(2)));
-                }
-                if declares_analyzer(self, sc, &args) {
-                    // Over a field whose index declares an analyzer the three
-                    // calls are `match_terms(f, terms(q, mode: any))`, with
-                    // `fuzzy`'s edit budget (section 4, Migration): one typed
-                    // term for the two spellings, so `queries fmt` writes
-                    // the canonical one without changing the term.
-                    let max_edits = options
-                        .pop()
-                        .map_or_else(|| int_lit(0), |(_, budget)| budget);
-                    SExpr::new(
-                        SKind::Call {
-                            func: "match_terms".into(),
-                            args,
-                            options: vec![
-                                (
-                                    "mode".into(),
-                                    SExpr::new(
-                                        SKind::Lit(Literal::String("any".into())),
-                                        Ty::scalar(ScalarType::String, false),
-                                    ),
-                                ),
-                                ("max_edits".into(), max_edits),
-                            ],
-                        },
-                        bool_ty(false),
-                    )
-                } else {
-                    SExpr::new(
-                        SKind::Call {
-                            func: name.into(),
-                            args,
-                            options,
-                        },
-                        bool_ty(false),
-                    )
-                }
             }
             "match_terms" => {
                 no_options(c)?;
@@ -6129,25 +6110,6 @@ fn is_integer(s: ScalarType) -> bool {
         s,
         ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64
     )
-}
-
-/// Whether a lexical call's field, its first typed argument, is a property
-/// of a stored node type whose full-text index declares an analyzer.
-fn declares_analyzer(checker: &Ctx<'_>, sc: &Scope, args: &[SExpr]) -> bool {
-    let Some(SExpr {
-        kind: SKind::Prop { col, prop },
-        ..
-    }) = args.first()
-    else {
-        return false;
-    };
-    let ty = sc.local(col).or_else(|| sc.outer_col(col)).map(|c| &c.ty);
-    matches!(ty, Some(Ty::Node { type_name, .. })
-        if checker
-            .catalog
-            .node_types
-            .get(type_name)
-            .is_some_and(|n| n.full_text_profile(prop).is_some()))
 }
 
 fn int_lit(n: i128) -> SExpr {

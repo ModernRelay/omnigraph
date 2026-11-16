@@ -139,7 +139,7 @@ query single_hop_both_bm25($q1: String, $q2: String) {
 
 query search_filter_single_hop($q1: String, $q2: String) {
     match {
-      let $pop = { match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } where search($c.text, $q1) return { $c } },
+      let $pop = { match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } where match_terms($c.text, terms($q1, mode: any)) return { $c } },
       from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), k: 60) as $score,
     }
     return { $c.slug }

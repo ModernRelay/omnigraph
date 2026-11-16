@@ -42,7 +42,7 @@ node Fresh {
 --- query
 query text_search($q: String) {
     match { $d: Doc }
-    where search($d.title, $q)
+    where match_terms($d.title, terms($q, mode: any))
     return { $d.slug, $d.title }
 }
 
@@ -61,7 +61,7 @@ d.title: String
 --- query
 query text_search_unknown($q: String) {
     match { $d: Doc }
-    where search($d.title, $q)
+    where match_terms($d.title, terms($q, mode: any))
     return { $d.slug, $d.title }
 }
 
@@ -77,7 +77,7 @@ d.title: String
 --- query
 query fuzzy_search($q: String) {
     match { $d: Doc }
-    where fuzzy($d.title, $q, max_edits: 2)
+    where match_terms($d.title, terms($q, mode: any, max_edits: 2))
     return { $d.slug, $d.title }
 }
 
@@ -93,7 +93,7 @@ d.title: String
 --- query
 query phrase_search($q: String) {
     match { $d: Doc }
-    where match_text($d.body, $q)
+    where match_terms($d.body, terms($q, mode: any))
     return { $d.slug, $d.title }
 }
 
@@ -110,7 +110,7 @@ d.title: String
 --- query
 query phrase_search_token_fallback($q: String) {
     match { $d: Doc }
-    where match_text($d.body, $q)
+    where match_terms($d.body, terms($q, mode: any))
     return { $d.slug, $d.title }
 }
 
@@ -127,7 +127,7 @@ d.title: String
 --- query
 query phrase_search_one_token($q: String) {
     match { $d: Doc }
-    where match_text($d.body, $q)
+    where match_terms($d.body, terms($q, mode: any))
     return { $d.slug, $d.title }
 }
 
@@ -151,7 +151,7 @@ query add_fresh() {
 --- query
 query fresh_search($q: String) {
     match { $f: Fresh }
-    where search($f.body, $q)
+    where match_terms($f.body, terms($q, mode: any))
     return { $f.slug }
 }
 
@@ -175,7 +175,7 @@ query retitle_fresh() {
 --- query
 query fresh_search($q: String) {
     match { $f: Fresh }
-    where search($f.body, $q)
+    where match_terms($f.body, terms($q, mode: any))
     return { $f.slug }
 }
 
@@ -206,7 +206,7 @@ query drop_first_fresh() {
 --- query
 query fresh_search($q: String) {
     match { $f: Fresh }
-    where search($f.body, $q)
+    where match_terms($f.body, terms($q, mode: any))
     return { $f.slug }
 }
 

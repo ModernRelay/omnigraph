@@ -1449,7 +1449,7 @@ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<
         Expr::Call(call) => {
             if matches!(
                 call.name.as_str(),
-                "search" | "fuzzy" | "match_text" | "match_terms" | "bm25" | "nearest" | "rrf"
+                "match_terms" | "bm25" | "nearest" | "rrf"
             ) {
                 *needs_indices = true;
             }

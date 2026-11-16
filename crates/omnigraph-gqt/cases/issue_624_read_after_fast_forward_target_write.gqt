@@ -65,7 +65,7 @@ p.name: String
 --- query branch: tgt
 query text_read() {
     match { $p: Person }
-    where search($p.text, "needle")
+    where match_terms($p.text, terms("needle", mode: any))
     return { count($p) as n }
 }
 

@@ -573,7 +573,7 @@ async fn string_predicates_compose_with_search_and_negation() {
     let q = r#"
 query prefix_and_search() {
     match { $m: Metric }
-    where search($m.label, "alps") and starts_with($m.label, "al")
+    where match_terms($m.label, terms("alps", mode: any)) and starts_with($m.label, "al")
     return { $m.name }
 }
 query not_alp_tagged() {

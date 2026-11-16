@@ -68,7 +68,7 @@ query add_operator() {
 --- query
 set engine = v2;
 query search_operators($q: String) {
-    match { $o: @Operator } where match_text($o.name, $q)
+    match { $o: @Operator } where match_terms($o.name, terms($q, mode: any))
     return { $o.name }
 }
 

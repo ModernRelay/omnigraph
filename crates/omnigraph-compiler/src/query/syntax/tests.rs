@@ -1048,10 +1048,10 @@ fn one_keyword_and_the_body_shape_is_the_kind() {
 
 #[test]
 fn calls_take_positionals_then_options_and_one_distinct_form() {
-    let Expr::Call(c) = where_expr("fuzzy($x.title, $q, max_edits: 2)") else {
+    let Expr::Call(c) = where_expr("nearest($pop, $x.embedding, $q, k: 2)") else {
         panic!()
     };
-    assert_eq!((c.args.len(), c.options.len()), (2, 1));
+    assert_eq!((c.args.len(), c.options.len()), (3, 1));
     // An option before a positional is refused with the reordered arguments.
     let e = refusal_of("query q() { match { $x: X } where f(k: 1, $x) return { 1 } }");
     assert_eq!(e.code.as_str(), "Q005");
