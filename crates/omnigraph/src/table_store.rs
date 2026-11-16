@@ -403,7 +403,11 @@ impl ScanTuning<'_> {
     /// the metric of whatever vector index covers the column; with one it
     /// searches an index of another metric flat instead (Lance 13
     /// `Scanner::create_plan`), so an index built for another distance is
-    /// never used.
+    /// never used. A `cosine` index stores its vectors normalized and
+    /// searches them under L2, so its `_distance` is not the flat path's
+    /// value for the same row; a `cosine` search re-scores its candidates on
+    /// the stored vectors (`refine(1)`), whose value is the flat kNN's, so a
+    /// row's distance does not depend on index coverage.
     pub(crate) fn nearest(
         &mut self,
         column: &str,
@@ -413,6 +417,9 @@ impl ScanTuning<'_> {
     ) -> std::result::Result<&mut Self, lance::Error> {
         self.scanner.nearest(column, query, limit)?;
         self.scanner.distance_metric(metric_type(distance));
+        if distance == VectorDistance::Cosine {
+            self.scanner.refine(1);
+        }
         Ok(self)
     }
 

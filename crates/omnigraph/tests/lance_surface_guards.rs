@@ -4965,6 +4965,98 @@ async fn distance_kernel_equals_the_flat_knn_distance_bit_for_bit() {
     }
 }
 
+// --- Guard: a refined cosine search scores on the stored vectors ---
+//
+// A cosine IVF_FLAT index stores normalized vectors (`lance-index`
+// `vector/ivf.rs`, `NormalizeTransformer`) and searches them under L2. With
+// `refine(1)` Lance re-scores the index's candidates on the stored vectors,
+// so an index-served `_distance` is the flat kNN's value bit for bit and a
+// row's distance does not depend on index coverage.
+
+#[tokio::test]
+async fn refined_cosine_index_search_equals_the_flat_distance_bit_for_bit() {
+    use arrow_array::FixedSizeListArray;
+    use arrow_array::types::{Float32Type, Int32Type};
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    const ROWS: usize = 64;
+    const DIMENSION: usize = 37;
+    let mut state = 0x2545_f491_u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state % 2_000) as f32 / 1_000.0 - 1.0 + 0.0005
+    };
+    let components: Vec<f32> = (0..ROWS * DIMENSION).map(|_| next()).collect();
+    let query = Float32Array::from((0..DIMENSION).map(|_| next()).collect::<Vec<_>>());
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let vectors = FixedSizeListArray::new(
+        item.clone(),
+        DIMENSION as i32,
+        Arc::new(Float32Array::from(components)),
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(item, DIMENSION as i32),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
+            Arc::new(vectors.clone()),
+        ],
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("cosine.lance");
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index_builder(
+            &["vector"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(1, MetricType::Cosine),
+        )
+        .name("vector_idx".to_string())
+        .replace(true)
+        .await
+        .unwrap();
+    let kernel = MetricType::Cosine.arrow_batch_func()(&query, &vectors).unwrap();
+    let mut scanner = dataset.scan();
+    scanner.nearest("vector", &query, ROWS).unwrap();
+    scanner.distance_metric(MetricType::Cosine);
+    scanner.refine(1);
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch["id"].as_primitive::<Int32Type>();
+    let distances = batch["_distance"].as_primitive::<Float32Type>();
+    assert_eq!(batch.num_rows(), ROWS);
+    for row in 0..batch.num_rows() {
+        let id = ids.value(row) as usize;
+        assert_eq!(
+            distances.value(row).to_bits(),
+            kernel.value(id).to_bits(),
+            "row {id}"
+        );
+    }
+}
+
 // --- Guard: an explicit projection may name `_distance` before `nearest` ---
 //
 // Lance 13 resolves the scoring columns (`_distance`, `_score`) in
