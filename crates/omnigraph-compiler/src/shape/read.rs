@@ -613,35 +613,57 @@ impl Facts {
     }
 
     /// `other`'s facts after this scope's, its `let` checks at their place
-    /// among them.
-    fn append(&mut self, other: Facts) {
+    /// among them. `other` holds no `optional` or `union`, which are placed
+    /// after their own scope's elements; such a read is drawn correlated.
+    fn append(&mut self, other: Facts) -> Result<(), ShapeError> {
+        let Facts {
+            bindings,
+            traversals,
+            filters,
+            blocks,
+            optionals,
+            unions,
+            correlates,
+            optional_names,
+            types,
+            lets: _,
+            inlined: _,
+            checks,
+            failing_filter,
+        } = other;
+        if !optionals.is_empty() || !unions.is_empty() || !optional_names.is_empty() {
+            return Err(ShapeError::Internal(
+                "an inline read holding an `optional` or a `union` was joined into its outer scope"
+                    .into(),
+            ));
+        }
         let at = self.marks();
-        self.checks
-            .extend(other.checks.into_iter().map(|mut check| {
-                check.marks = Marks {
-                    bindings: at.bindings + check.marks.bindings,
-                    traversals: at.traversals + check.marks.traversals,
-                    filters: at.filters + check.marks.filters,
-                    blocks: at.blocks + check.marks.blocks,
-                    // An inline read's facts join the scope's bindings,
-                    // traversals, filters and blocks.
-                    optionals: at.optionals,
-                    unions: at.unions,
-                    correlates: at.correlates + check.marks.correlates,
-                };
-                check
-            }));
+        self.checks.extend(checks.into_iter().map(|mut check| {
+            check.marks = Marks {
+                bindings: at.bindings + check.marks.bindings,
+                traversals: at.traversals + check.marks.traversals,
+                filters: at.filters + check.marks.filters,
+                blocks: at.blocks + check.marks.blocks,
+                // An inline read's facts join the scope's bindings,
+                // traversals, filters and blocks.
+                optionals: at.optionals,
+                unions: at.unions,
+                correlates: at.correlates + check.marks.correlates,
+            };
+            check
+        }));
         self.correlates
-            .extend(other.correlates.into_iter().map(|mut correlate| {
+            .extend(correlates.into_iter().map(|mut correlate| {
                 correlate.optionals_before = at.optionals;
                 correlate
             }));
-        self.bindings.extend(other.bindings);
-        self.traversals.extend(other.traversals);
-        self.filters.extend(other.filters);
-        self.failing_filter |= other.failing_filter;
-        self.blocks.extend(other.blocks);
-        self.types.extend(other.types);
+        self.bindings.extend(bindings);
+        self.traversals.extend(traversals);
+        self.filters.extend(filters);
+        self.failing_filter |= failing_filter;
+        self.blocks.extend(blocks);
+        self.types.extend(types);
+        Ok(())
     }
 
     /// Every name the facts bind or read as a node or edge variable.
@@ -2432,6 +2454,12 @@ impl<'a> Shaper<'a> {
         let outer: HashSet<String> = env_columns(input).into_iter().collect();
         let mut inner = Facts::default();
         self.facts(input, &mut inner)?;
+        // An `optional` or a `union` is placed after its own scope's
+        // elements; joined into the outer scope it would be placed after the
+        // outer elements too. Such a read is drawn as a read of its own.
+        if !inner.optionals.is_empty() || !inner.unions.is_empty() {
+            return self.correlate_read(input, items, bindings, facts);
+        }
         let inner_lets = std::mem::take(&mut inner.lets);
         inner.substitute(&inner_lets);
         let items: Vec<(String, IRExpr)> = items
@@ -2486,7 +2514,7 @@ impl<'a> Shaper<'a> {
                 *variable = name.clone();
             }
         };
-        facts.append(inner);
+        facts.append(inner)?;
         // The inner `return` computes its values on every inner row, before
         // any outer `where`: a value that can fail is evaluated there.
         for (column, mut value) in values {

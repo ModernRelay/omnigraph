@@ -7,6 +7,7 @@
 # notes: the names it binds. An arm may return a value, or group, order and
 # notes: cut its own rows: each arm is then drawn as a read of its own, its
 # notes: values one column each under the first arm's names.
+# notes: An inline read holding a union keeps it.
 
 --- runner
 timeout_ms: 10000
@@ -208,4 +209,25 @@ query arms_reading_the_enclosing_scope() {
 
 --- expect shape
 c.slug: String
+p.handle: String
+
+--- query
+query union_inside_an_inline_read() {
+    match {
+        from { match {
+            from union(
+                { match { $p: Person } where $p.age > 30 return { $p } },
+                { match { $a: Person, $q: Person, $a knows $q } return { $q as p } }),
+        } return { $p } },
+    }
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"cy"}
+{"p.handle":"bob"}
+{"p.handle":"bob"}
+
+--- expect shape
 p.handle: String
