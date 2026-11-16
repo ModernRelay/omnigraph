@@ -1,6 +1,6 @@
 # issue: none
 # notes: On a field whose index declares an analyzer, `match_terms` is the exact `terms` relation
-# notes: (docs/rfcs/2026-11-07-gq-3.md, section 4, "The lexical query"): the exact lexical scan
+# notes: (the GQ 3 RFC, section 4, "The lexical query"): the exact lexical scan
 # notes: analyzes document and query text with the field's profile at every edit budget, and a
 # notes: query term matches a stored term within the budget, counting one per inserted, deleted or
 # notes: substituted Unicode scalar value, so `abcd` and `acbd` are two edits apart and `cafe` and

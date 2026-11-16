@@ -1,6 +1,6 @@
 # issue: none
 # notes: A full-text call (`search`, `match_text`, `fuzzy`) is a Boolean operand like any other
-# notes: (docs/rfcs/2026-11-07-gq-3.md, section 5): under `not`, under `or`, compared with a
+# notes: (the GQ 3 RFC, section 5): under `not`, under `or`, compared with a
 # notes: value, inside `coalesce`, in a filter reading two bindings, inside a block and in a
 # notes: write's selection. It is true where the row is among the call's matches, so a null
 # notes: title is false, and `not search(…)` keeps exactly the rows `search(…)` drops. The seed

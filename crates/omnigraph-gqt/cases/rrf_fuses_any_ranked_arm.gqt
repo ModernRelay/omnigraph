@@ -1,5 +1,5 @@
 # issue: none
-# notes: `rrf` fuses 2 to 16 arms of any ranking (docs/rfcs/2026-11-07-gq-3.md, section 4, Fusion), each
+# notes: `rrf` fuses 2 to 16 arms of any ranking (the GQ 3 RFC, section 4, Fusion), each
 # notes: the plan its ranking takes standing alone, ranked from 1 over its distinct targets, with
 # notes: rrf = Σ weight / (k + rank) over the arms that selected the target, summed in written order.
 # notes: Step 1: an exact `distance` arm ranks every Doc d1 (0), d3 (0.4), d5 (0.68), d4 (1.3), d2 (2); the

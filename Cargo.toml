@@ -79,7 +79,7 @@ stop-words = { version = "=0.10.0", default-features = false }
 # a change to its Unicode data changes which values match and their scores,
 # so it needs the same audit as the analyzer pins above.
 unicode-normalization = "=0.1.25"
-# `bm25_v1` computes its IDF with this `log1p` (docs/rfcs/2026-11-07-gq-3.md,
+# `bm25_v1` computes its IDF with this `log1p` (the GQ 3 RFC,
 # section 4); a change moves scores in their last bits and needs review.
 libm = "=0.2.16"
 

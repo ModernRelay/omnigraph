@@ -1,5 +1,5 @@
 # issue: none
-# notes: the three analyzer profiles of `@index(fulltext, analyzer = ...)` (docs/rfcs/2026-11-07-gq-3.md
+# notes: the three analyzer profiles of `@index(fulltext, analyzer = ...)` (the GQ 3 RFC
 # notes: section 4, Schema: Text) match one corpus differently, and an index declaring no analyzer keeps
 # notes: edition 2's analysis (Lance's default). Every profile lowercases (`RUNNING`); only `english_v1`
 # notes: and edition 2 stem (`run` finds `Runners were RUNNING`); `standard_folded_v1`, `english_v1` and

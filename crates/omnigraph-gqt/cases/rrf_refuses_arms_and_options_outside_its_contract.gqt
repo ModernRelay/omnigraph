@@ -1,5 +1,5 @@
 # issue: none
-# notes: The type checker holds `rrf` to its contract (docs/rfcs/2026-11-07-gq-3.md, section 4, Fusion and
+# notes: The type checker holds `rrf` to its contract (the GQ 3 RFC, section 4, Fusion and
 # notes: Errors): 2 to 16 arms, `k` in 1..=1000000, each weight in (0, 1000000] with one weight per arm, no two
 # notes: arms with the same population, field and query (`weights` expresses emphasis), and every arm over one
 # notes: node column of one name and type (the fused target would be a pair). Each bound is admitted where it

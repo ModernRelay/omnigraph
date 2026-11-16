@@ -1,5 +1,5 @@
 # issue: none
-# notes: A `nearest` arm under `rrf` is the standalone `nearest` over its population (docs/rfcs/2026-11-07-gq-3.md,
+# notes: A `nearest` arm under `rrf` is the standalone `nearest` over its population (the GQ 3 RFC,
 # notes: section 4, law 1: eligibility before selection): its window holds `k` eligible targets.
 # notes: The Docs nearest the query (d1, d2, d3) have no author; only d4, d5 and d6 do. Step 1 fuses a window
 # notes: of 2 over the authored Docs with an exact `distance` arm from [0.5, 0] over the same population (the

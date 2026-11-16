@@ -1,6 +1,6 @@
 # issue: none
 # notes: A `bm25_v1` score is the retrieval's, not the filter's: its statistics are the field corpus,
-# notes: taken before any graph or property filter (docs/rfcs/2026-11-07-gq-3.md, section 4). The
+# notes: taken before any graph or property filter (the GQ 3 RFC, section 4). The
 # notes: insert lands in a fragment no full-text segment covers; the exact lexical scan reads no index,
 # notes: so `t1` scores the same with and without a filter that excludes `t2`, the other new row, at
 # notes: every index state.

@@ -1,5 +1,5 @@
 # issue: none
-# notes: A full-text index without `analyzer` takes `english_v1` (docs/rfcs/2026-11-07-gq-3.md,
+# notes: A full-text index without `analyzer` takes `english_v1` (the GQ 3 RFC,
 # notes: section 4, Schema), so `Doc.body`, declared `@index(fulltext)`, is analyzed exactly as
 # notes: `Doc.english`, declared with the profile: the same rows for every query, with no index read.
 # notes: The profile stems before it removes stop words, and its stop list holds each of NLTK's 198

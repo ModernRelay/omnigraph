@@ -1,6 +1,6 @@
 # issue: none
-# notes: `bm25` on a field whose index declares an analyzer scores with `bm25_v1` (docs/rfcs/
-# notes: 2026-11-07-gq-3.md, section 4, "bm25_v1"): F64, libm's `log1p` IDF over the field corpus
+# notes: `bm25` on a field whose index declares an analyzer scores with `bm25_v1` (the GQ 3
+# notes: RFC, section 4, "bm25_v1"): F64, libm's `log1p` IDF over the field corpus
 # notes: (every entity of the type with a non-empty analyzed value), alternatives within a query
 # notes: term's edit budget sharing its group's IDF, the best of them weighted 1, 1/2 or 1/4,
 # notes: parts summed in ascending query-term order; membership is the `terms` relation. Each type

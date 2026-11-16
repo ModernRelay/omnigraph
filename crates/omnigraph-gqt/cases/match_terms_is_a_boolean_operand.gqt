@@ -1,6 +1,6 @@
 # issue: none
 # notes: `match_terms(field, terms(…))` is a predicate and a Boolean operand like any other
-# notes: (docs/rfcs/2026-11-07-gq-3.md, section 4, "The lexical query"): standing alone,
+# notes: (the GQ 3 RFC, section 4, "The lexical query"): standing alone,
 # notes: under `not` and `or`, compared with a value, in a `let`, in a count block and an
 # notes: `exists`, and in a write's selection. `mode: all` (the default) needs every analyzed
 # notes: query term in the document, `mode: any` one of them; repeating or reordering query

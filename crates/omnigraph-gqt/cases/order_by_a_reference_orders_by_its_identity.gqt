@@ -1,6 +1,6 @@
 # issue: none
 # notes: An `order` key that is a node or edge reference orders by its identity, returned or not
-# notes: (docs/rfcs/2026-11-07-gq-3.md, section 2, the Order operator: "the identity (type, id) of every
+# notes: (the GQ 3 RFC, section 2, the Order operator: "the identity (type, id) of every
 # notes: reference column"): a node by its `@id`, an edge by its `@id`, and an edge over several
 # notes: types by its type, then its `@id`. Names sort the other way from handles, so ordering by a
 # notes: property would show. Over `distinct` rows a returned node orders by its identity too, and so

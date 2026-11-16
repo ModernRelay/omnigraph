@@ -1,6 +1,6 @@
 # issue: none
 # traversal: auto
-# notes: `@index` on an enum or a Bool builds a BITMAP (docs/rfcs/2026-11-07-gq-3.md section 4, "Scalar indexes").
+# notes: `@index` on an enum or a Bool builds a BITMAP (the GQ 3 RFC section 4, "Scalar indexes").
 # notes: Equality, `!=`, `in`, `is null` and a Boolean test probe it; every step's rows equal the reference
 # notes: interpreter's and an unindexed twin type's, and a null value never passes `!=` or `not`.
 # notes: The appended rows lie outside the index (partial coverage) and are still returned.

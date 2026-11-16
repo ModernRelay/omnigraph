@@ -1,6 +1,6 @@
 # issue: none
 # traversal: auto
-# notes: `@index` on a list builds a LABEL_LIST (docs/rfcs/2026-11-07-gq-3.md section 4, "Scalar indexes").
+# notes: `@index` on a list builds a LABEL_LIST (the GQ 3 RFC section 4, "Scalar indexes").
 # notes: `value in $x.list` and its negation probe it; every step's rows equal the reference interpreter's
 # notes: and an unindexed twin type's. A null or empty list never holds a value, and a null list stays out
 # notes: of the negation. The appended rows lie outside the index (partial coverage) and are still returned.

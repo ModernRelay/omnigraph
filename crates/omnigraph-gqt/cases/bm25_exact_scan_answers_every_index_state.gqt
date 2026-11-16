@@ -1,6 +1,6 @@
 # issue: none
 # notes: The exact lexical scan answers a field whose index declares an analyzer at every coverage
-# notes: state (docs/rfcs/2026-11-07-gq-3.md, section 4, "Exact execution and qualified
+# notes: state (the GQ 3 RFC, section 4, "Exact execution and qualified
 # notes: acceleration"): the analyzer is instantiated from the accepted schema whether or not an
 # notes: index exists, so `matches(indexed) = matches(unindexed) = matches(partially indexed)` and a
 # notes: declared but unbuilt index answers instead of refusing. `Doc.title` is indexed when the
