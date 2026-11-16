@@ -152,9 +152,9 @@ unsupported. Pattern:
 1. Add as optional: `new_prop: String?`
 2. Apply
 3. Backfill via a `mutate` or `load --mode merge`
-4. Keep it optional: tightening `T?` -> `T` is currently refused by the planner
-   (a property-type change, OG-MF-106). Enforce presence at write time by
-   convention until required-tightening ships as a migration step.
+4. Promote it: change `new_prop: String?` to `new_prop: String` and apply. The
+   apply reads the stored rows first and refuses, changing nothing, while any
+   live row still holds a null (OG-MF-104); see the constraints section below.
 
 ### Enum widening is a supported apply
 

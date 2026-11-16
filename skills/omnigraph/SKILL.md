@@ -417,7 +417,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Expecting `@embed` to populate vectors during load | missing/stale vectors | `@embed` is metadata; run the offline `omnigraph embed ... --reembed-all` file pipeline, then load its output |
 | `schema apply` with feature branches open | `schema apply requires a graph with only main` | Delete them (`merge --delete-branch` or `branch delete`); a merge alone leaves the branch live |
 | `nearest(...)` / `rrf(...)` without `limit` | compile error | Add `limit N`; a BM25-only query may omit it, though bounded output is recommended |
-| Adding non-nullable property without backfill | unsupported migration | Make optional → backfill; keep it optional (tightening `T?` → `T` is refused, OG-MF-106) |
+| Adding non-nullable property without backfill | unsupported migration | Add it optional → backfill → promote `T?` → `T`; the promotion is refused, changing nothing, while a stored row holds a null (OG-MF-104) |
 | `omnigraph init --json` | `unexpected argument '--json' found` | `init` doesn't support `--json`; drop the flag |
 | `omnigraph init` on an already-initialized URI | `graph already initialized or initialization metadata exists at '<uri>'` | Never overwrite it. `--force` only replaces orphan schema artifacts after proving there is no graph manifest |
 | `schema apply` dropping a property/type | nothing is reclaimed at apply; older commits still read the dropped data, and a dropped property's values stay in the current data files | a type: `cleanup` with a retention that excludes the pre-drop commits. A property: `optimize` first, delete branches and tags from before it, then that `cleanup`; the data is then unrecoverable |
