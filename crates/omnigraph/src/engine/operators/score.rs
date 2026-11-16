@@ -200,7 +200,10 @@ fn non_finite(message: String) -> OmniError {
 
 /// The `distance` of each row's vector to `query`, and the mask of the rows
 /// whose vector is not null and inside the distance's domain (a `cosine`
-/// zero vector is not).
+/// zero vector is not). The values come from Lance's own batch kernel for
+/// the distance (`DistanceType::arrow_batch_func`), the one its flat kNN
+/// scores with, so `distance` and an exhaustive `nearest` agree bit for bit
+/// and order near ties alike.
 fn distances(
     vectors: &FixedSizeListArray,
     query: &[f32],
@@ -212,12 +215,8 @@ fn distances(
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| OmniError::manifest_internal("a vector's components are not F32"))?;
     let width = query.len();
-    let mut out = Vec::with_capacity(vectors.len());
-    let mut keep = Vec::with_capacity(vectors.len());
     for row in 0..vectors.len() {
         if vectors.is_null(row) {
-            out.push(0.0);
-            keep.push(false);
             continue;
         }
         let start = vectors.value_offset(row) as usize;
@@ -228,12 +227,29 @@ fn distances(
                 )));
             }
         }
-        let vector = &values.values()[start..start + width];
-        let Some(value) = distance.evaluate(vector, query) else {
+    }
+    let scored = crate::table_store::metric_type(distance).arrow_batch_func()(
+        &Float32Array::from(query.to_vec()),
+        vectors,
+    )
+    .map_err(|error| OmniError::manifest_internal(format!("`distance` kernel: {error}")))?;
+    let zero_query = omnigraph_compiler::schema::vector::is_zero_vector(query);
+    let mut out = Vec::with_capacity(vectors.len());
+    let mut keep = Vec::with_capacity(vectors.len());
+    for row in 0..vectors.len() {
+        let start = vectors.value_offset(row) as usize;
+        let outside = vectors.is_null(row)
+            || (distance.refuses_zero_vector()
+                && (zero_query
+                    || omnigraph_compiler::schema::vector::is_zero_vector(
+                        &values.values()[start..start + width],
+                    )));
+        if outside {
             out.push(0.0);
             keep.push(false);
             continue;
-        };
+        }
+        let value = scored.value(row);
         if !value.is_finite() {
             return Err(non_finite(format!(
                 "`distance` ({distance}) over {width} components is not finite"
