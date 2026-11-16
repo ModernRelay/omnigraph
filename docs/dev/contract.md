@@ -117,8 +117,13 @@ Owners: [writes](writes.md), [recovery](recovery.md); `failpoints.rs`,
   later write; without it, a write is serialized where it lands, not where
   its caller last looked. An unpublished commit publishes under the same
   rule.
+- **Readers scale out.** A read learns the head from storage, never from
+  another process. Any number of reader processes may serve one root; none
+  coordinates with the writer or with another reader, and each is always
+  fresh: it observes every commit acknowledged before the read began. Not
+  promised: a stale read mode that trades freshness for latency.
 - **Sessions.** On one branch a client gets read-your-writes and monotonic
-  reads from the two rules above. A client that needs a fixed view across
+  reads from the rules above, on whichever reader process serves it. A client that needs a fixed view across
   requests pins a commit id. Not promised: a read "at least as new as commit
   X" on another branch, or any joint view of two branches.
 - **Across branches.** Branches are isolated until merged, and a merge
@@ -253,6 +258,7 @@ is a deliberate limit says so.
 | 2 | Within one process a read's capture can wait behind an exclusive schema apply, branch create or handle open, and behind the writes that operation waits for | Reads never wait for writers |
 | 2 | Branch create and delete, schema apply, dropping a proposal and `cleanup` are safe only from one writer process per graph; schema apply's only-`main` check can miss another process's branch create, and schema apply needs `main` to be the only branch | Every write decided by the same compare-and-swap, across processes; schema apply with live branches |
 | 2, 5 | A process that claimed a branch's writer epoch (embedded engine only) reads its bound branch without checking the head: it is stale once another process replaces it or deletes the branch, and can answer some reads with no storage request while the store is unreachable | Deliberate: the owner trades the check for latency. Wanted is a bounded staleness the owner can state |
+| 2 | Read replicas are not a supported topology: a served process takes the cluster's writer admission, so one server serves a cluster, and only read-only CLI commands read beside it | A read-only serving mode that takes no writer admission, so read capacity grows with processes |
 | 2 | An aggregate read with an `order` breaks ties between groups by nothing, so groups equal on the order keys come back in unspecified order | One total order for every sorted read |
 | 5 | On a local filesystem root nothing is fsynced: an acknowledged commit survives a process crash, not necessarily power loss or an operating-system crash. On an object store it is durable at acknowledgement | Durable at acknowledgement on every supported root, or local roots declared development-only |
 | 5 | A stream (export, Blob GET) that fails after its headers ends in an aborted body, not a typed refusal; a merge that also deletes its source can succeed while the deletion fails; retries a write took are not reported in its answer | Every failure typed at the door; retries visible in the answer |
@@ -286,8 +292,11 @@ wire compatibility are owned by [versioning](versioning.md).
 - **Clocks.** Timestamps come from writer clocks and are informational:
   ordering authority is the branch history. Time only orders listings of
   proposals and snapshots and selects what `cleanup --older-than` retains.
-- **Writers.** One mutation-capable writer process per cluster is the
-  supported topology ([support boundaries](invariants.md#current-support-boundaries)).
+- **Topology.** The target is one mutation-capable writer process per
+  cluster and any number of stateless reader processes over the same root,
+  added and removed freely. The writer half is the supported topology today
+  ([support boundaries](invariants.md#current-support-boundaries)); the
+  reader half is wanted.
   Ordinary writes and merges stay correct across processes; the control
   writes listed under [today and the target](#today-and-the-target) do not.
 - **Trust.** The server boundary is trusted to resolve actors. An embedded or
@@ -349,6 +358,7 @@ and write only the second, or propose changes to the first.
 | Quantity | Hypothesis | Revise when |
 |---|---|---|
 | Actors | A few to tens of agents per graph at once, a few people, a handful of programs; many graphs per deployment rather than one | Hundreds of concurrent agents on one graph |
+| Read capacity | Tens of agents at several retrieve reads a step is more read load than one process should carry, and it grows with agents while write load grows with tasks; reads are served by several processes | One process serves a graph's reads with headroom at the hypothesized actors |
 | Mix | Reads outnumber writes by one to two orders of magnitude; authored commits dominate writes by count, acquisition and sync by rows; deletes are rare everywhere | Analytical scans, updates or deletes become common; result sets pass 10^4 rows |
 | Volume | 10^4 to 10^7 entities per graph, set by the sources; 10 to 100 types; small scalar properties, text bodies, embeddings on a few types, Blobs for documents; agent batches of 10^2 to 10^5 records, backfills to 10^7 | 10^8 entities or 10^3 types; batches past 10^6; sync as streaming at thousands of events a second |
 | Rate | 10^2 to 10^4 commits a day; tens of live branches with hundreds of commits each and one writer; incremental sync every few minutes; an additive schema change about weekly; history retained long and read as often as the present | Commit rate or branch count up an order; several writers on one branch; conflict retries common; destructive schema changes frequent; history read rarely |
@@ -370,12 +380,16 @@ cost on this work. On cost the direction is: retrieve reads first, because
 they sit on the critical path of every agent step; then the cost of a small
 commit and of a branch, because authoring and coordination are the common
 writes; then history and change discovery; then bulk acquisition and sync.
-Analytical scans and single-branch write throughput beyond the hypothesized
-rate are not optimized for, and a design may trade them away.
+Read capacity scales out by adding reader processes; write capacity on one
+branch does not, and need not at the hypothesized rate. Analytical scans and
+single-branch write throughput beyond that rate are not optimized for, and a
+design may trade them away.
 
 What the hypothesis asks of the mechanisms, each with its cost owner in
 [testing](testing.md#cost-tests-and-benchmarks): a read on a warm handle
-costs a bounded number of storage requests independent of history; a commit
+costs a bounded number of storage requests independent of history, the
+freshness check included, and a reader's warm state is disposable, so a new
+reader is useful at once; a commit
 costs the same whatever the history depth and live branch count; a branch is
 free until written; a keyed upsert of an unchanged record costs little and
 publishes nothing (not so today, see
