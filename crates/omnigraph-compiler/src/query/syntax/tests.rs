@@ -1593,6 +1593,27 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query q() { match { $p: Person } return { $p.age as in_ } order { in_ desc } }"#,
     ),
     (
+        r#"a reserved alias beside a property whose name holds `order`"#,
+        "Q005",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.age as in, $p.order_id }
+  order { in desc }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.age as in_, $p.order_id } order { in_ desc } }"#,
+    ),
+    (
+        r#"a reserved alias with `order { … }` written in a string before the order"#,
+        "Q005",
+        r#"query q() {
+  match { $p: Person }
+  where $p.note = "order { in }"
+  return { $p.age as in }
+  order { in }
+}"#,
+        r#"query q() { match { $p: Person } where $p.note = "order { in }" return { $p.age as in_ } order { in_ } }"#,
+    ),
+    (
         r#"an option before a positional argument"#,
         "Q005",
         r#"query q($q: Vector(3)) {
@@ -2515,6 +2536,33 @@ fn every_refusal_shape_prints_a_repair_that_reparses_to_the_intended_text() {
             .unwrap_or_else(|e| panic!("{shape}: the repair does not parse: {e}\n{repaired}"));
         let want = parse_source(&as_source(intended)).expect("the intended text parses");
         assert_eq!(got, want, "{shape}: repaired to\n{repaired}");
+    }
+}
+
+/// No source reaches a slice or an `unwrap` in the parser: every prefix of
+/// every refused shape above, and every source with one character removed,
+/// is refused or accepted, never a panic.
+#[test]
+fn no_cut_or_deletion_of_a_refused_shape_panics_the_parser() {
+    for (shape, _, refused, _) in PARSE_REPAIRS {
+        let source = as_source(refused);
+        let cuts = source.char_indices().map(|(i, _)| i);
+        let mut variants: Vec<String> = cuts.clone().map(|i| source[..i].to_string()).collect();
+        variants.extend(source.char_indices().map(|(i, c)| {
+            let mut s = source.clone();
+            s.replace_range(i..i + c.len_utf8(), "");
+            s
+        }));
+        for variant in variants {
+            let outcome = std::panic::catch_unwind(|| {
+                let _ = parse_query_diagnostic(&variant);
+                let _ = super::parse::parse_source_all(&variant);
+            });
+            assert!(
+                outcome.is_ok(),
+                "{shape}: the parser panicked on\n{variant}"
+            );
+        }
     }
 }
 

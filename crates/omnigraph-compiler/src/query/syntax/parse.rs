@@ -210,6 +210,9 @@ struct Ctx {
     bindings: Vec<(String, String)>,
     vars: BTreeSet<String>,
     allow_bare: bool,
+    /// The whole `order` keys of the read being built that are bare names,
+    /// each with its span: a refused return alias renames its uses there.
+    order_aliases: Vec<(String, (usize, usize))>,
 }
 
 thread_local! {
@@ -1085,6 +1088,28 @@ fn annotation_value(pair: Pair<Rule>) -> R<AnnotationValue> {
 }
 
 fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
+    // The bare-name `order` keys of this read (a reserved word among them),
+    // from its tree; an inline
+    // read keeps its own and restores the enclosing read's.
+    let keys: Vec<(String, (usize, usize))> = pair
+        .clone()
+        .into_inner()
+        .filter(|s| s.as_rule() == Rule::order_clause)
+        .flat_map(|s| s.into_inner())
+        .filter(|o| o.as_rule() == Rule::ordering)
+        .filter_map(|o| o.into_inner().next())
+        .filter_map(|key| {
+            lone(&key, Rule::bare_name_rec).or_else(|| lone(&key, Rule::reserved_property))
+        })
+        .map(|name| (name.as_str().to_string(), span_of(&name)))
+        .collect();
+    let outer = with_ctx(|c| std::mem::replace(&mut c.order_aliases, keys));
+    let built = read_body_built(pair);
+    with_ctx(|c| c.order_aliases = outer);
+    built
+}
+
+fn read_body_built(pair: Pair<Rule>) -> R<ReadBody> {
     let input = input_of(&pair);
     let mut body = ReadBody {
         pattern: Box::default(),
@@ -1523,24 +1548,13 @@ fn projection(pair: Pair<Rule>) -> R<Projection> {
                 let renamed = format!("{word}_");
                 let mut edits = vec![edit(s, e, renamed.clone())];
                 // The alias's uses as whole `order` keys are renamed too.
-                if let Some(order) = input[e..].find("order").map(|k| e + k) {
-                    if let (Some(open), Some(close)) =
-                        (input[order..].find('{'), input[order..].find('}'))
-                    {
-                        let (open, close) = (order + open, order + close);
-                        for key in input[open + 1..close].split(',') {
-                            let key_start = open
-                                + 1
-                                + (key.as_ptr() as usize - input[open + 1..].as_ptr() as usize);
-                            let trimmed = key.trim_start();
-                            let at = key_start + (key.len() - trimmed.len());
-                            let first = trimmed.split_whitespace().next().unwrap_or("");
-                            if first == word {
-                                edits.push(edit(at, at + word.len(), renamed.clone()));
-                            }
-                        }
-                    }
-                }
+                edits.extend(with_ctx(|c| {
+                    c.order_aliases
+                        .iter()
+                        .filter(|(key, _)| key == word)
+                        .map(|(_, (ks, ke))| edit(*ks, *ke, renamed.clone()))
+                        .collect::<Vec<_>>()
+                }));
                 return Err(refusal(
                     input,
                     Q005,
