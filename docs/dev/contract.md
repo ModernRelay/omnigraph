@@ -365,14 +365,28 @@ and write only the second, or propose changes to the first.
 
 | Targets | No latency is measured yet. As a starting hypothesis for a warm handle in the store's region: a retrieve read answers in about 100 ms at the median and under 1 s at the tail; a small commit publishes in under 1 s; one branch publishes its commits serially, a few a second at most, which the hypothesized rate needs on average at one every several seconds, with bursts on shared state from merges and syncs | Measured figures replace these; shared state needs sustained tens of commits a second |
 
-**In category shorthand**, which [systems](systems.md#appendix-a-terminology-expansion)
-treats as a bundle to unpack: a hybrid. The larger half is operational (small,
-selective lookups on the critical path of a step, many small attributed
-commits); beside it run analytical reads over whole types that agents issue
-while retrieving, batch ingestion of whole sources, and a heavy history and
-change-data half. Both read modes run against the same fresh snapshot, with
-no copy to a second system. It is not a warehouse workload: analytical reads
-are over one graph at the volumes above, not over billions of rows.
+### Against the usual categories
+
+OLTP, OLAP, HTAP and LTAP are names for bundles that were useful together
+once: each fixes a contract, a mechanism and a workload at the same time
+([systems](systems.md#appendix-a-terminology-expansion)). Omnigraph is
+defined by its three parts above, not by a bundle, and matches each bundle
+in some claims and not in others.
+
+| Category | What it bundles | Where Omnigraph matches | Where it does not |
+|---|---|---|---|
+| OLTP | Work: many short, selective reads and writes, highly concurrent on the same data. Contract: interactive multi-statement transactions, serializable or weaker. Mechanism: row storage, a write-ahead log, updates in place, locks or multi-version rows | The read and write footprint: small selective lookups and small commits on a critical path | The transaction is one commit, not a session; writes on one branch are serial, so write concurrency comes from branches, not from row-level concurrency; no log and no update in place, so a commit costs object-store round trips |
+| OLAP | Work: few large scans and aggregates over much history, loaded in batches. Contract: a consistent snapshot of what was loaded, with a freshness lag accepted. Mechanism: columnar files, vectorized scans, compute apart from storage | The mechanism: columnar immutable files, batch loads, compute apart from storage; analytical reads are part of the work | The scale and the lag: analytical reads cover one graph of up to 10^7 entities, not billions of rows, and they read the same fresh commit as a lookup |
+| HTAP | Both of the above on one system, usually as two representations (row and column) with replication between them, promising analytics on fresh data without slowing transactions | The mixed read work on one system and one fresh snapshot | There is one representation, so no replication and no freshness gap to manage, and also no isolation of the two kinds of work from each other; the transactional half is weaker than OLTP as above |
+| LTAP | Transactional and analytical work over one copy of the data in an open format on object storage, with one write path and readers that scale out | The shape: one copy in open Lance on object storage, one writer and many readers, no export to a second system | The unit: a typed graph commit with branches and three-way merge, not a table transaction; retrieval over structure, vectors and text is a first-class read, which the category does not name |
+
+What none of the four names, and what this work is mostly made of: isolation
+by branch and merge instead of by lock or session; history read as often as
+the present; ranked retrieval as the common read; attribution of every
+change to an actor; and readers and writers that are programs acting on what
+they just read. Use a category word only as shorthand for the row it points
+at; a design argues from the clauses and the work, never from "it is an
+HTAP system".
 
 ### What we optimize for
 
