@@ -111,9 +111,11 @@ impl ExecutionPlan for LetExec {
             let mut scan = super::memory::WorkMemory::new(ctx, super::filter::LEXICAL_SCAN)?;
             scan.set_metrics(self.metrics.clone());
             let lexical = Arc::clone(lexical);
-            input = crate::engine::lexical::answered_first(input, async move {
-                lexical.answer(scan).await
-            });
+            input =
+                crate::engine::lexical::answered_first(
+                    input,
+                    async move { lexical.answer(scan).await },
+                );
         }
         let value = self.value.clone();
         let params = Arc::clone(&self.params);

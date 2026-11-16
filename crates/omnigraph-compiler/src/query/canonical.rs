@@ -183,14 +183,7 @@ fn expr(e: &Expr, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
             _ => None,
         };
         if let Some((code, fix, same_ir)) = found {
-            push(
-                out,
-                code,
-                Some(b.at.position),
-                print::expr(e),
-                fix,
-                same_ir,
-            );
+            push(out, code, Some(b.at.position), print::expr(e), fix, same_ir);
         }
     }
     match e {

@@ -1797,9 +1797,8 @@ fn a_full_text_call_plans_at_every_index_state() {
             FullTextCoverage::Full,
         ] {
             let mut fixture = Fixture::new(query, &[("q", Literal::String("graph".into()))]);
-            fixture.source = std::mem::take(&mut fixture.source).with_full_text_coverage(
-                "node:Doc", "title", coverage,
-            );
+            fixture.source = std::mem::take(&mut fixture.source)
+                .with_full_text_coverage("node:Doc", "title", coverage);
             let plan = fixture.plan();
             assert!(
                 plan.assumptions().full_text.is_empty(),

@@ -4653,7 +4653,10 @@ async fn publish_rewritten_merge_table(
     // target's linear HEAD untouched.
     let mut chain = MergeChain::new(
         target_txn.authority.staging_witness()?,
-        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key)?,
+        crate::db::omnigraph::table_ops::declared_full_text_columns(
+            &target_txn.catalog,
+            table_key,
+        )?,
     );
     for (payload, semantics) in [
         (&staged.inserts, KeyedWriteSemantics::StrictInsert),
@@ -4992,7 +4995,10 @@ async fn publish_proven_pure_insert_adopt(
     let schema: SchemaRef = Arc::new(proven.source.schema().into());
     let mut chain = MergeChain::new(
         target_txn.authority.staging_witness()?,
-        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key)?,
+        crate::db::omnigraph::table_ops::declared_full_text_columns(
+            &target_txn.catalog,
+            table_key,
+        )?,
     );
     let committed = commit_keyed_stream_chunks(
         target_db,
@@ -5074,7 +5080,10 @@ async fn publish_adopted_delta(
     // adapter keeps wide vector/blob rows streaming and batch-bounded.
     let mut chain = MergeChain::new(
         target_txn.authority.staging_witness()?,
-        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key)?,
+        crate::db::omnigraph::table_ops::declared_full_text_columns(
+            &target_txn.catalog,
+            table_key,
+        )?,
     );
     if let Some(insert_table) = &delta.inserts {
         current_ds = commit_staged_keyed_chunks(

@@ -704,10 +704,7 @@ mod tests {
                 &certificate(FORMAT_VERSION_FINGERPRINT, Some("sha256:english"), None),
                 Some("sha256:english"),
             ),
-            (
-                &certificate(FORMAT_VERSION, None, Some(native)),
-                None,
-            ),
+            (&certificate(FORMAT_VERSION, None, Some(native)), None),
         ] {
             assert!(
                 matches!(

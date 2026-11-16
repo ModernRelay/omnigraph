@@ -118,9 +118,8 @@ impl NodeType {
     /// `english_v1` when it declares none. `None` for a property with no
     /// full-text index.
     pub fn full_text_profile(&self, property: &str) -> Option<AnalyzerProfile> {
-        self.has_full_text_index(property).then(|| {
-            FullTextAnalysis::resolved(self.full_text_analysis.get(property)).profile()
-        })
+        self.has_full_text_index(property)
+            .then(|| FullTextAnalysis::resolved(self.full_text_analysis.get(property)).profile())
     }
 
     /// The scorer `property`'s full-text index declares: the default unless it
@@ -796,7 +795,9 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 indices
                     .iter()
                     .any(|columns| matches!(columns.as_slice(), [c] if *c == property.name))
-                    && properties.get(&property.name).and_then(PropType::index_kind)
+                    && properties
+                        .get(&property.name)
+                        .and_then(PropType::index_kind)
                         == Some(crate::types::PropIndexKind::FullText)
             })
             .map(|property| (property.name.clone(), property.full_text_fingerprint()))

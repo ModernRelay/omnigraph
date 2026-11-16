@@ -188,6 +188,9 @@ async fn every_gated_fusion_is_refused_before_the_gate() {
             text.contains("T86") && text.contains("an `rrf` arm over `bm25`"),
             "{name}: {text}"
         );
-        assert!(probes.rrf_gate_verdicts.lock().unwrap().is_empty(), "{name}");
+        assert!(
+            probes.rrf_gate_verdicts.lock().unwrap().is_empty(),
+            "{name}"
+        );
     }
 }

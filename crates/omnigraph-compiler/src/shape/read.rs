@@ -1637,7 +1637,8 @@ impl<'a> Shaper<'a> {
                 }),
             )),
             Term::Score { .. } => Err(ShapeError::Internal(
-                "a `Score` whose kind and query disagree, which the type checker never writes".into(),
+                "a `Score` whose kind and query disagree, which the type checker never writes"
+                    .into(),
             )),
             Term::Fuse { .. } => Ok((self.fused_population(body)?, Some(self.fused(body)?))),
             other => Ok((other, None)),

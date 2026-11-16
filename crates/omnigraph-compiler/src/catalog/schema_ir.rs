@@ -2196,7 +2196,10 @@ mod tests {
         let omitted = evolve(r#"node Doc { slug: String @key body: String @index(fulltext) }"#);
         assert!(!omitted.features.contains(FEATURE_FULL_TEXT_ANALYSIS));
         assert!(!schema_ir_json(&omitted).unwrap().contains("full_text"));
-        assert_eq!(property(&omitted, "body").full_text_fingerprint(), fingerprint);
+        assert_eq!(
+            property(&omitted, "body").full_text_fingerprint(),
+            fingerprint
+        );
 
         // The feature set is derived: a hand-authored IR whose set disagrees
         // with its declarations is refused, and so is an unknown feature.

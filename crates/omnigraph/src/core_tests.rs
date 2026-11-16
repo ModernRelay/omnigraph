@@ -94,10 +94,9 @@ mod fts_compat_tests {
             // The manifest's index details carry no stop list; the build's
             // parameters, which Lance writes into the index's own metadata,
             // name the profile's list, never Lance's default.
-            let params = serde_json::to_value(
-                crate::table_store::full_text_index_params(profile).unwrap(),
-            )
-            .unwrap();
+            let params =
+                serde_json::to_value(crate::table_store::full_text_index_params(profile).unwrap())
+                    .unwrap();
             let stop_list = profile.pipeline().stop_words().map(|words| {
                 words
                     .iter()

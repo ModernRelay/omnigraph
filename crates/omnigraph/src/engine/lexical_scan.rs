@@ -156,19 +156,26 @@ impl LexicalQuery {
             .filter(|edits| *edits <= MAX_EDITS)
             .ok_or_else(|| type_error(T71, format!("`max_edits: {max_edits}` is outside 0..=2")))?;
         let mut terms: Vec<String> = Vec::new();
-        analyzer.analyze(text, QUERY_MAX_BYTES, "lexical_query_bytes", true, |_| Ok(()), |token| {
-            if let Err(at) = terms.binary_search_by(|term| term.as_str().cmp(token)) {
-                if terms.len() == QUERY_MAX_TERMS {
-                    return Err(OmniError::resource_limit(
-                        "lexical_query_terms",
-                        QUERY_MAX_TERMS as u64,
-                        QUERY_MAX_TERMS as u64 + 1,
-                    ));
+        analyzer.analyze(
+            text,
+            QUERY_MAX_BYTES,
+            "lexical_query_bytes",
+            true,
+            |_| Ok(()),
+            |token| {
+                if let Err(at) = terms.binary_search_by(|term| term.as_str().cmp(token)) {
+                    if terms.len() == QUERY_MAX_TERMS {
+                        return Err(OmniError::resource_limit(
+                            "lexical_query_terms",
+                            QUERY_MAX_TERMS as u64,
+                            QUERY_MAX_TERMS as u64 + 1,
+                        ));
+                    }
+                    terms.insert(at, token.to_string());
                 }
-                terms.insert(at, token.to_string());
-            }
-            Ok(())
-        })?;
+                Ok(())
+            },
+        )?;
         if terms.is_empty() {
             return Err(type_error(
                 T20,
@@ -800,10 +807,17 @@ mod tests {
                 let mut tokens = |query: bool| {
                     let mut out = Vec::new();
                     analyzer
-                        .analyze(text, QUERY_MAX_BYTES, "lexical_query_bytes", query, |_| Ok(()), |token| {
-                            out.push(token.to_string());
-                            Ok(())
-                        })
+                        .analyze(
+                            text,
+                            QUERY_MAX_BYTES,
+                            "lexical_query_bytes",
+                            query,
+                            |_| Ok(()),
+                            |token| {
+                                out.push(token.to_string());
+                                Ok(())
+                            },
+                        )
                         .unwrap();
                     out
                 };

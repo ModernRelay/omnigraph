@@ -1288,7 +1288,9 @@ query nothing($q: String) {
     };
     let (rows, filtered) = run(&db, source, "filtered", &text("q", "engine")).await;
     assert_eq!(rows, 1);
-    let found = scanned(&filtered, |node| matches!(node, PhysicalNode::Filter { .. }));
+    let found = scanned(&filtered, |node| {
+        matches!(node, PhysicalNode::Filter { .. })
+    });
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!((found[0].1.rows, found[0].1.tokens), (3, 5));
 

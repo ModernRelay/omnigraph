@@ -290,24 +290,32 @@ impl LexicalScore {
     /// The score of the match `id`; `None` for an identity that does not
     /// match. An error before the scan ran.
     pub(crate) fn scores(&self) -> Result<&HashMap<String, f64>> {
-        self.scores.get().map(|scores| scores.as_ref()).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "the exact `bm25` over `{}` was read before its scan ran",
-                self.call
-            ))
-        })
+        self.scores
+            .get()
+            .map(|scores| scores.as_ref())
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "the exact `bm25` over `{}` was read before its scan ran",
+                    self.call
+                ))
+            })
     }
 }
 
 /// `input`, preceded by `answer`: the consumer's first poll runs `answer`
 /// before the input is pulled, and an error it returns is the stream's.
-pub(crate) fn answered_first<F>(input: SendableRecordBatchStream, answer: F) -> SendableRecordBatchStream
+pub(crate) fn answered_first<F>(
+    input: SendableRecordBatchStream,
+    answer: F,
+) -> SendableRecordBatchStream
 where
     F: std::future::Future<Output = Result<()>> + Send + 'static,
 {
     let schema = input.schema();
     let first = futures::stream::once(answer).filter_map(|answered| async move {
-        answered.err().map(|error| Err(super::operators::external(error)))
+        answered
+            .err()
+            .map(|error| Err(super::operators::external(error)))
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, first.chain(input)))
 }

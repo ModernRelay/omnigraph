@@ -393,9 +393,7 @@ impl IRExpr {
                 | Self::Literal(_, _)
                 | Self::AliasRef(_, _) => {}
                 Self::Nearest { query, .. } => pending.push(query),
-                Self::Bm25 { field, query, .. } => {
-                    pending.extend([field.as_ref(), query.as_ref()])
-                }
+                Self::Bm25 { field, query, .. } => pending.extend([field.as_ref(), query.as_ref()]),
                 Self::Rrf {
                     primary,
                     secondary,
@@ -436,9 +434,7 @@ impl IRExpr {
                 | Self::Literal(_, _)
                 | Self::AliasRef(_, _) => {}
                 Self::Nearest { query, .. } => pending.push(query),
-                Self::Bm25 { field, query, .. } => {
-                    pending.extend([field.as_ref(), query.as_ref()])
-                }
+                Self::Bm25 { field, query, .. } => pending.extend([field.as_ref(), query.as_ref()]),
                 Self::Rrf {
                     primary,
                     secondary,
@@ -481,9 +477,7 @@ impl IRExpr {
                     pending.push(query);
                 }
                 Self::Param(_, _) | Self::Literal(_, _) => {}
-                Self::Bm25 { field, query, .. } => {
-                    pending.extend([query.as_ref(), field.as_ref()])
-                }
+                Self::Bm25 { field, query, .. } => pending.extend([query.as_ref(), field.as_ref()]),
                 Self::Rrf {
                     primary,
                     secondary,

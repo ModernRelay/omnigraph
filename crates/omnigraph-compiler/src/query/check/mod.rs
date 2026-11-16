@@ -447,7 +447,11 @@ fn removed_lexical_call(c: &Call) -> QueryDiagnostic {
     let (Some(budget), Some((field, query))) = (budget, operands) else {
         return QueryDiagnostic::typecheck(T6, message).with_fix(format!(
             "match_terms(<field>, terms(<text>, mode: any{}))",
-            if name == "fuzzy" { ", max_edits: 2" } else { "" }
+            if name == "fuzzy" {
+                ", max_edits: 2"
+            } else {
+                ""
+            }
         ));
     };
     let replacement = match budget {

@@ -796,10 +796,6 @@ pub(super) enum NearestGatePlan {
     ProvenEmpty,
 }
 
-
-
-
-
 /// The columns the plan's scan projection names for one bound variable
 /// (`projection_pushdown`); a scan with no projection reads every
 /// non-blob column.

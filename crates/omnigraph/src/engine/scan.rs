@@ -192,8 +192,7 @@ impl<'n> NodeRead<'n> {
             },
             binding_columns,
         );
-        let proven_empty =
-            search_mode.answer_proven_empty;
+        let proven_empty = search_mode.answer_proven_empty;
         if !proven_empty {
             record_node_scan_projection(columns.read_projection().as_deref());
         }
@@ -609,9 +608,6 @@ pub(super) async fn execute_node_scan(
     Ok(scan_result)
 }
 
-
-
-
 /// The columns one node scan reads and emits. Blob properties are never `.gq`
 /// read values: typecheck refuses projecting, filtering, ordering or
 /// aggregating one, so a `.gq` node scan leaves their descriptors unread.
@@ -810,7 +806,6 @@ pub(super) fn add_null_blob_columns(
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(OmniError::arrow_internal)
 }
-
 
 /// Evaluate a constant in its stored type and require a non-null String.
 pub(super) fn resolve_to_string(expr: &IRExpr, params: &ParamMap) -> Result<String> {

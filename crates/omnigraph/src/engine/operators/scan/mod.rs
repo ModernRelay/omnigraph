@@ -115,13 +115,8 @@ impl ScanExec {
                 )?))
             }
             ScanSource::Table { mode, .. } => {
-                let schema = scan_output_schema(
-                    &type_name,
-                    &binding,
-                    &catalog,
-                    mode,
-                    projection.as_ref(),
-                )?;
+                let schema =
+                    scan_output_schema(&type_name, &binding, &catalog, mode, projection.as_ref())?;
                 if pipelined::streams(mode) {
                     ScanShape::Pipelined(Source::new(schema))
                 } else {

@@ -369,7 +369,7 @@ async fn maintain_indices_for_branch(
                     &|column| full_text_build(node, column),
                     &ds,
                 )
-                    .await?
+                .await?
             }
         };
         if !work.pending.is_empty() {

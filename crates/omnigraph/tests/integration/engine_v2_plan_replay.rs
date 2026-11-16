@@ -1421,10 +1421,8 @@ async fn a_window_ladder_replays_the_same_rungs() {
 async fn a_fusion_replays() {
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
-    let mut params = ParamMap::from([(
-        "r".to_string(),
-        Literal::List(vec![Literal::Float(1.0); 4]),
-    )]);
+    let mut params =
+        ParamMap::from([("r".to_string(), Literal::List(vec![Literal::Float(1.0); 4]))]);
     params.insert("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]));
     let Replayed {
         result,

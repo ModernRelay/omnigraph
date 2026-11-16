@@ -78,9 +78,8 @@ use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, skip};
 use crate::storage_layer::{
-    BLOB_READ_IO_BUFFER_BYTES, FullTextColumn, IndexBuildSpec,
-    KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, PendingScanBudget,
-    ProvenInsertChunk,
+    BLOB_READ_IO_BUFFER_BYTES, FullTextColumn, IndexBuildSpec, KEYED_WRITE_MAX_BYTES,
+    KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk,
 };
 use fts_compat::DeclaredAnalyzers;
 
@@ -6337,7 +6336,7 @@ impl TableStore {
                     &analysis.fingerprint,
                     native_full_text_build(),
                 )
-                    .await?;
+                .await?;
                 full_text_fields.extend(new_idx.fields.iter().copied());
             }
             if let IndexBuildSpec::Vector { .. } = spec {

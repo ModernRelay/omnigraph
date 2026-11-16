@@ -957,8 +957,7 @@ pub(super) fn validate_plan_values(
             }
         }
         for filter in pushed_filters {
-            if super::scan::ir_expr_to_df_expr(filter, params, None).is_none()
-            {
+            if super::scan::ir_expr_to_df_expr(filter, params, None).is_none() {
                 return Err(OmniError::manifest_internal(
                     "stored pushed filter cannot execute its recorded expression",
                 ));

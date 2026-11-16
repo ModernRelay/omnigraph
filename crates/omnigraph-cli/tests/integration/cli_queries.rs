@@ -1789,4 +1789,3 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     assert!(stderr.contains("error[Q002]:"), "{stderr}");
     assert!(stderr.contains("fix: query name()"), "{stderr}");
 }
-

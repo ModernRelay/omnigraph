@@ -796,11 +796,12 @@ fn lint_names_each_non_canonical_form_with_its_canonical_fix() {
         let found = named(source(from));
         assert_eq!(found.len(), 1, "{from}: {found:?}");
         let (_, fix) = &found[0];
-        let rewritten = source(from).replace(
-            &found_written(source(from), &found[0].0),
-            fix,
+        let rewritten = source(from).replace(&found_written(source(from), &found[0].0), fix);
+        assert_eq!(
+            lower(&rewritten),
+            lower(source(to)),
+            "{from} -> {rewritten}"
         );
-        assert_eq!(lower(&rewritten), lower(source(to)), "{from} -> {rewritten}");
         assert_eq!(named(source(to)), Vec::new(), "{to}");
     }
 }

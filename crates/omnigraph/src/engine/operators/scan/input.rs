@@ -9,8 +9,8 @@ use crate::engine::operators::LookupSpec;
 use crate::engine::operators::memory::WorkMemory;
 use crate::engine::operators::shape::{BatchSender, Flow, Streamed};
 use crate::engine::scan::{
-    ScanColumns, SearchColumns, add_null_blob_columns, hconcat_batches,
-    id_in_list_expr, ir_expr_to_df_expr,
+    ScanColumns, SearchColumns, add_null_blob_columns, hconcat_batches, id_in_list_expr,
+    ir_expr_to_df_expr,
 };
 use crate::error::OmniError;
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
@@ -285,8 +285,7 @@ async fn hydrate_nodes(
         .map_err(|error| memory.error(error))?;
     let mut filter_expr = id_in_list_expr(ids, catalog.system_columns.id);
     for filter in dst_filters {
-        if let Some(expr) = ir_expr_to_df_expr(filter, params, Some(&node_type.arrow_schema))
-        {
+        if let Some(expr) = ir_expr_to_df_expr(filter, params, Some(&node_type.arrow_schema)) {
             crate::instrumentation::record_pushed_filter_exprs(1);
             filter_expr = filter_expr.and(expr);
         } else {

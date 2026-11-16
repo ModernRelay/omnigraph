@@ -2475,7 +2475,12 @@ async fn uncertified_full_text_refuses_raw_token_filters_but_no_query() {
     let entry = snapshot.dataset("node:Doc").unwrap();
     let dataset = snapshot.open_dataset("node:Doc").await.unwrap();
     let indices = dataset.load_indices().await.unwrap();
-    let queries = ["text_search", "fuzzy_search", "phrase_search", "bm25_search"];
+    let queries = [
+        "text_search",
+        "fuzzy_search",
+        "phrase_search",
+        "bm25_search",
+    ];
     let rows = async |db: &Session| {
         let mut out = Vec::new();
         for query in queries {
@@ -2487,7 +2492,10 @@ async fn uncertified_full_text_refuses_raw_token_filters_but_no_query() {
         out
     };
     let certified = rows(&db).await;
-    assert!(certified.iter().all(|slugs| !slugs.is_empty()), "{certified:?}");
+    assert!(
+        certified.iter().all(|slugs| !slugs.is_empty()),
+        "{certified:?}"
+    );
     for index in indices.iter().filter(|index| {
         index.files.as_ref().is_some_and(|files| {
             files
