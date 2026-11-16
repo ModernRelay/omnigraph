@@ -13,42 +13,37 @@ use crate::catalog::Catalog;
 use crate::catalog::schema_ir::SYSTEM_COLUMNS_META;
 use crate::error::Result;
 use crate::ir::core::{AssignValue, CoreDecl, LexicalQuery, ScoreQuery, Sink, Term};
-use crate::ir::expr::IRExpr;
+use crate::ir::expr::{IRExpr, ScalarFunc};
 use crate::ir::{coerce, fold};
 use crate::query::value::{BinaryOp, CompOp, Literal};
 use crate::traversal::{EDGE_TYPE_COLUMN, EDGE_TYPE_META, EdgeSelection};
 use crate::types::ExprType;
 
-/// What a variable of the declaration binds: a node, or an edge of these
-/// types.
-#[derive(Debug, Clone)]
+/// What a variable binds in one scope: a node, or an edge of these types.
+#[derive(Debug, Clone, PartialEq)]
 enum Bound {
     Node,
     Edge(Vec<String>),
 }
 
+/// The variables one term's rows carry, by name. Each scope has its own: a
+/// write group's, a block's, an `optional`'s or a union arm's names never
+/// reach a sibling scope that reuses them.
+type Scope = HashMap<String, Bound>;
+
 struct Binder<'a> {
     catalog: &'a Catalog,
-    bound: HashMap<String, Bound>,
 }
 
 /// Bind every expression of `decl` in place.
 pub(super) fn bind_decl(catalog: &Catalog, decl: &mut CoreDecl) -> Result<()> {
-    let mut binder = Binder {
-        catalog,
-        bound: HashMap::new(),
-    };
+    let binder = Binder { catalog };
     match decl {
-        CoreDecl::Read(read) => {
-            binder.collect(&read.term);
-            binder.term(&mut read.term)
-        }
+        CoreDecl::Read(read) => binder.term(&mut read.term, &Scope::new()).map(|_| ()),
         CoreDecl::Write(write) => {
-            for group in &write.groups {
-                binder.collect(&group.input);
-            }
             for group in &mut write.groups {
-                binder.term(&mut group.input)?;
+                // A group's statements read the names its own selection binds.
+                let scope = binder.term(&mut group.input, &Scope::new())?;
                 for sink in &mut group.sinks {
                     let assignments = match sink {
                         Sink::Insert { assignments, .. } | Sink::Update { assignments, .. } => {
@@ -58,7 +53,7 @@ pub(super) fn bind_decl(catalog: &Catalog, decl: &mut CoreDecl) -> Result<()> {
                     };
                     for (_, value) in assignments {
                         if let AssignValue::Expr(e) = value {
-                            *e = binder.expr(e)?;
+                            *e = binder.expr(e, &scope)?;
                         }
                     }
                 }
@@ -68,99 +63,161 @@ pub(super) fn bind_decl(catalog: &Catalog, decl: &mut CoreDecl) -> Result<()> {
     }
 }
 
-impl Binder<'_> {
-    /// Every variable the term binds: a scanned node or edge type, an
-    /// expansion's destination and its edge.
-    fn collect(&mut self, term: &Term) {
-        match term {
-            Term::Scan { var, ty } => {
-                let bound = match ty {
-                    crate::ir::core::Ty::Edge { type_name, .. } => {
-                        Bound::Edge(type_name.split('|').map(str::to_string).collect())
+/// What a column of type `ty` binds, if it is a reference.
+fn bound_of(ty: &crate::ir::core::Ty) -> Option<Bound> {
+    match ty {
+        crate::ir::core::Ty::Edge { type_name, .. } => Some(Bound::Edge(
+            type_name.split('|').map(str::to_string).collect(),
+        )),
+        crate::ir::core::Ty::Node { .. } => Some(Bound::Node),
+        crate::ir::core::Ty::Value(_) => None,
+    }
+}
+
+/// The columns of `cols` that are references.
+fn scope_of(cols: &[crate::ir::core::Col]) -> Scope {
+    cols.iter()
+        .filter_map(|c| bound_of(&c.ty).map(|b| (c.name.clone(), b)))
+        .collect()
+}
+
+/// `b`'s names joined into `a`: a name both bind as edges binds every type
+/// either does.
+fn merge(mut a: Scope, b: Scope) -> Scope {
+    for (name, bound) in b {
+        match (a.get_mut(&name), bound) {
+            (Some(Bound::Edge(types)), Bound::Edge(more)) => {
+                for t in more {
+                    if !types.contains(&t) {
+                        types.push(t);
                     }
-                    _ => Bound::Node,
-                };
-                self.bound.insert(var.clone(), bound);
+                }
             }
+            (Some(_), _) => {}
+            (None, bound) => {
+                a.insert(name, bound);
+            }
+        }
+    }
+    a
+}
+
+/// The projected columns that are references: an item that is a variable
+/// of `scope` binds the item's name.
+fn projected(scope: &Scope, items: &[(String, IRExpr)]) -> Scope {
+    items
+        .iter()
+        .filter_map(|(name, e)| match e {
+            IRExpr::Variable(v, _) => scope.get(v).map(|b| (name.clone(), b.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+impl Binder<'_> {
+    /// Bind `term`'s expressions, each in the scope of the rows it reads,
+    /// and return the names `term`'s rows carry. `outer` is the scope a
+    /// correlated term's `Env` leaf and a call's arguments read.
+    fn term(&self, term: &mut Term, outer: &Scope) -> Result<Scope> {
+        Ok(match term {
+            Term::Unit => Scope::new(),
+            Term::Env(cols) => scope_of(cols),
+            Term::RecRef { ty, .. } => scope_of(&ty.cols),
+            Term::Scan { var, ty } => bound_of(ty)
+                .map(|b| Scope::from([(var.clone(), b)]))
+                .unwrap_or_default(),
             Term::Expand {
+                input,
                 dst,
                 edges,
                 edge_var,
                 ..
             } => {
-                self.bound.insert(dst.clone(), Bound::Node);
+                let mut scope = self.term(input, outer)?;
+                scope.insert(dst.clone(), Bound::Node);
                 if let Some(e) = edge_var {
-                    self.bound.insert(e.clone(), Bound::Edge(edge_types(edges)));
+                    scope.insert(e.clone(), Bound::Edge(edge_types(edges)));
                 }
+                scope
             }
-            _ => {}
-        }
-        for child in term.children() {
-            self.collect(child);
-        }
-    }
-
-    fn term(&self, term: &mut Term) -> Result<()> {
-        match term {
-            Term::Filter { pred, .. } => *pred = self.expr(pred)?,
-            Term::Project { items, .. } => {
-                for (_, e) in items {
-                    *e = self.expr(e)?;
+            Term::Filter { input, pred } => {
+                let scope = self.term(input, outer)?;
+                *pred = self.expr(pred, &scope)?;
+                scope
+            }
+            Term::Project { input, items, keep } => {
+                let scope = self.term(input, outer)?;
+                for (_, e) in items.iter_mut() {
+                    *e = self.expr(e, &scope)?;
                 }
+                let out = projected(&scope, items);
+                if *keep { merge(scope, out) } else { out }
             }
-            Term::Group { keys, aggs, .. } => {
-                for (_, e) in keys {
-                    *e = self.expr(e)?;
+            Term::Group { input, keys, aggs } => {
+                let scope = self.term(input, outer)?;
+                for (_, e) in keys.iter_mut() {
+                    *e = self.expr(e, &scope)?;
                 }
                 for (_, agg) in aggs {
                     if let Some(arg) = &mut agg.arg {
-                        *arg = self.expr(arg)?;
+                        *arg = self.expr(arg, &scope)?;
                     }
                 }
+                projected(&scope, keys)
             }
-            Term::Order { keys, .. } => {
+            Term::Order { input, keys } => {
+                let scope = self.term(input, outer)?;
                 for (e, _) in keys {
-                    *e = self.expr(e)?;
+                    *e = self.expr(e, &scope)?;
                 }
+                scope
             }
-            Term::Score { query, .. } => match query {
-                ScoreQuery::Vector(e) => *e = self.expr(e)?,
-                ScoreQuery::Lexical(LexicalQuery {
-                    text, max_edits, ..
-                }) => {
-                    *text = self.expr(text)?;
-                    *max_edits = self.expr(max_edits)?;
+            Term::Cut { input, .. } => self.term(input, outer)?,
+            Term::Score { input, query, .. } => {
+                let scope = self.term(input, outer)?;
+                match query {
+                    ScoreQuery::Vector(e) => *e = self.expr(e, &scope)?,
+                    ScoreQuery::Lexical(LexicalQuery {
+                        text, max_edits, ..
+                    }) => {
+                        *text = self.expr(text, &scope)?;
+                        *max_edits = self.expr(max_edits, &scope)?;
+                    }
                 }
-            },
-            Term::ApproxTopK { query, .. } => *query = self.expr(query)?,
-            Term::Call { bindings, .. } => {
-                for (_, e) in bindings {
-                    *e = self.expr(e)?;
-                }
+                scope
             }
-            _ => {}
-        }
-        match term {
-            Term::Unit | Term::Env(_) | Term::Scan { .. } | Term::RecRef { .. } => Ok(()),
-            Term::Expand { input, .. }
-            | Term::Filter { input, .. }
-            | Term::Project { input, .. }
-            | Term::Group { input, .. }
-            | Term::Order { input, .. }
-            | Term::Cut { input, .. }
-            | Term::Score { input, .. }
-            | Term::ApproxTopK { input, .. } => self.term(input),
-            Term::Correlate { outer, inner } => {
-                self.term(outer)?;
-                self.term(inner)
+            Term::ApproxTopK { input, query, .. } => {
+                let scope = self.term(input, outer)?;
+                *query = self.expr(query, &scope)?;
+                scope
+            }
+            Term::Correlate { outer: left, inner } => {
+                let scope = self.term(left, outer)?;
+                let joined = self.term(inner, &scope)?;
+                merge(scope, joined)
             }
             Term::Union { left, right } => {
-                self.term(left)?;
-                self.term(right)
+                let l = self.term(left, outer)?;
+                let r = self.term(right, outer)?;
+                merge(l, r)
             }
-            Term::Fuse { arms, .. } => arms.iter_mut().try_for_each(|a| self.term(a)),
-            Term::Fix { body, .. } | Term::Call { body, .. } => self.term(body),
-        }
+            Term::Fuse { arms, .. } => {
+                let mut scope = Scope::new();
+                for arm in arms {
+                    let arm_scope = self.term(arm, outer)?;
+                    scope = merge(scope, arm_scope);
+                }
+                scope
+            }
+            Term::Call { bindings, body, .. } => {
+                // The arguments are the caller's; the body is its own scope.
+                for (_, e) in bindings {
+                    *e = self.expr(e, outer)?;
+                }
+                self.term(body, &Scope::new())?
+            }
+            Term::Fix { body, .. } => self.term(body, outer)?,
+        })
     }
 
     /// A reference's identity column as a String leaf.
@@ -192,12 +249,12 @@ impl Binder<'_> {
     /// A comparison operand as [`coerce`] takes it: without the widening
     /// cast the type checker put on it, and a numeric literal at its own
     /// type, so the comparison's casts are `coerce`'s to choose.
-    fn operand(&self, e: &IRExpr) -> Result<IRExpr> {
+    fn operand(&self, e: &IRExpr, scope: &Scope) -> Result<IRExpr> {
         let e = match e {
             IRExpr::Cast { expr, .. } => expr,
             other => other,
         };
-        Ok(match self.expr(e)? {
+        Ok(match self.expr(e, scope)? {
             IRExpr::Literal(lit, ty) => {
                 let own = match &lit {
                     Literal::Integer(_) | Literal::Float(_) => literal_type(&lit).ok(),
@@ -211,8 +268,8 @@ impl Binder<'_> {
         })
     }
 
-    fn expr(&self, e: &IRExpr) -> Result<IRExpr> {
-        let b = |x: &IRExpr| self.expr(x).map(Box::new);
+    fn expr(&self, e: &IRExpr, scope: &Scope) -> Result<IRExpr> {
+        let b = |x: &IRExpr| self.expr(x, scope).map(Box::new);
         Ok(match e {
             IRExpr::PropAccess {
                 variable,
@@ -220,10 +277,36 @@ impl Binder<'_> {
                 ty,
             } => {
                 if property == EDGE_TYPE_META
-                    && let Some(Bound::Edge(types)) = self.bound.get(variable)
+                    && let Some(Bound::Edge(types)) = scope.get(variable)
                     && let [name] = types.as_slice()
                 {
-                    return Ok(IRExpr::Literal(Literal::String(name.clone()), ty.clone()));
+                    // A single-type edge's rows carry no type column: its
+                    // type is its name, and null on a row where the edge is
+                    // null (an `optional` with no match).
+                    let name = IRExpr::Literal(Literal::String(name.clone()), ty.clone());
+                    if !ty.nullable() {
+                        return Ok(name);
+                    }
+                    let present = IRExpr::IsNull {
+                        expr: Box::new(IRExpr::PropAccess {
+                            variable: variable.clone(),
+                            property: self.catalog.system_columns.id.to_string(),
+                            ty: ExprType::from_prop(&crate::types::PropType::scalar(
+                                crate::types::ScalarType::String,
+                                true,
+                            )),
+                        }),
+                        negated: true,
+                        ty: ExprType::from_prop(&crate::types::PropType::scalar(
+                            crate::types::ScalarType::Bool,
+                            false,
+                        )),
+                    };
+                    return Ok(IRExpr::Call {
+                        func: ScalarFunc::If,
+                        args: vec![present, name, IRExpr::Literal(Literal::Null, ty.clone())],
+                        ty: ty.clone(),
+                    });
                 }
                 IRExpr::PropAccess {
                     variable: variable.clone(),
@@ -236,7 +319,7 @@ impl Binder<'_> {
                 op: BinaryOp::Compare(CompOp::Contains),
                 right,
                 ..
-            } => coerce::in_list(self.operand(left)?, self.operand(right)?)?,
+            } => coerce::in_list(self.operand(left, scope)?, self.operand(right, scope)?)?,
             // Two references compare by identity: their `@id` columns.
             IRExpr::Binary {
                 left,
@@ -251,13 +334,13 @@ impl Binder<'_> {
                 op: op @ BinaryOp::Compare(_),
                 right,
                 ..
-            } => coerce::binary(self.operand(left)?, *op, self.operand(right)?)?,
+            } => coerce::binary(self.operand(left, scope)?, *op, self.operand(right, scope)?)?,
             IRExpr::Binary {
                 left,
                 op: op @ (BinaryOp::And | BinaryOp::Or),
                 right,
                 ..
-            } => coerce::binary(self.expr(left)?, *op, self.expr(right)?)?,
+            } => coerce::binary(self.expr(left, scope)?, *op, self.expr(right, scope)?)?,
             IRExpr::Binary {
                 left,
                 op,
@@ -269,8 +352,10 @@ impl Binder<'_> {
                 right: b(right)?,
                 ty: ty.clone(),
             },
-            IRExpr::Not(inner, _) => fold::not(self.expr(inner)?),
-            IRExpr::IsNull { expr, negated, .. } => fold::is_null(self.expr(expr)?, *negated),
+            IRExpr::Not(inner, _) => fold::not(self.expr(inner, scope)?),
+            IRExpr::IsNull { expr, negated, .. } => {
+                fold::is_null(self.expr(expr, scope)?, *negated)
+            }
             IRExpr::Neg { expr, ty } => IRExpr::Neg {
                 expr: b(expr)?,
                 ty: ty.clone(),
@@ -281,7 +366,10 @@ impl Binder<'_> {
             },
             IRExpr::Call { func, args, ty } => IRExpr::Call {
                 func: *func,
-                args: args.iter().map(|a| self.expr(a)).collect::<Result<_>>()?,
+                args: args
+                    .iter()
+                    .map(|a| self.expr(a, scope))
+                    .collect::<Result<_>>()?,
                 ty: ty.clone(),
             },
             IRExpr::Aggregate {
