@@ -4214,6 +4214,20 @@ impl Ctx<'_> {
                 ),
             ));
         }
+        // Arguments bind by position, so every parameter past the last
+        // argument takes its default; one without a default is missing.
+        if let Some(missing) = decl.params[c.args.len()..]
+            .iter()
+            .find(|p| p.default.is_none())
+        {
+            return Err(err(
+                T7,
+                format!(
+                    "`{}`'s parameter `${}` has no default and no argument; arguments bind by position, so pass every parameter up to the last one without a default",
+                    c.name, missing.name
+                ),
+            ));
+        }
         let mut bindings = Vec::new();
         for (i, (pname, pty)) in params.iter().enumerate() {
             let v = match c.args.get(i) {
@@ -4266,7 +4280,9 @@ impl Ctx<'_> {
                     v
                 }
                 None => {
-                    let d = decl.params[i].default.as_ref().unwrap();
+                    let Some(d) = decl.params[i].default.as_ref() else {
+                        unreachable!("a parameter past the arguments has a default (checked above)")
+                    };
                     SExpr::new(SKind::Lit(default_value(d)), Ty::Value(pty.clone()))
                 }
             };

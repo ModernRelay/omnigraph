@@ -5,6 +5,7 @@
 # notes: as an inline read's do. It is binding, not textual substitution: an
 # notes: argument reading a caller variable whose name the body also binds
 # notes: still reads the caller's, and the body's own names stay inside it.
+# notes: A call that leaves out a parameter with no default, after a defaulted one, is refused (T7).
 
 --- runner
 timeout_ms: 10000
@@ -147,3 +148,16 @@ query thirty_and_over() {
 --- expect shape
 p.handle: String
 years: I32?
+
+--- query
+query aged_between($lo: I32 = 30, $hi: I32) {
+    match { $p: Person }
+    where $p.age >= $lo and $p.age < $hi
+    return { $p }
+}
+query under_forty() {
+    match { from aged_between(40) }
+    return { $p.handle }
+}
+
+--- expect error: T7
