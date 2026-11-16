@@ -2902,8 +2902,11 @@ query widen($title: String) {
 /// the update's `<key> = v` match adds the derived id conjunct, and an upsert
 /// whose rows are all new or all present skips Lance's full-table merge
 /// join. Their calls do not follow the fragment count. The rows of the two
-/// sizes differ only in one GET of `KeyedInsert`, the first write after the
-/// reopen, which the forced join paid as well (it read 10 and 25). At 2
+/// sizes differ only in three GETs of `KeyedInsert`, the first write after the
+/// reopen: one the forced join paid as well (it read 10 and 25), and two
+/// because at 16 fragments the table's manifest outgrows the 4 KiB tail Lance
+/// reads first (its index section lists the key's full-text, NGRAM and BTREE
+/// indexes), so Lance reads the index section with its own HEAD and GET. At 2
 /// fragments the two writes before `MergeLoadPresent` leave as many fragments
 /// uncovered as covered, so it keeps the join; each write after the first
 /// finds the dataset the previous one committed in the handle cache, so that
@@ -3021,6 +3024,100 @@ query update_one() {
         ));
     }
     rows
+}
+
+/// The scalar index kinds `@index` builds beside BTREE
+/// (docs/rfcs/2026-11-07-gq-3.md section 4): one reconciliation that builds
+/// an enum's and a `Bool`'s BITMAP, a list's LABEL_LIST and a String's
+/// NGRAM, BTREE and full-text index together (`ScalarKindsBuild`), then on a
+/// reopened handle one read probing each kind: an enum equality through the
+/// BITMAP, a list membership through the LABEL_LIST and a `contains` through
+/// the NGRAM, whose candidates Lance rechecks.
+fn scalar_index_kind_cost_rows(replay: &str) -> String {
+    const SCHEMA: &str = "node Item {\n    slug: String @key\n    status: enum(open, closed) @index\n    done: Bool @index\n    tags: [String] @index\n    note: String @index\n}\n";
+    const READS: &str = r#"
+query by_status() {
+    match { $i: Item } where $i.status = "open"
+    return { $i.slug }
+}
+query by_tag() {
+    match { $i: Item } where "rust" in $i.tags
+    return { $i.slug }
+}
+query by_substring() {
+    match { $i: Item } where contains($i.note, "graph")
+    return { $i.slug }
+}
+"#;
+    const LABELS: [&str; 4] = [
+        "ScalarKindsBuild",
+        "ScalarKindsBitmapRead",
+        "ScalarKindsLabelListRead",
+        "ScalarKindsNgramRead",
+    ];
+
+    struct ScalarKindCost;
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for ScalarKindCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_scalar_kinds_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let rows = (0..16)
+                .map(|n| {
+                    let status = if n % 2 == 0 { "open" } else { "closed" };
+                    let tag = if n % 4 == 0 { "rust" } else { "go" };
+                    let note = if n % 3 == 0 { "graph engines" } else { "search" };
+                    format!(
+                        r#"{{"type":"Item","data":{{"slug":"i{n:02}","status":"{status}","done":{},"tags":["{tag}"],"note":"{note} {n}"}}}}"#,
+                        n % 5 == 0
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            db.load_jsonl(&rows, LoadMode::Append).await.unwrap();
+            omnigraph_dst::cost::set_label(LABELS[0]);
+            db.ensure_indices_as(None).await.unwrap();
+            drop(db);
+            omnigraph_dst::cost::set_label("_scalar_kinds_setup");
+            let db = session(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            );
+            let params = omnigraph_compiler::ir::ParamMap::new();
+            for (label, query, expected) in [
+                (LABELS[1], "by_status", 8),
+                (LABELS[2], "by_tag", 4),
+                (LABELS[3], "by_substring", 6),
+            ] {
+                omnigraph_dst::cost::set_label(label);
+                let result = query_main(&db, READS, query, &params).await;
+                omnigraph_dst::cost::set_label("_scalar_kinds_verify");
+                assert_eq!(result.unwrap().num_rows(), expected, "{query}");
+            }
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-scalar-kind-cost-{replay}"),
+        &ScalarKindCost,
+        &LABELS,
+    )
 }
 
 /// A keyed lookup and a one-hop traversal on main, in the order a served
@@ -4536,6 +4633,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&carried_write_cost_rows("a"));
     table.push_str(&writer_claim_cost_rows("a"));
     table.push_str(&analyzer_redeclaration_cost_rows("a"));
+    table.push_str(&scalar_index_kind_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -4555,6 +4653,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&carried_write_cost_rows("b"));
     table2.push_str(&writer_claim_cost_rows("b"));
     table2.push_str(&analyzer_redeclaration_cost_rows("b"));
+    table2.push_str(&scalar_index_kind_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"
