@@ -33,7 +33,11 @@ query secondary_key_breaks_fused_tie() {
     limit 1
 }
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"zz"}
+
+--- expect shape
+d.slug: String
 
 --- query
 query id_breaks_fused_tie() {
@@ -43,7 +47,11 @@ query id_breaks_fused_tie() {
     limit 1
 }
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"aa"}
+
+--- expect shape
+d.slug: String
 
 --- query
 query secondary_key_orders_fanout_rows() {
@@ -58,4 +66,8 @@ query secondary_key_orders_fanout_rows() {
     limit 1
 }
 
---- expect error: type error: T86:
+--- expect ordered
+{"c.slug":"zz"}
+
+--- expect shape
+c.slug: String

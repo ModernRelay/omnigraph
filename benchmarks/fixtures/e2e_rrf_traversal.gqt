@@ -1,5 +1,5 @@
 # issue: none
-# notes: Seven text chunks, one artifact and three edges. Four high-ranked alpha decoys have no edge; complete BM25 rankings make x win. Auto RRF planning only; forced-plan process settings and isolated expression construction are not reproduced.
+# notes: Seven text chunks, one artifact and three edges. Four high-ranked alpha decoys have no edge; complete BM25 rankings make x win. Both arms are exact `bm25` scores over every chunk; the traversal after the fusion keeps x.
 
 --- runner
 timeout_ms: 60000
@@ -50,4 +50,12 @@ query recall_two_terms($q1: String, $q2: String) {
 --- params
 {"q1":"alpha","q2":"beta"}
 
---- expect error: type error: T86:
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection named [ChunkOfArtifact out]
+fuse $c: arms [bm25, bm25]

@@ -14,7 +14,7 @@ environments:
 --- schema
 node Person {
     name: String @key
-    text: String @index
+    text: String @index(fulltext, analyzer = "standard_v1")
 }
 edge Knows: Person -> Person
 edge Likes: Person -> Person
@@ -38,7 +38,20 @@ query fused_types() {
     limit 2
 }
 
---- expect error: type error: T86:
+--- expect unordered
+{"edge_type":"Knows","edge_id":"shared"}
+{"edge_type":"Likes","edge_id":"shared"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- expect plan
+expand $p $q: selection alternation [Knows out, Likes out]
+fuse $p: arms [bm25, bm25]
+sort tiebreak [$p, $q, $e.@type, $e.@id]
+
+--- expect same as reference
 
 --- query
 query fused_type_page() {
@@ -53,7 +66,14 @@ query fused_type_page() {
     limit 1
 }
 
---- expect error: type error: T86:
+--- expect unordered
+{"edge_type":"Knows","edge_id":"shared"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- expect same as reference
 
 --- query
 query fused_wildcard_type_page() {
@@ -69,4 +89,16 @@ query fused_wildcard_type_page() {
     limit 1
 }
 
---- expect error: type error: T86:
+--- expect unordered
+{"edge_type":"Knows","edge_id":"shared"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- expect plan
+expand $p $q: selection wildcard [Knows out, Likes out]
+fuse $p: arms [bm25, bm25]
+sort tiebreak [$p, $q, $e.@type, $e.@id]
+
+--- expect same as reference

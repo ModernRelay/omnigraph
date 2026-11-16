@@ -152,7 +152,13 @@ query rrf_threshold_expression($v: Vector(2), $q: String) {
 --- params
 {"v":[1.0,0.0],"q":"needle"}
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"a","high":true}
+{"d.slug":"b","high":false}
+
+--- expect shape
+d.slug: String
+high: Bool
 
 --- query
 set engine = v2;
@@ -166,7 +172,13 @@ query rrf_threshold_alias($v: Vector(2), $q: String) {
 --- params
 {"v":[1.0,0.0],"q":"needle"}
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"a","high":true}
+{"d.slug":"b","high":false}
+
+--- expect shape
+d.slug: String
+high: Bool
 
 --- query
 set engine = v2;

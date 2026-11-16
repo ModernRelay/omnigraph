@@ -8234,4 +8234,8 @@ query fused($t: String) {
 --- params
 {"t":"needle"}
 
---- expect error: type error: T86:
+--- expect unordered
+{"d.slug":"best"}
+
+--- expect shape
+d.slug: String

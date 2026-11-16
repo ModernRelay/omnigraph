@@ -11,7 +11,7 @@ environments:
 --- schema
 node Doc {
     slug: String @key
-    body: String @index
+    body: String @index(fulltext, analyzer = "standard_v1")
     embedding: Vector(2) @index
 }
 node Topic {
@@ -33,4 +33,9 @@ query ranked_destination() {
     order { $score desc }
     limit 1
 }
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"d1"}
+--- expect shape
+d.slug: String
+
+--- expect same as reference

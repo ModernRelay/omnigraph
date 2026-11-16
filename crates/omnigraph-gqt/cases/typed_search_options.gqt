@@ -1,6 +1,7 @@
 # issue: none
 # notes: Supplied search options must fit their API range; only absent options use defaults.
-# notes: Nullable query and option parameters refuse null before search execution.
+# notes: Nullable query and option parameters refuse null before search execution. An `rrf` `k:`
+# notes: parameter is refused outside 1..=1000000 as the read runs, both bounds admitted.
 # notes: The `rrf` arms differ only in repeating the term, since identical arms are a type error; both select the one Doc.
 
 --- runner
@@ -12,7 +13,7 @@ environments:
 --- schema
 node Doc {
     key: String @key
-    text: String @index
+    text: String @index(fulltext, analyzer = "standard_v1")
     embedding: Vector(2)
 }
 
@@ -59,7 +60,7 @@ query null_rrf_option($k: I64?) {
 }
 --- params
 {"k":null}
---- expect error: type error: T86:
+--- expect error: search option must resolve to a non-null integer
 
 --- query
 set engine = v2;
@@ -71,7 +72,7 @@ query zero_rrf_option($k: I64) {
 }
 --- params
 {"k":0}
---- expect error: type error: T86:
+--- expect error: rrf k must be an integer in 1..=1000000
 
 --- query
 set engine = v2;
@@ -83,7 +84,36 @@ query oversized_rrf_option($k: U64) {
 }
 --- params
 {"k":4294967296}
---- expect error: type error: T86:
+--- expect error: rrf k must be an integer in 1..=1000000
+
+--- query
+set engine = v2;
+query bound_rrf_option($k: I64) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
+    return { $d.key }
+    order { $score desc }
+    limit 1
+}
+--- params
+{"k":1000001}
+--- expect error: rrf k must be an integer in 1..=1000000, got 1000001
+
+--- query
+set engine = v2;
+query largest_rrf_option($k: I64) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
+    return { $d.key }
+    order { $score desc }
+    limit 1
+}
+--- params
+{"k":1000000}
+--- expect unordered
+{"d.key":"a"}
+--- expect shape
+d.key: String
+
+--- expect same as reference
 
 --- query
 set engine = v2;
@@ -95,7 +125,12 @@ query typed_rrf_option($k: U32) {
 }
 --- params
 {"k":5}
---- expect error: type error: T86:
+--- expect unordered
+{"d.key":"a"}
+--- expect shape
+d.key: String
+
+--- expect same as reference
 
 --- query
 set engine = v2;

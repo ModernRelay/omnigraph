@@ -5,8 +5,9 @@
 # notes: reference interpreter. The field declares an analyzer, so the exact lexical scan answers
 # notes: it: `bm25` is `bm25_v1` in F64, its projected scores equal the reference's, and `bm25` over
 # notes: `terms(…)` asking for every term or an edit budget runs, as does `match_terms` with an
-# notes: edit budget. An `rrf` arm over that `bm25` is not lowered yet (`T86`): the fusion ranks
-# notes: its arms on ranked scans, and the exact score is a step over the population.
+# notes: edit budget. An `rrf` of a `nearest` arm and that `bm25` fuses the window d1, d3, d6, d4
+# notes: with the exact ranks d4, d1, d2 (shorter documents score higher): d1 leads, d4 follows, and
+# notes: d2 and d6, tied at 1/63, take the written `$d.slug` key.
 
 --- runner
 timeout_ms: 10000
@@ -205,7 +206,17 @@ query q() {
     order { $score desc, $d.slug }
 }
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"d1"}
+{"d.slug":"d4"}
+{"d.slug":"d3"}
+{"d.slug":"d2"}
+{"d.slug":"d6"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
 
 --- query
 query q() {

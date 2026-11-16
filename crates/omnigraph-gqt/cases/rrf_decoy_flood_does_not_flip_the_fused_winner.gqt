@@ -11,7 +11,7 @@ environments:
 --- schema
 node Chunk {
     slug: String @key
-    text: String @index
+    text: String @index(fulltext, analyzer = "standard_v1")
 }
 
 node Artifact {
@@ -51,7 +51,17 @@ query recall_two_terms($q1: String, $q2: String) {
 --- params
 {"q1":"alpha","q2":"beta"}
 
---- expect error: type error: T86:
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection named [ChunkOfArtifact out]
+fuse $c: arms [bm25, bm25]
+
+--- expect same as reference
 
 --- query
 query recall_alternation($q1: String, $q2: String) {
@@ -71,7 +81,18 @@ query recall_alternation($q1: String, $q2: String) {
 --- params
 {"q1":"alpha","q2":"beta"}
 
---- expect error: type error: T86:
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection alternation [ChunkOfArtifact out]
+fuse $c: arms [bm25, bm25]
+expand $c $a: mode indexed_scan ran indexed_scan
+
+--- expect same as reference
 
 --- query
 query recall_wildcard($q1: String, $q2: String) {
@@ -91,4 +112,15 @@ query recall_wildcard($q1: String, $q2: String) {
 --- params
 {"q1":"alpha","q2":"beta"}
 
---- expect error: type error: T86:
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection wildcard [ChunkOfArtifact out]
+fuse $c: arms [bm25, bm25]
+expand $c $a: mode indexed_scan ran indexed_scan
+--- expect same as reference
+

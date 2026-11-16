@@ -47,7 +47,7 @@ query operators() {
 {"o.name":"OptionalJoin","o.inputs":[2]}
 {"o.name":"Correlate","o.inputs":[1,2]}
 {"o.name":"OuterReference","o.inputs":[0]}
-{"o.name":"RankFuse","o.inputs":[2]}
+{"o.name":"Fuse","o.inputs":[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]}
 {"o.name":"Projection","o.inputs":[1]}
 {"o.name":"Aggregate","o.inputs":[1]}
 {"o.name":"Sort","o.inputs":[1]}
@@ -108,6 +108,7 @@ query logical_kinds() {
 {"k.name":"Expand","k.coverage":"refused_by_name"}
 {"k.name":"Filter","k.coverage":"routable"}
 {"k.name":"FragmentWrite","k.coverage":"refused_by_name"}
+{"k.name":"Fuse","k.coverage":"refused_by_name"}
 {"k.name":"Join","k.coverage":"routable"}
 {"k.name":"Let","k.coverage":"refused_by_name"}
 {"k.name":"Limit","k.coverage":"routable"}
@@ -117,7 +118,6 @@ query logical_kinds() {
 {"k.name":"OptionalJoin","k.coverage":"refused_by_name"}
 {"k.name":"OuterReference","k.coverage":"refused_by_name"}
 {"k.name":"Projection","k.coverage":"routable"}
-{"k.name":"RankFuse","k.coverage":"refused_by_name"}
 {"k.name":"RowDiff","k.coverage":"routable"}
 {"k.name":"Score","k.coverage":"refused_by_name"}
 {"k.name":"Sort","k.coverage":"routable"}

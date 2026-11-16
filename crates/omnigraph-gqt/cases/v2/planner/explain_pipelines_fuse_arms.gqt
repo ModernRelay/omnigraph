@@ -1,5 +1,8 @@
 # issue: none
-# notes: RankFuse is a breaker with two inputs: each arm's ranked scan is its own pipeline into the fusion (the secondary arm first), the fused rows drain into the Sort above it, and the sorted page reaches the consumer.
+# notes: Fuse is a breaker with one input per arm, each arm the plan its ranking takes standing alone: the exact
+# notes: `bm25` arm scores its scan and sorts by the score into the fusion (an arm after the first is a collected
+# notes: side, so its pipelines come first), the `nearest` arm's window sorts its candidates and cuts its targets
+# notes: into the fusion, the fused rows drain into the Sort above it, and the sorted page reaches the consumer.
 
 --- runner
 timeout_ms: 10000
@@ -10,7 +13,7 @@ environments:
 --- schema
 node Doc {
     slug: String @key
-    text: String @index
+    text: String @index(fulltext, analyzer = "standard_v1")
     embedding: Vector(4) @index
 }
 
@@ -31,4 +34,17 @@ query fused($q: Vector(4), $t: String) {
 }
 --- params
 {"q": [0.0, 0.0, 0.0, 0.0], "t": "needle"}
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"d000"}
+{"d.slug":"d001"}
+{"d.slug":"d002"}
+--- expect shape
+d.slug: String
+--- expect plan
+pipeline 0: Scan -> Score => Sort
+pipeline 1: Sort => Fuse(arm) after 0
+pipeline 2: Scan => Sort
+pipeline 3: Sort -> TargetCut => Fuse after 2
+pipeline 4: Fuse -> Projection => Sort after 1, 3
+pipeline 5: Sort -> Page => consumer after 4
+fuse $d: arms [nearest, bm25]

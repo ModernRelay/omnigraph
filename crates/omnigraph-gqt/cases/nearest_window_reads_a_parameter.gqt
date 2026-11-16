@@ -13,7 +13,7 @@ environments:
 --- schema
 node Doc {
     slug: String @key
-    text: String @index
+    text: String @index(fulltext, analyzer = "standard_v1")
     embedding: Vector(2) @index
 }
 edge Cites: Doc -> Doc
@@ -82,7 +82,14 @@ query an_rrf_arm_window_from_a_parameter($k: I64) {
 --- params
 {"k": 1}
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"b"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference
 
 --- query
 query a_window_below_one_is_refused($k: I64) {

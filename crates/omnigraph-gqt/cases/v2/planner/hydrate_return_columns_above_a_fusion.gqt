@@ -1,7 +1,6 @@
 # issue: none
-# red_on: 2026-10-10, upstream 58f1fcc6: pass 6 skipped every plan with a RankFuse and every ranked scan, so both arms read `body` and `title` for all twelve docs and no `HydrateColumns` was placed.
-# notes: Twelve docs, query vector [0,0], needle count falling from d00 to d03. The nearest arm's window is the limit (d00, d01); bm25 ranks d00 > d01 > d02 > d03 on term frequency at equal length. Fused: d00 1/61 + 1/61, d01 1/62 + 1/62, d02 1/63, d03 1/64, so the limit keeps d00 and d01 in that order.
-# notes: Pass 6 rewrites both arm scans together (12 rows > 4 x 2): the arms carry ids, scores and the row address into the fusion, the Sort above cuts, and `HydrateColumns` fetches `body` and `title` for the two kept rows (RFC 0047 §Total order).
+# notes: Twelve docs, query vector [0,0], needle count falling from d00 to d03. The nearest arm's window is its `k` (d00, d01); bm25 ranks d00 > d01 > d02 > d03 on term frequency at equal length. Fused: d00 1/61 + 1/61, d01 1/62 + 1/62, d02 1/63, d03 1/64, so the limit keeps d00 and d01 in that order.
+# notes: Each arm scans the target on its own, so late materialization hydrates no return column above a fusion, as above a union: every arm reads the target's columns into the fusion, which carries them from the first arm that selected each target.
 # notes: Step 2 keeps a standalone BM25 scan unhydrated.
 
 --- runner
@@ -45,7 +44,19 @@ query fused_top_two($q: Vector(2), $t: String) {
 --- params
 {"q": [0.0, 0.0], "t": "needle"}
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.body":"body 00","d.slug":"d00","d.title":"t-00"}
+{"d.body":"body 01","d.slug":"d01","d.title":"t-01"}
+
+--- expect shape
+d.slug: String
+d.body: String?
+d.title: String
+
+--- expect plan
+not pass late_materialization
+scan Doc as $d: ranked nearest fetch 2
+fuse $d: arms [nearest, bm25]
 
 --- query
 set engine = v2;

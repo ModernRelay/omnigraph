@@ -16,7 +16,7 @@ node Person {
 }
 node Doc {
     slug: String @key
-    body: String @index
+    body: String @index(fulltext, analyzer = "standard_v1")
     embedding: Vector(2) @index
 }
 edge Knows: Person -> Doc
@@ -95,8 +95,12 @@ query rrf_over_one_destination($q: Vector(2)) {
 }
 --- params
 {"q": [0.0, 0.0]}
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"d1"}
+--- expect shape
+d.slug: String
 
+--- expect same as reference
 --- query
 query nearest_from_a_source_with_no_edges($q: Vector(2)) {
     match {

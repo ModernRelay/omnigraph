@@ -12,7 +12,7 @@ node Doc {
     slug: String @key
     n: I64 @index
     name: String @index
-    text: String @index
+    text: String @index(fulltext, analyzer = "standard_v1")
     embedding: Vector(4) @index
 }
 
@@ -37,4 +37,12 @@ query fused($q: Vector(4), $t: String) {
 --- params
 {"q": [-0.3, 0.0, 0.0, 0.0], "t": "needle"}
 
---- expect error: type error: T86:
+--- expect unordered
+{"d.slug":"d000"}
+{"d.slug":"d001"}
+{"d.slug":"d002"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference

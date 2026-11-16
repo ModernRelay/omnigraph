@@ -86,7 +86,16 @@ query rrf_order() {
     limit 10
 }
 
---- expect error: type error: T86:
+--- expect unordered
+{"p.pid":"p"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+cross join $p.text contains $m.number
+scan Passage as $p: no runtime filter
+scan Passage as $p: ranked nearest fetch 10
 
 --- query
 set engine = v2;

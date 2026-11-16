@@ -1,0 +1,180 @@
+# issue: none
+# notes: `rrf` fuses 2 to 16 arms of any ranking (docs/rfcs/2026-11-07-gq-3.md, section 4, Fusion), each
+# notes: the plan its ranking takes standing alone, ranked from 1 over its distinct targets, with
+# notes: rrf = Σ weight / (k + rank) over the arms that selected the target, summed in written order.
+# notes: Step 1: an exact `distance` arm ranks every Doc d1 (0), d3 (0.4), d5 (0.68), d4 (1.3), d2 (2); the
+# notes: `bm25` arm over "graph" ranks d2 (two occurrences in two tokens), d1, d5 (three tokens) and
+# notes: selects nothing else, so d4 and d3 hold one arm's term: d1 = 1/61 + 1/62, d2 = 1/65 + 1/61,
+# notes: d5 = 1/63 + 1/63, d3 = 1/62, d4 = 1/64.
+# notes: Step 2: three arms with weights [2, 1, 0.5]: the `nearest` window of 2 (d1, d3), `bm25` over
+# notes: "search" (d3, then d1 and d5 by length) and `distance` from [1, 0] (d2, d4, d5, d3, d1):
+# notes: d1 = 2/61 + 1/62 + 0.5/65, d3 = 2/62 + 1/61 + 0.5/64, d5 = 1/63 + 0.5/63, d2 = 0.5/61,
+# notes: d4 = 0.5/62.
+# notes: Step 3: arms over different populations: the `nearest` window of 2 over the Docs someone wrote
+# notes: (d2, d4, d5) ranks d5 (0.08), d4 (0.9) and never d1 or d3, which only the `bm25` arm over every
+# notes: Doc selects ("search": d3, d1, d5); d1 and d4 tie at 1/62 and the tie rule orders them.
+# notes: Step 4: an inline read with an `order` ranks each target at its first row: the authorships
+# notes: by author name descending are carl/d5, bob/d4, ada/d2, ada/d4, so d4's second row takes no
+# notes: second rank; d5 1, d4 2, d2 3, beside `bm25` over "graph" (d2 1, d1 2, d5 3).
+# notes: Step 5: an `rrf` arm ranks by its fused score, descending: the inner fusion ranks d1, d2, d3, d5,
+# notes: and beside `distance` from [1, 0] d2 = 1/62 + 1/61 leads; d3 and d5 tie at 1/63 + 1/64.
+# notes: Every step agrees with the reference interpreter, which evaluates the same `Fuse`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index(fulltext, analyzer = "standard_v1")
+    embedding: Vector(2) @index
+}
+node Person {
+    name: String @key
+}
+edge Wrote: Person -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","text":"graph search","embedding":[0.0,1.0]}}
+{"type":"Doc","data":{"slug":"d2","text":"graph graph","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d3","text":"search","embedding":[0.6,0.8]}}
+{"type":"Doc","data":{"slug":"d4","text":"vectors","embedding":[0.9,0.3]}}
+{"type":"Doc","data":{"slug":"d5","text":"graph search engines","embedding":[0.2,0.2]}}
+{"type":"Person","data":{"name":"ada"}}
+{"type":"Person","data":{"name":"bob"}}
+{"type":"Person","data":{"name":"carl"}}
+{"edge":"Wrote","from":"ada","to":"d2"}
+{"edge":"Wrote","from":"ada","to":"d4"}
+{"edge":"Wrote","from":"bob","to":"d4"}
+{"edge":"Wrote","from":"carl","to":"d5"}
+
+--- query
+query distance_arm() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(distance($all, $d.embedding, [0.0, 1.0]), bm25($all, $d.text, "graph")) as $s,
+    }
+    return { $d.slug, $s }
+    order { $s desc }
+}
+
+--- expect ordered
+{"d.slug":"d1","s":0.032522474881}
+{"d.slug":"d2","s":0.031778058008}
+{"d.slug":"d5","s":0.031746031746}
+{"d.slug":"d3","s":0.016129032258}
+{"d.slug":"d4","s":0.015625}
+
+--- expect shape
+d.slug: String
+s: F64
+
+--- expect plan
+fuse $d: arms [distance, bm25]
+
+--- expect same as reference
+
+--- query
+query three_weighted_arms() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 1.0], k: 2), bm25($all, $d.text, "search"), distance($all, $d.embedding, [1.0, 0.0]), weights: [2.0, 1.0, 0.5]) as $s,
+    }
+    return { $d.slug, $s }
+    order { $s desc }
+}
+
+--- expect ordered
+{"d.slug":"d1","s":0.056608225196}
+{"d.slug":"d3","s":0.056464007139}
+{"d.slug":"d5","s":0.02380952381}
+{"d.slug":"d2","s":0.008196721311}
+{"d.slug":"d4","s":0.008064516129}
+
+--- expect shape
+d.slug: String
+s: F64
+
+--- expect plan
+fuse $d: arms [nearest, bm25, distance]
+scan Doc as $d: ranked nearest fetch 2
+
+--- expect same as reference
+
+--- query
+query different_populations() {
+    match {
+      let $written = { match { $d: Doc, $p: Person, $p wrote $d } return { $d } },
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($written, $d.embedding, [0.0, 0.0], k: 2), bm25($all, $d.text, "search"), k: 60) as $s,
+    }
+    return { $d.slug, $s }
+    order { $s desc }
+}
+
+--- expect ordered
+{"d.slug":"d5","s":0.032266458496}
+{"d.slug":"d3","s":0.016393442623}
+{"d.slug":"d1","s":0.016129032258}
+{"d.slug":"d4","s":0.016129032258}
+
+--- expect shape
+d.slug: String
+s: F64
+
+--- expect same as reference
+
+--- query
+query ordered_arm() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf({ match { $p: Person, $d: Doc, $p wrote $d } return { $d } order { $p.name desc } }, bm25($all, $d.text, "graph")) as $s,
+    }
+    return { $d.slug, $s }
+    order { $s desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"d2","s":0.032266458496}
+{"d.slug":"d5","s":0.032266458496}
+{"d.slug":"d1","s":0.016129032258}
+{"d.slug":"d4","s":0.016129032258}
+
+--- expect shape
+d.slug: String
+s: F64
+
+--- expect plan
+fuse $d: arms [ordered, bm25]
+
+--- expect same as reference
+
+--- query
+query nested_fusion_arm() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(rrf(nearest($all, $d.embedding, [0.0, 1.0], k: 2), bm25($all, $d.text, "graph")), distance($all, $d.embedding, [1.0, 0.0])) as $s,
+    }
+    return { $d.slug, $s }
+    order { $s desc }
+}
+
+--- expect ordered
+{"d.slug":"d2","s":0.032522474881}
+{"d.slug":"d1","s":0.031778058008}
+{"d.slug":"d3","s":0.031498015873}
+{"d.slug":"d5","s":0.031498015873}
+{"d.slug":"d4","s":0.016129032258}
+
+--- expect shape
+d.slug: String
+s: F64
+
+--- expect plan
+fuse $d: arms [rrf, distance]
+fuse $d: arms [nearest, bm25]
+
+--- expect same as reference

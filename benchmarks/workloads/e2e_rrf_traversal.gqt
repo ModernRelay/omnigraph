@@ -1,5 +1,5 @@
 # issue: none
-# notes: Complete auto-planned BM25/BM25 RRF query with traversal and exact winner x; bounded replacement for the rrf-gate engine read. One operation on a fresh handle is timed; checks and restart are outside the timer.
+# notes: A fusion of two exact `bm25` arms with a traversal after it and the exact winner x. One operation on a fresh handle is timed; checks and restart are outside the timer.
 
 --- runner
 timeout_ms: 60000
@@ -25,7 +25,15 @@ query recall_two_terms($q1: String, $q2: String) {
 --- params
 {"q1":"alpha","q2":"beta"}
 
---- expect error: type error: T86:
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection named [ChunkOfArtifact out]
+fuse $c: arms [bm25, bm25]
 
 --- restart
 
@@ -47,4 +55,12 @@ query recall_two_terms($q1: String, $q2: String) {
 --- params
 {"q1":"alpha","q2":"beta"}
 
---- expect error: type error: T86:
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection named [ChunkOfArtifact out]
+fuse $c: arms [bm25, bm25]

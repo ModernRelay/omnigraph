@@ -16,7 +16,7 @@ environments:
 --- schema
 node Doc {
     slug: String @key
-    title: String @index
+    title: String @index(fulltext, analyzer = "standard_v1")
     embedding: Vector(3) @index
 }
 
@@ -32,7 +32,16 @@ query unweighted() {
     order { $s desc }
 }
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"d1","s":0.032522474881}
+{"d.slug":"d2","s":0.032266458496}
+{"d.slug":"d3","s":0.016129032258}
+
+--- expect shape
+d.slug: String
+s: F64
+
+--- expect same as reference
 
 --- query
 query weighted() {
@@ -41,7 +50,16 @@ query weighted() {
     order { $s desc }
 }
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"d2","s":0.097840228988}
+{"d.slug":"d1","s":0.097038603913}
+{"d.slug":"d3","s":0.016129032258}
+
+--- expect shape
+d.slug: String
+s: F64
+
+--- expect same as reference
 
 --- query
 query unit_weights() {
@@ -50,4 +68,13 @@ query unit_weights() {
     order { $s desc }
 }
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.slug":"d1","s":0.032522474881}
+{"d.slug":"d2","s":0.032266458496}
+{"d.slug":"d3","s":0.016129032258}
+
+--- expect shape
+d.slug: String
+s: F64
+--- expect same as reference
+

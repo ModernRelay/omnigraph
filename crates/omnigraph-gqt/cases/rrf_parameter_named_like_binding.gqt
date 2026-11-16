@@ -10,7 +10,7 @@ environments:
 --- schema
 node Doc {
     slug: String @key
-    text: String @index
+    text: String @index(fulltext, analyzer = "standard_v1")
     embedding: Vector(4) @index
 }
 
@@ -44,4 +44,10 @@ query fused_v2($q: Vector(4), $t: String) {
 --- params
 {"q": [-0.3, 0.0, 0.0, 0.0], "t": "needle"}
 
---- expect error: type error: T86:
+--- expect unordered
+{"d.slug":"d002"}
+
+--- expect shape
+d.slug: String
+
+--- expect same as reference

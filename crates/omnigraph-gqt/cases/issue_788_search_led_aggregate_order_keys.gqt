@@ -92,7 +92,12 @@ query fused_largest_group($t: String) {
 --- params
 {"t": "needle"}
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.kind":"y","n":2}
+
+--- expect shape
+d.kind: String
+n: I64
 
 --- query
 set engine = v2;
@@ -106,4 +111,9 @@ query fused_smallest_group($t: String) {
 --- params
 {"t": "needle"}
 
---- expect error: type error: T86:
+--- expect ordered
+{"d.kind":"x","n":1}
+
+--- expect shape
+d.kind: String
+n: I64

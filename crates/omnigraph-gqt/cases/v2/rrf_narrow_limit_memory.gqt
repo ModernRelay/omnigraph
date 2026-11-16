@@ -27,4 +27,7 @@ query narrow_fused_limit() {
   order { $score desc }
   limit 1
 }
---- expect error: type error: T86:
+--- expect unordered
+{"one":1}
+--- expect shape
+one: I64

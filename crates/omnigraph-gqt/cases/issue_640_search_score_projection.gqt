@@ -165,7 +165,13 @@ query rrf_projected($q: String, $v: Vector(2)) {
 --- params
 {"q": "needle", "v": [1.0, 0.0]}
 
---- expect error: type error: T86:
+--- expect ordered
+{"p.name": "A", "fused": 0.03278688524590164}
+{"p.name": "B", "fused": 0.03225806451612903}
+
+--- expect shape
+p.name: String
+fused: F64
 
 --- query
 query search_projected($q: String) {
