@@ -825,6 +825,44 @@ fn a_plan_budget_overrun_stops_as_the_term_is_built() {
     assert!(reported(&m) < 3 * 4096, "{m}");
 }
 
+/// A declared read is typed once per declaration however often it is
+/// called: reads that each bind the next one twice with `let`, without
+/// drawing it, type 41 reads, not 2^40 calls, and the relation a `let`
+/// binds is charged to the plan budget as it is bound.
+#[test]
+fn a_called_read_is_typed_once_however_often_it_is_called() {
+    let mut reads = vec!["query u40() { match { $p: Person } return { $p } }".to_string()];
+    for i in (0..40).rev() {
+        reads.push(format!(
+            "query u{i}() {{ match {{ $p: Person, let $a = u{n}(), let $b = u{n}() }} return {{ $p }} }}",
+            n = i + 1
+        ));
+    }
+    reads.reverse();
+    let started = std::time::Instant::now();
+    let _ = check(&reads.join("\n"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "typing took {:?}",
+        started.elapsed()
+    );
+    // A bound relation over the budget is refused although nothing draws it.
+    let mut nested = String::from("$q12: Person, $q11 knows $q12");
+    for i in (1..12).rev() {
+        nested = format!(
+            "$q{i}: Person, $q{} knows $q{i}, optional {{ {nested} }}",
+            i - 1
+        );
+    }
+    let m = refused(
+        &format!(
+            "query q() @budget(plan = 1000) {{ match {{ $p: Person, let $r = {{ match {{ $q0: Person, optional {{ {nested} }} }} return {{ $q0 }} }} }} return {{ $p.handle }} }}"
+        ),
+        "T70",
+    );
+    assert!(m.contains("plan budget"), "{m}");
+}
+
 /// [`Step::added`] counts exactly the nodes [`apply`] adds above a present
 /// term, for every kind of step.
 #[test]

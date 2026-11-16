@@ -275,6 +275,7 @@ fn typed_decl(catalog: &Catalog, unit: &HashMap<String, &Decl>, decl: &Decl) -> 
         element_span: None,
         refusals: Vec::new(),
         plan_limit: DEFAULT_PLAN_BUDGET,
+        typed_calls: HashMap::new(),
     };
     let params = match param_types(&decl.params) {
         Ok(p) => p,
@@ -1081,6 +1082,10 @@ struct Ctx<'a> {
     /// for it is a subtree of its expanded tree, so a term over the budget
     /// stops the compile as soon as it is built ([`Ctx::charge`]).
     plan_limit: usize,
+    /// Each declared read the declaration calls, typed once: its body's
+    /// term, type and column shapes. A body that reached a recursive
+    /// reference depends on the call frames and is typed at each call.
+    typed_calls: HashMap<String, (Term, RelTy, Vec<Option<String>>)>,
 }
 
 struct Frame {
@@ -3178,6 +3183,8 @@ impl Ctx<'_> {
             LetValue::Expr(_) => None,
         };
         if let Some(r) = rel {
+            // A bound relation is charged as it is bound, drawn or not.
+            self.charge(r.term.size(), &r.term)?;
             sc.rels.insert(name.to_string(), r);
             return Ok(());
         }
@@ -4317,17 +4324,29 @@ impl Ctx<'_> {
                 ),
             ));
         }
-        self.frames.push(Frame {
-            decl: c.name.clone(),
-            params: params.clone(),
-            bindings: bindings.clone(),
-        });
-        let out = self.read_decl(decl);
-        self.frames.pop();
-        let out = out?;
-        let Rel {
-            term, ty, shaped, ..
-        } = out.rel;
+        // The body of a read typed once per declaration, so a read called
+        // many times (each caller calling the next twice) is not typed
+        // again at each call.
+        let (term, ty, shaped) = match self.typed_calls.get(&c.name) {
+            Some(typed) if self.assume.is_empty() => typed.clone(),
+            _ => {
+                self.frames.push(Frame {
+                    decl: c.name.clone(),
+                    params: params.clone(),
+                    bindings: bindings.clone(),
+                });
+                let out = self.read_decl(decl);
+                self.frames.pop();
+                let Rel {
+                    term, ty, shaped, ..
+                } = out?.rel;
+                if self.assume.is_empty() && !reaches_recursion(&term) {
+                    self.typed_calls
+                        .insert(c.name.clone(), (term.clone(), ty.clone(), shaped.clone()));
+                }
+                (term, ty, shaped)
+            }
+        };
         let term = Term::Call {
             name: c.name.clone(),
             bindings: params
@@ -5699,6 +5718,13 @@ impl Step {
             Step::Optional { inner, .. } => 7 + 2 * inner.size(),
         }
     }
+}
+
+/// Whether `t` holds a recursive reference or a fixpoint, whose typing
+/// depends on the call frames it was typed under.
+fn reaches_recursion(t: &Term) -> bool {
+    matches!(t, Term::RecRef { .. } | Term::Fix { .. })
+        || t.children().into_iter().any(reaches_recursion)
 }
 
 /// The column names a term produces (types are not needed by the fold).
