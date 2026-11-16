@@ -100,11 +100,21 @@ the rate falls to 0 writes/s. This RFC makes that read bounded, then cheap:
 
 - The check reads only the key columns of the files that no index covers, in
   one pass, and compares the values in memory. Its cost grows with those
-  files, not with the table, and it has no cliff.
-- The known keys are an in-memory record of the keys that this process wrote
-  into each data file, for every kind of key that a check compares. A data
-  file never changes after it is written, so the record stays correct for
-  that file. The check then reads memory instead of storage for those files.
+  files, not with the table, and no row count switches it to a whole-table
+  read.
+- The known keys are an in-memory record of the keys in each data file, for
+  every kind of key that a check compares. The process records them when it
+  writes a file, and when a check reads a whole file. A data file never
+  changes after it is written, so the record stays correct for that file.
+  The check then reads memory instead of storage for those files.
+
+Both parts are needed. A stress study of the lookup found that the bounded
+read alone still costs about one request per uncovered file. Each write adds
+one file, so a process that did not write those files, for example after a
+restart, still slows toward 0 writes/s: 0.67 writes/s at 20,000 files,
+against 0.52 on `main`. When the check also records the files it reads, the
+first write pays one read of those files, and the next writes read memory:
+6.9 writes/s, equal to the process that wrote the files.
 
 ### Which writes join a batch
 
@@ -226,8 +236,14 @@ collector does not change.
   reads the count of its source, so two of them from the same source never
   share a batch. Edges from different sources still batch.
 - A `@unique` group with no index costs a read of the whole table's group
-  columns per write, as it does today. A decision below proposes that
-  `@unique` implies an index, as `@key` does.
+  columns per write, as it does today: 15.7 MB per insert at 1 million rows
+  in the study. A decision below proposes that `@unique` implies a BTREE
+  index on its group's first column. With it, the insert read 4.1 KB at
+  every table size.
+- Writes still slow as files accumulate, even when the check reads memory.
+  Each commit rewrites a table manifest that lists every file: 85 KB per
+  insert at 100 files, 775 KB at 5,000. That is why maintenance stays
+  required.
 - The gain is in one process. Another process's writes are not in the log,
   so the leader refuses the writes they can affect. One writer process per
   cluster is the supported topology today.
@@ -273,6 +289,12 @@ in this revision. After the fixes, no acknowledged write was lost or
 duplicated under crashes, network faults, cancellation, several actors and
 processes, and maintenance.
 
+A second study built the key lookup for every kind of key and stress-tested
+it. It agreed with a whole-table scan in 85,104 random comparisons. It held
+under 64 writers with `optimize` racing, and its memory stayed within budget
+for 30 minutes. It found four defects, one of them in this RFC's text: the
+restart cost described above. Each one became a rule or a correction.
+
 ### Rollout
 
 Each step leaves `main` shippable and adds its tests.
@@ -296,7 +318,10 @@ Each step leaves `main` shippable and adds its tests.
   actors can share a commit, which records each write's actor and rows? It
   changes the commit record format. Batches of several actors are not
   measured yet.
-- Do you accept that `@unique` implies an index on its group, as `@key` does?
+- Do you accept that `@unique` implies a BTREE index on its group's first
+  column? It must be a BTREE whatever the column's type, because the index
+  that `@key` implies on a free-text String is full-text, and an equality
+  check cannot use it.
 - Do you accept that batching requires a maintenance cadence, written in the
   user docs?
 - Do you accept the footprint taken from the validator's checks, so that
@@ -388,7 +413,7 @@ Code locations are on `main` at `4f7c2076`. Search by name if a line moved.
 | Record | One publication in the log: parent head, produced head, and one class per touched table, with keys per key space | |
 | Class | `inserted(ids)`, `touched(written ids)`, `row_preserving` or `changed` | `PublicationEffect` (new) |
 | Write list | The commit record's list of the writes a commit holds: each write's actor and, per table, the range of stable row ids its rows received | `GraphCommit`, `omnigraph-catalog` `src/commit_graph.rs` |
-| Known keys | Process-wide map from a data file's resolved location to the exact keys this process wrote into it, per key space | |
+| Known keys | Process-wide map from a data file's normalized location to the exact keys in it, per key space, recorded when this process wrote the file or read it whole | |
 | Uncovered tail | The fragments that the index of a key space's column does not cover at a pinned version | |
 | Key lookup | A check's read of committed keys: covered fragments through the index only, the tail from the known keys or one scan of its key columns | |
 
@@ -452,10 +477,17 @@ a test pass.
 15. Acknowledge nothing before the publication is durable and visible. A lost
     acknowledgement counts only when the publisher's read-back finds the
     batch's commit.
-16. Record known keys only from the absence-proven insert writer, only when
-    its staged write produced exactly one data file, and for every key space
-    of its table, from the rows it wrote. Answer from the map only for a
-    fragment with one data file, no deletion file and no overlay.
+16. Record known keys from two sources only: the absence-proven insert
+    writer, when its staged write produced exactly one data file, for every
+    key space of its table from the rows it wrote; and a key lookup's tail
+    scan, for each fragment it read whole that the map can answer, for the
+    key space it read. Answer from the map only for a fragment with one data
+    file that lists every field of the key space, no deletion file and no
+    overlay. Key entries by the normalized dataset root and the key space's
+    field ids. (K1: with the writer as the only source, a restarted process
+    paid one request per uncovered fragment on every insert, the cliff's
+    cost. K3: a root spelled `file:///x` by one handle and `/x` by another
+    never matched, so compacted files never left the map.)
 17. Derive the footprint from the checks the judge runs, never from a list of
     constraint kinds. Map each `ValidateCheck` to its key space through one
     `match` with no wildcard arm. A check with no key form makes the entry
@@ -464,10 +496,13 @@ a test pass.
     revision excluded `@unique` and `@card` types by name, so a new kind of
     cross-row check would have batched unproven.)
 18. Never plan a key list per uncovered fragment. A key lookup reads the
-    covered fragments through the index only, and reads the uncovered tail's
-    key columns once, matching in memory. No row cap applies. (C1: past
-    `KEYED_WRITE_MAX_ROWS`, every keyed insert read the whole table, 0
-    writes/s, and the cliff returned in every cold process.)
+    covered fragments through the index only, filtering on one column, and
+    reads the uncovered tail's key columns once. It matches every returned
+    row against a set of the wanted keys by value, so a repeated wanted key
+    counts once and a stale index entry is no match. No row cap applies.
+    (C1: past `KEYED_WRITE_MAX_ROWS`, every keyed insert read the whole
+    table, 0 writes/s, and the cliff returned in every cold process. K2: a
+    repeated key reported its holders twice, which doubled a `@card` count.)
 19. Record every member in the commit's write list, with its own actor and
     its row-id range per table, read from the committed manifests before the
     publication. Never credit a batch to one member's actor.
@@ -817,13 +852,29 @@ space: the absence of ids (`first_existing_id` and `existing_id_count`,
 `crates/omnigraph/src/validate.rs`), the presence of endpoint ids, and the
 edge count per source. A lookup reads in two parts at the pinned version:
 
-1. The covered fragments, through the index on the key space's column, index
-   only. Lance's `fast_search` restricts a filtered scan with an index query
-   to the indexed fragments.
-2. The uncovered tail. A fragment that the known keys answer is read from
-   memory. The others are read in one scan restricted to them
-   (`Scanner::with_fragments`) that projects only the key columns. The
-   values are matched against an in-memory set of the wanted keys.
+1. The covered fragments, through the index on the key space's first column,
+   index only. Lance's `fast_search` restricts a filtered scan with an index
+   query to the indexed fragments (`Scanner::fast_search` sets
+   `with_only_indexed_fragments`, and `FilteredReadExec` skips every fragment
+   outside the index's applicable set). Filter on that one column only. For
+   an `AND` over two indexed columns, the applicable set is the
+   intersection of their coverages, so a fragment that only one index
+   covers would be read by neither part. Take this part only when exactly
+   one index that answers an `IN` list keys the column, every segment of it
+   is a BTREE that reports its fragment bitmap, and every fragment records
+   its physical rows. Otherwise the whole table is the tail.
+2. The uncovered tail: the exact complement of that index's coverage. A
+   fragment that the known keys answer is read from memory. The others are
+   read in one scan restricted to them (`Scanner::with_fragments`) that
+   projects only the key and holder columns, and that scan records each
+   fragment it read whole in the known keys.
+
+Rows from both parts are matched against an in-memory set of the wanted
+keys, by value. Part 1 needs this as well as part 2. With one index segment,
+which is all that Omnigraph writes, Lance masks the old entry of an updated
+or deleted row through the deletion vector. With a delta segment, Lance
+returns a moved row, at its new value, for its old value (lance#9817).
+Matching by value reads that old value as absent.
 
 Today the probe plans one copy of its key list per uncovered fragment. So
 `stage_keyed_write` (`table_store.rs`) takes the probe only while fragments
@@ -832,8 +883,16 @@ insert becomes Lance's insert-capable merge, which joins against every id of
 the table: 0 writes/s (C1, on `main` today). The two-part lookup plans no key
 list over the tail, so the cap goes. Its cost is the uncovered rows' key
 columns, which grows with the tail and not with the table, and it falls to
-memory where the known keys answer. A cold process, a restart and the files
-of another process therefore cost a bounded read, not the cliff.
+memory where the known keys answer.
+
+The bound alone is not enough. One fragment per write means about one
+request per uncovered fragment, which is what the merge join read. In the
+key-lookup study, a cold process at a 20,000-fragment tail made 0.67
+writes/s with the bounded read alone, against 0.52 on `main`. A cold
+process, a restart and the files of another process escape the cliff only
+because the tail scan records what it read (rule 16). The first insert
+reads the tail once and the next ones read memory: 6.9 writes/s, equal to
+the warm process, at 1.1 requests per insert.
 `coverage_validate_access` (`omnigraph-planner` `src/cost.rs`) chooses the
 two-part lookup under partial coverage instead of a whole-table scan.
 
@@ -841,29 +900,46 @@ The ids, `src` and `dst` always have a BTREE. A `@unique` group has an index
 only when the schema declares one: `@key` implies an index and `@unique` does
 not (`omnigraph-compiler` `src/catalog/mod.rs`). Without one, part 1 reads
 the whole table's group columns, as the uniqueness check does today. So
-`@unique` is to imply an index on its group's first column, as `@key` does
-(a decision in Part 1). Index maintenance builds single-column indexes only,
+`@unique` is to imply a BTREE on its group's first column, whatever the
+column's type (a decision in Part 1). It cannot reuse the rule that gives
+`@key` its index (`PropType::index_kind`): on a free-text String that rule
+builds a full-text index, which no equality or `IN` lookup uses (R1). Keep
+the implied BTREE apart from the declared `indices`. Index maintenance builds single-column indexes only,
 so a composite group narrows on its first column and matches the rest in
 memory. The index is derived state (invariant 7). A missing or lagging index
 changes cost, never a result.
 
 ### Known keys
 
-A process-wide map from a data file's resolved object location (dataset
-root, base and path) to the exact keys this process wrote into it, per key
-space of its table: the ids, each `@unique` group's tuples with the id of
+A process-wide map from a data file's resolved object location (normalized
+dataset root, base and path) to the exact keys in it, per key space of its
+table: the ids, each `@unique` group's tuples with the id of
 the row that holds each, and an edge table's `src` and `dst` values with
 their counts.
 
-Filling. `stage_absence_proven_strict_insert` fills it when its staged write
-produced exactly one data file, the usual shape of a keyed batch (at most
-8,192 rows). It records every key space from the rows it wrote, after the
-file is written and before any manifest can name it. No other writer records.
+Filling. Two sources fill it, and nothing else records:
+
+- `stage_absence_proven_strict_insert`, when its staged write produced
+  exactly one data file, the usual shape of a keyed batch (at most 8,192
+  rows). It records every key space from the rows it wrote, after the file
+  is written and before any manifest can name it.
+- A key lookup's tail scan. The scan has no filter, so every fragment it
+  reads arrives with all its rows. For each fragment that the map can answer
+  (the Reading rule below), it records the key space it read, attributing
+  rows to fragments by `_rowaddr`.
+
+The second source is what makes a cold process cheap. Without it, a
+restarted process never learns the files it did not write, and pays a read
+of every uncovered fragment on every insert.
 
 Reading. A key lookup (Key lookups) answers an uncovered fragment from the
-map when the fragment has exactly one data file that the map knows, and no
-deletion file and no overlay. Every other uncovered fragment goes to the
-lookup's tail scan.
+map when the fragment has exactly one data file that the map knows, that
+file lists every field of the key space, and the fragment has no deletion
+file and no overlay. Every other uncovered fragment goes to the lookup's
+tail scan. Key the spaces by field id, not by column name, so that a rename
+keeps the entries and a drop and re-add does not inherit them. Normalize
+the dataset root before keying: Lance reports one local root as `file:///x`
+from one opener and as `/x` from another.
 
 Two rules keep the read cheap as the tail grows:
 
@@ -874,7 +950,10 @@ Two rules keep the read cheap as the tail grows:
   uncovered, and whether the map knows all of them, is a fact about one
   pinned version. Share it across probes instead of computing it three times
   per write under a process-wide lock. Pure inserts doubled in the dev build
-  (112 to 225 writes/s).
+  (112 to 225 writes/s). With one writer every write is a new version, so
+  the shared analysis never hits. It then costs about 0.6 µs per uncovered
+  fragment per lookup (1.2 ms at 2,000 fragments). Reuse a computed
+  analysis only while every file it counts as known is still in the map.
 
 Why the answer is exact. Lance names every data file from a fresh random UUID
 and never rewrites a file. So the ids in a file are a fact about the object,
@@ -888,9 +967,12 @@ A fragment goes to the tail scan for:
 
 - a fragment with a deletion file (the map reports deleted rows as
   present: a false `KeyConflict`, or an upsert taken for an update);
-- a second data file (a column patch) or an overlay;
+- a second data file (a column patch, which the engine writes only on a
+  table with a Vector or Blob column) or an overlay;
+- a data file that does not list every field of the key space;
 - a file the map does not know (another process wrote it, compaction, a load
-  or a merge rewrote it, the entry was evicted, or the process restarted).
+  or a merge rewrote it, the entry was evicted, or the process restarted),
+  until a tail scan reads it whole.
 
 Another handle of the same process is not a bypass, because the map is
 process-wide. A recreated branch or a restored backup cannot make an entry
@@ -935,6 +1017,13 @@ These passes are linear in the fragment count: the uncovered-set computation,
 the known-key lookups per uncovered fragment, the tail's data-file sizes, and
 each batch's table manifest build and write. Batching raises the rate at
 which fragments accumulate, so the rate decays without maintenance.
+
+With the known keys warm, the manifest is the larger cost. In the key-lookup
+study, one writer on local disk read a flat 1.1 requests and 4.1 KB per
+insert from 100 to 20,000 fragments, but fell from 111 to 7.3 writes/s.
+Each detached commit rewrites a table manifest that lists every fragment:
+85 KB written per 10-row insert at 100 fragments, 775 KB at 5,000. At 2,000
+fragments, the key lookup took 3.2 ms of a 17.8 ms write.
 
 So batching is specified with a maintenance cadence:
 
@@ -1117,7 +1206,7 @@ branches are measured.
 
 | Step | Scope | Done when |
 |---|---|---|
-| 1. Key lookups and known keys | The two-part key lookup for every key space with the cap removed, the map for every key space, the byte bound with eviction, dropping files a `Rewrite` removed, the tail analysis once per version, and the index that `@unique` implies | In-source `table_store` and `validate` tests compare map, tail scan and full scan on every fragment shape (deletion file, column patch, compaction, unknown file, eviction). A tail past `KEYED_WRITE_MAX_ROWS` stays on the absence-proven writer, with the map and without it. `write_cost.rs` shows a keyed insert's requests flat as the tail grows when the map answers, bounded by the tail in a cold process, and a `@unique` insert reading no committed rows outside the tail. The DST cost golden records it at two tail lengths. `forbidden_apis.rs` pins that only the absence-proven writer records. No behavior change |
+| 1. Key lookups and known keys | The two-part key lookup for every key space with the cap removed, the map for every key space filled by the writer and by the tail scan, keyed by normalized root and field ids, the byte bound with eviction, dropping files a `Rewrite` removed, the tail analysis once per version, and the BTREE that `@unique` implies | In-source `table_store` and `validate` tests compare map, tail scan and full scan on every fragment shape (deletion file, column patch on a table with a Vector column, compaction, unknown file, eviction, a repeated wanted key, a delta index segment that returns a moved row for its old value), and across the system-column upgrade. A tail past `KEYED_WRITE_MAX_ROWS` stays on the absence-proven writer, with the map and without it. `write_cost.rs` shows a keyed insert's requests flat as the tail grows when the map answers; in a cold process, the first insert's requests bounded by the tail and the next ones flat; and a `@unique` insert reading no committed rows outside the tail. The DST cost golden records the warm and the cold-fill rows at two tail lengths. `forbidden_apis.rs` pins that only the absence-proven writer and the tail scan record. No behavior change |
 | 2. Footprint | Carry `op_kinds` through staging and rewrite its doc comment to name the executed-operation class, with `strict_pre_stage_version_check` its one owner. Record validation reads, with endpoint ids. Give `StagedWrite` the exact inserted ids its doc comment describes, and carry a mutation's written ids to its publication. Derive the footprint from `ValidateCheck` through one wildcard-free `match`, and record removed rows' tuples and endpoints on the delete path. Define `PublicationEffect` and its four constructors, with keys per key space. Make eligibility one function | In-source staging tests, one per `ValidateCheck` arm, and `writes.rs`. `forbidden_apis.rs` pins the wildcard-free match. No behavior change |
 | 3. Composition and attribution | The sealed adapter, the engine half of the guard, the Blob case, and the write list after its format decision | `lance_surface_guards.rs` (including one contiguous row-id range per member), `integration/changes.rs` (the feed's fast path, and each row's actor), the merge owners (the pure-insert proof), the catalog tests (the write list's round trip and byte budget), `forbidden_apis.rs` |
 | 4. Maintenance carry | Index builds and `optimize`'s direct path carried over insert-only and row-preserving publications | `lance_surface_guards.rs` (`TransactionRebase` of `CreateIndex` and `Rewrite` over an insert-only `Update`), `failpoints.rs`, `detached_commit_matrix.rs` (a carried index build), the DST cost golden |
@@ -1164,7 +1253,7 @@ because `.gqt` cannot express them. The cells:
 - two actors share one commit, and the change feed reports each row with
   its own actor;
 - a cold process with a tail past `KEYED_WRITE_MAX_ROWS` stays on the
-  absence-proven writer;
+  absence-proven writer, and its second insert reads the tail from the map;
 - a publication by `optimize`, a merge or another handle between capture and
   batch;
 - `group_commit = off` matches today.
@@ -1220,9 +1309,14 @@ Each defect has a rule above and a test that must fail without the rule.
 | H2 | Medium | Groups keyed by actor: one actor's batches foreign to another's | 6 | Matrix: two actors, two handles |
 | H4 | Low–medium | A write cancelled before admission was published | 11 | Batch-outcome cells |
 | H7 | Low | In-doubt followers got an internal error | 9 | Batch-outcome cells |
+| K1 | High | A cold process read every uncovered fragment on every insert, the cliff's cost, because only the writer recorded known keys | 16 | `write_cost.rs` cold-fill curve |
+| K2 | Medium | A repeated wanted key reported its holders twice from the map: a doubled `@card` count and a false refusal | 18 | Map, tail and full scan compared with a repeated key |
+| R1 | Medium | RFC text: an index implied "as `@key` does" is full-text on a free-text String, so `@unique` got no usable index | Key lookups | A `@unique` String insert reads no committed rows outside the tail |
+| K3 | Low | Map keys used the root as each opener spelled it, so files never matched under `optimize`'s handles and compacted files stayed | 16 | Compaction drops every file it removed |
 
 Hypotheses that produced no defect: Blob tables in batches (H6), an
-unbounded queue (H8), and known keys keyed by relative path (H9).
+unbounded queue (H8), and known keys keyed by relative path (H9). K1 to K3
+and R1 come from the key-lookup study (Part 3, Measured).
 
 ## Part 3: Evidence and history
 
@@ -1235,7 +1329,11 @@ logs, raw results and prototypes; Lance 13.0.0's transaction, versioning,
 branch/tag, distributed-write, row-ID-lineage, object-store and Blob pages,
 read 2026-11-14. Stress-tested: the #1401 prototype merged with #1407 and
 `main`, on release binaries, fork branch `research/group-commit-stress` at
-`155911f0` (2026-11-15).
+`155911f0` (2026-11-15). The key lookup: built on that prototype and
+stress-tested on release binaries, fork branch `research/key-lookup-stress`
+at `3df0ca28`, with its report `REPORT-key-lookup.md` (2026-11-15). Lance
+13.0.0 source for `fast_search`: `scanner.rs`, `filtered_read.rs` and
+`scalar_logical.rs`.
 
 ### Why one branch serves one write per publication
 
@@ -1377,6 +1475,52 @@ The mix was 70% fresh inserts, about 15% same-table updates, deletes and
 upserts of present keys, and persons and edges, with `optimize` every 30 s.
 At 1,024 embedded writers with 10% same-table updates and deletes, the
 first-draft rules made 1.0 writes per commit and exact footprints 15.6.
+
+The key-lookup study (2026-11-15). The two-part lookup for every key space,
+the cap removed, the map for every key space with a byte budget, and an
+implied BTREE for `@unique`, built on the stress prototype.
+
+- Equivalence. 32 seeds of 300 random steps compared the lookup with a
+  whole-table scan in every key space after every step: 85,104 comparisons
+  over 2.39 million wanted keys, 0 differences. The steps covered deletion
+  files, column patches, restarts, eviction to random budgets, child
+  processes writing, compaction, index folds, loads, schema changes and the
+  system-column upgrade.
+- Staleness. No old value read present and no present key was hidden,
+  through updates, upserts, deletes, a lagging index, compaction and folds.
+  On a raw Lance dataset with a delta segment, Lance itself returned the
+  moved row, at its new value, for its old value; matching by value read it
+  absent.
+- Concurrency. Four served runs of 300 s on RustFS at +30 ms, group commit
+  on, `optimize` every 30 s: 0 violations, 0 false refusals, 0 false
+  acceptances. Throughput stayed about 2 writes/s, because that prototype
+  keeps `@unique` and `@card` types out of batches.
+- Memory. 30 minutes served, 48 writers, every key space written, a 4 MiB
+  budget: the map never exceeded it while evicting 68,000 files, and 88,025
+  acknowledged writes verified. Server RSS still grew from 0.9 to 2.4 GB,
+  which is not the map.
+
+| Tail rows (fragments), local disk, one writer | `main`, cold | Warm | Cold, bounded read only | Cold, tail scan records |
+|---|---|---|---|---|
+| 1,000 (101) | 50.8 writes/s, 121 requests | 111.3, 1.1 | 60.1, 101 | 102.4, 3.6 |
+| 10,000 (1,001) | 11.9, 1,021 | 57.0, 1.1 | 12.9, 1,001 | 58.8, 26 |
+| 50,000 (5,001) | 2.7, 5,021 | 26.2, 1.1 | 2.5, 5,001 | 22.6, 126 |
+| 200,000 (20,001) | 0.52, 20,017 | 7.3, 1.1 | 0.67, 20,001 | 6.9, 501 |
+
+Requests are per insert. In the last column they average one full read of
+the tail over 40 inserts; every insert after the first reads 1.1. Writes/s
+is within about 20%, because other work ran on the host; requests are
+exact.
+
+| `@unique` group, 100-fragment tail | 10,000 rows | 100,000 rows | 1,000,000 rows |
+|---|---|---|---|
+| Implied BTREE, warm | 112.4 writes/s, 4.1 KB read | 107.6, 4.1 KB | 114.1, 4.1 KB |
+| No index, warm | 52.7, 334 KB | 37.6, 1,653 KB | 10.7, 15,734 KB |
+
+Edges under `@card(0..5)` behaved like ids: warm at 1.1 requests per
+insert from 101 to 5,001 tail fragments, cold at `main`'s cost without the
+tail-scan fill (0.74 against 0.57 writes/s at 5,001) and 8.1 writes/s with
+it. Not yet done: the `write_cost.rs` curve and the storage-cost golden rows.
 
 ### The carried-over guard
 
@@ -1533,3 +1677,12 @@ test:
   bounded tail read instead of the C1 cliff. Known keys cover every key
   space, and `@unique` is proposed to imply an index. None of these is
   measured yet.
+- 2026-11-15: The key lookup measured. The key-lookup study confirmed
+  equivalence, staleness, concurrency and memory, and corrected the cost
+  claim: the bounded read alone leaves a cold process at the cliff's cost.
+  The tail scan now also records known keys (rule 16, K1). Rule 18 filters
+  on one column and matches by value with a set of wanted keys (K2, and
+  Lance's delta-segment entries). Entries are keyed by normalized root and
+  field ids (K3). `@unique` implies a BTREE whatever the column's type (R1).
+  The manifest, not the lookup, is the remaining decay with the fragment
+  count. Batching of several actors is still not measured.
