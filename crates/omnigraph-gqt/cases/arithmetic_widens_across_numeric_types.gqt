@@ -191,7 +191,6 @@ p.handle: String
 quotient: I32?
 remainder: I32?
 
---- expect same as reference
 
 --- query
 query unary_minus_over_an_unsigned_value() {

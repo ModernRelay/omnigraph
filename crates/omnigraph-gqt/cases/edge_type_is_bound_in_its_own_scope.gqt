@@ -44,7 +44,6 @@ query known_in_one_block_employed_in_another() {
 --- expect shape
 p.handle: String
 
---- expect same as reference
 
 --- query
 query edge_kinds() {
@@ -61,7 +60,6 @@ query edge_kinds() {
 p.handle: String
 kind: String?
 
---- expect same as reference
 
 --- mutate
 query drop_both() {

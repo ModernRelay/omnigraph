@@ -81,7 +81,6 @@ total: F64
 negated: F64
 n: I64
 
---- expect same as reference
 
 --- query
 query aggregate_under_a_call_over_no_rows() {
@@ -95,4 +94,3 @@ query aggregate_under_a_call_over_no_rows() {
 --- expect shape
 top: I32
 
---- expect same as reference
