@@ -3,6 +3,7 @@
 # notes: Nullable query and option parameters refuse null before search execution. An `rrf` `k:`
 # notes: parameter is refused outside 1..=1000000 as the read runs, both bounds admitted.
 # notes: The `rrf` arms differ only in repeating the term, since identical arms are a type error; both select the one Doc.
+# notes: A `nearest` window written as a fourth positional argument is `T71`, its fix naming it `k:`.
 
 --- runner
 timeout_ms: 10000
@@ -165,3 +166,14 @@ query null_nearest_query($q: Vector(2)?) {
 --- params
 {"q":null}
 --- expect error: nearest query must resolve to a non-null String or numeric vector
+
+--- query
+query positional_window($q: Vector(2)) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, 1) as $distance }
+    return { $d.key }
+}
+
+--- params
+{"q": [1.0, 0.0]}
+
+--- expect error: T71: `nearest`'s window is the option `k:`

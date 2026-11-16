@@ -216,20 +216,61 @@ fn every_expect_error_case_reaches_a_fixed_point_within_three_passes() {
     let steps = error_steps();
     assert!(steps.len() > 300, "the corpus shrank: {}", steps.len());
     let mut refused = 0;
+    // Sources a machine-applicable fix moved at least one pass: a refusal
+    // that prints none passes the rule without being tested by it.
+    let mut fixed = 0;
+    // The codes whose fixes are part of the break's contract (the GQ 3 RFC,
+    // section 6, "Stored sources at upgrade"), each fixed somewhere.
+    let mut contract: Vec<(&str, bool)> = ["T7", "T65", "T71", "Q008"]
+        .into_iter()
+        .map(|code| (code, false))
+        .collect();
     let mut violations = Vec::new();
     for step in &steps {
         let Some(cat) = catalog(&step.schema) else {
             continue;
         };
-        if check_source_all(&cat, &step.source).is_empty() {
+        let first = check_source_all(&cat, &step.source);
+        if first.is_empty() {
             continue;
         }
         refused += 1;
-        if let Err(violation) = converge(&cat, &step.source) {
-            violations.push(format!("{}: {violation}\n{}", step.origin, step.source));
+        match converge(&cat, &step.source) {
+            Ok(passes) if passes > 0 => {
+                fixed += 1;
+                for diagnostic in &first {
+                    let applicable = diagnostic
+                        .suggestion
+                        .as_deref()
+                        .is_some_and(|s| s.applicability == Applicability::MachineApplicable);
+                    if let Some(entry) = contract
+                        .iter_mut()
+                        .find(|(code, _)| *code == diagnostic.code.as_str())
+                    {
+                        entry.1 |= applicable;
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(violation) => {
+                violations.push(format!("{}: {violation}\n{}", step.origin, step.source))
+            }
         }
     }
     assert!(refused > 100, "few compile refusals: {refused}");
+    assert!(
+        fixed >= 35,
+        "few refusals print a fix the rule tests: {fixed} of {refused}"
+    );
+    let untested: Vec<&str> = contract
+        .iter()
+        .filter(|(_, seen)| !seen)
+        .map(|(code, _)| *code)
+        .collect();
+    assert!(
+        untested.is_empty(),
+        "no corpus refusal of {untested:?} prints a machine-applicable fix that converges"
+    );
     assert!(
         violations.is_empty(),
         "{} of {refused} refused sources break the fix-convergence rule:\n{}",

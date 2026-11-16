@@ -3713,6 +3713,35 @@ impl Ctx<'_> {
                 ));
             }
         }
+        // `nearest`'s window written as a fourth positional argument: the
+        // fix names it `k:` in place.
+        if name == "nearest"
+            && c.args.len() == positional + 1
+            && c.at.end > c.at.start
+            && !c.options.iter().any(|(o, _)| o == "k")
+            && let Some(Arg::Expr(window)) = c.args.last()
+        {
+            let mut fixed = c.clone();
+            fixed.args.pop();
+            fixed.options.insert(0, ("k".to_string(), window.clone()));
+            let replacement = crate::query::syntax::print::call(&fixed);
+            let mut diagnostic = QueryDiagnostic::typecheck(
+                T71,
+                "`nearest`'s window is the option `k:`, not a fourth positional argument",
+            )
+            .with_fix(replacement.clone())
+            .with_suggestion(Suggestion {
+                applicability: Applicability::MachineApplicable,
+                edits: vec![TextEdit {
+                    start: c.at.start,
+                    end: c.at.end,
+                    replacement,
+                }],
+            });
+            diagnostic.position = Some(c.at.position);
+            diagnostic.end = Some(c.at.end_position);
+            return Err(E::D(diagnostic));
+        }
         if c.args.len() != positional {
             let fix = match name {
                 "nearest" => "nearest(<population>, $x.field, $q, k: n)",
