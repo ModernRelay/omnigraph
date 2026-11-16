@@ -288,7 +288,7 @@ triple, so the written order is always the direction.
 ```gq
 // edition 2
 query boss($slug: String) {
-  match { $c: Company { slug: $slug }  $c worksAt $p }   // fmt: $p worksAt $c
+  match { $c: Company { slug: $slug }  $c worksAt $p }   // queries format: $p worksAt $c
   return { $p.name }
 }
 ```

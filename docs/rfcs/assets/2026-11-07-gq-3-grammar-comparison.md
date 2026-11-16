@@ -67,7 +67,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | a path value: refused | `p = (a)-[]->*(b)`, `PATH_LENGTH(p)`, `NODES(p)` | `p = …`, `nodes(p)`, `length(p)` | none in `GRAPH_TABLE` | none (a list encoding) |
 | `$d in $coll`: inside `match` any word is an edge name, keywords included, since no expression is written there; a quoted name is also accepted (`edge_ident`, `string_lit` in `edge_sel`) | `` `in` ``, backtick-delimited | `` `in` `` | `"in"` (a delimited identifier) | none |
 | `@edge` of the catalogue (`catalogue_edge`, stage S) | none | none | none | none |
-| the written-incoming order (`$c worksAt $p`) is accepted and `fmt` rewrites it | the arrow says it; no rewrite | the arrow says it; LangChain's `CypherQueryCorrector` is the rewrite, after generation | the join keys say it | the argument order says it |
+| the written-incoming order (`$c worksAt $p`) is accepted and `queries format` rewrites it | the arrow says it; no rewrite | the arrow says it; LangChain's `CypherQueryCorrector` is the rewrite, after generation | the join keys say it | the argument order says it |
 | `-e->`, `<-e-`, `-e-`: recognised to print the triple as the fix (`arrow_traversal`) | the form itself | the form itself | n/a | n/a |
 
 ## 5. Predicates and blocks
