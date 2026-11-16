@@ -1424,6 +1424,12 @@ pub struct MergeWriteProbes {
     /// statement that reaches `open_table_for_mutation`). A statement refused
     /// while its assignments resolve must leave this at zero.
     pub mutation_table_open_calls: Arc<AtomicU64>,
+    /// Membership predicates (`id in [ids]`) a mutation statement built from
+    /// its group's selection rows, one per evaluated chunk of ids, and the
+    /// most ids one of them carried: a statement over many selected
+    /// entities must evaluate bounded predicates, not one list of them all.
+    pub selection_membership_predicates: Arc<AtomicU64>,
+    pub selection_membership_max_ids: Arc<AtomicU64>,
     /// Blob payload values a rewrite consumed while rebuilding descriptor rows
     /// into a logical source (a keyed write or a branch merge), or that
     /// export, a change image or an entity read rendered: one per managed
@@ -1538,6 +1544,12 @@ impl MergeWriteProbes {
     }
     pub fn mutation_table_open_calls(&self) -> u64 {
         self.mutation_table_open_calls.load(Ordering::Relaxed)
+    }
+    pub fn selection_membership_predicates(&self) -> u64 {
+        self.selection_membership_predicates.load(Ordering::Relaxed)
+    }
+    pub fn selection_membership_max_ids(&self) -> u64 {
+        self.selection_membership_max_ids.load(Ordering::Relaxed)
     }
     pub fn blob_payload_read_calls(&self) -> u64 {
         self.blob_payload_read_calls.load(Ordering::Relaxed)
@@ -1778,6 +1790,17 @@ pub fn record_stage_vector_index() {
 pub fn record_mutation_table_open() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.mutation_table_open_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one membership predicate a mutation statement built from its
+/// selection rows, carrying `ids` ids. No-op in production.
+pub fn record_selection_membership(ids: usize) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.selection_membership_predicates
+            .fetch_add(1, Ordering::Relaxed);
+        p.selection_membership_max_ids
+            .fetch_max(ids as u64, Ordering::Relaxed);
     });
 }
 

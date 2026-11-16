@@ -298,13 +298,21 @@ group's first statement. When the selection is a scan of the statements'
 target filtered by predicates a staged scan evaluates, and the group's one
 `update` or `delete` is its first statement, that statement takes the
 predicate as its selection, read together with the groups staged before it,
-and an `insert` after it runs once per row it matched. Every other group with
+and an `insert` after it stages one row per row it matched. Every other group with
 a selection, a group of two or more `update` or `delete` statements included,
 runs it as a read that the read planner shapes, against the snapshot the
 write captured: the read returns, per row, the identity of each `update` or
 `delete` variable and the value of each assignment that reads the row, the
-statement then selects exactly those identities, and an `insert` runs once
-per row. An `insert` with no selection runs once. A selection read sees the
+statement then selects exactly those identities, and an `insert` stages one
+row per row. A `delete` evaluates the identities 8,192 at a time
+(`PROBE_CHUNK_KEYS`), one membership predicate per chunk, so no predicate it
+scans grows with the selection. An `update` stages at least one row per
+identity, so one selecting more entities than one table stages (8,192,
+`KEYED_WRITE_MAX_ROWS`) is refused before its table opens, and its one
+predicate holds at most that many. An `insert` with no selection stages one
+row. An `insert` statement opens its table once, however many rows it stages,
+and admits each row to the staging, row and byte limits included, as it builds
+it. A selection read sees the
 snapshot, not the statements staged before it, so a group whose selection
 reads a table an earlier group of the write changes, and an assignment that
 reads a Blob from a row, are refused at type check (`T86`).
@@ -738,7 +746,10 @@ id scan also returns each matched row's address at the table's pin, and
 `stage_all` writes the deletion vectors for exactly those rows
 (`TableStore::stage_delete_rows`, Lance's `DeleteBuilder` after its scan), so
 a deleted table is scanned once; addresses from another version than the
-reopened pin take Lance's scanning delete. A node delete whose predicate has
+reopened pin take Lance's scanning delete. A delete statement's scan leaves
+out the rows at the addresses earlier statements of the mutation recorded
+(`scheduled_deletes`), so statements that overlap count and record each row
+once, and no scan's filter grows with the statements before it. A node delete whose predicate has
 a `<key> = v` conjunct on the type's single String `@key` also filters on the
 derived id when the pinned table has an id BTREE, as the read planner's key
 narrowing does. Mutation validation reads the write's pinned base through the

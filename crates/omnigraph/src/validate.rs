@@ -107,10 +107,12 @@ pub(crate) enum AccessPath {
     Scan,
 }
 
-/// Keys per batched committed probe: uniqueness holders and `@card` edges.
-/// Bounds the pushed-down filter size, since a merge delta is not row-capped
-/// and a load holds many keyed batches of `KEYED_WRITE_MAX_ROWS` rows.
-const PROBE_CHUNK_KEYS: usize = 8_192;
+/// Keys per batched committed probe: uniqueness holders and `@card` edges,
+/// and the ids per membership predicate of a `delete` over a write group's
+/// selection rows. Bounds the pushed-down filter size, since a merge delta is
+/// not row-capped, a load holds many keyed batches of `KEYED_WRITE_MAX_ROWS`
+/// rows, and a delete's selection is bounded only by the removed-id budget.
+pub(crate) const PROBE_CHUNK_KEYS: usize = 8_192;
 
 /// Index-backed view of committed target state for the merge delta's lookups.
 /// Every method reads the (indexed) target table via a structured `filter_expr`

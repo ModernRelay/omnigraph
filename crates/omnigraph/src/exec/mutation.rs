@@ -11,9 +11,10 @@ use crate::loader::append_blob_value;
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle, WriteBudget};
+use crate::validate::PROBE_CHUNK_KEYS;
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
-use lance_select::mask::RowAddrTreeMap;
+use lance_select::mask::{RowAddrTreeMap, RowSetOps};
 use omnigraph_compiler::query::value::{BinaryOp, CompOp};
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
@@ -438,6 +439,100 @@ fn preflight_blob_assignments(
             })?)
             .ok_or_else(|| OmniError::manifest_internal("Blob assignment byte count overflow"))?;
     write_budget.check("decoded blob input bytes per operation", bytes)
+}
+
+/// The id an inserted node row takes: the canonical id of its `@key`
+/// tuple, or a fresh ULID for a type without a key.
+fn node_insert_id(
+    catalog: &Catalog,
+    type_name: &str,
+    resolved: &HashMap<String, Literal>,
+) -> Result<String> {
+    let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "checked mutation node type '{type_name}' is missing from catalog"
+        ))
+    })?;
+    let Some(key_properties) = node_type.key.as_ref() else {
+        return Ok(crate::dst_ids::new_ulid().to_string());
+    };
+    let schema = &node_type.arrow_schema;
+    let mut typed_keys = Vec::with_capacity(key_properties.len());
+    for key_prop in key_properties {
+        let key_literal = resolved.get(key_prop).ok_or_else(|| {
+            OmniError::manifest(format!("insert missing @key property '{}'", key_prop))
+        })?;
+        let key_field = schema.field_with_name(key_prop).map_err(|_| {
+            OmniError::manifest_internal(format!(
+                "@key property '{}' is missing from node {} Arrow schema",
+                key_prop, node_type.name
+            ))
+        })?;
+        typed_keys.push(literal_to_typed_array(
+            key_literal,
+            key_field.data_type(),
+            1,
+        )?);
+    }
+    crate::loader::canonical_key_id(&typed_keys, 0)?.ok_or_else(|| {
+        let key_description = match key_properties.as_slice() {
+            [key] => format!("@key property '{key}'"),
+            _ => format!("@key properties ({})", key_properties.join(", ")),
+        };
+        OmniError::manifest(format!("insert {key_description} cannot contain null"))
+    })
+}
+
+/// The id an inserted edge row takes: the canonical id of its `@key` tuple,
+/// whose endpoint columns read the `from` and `to` assignments, or a fresh
+/// ULID for a type without a key.
+fn edge_insert_id(
+    catalog: &Catalog,
+    type_name: &str,
+    resolved: &HashMap<String, Literal>,
+) -> Result<String> {
+    let edge_type = catalog.edge_types.get(type_name).ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "checked mutation edge type '{type_name}' is missing from catalog"
+        ))
+    })?;
+    let Some(key_columns) = edge_type.key.as_ref() else {
+        return Ok(crate::dst_ids::new_ulid().to_string());
+    };
+    let schema = &edge_type.arrow_schema;
+    let system_columns = catalog.system_columns;
+    let mut typed_keys = Vec::with_capacity(key_columns.len());
+    for key_col in key_columns {
+        let (assignment, is_endpoint) = match key_col.as_str() {
+            column if column == system_columns.src => ("from", true),
+            column if column == system_columns.dst => ("to", true),
+            other => (other, false),
+        };
+        let key_literal = resolved.get(assignment).ok_or_else(|| {
+            if is_endpoint {
+                OmniError::manifest(format!("missing required edge endpoint '{}'", assignment))
+            } else {
+                OmniError::manifest(format!("insert missing @key property '{}'", assignment))
+            }
+        })?;
+        let key_field = schema.field_with_name(key_col).map_err(|_| {
+            OmniError::manifest_internal(format!(
+                "@key property '{}' is missing from edge {} Arrow schema",
+                key_col, edge_type.name
+            ))
+        })?;
+        typed_keys.push(literal_to_typed_array(
+            key_literal,
+            key_field.data_type(),
+            1,
+        )?);
+    }
+    crate::loader::canonical_key_id(&typed_keys, 0)?.ok_or_else(|| {
+        OmniError::manifest(format!(
+            "insert @key properties ({}) cannot contain null",
+            key_columns.join(", ")
+        ))
+    })
 }
 
 /// Build a single-row RecordBatch from resolved assignments.
@@ -908,35 +1003,41 @@ struct SelectedEntities {
     values: RowValues,
 }
 
-impl SelectedEntities {
-    /// `id in [ids]` as the typed membership expression the staged
-    /// statement evaluates; `None` when the rows select no entity.
-    fn membership(&self, id_column: &str) -> Option<IRExpr> {
-        if self.ids.is_empty() {
-            return None;
-        }
-        let string = |list: bool| ExprType::Value {
-            scalar: ScalarType::String,
-            list,
+/// What an `update` statement runs over.
+#[derive(Clone, Copy)]
+enum UpdateSelection<'a> {
+    /// The rows its own predicate matches.
+    Predicate(&'a IRExpr),
+    /// The entities its group's selection read selected, with the values
+    /// its row-read assignments give each.
+    Entities(&'a SelectedEntities),
+}
+
+/// `id in [ids]` as the typed membership expression a staged statement
+/// evaluates over `ids`, a selection's entities or a chunk of them.
+fn id_membership(ids: &[String], id_column: &str) -> IRExpr {
+    crate::instrumentation::record_selection_membership(ids.len());
+    let string = |list: bool| ExprType::Value {
+        scalar: ScalarType::String,
+        list,
+        nullable: false,
+    };
+    IRExpr::Binary {
+        left: Box::new(IRExpr::Literal(
+            Literal::List(ids.iter().cloned().map(Literal::String).collect()),
+            string(true),
+        )),
+        op: BinaryOp::Compare(CompOp::Contains),
+        right: Box::new(IRExpr::PropAccess {
+            variable: String::new(),
+            property: id_column.to_string(),
+            ty: string(false),
+        }),
+        ty: ExprType::Value {
+            scalar: ScalarType::Bool,
+            list: false,
             nullable: false,
-        };
-        Some(IRExpr::Binary {
-            left: Box::new(IRExpr::Literal(
-                Literal::List(self.ids.iter().cloned().map(Literal::String).collect()),
-                string(true),
-            )),
-            op: BinaryOp::Compare(CompOp::Contains),
-            right: Box::new(IRExpr::PropAccess {
-                variable: String::new(),
-                property: id_column.to_string(),
-                ty: string(false),
-            }),
-            ty: ExprType::Value {
-                scalar: ScalarType::Bool,
-                list: false,
-                nullable: false,
-            },
-        })
+        },
     }
 }
 
@@ -1268,48 +1369,46 @@ pub(super) async fn open_table_for_mutation(
     Ok((opened.handle, opened.full_path, opened.table_branch))
 }
 
-/// Build the committed-snapshot filter used to COUNT a delete statement's
-/// `affected_*`, excluding rows a prior delete statement on the same table
-/// already scheduled for removal in this query.
+/// The rows of `table_key`, at its pinned `version`, that an earlier delete
+/// statement of this mutation already scheduled for removal: a delete
+/// statement's scan leaves them out of the rows it counts and records.
 ///
-/// Deletes stage — they no longer inline-commit — so every statement in a
-/// delete-only query scans the same unchanged committed snapshot. Counting each
-/// predicate independently would double-count overlapping statements (the old
-/// inline path did not, because each delete committed before the next ran). The
-/// combined staged delete actually removes the UNION `p₁ ∪ p₂ ∪ …`; excluding
-/// the prior predicates here makes each statement contribute `|pₙ \ (p₁ ∪ …)|`,
-/// whose sum is exactly that distinct count. `base` (the original predicate) is
-/// still what gets recorded — only the count uses this exclusion.
+/// Deletes stage, so every statement of a delete-only mutation scans the same
+/// committed snapshot. Counting each predicate on its own would count rows
+/// that overlapping statements share twice, and record their ids twice. The
+/// combined staged delete removes the union `p₁ ∪ p₂ ∪ …`; leaving out the
+/// rows earlier statements scheduled makes each statement contribute
+/// `|pₙ \ (p₁ ∪ …)|`, whose sum is exactly that distinct count. The statement's
+/// own predicate is still what gets recorded.
+///
+/// Every recorded predicate also records the addresses its scan matched
+/// (`MutationStaging::record_deleted_row_addrs`), so their union is exactly
+/// the rows the earlier predicates selected as true: a row an earlier
+/// predicate leaves unknown (a null) was never recorded and stays in, and a
+/// chunk of one statement's selected entities leaves out the rows an earlier
+/// chunk's cascade reached. The exclusion is a set of addresses, not a filter,
+/// so no statement's scan grows with the predicates recorded before it.
 ///
 /// LOAD-BEARING on D₂: this exclusion assumes the committed snapshot is
 /// invariant across the query's statements, which holds only because D₂
 /// (`enforce_no_mixed_destructive_constructive`) forbids mixing inserts/updates
 /// with deletes — so a delete-touched table never has pending writes that would
-/// shift what a later statement sees. If D₂ is ever relaxed, this dedup must be
-/// revisited (a later delete would then need to see prior in-query writes).
-///
-/// The exclusion uses `IS NOT TRUE`, not `NOT`, because of SQL three-valued
-/// logic: a prior predicate referencing a column that is NULL for some row
-/// (e.g. `age > 30` on a row with NULL `age`) evaluates to UNKNOWN, and
-/// `NOT UNKNOWN` is still UNKNOWN — which a `WHERE` treats as not-matched, so
-/// the row would be wrongly dropped from this statement's scan even though the
-/// prior delete never matched it (dropping it from `deleted_ids` skips its
-/// cascade, or — if it is the only match — leaves the node undeleted). Only
-/// rows a prior predicate matched as definitely TRUE should be excluded:
-/// `(prior) IS NOT TRUE` keeps both FALSE and UNKNOWN rows.
-///
-/// Each prior predicate gets its own `IS NOT TRUE` (`(p1 OR p2) IS NOT TRUE`
-/// is `p1 IS NOT TRUE AND p2 IS NOT TRUE`). An `OR` of the priors would put
-/// their tests side by side, where Lance's simplifier folds two disjoint
-/// `NOT IN` tests of one nullable column to `true` and so excludes the rows
-/// whose value is null (#1277); `IS NOT TRUE` has no rewrite there.
-fn dedup_delete_filter(base: &Expr, prior: &[Expr]) -> Expr {
-    prior
-        .iter()
-        .cloned()
-        .fold(base.clone(), |filter, excluded| {
-            filter.and(excluded.is_not_true())
-        })
+/// shift what a later statement sees. If D₂ is ever relaxed, this exclusion
+/// must be revisited (a later delete would then need to see prior in-query
+/// writes).
+fn scheduled_deletes<'a>(
+    recorded: &'a HashMap<String, (u64, RowAddrTreeMap)>,
+    table_key: &str,
+    version: u64,
+) -> Result<Option<&'a RowAddrTreeMap>> {
+    match recorded.get(table_key) {
+        None => Ok(None),
+        Some((recorded_version, addrs)) if *recorded_version == version => Ok(Some(addrs)),
+        Some((recorded_version, _)) => Err(OmniError::manifest_internal(format!(
+            "delete row addresses for '{table_key}' captured at version {recorded_version}, \
+             scanned at {version}"
+        ))),
+    }
 }
 
 /// D₂ parse-time check: a single mutation query is either insert/update-only
@@ -2109,49 +2208,32 @@ impl Omnigraph {
                     target,
                     assignments,
                     rows,
-                } => match rows {
-                    InsertRows::Once => {
-                        let values = evaluate_assignments(assignments, params)?;
-                        self.execute_insert(target, values, branch, staging, txn)
-                            .await?
-                    }
-                    InsertRows::Matched => {
-                        let mut result = MutationResult::default();
-                        if matched > 0 {
+                } => {
+                    let rows = match rows {
+                        InsertRows::Once => vec![evaluate_assignments(assignments, params)?],
+                        InsertRows::Matched if matched > 0 => {
                             let values = evaluate_assignments(assignments, params)?;
-                            for _ in 0..matched {
-                                let one = self
-                                    .execute_insert(target, values.clone(), branch, staging, txn)
+                            vec![values; matched as usize]
+                        }
+                        InsertRows::Matched => Vec::new(),
+                        InsertRows::Selected(rows) => {
+                            let read =
+                                selection_rows(ir, rows.read, &mut selected, params, txn, reader)
                                     .await?;
-                                result.affected_nodes += one.affected_nodes;
-                                result.affected_edges += one.affected_edges;
-                            }
+                            inserted_entities(
+                                &ir.name,
+                                &txn.catalog,
+                                target,
+                                assignments,
+                                rows,
+                                read,
+                                params,
+                            )?
                         }
-                        result
-                    }
-                    InsertRows::Selected(rows) => {
-                        let read =
-                            selection_rows(ir, rows.read, &mut selected, params, txn, reader)
-                                .await?;
-                        let mut result = MutationResult::default();
-                        for values in inserted_entities(
-                            &ir.name,
-                            &txn.catalog,
-                            target,
-                            assignments,
-                            rows,
-                            read,
-                            params,
-                        )? {
-                            let one = self
-                                .execute_insert(target, values, branch, staging, txn)
-                                .await?;
-                            result.affected_nodes += one.affected_nodes;
-                            result.affected_edges += one.affected_edges;
-                        }
-                        result
-                    }
-                },
+                    };
+                    self.execute_insert(target, rows, branch, staging, txn)
+                        .await?
+                }
                 WriteOp::Update {
                     target,
                     assignments,
@@ -2171,8 +2253,7 @@ impl Omnigraph {
                             self.execute_update(
                                 target,
                                 assignments,
-                                predicate,
-                                None,
+                                UpdateSelection::Predicate(predicate),
                                 params,
                                 branch,
                                 staging,
@@ -2187,23 +2268,21 @@ impl Omnigraph {
                                 selection_rows(ir, rows.read, &mut selected, params, txn, reader)
                                     .await?;
                             let entities = selected_entities(&ir.name, target, rows, read)?;
-                            match entities.membership(txn.catalog.system_columns.id) {
-                                None => MutationResult::default(),
-                                Some(predicate) => {
-                                    self.execute_update(
-                                        target,
-                                        assignments,
-                                        &predicate,
-                                        Some(&entities.values),
-                                        params,
-                                        branch,
-                                        staging,
-                                        txn,
-                                        sole_write,
-                                        only_write,
-                                    )
-                                    .await?
-                                }
+                            if entities.ids.is_empty() {
+                                MutationResult::default()
+                            } else {
+                                self.execute_update(
+                                    target,
+                                    assignments,
+                                    UpdateSelection::Entities(&entities),
+                                    params,
+                                    branch,
+                                    staging,
+                                    txn,
+                                    sole_write,
+                                    only_write,
+                                )
+                                .await?
                             }
                         }
                     }
@@ -2218,15 +2297,21 @@ impl Omnigraph {
                             selection_rows(ir, rows.read, &mut selected, params, txn, reader)
                                 .await?;
                         let entities = selected_entities(&ir.name, target, rows, read)?;
-                        match entities.membership(txn.catalog.system_columns.id) {
-                            None => MutationResult::default(),
-                            Some(predicate) => {
-                                self.execute_delete(
-                                    target, &predicate, params, branch, staging, txn,
-                                )
-                                .await?
-                            }
+                        // A chunk of ids at a time, so no predicate the delete
+                        // evaluates grows with the selection. The chunks are
+                        // disjoint, and each statement's scan leaves out the
+                        // rows an earlier one scheduled by their addresses,
+                        // so the counts sum to the statement's own.
+                        let mut result = MutationResult::default();
+                        for chunk in entities.ids.chunks(PROBE_CHUNK_KEYS) {
+                            let predicate = id_membership(chunk, txn.catalog.system_columns.id);
+                            let one = self
+                                .execute_delete(target, &predicate, params, branch, staging, txn)
+                                .await?;
+                            result.affected_nodes += one.affected_nodes;
+                            result.affected_edges += one.affected_edges;
                         }
+                        result
                     }
                 },
             };
@@ -2239,92 +2324,35 @@ impl Omnigraph {
         Ok(total)
     }
 
+    /// Stage one `insert` statement's rows: each row's values become a
+    /// one-row batch with its id (the canonical key id of a keyed type, a
+    /// fresh ULID otherwise), refused as a lone insert would be, and the
+    /// statement opens its table once, after its first row is built, however
+    /// many rows its group gave it. Each row is admitted to the staging as it
+    /// is built, so the write budget stops the statement at the row that
+    /// passes it rather than after every row's decoded Blob payload is held.
     async fn execute_insert(
         &self,
         target: &MutationTarget,
-        resolved: HashMap<String, Literal>,
+        rows: Vec<HashMap<String, Literal>>,
         branch: Option<&str>,
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
         let catalog = &txn.catalog;
-        match target {
+        let (schema, blob_props, has_key, table_key) = match target {
             MutationTarget::Node { type_name } => {
                 let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
                     OmniError::manifest_internal(format!(
                         "checked mutation node type '{type_name}' is missing from catalog"
                     ))
                 })?;
-                let schema = node_type.arrow_schema.clone();
-                refuse_null_on_required(type_name, &schema, &resolved)?;
-                let blob_props = node_type.blob_properties.clone();
-                let id = if let Some(key_properties) = node_type.key.as_ref() {
-                    let mut typed_keys = Vec::with_capacity(key_properties.len());
-                    for key_prop in key_properties {
-                        let key_literal = resolved.get(key_prop).ok_or_else(|| {
-                            OmniError::manifest(format!(
-                                "insert missing @key property '{}'",
-                                key_prop
-                            ))
-                        })?;
-                        let key_field = schema.field_with_name(key_prop).map_err(|_| {
-                            OmniError::manifest_internal(format!(
-                                "@key property '{}' is missing from node {} Arrow schema",
-                                key_prop, node_type.name
-                            ))
-                        })?;
-                        typed_keys.push(literal_to_typed_array(
-                            key_literal,
-                            key_field.data_type(),
-                            1,
-                        )?);
-                    }
-                    crate::loader::canonical_key_id(&typed_keys, 0)?.ok_or_else(|| {
-                        let key_description = match key_properties.as_slice() {
-                            [key] => format!("@key property '{key}'"),
-                            _ => format!("@key properties ({})", key_properties.join(", ")),
-                        };
-                        OmniError::manifest(format!("insert {key_description} cannot contain null"))
-                    })?
-                } else {
-                    crate::dst_ids::new_ulid().to_string()
-                };
-
-                let batch = build_insert_batch(
-                    &schema,
-                    &id,
-                    &resolved,
-                    &blob_props,
-                    catalog.system_columns,
-                    staging.write_budget(),
-                )?;
-                let has_key = node_type.key.is_some();
-                let table_key = format!("node:{}", type_name);
-                let insert_kind = if has_key {
-                    crate::db::MutationOpKind::Merge
-                } else {
-                    crate::db::MutationOpKind::Insert
-                };
-                let (_ds, _full_path, _table_branch) = open_table_for_mutation(
-                    self,
-                    staging,
-                    branch,
-                    &table_key,
-                    insert_kind,
-                    Some(txn),
+                (
+                    node_type.arrow_schema.clone(),
+                    &node_type.blob_properties,
+                    node_type.key.is_some(),
+                    format!("node:{type_name}"),
                 )
-                .await?;
-                let mode = if has_key {
-                    PendingMode::Upsert
-                } else {
-                    PendingMode::StrictInsert
-                };
-                staging.append_batch(&table_key, schema, mode, batch)?;
-
-                Ok(MutationResult {
-                    affected_nodes: 1,
-                    affected_edges: 0,
-                })
             }
             MutationTarget::Edge { type_name } => {
                 let edge_type = catalog.edge_types.get(type_name).ok_or_else(|| {
@@ -2332,68 +2360,39 @@ impl Omnigraph {
                         "checked mutation edge type '{type_name}' is missing from catalog"
                     ))
                 })?;
-                let schema = edge_type.arrow_schema.clone();
-                refuse_null_on_required(type_name, &schema, &resolved)?;
-                let blob_props = edge_type.blob_properties.clone();
-                let id = if let Some(key_columns) = edge_type.key.as_ref() {
-                    let system_columns = catalog.system_columns;
-                    let mut typed_keys = Vec::with_capacity(key_columns.len());
-                    for key_col in key_columns {
-                        let (assignment, is_endpoint) = match key_col.as_str() {
-                            column if column == system_columns.src => ("from", true),
-                            column if column == system_columns.dst => ("to", true),
-                            other => (other, false),
-                        };
-                        let key_literal = resolved.get(assignment).ok_or_else(|| {
-                            if is_endpoint {
-                                OmniError::manifest(format!(
-                                    "missing required edge endpoint '{}'",
-                                    assignment
-                                ))
-                            } else {
-                                OmniError::manifest(format!(
-                                    "insert missing @key property '{}'",
-                                    assignment
-                                ))
-                            }
-                        })?;
-                        let key_field = schema.field_with_name(key_col).map_err(|_| {
-                            OmniError::manifest_internal(format!(
-                                "@key property '{}' is missing from edge {} Arrow schema",
-                                key_col, edge_type.name
-                            ))
-                        })?;
-                        typed_keys.push(literal_to_typed_array(
-                            key_literal,
-                            key_field.data_type(),
-                            1,
-                        )?);
-                    }
-                    crate::loader::canonical_key_id(&typed_keys, 0)?.ok_or_else(|| {
-                        OmniError::manifest(format!(
-                            "insert @key properties ({}) cannot contain null",
-                            key_columns.join(", ")
-                        ))
-                    })?
-                } else {
-                    crate::dst_ids::new_ulid().to_string()
-                };
-
-                let batch = build_insert_batch(
-                    &schema,
-                    &id,
-                    &resolved,
-                    &blob_props,
-                    catalog.system_columns,
-                    staging.write_budget(),
-                )?;
-                let has_key = edge_type.key.is_some();
-                let table_key = format!("edge:{}", type_name);
-                let insert_kind = if has_key {
-                    crate::db::MutationOpKind::Merge
-                } else {
-                    crate::db::MutationOpKind::Insert
-                };
+                (
+                    edge_type.arrow_schema.clone(),
+                    &edge_type.blob_properties,
+                    edge_type.key.is_some(),
+                    format!("edge:{type_name}"),
+                )
+            }
+        };
+        let (insert_kind, mode) = if has_key {
+            (crate::db::MutationOpKind::Merge, PendingMode::Upsert)
+        } else {
+            (crate::db::MutationOpKind::Insert, PendingMode::StrictInsert)
+        };
+        let mut staged = 0usize;
+        for resolved in rows {
+            refuse_null_on_required(target.type_name(), &schema, &resolved)?;
+            let id = match target {
+                MutationTarget::Node { type_name } => {
+                    node_insert_id(catalog, type_name, &resolved)?
+                }
+                MutationTarget::Edge { type_name } => {
+                    edge_insert_id(catalog, type_name, &resolved)?
+                }
+            };
+            let batch = build_insert_batch(
+                &schema,
+                &id,
+                &resolved,
+                blob_props,
+                catalog.system_columns,
+                staging.write_budget(),
+            )?;
+            if staged == 0 {
                 let (_handle, _full_path, _table_branch) = open_table_for_mutation(
                     self,
                     staging,
@@ -2403,29 +2402,32 @@ impl Omnigraph {
                     Some(txn),
                 )
                 .await?;
-                let mode = if has_key {
-                    PendingMode::Upsert
-                } else {
-                    PendingMode::StrictInsert
-                };
-                staging.append_batch(&table_key, schema, mode, batch)?;
-
-                self.invalidate_graph_index_for([table_key.as_str()]).await;
-
-                Ok(MutationResult {
-                    affected_nodes: 0,
-                    affected_edges: 1,
-                })
             }
+            staging.append_batch(&table_key, schema.clone(), mode, batch)?;
+            staged += 1;
         }
+        Ok(match target {
+            MutationTarget::Node { .. } => MutationResult {
+                affected_nodes: staged,
+                affected_edges: 0,
+            },
+            MutationTarget::Edge { .. } => {
+                if staged > 0 {
+                    self.invalidate_graph_index_for([table_key.as_str()]).await;
+                }
+                MutationResult {
+                    affected_nodes: 0,
+                    affected_edges: staged,
+                }
+            }
+        })
     }
 
     async fn execute_update(
         &self,
         target: &MutationTarget,
         assignments: &[Assignment],
-        predicate: &IRExpr,
-        row_values: Option<&RowValues>,
+        selection: UpdateSelection<'_>,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
@@ -2448,6 +2450,10 @@ impl Omnigraph {
                 "checked mutation node type '{type_name}' is missing from catalog"
             ))
         })?;
+        let row_values = match selection {
+            UpdateSelection::Predicate(_) => None,
+            UpdateSelection::Entities(entities) => Some(&entities.values),
+        };
 
         // Reject updates to every @key component — physical identity is the
         // canonical typed tuple, so changing even a non-leading component
@@ -2465,7 +2471,12 @@ impl Omnigraph {
         }
 
         let schema = node_type.arrow_schema.clone();
-        let pred_expr = mutation_predicate_expr(predicate, params, &schema)?;
+        let own_pred_expr = match selection {
+            UpdateSelection::Predicate(predicate) => {
+                Some(mutation_predicate_expr(predicate, params, &schema)?)
+            }
+            UpdateSelection::Entities(_) => None,
+        };
         // Resolved before the table is opened, so a null on a non-nullable
         // property is refused even when the predicate matches no row.
         let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
@@ -2501,6 +2512,27 @@ impl Omnigraph {
         };
 
         let table_key = format!("node:{}", type_name);
+        let membership;
+        let (predicate, pred_expr) = match (selection, own_pred_expr) {
+            (UpdateSelection::Predicate(predicate), Some(pred_expr)) => (predicate, pred_expr),
+            (UpdateSelection::Entities(entities), _) => {
+                // Every selected entity is a row of the pinned snapshot, so
+                // the update stages at least one row per id, and one table
+                // stages at most `KEYED_WRITE_MAX_ROWS`: a larger selection
+                // is refused here, before the predicate of its ids is built
+                // or scanned, as its staging would refuse it afterwards. So
+                // the predicate carries at most that many ids.
+                staging.admit_keyed_rows(&table_key, entities.ids.len())?;
+                membership = id_membership(&entities.ids, catalog.system_columns.id);
+                let pred_expr = mutation_predicate_expr(&membership, params, &schema)?;
+                (&membership, pred_expr)
+            }
+            (UpdateSelection::Predicate(_), None) => {
+                return Err(OmniError::manifest_internal(
+                    "an update's own predicate was not converted",
+                ));
+            }
+        };
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
             self,
             staging,
@@ -2774,15 +2806,12 @@ impl Omnigraph {
                 Some(id_conjunct) => pred_expr.clone().and(id_conjunct),
                 None => pred_expr.clone(),
             };
-        let scan_filter = dedup_delete_filter(
-            &scan_predicate,
-            staging.recorded_delete_predicates(&table_key),
-        );
         let (deleted_ids, deleted_addrs) = scan_deleted_ids(
             self,
             &ds,
             txn.catalog.system_columns.id,
-            scan_filter,
+            scan_predicate,
+            scheduled_deletes(&staging.deleted_row_addrs, &table_key, ds.version())?,
             &mut staging.deleted_id_budget,
         )
         .await?;
@@ -2852,16 +2881,13 @@ impl Omnigraph {
             // staged deletes the rows aren't removed until end-of-query, so
             // count the matching committed edges now. Exact under D₂ (no staged
             // inserts can add matches mid-query), and bounded by the cascade
-            // working set. Exclude edges a prior delete statement (a prior
+            // working set. Leave out edges a prior delete statement (a prior
             // cascade, or an explicit edge delete) on this table already
-            // scheduled, so an edge incident to two deleted nodes — or matched
-            // by both a cascade and an explicit `delete <Edge>` — is counted
-            // once. Record the ORIGINAL cascade filter (the combined staged
-            // delete removes the union); skip only when nothing NEW matches.
-            let count_filter = dedup_delete_filter(
-                &cascade_filter,
-                staging.recorded_delete_predicates(&edge_table_key),
-            );
+            // scheduled (`scheduled_deletes`), so an edge incident to two
+            // deleted nodes — or matched by both a cascade and an explicit
+            // `delete <Edge>` — is counted once. Record the ORIGINAL cascade
+            // filter (the combined staged delete removes the union); skip only
+            // when nothing NEW matches.
             // Scan (not count) the cascade-removed edge ids so validation
             // recounts the OTHER endpoint's @card after the cascade; `len()` is
             // the affected count.
@@ -2869,7 +2895,12 @@ impl Omnigraph {
                 self,
                 &edge_ds,
                 txn.catalog.system_columns.id,
-                count_filter,
+                cascade_filter.clone(),
+                scheduled_deletes(
+                    &staging.deleted_row_addrs,
+                    &edge_table_key,
+                    edge_ds.version(),
+                )?,
                 &mut staging.deleted_id_budget,
             )
             .await?;
@@ -2929,13 +2960,12 @@ impl Omnigraph {
         let ds = handle.expect("strict Delete op always opens its dataset");
 
         // Count matching committed edges now (the staged delete won't remove
-        // them until end-of-query). Exact under D₂; exclude edges a prior delete
-        // statement on this table (an earlier cascade or edge delete) already
-        // scheduled, so overlapping statements don't double-count. Record the
-        // ORIGINAL predicate below (the combined staged delete removes the
-        // union); only record when something NEW matches.
-        let count_filter =
-            dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
+        // them until end-of-query). Exact under D₂; leave out edges a prior
+        // delete statement on this table (an earlier cascade or edge delete)
+        // already scheduled (`scheduled_deletes`), so overlapping statements
+        // don't double-count. Record the ORIGINAL predicate below (the combined
+        // staged delete removes the union); only record when something NEW
+        // matches.
         // Scan the matched edge ids (not just count): the ids feed validation so
         // a delete emptying a src below @card min is rejected; `len()` is the
         // affected count. One scan replaces the former count-here + resolve-at-
@@ -2944,7 +2974,8 @@ impl Omnigraph {
             self,
             &ds,
             txn.catalog.system_columns.id,
-            count_filter,
+            pred_expr.clone(),
+            scheduled_deletes(&staging.deleted_row_addrs, &table_key, ds.version())?,
             &mut staging.deleted_id_budget,
         )
         .await?;
@@ -3034,14 +3065,16 @@ async fn key_id_conjunct(
     ))
 }
 
-/// Walk the exact typed predicate a batch at a time, admitting each id against
-/// `budget` before copying it, and keep each matched row's address so the
-/// staged delete removes exactly these rows without scanning again.
+/// Walk the exact typed predicate a batch at a time, leaving out the rows at
+/// the `scheduled` addresses (see `scheduled_deletes`), admitting each other
+/// id against `budget` before copying it, and keep each matched row's address
+/// so the staged delete removes exactly these rows without scanning again.
 async fn scan_deleted_ids(
     db: &Omnigraph,
     snapshot: &SnapshotHandle,
     id_column: &str,
     filter: Expr,
+    scheduled: Option<&RowAddrTreeMap>,
     budget: &mut DeletedIdBudget,
 ) -> Result<(Vec<String>, RowAddrTreeMap)> {
     let mut stream = db
@@ -3068,10 +3101,14 @@ async fn scan_deleted_ids(
             ));
         }
         for i in 0..ids.len() {
+            let addr = row_addrs.value(i);
+            if scheduled.is_some_and(|scheduled| scheduled.contains(addr)) {
+                continue;
+            }
             let id = ids.value(i);
             budget.retain(id)?;
             removed.push(id.to_owned());
-            if !addrs.insert(row_addrs.value(i)) {
+            if !addrs.insert(addr) {
                 return Err(OmniError::manifest_internal(
                     "delete id scan returned one row address twice",
                 ));
@@ -3329,26 +3366,5 @@ edge Shared: Endpoint -> Endpoint { label: String }
         assert!(staging.is_empty());
         assert!(staging.paths.is_empty());
         assert!(staging.deleted_ids.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod delete_filter_tests {
-    use super::dedup_delete_filter;
-    use crate::engine::lance_filter_support::selected_rows;
-    use datafusion::prelude::{col, lit, not};
-
-    /// A later statement selects `k = "a"`, the row whose `s` is null; the
-    /// earlier statements' disjoint `NOT IN` tests are null there, so they
-    /// did not match it and must not exclude it.
-    #[test]
-    fn earlier_disjoint_not_in_statements_do_not_exclude_a_null_row_issue_1277() {
-        let prior = [
-            not(col("s").in_list(vec![lit("y")], false)),
-            not(col("s").in_list(vec![lit("x")], false)),
-        ];
-        let filter = dedup_delete_filter(&col("k").eq(lit("a")), &prior);
-        assert_eq!(selected_rows(filter.clone(), false), vec![0]);
-        assert_eq!(selected_rows(filter, true), vec![0]);
     }
 }

@@ -316,21 +316,7 @@ impl MutationStaging {
             mode,
             PendingMode::StrictInsert | PendingMode::Upsert | PendingMode::ColumnPatch
         ) {
-            let existing_rows = self
-                .pending
-                .get(table_key)
-                .map(PendingTable::total_rows)
-                .unwrap_or(0);
-            let rows = existing_rows
-                .checked_add(batch.num_rows())
-                .ok_or_else(|| OmniError::manifest_internal("pending keyed row count overflow"))?;
-            if rows > KEYED_WRITE_MAX_ROWS {
-                return Err(OmniError::resource_limit(
-                    format!("keyed entities for {table_key}"),
-                    KEYED_WRITE_MAX_ROWS as u64,
-                    rows as u64,
-                ));
-            }
+            self.admit_keyed_rows(table_key, batch.num_rows())?;
             let existing_bytes = match self.pending.get(table_key) {
                 Some(existing) => existing.total_bytes()?,
                 None => 0,
@@ -362,6 +348,30 @@ impl MutationStaging {
         entry.batches.push(batch);
         self.pending_bytes = pending_bytes;
         self.pending_payload_bytes = pending_payload_bytes;
+        Ok(())
+    }
+
+    /// Refuse `additional` keyed rows on `table_key` when the rows already
+    /// pending there and they pass `KEYED_WRITE_MAX_ROWS`, the rows one table
+    /// stages per operation. `append_batch` checks each keyed batch here; a
+    /// caller that knows a lower bound on the rows it would stage asks first,
+    /// before the work of building them.
+    pub(crate) fn admit_keyed_rows(&self, table_key: &str, additional: usize) -> Result<()> {
+        let existing_rows = self
+            .pending
+            .get(table_key)
+            .map(PendingTable::total_rows)
+            .unwrap_or(0);
+        let rows = existing_rows
+            .checked_add(additional)
+            .ok_or_else(|| OmniError::manifest_internal("pending keyed row count overflow"))?;
+        if rows > KEYED_WRITE_MAX_ROWS {
+            return Err(OmniError::resource_limit(
+                format!("keyed entities for {table_key}"),
+                KEYED_WRITE_MAX_ROWS as u64,
+                rows as u64,
+            ));
+        }
         Ok(())
     }
 
@@ -404,8 +414,8 @@ impl MutationStaging {
 
     /// Record ids removed by a delete op on `table_key`, captured from the op's
     /// own scan, for validation (so cardinality recounts an emptied src). The
-    /// caller scans with a dedup filter that excludes prior-scheduled matches, so
-    /// no id is recorded twice across statements.
+    /// caller's scan leaves out the rows earlier statements scheduled, so no id
+    /// is recorded twice across statements.
     pub(crate) fn record_deleted_ids(&mut self, table_key: &str, ids: Vec<String>) {
         if ids.is_empty() {
             return;
@@ -438,19 +448,6 @@ impl MutationStaging {
         }
         entry.1 |= addrs;
         Ok(())
-    }
-
-    /// Delete predicates already recorded for `table_key` by earlier delete
-    /// statements in this query. Read before recording the current statement's
-    /// predicate so its `affected_*` count can exclude rows a prior statement
-    /// already scheduled for deletion (deletes stage, so the committed snapshot
-    /// is unchanged across statements — without this, overlapping predicates
-    /// would double-count). `&[]` if none.
-    pub(crate) fn recorded_delete_predicates(&self, table_key: &str) -> &[Expr] {
-        self.delete_predicates
-            .get(table_key)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
     }
 
     /// Read-your-writes accessor: the accumulated pending batches for
