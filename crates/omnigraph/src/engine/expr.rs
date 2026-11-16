@@ -14,6 +14,9 @@ use omnigraph_planner::PhysicalNode;
 pub(super) struct ProjectionContext {
     catalog: Arc<Catalog>,
     bindings: HashMap<String, String>,
+    /// Each edge binding an `Expand` names, with whether its selection
+    /// spans several edge types, whose rows then carry the type column.
+    edges: HashMap<String, bool>,
 }
 
 impl ProjectionContext {
@@ -21,6 +24,7 @@ impl ProjectionContext {
     /// node type, an `Expand` binds its destination, inner trees included.
     pub(super) fn for_plan(catalog: &Arc<Catalog>, plan: &PhysicalPlan) -> Self {
         let mut bindings = HashMap::new();
+        let mut edges = HashMap::new();
         for (_, node) in plan.live() {
             match node {
                 PhysicalNode::Scan { spec, .. } | PhysicalNode::MetadataCount { spec, .. } => {
@@ -29,8 +33,17 @@ impl ProjectionContext {
                         bindings.insert(binding.clone(), type_name.to_string());
                     }
                 }
-                PhysicalNode::Expand { dst, dst_type, .. } => {
+                PhysicalNode::Expand {
+                    dst,
+                    dst_type,
+                    edges: selection,
+                    edge_binding,
+                    ..
+                } => {
                     bindings.insert(dst.clone(), dst_type.clone());
+                    if let Some(edge) = edge_binding {
+                        edges.insert(edge.clone(), selection.named().is_none());
+                    }
                 }
                 PhysicalNode::SortMergeJoin { .. }
                 | PhysicalNode::HashJoin { .. }
@@ -64,6 +77,7 @@ impl ProjectionContext {
         Self {
             catalog: Arc::clone(catalog),
             bindings,
+            edges,
         }
     }
 
@@ -754,7 +768,10 @@ pub(super) fn evaluate_projection(
 /// built. A node binding's identity is its id; an edge binding's is its id
 /// too, and for an edge over several types, whose rows carry the edge type,
 /// its type and id together, joined by a NUL that no type name holds, so
-/// `count(distinct $k)` tells two types' equal ids apart.
+/// `count(distinct $k)` tells two types' equal ids apart. Which of the two
+/// follows from the binding's declared selection, never from the columns the
+/// batch happens to hold: a selection over several types whose rows lack the
+/// type column fails.
 pub(super) fn identity_column(
     wide_batch: &RecordBatch,
     variable: &str,
@@ -771,8 +788,17 @@ pub(super) fn identity_column(
         "{variable}.{}",
         omnigraph_compiler::traversal::EDGE_TYPE_COLUMN
     );
-    let Some(types) = wide_batch.column_by_name(&type_name) else {
-        return Ok((variable.to_string(), col.clone()));
+    let types = match ctx.edges.get(variable) {
+        Some(false) => return Ok((variable.to_string(), col.clone())),
+        Some(true) => wide_batch.column_by_name(&type_name).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "edge binding '{variable}' spans several edge types but its rows carry no '{type_name}'"
+            ))
+        })?,
+        None => match wide_batch.column_by_name(&type_name) {
+            Some(types) => types,
+            None => return Ok((variable.to_string(), col.clone())),
+        },
     };
     let as_strings = |array: &ArrayRef, name: &str| {
         array
@@ -789,6 +815,47 @@ pub(super) fn identity_column(
         })
         .collect();
     Ok((variable.to_string(), Arc::new(identities)))
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use omnigraph_compiler::catalog::build_catalog;
+    use omnigraph_compiler::schema::parser::parse_schema;
+
+    fn context(edges: &[(&str, bool)]) -> ProjectionContext {
+        let schema = "node P {\n  k: String @key\n}\nedge A: P -> P\nedge B: P -> P\n";
+        ProjectionContext {
+            catalog: Arc::new(build_catalog(&parse_schema(schema).unwrap()).unwrap()),
+            bindings: HashMap::new(),
+            edges: edges.iter().map(|(n, m)| (n.to_string(), *m)).collect(),
+        }
+    }
+
+    fn ids_only(catalog: &Catalog) -> RecordBatch {
+        let name = format!("k.{}", catalog.system_columns.id);
+        RecordBatch::try_from_iter([(
+            name.as_str(),
+            Arc::new(StringArray::from(vec!["e1", "e1"])) as ArrayRef,
+        )])
+        .unwrap()
+    }
+
+    /// An edge over one type counts by its id; one over several types needs
+    /// the type column its rows carry, and fails rather than merging two
+    /// types' equal ids when the batch lacks it.
+    #[test]
+    fn an_edge_identity_follows_the_declared_selection() {
+        let one = context(&[("k", false)]);
+        let (_, ids) = identity_column(&ids_only(&one.catalog), "k", &one).unwrap();
+        assert_eq!(ids.len(), 2);
+        let several = context(&[("k", true)]);
+        let error = identity_column(&ids_only(&several.catalog), "k", &several).unwrap_err();
+        assert!(
+            error.to_string().contains("spans several edge types"),
+            "{error}"
+        );
+    }
 }
 
 #[cfg(test)]
