@@ -1152,9 +1152,56 @@ fn comparison_to_df_expr(
         CompOp::Ge => left.gt_eq(right),
         CompOp::Le => left.lt_eq(right),
         CompOp::StartsWith => datafusion::functions::expr_fn::starts_with(left, right),
-        CompOp::StringContains => datafusion::functions::expr_fn::contains(left, right),
+        CompOp::StringContains => string_contains_to_df_expr(left, right),
         CompOp::Contains => unreachable!("handled above"),
     })
+}
+
+/// `contains(text, needle)` as the scanner reads it. Lance 13 sends a literal
+/// needle of three or more characters to an NGRAM index on `text`; when the
+/// needle holds no lowercased, ASCII-folded alphanumeric trigram the index
+/// yields no token, its result guarantees no row, and the scanner returns no
+/// row of an indexed fragment
+/// (`lance_surface_guards::ngram_returns_a_case_folded_superset_that_lance_rechecks`).
+/// Such a needle is pushed as `replace(text, needle, '') != text`, which has
+/// the same value on every row (null where `text` is null) and which no Lance
+/// index parser answers, so the scan evaluates it. Drop the rewrite at the
+/// bump whose scanner rechecks every row for that result.
+fn string_contains_to_df_expr(
+    text: datafusion::prelude::Expr,
+    needle: datafusion::prelude::Expr,
+) -> datafusion::prelude::Expr {
+    use datafusion::prelude::Expr;
+    if let Expr::Literal(ScalarValue::Utf8(Some(value)) | ScalarValue::LargeUtf8(Some(value)), _) =
+        &needle
+        && !ngram_index_answers_contains(value)
+    {
+        return datafusion::functions::expr_fn::replace(text.clone(), needle, df_lit(""))
+            .not_eq(text);
+    }
+    datafusion::functions::expr_fn::contains(text, needle)
+}
+
+/// Whether Lance's NGRAM index returns the scan's rows for `contains(_,
+/// needle)`: a needle shorter than one trigram never reaches the index
+/// (`TextQueryParser`'s `min_contains_chars`), and a longer one must yield a
+/// trigram through Lance's own NGRAM analysis (`TEXT_PREPPER`, then
+/// `NGRAM_TOKENIZER`), which `NGramIndex::search` applies to the needle.
+pub(crate) fn ngram_index_answers_contains(needle: &str) -> bool {
+    use lance_tokenizer::TokenStream;
+    const NGRAM_CHARS: usize = 3;
+    if needle.chars().count() < NGRAM_CHARS {
+        return true;
+    }
+    let mut prepper = lance_index::scalar::ngram::TEXT_PREPPER.clone();
+    let mut tokenizer = lance_index::scalar::ngram::NGRAM_TOKENIZER.clone();
+    let mut prepared = prepper.token_stream(needle);
+    while prepared.advance() {
+        if tokenizer.token_stream(&prepared.token().text).advance() {
+            return true;
+        }
+    }
+    false
 }
 
 /// A constant list keeps one recorded element domain, including its explicit cast.

@@ -2495,7 +2495,9 @@ async fn rrf_fuses_two_vector_queries() {
 async fn mutation_with_deferred_index_coverage_remains_searchable() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_search_db(&dir).await;
-    assert_eq!(doc_user_index_count(&db).await, 4);
+    // `id`'s BTREE plus a full-text, NGRAM and BTREE index on each of the
+    // key property, title and body.
+    assert_eq!(doc_user_index_count(&db).await, 10);
 
     let mut mutation_params = vector_param("$embedding", &[0.9, 0.1, 0.1, 0.1]);
     mutation_params.insert(
@@ -2517,7 +2519,7 @@ async fn mutation_with_deferred_index_coverage_remains_searchable() {
 
     assert_eq!(
         doc_user_index_count(&db).await,
-        4,
+        10,
         "mutation must leave physical index materialization to the reconciler"
     );
 
@@ -2773,8 +2775,8 @@ node Doc {
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(
         user_indices.len(),
-        3,
-        "expected id BTree index plus key-property and vector indices"
+        5,
+        "expected id BTree index, the key property's full-text, NGRAM and BTREE indexes, and the vector index"
     );
 }
 
@@ -2794,8 +2796,8 @@ async fn load_commit_creates_inverted_indices_for_string_annotations() {
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(
         user_indices.len(),
-        4,
-        "expected id BTree index plus key-property and title/body inverted indices"
+        10,
+        "expected id BTree index plus the full-text, NGRAM and BTREE indexes of the key property, title and body"
     );
 }
 

@@ -1,12 +1,11 @@
 //! Coverage for `build_indices_on_dataset_for_catalog`'s per-property index
-//! dispatch: which scalar/vector index each `@index`/`@key` column gets.
+//! dispatch: which scalar/vector indexes each `@index`/`@key` column gets
+//! (docs/rfcs/2026-11-07-gq-3.md section 4, "Scalar indexes").
 //!
-//! The observable signal is `SnapshotDataset::index_coverage`, which
-//! reports `Indexed` only when a BTREE covers the column (the same helper the
-//! traversal chooser uses). Enums and orderable scalars must get a BTREE so
-//! `=`/range/IN/IS NULL are index-accelerated; free-text Strings keep FTS
-//! only (a companion BTREE is deferred on the second-generation clone
-//! index-read bug — see `lance_surface_guards`).
+//! Orderable scalars get a BTREE, so `SnapshotDataset::index_coverage` (the
+//! helper the traversal chooser uses) reports `Indexed`. An enum or `Bool`
+//! gets a BITMAP, a list a LABEL_LIST, and a free-text String its full-text
+//! index, an NGRAM and a BTREE; each is checked by its index family.
 
 use omnigraph::IndexCoverage;
 use omnigraph::db::Omnigraph;
@@ -21,23 +20,43 @@ node Item {
     published: DateTime @index
     rank: I32 @index
     title: String @index
+    active: Bool @index
+    tags: [String] @index
     note: String?
 }
 "#;
 
-const DATA: &str = r#"{"type":"Item","data":{"slug":"a","status":"active","published":"2024-06-01T00:00:00Z","rank":1,"title":"alpha","note":"n1"}}
-{"type":"Item","data":{"slug":"b","status":"archived","published":"2023-01-01T00:00:00Z","rank":2,"title":"beta","note":"n2"}}
-{"type":"Item","data":{"slug":"c","status":"active","published":"2025-02-02T00:00:00Z","rank":3,"title":"gamma","note":"n3"}}"#;
+const DATA: &str = r#"{"type":"Item","data":{"slug":"a","status":"active","published":"2024-06-01T00:00:00Z","rank":1,"title":"alpha","active":true,"tags":["x"],"note":"n1"}}
+{"type":"Item","data":{"slug":"b","status":"archived","published":"2023-01-01T00:00:00Z","rank":2,"title":"beta","active":false,"tags":[],"note":"n2"}}
+{"type":"Item","data":{"slug":"c","status":"active","published":"2025-02-02T00:00:00Z","rank":3,"title":"gamma","active":true,"tags":["x","y"],"note":"n3"}}"#;
 
-// Enums and orderable scalars (DateTime, numeric) get a BTREE from the index
-// reconciler, so a `=`/range filter on them uses the index. Free-text
-// String `@index` keeps FTS only (its companion BTREE is deferred on the
-// upstream clone-of-clone index-read bug), and an un-annotated column has no
-// scalar index — both report `Degraded`, the negative control that keeps
-// this test from being vacuously green. A second `ensure_indices` run must
-// be a no-op.
+/// The index families on `column`, by the message name of each index's
+/// details (`BTree`, `Bitmap`, `LabelList`, `NGram`, `Inverted`), sorted.
+async fn families(ds: &omnigraph::db::SnapshotDataset, column: &str) -> Vec<String> {
+    let field = ds.schema().field(column).unwrap().id;
+    let mut families: Vec<String> = ds
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.fields == [field])
+        .filter_map(|index| index.index_details.as_ref())
+        .filter_map(|details| details.type_url.rsplit('.').next())
+        .map(|message| message.trim_end_matches("IndexDetails").to_string())
+        .collect();
+    families.sort();
+    families
+}
+
+// Orderable scalars (DateTime, numeric) get a BTREE from the index
+// reconciler, so a `=`/range filter on them uses the index. An enum and a
+// `Bool` get a BITMAP and no BTREE, a list a LABEL_LIST, and a free-text
+// String its full-text index, an NGRAM and a BTREE. An un-annotated column
+// has no scalar index and reports `Degraded`, the negative control that keeps
+// this test from being vacuously green. A second `ensure_indices` run must be
+// a no-op.
 #[tokio::test]
-async fn node_scalar_and_enum_index_columns_get_btree() {
+async fn node_index_columns_get_the_index_kinds_their_type_serves() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = session(Omnigraph::init(uri, SCHEMA).await.unwrap());
@@ -47,21 +66,25 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open_dataset("node:Item").await.unwrap();
 
-    for col in ["status", "published", "rank"] {
+    for col in ["published", "rank"] {
         let cov = ds.index_coverage(col).await.unwrap();
         assert_eq!(
             cov,
             IndexCoverage::Indexed,
-            "column '{col}' (enum/DateTime/numeric @index) must get a BTREE, got {cov:?}"
+            "column '{col}' (DateTime/numeric @index) must get a BTREE, got {cov:?}"
         );
     }
-
-    // Free-text String @index -> FTS, which is not a BTREE -> Degraded.
-    let title_cov = ds.index_coverage("title").await.unwrap();
-    assert!(
-        matches!(title_cov, IndexCoverage::Degraded { .. }),
-        "free-text String @index keeps FTS only while the companion BTREE is deferred, got {title_cov:?}"
-    );
+    for (col, expected) in [
+        ("published", &["BTree"][..]),
+        ("rank", &["BTree"][..]),
+        ("status", &["Bitmap"][..]),
+        ("active", &["Bitmap"][..]),
+        ("tags", &["LabelList"][..]),
+        ("title", &["BTree", "Inverted", "NGram"][..]),
+        ("note", &[][..]),
+    ] {
+        assert_eq!(families(&ds, col).await, expected, "the indexes of `{col}`");
+    }
     assert!(ds.has_fts_index("title").await.unwrap());
 
     // No @index annotation -> no scalar index at all -> Degraded.
@@ -83,7 +106,3 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
         "second ensure_indices must be a no-op on a fully-indexed graph"
     );
 }
-
-// (The companion-BTREE naming-collision regression — a column literally
-// named `{other}_btree` colliding with another column's companion index name
-// — lives on the `dual-btree-companion` branch with the deferred dispatch.)

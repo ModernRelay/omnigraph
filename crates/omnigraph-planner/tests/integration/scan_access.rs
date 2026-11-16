@@ -76,6 +76,7 @@ fn answer() -> ScanAccess {
     ScanAccess::IndexProbe {
         query: IndexQuery::Search {
             index: "identity".into(),
+            family: "btree".into(),
             column: "__id".into(),
             search: "__id = a".into(),
         },

@@ -292,8 +292,12 @@ logical_kinds! {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IndexQuery {
+    /// One index search: the index, its family (`btree`, `bitmap`,
+    /// `label_list`, `ngram`, or Lance's own name for another), the column
+    /// and the search Lance runs.
     Search {
         index: String,
+        family: String,
         column: String,
         search: String,
     },

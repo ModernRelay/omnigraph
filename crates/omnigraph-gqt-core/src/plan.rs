@@ -42,7 +42,7 @@ use serde_json::Value;
 use crate::load_plan::PipelineClaim;
 use crate::report::Report;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ diagnostics present]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `fuse $var: arms [nearest, bm25, distance, ordered, rrf]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>[ <btree|bitmap|label_list|ngram>]`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ diagnostics present]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `fuse $var: arms [nearest, bm25, distance, ordered, rrf]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
@@ -110,10 +110,13 @@ pub(crate) enum PlanLine {
         type_name: String,
         binding: Option<String>,
     },
+    /// A physical scan is sequential (`column` absent) or probes an index
+    /// on `column`, of the `family` when one is claimed.
     ScanIndex {
         type_name: String,
         binding: Option<String>,
         column: Option<String>,
+        family: Option<String>,
     },
     /// A physical `HashJoin` reaches `$binding`'s rows through a build of
     /// its table, and when `ran` is claimed, the run took that side of the
@@ -701,15 +704,27 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                     type_name,
                     binding,
                     column: None,
+                    family: None,
                 }),
                 ["index_probe", column] if identifier(column) => lines.push(PlanLine::ScanIndex {
                     type_name,
                     binding,
                     column: Some((*column).to_string()),
+                    family: None,
                 }),
+                ["index_probe", column, kind]
+                    if identifier(column) && INDEX_KINDS.contains(kind) =>
+                {
+                    lines.push(PlanLine::ScanIndex {
+                        type_name,
+                        binding,
+                        column: Some((*column).to_string()),
+                        family: Some((*kind).to_string()),
+                    })
+                }
                 _ => {
                     return Err(refused(
-                        "claims `access id_lookup`, `access sequential` or `access index_probe <column>`",
+                        "claims `access id_lookup`, `access sequential` or `access index_probe <column>[ <btree|bitmap|label_list|ngram>]`",
                     ));
                 }
             }
@@ -1946,6 +1961,7 @@ pub(crate) fn plan_mismatch(
                 type_name,
                 binding,
                 column,
+                family,
             } => {
                 let selected = match physical_scans(&nodes, type_name, binding.as_deref()) {
                     Ok(selected) => selected,
@@ -1967,11 +1983,17 @@ pub(crate) fn plan_mismatch(
                         if !scan
                             .index_query
                             .as_ref()
-                            .is_some_and(|query| probes_column(query, column))
+                            .is_some_and(|query| probes_column(query, column, family.as_deref()))
                         {
-                            return Some(format!(
-                                "expect plan: the scan of `{type_name}` does not probe column `{column}`"
-                            ));
+                            return Some(match family {
+                                Some(kind) => format!(
+                                    "expect plan: the scan of `{type_name}` does not probe column `{column}` through a {kind} index; it probes {:?}",
+                                    scan.index_query
+                                ),
+                                None => format!(
+                                    "expect plan: the scan of `{type_name}` does not probe column `{column}`"
+                                ),
+                            });
                         }
                     }
                 }
@@ -2117,14 +2139,23 @@ pub(crate) fn plan_mismatch(
 
 /// The physical scans of `type_name` (bound to `binding` when named), or
 /// the mismatch naming what the plan scans instead.
-fn probes_column(query: &omnigraph_planner::IndexQuery, column: &str) -> bool {
+/// The index families an `access index_probe <column> <kind>` claim names.
+const INDEX_KINDS: &[&str] = &["btree", "bitmap", "label_list", "ngram"];
+
+/// Whether `query` searches `column`, through an index of `kind` when one is
+/// named.
+fn probes_column(query: &omnigraph_planner::IndexQuery, column: &str, kind: Option<&str>) -> bool {
     use omnigraph_planner::IndexQuery;
     match query {
-        IndexQuery::Search { column: found, .. } => found == column,
+        IndexQuery::Search {
+            column: found,
+            family,
+            ..
+        } => found == column && kind.is_none_or(|kind| kind == family),
         IndexQuery::And { left, right } | IndexQuery::Or { left, right } => {
-            probes_column(left, column) || probes_column(right, column)
+            probes_column(left, column, kind) || probes_column(right, column, kind)
         }
-        IndexQuery::Not { input } => probes_column(input, column),
+        IndexQuery::Not { input } => probes_column(input, column, kind),
     }
 }
 
@@ -3052,7 +3083,7 @@ mod tests {
 
     #[test]
     fn scalar_access_claims_require_matching_typed_leaves_on_every_scan() {
-        let leaf = json!({"kind":"search","index":"by_age","column":"age","search":"age = 1"});
+        let leaf = json!({"kind":"search","index":"by_age","family":"btree","column":"age","search":"age = 1"});
         let scan = json!({"node":"Scan","table":"node:Doc","binding":"d","access":"index_probe",
             "index_query":{"kind":"not","input":{"kind":"or","left":leaf.clone(),"right":leaf}},
             "residual":"(active = true)"});
@@ -3075,10 +3106,18 @@ mod tests {
         assert!(check(&claims, &both).is_some());
         let claims = parse_plan_body(&[(0, "scan Doc as $d: access sequential")]).unwrap();
         assert_eq!(check(&claims, &json!({"physical_plan":sequential})), None);
+        let claims =
+            parse_plan_body(&[(0, "scan Doc as $d: access index_probe age btree")]).unwrap();
+        assert_eq!(check(&claims, &explain), None);
+        let claims =
+            parse_plan_body(&[(0, "scan Doc as $d: access index_probe age ngram")]).unwrap();
+        let mismatch = check(&claims, &explain).unwrap();
+        assert!(mismatch.contains("through a ngram index"), "{mismatch}");
         for refused in [
             "scan Doc: access index_probe",
             "scan Doc: access sequential age",
             "scan Doc: access index_probe age extra",
+            "scan Doc: access index_probe age btree extra",
         ] {
             assert!(parse_plan_body(&[(0, refused)]).is_err());
         }

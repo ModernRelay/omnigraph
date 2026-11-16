@@ -1916,17 +1916,16 @@ node Tag {
                 );
             }
         }
-        // A dropped property takes its own index with it (the drop's
-        // Project removes it); every other index keeps its coverage.
+        // A dropped property takes its own indexes with it (the drop's
+        // Project removes them); every other index keeps its coverage.
         let (_, dropped_id, _) = field(fields_before, dropped);
         let surviving = coverage_before
             .iter()
             .filter(|(fields, _)| fields != &[*dropped_id])
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(
-            surviving.len(),
-            coverage_before.len() - 1,
+        assert!(
+            surviving.len() < coverage_before.len(),
             "{table}: the dropped column was indexed before the apply"
         );
         assert_eq!(
@@ -3444,6 +3443,7 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
                 .unwrap()
                 .iter()
                 .filter(|index| index.fields.contains(&field))
+                .filter(|index| omnigraph_core::dataset_index::is_full_text_index(index))
                 .map(|index| index.fragment_bitmap.as_ref().map(|bitmap| bitmap.len()))
                 .collect::<Vec<_>>()
         }
@@ -3549,6 +3549,7 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
             let segments = indices
                 .iter()
                 .filter(|index| index.fields == [field])
+                .filter(|index| omnigraph_core::dataset_index::is_full_text_index(index))
                 .cloned()
                 .collect::<Vec<_>>();
             (ds, segments)

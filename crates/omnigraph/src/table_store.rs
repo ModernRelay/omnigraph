@@ -70,8 +70,9 @@ use crate::blob::{
     StorageRootConflict, nested_blob_field,
 };
 use crate::dataset_index::{
-    has_btree_index_on, has_fts_index_on, has_fts_postings_on, has_vector_index_on,
-    is_full_text_index, validate_full_text_demand, validate_full_text_scan,
+    ScalarIndexFamily, has_btree_index_on, has_fts_index_on, has_fts_postings_on,
+    has_scalar_index_on, has_vector_index_on, is_full_text_index, validate_full_text_demand,
+    validate_full_text_scan,
 };
 use crate::db::manifest::{TableVersionMetadata, open_dataset_entry};
 use crate::db::{DatasetEntry, Snapshot};
@@ -1074,6 +1075,9 @@ struct IndexLag {
     name: String,
     fields: Vec<i32>,
     vector: bool,
+    /// The scalar family a non-vector index is rebuilt in; `None` for a
+    /// vector index.
+    family: Option<ScalarIndexFamily>,
     /// The distance a vector index ranks by exactly, which its fold keeps;
     /// `None` for any other index.
     distance: Option<VectorDistance>,
@@ -1104,6 +1108,16 @@ pub struct StagedIndexReconciliation {
 pub struct RefreshedIndex {
     pub column: String,
     pub vector: bool,
+    /// The family a rebuilt scalar index kept; `None` for a vector index.
+    pub family: Option<ScalarIndexFamily>,
+}
+
+/// The name the engine gives a BITMAP, LABEL_LIST or NGRAM index on
+/// `column`, and a String's BTREE beside its full-text index:
+/// `{column}_{family}`. A same-batch companion builder cannot see another's
+/// default name, so these are explicit.
+pub(crate) fn scalar_index_name(column: &str, family: ScalarIndexFamily) -> String {
+    format!("{column}_{}", family.as_str())
 }
 
 /// The Lance metric a field's declared distance names: Lance's `l2` is the
@@ -3445,7 +3459,10 @@ impl TableStore {
     /// One eligibility rule for optimize planning and execution. Full-text
     /// folding cannot establish analyzer proof; unknown kinds cannot be planned.
     pub(crate) fn can_fold_index(index: &IndexMetadata) -> bool {
-        !is_system_index(index) && index.index_details.is_some() && !is_full_text_index(index)
+        !is_system_index(index)
+            && index.index_details.is_some()
+            && !is_full_text_index(index)
+            && (Self::index_is_vector(index) || ScalarIndexFamily::of(index).is_some())
     }
 
     /// Whether a foldable index is a vector index.
@@ -3522,6 +3539,7 @@ impl TableStore {
                 name,
                 fields: segments[0].fields.clone(),
                 vector,
+                family: ScalarIndexFamily::of(segments[0]),
                 distance: exact_vector_index_distance(segments[0]),
             });
         }
@@ -3647,9 +3665,17 @@ impl TableStore {
                     .execute_uncommitted()
                     .await
             } else {
+                // A scalar index is rebuilt in its own family; one of no
+                // known family is not foldable (`can_fold_index`).
+                let family = item.family.ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "lagging index '{}' has no scalar family to fold in",
+                        item.name
+                    ))
+                })?;
                 let params = ScalarIndexParams::default();
                 ds_clone
-                    .create_index_builder(&columns, IndexType::BTree, &params)
+                    .create_index_builder(&columns, family.index_type(), &params)
                     .name(item.name.clone())
                     .replace(true)
                     .execute_uncommitted()
@@ -3692,6 +3718,7 @@ impl TableStore {
             refreshed.push(RefreshedIndex {
                 column,
                 vector: item.vector,
+                family: item.family,
             });
             new_indices.push(new_idx);
         }
@@ -6275,6 +6302,7 @@ impl TableStore {
         for spec in specs {
             let (column, index_type) = match spec {
                 IndexBuildSpec::BTree { column, .. } => (column, "BTREE"),
+                IndexBuildSpec::Scalar { column, family } => (column, family.as_str()),
                 IndexBuildSpec::FullText { column, .. } => (column, "FTS"),
                 IndexBuildSpec::Vector { column, .. } => (column, "Vector"),
             };
@@ -6298,6 +6326,15 @@ impl TableStore {
                         builder = builder.name(name.clone());
                     }
                     builder.replace(true).execute_uncommitted().await
+                }
+                IndexBuildSpec::Scalar { column, family } => {
+                    let params = ScalarIndexParams::default();
+                    ds_clone
+                        .create_index_builder(&[column.as_str()], family.index_type(), &params)
+                        .name(scalar_index_name(column, *family))
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await
                 }
                 IndexBuildSpec::FullText { column, analysis } => {
                     let params = full_text_index_params(analysis.profile)?;
@@ -7272,6 +7309,16 @@ impl TableStore {
 
     pub async fn has_btree_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
         has_btree_index_on(ds, column).await
+    }
+
+    /// Whether `column` carries an index of `family`.
+    pub async fn has_scalar_index(
+        &self,
+        ds: &Dataset,
+        column: &str,
+        family: ScalarIndexFamily,
+    ) -> Result<bool> {
+        has_scalar_index_on(ds, column, family).await
     }
 
     pub async fn has_fts_index(&self, ds: &Dataset, column: &str) -> Result<bool> {

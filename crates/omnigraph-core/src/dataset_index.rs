@@ -429,6 +429,70 @@ pub async fn user_indices_for_column(ds: &Dataset, column: &str) -> Result<Vec<I
         .collect())
 }
 
+/// A scalar index family Omnigraph builds on a declared property
+/// (docs/rfcs/2026-11-07-gq-3.md section 4): BTREE for equality, ranges and
+/// order, BITMAP for an enum or `Bool`, LABEL_LIST for a list's membership and
+/// NGRAM for a String's substring test. Every family is derived acceleration;
+/// a fold rebuilds an index whole in its own family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ScalarIndexFamily {
+    BTree,
+    Bitmap,
+    LabelList,
+    NGram,
+}
+
+impl ScalarIndexFamily {
+    /// The family of `index`, read from its details type URL; `None` for any
+    /// other index (full text, vector, a zone map or Bloom filter another
+    /// writer built, or one with no details).
+    pub fn of(index: &IndexMetadata) -> Option<Self> {
+        let url = &index.index_details.as_ref()?.type_url;
+        let message = url.rsplit(['.', '/']).next()?;
+        [
+            (Self::BTree, "BTreeIndexDetails"),
+            (Self::Bitmap, "BitmapIndexDetails"),
+            (Self::LabelList, "LabelListIndexDetails"),
+            (Self::NGram, "NGramIndexDetails"),
+        ]
+        .into_iter()
+        .find_map(|(family, details)| (message == details).then_some(family))
+    }
+
+    /// The Lance index type that builds this family.
+    pub fn index_type(self) -> lance_index::IndexType {
+        match self {
+            Self::BTree => lance_index::IndexType::BTree,
+            Self::Bitmap => lance_index::IndexType::Bitmap,
+            Self::LabelList => lance_index::IndexType::LabelList,
+            Self::NGram => lance_index::IndexType::NGram,
+        }
+    }
+
+    /// The family's name in reports and index names (`btree`, `bitmap`,
+    /// `label_list`, `ngram`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BTree => "btree",
+            Self::Bitmap => "bitmap",
+            Self::LabelList => "label_list",
+            Self::NGram => "ngram",
+        }
+    }
+}
+
+/// Whether `column` of `ds` carries an index of `family`.
+pub async fn has_scalar_index_on(
+    ds: &Dataset,
+    column: &str,
+    family: ScalarIndexFamily,
+) -> Result<bool> {
+    let indices = user_indices_for_column(ds, column).await?;
+    Ok(indices
+        .iter()
+        .any(|index| ScalarIndexFamily::of(index) == Some(family)))
+}
+
 pub async fn has_btree_index_on(ds: &Dataset, column: &str) -> Result<bool> {
     let indices = user_indices_for_column(ds, column).await?;
     Ok(indices.iter().any(|index| {

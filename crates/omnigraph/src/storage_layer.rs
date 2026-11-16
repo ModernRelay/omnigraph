@@ -239,6 +239,13 @@ pub enum IndexBuildSpec {
         column: String,
         name: Option<String>,
     },
+    /// A BITMAP, LABEL_LIST or NGRAM index (a BTREE is [`Self::BTree`]),
+    /// named `{column}_{family}` so it never collides with a companion built
+    /// on the same column in the same batch.
+    Scalar {
+        column: String,
+        family: omnigraph_core::dataset_index::ScalarIndexFamily,
+    },
     FullText {
         column: String,
         analysis: FullTextBuild,
@@ -1034,6 +1041,13 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     // ── Index presence (reads, no HEAD advance) ──────────────────────
 
     async fn has_btree_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
+    /// Whether `column` carries an index of the scalar `family`.
+    async fn has_scalar_index(
+        &self,
+        snapshot: &SnapshotHandle,
+        column: &str,
+        family: omnigraph_core::dataset_index::ScalarIndexFamily,
+    ) -> Result<bool>;
     async fn has_fts_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
     /// Whether a full-text segment on `column` holds postings; an untrained
     /// declaration segment does not.
@@ -1767,6 +1781,15 @@ impl TableStorage for TableStore {
 
     async fn has_btree_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool> {
         TableStore::has_btree_index(self, snapshot.dataset(), column).await
+    }
+
+    async fn has_scalar_index(
+        &self,
+        snapshot: &SnapshotHandle,
+        column: &str,
+        family: omnigraph_core::dataset_index::ScalarIndexFamily,
+    ) -> Result<bool> {
+        TableStore::has_scalar_index(self, snapshot.dataset(), column, family).await
     }
 
     async fn has_fts_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool> {

@@ -66,8 +66,18 @@ fn kind(index: &IndexMetadata) -> IndexKind {
         return IndexKind::Unknown;
     };
     let details = IndexDetails(details.clone());
+    use omnigraph_core::dataset_index::ScalarIndexFamily;
     if omnigraph_core::dataset_index::is_btree_index(index) {
         IndexKind::Btree { usable: false }
+    } else if let Some(family) = ScalarIndexFamily::of(index) {
+        match family {
+            ScalarIndexFamily::Bitmap => IndexKind::Bitmap,
+            ScalarIndexFamily::LabelList => IndexKind::LabelList,
+            ScalarIndexFamily::NGram => IndexKind::NGram,
+            // A BTREE detected by type URL but not by plugin name is not one
+            // the engine built.
+            ScalarIndexFamily::BTree => IndexKind::Unknown,
+        }
     } else if details.supports_fts() {
         IndexKind::Inverted
     } else if details.is_vector() && vector_index_ranks_exactly(index) {
@@ -204,12 +214,16 @@ mod tests {
         for family in [
             None,
             Some("FutureBTreeIndexDetails"),
-            Some("BitmapIndexDetails"),
+            Some("ZoneMapIndexDetails"),
+            Some("BloomFilterIndexDetails"),
         ] {
             let index = segment("key", 0, Some(&[1]), family);
             assert_eq!(kind(&index), IndexKind::Unknown, "{family:?}");
         }
         for (family, expected) in [
+            ("BitmapIndexDetails", IndexKind::Bitmap),
+            ("LabelListIndexDetails", IndexKind::LabelList),
+            ("NGramIndexDetails", IndexKind::NGram),
             ("InvertedIndexDetails", IndexKind::Inverted),
             // Empty vector details are unknown: Lance infers missing details
             // when it loads indices, so empty ones are details it could not.

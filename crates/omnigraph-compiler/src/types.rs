@@ -233,11 +233,17 @@ impl std::fmt::Display for ScalarType {
     }
 }
 
-/// The index a one-column `@index` or `@key` declaration builds on a node
-/// property: a scalar BTREE, a full-text inverted index or a vector index.
+/// One index a one-column `@index` or `@key` declaration builds on a node
+/// property (docs/rfcs/2026-11-07-gq-3.md section 4, "Scalar indexes"): a
+/// BTREE for equality, ranges and order, a BITMAP for an enum or `Bool`, a
+/// LABEL_LIST for a list's `in`, an NGRAM for a String's `contains`, the
+/// full-text inverted index, or a vector index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropIndexKind {
     Btree,
+    Bitmap,
+    LabelList,
+    NGram,
     FullText,
     Vector,
 }
@@ -297,32 +303,55 @@ impl PropType {
         self.enum_values.is_some()
     }
 
-    /// The index a one-column `@index`/`@key` declaration on a node property
-    /// of this type builds, `None` when the type is not indexable (a list or a
-    /// `Blob`). Enums are physically `String` but filtered by equality, so
-    /// they take a scalar BTREE, not a full-text index (Lance never consults
-    /// an inverted index for `=` or a range); free-text Strings take the
-    /// full-text index `search`, `fuzzy`, `match_text` and `bm25` read. The
-    /// one rule the type checker (`T27`) and index maintenance share.
-    pub fn index_kind(&self) -> Option<PropIndexKind> {
+    /// The indexes a one-column `@index`/`@key` declaration on a node
+    /// property of this type builds, empty when the type is not indexable (a
+    /// `Blob`, or a list of vectors or Blobs). Each is derived acceleration
+    /// (invariant 7); the kinds follow the predicates Lance 13 answers per
+    /// index (docs/dev/lance.md, the scalar index rows):
+    ///
+    /// - an enum or `Bool` takes a BITMAP, which answers equality, `!=`,
+    ///   `in`, ranges and `is null` exactly, as a BTREE would, and no BTREE
+    ///   beside it, since nothing orders through an index;
+    /// - a list takes a LABEL_LIST, which answers `value in $x.list` exactly;
+    /// - a free-text String takes its full-text index, an NGRAM for
+    ///   `contains` (a candidate superset Lance rechecks) and a BTREE for
+    ///   equality, `in`, ranges and `starts_with`, which an NGRAM answers none
+    ///   of;
+    /// - every other scalar takes a BTREE, and a vector its vector index.
+    ///
+    /// The one rule the type checker and index maintenance share.
+    pub fn index_kinds(&self) -> &'static [PropIndexKind] {
         if self.list {
-            return None;
+            return match self.scalar {
+                ScalarType::Vector(_) | ScalarType::Blob => &[],
+                _ => &[PropIndexKind::LabelList],
+            };
         }
         match self.scalar {
-            ScalarType::String if !self.is_enum() => Some(PropIndexKind::FullText),
-            ScalarType::Vector(_) => Some(PropIndexKind::Vector),
-            ScalarType::String
-            | ScalarType::DateTime
+            ScalarType::String if self.is_enum() => &[PropIndexKind::Bitmap],
+            ScalarType::String => &[
+                PropIndexKind::FullText,
+                PropIndexKind::NGram,
+                PropIndexKind::Btree,
+            ],
+            ScalarType::Bool => &[PropIndexKind::Bitmap],
+            ScalarType::Vector(_) => &[PropIndexKind::Vector],
+            ScalarType::DateTime
             | ScalarType::Date
             | ScalarType::I32
             | ScalarType::I64
             | ScalarType::U32
             | ScalarType::U64
             | ScalarType::F32
-            | ScalarType::F64
-            | ScalarType::Bool => Some(PropIndexKind::Btree),
-            ScalarType::Blob => None,
+            | ScalarType::F64 => &[PropIndexKind::Btree],
+            ScalarType::Blob => &[],
         }
+    }
+
+    /// Whether a one-column index on a property of this type builds the
+    /// full-text index `match_terms` and `bm25` read: a free-text String.
+    pub fn has_full_text_index_kind(&self) -> bool {
+        self.index_kinds().contains(&PropIndexKind::FullText)
     }
 
     pub fn to_arrow(&self) -> DataType {

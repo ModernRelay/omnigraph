@@ -53,6 +53,7 @@ fn mirror(expr: &ScalarIndexExpr) -> IndexQuery {
     match expr {
         ScalarIndexExpr::Query(search) => IndexQuery::Search {
             index: search.index_name.clone(),
+            family: index_family_name(&search.index_type),
             column: search.column.clone(),
             search: search.query.format(&search.column),
         },
@@ -67,6 +68,18 @@ fn mirror(expr: &ScalarIndexExpr) -> IndexQuery {
         ScalarIndexExpr::Not(input) => IndexQuery::Not {
             input: Box::new(mirror(input)),
         },
+    }
+}
+
+/// The family name a probe records for Lance's index type name: the
+/// families the engine builds by their schema names, any other in lower case.
+fn index_family_name(index_type: &str) -> String {
+    match index_type {
+        "BTree" => "btree".to_string(),
+        "Bitmap" => "bitmap".to_string(),
+        "LabelList" => "label_list".to_string(),
+        "NGram" => "ngram".to_string(),
+        other => other.to_ascii_lowercase(),
     }
 }
 

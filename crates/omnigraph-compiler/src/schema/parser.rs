@@ -1050,11 +1050,13 @@ fn validate_property_annotations(
     let mut embed_seen = false;
 
     for ann in &prop.annotations {
-        // List/vector/blob restrictions on property-level annotations
+        // List/vector/blob restrictions on property-level annotations. A
+        // list takes a plain `@index` (a LABEL_LIST serving `in`), never a
+        // full-text one.
         if prop.prop_type.list
             && (ann.name == "key"
                 || ann.name == "unique"
-                || ann.name == "index"
+                || (ann.name == "index" && ann.value.is_some())
                 || ann.name == "embed")
         {
             return Err(CompilerError::Parse(format!(

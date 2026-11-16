@@ -108,7 +108,18 @@ pub struct IndexFact {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IndexKind {
-    Btree { usable: bool },
+    Btree {
+        usable: bool,
+    },
+    /// A BITMAP index (an enum or `Bool` property): equality, `in`, ranges
+    /// and `is null`, exactly. Never claims key coverage.
+    Bitmap,
+    /// A LABEL_LIST index (a list property): `value in $x.list`, exactly.
+    LabelList,
+    /// An NGRAM index (a String property): `contains`, as a candidate
+    /// superset Lance rechecks.
+    #[serde(rename = "ngram")]
+    NGram,
     Inverted,
     Vector,
     Unknown,

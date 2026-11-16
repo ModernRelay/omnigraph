@@ -5,6 +5,7 @@ use crate::seams::{decide_seam, fail};
 use crate::table_store::{RefreshedIndex, TableStore};
 use lance::index::DatasetIndexExt;
 use omnigraph_compiler::types::PropIndexKind;
+use omnigraph_core::dataset_index::ScalarIndexFamily;
 
 pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index::GraphIndex>> {
     let (resolved, catalog) = db.capture_current_read_view().await?;
@@ -98,6 +99,9 @@ pub struct BuiltIndex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BuiltIndexKind {
     Btree,
+    Bitmap,
+    LabelList,
+    NGram,
     FullText,
     Vector,
 }
@@ -106,8 +110,22 @@ impl BuiltIndexKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Btree => "btree",
+            Self::Bitmap => "bitmap",
+            Self::LabelList => "label_list",
+            Self::NGram => "ngram",
             Self::FullText => "full_text",
             Self::Vector => "vector",
+        }
+    }
+}
+
+impl From<ScalarIndexFamily> for BuiltIndexKind {
+    fn from(family: ScalarIndexFamily) -> Self {
+        match family {
+            ScalarIndexFamily::BTree => Self::Btree,
+            ScalarIndexFamily::Bitmap => Self::Bitmap,
+            ScalarIndexFamily::LabelList => Self::LabelList,
+            ScalarIndexFamily::NGram => Self::NGram,
         }
     }
 }
@@ -680,6 +698,9 @@ async fn maintain_indices_for_branch(
                     crate::storage_layer::IndexBuildSpec::BTree { column, .. } => {
                         (column, BuiltIndexKind::Btree)
                     }
+                    crate::storage_layer::IndexBuildSpec::Scalar { column, family } => {
+                        (column, BuiltIndexKind::from(*family))
+                    }
                     crate::storage_layer::IndexBuildSpec::FullText { column, .. } => {
                         (column, BuiltIndexKind::FullText)
                     }
@@ -694,10 +715,10 @@ async fn maintain_indices_for_branch(
                 .unwrap_or_default()
                 .into_iter()
                 .map(|index| {
-                    let kind = if index.vector {
-                        BuiltIndexKind::Vector
-                    } else {
-                        BuiltIndexKind::Btree
+                    let kind = match index.family {
+                        _ if index.vector => BuiltIndexKind::Vector,
+                        Some(family) => BuiltIndexKind::from(family),
+                        None => BuiltIndexKind::Btree,
                     };
                     (index.column, kind, BuiltIndexAction::Refreshed)
                 });
@@ -790,7 +811,7 @@ pub(super) async fn append_deferred_full_text_indexes(
 }
 
 /// The columns of `table_key` that carry a declared full-text index: every
-/// one-column `@index`/`@key` node property [`PropType::index_kind`] maps to
+/// one-column `@index`/`@key` node property [`PropType::index_kinds`] gives
 /// full text, the same rule the index builder follows. Edges declare none.
 /// Every detached commit a writer publishes declares them
 /// (`TableStore::commit_staged_detached`).
@@ -920,11 +941,12 @@ pub(super) struct IndexWorkStatus {
 /// zero commits and must NOT become publication targets).
 ///
 /// Per `build_indices_on_dataset_for_catalog`, nodes get BTree (id) plus, for
-/// each one-column `@index`/`@key` property, the index `PropType::index_kind`
-/// assigns: a scalar BTREE for enums and orderable scalars
-/// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector
+/// each one-column `@index`/`@key` property, the indexes
+/// `PropType::index_kinds` assigns: a BITMAP for enums and `Bool`, a
+/// LABEL_LIST for lists, FTS, NGRAM and BTREE for free-text Strings, a BTREE
+/// for the other orderable scalars (DateTime/Date/numeric), or a Vector
 /// index. Edges get BTree only (id, src, dst). This helper and the builder
-/// share `PropType::index_kind` so they cannot drift — see its doc comment.
+/// share `PropType::index_kinds` so they cannot drift — see its doc comment.
 #[derive(Default)]
 pub(super) struct PlannedIndexWork {
     pub(super) specs: Vec<crate::storage_layer::IndexBuildSpec>,
@@ -966,7 +988,7 @@ async fn plan_full_text_rebuild(
         if let [column] = declaration.as_slice()
             && properties
                 .get(column)
-                .is_some_and(|property| property.index_kind() == Some(PropIndexKind::FullText))
+                .is_some_and(PropType::has_full_text_index_kind)
         {
             columns.insert(column.clone());
         }
@@ -1024,7 +1046,7 @@ async fn plan_full_text_rebuild(
         let Some(field) = field.filter(|field| {
             properties
                 .get(&field.name)
-                .is_some_and(|property| property.index_kind() == Some(PropIndexKind::FullText))
+                .is_some_and(PropType::has_full_text_index_kind)
         }) else {
             return Err(OmniError::manifest(format!(
                 "cannot rebuild full-text index '{}' on {}: only single, non-list, \
@@ -1092,49 +1114,76 @@ async fn plan_index_work_node(
         let Some(prop_type) = node_type.properties.get(prop_name) else {
             continue;
         };
-        match prop_type.index_kind() {
-            // An untrained segment only declares the analyzer
-            // (`TableStore::commit_staged_detached`); the postings are built
-            // here once no segment covers a fragment.
-            Some(PropIndexKind::FullText) => {
-                if !db.storage().has_fts_postings(ds, prop_name).await? {
-                    work.push_spec(crate::storage_layer::IndexBuildSpec::FullText {
-                        column: prop_name.clone(),
-                        analysis: full_text_build(node_type, prop_name)?,
-                    });
-                }
-            }
-            // A vector index is built for the field's declared distance; one
-            // built for another distance (the field's distance changed) is
-            // never used, so it is built anew, replacing the old one.
-            Some(PropIndexKind::Vector) => {
-                let distance = node_type.vector_distance(prop_name);
-                if !db
-                    .storage()
-                    .has_vector_index_for(ds, prop_name, distance)
-                    .await?
-                {
-                    if vector_column_trainable(db, ds, prop_name).await? {
-                        work.push_spec(crate::storage_layer::IndexBuildSpec::Vector {
+        let kinds = prop_type.index_kinds();
+        for kind in kinds {
+            match kind {
+                // An untrained segment only declares the analyzer
+                // (`TableStore::commit_staged_detached`); the postings are
+                // built here once no segment covers a fragment.
+                PropIndexKind::FullText => {
+                    if !db.storage().has_fts_postings(ds, prop_name).await? {
+                        work.push_spec(crate::storage_layer::IndexBuildSpec::FullText {
                             column: prop_name.clone(),
-                            distance,
+                            analysis: full_text_build(node_type, prop_name)?,
                         });
-                    } else {
-                        work.pending.push(PendingIndex {
-                            type_key: table_key.to_string(),
-                            property: prop_name.clone(),
-                            reason: "property has no non-null vectors to train on yet".to_string(),
+                    }
+                }
+                // A vector index is built for the field's declared distance;
+                // one built for another distance (the field's distance
+                // changed) is never used, so it is built anew, replacing the
+                // old one.
+                PropIndexKind::Vector => {
+                    let distance = node_type.vector_distance(prop_name);
+                    if !db
+                        .storage()
+                        .has_vector_index_for(ds, prop_name, distance)
+                        .await?
+                    {
+                        if vector_column_trainable(db, ds, prop_name).await? {
+                            work.push_spec(crate::storage_layer::IndexBuildSpec::Vector {
+                                column: prop_name.clone(),
+                                distance,
+                            });
+                        } else {
+                            work.pending.push(PendingIndex {
+                                type_key: table_key.to_string(),
+                                property: prop_name.clone(),
+                                reason: "property has no non-null vectors to train on yet"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+                // A BTREE beside a full-text index is named explicitly: the
+                // full-text index in the same batch takes the default name.
+                PropIndexKind::Btree => {
+                    if !db.storage().has_btree_index(ds, prop_name).await? {
+                        let name = kinds.contains(&PropIndexKind::FullText).then(|| {
+                            crate::table_store::scalar_index_name(
+                                prop_name,
+                                ScalarIndexFamily::BTree,
+                            )
+                        });
+                        work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
+                            column: prop_name.clone(),
+                            name,
+                        });
+                    }
+                }
+                PropIndexKind::Bitmap | PropIndexKind::LabelList | PropIndexKind::NGram => {
+                    let family = match kind {
+                        PropIndexKind::Bitmap => ScalarIndexFamily::Bitmap,
+                        PropIndexKind::LabelList => ScalarIndexFamily::LabelList,
+                        _ => ScalarIndexFamily::NGram,
+                    };
+                    if !db.storage().has_scalar_index(ds, prop_name, family).await? {
+                        work.push_spec(crate::storage_layer::IndexBuildSpec::Scalar {
+                            column: prop_name.clone(),
+                            family,
                         });
                     }
                 }
             }
-            Some(PropIndexKind::Btree) if !db.storage().has_btree_index(ds, prop_name).await? => {
-                work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
-                    column: prop_name.clone(),
-                    name: None,
-                });
-            }
-            Some(PropIndexKind::Btree) | None => {}
         }
     }
     Ok(work)

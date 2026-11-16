@@ -133,14 +133,16 @@ impl NodeType {
 
     /// Whether `property` carries a declared full-text index: a one-column
     /// `@index` or `@key` on a free-text String property
-    /// ([`PropType::index_kind`]). A composite declaration builds no
+    /// ([`PropType::index_kinds`]). A composite declaration builds no
     /// property index.
     pub fn has_full_text_index(&self, property: &str) -> bool {
         self.indices
             .iter()
             .any(|columns| matches!(columns.as_slice(), [column] if column == property))
-            && self.properties.get(property).and_then(PropType::index_kind)
-                == Some(crate::types::PropIndexKind::FullText)
+            && self
+                .properties
+                .get(property)
+                .is_some_and(PropType::has_full_text_index_kind)
     }
 
     /// Backward-compatible accessor: returns the first (and typically only) key property name.
@@ -797,8 +799,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                     .any(|columns| matches!(columns.as_slice(), [c] if *c == property.name))
                     && properties
                         .get(&property.name)
-                        .and_then(PropType::index_kind)
-                        == Some(crate::types::PropIndexKind::FullText)
+                        .is_some_and(PropType::has_full_text_index_kind)
             })
             .map(|property| (property.name.clone(), property.full_text_fingerprint()))
             .collect();
@@ -973,8 +974,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                         indices
                             .iter()
                             .any(|columns| matches!(columns.as_slice(), [c] if *c == property.name))
-                            && property.prop_type.index_kind()
-                                == Some(crate::types::PropIndexKind::FullText)
+                            && property.prop_type.has_full_text_index_kind()
                     })
                     .map(|property| (property.name.clone(), property.full_text_fingerprint()))
                     .collect(),

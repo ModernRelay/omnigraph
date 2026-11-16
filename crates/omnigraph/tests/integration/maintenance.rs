@@ -2793,9 +2793,9 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
 }
 
 /// An index build on a branch builds the declared indexes a type whose first
-/// rows landed there lacks, rebuilds a BTREE whose coverage lags the branch's
-/// new rows, and publishes both in one commit on that branch, attributed to
-/// its actor. Full-text coverage is pending with the rebuild that refreshes
+/// rows landed there lacks, rebuilds each BTREE and NGRAM whose coverage lags
+/// the branch's new rows in its own family, and publishes both in one commit
+/// on that branch, attributed to its actor. Full-text coverage is pending with the rebuild that refreshes
 /// it; main keeps its registrations and history; a second run publishes
 /// nothing.
 #[tokio::test]
@@ -2858,6 +2858,18 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
                 BuiltIndexAction::Refreshed
             ),
             built(
+                "node:Person",
+                "name",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Refreshed
+            ),
+            built(
+                "node:Person",
+                "name",
+                BuiltIndexKind::NGram,
+                BuiltIndexAction::Refreshed
+            ),
+            built(
                 "node:Tag",
                 "__id",
                 BuiltIndexKind::Btree,
@@ -2867,6 +2879,18 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
                 "node:Tag",
                 "rank",
                 BuiltIndexKind::Btree,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "slug",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "slug",
+                BuiltIndexKind::NGram,
                 BuiltIndexAction::Built
             ),
             built(
