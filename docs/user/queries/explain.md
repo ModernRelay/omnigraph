@@ -35,8 +35,8 @@ listing prints them:
 
 Every fresh physical `Scan` records `access`. `sequential` disables scalar
 indexing. `index_probe` includes `index` (sorted names), `index_query` (a
-Boolean tree with index name, physical column and Lance-rendered search at
-each leaf), and `residual` (the indexed branch's remaining predicate, or
+Boolean tree with index name, family (`btree`, `bitmap`, `label_list` or
+`ngram`), physical column and Lance-rendered search at each leaf), and `residual` (the indexed branch's remaining predicate, or
 null). Uncovered fragments still apply the full filter. `runtime` records a
 `reason`: ranking, search membership, join-generated filters or a dynamic
 expression can add inputs unavailable during planning. Those reads retain

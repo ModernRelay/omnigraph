@@ -540,6 +540,26 @@ or a `contains_tokens` demand is present. A scan with no full-text query, no
 SQL-string filter and no `contains_tokens` call in its typed filters skips
 both.
 
+A pushed filter reaches Lance unchanged, and Lance's scanner picks the index
+for each conjunct from the pinned manifest's index section.
+`plan_source/scan_access.rs::inspect` reads that choice off the physical plan
+Lance builds and records it as the scan's `access`: `index_probe` with an
+`index_query` whose leaves name the index, its family (`btree`, `bitmap`,
+`label_list`, `ngram`, or Lance's own name for one the engine did not build),
+the column and the search Lance runs for the conjunct, and the `residual` the
+indexed branch still applies; the planner's index facts
+(`plan_source/indexes.rs`) classify each index by the same family. A BTREE
+answers `=`, `in`, ranges and `starts_with`, a BITMAP (an enum or `Bool`) `=`,
+`!=`, `in`, ranges and `is null`, and a LABEL_LIST (a list) `value in
+$x.list`, all exactly. An NGRAM (a String) answers `contains` with candidates
+that Lance rechecks with the whole pushed filter. A needle of fewer than three
+characters never reaches it; one of three or more with no alphanumeric trigram
+makes Lance 13 drop every match of an indexed fragment, so
+`scan::string_contains_to_df_expr` pushes it as `replace(text, needle, '') !=
+text`, which no index answers ([Lance alignment](lance.md), the NGRAM row). A
+fragment no segment covers is read with the whole filter, so index presence,
+kind and coverage change cost, never rows.
+
 String-built SQL is retained only at explicitly documented compatibility
 seams. The camel-case regression and its two-parser boundary are recorded in
 [the case study](case-studies/camel-case-filtering.md).

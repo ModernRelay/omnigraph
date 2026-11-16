@@ -163,9 +163,10 @@ query prolific($least: I64) {
 - The infix forms `$x.title contains "graph"` and `$x.title starts_with "Omni"`,
   and `contains` over a list, are `T7`, with the call or `in` as the fix.
 
-`NULL` never matches these predicates, and `%` and `_` are not wildcards. They
-are correct without an index, and a free-text index does not speed them up;
-use [full-text search](../search/index.md) for tokens, fuzzy matching, relevance.
+`NULL` never matches these predicates, and `%` and `_` are not wildcards. An
+index never changes their rows; `@index` speeds `in` over a list and `contains`
+([what `@index` builds](../schema/index.md#what-index-builds)). Use [full-text
+search](../search/index.md) for tokens, fuzzy matching, relevance.
 
 ### System fields
 

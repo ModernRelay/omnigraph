@@ -71,7 +71,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `lint` | Validate `.gq` source | local schema or direct graph |
 | `upgrade` | Convert a v8, v9 or v13 graph's storage to the format this binary serves, offline; `--check` writes nothing | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes on `main`; a server target runs it as a [recorded operation](../operations/recorded-operations.md), waiting for its record unless `--no-wait` | direct or served |
-| `index build` | Build a branch's missing declared indexes and refresh lagging BTREE and vector coverage ([Maintenance](../operations/maintenance.md#build-indexes)) | direct |
+| `index build` | Build a branch's missing declared indexes and refresh lagging scalar and vector coverage ([Maintenance](../operations/maintenance.md#build-indexes)) | direct |
 | `index rebuild --kind full-text` | Replace full-text indexes on one branch; `rebuild-full-text-indexes` is its deprecated spelling | direct |
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
 | `graphs list` | List graph metadata or minimal identity discovery | served |

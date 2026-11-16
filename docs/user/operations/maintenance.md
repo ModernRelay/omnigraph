@@ -114,8 +114,9 @@ omnigraph index build --target ./cluster-root --graph knowledge \
 ```
 
 On any branch, `index build` builds every declared index a table lacks and
-rebuilds whole each BTREE or vector index that leaves rows uncovered or was
-built for another [distance](../search/distances.md) than its property's. Every
+rebuilds whole, in its own kind, each BTREE, BITMAP, LABEL_LIST, NGRAM or
+vector index that leaves rows uncovered, and each vector index built for
+another [distance](../search/distances.md) than its property's. Every
 table publishes in one graph commit on that branch; other branches and snapshots
 keep their indexes, and a branch with nothing to do publishes nothing. The
 default branch is `main`. As with optimize, a write that lands on a table while
@@ -126,7 +127,8 @@ coverage: matching and ranking read the rows with the field's profile.
 
 JSON reports `branch`, `graph_commit_id` (null for a no-op), `indexes` with each
 `type_key`, `property` (the indexed column, `__id` for the identity index),
-`kind` (`btree`, `full_text` or `vector`) and `action` (`built` or `refreshed`),
+`kind` (`btree`, `bitmap`, `label_list`, `ngram`, `full_text` or `vector`) and
+`action` (`built` or `refreshed`),
 and `pending_indexes` with each `type_key`, `property` and `reason`.
 
 ## Rebuild full-text indexes

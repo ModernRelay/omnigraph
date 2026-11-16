@@ -765,8 +765,10 @@ complete loss of metrics that these conditional checks alone would allow.
 
 A `scan <Type>[ as $var]: access sequential` line requires the recorded
 sequential choice. `access index_probe <physical-column>` requires a probe
-with that physical column in a leaf of `index_query`; it does not compare
-rendered search text, residuals or index names. `pass scan_access` records
+with that physical column in a leaf of `index_query`, and `access index_probe
+<physical-column> <family>` (`btree`, `bitmap`, `label_list`, `ngram`) one
+through an index of that family; neither compares rendered search text,
+residuals or index names. `pass scan_access` records
 completed finalization; `pass key_to_id` records a safe key narrowing.
 
 A `load csv` step may carry an `--- expect plan` section directly after its

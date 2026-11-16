@@ -85,11 +85,31 @@ also have a single-property shorthand.
 |---|---|---|
 | `@key(p, ...)` | node or edge | The property tuple identifies the entity; its id is derived from it. Key properties must be non-null scalar values. An edge key must include both `@src` and `@dst`, and a key may be declared only when the type is created. |
 | `@unique(p, ...)` | node or edge | No two entities may share the property tuple. Edge constraints may include `@src` and `@dst`. |
-| `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness. |
+| `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness; see [What `@index` builds](#what-index-builds). |
 | `@index(fulltext, analyzer = "…", scorer = "…")` | a node's String property | Declares the property's full-text index with its analyzer profile (`standard_v1`, `standard_folded_v1` or `english_v1`) and scorer (`bm25_v1`, the default, or `none`). Without `analyzer` it takes `english_v1`. See [Full-text analyzers](../search/analyzers.md). |
 | `@range(p, min..max)` | node | Restricts a numeric property, or each element of a numeric list, to an inclusive range; either bound may be omitted. Values compare with the bounds exactly at any magnitude, and a decimal bound on an integer property admits the integers on its side: `@range(n, -2.5..2.5)` admits -2 through 2. |
 | `@check(p, "regex")` | node | Requires a String property to match the expression. |
 | `@card(min..max)` | edge | Bounds how many edges of the type start at each source node; omit `max` for an unbounded range, as in `@card(1..)`. The default is unbounded from zero. See [Edge cardinality](#edge-cardinality). |
+
+### What `@index` builds
+
+`@index` states intent, and an index pass (`omnigraph index build`, or
+optimize) builds the indexes that serve the property's type, never a write.
+One property can carry more than one:
+
+| Property type | Indexes | Predicates they speed up |
+|---|---|---|
+| enum, `Bool` | BITMAP | `=`, `!=`, `in [...]`, ranges, `is null` |
+| list | LABEL_LIST | `value in $x.list`, `not (value in $x.list)` |
+| free-text `String` | full text, NGRAM, BTREE | `match_terms` and `bm25`; `contains`; `=`, `in [...]`, ranges, `starts_with` |
+| number, `Date`, `DateTime` | BTREE | `=`, `in [...]`, ranges |
+| vector | vector index | `nearest` |
+
+An index changes cost, never rows: a row an index does not cover yet, after a
+write, is read directly, and an NGRAM's candidates are checked exactly. An
+existing graph gains the kinds it lacks at its next index pass. The index
+`@key` implies follows the same table, and an edge builds only its identity and
+endpoint indexes.
 
 `@range(p, ..10)` supplies only a maximum, and `@range(p, 10..)` supplies
 only a minimum; both endpoints are inclusive. Integer bounds must fit `I64`

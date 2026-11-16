@@ -26,8 +26,10 @@ node Chunk {
   writing one fails validation and a zero query vector is refused
 - `@embed("source_prop", model="model-id")` — associates the vector with its
   String source and, optionally, the exact model space
-- `@index` — declares derived index intent and can accelerate vector search;
-  correctness falls back to an exact scan when coverage is missing
+- `@index` — declares derived index intent and can accelerate vector search
+  (on a String it also builds the full-text index, an NGRAM for `contains`
+  and a BTREE); correctness falls back to an exact scan when coverage is
+  missing
 
 The schema says **where** embeddings live and **what** they come from. It does
 not populate vectors during mutation or load. Supply required vectors in input
