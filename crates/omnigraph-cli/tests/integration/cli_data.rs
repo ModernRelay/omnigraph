@@ -1260,7 +1260,6 @@ fn maintenance_refuses_server_targets_before_network() {
         &["index", "build"][..],
         &["index", "rebuild", "--kind", "full-text"],
         &["rebuild-full-text-indexes"],
-        &["repair"],
         &["cleanup"],
         &["upgrade"],
     ] {
@@ -1411,42 +1410,6 @@ fn index_rebuild_requires_a_kind_issue_840() {
 }
 
 #[test]
-fn repair_json_reports_noop_on_clean_graph() {
-    let temp = tempdir().unwrap();
-    let graph = graph_path(temp.path());
-    init_graph(&graph);
-    load_fixture(&graph);
-
-    let output = output_success(
-        cli()
-            .arg("repair")
-            .arg("--json")
-            .arg("--target")
-            .arg(&graph),
-    );
-    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-
-    assert!(payload.get("confirm").is_none());
-    assert!(payload.get("force").is_none());
-    // The report publishes nothing, so it names no graph manifest version.
-    assert!(payload.get("graph_manifest_version").is_none());
-    assert!(payload.get("manifest_version").is_none());
-    assert!(payload.get("tables").is_none());
-    let datasets = payload["datasets"].as_array().unwrap();
-    assert_eq!(datasets.len(), 4);
-    assert!(datasets.iter().all(|dataset| {
-        dataset["classification"] == "no_drift" && dataset["action"] == "no_op"
-    }));
-
-    let human = stdout_string(&output_success(
-        cli().arg("repair").arg("--target").arg(&graph),
-    ));
-    assert!(human.contains("4 datasets"), "{human}");
-    assert!(human.contains("node type 'Person'"), "{human}");
-    assert!(!human.contains("node:Person"), "{human}");
-}
-
-#[test]
 fn index_rebuild_json_noops_without_full_text_properties_issue_840() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -1497,47 +1460,71 @@ fn index_rebuild_json_noops_without_full_text_properties_issue_840() {
     assert_eq!(manifest_dataset_version(&graph), version_before);
 }
 
+/// A linear commit a foreign Lance writer put above a table's last linear
+/// version is listed by a confirmed `cleanup` (under `foreign_versions` in
+/// JSON, by name in the human report), never deleted and never adopted; the
+/// removed `repair` command is refused as a usage error.
 #[test]
-fn repair_reports_foreign_drift_and_refuses_removed_flags() {
+fn cleanup_lists_a_foreign_commit_without_deleting_or_adopting_it() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
     load_fixture(&graph);
-    let graph_manifest_before = manifest_dataset_version(&graph);
-    let (table_manifest_before, table_head_before) = forge_person_foreign_commit(&graph);
+    let (_, foreign_head) = forge_person_foreign_commit(&graph);
+    let people = || {
+        parse_stdout_json(&output_success(
+            cli()
+                .arg("query")
+                .arg("--target")
+                .arg(&graph)
+                .arg("--query")
+                .arg(fixture("test.gq"))
+                .arg("total_people")
+                .arg("--json"),
+        ))["rows"]
+            .clone()
+    };
+    let rows_before = people();
 
-    let output = output_success(
-        cli()
-            .arg("repair")
-            .arg("--json")
-            .arg("--target")
-            .arg(&graph),
-    );
-    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(payload.get("graph_manifest_version").is_none());
-    let person = payload["datasets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|dataset| dataset["type_key"] == "node:Person")
-        .unwrap();
-    assert_eq!(person["classification"], "foreign_drift");
-    assert_eq!(person["action"], "no_op");
-    assert_eq!(person["published_dataset_version"], table_manifest_before);
-    assert_eq!(person["lance_head_version"], table_head_before);
-    assert!(
-        person["operations"][0]
-            .as_str()
-            .is_some_and(|operation| operation.contains("foreign linear version")),
-        "{}",
-        person["operations"]
-    );
-    assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
-    for flag in ["--confirm", "--force"] {
-        let refused = output_failure(cli().arg("repair").arg(flag).arg("--target").arg(&graph));
-        assert_eq!(refused.status.code(), Some(64));
-        assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
+    for _ in 0..2 {
+        let cleaned = parse_stdout_json(&output_success(
+            cli()
+                .args(["cleanup", "--keep", "1", "--confirm", "--json", "--target"])
+                .arg(&graph),
+        ));
+        let person = cleaned["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dataset| dataset["type_key"] == "node:Person")
+            .unwrap();
+        assert_eq!(person["error"], Value::Null, "{person}");
+        assert_eq!(
+            person["foreign_versions"],
+            serde_json::json!([foreign_head]),
+            "every run lists the foreign commit and none deletes it: {person}"
+        );
     }
+    let human = stdout_string(&output_success(
+        cli()
+            .args(["cleanup", "--keep", "1", "--confirm", "--target"])
+            .arg(&graph),
+    ));
+    assert!(
+        human.contains(&format!(
+            "node type 'Person': foreign Lance versions {foreign_head} kept, never read or adopted"
+        )),
+        "the human report names the foreign commit: {human}"
+    );
+    assert_eq!(
+        people(),
+        rows_before,
+        "reads resolve the pin, never the foreign commit"
+    );
+
+    let refused = output_failure(cli().arg("repair").arg("--target").arg(&graph));
+    assert_eq!(refused.status.code(), Some(64), "{refused:?}");
+    assert!(refused.stdout.is_empty());
 }
 
 #[test]

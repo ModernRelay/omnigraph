@@ -3,13 +3,19 @@ use crate::helpers;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use async_trait::async_trait;
+use futures::TryStreamExt;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
 use omnigraph::db::MergeOutcome;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{
     MergeWriteProbes, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
 };
 use omnigraph::loader::LoadMode;
+use omnigraph::storage::{storage_for_uri, storage_read_through};
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
+use omnigraph_storage::read_through_contract::{self, Fixture, s3_prefix_store};
 
 use crate::helpers::*;
 
@@ -253,7 +259,6 @@ async fn s3_adapter_conditional_writes_contract() {
         eprintln!("skipping s3 adapter cas test: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
     };
-    use omnigraph::storage::storage_for_uri;
     let adapter = storage_for_uri(&uri).unwrap();
     let object = format!("{uri}/cas-probe.json");
 
@@ -404,4 +409,242 @@ async fn s3_fresh_branch_traversal_reuses_main_graph_index_with_etags() {
         0,
         "with real e_tags, a fresh lazy-fork branch must reuse main's cached CSR index, not rebuild"
     );
+}
+
+/// Every object under an `s3://` prefix with its size and ETag, sorted by
+/// key: the base's bytes as the listing reports them.
+async fn listing(uri: &str) -> Vec<(String, u64, Option<String>)> {
+    let mut rows: Vec<_> = s3_prefix_store(uri)
+        .unwrap()
+        .list(None)
+        .map_ok(|meta| (meta.location.to_string(), meta.size, meta.e_tag))
+        .try_collect()
+        .await
+        .unwrap();
+    rows.sort();
+    rows
+}
+
+/// The read-through storage contract's stores on prefixes of the test
+/// bucket: a base prefix holding the named objects and a fresh prefix per
+/// clone root, all under one test root.
+struct S3Fixture {
+    root: String,
+    next: AtomicU64,
+}
+
+impl S3Fixture {
+    fn store(&self, kind: &str) -> Arc<dyn ObjectStore> {
+        let n = self.next.fetch_add(1, Ordering::Relaxed);
+        s3_prefix_store(&format!("{}/{kind}-{n}", self.root)).unwrap()
+    }
+}
+
+#[async_trait]
+impl Fixture for S3Fixture {
+    async fn base(&self, files: &[(&str, &str)]) -> Arc<dyn ObjectStore> {
+        let store = self.store("base");
+        for (key, text) in files {
+            store
+                .put(
+                    &ObjectPath::from(*key),
+                    PutPayload::from(text.as_bytes().to_vec()),
+                )
+                .await
+                .unwrap();
+        }
+        store
+    }
+
+    async fn clone_root(&self) -> Arc<dyn ObjectStore> {
+        self.store("clone")
+    }
+}
+
+/// The durable-form rows of the storage contract (the graph shallow clone
+/// RFC, The storage contract), run over a bucket prefix as base and another
+/// as clone root; the bodies are the storage crate's own.
+macro_rules! s3_contract_rows {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[tokio::test(flavor = "multi_thread")]
+            async fn $name() {
+                let Some(root) = s3_test_graph_uri("read-through") else {
+                    eprintln!("skipping s3 read-through contract test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+                    return;
+                };
+                let fixture = S3Fixture { root: root.clone(), next: AtomicU64::new(0) };
+                read_through_contract::$name(&fixture).await;
+                storage_for_uri(&root).unwrap().delete_prefix(&root).await.unwrap();
+            }
+        )*
+    };
+}
+
+s3_contract_rows!(
+    durable_deletes_survive_a_reopen_and_stay_in_their_own_clone_root,
+    a_durable_store_keeps_its_whiteouts_out_of_sight,
+    durable_refuses_a_base_that_is_itself_a_clone_root,
+    durable_refuses_a_base_that_holds_an_object_at_the_reserved_name,
+    a_clone_root_carries_the_reserved_directory_from_its_first_build,
+    a_stop_between_the_whiteout_and_the_delete_leaves_the_key_deleted_or_untouched,
+    an_update_and_a_delete_of_one_base_object_take_turns,
+    a_create_and_a_delete_of_one_base_object_take_turns,
+    a_rename_of_a_base_object_is_refused_and_one_of_a_clone_object_runs,
+    create_after_a_durable_delete_holds_across_reopens,
+    racing_updates_of_a_base_object_over_a_clone_root_admit_one,
+);
+
+/// The read-through adapter over two prefixes: reads fall through, writes and
+/// prefix deletes stay in the clone root, and the base prefix's listing and
+/// ETags are as they were after the calls and after the clone root is deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_read_through_adapter_masks_the_base_and_leaves_its_listing_as_it_was() {
+    let Some(root) = s3_test_graph_uri("read-through-adapter") else {
+        eprintln!("skipping s3 read-through adapter test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+    let base_uri = format!("{root}/base");
+    let clone_uri = format!("{root}/clone");
+    let base = storage_for_uri(&base_uri).unwrap();
+    for (name, text) in [
+        ("a.json", "a"),
+        ("tree/x.json", "x"),
+        ("tree/sub/y.json", "y"),
+    ] {
+        base.write_text(&format!("{base_uri}/{name}"), text)
+            .await
+            .unwrap();
+    }
+    let before = listing(&base_uri).await;
+
+    let clone = storage_read_through(&base_uri, &clone_uri).await.unwrap();
+    assert_eq!(
+        clone
+            .read_text_if_exists(&format!("{clone_uri}/a.json"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("a")
+    );
+    clone
+        .write_text(&format!("{clone_uri}/b.json"), "b")
+        .await
+        .unwrap();
+    assert!(!base.exists(&format!("{base_uri}/b.json")).await.unwrap());
+    clone
+        .delete_prefix(&format!("{clone_uri}/tree"))
+        .await
+        .unwrap();
+    assert!(
+        !clone
+            .exists(&format!("{clone_uri}/tree/x.json"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        base.exists(&format!("{base_uri}/tree/x.json"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        clone
+            .delete_prefix(&format!("{clone_uri}/__clone"))
+            .await
+            .is_err(),
+        "a prefix delete of the reserved directory is refused"
+    );
+    clone.delete(&format!("{clone_uri}/a.json")).await.unwrap();
+
+    let reopened = storage_read_through(&base_uri, &clone_uri).await.unwrap();
+    assert_eq!(
+        reopened
+            .read_text_if_exists(&format!("{clone_uri}/a.json"))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        reopened
+            .read_text_if_exists(&format!("{clone_uri}/b.json"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("b")
+    );
+    assert_eq!(
+        listing(&base_uri).await,
+        before,
+        "the base prefix's listing and ETags are as they were"
+    );
+
+    storage_for_uri(&clone_uri)
+        .unwrap()
+        .delete_prefix(&clone_uri)
+        .await
+        .unwrap();
+    assert_eq!(listing(&clone_uri).await, Vec::new());
+    assert_eq!(
+        listing(&base_uri).await,
+        before,
+        "deleting the clone root's prefix leaves the base's listing as it was"
+    );
+    storage_for_uri(&root)
+        .unwrap()
+        .delete_prefix(&root)
+        .await
+        .unwrap();
+}
+
+/// `Omnigraph::open_clone` over two prefixes: the clone answers as its base,
+/// a write lands only under the clone prefix, the base's listing and ETags
+/// are unchanged, and a second open over the same clone root finds the write.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_open_clone_reads_the_base_and_writes_only_its_own_prefix() {
+    let Some(root) = s3_test_graph_uri("shallow-clone") else {
+        eprintln!("skipping s3 shallow clone test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+    let base_uri = format!("{root}/base");
+    let clone_uri = format!("{root}/clone");
+    let persons = {
+        let base = init_and_load_at(&base_uri, TEST_SCHEMA).await;
+        count_rows(&base, "node:Person").await
+    };
+    let before = listing(&base_uri).await;
+
+    let clone = session(Omnigraph::open_clone(&base_uri, &clone_uri).await.unwrap());
+    assert_eq!(count_rows(&clone, "node:Person").await, persons);
+    mutate_main(
+        &clone,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Cloned")], &[("$age", 1)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(count_rows(&clone, "node:Person").await, persons + 1);
+
+    assert_eq!(
+        listing(&base_uri).await,
+        before,
+        "the base prefix's listing and ETags are unchanged"
+    );
+    assert!(
+        storage_for_uri(&clone_uri)
+            .unwrap()
+            .exists(&format!("{clone_uri}/__clone/created"))
+            .await
+            .unwrap()
+    );
+    let base = session(Omnigraph::open(&base_uri).await.unwrap());
+    assert_eq!(count_rows(&base, "node:Person").await, persons);
+
+    let reopened = session(Omnigraph::open_clone(&base_uri, &clone_uri).await.unwrap());
+    assert_eq!(count_rows(&reopened, "node:Person").await, persons + 1);
+    storage_for_uri(&root)
+        .unwrap()
+        .delete_prefix(&root)
+        .await
+        .unwrap();
 }

@@ -69,18 +69,25 @@ macro_rules! scenario_tests {
 fn catalog() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks")
 }
+/// The recorded identities were taken on APFS with the clonefile reset.
 fn recorded_catalog() -> crate::catalog::Catalog {
     let mut catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
-    catalog.definition.defaults.environment =
-        Some(GqtEnvironment::embedded(crate::case::Backend::LocalFs {
-            filesystem: crate::case::LocalFilesystem::Apfs,
-            storage_class: crate::case::LocalStorageClass::NvmeSsd,
-        }));
     catalog.definition.defaults.protocol.reset = Some(crate::case::ResetMode::LocalClonefile);
     catalog
 }
+fn apfs_backend() -> crate::case::Backend {
+    crate::case::Backend::LocalFs {
+        filesystem: crate::case::LocalFilesystem::Apfs,
+        storage_class: crate::case::LocalStorageClass::NvmeSsd,
+    }
+}
+fn recorded_environment() -> GqtEnvironment {
+    GqtEnvironment::embedded(apfs_backend())
+}
 fn plan(name: &str) -> PlannedGqt {
-    recorded_catalog().plan(name).unwrap()
+    recorded_catalog()
+        .plan_in(name, &recorded_environment())
+        .unwrap()
 }
 #[derive(Debug, Default)]
 struct Signals {
@@ -215,7 +222,9 @@ fn original_pairs_and_groups_preserve_pre_migration_identity() {
             .iter()
             .find(|scenario| scenario.id == *id)
             .unwrap_or_else(|| panic!("original scenario {id} is missing"));
-        let plan = catalog.plan(&scenario.id).unwrap();
+        let plan = catalog
+            .plan_in(&scenario.id, &recorded_environment())
+            .unwrap();
         plan.revalidate().unwrap();
         assert_eq!(
             old["planned_sha256"], plan.planned_sha256,
@@ -250,7 +259,7 @@ fn original_pairs_and_groups_preserve_pre_migration_identity() {
         );
         assert_eq!(
             old["repetitions"],
-            scenario.expand(&catalog.definition.defaults).1
+            scenario.repetitions(&catalog.definition.defaults)
         );
     }
     let groups: std::collections::BTreeMap<String, Vec<(String, u32)>> =
@@ -258,7 +267,7 @@ fn original_pairs_and_groups_preserve_pre_migration_identity() {
     assert_eq!(groups.len(), 8);
     let selection = |name: Option<&str>| {
         catalog
-            .resolve(name, None)
+            .resolve_in(name, None, &recorded_environment())
             .unwrap()
             .runs
             .into_iter()
@@ -521,6 +530,125 @@ fn query_shape_scenario_tests_cover_every_catalog_scenario() {
     assert_eq!(
         QUERY_SHAPE_SCENARIO_TESTS,
         query_shape_cases().map(|(id, _)| id).collect::<Vec<_>>()
+    );
+}
+
+/// A planned case with its reset and backend replaced, its identity recomputed.
+fn with_reset(
+    p: &PlannedGqt,
+    backend: crate::case::Backend,
+    reset: crate::case::ResetMode,
+) -> PlannedGqt {
+    let mut changed = p.clone();
+    changed.definition.environment = GqtEnvironment::embedded(backend);
+    changed.definition.protocol.reset = reset;
+    changed.cache_condition = crate::gqt_case::admit_point_queries(
+        &changed.queries.parse().unwrap(),
+        &changed.definition.workload.measured_step,
+        changed.definition.environment.target,
+        reset,
+    )
+    .unwrap();
+    changed.case_digest = crate::model::typed_sha256(&changed.definition).unwrap();
+    changed.planned_sha256 = changed.planned_hash().unwrap();
+    changed
+}
+fn s3_backend() -> crate::case::Backend {
+    crate::case::Backend::S3 {
+        implementation: crate::case::S3Implementation::Rustfs,
+        implementation_version: "1.0.0-beta.12".into(),
+        region: "us-east-1".into(),
+        storage_class: "STANDARD".into(),
+        versioning: crate::case::S3Versioning::Disabled,
+        image_digest: Some(format!("sha256:{}", "e".repeat(64))),
+    }
+}
+fn point_id(p: &PlannedGqt) -> String {
+    p.bind(
+        &"a".repeat(64),
+        crate::dataset_identity::DATASET_LOGICAL_ALGORITHM,
+    )
+    .unwrap()
+    .point_id
+}
+
+#[test]
+fn clone_is_a_reset_level_of_its_own_on_local_and_s3_stores() {
+    use crate::case::{Backend, LocalFilesystem, LocalStorageClass, ResetMode};
+    let apfs = Backend::LocalFs {
+        filesystem: LocalFilesystem::Apfs,
+        storage_class: LocalStorageClass::NvmeSsd,
+    };
+    let xfs = Backend::LocalFs {
+        filesystem: LocalFilesystem::Xfs,
+        storage_class: LocalStorageClass::NvmeSsd,
+    };
+    let p = plan("tiny-read");
+    assert_eq!(p.definition.protocol.reset, ResetMode::LocalClonefile);
+    let admitted = [
+        with_reset(&p, apfs.clone(), ResetMode::Clone),
+        with_reset(&p, xfs.clone(), ResetMode::Clone),
+        with_reset(&p, s3_backend(), ResetMode::Clone),
+    ];
+    for changed in &admitted {
+        changed.revalidate().unwrap();
+        changed.dataset_build_plan().unwrap().revalidate().unwrap();
+        assert_ne!(
+            point_id(changed),
+            point_id(&p),
+            "clone is a new point beside the restore level"
+        );
+    }
+    assert_ne!(
+        point_id(&admitted[0]),
+        point_id(&admitted[2]),
+        "the store's backend stays in the point"
+    );
+    for (backend, reset) in [
+        (apfs.clone(), ResetMode::PlainCopy),
+        (xfs, ResetMode::LocalClonefile),
+        (s3_backend(), ResetMode::S3Versioning),
+        (s3_backend(), ResetMode::LocalClonefile),
+        (apfs, ResetMode::None),
+    ] {
+        let refused = with_reset(&p, backend.clone(), reset);
+        assert!(
+            refused.revalidate().is_err(),
+            "{backend:?} under {reset:?} is not an admitted embedded pair"
+        );
+    }
+    let mut served = with_reset(&p, s3_backend(), ResetMode::Clone);
+    served.definition.environment.target = Target::Server;
+    served.definition.environment.network_position = crate::case::NetworkPosition::SameHost;
+    served.case_digest = crate::model::typed_sha256(&served.definition).unwrap();
+    served.planned_sha256 = served.planned_hash().unwrap();
+    assert!(
+        served.revalidate().is_err(),
+        "a served case keeps reset: none"
+    );
+}
+
+#[test]
+fn an_s3_environment_derives_the_clone_reset() {
+    let catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
+    assert_eq!(catalog.definition.defaults.protocol.reset, None);
+    assert_eq!(catalog.definition.scenarios.len(), 79);
+    let plan = catalog
+        .plan_in("tiny-read", &GqtEnvironment::embedded(s3_backend()))
+        .unwrap();
+    assert_eq!(
+        plan.definition.protocol.reset,
+        crate::case::ResetMode::Clone
+    );
+    assert_eq!(plan.definition.environment.backend, s3_backend());
+    let local = catalog.plan("tiny-read").unwrap();
+    assert_eq!(
+        local.definition.environment,
+        crate::catalog::local_environment()
+    );
+    assert_ne!(
+        local.definition.protocol.reset,
+        crate::case::ResetMode::Clone
     );
 }
 
@@ -947,7 +1075,7 @@ fn request_budget_and_projection_budget_are_admitted_before_io() {
     assert!(serde_json::to_vec(&b).unwrap().len() < 512 * 1024);
 }
 
-async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
+pub(crate) async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
     use crate::gqt_record::{GqtMeasurementsV1, GqtRunIdentityV1, GqtRunRecordV1};
     use crate::record::{
         AcquisitionStatusV1, AcquisitionV1, EvidenceStrengthV1, WallClockSummaryV1,
@@ -1019,6 +1147,7 @@ async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
             },
         }),
         dataset_cache_hit: Some(true),
+        base: None,
         acquisition: AcquisitionV1 {
             status: AcquisitionStatusV1::Complete,
             requested_repetitions: 1,
@@ -1260,6 +1389,9 @@ async fn completed_gqt_prefix_has_one_owner_and_failed_repetition_is_retained() 
         fixture: record.fixture,
         dataset_cache_hit: Some(true),
         server_receipt: None,
+        base: None,
+        product: None,
+        observed_backend: None,
         samples: vec![sample.clone()],
         wall_clock: crate::runner::WallClockSummary {
             observed_repetitions: 1,
@@ -1446,6 +1578,9 @@ async fn gqt_record_build_rejects_receipts_outside_the_frozen_program() {
         fixture: record.fixture.clone(),
         dataset_cache_hit: record.dataset_cache_hit,
         server_receipt: None,
+        base: None,
+        product: None,
+        observed_backend: None,
         samples: record.measurements.raw_samples.clone(),
         wall_clock: WallClockSummary {
             observed_repetitions: 1,

@@ -422,6 +422,7 @@ pub(crate) async fn execute_queries_validate(
         let graph_binding = binding.for_uri(&serving_graph.root.to_string_lossy())?;
         let db = crate::admission::open_read_only_with_binding(
             &graph_binding,
+            None,
             snapshot.state_cas.as_deref(),
         )
         .await?;

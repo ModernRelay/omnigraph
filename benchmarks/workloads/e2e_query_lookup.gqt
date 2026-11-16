@@ -6,6 +6,8 @@ timeout_ms: 60000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
 
 --- query
 query lookup() { match { $p: Person } where $p.name = "p000500" return { $p.name, $p.age } }

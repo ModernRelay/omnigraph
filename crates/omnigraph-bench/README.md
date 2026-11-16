@@ -136,15 +136,16 @@ uncertain containment cannot release a cache entry for safe reuse.
 
 ## Served read-only acquisition
 
-`query-shapes-served` and `traversal-served` add server-target variants with
-separate workload sources and point identities. Select one scenario against
-an already provisioned graph:
+A scenario runs against a server when the run says so; the served point is its
+own identity (the target, the receipt's backend and the network position enter
+`point_id`). Select one scenario against an already provisioned graph:
 
 ```bash
-target/release/omnigraph-bench run e2e-query-count-served \
+target/release/omnigraph-bench run e2e-query-count \
   --server http://127.0.0.1:8080 --graph bench \
   --server-receipt /path/to/deployment.json \
   --server-token-env BENCH_SERVER_TOKEN \
+  --network-position same-host \
   --dataset-cache /path/to/client-scratch --repetitions 5 --json
 ```
 
@@ -203,12 +204,11 @@ One invocation accepts one receipt, endpoint and graph. All selected scenarios
 must use that receipt's dataset recipe and backend; incompatible groups fail
 before archive creation or network activity. The groups are discovery sets:
 run their different fixture recipes in separate invocations against matching
-provisioned graphs. A served definition must declare `network_position`; a
-server target without it is refused. For another deployment, author an explicit
-server backend and `same-host`, `same-region`, or `remote` network position in
-custom YAML;
-these declarations enter point identity and are never inferred from the client.
-Explicit `--dataset`/`--queries` pairs are embedded only and refuse `--server`.
+provisioned graphs. The served environment is the run's: the receipt's backend
+and `--network-position` (`same-host` unless given; `same-region` or `remote`
+for another deployment). These declarations enter point identity and are never
+inferred from the client. Explicit `--dataset`/`--queries` pairs are embedded
+only and refuse `--server`.
 
 The entire schema-less query program must be read-only, including loop bodies
 and verification suffixes, or write only unpublished commits: a mutation
@@ -218,8 +218,10 @@ drop "${name}"`. Such a write advances no head, so the provisioned graph is the
 same for every repetition without a reset; its receipt records
 `published: false`, and a record whose write receipt lacks that flag is
 refused. Published writes, `commit publish`, drops of a commit the workload did
-not bind, loads, branch creates and deletes, restarts, index requirements and
-registered-fixture recipes are refused. Settings prefixes on read steps are
+not bind, loads, branch creates and deletes, index requirements and
+registered-fixture recipes are refused, as is a restart before the measured
+step; a restart after it is the long-running lifecycle's no-op and gets a step
+receipt with no door opened. Settings prefixes on read steps are
 refused for served acquisition. Acquisition does not seed, restore,
 restart or clean up the server. It creates a fresh client worker per repetition
 and sends only the admitted GQT steps; a dropped commit leaves its detached
@@ -592,7 +594,74 @@ not), and its runs have `durable_record: false`.
 `scripts/compare-local-routes.py` runs the three routes in alternating order
 over several passes into a fresh output directory and prints the per-route
 p50, the ratios, the storage calls of the measured step and the verdict on the
-read-through threshold.
+read-through threshold; with `--store` and `--product` it runs the clone route
+beside them.
+
+`run --store <directory | s3://bucket/prefix>` runs an engine-target scenario
+at the `clone` reset level over a fixture store: the scenario's frozen base is
+acquired from the store (built there by this harness when absent, under a
+lease; the key names the recipe and the storage format, never the commit), and
+every repetition hands a worker an empty clone root under `clones/` that the
+product's `omnigraph` opens with `--target <clone> --base <base>`. Every step
+of the program is its own `omnigraph` process (`query`, `mutate`, `load`, a
+control statement through `mutate -e`, a read statement through `query -e`),
+judged from its `--json` document; the measured step's child is timed from
+spawn to exit, its `--stats` document gives the sample's Lance call counts
+and `peak_rss_bytes`, and the supervising runner lists the clone when the
+worker declares itself ready, before the measured step begins, to witness that
+the preparation wrote nothing there (the worker holds no store credentials;
+the product's children receive the run's `AWS_*` variables). The clone is deleted
+after a verified repetition and kept for inspection after a failed one. A
+`--- restart` is never the measured step on this route and is a no-op
+elsewhere in the program; `--- schema` and seeds, `--- csv` sections, seams,
+pins, settings and concurrent steps have no command-line form and are refused
+at admission. The derived cache condition names the lifecycle `fresh-per-step`:
+preparation reads give `post-reopen`, never `warm`. `--product <path>` names
+the binary (`omnigraph` beside the bench executable when unset); its `version
+--json` is read once, a binary whose `internal_schema.writes` differs from the
+format this harness builds bases in is refused, and the record's system under
+test is `product-binary`: that document, the binary's sha256 and the harness
+worker build beside it, never claim-eligible. An `s3://` store needs
+`--backend <json or file>`, the declared S3 backend (`implementation`,
+`implementation_version`, `region`, `storage_class`, `versioning`,
+`image_digest`) the record carries with `probe: "declared"`; a local store's
+backend is probed as on every local run. The children run with a cleared
+environment plus the `AWS_*` client variables, `LANCE_MEM_POOL_SIZE`, the
+locale, `PATH`, `HOME` and a `TMPDIR` under the worker's scratch.
+
+A `--store` run without `--archive` puts every completed run's record into the
+store under `records/<sha256>.json`, put-if-absent, under one session id; the
+`--json` output names them in `store_records`. Nothing censored is put. The
+record names its base by the manifest's identity fields, object count and
+bytes, and the manifest's sha256 (the digest every sample carries), never by
+the object listing, which stays in the store's `base-manifest.json`.
+`run <scenario|group> --store <uri> --at <ref> [--at <ref>]...` measures
+commits: every ref is resolved with `git rev-parse` in the working directory,
+its `omnigraph` taken from the store's `builds/<sha>/<triple>/omnigraph` or,
+on a miss, built from `git archive <sha>` in a scratch directory under the
+dataset cache with `cargo build --release --locked -p omnigraph-cli --bin
+omnigraph` and put there (a clean tree by construction); `<ref>=<path>` names
+the binary instead and puts nothing. Every ref is resolved, then every ref's
+binary is inspected, before any run: a product writing another storage format
+refuses the whole command as `not_comparable`, and a binary whose `version
+--json` names another commit than its ref is refused as
+`product_commit_mismatch` (a development build names no commit and is admitted
+under any ref); then the selection runs once per ref against the same bases,
+each record carrying `requested_commit` beside the binary's own
+`source_commit`, and the table prints one row per ref and scenario (commit,
+version, repetitions, min, p50, max, the measured step's Lance calls at p50,
+records put). When a later ref's run fails, the refs completed before it are
+printed first (the table, or one line per ref under `--json`), since their
+records are already in the store. `--at` runs catalog scenarios only, never a
+legacy case file, and conflicts with `--archive` and `--product`.
+
+`report <scenario|group> --store <uri>` reads the store's `records/` and
+prints the selection's series: one row per record (invocation time, commit,
+system under test, version, observed and requested repetitions, min, p50,
+max, status), grouped by scenario, `point_id` and machine label; a group is
+one machine's rows and the report never forms a factor across groups. A
+record whose bytes do not hash to its name, or that is not run-record JSON,
+fails the report.
 
 Machine-readable diagnostic-mode failures keep the suite/case/point identity
 and all completed runs or repetitions. A worker killed at its hard deadline

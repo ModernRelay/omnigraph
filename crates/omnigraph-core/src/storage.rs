@@ -345,15 +345,15 @@ pub fn storage_for_uri_scoped(uri: &str, scope: StorageIoScope) -> Result<Arc<dy
 }
 
 /// Storage for the graph root `root_uri` read through the base `base_uri`,
-/// two root URIs of one backend, local directories in this phase: the graph
-/// starts as the one the base holds, every write lands under the root, and
-/// the base is never written. A handle opened with it reads its Lance
-/// datasets through the same mount.
+/// two root URIs of one backend, local directories or `s3://` prefixes of
+/// one endpoint: the graph starts as the one the base holds, every write
+/// lands under the root, and the base is never written. A handle opened
+/// with it reads its Lance datasets through the same mount.
 ///
 /// # Errors
-/// When the two roots are not of one kind or that kind is not local, when
-/// one lies inside the other, or when the base or the root's delete markers
-/// cannot be listed.
+/// When the two roots are not of one kind or that kind is neither local nor
+/// S3, when one lies inside the other, or when the base or the root's delete
+/// markers cannot be listed.
 pub async fn storage_read_through(
     base_uri: &str,
     root_uri: &str,

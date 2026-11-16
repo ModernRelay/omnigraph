@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.producthunt.com/products/omnigraph?launch=omnigraph&utm_source=github&utm_medium=readme&utm_campaign=ph-launch"><img alt="Omnigraph on Product Hunt" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1298575&theme=light" width="250" height="54"></a>
+  <a href="https://www.producthunt.com/products/omnigraph?embed=true&utm_source=badge-top-post-badge&utm_medium=badge&utm_campaign=badge-omnigraph"><img alt="Omnigraph - Open source graph database for your AI agents | Product Hunt" src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=1298575&theme=neutral&period=daily" width="250" height="54"></a>
 </p>
 
 <hr>

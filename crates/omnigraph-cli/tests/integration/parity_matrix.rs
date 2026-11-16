@@ -1569,7 +1569,7 @@ fn parity_errors_share_exit_codes() {
 //
 // - `graphs list`: server-only today; becomes Both-capability when the
 //   embedded arm enumerates the cluster catalog (RFC-009 open Q3, answered).
-// - `init`, `optimize`, `repair`, `cleanup`, `cluster *`: storage-plane by
+// - `init`, `optimize`, `cleanup`, `cluster *`: storage-plane by
 //   design (must work with the server down); Phase 4 declares this.
 #[allow(dead_code)]
 const EXCLUSIONS_DOCUMENTED: () = ();

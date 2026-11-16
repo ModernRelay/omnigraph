@@ -243,7 +243,7 @@ fn inspect_source(
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .ok_or("GQT filename must be UTF-8")?;
-                    parse_case(stem, &text)
+                    parse_case(stem, &text).map_err(String::from)
                 });
             parsed
                 .and_then(|case| {
@@ -335,7 +335,7 @@ pub fn scenario(catalog: &Catalog, scenario: &Scenario) -> ScenarioEntry {
             .filter(|(_, members)| members.contains(&scenario.id))
             .map(|(id, _)| id.clone())
             .collect(),
-        repetitions: scenario.expand(&catalog.definition.defaults).1,
+        repetitions: scenario.repetitions(&catalog.definition.defaults),
         source: state,
         diagnostics,
     }

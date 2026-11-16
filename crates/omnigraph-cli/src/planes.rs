@@ -96,7 +96,6 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         }
         | Command::Index { .. }
         | Command::RebuildFullTextIndexes(_)
-        | Command::Repair(_)
         | Command::Cleanup(_) => Graph {
             direct_only: true,
             root: true,
@@ -201,8 +200,33 @@ pub(crate) fn admits_inline_s3_root(command: &Command) -> bool {
         } | Command::Optimize(_)
             | Command::Index { .. }
             | Command::Cleanup(_)
-            | Command::Repair(_)
             | Command::RebuildFullTextIndexes(_)
+    )
+}
+
+/// The commands that open a direct graph as a shallow clone under `--base`:
+/// the reads and writes the embedded client serves. Maintenance, schema
+/// changes and deployment keep the one root they are given, since what a
+/// `cleanup`, an `optimize` or an upgrade leaves in a clone root is not
+/// defined. Under an `s3://` base these commands name the clone's `s3://`
+/// prefix inline (`scope::resolve`), the pair `open_clone` puts on one
+/// endpoint, where a registered direct target admits `file://` only.
+pub(crate) fn admits_base(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Query(_)
+            | Command::Mutate(_)
+            | Command::Load(_)
+            | Command::Branch { .. }
+            | Command::Commit { .. }
+            | Command::Changes { .. }
+            | Command::Diff(_)
+            | Command::Snapshot(_)
+            | Command::Export(_)
+            | Command::Blob { .. }
+            | Command::Schema {
+                command: SchemaCommand::Show { .. }
+            }
     )
 }
 
@@ -368,7 +392,6 @@ fn accepts_actor(command: &Command) -> bool {
         | Command::Init(_)
         | Command::Upgrade(_)
         | Command::Optimize(_)
-        | Command::Repair(_)
         | Command::Cleanup(_)
         | Command::Lint(_)
         | Command::Alias(_)
@@ -668,7 +691,6 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             IndexCommand::Rebuild(_) => "index rebuild",
         },
         Command::RebuildFullTextIndexes(_) => "rebuild-full-text-indexes",
-        Command::Repair(_) => "repair",
         Command::Cleanup(_) => "cleanup",
         Command::Cluster { .. } => "cluster",
         Command::Organization { .. } => "organization",

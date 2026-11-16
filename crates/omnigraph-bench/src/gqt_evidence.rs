@@ -1,9 +1,11 @@
 //! Per-repetition preparation input and the proof a worker reports before
 //! measurement; the protocol frames carry them, the runner and record check them.
+use crate::case::ResetMode;
 use crate::gqt_case::{BoundGqt, Target};
 use crate::gqt_served::ServedInput;
 use crate::model::digest;
 use crate::reset::{MetadataDigest, PhysicalDigest};
+use crate::store::CloneRoot;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -88,6 +90,24 @@ pub enum RepetitionInputV2 {
     Served {
         input: Box<ServedInput>,
     },
+    Clone {
+        input: Box<CloneInput>,
+    },
+}
+
+/// What a `--store` repetition's child processes address: the clone the
+/// repetition owns, the frozen base it reads through, the product binary
+/// whose digest the record names, and the environment the children run with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloneInput {
+    pub store_uri: String,
+    pub base_root_uri: String,
+    pub base_manifest_sha256: String,
+    pub clone: CloneRoot,
+    pub product: PathBuf,
+    pub product_sha256: String,
+    pub environment: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,12 +120,28 @@ pub enum PreparationProofV2 {
     Served {
         server_receipt_sha256: String,
     },
+    Clone {
+        base_manifest_sha256: String,
+    },
 }
 
 impl RepetitionInputV2 {
     pub fn validate(&self, case: &BoundGqt) -> Result<(), String> {
         case.revalidate()?;
         match (self, case.identity.environment.target) {
+            (Self::Clone { input }, Target::Engine)
+                if case.plan.definition.protocol.reset == ResetMode::Clone
+                    && digest(&input.base_manifest_sha256)
+                    && digest(&input.product_sha256)
+                    && input.product.is_absolute()
+                    && input.clone.uri.starts_with(&input.store_uri)
+                    && input.base_root_uri.starts_with(&input.store_uri)
+                    && input.environment.iter().all(|(name, _)| {
+                        !name.is_empty() && !name.contains('=') && !name.contains('\0')
+                    }) =>
+            {
+                Ok(())
+            }
             (
                 Self::Embedded {
                     repetition_root,
@@ -137,6 +173,9 @@ impl RepetitionInputV2 {
             }),
             Self::Served { input } => Ok(PreparationProofV2::Served {
                 server_receipt_sha256: input.receipt.digest()?,
+            }),
+            Self::Clone { input } => Ok(PreparationProofV2::Clone {
+                base_manifest_sha256: input.base_manifest_sha256.clone(),
             }),
         }
     }

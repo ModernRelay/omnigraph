@@ -1864,6 +1864,227 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
     }
 }
 
+/// Runs one command line against the default operator configuration and
+/// returns its completion with both streams as text.
+async fn run_cli(args: &[&str]) -> (Completion, String, String) {
+    let parsed = crate::invocation::parse_from(args.iter().copied()).unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let completion = super::execute(
+        parsed,
+        crate::operator::InvocationConfig::at(None, None),
+        &mut io::empty(),
+        false,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .unwrap();
+    (
+        completion,
+        String::from_utf8(stdout).unwrap(),
+        String::from_utf8(stderr).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn base_opens_a_graph_shallow_clone_and_leaves_the_base_unchanged() {
+    const PEOPLE: &str = "query people() { match { $p: Person } return { $p.slug } }";
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base.omni").to_str().unwrap().to_owned();
+    let clone = temp.path().join("clone").to_str().unwrap().to_owned();
+    omnigraph::db::Omnigraph::init(&base, "node Person { slug: String @key }")
+        .await
+        .unwrap();
+    let insert = |slug: &str| format!("query add() {{ insert Person {{ slug: \"{slug}\" }} }}");
+    let (seeded, _, _) = run_cli(&[
+        "omnigraph",
+        "mutate",
+        "--target",
+        &base,
+        "-e",
+        &insert("a"),
+        "--json",
+    ])
+    .await;
+    assert_eq!(seeded.code(), 0);
+    let base_listing_before = list_tree(temp.path().join("base.omni"));
+
+    let (written, _, stderr) = run_cli(&[
+        "omnigraph",
+        "mutate",
+        "--target",
+        &clone,
+        "--base",
+        &base,
+        "-e",
+        &insert("b"),
+        "--json",
+    ])
+    .await;
+    assert_eq!(written.code(), 0, "{stderr}");
+    let (read, clone_rows, _) = run_cli(&[
+        "omnigraph",
+        "query",
+        "--target",
+        &clone,
+        "--base",
+        &base,
+        "-e",
+        PEOPLE,
+        "--json",
+    ])
+    .await;
+    assert_eq!(read.code(), 0);
+    let clone_rows: Value = serde_json::from_str(&clone_rows).unwrap();
+    assert_eq!(clone_rows["row_count"], 2, "{clone_rows}");
+
+    let (read, base_rows, _) = run_cli(&[
+        "omnigraph",
+        "query",
+        "--target",
+        &base,
+        "-e",
+        PEOPLE,
+        "--json",
+    ])
+    .await;
+    assert_eq!(read.code(), 0);
+    let base_rows: Value = serde_json::from_str(&base_rows).unwrap();
+    assert_eq!(
+        base_rows["row_count"], 1,
+        "the base answers as before: {base_rows}"
+    );
+    assert_eq!(
+        list_tree(temp.path().join("base.omni")),
+        base_listing_before,
+        "the base records no clone"
+    );
+    assert!(temp.path().join("clone/__clone/created").is_file());
+}
+
+#[tokio::test]
+async fn stats_writes_one_document_with_the_invocation_s_store_calls() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base.omni").to_str().unwrap().to_owned();
+    let clone = temp.path().join("clone").to_str().unwrap().to_owned();
+    let stats = temp.path().join("stats.json");
+    omnigraph::db::Omnigraph::init(&base, "node Person { slug: String @key }")
+        .await
+        .unwrap();
+    let (completion, _, stderr) = run_cli(&[
+        "omnigraph",
+        "query",
+        "--target",
+        &clone,
+        "--base",
+        &base,
+        "--stats",
+        stats.to_str().unwrap(),
+        "-e",
+        "query people() { match { $p: Person } return { $p.slug } }",
+        "--json",
+    ])
+    .await;
+    assert_eq!(completion.code(), 0, "{stderr}");
+    let document: Value = serde_json::from_slice(&std::fs::read(&stats).unwrap()).unwrap();
+    assert_eq!(document["stats_version"], 1);
+    assert_eq!(document["exit_code"], 0);
+    assert!(document["elapsed_ms"].as_f64().unwrap() > 0.0, "{document}");
+    let manifest = &document["storage"]["manifest"];
+    assert!(
+        manifest["get"].as_u64().unwrap() + manifest["list"].as_u64().unwrap() > 0,
+        "the open through the clone's mount is object-store I/O the `__manifest` plane counts: {document}"
+    );
+    for class in [
+        "put", "put_part", "head", "list", "delete", "copy", "rename",
+    ] {
+        assert!(manifest[class].is_u64(), "{class} missing: {document}");
+    }
+    assert!(document["storage"]["table"].is_object(), "{document}");
+}
+
+#[tokio::test]
+async fn stats_that_cannot_be_written_fails_after_the_mutation_committed() {
+    const PEOPLE: &str = "query people() { match { $p: Person } return { $p.slug } }";
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base.omni").to_str().unwrap().to_owned();
+    let blocker = temp.path().join("blocker");
+    std::fs::write(&blocker, b"").unwrap();
+    let stats = blocker.join("stats.json");
+    omnigraph::db::Omnigraph::init(&base, "node Person { slug: String @key }")
+        .await
+        .unwrap();
+    let (completion, _, stderr) = run_cli(&[
+        "omnigraph",
+        "mutate",
+        "--target",
+        &base,
+        "--stats",
+        stats.to_str().unwrap(),
+        "-e",
+        "query add() { insert Person { slug: \"a\" } }",
+        "--json",
+    ])
+    .await;
+    assert_ne!(completion.code(), 0, "{stderr}");
+    assert!(stderr.contains("writing --stats"), "{stderr}");
+    let (read, rows, _) = run_cli(&[
+        "omnigraph",
+        "query",
+        "--target",
+        &base,
+        "-e",
+        PEOPLE,
+        "--json",
+    ])
+    .await;
+    assert_eq!(read.code(), 0);
+    let rows: Value = serde_json::from_str(&rows).unwrap();
+    assert_eq!(
+        rows["row_count"], 1,
+        "the mutation committed before the document failed: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn base_is_refused_where_the_command_has_no_clone_form() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base.omni").to_str().unwrap().to_owned();
+    let clone = temp.path().join("clone").to_str().unwrap().to_owned();
+    omnigraph::db::Omnigraph::init(&base, "node Person { slug: String @key }")
+        .await
+        .unwrap();
+    let (completion, stdout, stderr) =
+        run_cli(&["omnigraph", "optimize", "--target", &clone, "--base", &base]).await;
+    assert_ne!(completion.code(), 0);
+    assert!(
+        format!("{stdout}{stderr}").contains("no clone form"),
+        "{stdout}{stderr}"
+    );
+    assert!(!temp.path().join("clone").exists());
+}
+
+/// Every file under `root` with its length, so a tree can be compared
+/// before and after an operation that must not write it.
+fn list_tree(root: std::path::PathBuf) -> Vec<(std::path::PathBuf, u64)> {
+    let mut out = Vec::new();
+    let mut pending = vec![root];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(path);
+            } else {
+                out.push((path, entry.metadata().unwrap().len()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 fn direct_test_target(uri: &str, root: bool) -> crate::targets::ResolvedTarget {
     use crate::targets::*;
     ResolvedTarget::new(

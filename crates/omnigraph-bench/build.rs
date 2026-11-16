@@ -77,6 +77,7 @@ fn main() {
     }
     if let Some(root) = repository {
         emit_gqt_engine_digest(root);
+        emit_lance_version(root);
     }
     let source_git_commit = repository
         .and_then(probe_git_commit)
@@ -151,6 +152,24 @@ fn main() {
             println!("cargo:rerun-if-env-changed={name}");
         }
     }
+}
+
+/// The pinned `lance` version from `Cargo.lock`, a term of the frozen base's
+/// key: the format a base was written in outlives every engine commit that
+/// keeps the pin, and a bump is a new base.
+fn emit_lance_version(repository: &Path) {
+    let lock = std::fs::read_to_string(repository.join("Cargo.lock")).expect("read Cargo.lock");
+    let document: toml::Value = toml::from_str(&lock).expect("parse Cargo.lock");
+    let version = document
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|package| package.get("name").and_then(toml::Value::as_str) == Some("lance"))
+        .and_then(|package| package.get("version"))
+        .and_then(toml::Value::as_str)
+        .expect("Cargo.lock pins lance");
+    println!("cargo:rustc-env=GQT_LANCE_VERSION={version}");
 }
 
 fn probe_git_commit(repository: &Path) -> Option<String> {

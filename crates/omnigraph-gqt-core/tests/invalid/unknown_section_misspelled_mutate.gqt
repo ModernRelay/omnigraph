@@ -1,0 +1,18 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+--- seed
+{"type":"Person","data":{"name":"alice","age":1}}
+--- mutat
+query add($n: String) { insert Person { name: $n, age: 2 } }
+--- params
+{"n":"bob"}
+--- expect affected: nodes=1 edges=0

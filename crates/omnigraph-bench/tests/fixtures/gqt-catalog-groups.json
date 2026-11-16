@@ -1,7 +1,7 @@
 {
   "aws-xfs-process-cold": [
     [
-      "branch-merge-d50-process-cold-xfs",
+      "branch-merge-d50-process-cold",
       5
     ]
   ],

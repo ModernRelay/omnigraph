@@ -13,7 +13,7 @@ use omnigraph_core::graph_commit_id::canonical_ulid;
 use crate::error::{OmniError, Result};
 
 use super::layout::{
-    manifest_uri, open_manifest_branch_with_identifier, open_manifest_dataset_with_session,
+    manifest_uri, open_manifest_branch_with_identifier, open_manifest_dataset_at_with_session,
 };
 use super::metadata::TableVersionMetadata;
 use super::migrations::{guard_stamp, stamp_entry, stamp_for_system_columns};
@@ -354,16 +354,25 @@ pub(crate) async fn snapshot_state_at(
     control_session: &Arc<lance::session::Session>,
 ) -> Result<(Dataset, VersionState)> {
     let root = root_uri.trim_end_matches('/');
-    let dataset = open_manifest_dataset_with_session(root, branch, control_session).await?;
-    let dataset = dataset
-        .checkout_version(version)
-        .await
-        .map_err(OmniError::storage)?;
-    let state = match crate::legacy::at_version(root, control_session, history, &dataset).await? {
-        None => VersionState::Rows(read_manifest_state(&dataset).await?),
-        Some(at) => VersionState::Legacy(at),
-    };
+    let dataset =
+        open_manifest_dataset_at_with_session(root, branch, version, control_session).await?;
+    let state = version_state(root, &dataset, history, control_session).await?;
     Ok((dataset, state))
+}
+
+/// What the checked-out `__manifest` version `dataset` is read from.
+pub(crate) async fn version_state(
+    root: &str,
+    dataset: &Dataset,
+    history: &ExtentCache,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<VersionState> {
+    Ok(
+        match crate::legacy::at_version(root, control_session, history, dataset).await? {
+            None => VersionState::Rows(read_manifest_state(dataset).await?),
+            Some(at) => VersionState::Legacy(at),
+        },
+    )
 }
 
 async fn build_initial_entries(

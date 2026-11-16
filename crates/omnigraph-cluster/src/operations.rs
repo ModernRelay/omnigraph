@@ -56,7 +56,7 @@ const OPERATIONS_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionScope {
-    /// Shared by optimize, cleanup, repair and the full-text rebuild: one
+    /// Shared by optimize, cleanup and the full-text rebuild: one
     /// active operation per cluster.
     Maintenance,
 }

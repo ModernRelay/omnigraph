@@ -417,7 +417,48 @@ fn render_diagnostic(
     lines.join("\n")
 }
 
+/// Resolves and dispatches the command, under the `--stats` recorder when
+/// one is asked for, so a refusal before dispatch writes the document too.
 async fn run(
+    cli: Cli,
+    explicit_config: bool,
+    operator: operator::InvocationConfig,
+    machine: &mut Option<MachineErrors>,
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<Completion> {
+    let Some(stats) = cli.stats.clone() else {
+        return run_resolved(
+            cli,
+            explicit_config,
+            operator,
+            machine,
+            stdin,
+            stdin_is_terminal,
+            stdout,
+            stderr,
+        )
+        .await;
+    };
+    crate::stats::record(
+        &stats,
+        run_resolved(
+            cli,
+            explicit_config,
+            operator,
+            machine,
+            stdin,
+            stdin_is_terminal,
+            stdout,
+            stderr,
+        ),
+    )
+    .await
+}
+
+async fn run_resolved(
     cli: Cli,
     explicit_config: bool,
     operator: operator::InvocationConfig,
@@ -493,7 +534,7 @@ async fn run(
             transports,
             crate::operator_routing::AUTH.scope(
                 authentication,
-                run_bound(
+                dispatch(
                     cli,
                     operator,
                     target,
@@ -508,7 +549,7 @@ async fn run(
         .await
 }
 
-async fn run_bound(
+async fn dispatch(
     cli: Cli,
     operator: operator::InvocationConfig,
     target: Option<targets::ResolvedTarget>,
@@ -913,21 +954,6 @@ async fn run_bound(
         }
         Command::RebuildFullTextIndexes(args) => {
             return commands::maintenance::run_full_text_rebuild(
-                args,
-                commands::maintenance::MaintenanceScope {
-                    operator: &operator,
-                    target: required_target(),
-                    graph: cli.graph.as_deref(),
-                    actor: cli.as_actor.as_deref(),
-                    yes: cli.yes,
-                },
-                stdout,
-                stderr,
-            )
-            .await;
-        }
-        Command::Repair(args) => {
-            return commands::maintenance::run_repair(
                 args,
                 commands::maintenance::MaintenanceScope {
                     operator: &operator,

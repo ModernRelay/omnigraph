@@ -44,17 +44,15 @@ pub async fn initialize_local_fixture(
                             "optimized fixture returned no outcome for intended user table {key}"
                         ))
                     })?;
-                if outcome.skipped().is_some()
-                    || !outcome.committed()
+                if !outcome.committed()
                     || outcome.fragments_removed == 0
                     || outcome.fragments_added == 0
                 {
                     return Err(fixture_error(format!(
-                        "optimized fixture did not productively compact {key}: committed={}, fragments_removed={}, fragments_added={}, skipped={:?}",
-                        outcome.committed(),
+                        "optimized fixture did not productively compact {key}: outcome={}, fragments_removed={}, fragments_added={}",
+                        outcome.outcome.as_str(),
                         outcome.fragments_removed,
                         outcome.fragments_added,
-                        outcome.skipped()
                     )));
                 }
             }

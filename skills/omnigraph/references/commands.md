@@ -46,7 +46,6 @@ prints the exact flags of the installed binary.
 | `upgrade` | — | Convert a standalone graph's storage offline |
 | `optimize` | — | Compact data and reconcile declared indexes on `main` |
 | `index` | `build` `rebuild` | Build a branch's missing or lagging indexes; replace its full-text indexes |
-| `repair` | — | Report foreign Lance history without adopting it |
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` `fmt` | Check a cluster's stored queries; list a cluster's or a served graph's; format `.gq` files |
@@ -323,7 +322,12 @@ traversal startup; it does not collect unused forks (that is `cleanup`). It
 works on `main`; use `index build` for another branch. Writes running beside
 it are not refused by its publication: a write it overtook commits over the
 compaction, or prepares again once, holding writes off, when it changes a row
-the run moved. None returns `read_set_conflict` for it. Against a server
+the run moved. None returns `read_set_conflict` for it. Writes to `main` wait
+while it holds main's writer gates: `--max-gate-hold 30s` starts no table after
+that long except the first, so a write waits about the bound plus one table,
+and `--tables node:Person,edge:Knows` runs only those tables, in that order.
+Each table reports `optimized`, `unchanged`, `deferred` or `failed`; one
+table's failure does not stop the others, so read the report. Against a server
 target it runs as a recorded operation: it prints an operation id, waits for
 the operation's record (`--no-wait`, `--timeout`), and `--operation <id>`
 observes one; after a lost response it looks the id up and never resubmits.
@@ -521,9 +525,17 @@ identities use different targets. There is no `--auth` selector or last-used ide
 
 Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
-`optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph`, with region
+`optimize`/`index build`/`index rebuild`/`cleanup --graph`, with region
 and endpoint captured from the environment
-([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
+([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)),
+and a graph shallow clone: `--base URI` opens a direct graph target over the
+graph at `URI` (reads fall through to the base, writes land in the target, the
+base is never written) for `query`, `mutate`, `load`, `branch`, `commit`,
+`changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`; an inline
+`s3://` clone root with an `s3://` base is admitted there. Nothing in the target
+records its base, so every reopen passes the same `--base`; a clone root opened
+without it is refused. `--stats PATH` writes one JSON document per invocation
+with the logical object-store calls, the exit code and the peak resident set.
 Each direct writer keeps its admission lock; `cluster force-unlock` it before
 starting the server. Inline local paths and `file://`
 URIs are accepted; remote endpoints must be registered. Server targets own auth;

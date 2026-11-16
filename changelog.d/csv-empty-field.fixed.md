@@ -1,0 +1,1 @@
+- CSV query output quotes empty strings so a single empty field survives a CSV round trip.

@@ -17,7 +17,7 @@ pub(crate) use crate::commands::history::{BranchCommand, ChangesCommand, CommitC
 use crate::commands::history::{DiffArgs, SnapshotArgs};
 pub(crate) use crate::commands::maintenance::IndexCommand;
 use crate::commands::maintenance::{
-    CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
+    CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, UpgradeArgs,
 };
 use crate::commands::query::{AliasArgs, CatalogueArgs, MutateArgs, QueryArgs};
 pub(crate) use crate::commands::schema::SchemaCommand;
@@ -44,6 +44,20 @@ pub(crate) struct Cli {
     /// Named resource target or inline local storage address; otherwise defaults.target.
     #[arg(long, global = true, value_name = "NAME|ADDRESS", value_parser = crate::invocation::single_selector("--target"))]
     pub(crate) target: Option<String>,
+
+    /// Open the direct target as a graph shallow clone of the graph at URI:
+    /// a read falls through to this base where the target has no object of
+    /// its own, every write lands in the target, and the base is never
+    /// written. Both are local directories or `s3://` prefixes of one
+    /// endpoint; an S3 pair reads the standard `AWS_*` environment.
+    #[arg(long, global = true, value_name = "URI", value_parser = crate::invocation::single_selector("--base"))]
+    pub(crate) base: Option<String>,
+
+    /// Write this invocation's statistics as JSON to PATH when it ends:
+    /// elapsed wall-clock, logical object-store calls by class for the
+    /// `__manifest` and table planes of a direct target, and peak RSS.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub(crate) stats: Option<std::path::PathBuf>,
 
     /// Actor id for direct-engine writes and actor-bound cluster operations;
     /// On a served write, and on every request `mcp` relays, it is an assertion:
@@ -157,8 +171,6 @@ pub(crate) enum Command {
     /// Deprecated spelling of `index rebuild --kind full-text`
     #[command(hide = true)]
     RebuildFullTextIndexes(RebuildFullTextIndexesArgs),
-    /// Diagnose foreign Lance HEAD movement without adopting it.
-    Repair(RepairArgs),
     /// Remove old Lance versions from every backing dataset of the graph (destructive)
     Cleanup(CleanupArgs),
     /// Validate queries against a schema (offline) or repo (repo-backed).

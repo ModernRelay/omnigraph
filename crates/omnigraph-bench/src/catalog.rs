@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::case::{
-    Attribution, Backend, LocalFilesystem, LocalStorageClass, Protocol, ResetMode, Schedule, Timer,
-    ValidatedCase,
+    Attribution, Backend, LocalFilesystem, LocalStorageClass, NetworkPosition, Protocol, ResetMode,
+    Schedule, Timer, ValidatedCase,
 };
 use crate::gqt_case::{
     self, GqtCaseV1, GqtEnvironment, GqtFixture, GqtScenario, GqtWorkload, MeasuredStep, PlannedGqt,
@@ -43,8 +43,6 @@ pub struct Defaults {
         skip_serializing_if = "Option::is_none"
     )]
     pub deadline_seconds: Option<Option<u64>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment: Option<GqtEnvironment>,
     #[serde(default, skip_serializing_if = "ProtocolOverrides::is_empty")]
     pub protocol: ProtocolOverrides,
 }
@@ -107,20 +105,37 @@ pub struct Scenario {
         skip_serializing_if = "Option::is_none"
     )]
     pub deadline_seconds: Option<Option<u64>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment: Option<GqtEnvironment>,
     #[serde(default, skip_serializing_if = "ProtocolOverrides::is_empty")]
     pub protocol: ProtocolOverrides,
 }
 impl Scenario {
-    pub fn expand(&self, defaults: &Defaults) -> (GqtCaseV1, u32) {
-        let environment = self
-            .environment
-            .clone()
-            .or_else(|| defaults.environment.clone())
-            .unwrap_or_else(local_environment);
+    /// The repetitions this scenario asks for, its own or the defaults'.
+    pub fn repetitions(&self, defaults: &Defaults) -> u32 {
+        self.repetitions.or(defaults.repetitions).unwrap_or(5)
+    }
+
+    /// The case as one experiment: the scenario names what is measured, the
+    /// run's `environment` names where, and the reset level follows it
+    /// unless the protocol overrides say otherwise. The catalog's defaults
+    /// describe the embedded protocol; a served point derives `reset: none`
+    /// and `attribution: off`, which only the scenario's own block overrides.
+    pub fn expand(&self, defaults: &Defaults, environment: &GqtEnvironment) -> (GqtCaseV1, u32) {
+        self.expand_with(defaults, environment, None)
+    }
+
+    /// [`expand`](Self::expand) with the reset level a `--store` run asks
+    /// for: the scenario's own pin wins, then the run's, then the one the
+    /// environment derives. A clone point derives `attribution: off`, since
+    /// the product's process boundary hides the merge phases.
+    pub fn expand_with(
+        &self,
+        defaults: &Defaults,
+        environment: &GqtEnvironment,
+        run_reset: Option<ResetMode>,
+    ) -> (GqtCaseV1, u32) {
+        let environment = environment.clone();
         let served = environment.target == crate::gqt_case::Target::Server;
-        let reset = if served {
+        let derived = if served {
             ResetMode::None
         } else {
             match environment.backend {
@@ -128,9 +143,15 @@ impl Scenario {
                     filesystem: LocalFilesystem::Apfs,
                     ..
                 } => ResetMode::LocalClonefile,
-                _ => ResetMode::PlainCopy,
+                Backend::LocalFs { .. } => ResetMode::PlainCopy,
+                Backend::S3 { .. } => ResetMode::Clone,
             }
         };
+        let reset = self.protocol.reset.or(run_reset).unwrap_or(derived);
+        let restored = !served && reset != ResetMode::Clone;
+        fn embedded_default<T>(restored: bool, value: Option<T>) -> Option<T> {
+            if restored { value } else { None }
+        }
         let protocol = Protocol {
             deadline_seconds: self
                 .deadline_seconds
@@ -139,11 +160,11 @@ impl Scenario {
             attribution: self
                 .protocol
                 .attribution
-                .or(defaults.protocol.attribution)
-                .unwrap_or(if served {
-                    Attribution::Off
-                } else {
+                .or(embedded_default(restored, defaults.protocol.attribution))
+                .unwrap_or(if restored {
                     Attribution::PerPhase
+                } else {
+                    Attribution::Off
                 }),
             schedule: self
                 .protocol
@@ -153,8 +174,9 @@ impl Scenario {
             reset: self
                 .protocol
                 .reset
-                .or(defaults.protocol.reset)
-                .unwrap_or(reset),
+                .or(run_reset)
+                .or(embedded_default(restored, defaults.protocol.reset))
+                .unwrap_or(derived),
             timer: self
                 .protocol
                 .timer
@@ -174,8 +196,18 @@ impl Scenario {
                 environment,
                 protocol,
             },
-            self.repetitions.or(defaults.repetitions).unwrap_or(5),
+            self.repetitions(defaults),
         )
+    }
+}
+
+/// The served environment a `--server` run supplies: the receipt's backend
+/// at the position the run declares.
+pub fn served_environment(backend: Backend, network_position: NetworkPosition) -> GqtEnvironment {
+    GqtEnvironment {
+        backend,
+        target: crate::gqt_case::Target::Server,
+        network_position,
     }
 }
 
@@ -261,6 +293,12 @@ impl Catalog {
         })
     }
 
+    /// The scenario ids a selector names: one scenario, one group, or the
+    /// catalog's run list.
+    pub fn selection(&self, selector: Option<&str>) -> Result<Vec<String>, Vec<Diagnostic>> {
+        select(&self.definition, selector)
+    }
+
     pub fn scenario(&self, id: &str) -> Result<&Scenario, Vec<Diagnostic>> {
         self.definition
             .scenarios
@@ -274,17 +312,58 @@ impl Catalog {
             })
     }
 
+    /// The scenario planned in the host's local default environment.
     pub fn plan(&self, id: &str) -> Result<PlannedGqt, Vec<Diagnostic>> {
+        self.plan_in(id, &local_environment())
+    }
+
+    pub fn plan_in(
+        &self,
+        id: &str,
+        environment: &GqtEnvironment,
+    ) -> Result<PlannedGqt, Vec<Diagnostic>> {
+        self.plan_with(id, environment, None)
+    }
+
+    /// [`plan_in`](Self::plan_in) under the reset level a `--store` run asks for.
+    pub fn plan_with(
+        &self,
+        id: &str,
+        environment: &GqtEnvironment,
+        run_reset: Option<ResetMode>,
+    ) -> Result<PlannedGqt, Vec<Diagnostic>> {
         let scenario = self.scenario(id)?;
-        let (definition, _) = scenario.expand(&self.definition.defaults);
+        let (definition, _) =
+            scenario.expand_with(&self.definition.defaults, environment, run_reset);
         gqt_case::load_with_root(&self.path, definition, &self.root)
             .map_err(|message| vec![Diagnostic::error("invalid_scenario", id, message)])
     }
 
+    /// The selection resolved in the host's local default environment.
     pub fn resolve(
         &self,
         selector: Option<&str>,
         repetitions: Option<u32>,
+    ) -> Result<ResolvedSuite, Vec<Diagnostic>> {
+        self.resolve_in(selector, repetitions, &local_environment())
+    }
+
+    pub fn resolve_in(
+        &self,
+        selector: Option<&str>,
+        repetitions: Option<u32>,
+        environment: &GqtEnvironment,
+    ) -> Result<ResolvedSuite, Vec<Diagnostic>> {
+        self.resolve_with(selector, repetitions, environment, None)
+    }
+
+    /// [`resolve_in`](Self::resolve_in) under the reset level a `--store` run asks for.
+    pub fn resolve_with(
+        &self,
+        selector: Option<&str>,
+        repetitions: Option<u32>,
+        environment: &GqtEnvironment,
+        run_reset: Option<ResetMode>,
     ) -> Result<ResolvedSuite, Vec<Diagnostic>> {
         let ids = select(&self.definition, selector)?;
         let configured: Vec<_> = ids
@@ -292,7 +371,7 @@ impl Catalog {
             .map(|id| {
                 let scenario = self.scenario(id)?;
                 let repetitions =
-                    repetitions.unwrap_or(scenario.expand(&self.definition.defaults).1);
+                    repetitions.unwrap_or(scenario.repetitions(&self.definition.defaults));
                 check_repetitions(repetitions)?;
                 Ok((id, repetitions))
             })
@@ -311,7 +390,7 @@ impl Catalog {
         let mut runs = Vec::with_capacity(ids.len());
         let mut identities = BTreeSet::new();
         for (id, repetitions) in configured {
-            let plan = self.plan(id)?;
+            let plan = self.plan_with(id, environment, run_reset)?;
             if !identities.insert(plan.planned_sha256.clone()) {
                 return Err(vec![error(
                     "duplicate_planned_identity",
@@ -396,7 +475,7 @@ fn validate(config: &ConfigV2) -> Result<(), Vec<Diagnostic>> {
                 ),
             )]);
         }
-        let (definition, repetitions) = scenario.expand(&config.defaults);
+        let (definition, repetitions) = scenario.expand(&config.defaults, &local_environment());
         check_repetitions(repetitions)?;
         gqt_case::validate_definition(&definition)
             .map_err(|e| vec![Diagnostic::error("invalid_scenario", &scenario.id, e)])?;
