@@ -192,6 +192,12 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 
 ## Change discipline
 
+- Check every design, RFC and non-trivial change against
+  [the contract](docs/dev/contract.md) before building it: name the clauses
+  it keeps or extends and the workload row it serves, and say whether it
+  moves a row of the page's today table toward its target. A design that
+  weakens a clause, adds a deviation or assumes a different workload says so
+  and updates that page in the same pull request.
 - Preserve unrelated work in a dirty tree. Never discard user changes.
 - Make the smallest coherent change that closes the behavior and test surface.
 - For a bug, reproduce the predicted failure at the tier the regression rule

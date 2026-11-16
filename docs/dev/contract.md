@@ -328,8 +328,8 @@ distribution is their sum.
 | Activity | What the agent does | Footprint on the graph |
 |---|---|---|
 | Orient | Learns what exists and what the words mean: the schema, the types and their counts, what changed since it last looked, what others are doing now | Schema and catalogue reads; change feed from a cursor; branch and commit listings; cheap, at every session start and after every pause |
-| Retrieve | Assembles the context for the next step: the entity by key, its neighborhood, the things like it, the passages that mention it, under filters on type, time and status | Selective reads combining key lookup, one to three hops, vector, lexical and fused ranking; tens to a few hundred rows; several per step, on the step's critical path; the most common read |
-| Acquire | Brings outside information in: fetches pages, documents, API results and files; imports a dataset it was handed or found; extracts entities, relations and passages from unstructured content; embeds text | Bulk keyed loads, unplanned and bursty, on the task's branch; Blob writes of documents and transcripts; embedding columns; the usual way a new source enters before a sync exists |
+| Retrieve | Assembles the context for the next step, in two modes. Lookup: the entity by key, its neighborhood, the things like it, the passages that mention it, under filters on type, time and status. Analytical: how many, which most, grouped by what, over a type or a filtered slice, to size a problem, rank candidates or summarize before deciding | Lookup: selective reads combining key lookup, one to three hops, vector, lexical and fused ranking; tens to a few hundred rows; several per step; the most common read. Analytical: aggregates, group-bys, top-N and filtered scans over whole types, small results from wide reads; fewer than lookups but on the same critical path of a step |
+| Acquire | Brings outside information in: fetches pages, documents, API results and files; imports a dataset it was handed or found, structured (tables, exports, API dumps) or unstructured (PDFs, documents, transcripts, mail); extracts entities, relations and passages from the unstructured content; embeds text | Keyed loads from 10^2 records to 10^7 for a whole source, unplanned and bursty, on the task's branch, as many bounded batches; Blob writes of thousands of source documents; extracted entities and passages linked to the Blob they came from; embedding columns; the usual way a new source enters before a sync exists |
 | Author | Records what it learned, decided and did: observations, claims with evidence, decisions with reasons, tasks, plans, status, and links between things that already exist | Small attributed commits of one to tens of entities, many per task, on the task's branch, append-mostly; the most common write and the densest edges |
 | Derive | Computes over what is there: classifies, scores, resolves duplicates, summarizes, infers edges, consolidates old memory into new | Reads wide across a type, writes many small updates or a batch per run; periodic, often as a pipeline |
 | Coordinate | Shares work with other agents and people: claims a task, hands one off, checks whether something was already done, avoids writing over a concurrent change | Concurrent reads of shared state; conditional writes from the commit it read; one branch per task, so one writer per branch by construction of the work, not by a lock; merges into shared state; a conflict re-decided from a fresh read, not retried blind |
@@ -337,7 +337,7 @@ distribution is their sum.
 | Propose and review | Puts a change up for a person or another agent to accept; reads what a branch would change; approves, merges, or discards | Branch diffs and merge previews; a merge or a branch delete; unpublished commits that wait |
 | Reflect and evaluate | Looks back: what was known at a time, what was decided and why, what happened after; compares a past state with now; evaluates its own earlier actions | Reads at a past commit; diffs across history; commit changes with actors; with orient, the second most common read |
 | Maintain | Adjusts the model as the domain is understood better: adds a type or property, widens an enum, re-embeds, rebuilds coverage, prunes | Additive schema applies; index and layout maintenance; rare, reviewed destructive changes and cleanup |
-| Answer | Answers a person's question or produces a report: how many, which, since when, grouped by | Aggregation over whole types; larger results; occasional |
+| Report | Answers a person's question or produces a report or dashboard: the analytical mode of retrieve, with larger results and no step waiting on it | Aggregation over whole types; larger results; scheduled or occasional |
 
 People do a subset by hand or through a UI, at a low rate: orient, retrieve,
 author (a correction, an annotation), propose and review (the approvals that
@@ -359,31 +359,36 @@ and write only the second, or propose changes to the first.
 |---|---|---|
 | Actors | A few to tens of agents per graph at once, a few people, a handful of programs; many graphs per deployment rather than one | Hundreds of concurrent agents on one graph |
 | Read capacity | Tens of agents at several retrieve reads a step is more read load than one process should carry, and it grows with agents while write load grows with tasks; reads are served by several processes | One process serves a graph's reads with headroom at the hypothesized actors |
-| Mix | Reads outnumber writes by one to two orders of magnitude; authored commits dominate writes by count, acquisition and sync by rows; deletes are rare everywhere | Analytical scans, updates or deletes become common; result sets pass 10^4 rows |
-| Volume | 10^4 to 10^7 entities per graph, set by the sources; 10 to 100 types; small scalar properties, text bodies, embeddings on a few types, Blobs for documents; agent batches of 10^2 to 10^5 records, backfills to 10^7 | 10^8 entities or 10^3 types; batches past 10^6; sync as streaming at thousands of events a second |
+| Mix | Reads outnumber writes by one to two orders of magnitude; most reads are lookups, and a real minority, perhaps one in ten, are analytical reads over whole types; authored commits dominate writes by count, acquisition and sync by rows; deletes are rare everywhere | Analytical reads become the majority; updates or deletes become common; result sets pass 10^4 rows |
+| Volume | 10^4 to 10^7 entities per graph, set by the sources; 10 to 100 types; small scalar properties, text bodies, embeddings on a few types, Blobs for documents; agent batches of 10^2 to 10^5 records, whole-source imports and backfills to 10^7 records and 10^4 documents | 10^8 entities or 10^3 types; batches past 10^6; sync as streaming at thousands of events a second |
 | Rate | 10^2 to 10^4 commits a day; tens of live branches with hundreds of commits each and one writer; incremental sync every few minutes; an additive schema change about weekly; history retained long and read as often as the present | Commit rate or branch count up an order; several writers on one branch; conflict retries common; destructive schema changes frequent; history read rarely |
 
 | Targets | No latency is measured yet. As a starting hypothesis for a warm handle in the store's region: a retrieve read answers in about 100 ms at the median and under 1 s at the tail; a small commit publishes in under 1 s; one branch publishes its commits serially, a few a second at most, which the hypothesized rate needs on average at one every several seconds, with bursts on shared state from merges and syncs | Measured figures replace these; shared state needs sustained tens of commits a second |
 
 **In category shorthand**, which [systems](systems.md#appendix-a-terminology-expansion)
-treats as a bundle to unpack: an operational footprint (small, selective,
-latency on the critical path of a step, many small attributed commits) with
-batch ingestion phases, a heavy history and change-data half, and occasional
-analytical aggregation. Not a warehouse workload; "HTAP" would overstate the
-analytical half; nearest to operational retrieval over a versioned store.
+treats as a bundle to unpack: a hybrid. The larger half is operational (small,
+selective lookups on the critical path of a step, many small attributed
+commits); beside it run analytical reads over whole types that agents issue
+while retrieving, batch ingestion of whole sources, and a heavy history and
+change-data half. Both read modes run against the same fresh snapshot, with
+no copy to a second system. It is not a warehouse workload: analytical reads
+are over one graph at the volumes above, not over billions of rows.
 
 ### What we optimize for
 
 In this order, and a later item never buys an earlier one: the clauses above
 (correctness), then the fewest mechanisms that keep them (simplicity), then
-cost on this work. On cost the direction is: retrieve reads first, because
-they sit on the critical path of every agent step; then the cost of a small
+cost on this work. On cost the direction is: retrieve reads first, lookups
+and then analytical reads, because both sit on the critical path of an agent
+step; then the cost of a small
 commit and of a branch, because authoring and coordination are the common
 writes; then history and change discovery; then bulk acquisition and sync.
 Read capacity scales out by adding reader processes; write capacity on one
-branch does not, and need not at the hypothesized rate. Analytical scans and
-single-branch write throughput beyond that rate are not optimized for, and a
-design may trade them away.
+branch does not, and need not at the hypothesized rate. An analytical read
+may cost more than a lookup but not in proportion to history, and a lookup
+is never slowed to serve one. Warehouse-scale scans and single-branch write
+throughput beyond the hypothesized rate are not optimized for, and a design
+may trade them away.
 
 What the hypothesis asks of the mechanisms, each with its cost owner in
 [testing](testing.md#cost-tests-and-benchmarks): a read on a warm handle
