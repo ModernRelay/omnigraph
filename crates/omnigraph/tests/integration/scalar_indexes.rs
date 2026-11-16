@@ -106,3 +106,76 @@ async fn node_index_columns_get_the_index_kinds_their_type_serves() {
         "second ensure_indices must be a no-op on a fully-indexed graph"
     );
 }
+
+/// A BITMAP, LABEL_LIST or NGRAM whose coverage lags an append is rebuilt
+/// whole in its own family, by an index pass and by optimize, never as a
+/// BTREE under its name, and then covers every fragment: the appended row is
+/// found through each.
+#[tokio::test]
+async fn a_lagging_bitmap_label_list_or_ngram_is_rebuilt_in_its_own_family() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+    db.load_jsonl(DATA, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+    let append = |slug: &'static str| {
+        let db = &db;
+        async move {
+            db.load_jsonl(
+                &format!(
+                    r#"{{"type":"Item","data":{{"slug":"{slug}","status":"archived","published":"2025-03-03T00:00:00Z","rank":9,"title":"zeta","active":false,"tags":["z"],"note":"n"}}}}"#
+                ),
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+        }
+    };
+    let assert_rebuilt = |step: &'static str| {
+        let db = &db;
+        async move {
+            let snap = snapshot_main(db).await.unwrap();
+            let ds = snap.open_dataset("node:Item").await.unwrap();
+            for (col, expected) in [
+                ("status", &["Bitmap"][..]),
+                ("active", &["Bitmap"][..]),
+                ("tags", &["LabelList"][..]),
+                ("title", &["BTree", "Inverted", "NGram"][..]),
+            ] {
+                assert_eq!(families(&ds, col).await, expected, "{step}: `{col}`");
+            }
+            let pinned = open_pinned_dataset_for_test(db, "main", "node:Item").await;
+            let current: std::collections::BTreeSet<u32> = pinned
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect();
+            let rebuilt = ["_bitmap", "_label_list", "_ngram", "_btree"];
+            for index in ds.load_indices().await.unwrap().iter() {
+                if !rebuilt.iter().any(|suffix| index.name.ends_with(suffix)) {
+                    continue;
+                }
+                let covered: std::collections::BTreeSet<u32> = index
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|bitmap| bitmap.iter().collect())
+                    .unwrap_or_default();
+                assert!(
+                    current.is_subset(&covered),
+                    "{step}: index '{}' covers {covered:?} of {current:?}",
+                    index.name
+                );
+            }
+        }
+    };
+
+    append("d").await;
+    db.ensure_indices_as(None).await.unwrap();
+    assert_rebuilt("index pass").await;
+
+    append("e").await;
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert_rebuilt("optimize").await;
+}
