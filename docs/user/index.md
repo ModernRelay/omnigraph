@@ -17,7 +17,7 @@ deployment.
 - [Traversal patterns and edge selections](queries/traversal.md)
 - [Diagnostics](queries/diagnostics.md)
 - [Mutations and loading](mutations/index.md) and [conditional mutations](mutations/conditional.md)
-- [Search](search/index.md), [full-text analyzers](search/analyzers.md), [vector distances](search/distances.md) and [embeddings](search/embeddings.md)
+- [Search](search/index.md), [fusion](search/fusion.md), [full-text analyzers](search/analyzers.md), [vector distances](search/distances.md) and [embeddings](search/embeddings.md)
 - [Blob values](blobs.md)
 - [Storage and durability](concepts/storage.md)
 

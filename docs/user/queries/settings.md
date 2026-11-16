@@ -78,7 +78,7 @@ refuses startup; no default is substituted.
 | Name | Type and values | Default | Scope | Process default variable | What it chooses |
 |---|---|---|---|---|---|
 | `engine` | enum `v2` | `v2` | request | `OMNIGRAPH_ENGINE` | the engine a read query runs on; `v2`, the plan runner, is the only value, and `v1` is refused as an unknown value; this setting does not change change-feed or merge execution |
-| `rrf_plan` | enum `auto`, `force_prefilter`, `force_postfilter` | `auto` | process | `OMNIGRAPH_RRF_PLAN` | the reciprocal rank fusion plan on a traversal-constrained `nearest`, for diagnosis |
+| `rrf_plan` | enum `auto`, `force_prefilter`, `force_postfilter` | `auto` | process | `OMNIGRAPH_RRF_PLAN` | the prefilter gate of a traversal-constrained `nearest`, an `rrf` arm included: decide by size, or force one plan, for diagnosis |
 | `merge_lineage` | enum `off`, `on`, `verify` | `on` (a debug build defaults to `verify`) | request | `OMNIGRAPH_MERGE_LINEAGE` | how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared |
 | `change_lineage` | enum `off`, `on`, `verify` | `on` (a debug build defaults to `verify`) | request | `OMNIGRAPH_CHANGE_LINEAGE` | how a graph diff or commit page finds the entities it compares across a window with no adjacent transaction: the exact ordered merge of both versions, the entities paired by stable identity, or both compared |
 | `ann_nprobes` | integer, at least `0` | `20` | request | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap |

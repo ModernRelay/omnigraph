@@ -85,7 +85,7 @@ The `plan` rows are the query explain's, with these values for a load:
 |---|---|
 | `datafusion` | `unavailable`: a load's operators are lowered at execution, under the statement's transaction |
 | `route` | `engine` for overwrite, which runs the plan; `executor` for append and merge, which the plan describes while the keyed adapters run them (`reason` then says `mode_on_executor`) |
-| `explain_version` | the shared counter, `8` since a write's plan has the `DeltaSource` leaf |
+| `explain_version` | the shared counter, `9` since a fusion's plan is one `Fuse` node over its arms (`8` added a write's `DeltaSource` leaf) |
 | `operation` | `kind` (`load`), `mode`, and `tables`: the target and each consulted committed table with its `type_key` and `version` |
 
 ## A staged write's document

@@ -121,6 +121,7 @@ binary's rows.
 | Expand | [1] |
 | Filter | [1] |
 | FragmentWrite | [1] |
+| Fuse | [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] |
 | HashJoin | [2] |
 | HydrateByAddress | [1] |
 | HydrateColumns | [1] |
@@ -130,7 +131,6 @@ binary's rows.
 | OuterReference | [0] |
 | Page | [1] |
 | Projection | [1] |
-| RankFuse | [2] |
 | RowCompare | [1] |
 | Scan | [0, 1] |
 | Score | [1] |
@@ -188,6 +188,7 @@ binary's rows.
 | Expand | refused_by_name |
 | Filter | routable |
 | FragmentWrite | refused_by_name |
+| Fuse | refused_by_name |
 | Join | routable |
 | Let | refused_by_name |
 | Limit | routable |
@@ -197,7 +198,6 @@ binary's rows.
 | OptionalJoin | refused_by_name |
 | OuterReference | refused_by_name |
 | Projection | routable |
-| RankFuse | refused_by_name |
 | RowDiff | routable |
 | Score | refused_by_name |
 | Sort | routable |

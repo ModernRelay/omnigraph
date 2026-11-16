@@ -294,22 +294,20 @@ calls itself.
 
 | Refused | Stage |
 |---|---|
-| `rrf` with `distance` as an arm, an arm that is a read ranked by its own `order`, arm windows that differ, arms over two different populations, or other than two arms | B |
 | A ranking beside another pattern component or correlated on an outer name, two rankings in one pattern, a ranking inside an `optional`, a `union` arm or an inline read, a ranking over a read with its own aggregate, `distinct`, `order` or `limit` | B |
 | A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope; an inline read returning an outer name under another name; a called read's `limit $k` bound to a computed argument | B |
 | A node an `optional` introduces, or an edge reference, returned whole; a `let` inside an `optional` that binds no node of its own | B |
 | A full-text call (`match_terms`) read as a value in `return`, `order` or a block's aggregate | B |
-| An `rrf` arm over `bm25` | B |
 | A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B |
 | A read that calls itself (`Fix`) | Rec |
 
 ```text
-query q($v: Vector(3), $s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(distance($all, $d.embedding, $v), bm25($all, $d.body, $s)) as $score } return { $d.title } }
+query q($s: String) { match { $d: Doc } return { $d.title, match_terms($d.body, terms($s, mode: any)) as hit } }
 ```
 
 ```text
-error[T86]: type error: T86: `q`: this release's planner does not lower an `rrf` arm over `distance`; stage B (the break) adds it
-  --> line 1, column 94
+error[T86]: type error: T86: `q`: this release's planner does not lower a full-text call read as a value in `return`; stage B (the break) adds it
+  --> line 1, column 60
 ```
 
 `T86` prints a fix only where a form the planner runs has the same rows and

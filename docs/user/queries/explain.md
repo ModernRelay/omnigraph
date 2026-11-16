@@ -85,7 +85,8 @@ value), `fetch` (the candidates the index is asked for: the query's limit
 for `nearest`, `null` for `bm25`, which is uncapped), `nprobes` on a
 `nearest` scan (the `ann_nprobes` setting when the plan was built, the IVF
 partitions probed per index delta; `null` is no cap) and `scope` (`order`
-for the query's own ranking, `primary` or `secondary` for an arm of `rrf`).
+for the query's own ranking, `window` for a ranking drawn as a pattern step,
+a fusion's `nearest` arm included).
 A `nearest` scan's `policy` declares what the run may do when an attempt
 leaves it short: `probe_factor` (each rescan multiplies the probe cap),
 `flat_rescan_on_unreached`, `uncapped_on_missing_counters` and
@@ -94,10 +95,12 @@ applies its filter: `before_scoring` when the property's full-text index
 covers every fragment of the pinned version, `after_scoring` otherwise, so a
 filter never changes a BM25 score. A
 physical
-`RankFuse` row has two inputs, one subtree per arm, each with its own ranked
-`Scan`; it carries `arms` (binding and kind per arm), `k`, `limit` (the
-query's, which sizes the nearest arm's candidate window; the fused rows are
-cut by the `Limit` above the `Sort`) and `row_tiebreak`. A physical `AntiJoin`
+`Fuse` row has one input per `rrf` arm, each the subtree the arm's ranking
+runs standing alone (a `nearest` window's ranked `Scan`, `Sort` and
+`TargetCut`, an exact score's `Score` and the `Sort` by it, an ordered
+read's `Correlate`); it carries `target`, `arms` (how each arm ranks:
+`nearest`, `distance`, `bm25`, `ordered` or `rrf`), `k` and `weights`. The
+fused rows are ordered by the `Sort` above it and cut by the `Limit`. A physical `AntiJoin`
 row (a correlated block: `not`, `exists`, `count` and the column aggregates)
 carries `strategy`: `correlated` when its second input starts from the outer
 rows through an `OuterReference`, `key_set` when the block's pattern runs once
@@ -107,10 +110,7 @@ each outer row. The planner chooses `key_set` only for a block that reads
 nothing of the outer rows but that identity, and only when its row estimate is
 lower; it then records the pass `anti_join_strategy` and the statistic
 `anti_join_rows($x)` with both estimates. Either strategy returns the same
-rows. These downstream
-row keys follow the arm's score and fused node ID; selected edges use
-`$e.@type` before `$e.@id`. Fusion still scores the ranked node by its ID and
-appends the fused score as `<binding>._rrf`. A
+rows. A
 physical `CrossJoin` row carries `filters`, the conjuncts over both bindings
 it keeps pairs by, when it has any. A physical `ContainsJoin` row is the
 planner's join for one `contains($r.x, $l.y)` conjunct: it carries `haystack`
@@ -159,7 +159,7 @@ full-text index); and
 retained through rewrites so historical replay can enforce the target rule. Every
 planned document carries `pipelines`, the physical plan cut at each node whose
 operator emits nothing before it has seen its whole input (`Sort`, `Aggregate`,
-`AntiJoin`, `RankFuse`, a load's `Validate`, a costed multi-hop `Expand`) and
+`AntiJoin`, `Fuse`, a load's `Validate`, a costed multi-hop `Expand`) and
 at a join's build side (a hash join's build, the collected left side of a
 cross join or a contains join): each entry names its `source`, its
 `partitions` (the streams its source runs: a `load csv` source's
@@ -181,8 +181,8 @@ plans without coverage provenance continue to check coverage during execution.
 Sort keys and ordering use GQ text such as `$p.name desc`; a ranked scan's
 ordering names `$p._distance asc` or `$p._score desc`, and the physical
 `Sort` above a search order leads its `keys` with that score key, followed by
-the query's plain keys; a fusion's ordering is `rrf($a, $b) desc` and it
-plans no `Sort`. A `Sort` row's `tiebreak` lists the metadata keys it appends after
+the query's plain keys; a fusion's rows leave unordered, and the read's own
+`order` sorts them by the fused score like any other column. A `Sort` row's `tiebreak` lists the metadata keys it appends after
 `keys` (`$p.@id`, and `$e.@type` plus `$e.@id` for selected bound edges, the
 bindings the query declares in the order its pattern binds them, then a
 `from`'s value columns and any binding the query does not name), empty where
@@ -195,7 +195,7 @@ The `datafusion` tree is the plan the query executes on the `v2` route: the
 physical tree lowered to operators, every read operator omnigraph's own
 (`ScanExec`, `ExpandExec`, `HashJoinExec`, `FilterExec`, `ProjectionExec`,
 `SortExec`, `LimitExec`, `HydrateExec`, `CrossJoinExec`, `ContainsJoinExec`,
-`AntiJoinMaskExec`, `RankFuseExec`,
+`AntiJoinMaskExec`, `FuseExec`,
 `MetadataCountExec`) except the aggregate, DataFusion's `AggregateExec`, one
 row per operator with `depth` from
 its nesting and `detail` the operator's own text (a filter's predicate, a
@@ -233,8 +233,9 @@ declared policy: `node` `gate` (a pre-pass gate's `plan`, `prefilter`,
 overfetch `rung`. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
-`Executed::profile`). The row schema is `explain_version` 8 (version 8 added
-the `DeltaSource` node a staged write's plan starts from): `pipelines`
+`Executed::profile`). The row schema is `explain_version` 9 (version 9
+replaced the two-arm `RankFuse` node with `Fuse`; version 8 added the
+`DeltaSource` node a staged write's plan starts from): `pipelines`
 entries (on every planner document since version 7, on diff and merge
 documents only before it) carry a pipeline `id` and `depends_on`, with
 `source`, `operators` and `sink` as objects whose `id` joins the

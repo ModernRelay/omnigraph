@@ -12,7 +12,7 @@ with `as`.
 | `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by the field's declared [distance](distances.md) (`l2` unless declared), with the exact distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
 | `distance(rel, $d.embedding, $q)` | Every row of `rel` with the exact distance of its vector to `$q`, under the field's declared [distance](distances.md), as the score; a row whose vector is null is dropped. `$q` may be a vector or text, as for `nearest`. |
 | `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their [`bm25_v1`](analyzers.md#exact-matching-and-scoring) relevance, an `F64` over the whole field, as the score. `$q` is a String, which matches any of its terms, or a `terms(…)` value, which may ask for every term and an edit budget. |
-| `rrf(ranking, ranking, k: 60, weights: [w, w])` | Two rankings of one population fused with Reciprocal Rank Fusion: the result has the ranked node column and the fused score, named by the `as` of the `from` that draws it, and nothing else. The default `k` is 60 and every weight defaults to 1.0. An arm over `bm25` is not run (`T86`). |
+| `rrf(arm, arm, …, k: 60, weights: [w, …])` | 2 to 16 rankings of one node column fused with Reciprocal Rank Fusion: each arm is a ranking (`nearest`, `distance`, `bm25`, another `rrf`) or an inline read with an `order`, over a population of its own. The result has the ranked node column and the fused score, named by the `as` of the `from` that draws it, and nothing else. The default `k` is 60 and every weight defaults to 1.0. See [Fusion](fusion.md). |
 | `match_terms($d.body, terms($q, mode: all, max_edits: n))` | True where the property holds every analyzed term of `$q` (`mode: all`, the default) or one of them (`mode: any`), each within `n` edits (0 to 2, default 0). |
 
 The first argument of a ranking is the population it ranks: a relation a `let`
@@ -60,22 +60,12 @@ means the top ten matches that satisfy the graph and property filters.
 A `bm25` ranking scores every matching entity before applying the final
 limit. Equal scores are then ordered by entity identity.
 
-A `nearest` ranking inside `rrf` is inherently top-k, as vector search always
-is: an entity outside its window adds no vector contribution to its fused
-score.
+A `nearest` arm of `rrf` is the same `nearest` it is standing alone: it
+selects the `k` nearest targets of its own population, and an entity outside
+that window adds nothing to its fused score.
 
 `rrf` yields one row per target with the target and its fused score, and no
-other column of the population: a population whose pattern reaches a target
-several times adds no row and no vote for it. Elements and a `where` written
-after the `from` run over those rows; a read that needs a population column
-draws it again there, correlated on the target:
-
-```gq fragment
-let $pop = { match { $d: Doc, $t: Tag, $d tagged $t } return { $d } },
-from rrf(nearest($pop, $d.embedding, $q, k: 10), nearest($pop, $d.embedding, $s, k: 10)) as $score,
-$t: Tag,
-$d tagged $t,
-```
+other column of any population ([Fusion](fusion.md#populations)).
 
 ## Vector search
 
@@ -104,8 +94,6 @@ query within($q: Vector(4), $r: F64) {
   order { $distance }
 }
 ```
-
-`distance` is not lowered as an `rrf` arm (`T86`).
 
 Vectors are ranked by the field's declared distance, `l2`, `cosine` or `dot`
 ([Vector distances](distances.md)); `cosine` refuses a zero vector, stored or
@@ -139,18 +127,18 @@ once a rung would cover the whole type anyway, so `limit` is
 filled whenever that many survivors exist; a query whose survivors are permanently fewer than
 `limit` pays that whole-type pass on every execution. A `nearest` ranking constrained by a traversal is first restricted
 to the entities that can satisfy the traversal's first hop when few entities
-can (the same gate `rrf` uses), and ranks only those. A `nearest` arm
-inside `rrf` is a top-k window: the arm's scan widens its own cap, but a
-traversal that drops the arm's rows shortens the fused answer. As with every
+can, and ranks only those. A `nearest` arm of `rrf` takes the same gate,
+probe ladder and overfetch over its own population, so its window fills
+its `k` from the targets its population admits. As with every
 IVF search, a full candidate count does not make the ANN ranking exact; the
 cap remains a recall/latency tradeoff.
 
 | Setting or variable | Meaning |
 |---|---|
 | `ann_nprobes` ([session setting](../queries/index.md#session-settings), `request` scope; process default `OMNIGRAPH_ANN_NPROBES`) | Partition cap per index delta of a `nearest` scan; default 20, `0` removes the cap, an invalid value refuses startup |
-| `OMNIGRAPH_RRF_GATE_RATIO` | Fraction of the ranked type below which a traversal-constrained `nearest` or `rrf` prefilters its scan; default 0.10, `0` turns the gate off, an invalid value is the default |
+| `OMNIGRAPH_RRF_GATE_RATIO` | Fraction of the ranked type below which a traversal-constrained `nearest`, an `rrf` arm included, prefilters its scan; default 0.10, `0` turns the gate off, an invalid value is the default |
 | `OMNIGRAPH_RRF_GATE_MAX_IDS` | Largest eligible set the gate pushes into the scan; default 100000, `0` turns the gate off, an invalid value is the default |
-| `rrf_plan` ([session setting](../queries/index.md#session-settings), `process` scope; process default `OMNIGRAPH_RRF_PLAN`) | `auto` (default), `force_prefilter`, or `force_postfilter`, for diagnosis. On a traversal-constrained `nearest`, `force_postfilter` can leave `limit` unfilled and `force_prefilter` ranks the eligible entities regardless of the size threshold |
+| `rrf_plan` ([session setting](../queries/index.md#session-settings), `process` scope; process default `OMNIGRAPH_RRF_PLAN`) | `auto` (default), `force_prefilter`, or `force_postfilter`, for diagnosis. On a traversal-constrained `nearest`, an `rrf` arm included, `force_postfilter` skips the gate, so the scan ranks the whole type and its overfetch ladder refills the window, and `force_prefilter` ranks the eligible entities regardless of the size threshold |
 
 ## Full-text search
 
@@ -212,17 +200,15 @@ not accelerate equality, `starts_with(...)`, or literal substring `contains(...)
 ## Hybrid ranking
 
 Reciprocal Rank Fusion combines rankings without assuming their raw scores use
-the same scale. Name the population once with `let` and rank it in both arms;
+the same scale. Name the population with `let` and rank it in every arm;
 `from rrf(...) as $score` draws one row per target with the fused score under
-the name its `as` writes, `$score` here. An arm over `bm25` is not run
-(`T86`), so both arms here are `nearest`, one over a vector and one over text
-the embedding provider converts:
+the name its `as` writes, `$score` here:
 
 ```gq
 query hybrid($vector: Vector(4), $text: String) {
   match {
     let $all = { match { $d: Document } return { $d } },
-    from rrf(nearest($all, $d.embedding, $vector, k: 10), nearest($all, $d.embedding, $text, k: 10), k: 60) as $score,
+    from rrf(nearest($all, $d.embedding, $vector, k: 10), bm25($all, $d.body, $text), k: 60) as $score,
   }
   return { $d.slug, $d.title }
   order { $score desc }
@@ -230,10 +216,11 @@ query hybrid($vector: Vector(4), $text: String) {
 }
 ```
 
-An `rrf` takes two arms. Two arms that rank the same population, property
-and query are refused (`T75`), and so are arms that rank two different
-bindings: the fused target would be a pair. A target's fused score sums
-`weight / (k + rank)` over the arms that selected it, ranks counted from 1.
+An `rrf` takes 2 to 16 arms over one node column; each arm is a ranking or an
+inline read with an `order`, over a population of its own, and runs as the
+same ranking runs standing alone. A target's fused score is
+`weight / (k + rank)` summed over the arms that selected it. [Fusion](fusion.md)
+states the ranks, the arms, the populations, the refusals and the limits.
 
 Ranking order is a contract, not a side effect: search-ordered results are
 sorted on the search score itself, including through multi-hop traversals, with
@@ -241,7 +228,7 @@ secondary keys and the entity-id tie-break applied after the score. A fused
 order sorts every row by the fused score, then the keys written after it,
 then every binding's id, and `limit` counts rows after that order; an
 element after the `from` that reaches a target several times multiplies its
-row. The full
+row, each copy carrying the target's fused score. The full
 ordering contract lives on the [queries page](../queries/index.md).
 
 ## Ranking a traversal-reached binding
@@ -295,7 +282,9 @@ match with the exact lexical scan, so it is always exhaustive. A `nearest` searc
 searched every partition of the vector index, scored every row without one,
 or returned every row it admitted. It is `false` when the `ann_nprobes` cap
 left partitions unsearched, so a nearer row may exist; raising the cap
-searches more. An `rrf` is exhaustive when its `nearest` arms are.
+searches more. An `rrf` is exhaustive when every `nearest` arm searched
+everything over its own population; its `distance` and `bm25` arms always
+are.
 
 `score_columns` lists the returned columns that hold the ranking's own
 score, in return order. Two columns that return one score both appear; a

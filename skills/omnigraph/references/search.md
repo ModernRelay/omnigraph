@@ -78,7 +78,7 @@ with `as`: `from nearest(rel, $c.embedding, $q, k: n) as $distance` (add
 `recall: 1` for an exhaustive search with no probe cap),
 `from bm25(rel, $d.title, $q) as $score` (any term of the String `$q`; `terms($q)`
 asks for every term, `terms($q, max_edits: n)` an edit budget),
-`from rrf(arm, arm, k: 60, weights: [1.0, 1.0]) as $score`. `rel` is the population, a relation
+`from rrf(arm, arm, …, k: 60, weights: [1.0, 1.0, …]) as $score`. `rel` is the population, a relation
 named with `let` before the ranking, `let $pop = { match { … } where … return { $c } }`,
 whose `return` lists every binding the rest of the query reads (an inline read
 in its place also works). `from` adds the population's columns and the score
@@ -124,7 +124,7 @@ and it scans the population: every row of `rel` with its exact distance to
 covers; a row whose vector is null (or a zero vector on a `cosine` field) is
 dropped, and a non-finite component or distance is refused (`E3`).
 `order { $distance }` with `limit n` is the exact window, ties to the smaller
-ID; `where $distance < $r` is a radius. It is not an `rrf` arm (`T86`).
+ID; `where $distance < $r` is a radius.
 
 ```gq
 query within($q: Vector(1536), $r: F64) {
@@ -148,23 +148,28 @@ query top_titles($q: String) {
 
 ### Hybrid (Reciprocal Rank Fusion)
 
-`let` names the population once and both arms rank it. `rrf` takes two arms;
-identical arms, or arms that rank two different bindings, are refused (`T75`).
-An arm over `bm25` is not run (`T86`): fuse two `nearest` arms.
-A target scores the sum over the arms that selected it of
-`weight / (k + rank)`, ranks counted from 1; `weights: [w, w]` (one number in
-`(0, 1000000]` per arm, default 1.0, another length `T75`) gives an arm more
-say, so `weights: [1.0, 3.0]` lets the second arm lead.
-It yields one row per target with the fused score and no other population
-column; a population that reaches a target several times adds no row, and a
-read that needs a population column draws it again after the `from`
-(`$t: Tag, $d tagged $t`), correlated on the target:
+`rrf` takes 2 to 16 arms over one node column, each a ranking (`nearest`,
+`distance`, `bm25`, another `rrf`) ranked by its own score, or an inline read
+with an `order` (`{ match { … } return { $d } order { … } }`), which ranks each
+target at its first row. Each arm has its own population and runs as the same
+ranking runs alone: a `nearest` arm fills its `k` from its population, gate
+and ladder included; `distance` and `bm25` are exact. Identical arms (same
+population, property and query), arms that rank two different bindings, or
+fewer than 2 or more than 16 arms are refused (`T75`). Each arm ranks its
+distinct targets from 1 (ties to the smaller ID); a target scores the sum,
+in written order, over the arms that selected it of `weight / (k + rank)`
+(`k` 1 to 1000000, default 60; one weight in `(0, 1000000]` per arm, default
+1.0, another length `T75`, out of range `T71`), so `weights: [1.0, 3.0]` lets
+the second arm lead. It yields one row per target with the fused score and
+no other population column; a population that reaches a target several times
+adds no row or vote, and a read that needs a population column draws it
+again after the `from` (`$t: Tag, $d tagged $t`), correlated on the target:
 
 ```gq
 query hybrid($vq: Vector(1536), $tq: String) {
     match {
         let $all = { match { $d: Doc } return { $d } },
-        from rrf(nearest($all, $d.embedding, $vq, k: 10), nearest($all, $d.embedding, $tq, k: 10), k: 60) as $score,
+        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60) as $score,
     }
     return { $d.slug, $d.title }
     order { $score desc }
@@ -214,7 +219,8 @@ line, `POST /query`, stored-query calls):
 `order` is `ascending` for a `nearest` distance and `descending` for a `bm25`
 or fused score. `exhaustive: false` means the `ann_nprobes` cap left
 partitions unsearched, so a nearer row may exist (raise `ann_nprobes`); `bm25`
-is always exhaustive, and `rrf` is when every `nearest` arm is. `score_columns`
+is always exhaustive, and `rrf` is when every `nearest` arm searched
+everything over its own population (its exact arms always are). `score_columns`
 lists the returned columns that hold the ranking's own score, by the names
 the read returns them under (`["score"]` above for `$score as score`). A read that
 draws from no ranking has no `ranking`.
@@ -260,7 +266,7 @@ under `standard_folded_v1` and `english_v1`. `english_v1`'s stop list holds
 NLTK's 198 English stop words and each one's stem, so `only` and `very` match
 nothing and `"human beings"` analyzes to `human`; a query of only stop words is
 `T20` when the read runs. `scorer = "none"` keeps the field matchable and
-makes `bm25` over it `T87`, also as an `rrf` arm (`T87` comes before `T86`);
+makes `bm25` over it `T87`, also as an `rrf` arm;
 use a `where` filter there. No call takes an analyzer (`terms(…)` with one is
 `T71`).
 
@@ -272,8 +278,8 @@ query term to a stored term within the budget (one edit per inserted, deleted
 or substituted character; a swap costs two). `bm25` is `bm25_v1`, an `F64`
 scored against the whole field (every entity whose value has at least one
 analyzed term, before filters), so a filter never changes a surviving row's
-score; the plan shows a `Score` node, not a ranked scan. `rrf` with a `bm25`
-arm is `T86`. A query over 64 KiB or 1,024 distinct terms, or a value over
+score; the plan shows a `Score` node, not a ranked scan, in an `rrf` arm too.
+A query over 64 KiB or 1,024 distinct terms, or a value over
 16 MiB, fails with a resource-limit error (HTTP 413, detail `resource_limit`
 with `resource` `lexical_query_bytes`, `lexical_query_terms` or
 `lexical_value_bytes`); the scan's terms and comparisons count against
@@ -297,8 +303,8 @@ query related_chunks($artifact_slug: String, $q: Vector(1536)) {
 }
 ```
 
-Scoping fixes the answer, not always the cost: a `nearest` or `rrf` scan
-prefilters to the traversal's eligible entities only when they are few:
+Scoping fixes the answer, not always the cost: a `nearest` scan, an `rrf`
+arm's included, prefilters to the traversal's eligible entities only when they are few:
 within `OMNIGRAPH_RRF_GATE_RATIO` of the ranked type (default 10%) and at most
 `OMNIGRAPH_RRF_GATE_MAX_IDS` (default 100000). Otherwise the ranked type is
 scanned and the traversal keeps the rows it reaches. A `bm25` scores the
@@ -310,11 +316,11 @@ declares first, and whether or not it is declared: with
 `$a: InformationArtifact` first, then `$c partOfArtifact $a`, ranked on
 `$c`, the query ranks `Chunk` and keeps the chunks the traversal reaches.
 
-A standalone `nearest` ranking widens an underfilled candidate set, finally
-using an exact scan if needed to fill the limit with available survivors.
-An `rrf` vector arm retains a top-k window: an entity outside that window has
-no vector contribution, so filtering through a traversal can shorten or change
-the fused answer.
+A `nearest` ranking, standing alone or as an `rrf` arm, widens an
+underfilled candidate set, finally using an exact scan if needed to fill its
+window with available survivors of its population. An entity outside an
+`rrf` arm's window has no contribution from that arm; elements written after
+the `rrf`'s `from` run over the fused targets and refill nothing.
 
 A `nearest` scan uses only the IVF_FLAT vector index Omnigraph builds for the
 field's declared distance; an index built for another distance or written
@@ -329,7 +335,7 @@ fill the limit, so a filled limit does not make the ANN ranking exact. A scoped
 `nearest` whose survivors are always fewer than `limit` pays an exact
 whole-type pass on every execution. `OMNIGRAPH_RRF_GATE_RATIO` and
 `OMNIGRAPH_RRF_GATE_MAX_IDS` tune the prefilter that a selective traversal
-pushes into a `nearest` or `rrf` scan; leave them unset in normal operation.
+pushes into a `nearest` scan; leave them unset in normal operation.
 
 `OMNIGRAPH_ANN_NPROBES` and `OMNIGRAPH_RRF_PLAN` are not free tunables. Each is
 the process default of a session setting (`ann_nprobes`, `request` scope;

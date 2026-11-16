@@ -356,15 +356,16 @@ too, and is not a return item (`T86`). A ranked read's JSON carries a `ranking` 
 
 ### Hybrid (reciprocal rank fusion)
 
-Name the population once with `let` and rank it in both arms; the two arms must
-differ and rank one binding (`T75`), and an arm over `bm25` is not run
-(`T86`):
+Name the population once with `let` and rank it in every arm; `rrf` takes 2
+to 16 arms (`nearest`, `distance`, `bm25`, another `rrf`, or an inline read
+with an `order`), each over its own population and run as the same ranking
+runs alone, and the arms must differ and rank one binding (`T75`):
 
 ```gq
 query hybrid_search($vq: Vector(3072), $tq: String) {
     match {
         let $all = { match { $d: Doc } return { $d } },
-        from rrf(nearest($all, $d.embedding, $vq, k: 10), nearest($all, $d.embedding, $tq, k: 10), k: 60) as $score,
+        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60) as $score,
     }
     return { $d.slug, $d.title }
     order { $score desc }

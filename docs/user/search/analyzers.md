@@ -43,8 +43,7 @@ Folding after stemming keeps `"résumés"` (`résumé`) apart from `"resumes"`
 
 `scorer` is `bm25_v1`, the default, or `none`. A `none` field matches
 (`match_terms`) but does not rank: `bm25` over it is refused at type checking
-(`T87`). The type checker raises `T87` before the planner's refusals, so an
-`rrf` arm over `bm25` on a `none` field is `T87`, not `T86`. An unknown
+(`T87`), in an `rrf` arm too. An unknown
 profile, scorer or option is a schema error that lists the admitted names. No
 query names an analyzer: `terms(…)` admits `mode` and `max_edits` only
 (`T71`).
@@ -124,7 +123,8 @@ with no analyzed term is `T20`: an empty or punctuation-only literal at type
 checking, and any text the profile reduces to nothing, stop words included,
 when the read runs.
 
-An `rrf` arm over `bm25` is not run (`T86`).
+An `rrf` arm over `bm25` is that same exact score over the arm's population,
+ranked by it from the highest ([Hybrid ranking](index.md#hybrid-ranking)).
 
 ## The names Lance and LanceDB use
 
