@@ -99,6 +99,9 @@ pub enum PatternStep {
         /// planning, so the plan's window is that value and a replay folds
         /// the value its own value table holds.
         window_param: Option<String>,
+        /// `nearest`'s declared `recall:`; `recall: 1` searches every
+        /// partition.
+        recall: Option<f64>,
     },
     /// A correlated block: `inner` runs over the outer rows and `predicate`
     /// decides per outer row on the aggregate of its matches.
@@ -316,6 +319,9 @@ struct Ranking {
     /// retains). It is a step over its population's rows, never a ranked
     /// scan, and its `order` and `limit` are the read's own sort and cut.
     exact: Option<(String, ScoreKind, IRExpr)>,
+    /// `nearest`'s declared `recall:`, `None` when omitted or not a
+    /// `nearest`.
+    recall: Option<f64>,
 }
 
 /// A body split at the ranking it draws.
@@ -1123,10 +1129,12 @@ impl<'a> Shaper<'a> {
         // read's `limit`; any other ranking is a `Rank` step over its
         // population, cut to its own window, the `order` a plain sort.
         // A cut read from a parameter has no count yet, so no ranking can
-        // take it for its window.
+        // take it for its window. A declared `recall:` is carried by the
+        // `Rank` step, which records it.
         let windowed = ranking.as_ref().is_some_and(|ranking| {
             after.is_some()
                 || ranking.exact.is_some()
+                || ranking.recall.is_some()
                 || limit_param.is_some()
                 || !self.ranked_scan_runs(ranking, order_keys, limit, grouped)
         });
@@ -1294,6 +1302,7 @@ impl<'a> Shaper<'a> {
                     binding: ranking.column.clone(),
                     window,
                     window_param,
+                    recall: ranking.recall,
                 },
             });
             // The later elements and `where` read the score by its name.
@@ -1559,7 +1568,7 @@ impl<'a> Shaper<'a> {
                 query,
                 out,
                 k,
-                ..
+                recall,
             } => Ok((
                 self.population(input)?,
                 Some(Ranking {
@@ -1575,6 +1584,7 @@ impl<'a> Shaper<'a> {
                     descending: false,
                     windows: vec![k.clone()],
                     exact: None,
+                    recall: *recall,
                 }),
             )),
             // `bm25` is the exact score: `bm25_v1` over the field corpus,
@@ -1613,6 +1623,7 @@ impl<'a> Shaper<'a> {
                             lexical,
                         ),
                     )),
+                    recall: None,
                 }),
             )),
             Term::Score {
@@ -1636,6 +1647,7 @@ impl<'a> Shaper<'a> {
                     descending: false,
                     windows: Vec::new(),
                     exact: Some((property.clone(), ScoreKind::Distance, query.clone())),
+                    recall: None,
                 }),
             )),
             Term::Score { .. } => Err(ShapeError::Internal(
@@ -1736,6 +1748,8 @@ impl<'a> Shaper<'a> {
             descending: true,
             windows,
             exact: None,
+            // An `rrf` arm's `recall:` is the fusion's to read.
+            recall: None,
         })
     }
 

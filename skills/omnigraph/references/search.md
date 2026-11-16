@@ -74,7 +74,8 @@ replacement vectors; neither `merge` nor `overwrite` does that automatically.
 ## Search Functions in Queries
 
 A ranking is a relation drawn into `match` with `from`, which names its score
-with `as`: `from nearest(rel, $c.embedding, $q, k: n) as $distance`,
+with `as`: `from nearest(rel, $c.embedding, $q, k: n) as $distance` (add
+`recall: 1` for an exhaustive search with no probe cap),
 `from bm25(rel, $d.title, $q) as $score` (any term of the String `$q`; `terms($q)`
 asks for every term, `terms($q, max_edits: n)` an edit budget),
 `from rrf(arm, arm, k: 60, weights: [1.0, 1.0]) as $score`. `rel` is the population, a relation

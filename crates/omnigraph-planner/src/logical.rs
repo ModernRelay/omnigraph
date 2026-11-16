@@ -664,6 +664,9 @@ pub enum LogicalNode {
         /// The score leads the read's final sort (today's ranked read); a
         /// ranking drawn as a pattern step orders nothing by itself.
         leads: bool,
+        /// The declared `recall:`; `Some(1.0)` searches every partition, and
+        /// any other bound takes the session's probe policy.
+        recall: Option<f64>,
     },
     /// A leading `order { bm25($v.prop, q) }`: the full-text ranking, `_score`.
     TextSearch {
@@ -1214,15 +1217,22 @@ impl LogicalPlan {
                 property,
                 k,
                 reads,
+                recall,
                 ..
-            } => json!({
-                "node": "Nearest",
-                "binding": binding,
-                "property": property,
-                "typed_query": crate::typed::expr(query),
-                "k": k,
-                "reads": rendered(reads),
-            }),
+            } => {
+                let mut value = json!({
+                    "node": "Nearest",
+                    "binding": binding,
+                    "property": property,
+                    "typed_query": crate::typed::expr(query),
+                    "k": k,
+                    "reads": rendered(reads),
+                });
+                if let Some(recall) = recall {
+                    value["recall"] = json!(recall);
+                }
+                value
+            }
             LogicalNode::TextSearch {
                 query,
                 binding,

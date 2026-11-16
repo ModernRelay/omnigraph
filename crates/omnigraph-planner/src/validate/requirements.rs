@@ -381,6 +381,8 @@ pub struct Requirements {
     /// one with no window (`bm25`). Its score leads no sort, and the
     /// eligibility conjuncts after it run over the selected rows.
     pub(crate) window: Option<Option<u64>>,
+    /// That step's declared `recall:`; `recall: 1` probes without a cap.
+    pub(crate) recall: Option<f64>,
 }
 
 /// One exact score the query writes: the scored binding, its node type
@@ -407,6 +409,7 @@ impl Requirements {
         let mut blocks = Vec::new();
         let mut bindings: BTreeMap<String, BoundVariable> = BTreeMap::new();
         let mut rank_step: Option<(&IRExpr, Option<u64>)> = None;
+        let mut recall = None;
         let mut rank_at: Option<usize> = None;
         let mut steps = Vec::new();
         let mut optionals = Vec::new();
@@ -438,8 +441,14 @@ impl Requirements {
                     query: query.clone(),
                 }),
                 PatternStep::Let { value, .. } => lets.push(value.clone()),
-                PatternStep::Rank { key, window, .. } => {
+                PatternStep::Rank {
+                    key,
+                    window,
+                    recall: declared,
+                    ..
+                } => {
                     rank_step = Some((key, *window));
+                    recall = *declared;
                     rank_at = Some(eligibility.len());
                 }
                 PatternStep::NodeScan {
@@ -591,6 +600,7 @@ impl Requirements {
             limit: ir.limit,
             aggregate: grouped,
             window: rank_step.map(|(_, window)| window),
+            recall,
         })
     }
 }

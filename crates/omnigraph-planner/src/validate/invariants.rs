@@ -1219,6 +1219,13 @@ impl Requirements {
             .settings
             .get(omnigraph_compiler::settings::SettingId::AnnNprobes.name());
         let nprobes = match access.kind {
+            // A step that declares `recall: 1` searches every partition.
+            RankKind::Nearest
+                if self.recall == Some(1.0)
+                    && matches!(access.scope, RankScope::Order | RankScope::Window) =>
+            {
+                None
+            }
             RankKind::Nearest => setting
                 .map(|value| match value.as_str() {
                     "0" => None,

@@ -363,7 +363,7 @@ fn resolve_query(
     let grouped = has_aggregates || *distinct;
     let mut ranked = false;
     if let Some(leading) = orderings.first().filter(|_| !windowed) {
-        if let Some(mut node) = search_node(current, &leading.expr, *limit, true) {
+        if let Some(mut node) = search_node(current, &leading.expr, *limit, true, None) {
             if let LogicalNode::RankFuse {
                 arms, row_tiebreak, ..
             } = &mut node
@@ -595,13 +595,15 @@ fn resolve_pipeline(
                 key,
                 binding,
                 window,
+                recall,
                 ..
             } => {
                 let input = bound(current, "ranking")?;
                 let schema = schema_of(plan, input)?;
-                let mut node = search_node(input, key, *window, false).ok_or_else(|| {
-                    PlanError::Internal(format!("the ranking step `{key}` is not a search"))
-                })?;
+                let mut node =
+                    search_node(input, key, *window, false, *recall).ok_or_else(|| {
+                        PlanError::Internal(format!("the ranking step `{key}` is not a search"))
+                    })?;
                 if let LogicalNode::RankFuse {
                     arms, row_tiebreak, ..
                 } = &mut node
@@ -955,6 +957,7 @@ fn search_node(
     expr: &IRExpr,
     limit: Option<u64>,
     leads: bool,
+    recall: Option<f64>,
 ) -> Option<LogicalNode> {
     match expr {
         IRExpr::Nearest {
@@ -973,6 +976,7 @@ fn search_node(
                 k: limit,
                 reads,
                 leads,
+                recall,
             })
         }
         IRExpr::Bm25 { field, query, .. } => {
@@ -2850,6 +2854,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             k: _,
             reads,
             leads: _,
+            recall: _,
         }
         | LogicalNode::TextSearch {
             input: _,
@@ -3992,6 +3997,7 @@ impl Lowering<'_> {
                 query,
                 k,
                 leads,
+                recall,
                 ..
             } => {
                 let lowered = self.lower(*input)?;
@@ -4002,7 +4008,14 @@ impl Lowering<'_> {
                     property: property.clone(),
                     query: query.clone(),
                     fetch,
-                    nprobes: self.source.ann_nprobes(),
+                    // `recall: 1` searches every partition: no probe cap, so
+                    // the scan is exhaustive. Any other bound is resolved by
+                    // the session's effort settings.
+                    nprobes: if *recall == Some(1.0) {
+                        None
+                    } else {
+                        self.source.ann_nprobes()
+                    },
                     scope: if *leads {
                         RankScope::Order
                     } else {

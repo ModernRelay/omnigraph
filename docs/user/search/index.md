@@ -121,7 +121,10 @@ IVF vector searches keep Lance's adaptive one-partition minimum and cap the
 partitions a `nearest` scan reads at 20 per index delta by default. The cap
 prevents Lance's centroid-distance heuristic from expanding a small search
 across the entire index; larger values can improve recall at the cost of
-latency and object-store I/O.
+latency and object-store I/O. `nearest(rel, $d.f, $q, k: n, recall: r)`
+declares the recall the read accepts, a literal in `(0, 1]`: `recall: 1`
+searches every partition with no cap, so the search is exhaustive, and any
+other bound takes the session's cap (`explain` shows the scan's `nprobes`).
 
 A capped scan that returns fewer candidates than requested with partitions
 left unread is rerun with the cap raised four-fold, then without a cap, until
