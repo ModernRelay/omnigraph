@@ -1879,8 +1879,13 @@ pub struct ParamDescriptor {
     /// Dimension when `kind == vector`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_dim: Option<u32>,
-    /// `false` → the caller must supply it; `true` → optional.
+    /// Whether the parameter admits null.
     pub nullable: bool,
+    /// The declared default, the value an omitted parameter binds. A
+    /// parameter with neither `nullable` nor a `default` is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Value>)]
+    pub default: Option<Value>,
 }
 
 /// One entry in the stored-query catalog (`GET /queries`).
@@ -1922,7 +1927,35 @@ fn scalar_kind(scalar: ScalarType) -> ParamKind {
     }
 }
 
+/// A literal as the JSON value a caller passes for it: a date or datetime
+/// as its text, an integer as a number when it fits one exactly.
+pub fn literal_json(literal: &omnigraph_compiler::query::value::Literal) -> Value {
+    use omnigraph_compiler::query::value::Literal;
+    match literal {
+        Literal::Null => Value::Null,
+        Literal::String(text) | Literal::Date(text) | Literal::DateTime(text) => {
+            Value::String(text.clone())
+        }
+        Literal::Integer(n) => i64::try_from(*n)
+            .map(Value::from)
+            .or_else(|_| u64::try_from(*n).map(Value::from))
+            .unwrap_or_else(|_| Value::String(n.to_string())),
+        Literal::Float(f) => serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number),
+        Literal::Bool(b) => Value::Bool(*b),
+        Literal::List(items) => Value::Array(items.iter().map(literal_json).collect()),
+    }
+}
+
 pub fn param_descriptor(param: &Param) -> ParamDescriptor {
+    let default = param.default.as_ref().map(literal_json);
+    let descriptor = param_descriptor_kind(param);
+    ParamDescriptor {
+        default,
+        ..descriptor
+    }
+}
+
+fn param_descriptor_kind(param: &Param) -> ParamDescriptor {
     match PropType::from_param_type_name(&param.type_name, param.nullable) {
         Some(pt) if pt.list => ParamDescriptor {
             name: param.name.clone(),
@@ -1930,6 +1963,7 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
             item_kind: Some(scalar_kind(pt.scalar)),
             vector_dim: None,
             nullable: param.nullable,
+            default: None,
         },
         Some(pt) => {
             let (kind, vector_dim) = match pt.scalar {
@@ -1942,6 +1976,7 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
                 item_kind: None,
                 vector_dim,
                 nullable: param.nullable,
+                default: None,
             }
         }
         // Unreachable for a parsed query (every declared param type is
@@ -1953,6 +1988,7 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
             item_kind: None,
             vector_dim: None,
             nullable: param.nullable,
+            default: None,
         },
     }
 }

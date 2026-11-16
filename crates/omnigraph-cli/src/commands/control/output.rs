@@ -31,6 +31,9 @@ pub(crate) struct QueriesParam {
     #[serde(rename = "type")]
     pub(crate) type_name: String,
     pub(crate) nullable: bool,
+    /// The declared default, which an omitted parameter binds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) default: Option<serde_json::Value>,
 }
 
 #[derive(serde::Serialize)]
@@ -132,10 +135,13 @@ pub(super) fn write_queries_list(
                 .iter()
                 .map(|p| {
                     format!(
-                        "${}: {}{}",
+                        "${}: {}{}{}",
                         p.name,
                         p.type_name,
-                        if p.nullable { "?" } else { "" }
+                        if p.nullable { "?" } else { "" },
+                        p.default
+                            .as_ref()
+                            .map_or_else(String::new, |value| format!(" = {value}"))
                     )
                 })
                 .collect::<Vec<_>>();
@@ -206,7 +212,11 @@ fn catalog_param_type(param: &ParamDescriptor) -> String {
         (ParamKind::Vector, _, Some(dim)) => format!("{}({dim})", spell(ParamKind::Vector)),
         (kind, _, _) => spell(kind),
     };
-    format!("{base}{}", if param.nullable { "?" } else { "" })
+    let default = param
+        .default
+        .as_ref()
+        .map_or_else(String::new, |value| format!(" = {value}"));
+    format!("{base}{}{default}", if param.nullable { "?" } else { "" })
 }
 
 /// One `queries list` entry, shared by the direct and served forms.
@@ -312,11 +322,20 @@ mod tests {
                 mutation: false,
                 description: Some("Find people\nby name".into()),
                 instruction: Some(String::new()),
-                params: vec![QueriesParam {
-                    name: "name".into(),
-                    type_name: "String".into(),
-                    nullable: true,
-                }],
+                params: vec![
+                    QueriesParam {
+                        name: "name".into(),
+                        type_name: "String".into(),
+                        nullable: true,
+                        default: None,
+                    },
+                    QueriesParam {
+                        name: "limit".into(),
+                        type_name: "I32".into(),
+                        nullable: false,
+                        default: Some(json!(10)),
+                    },
+                ],
             }],
         };
         let mut human = Vec::new();
@@ -324,7 +343,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(human).unwrap(),
             concat!(
-                "read  people($name: String?) [mcp: people]\n",
+                "read  people($name: String?, $limit: I32 = 10) [mcp: people]\n",
                 "    description: Find people\n",
                 "                 by name\n",
                 "    instruction: \n",
@@ -337,7 +356,8 @@ mod tests {
             json!({
                 "queries": [{"name":"people", "mcp_expose":true, "tool_name":null,
                     "mutation":false, "description":"Find people\nby name", "instruction":"",
-                    "params":[{"name":"name", "type":"String", "nullable":true}]}]
+                    "params":[{"name":"name", "type":"String", "nullable":true},
+                        {"name":"limit", "type":"I32", "nullable":false, "default":10}]}]
             })
         );
         assert_eq!(encoded.last(), Some(&b'\n'));
@@ -358,6 +378,7 @@ mod tests {
             item_kind,
             vector_dim,
             nullable,
+            default: None,
         };
         let catalog = QueriesCatalogOutput {
             queries: vec![
@@ -386,7 +407,13 @@ mod tests {
                     description: None,
                     instruction: Some("Use for bulk changes".into()),
                     mutation: true,
-                    params: vec![param("count", ParamKind::BigInt, None, None, false)],
+                    params: vec![
+                        param("count", ParamKind::BigInt, None, None, false),
+                        ParamDescriptor {
+                            default: Some(json!(3)),
+                            ..param("batch", ParamKind::Int, None, None, false)
+                        },
+                    ],
                 },
             ],
         };
@@ -399,7 +426,7 @@ mod tests {
                 "$since: datetime)\n",
                 "    description: Find people\n",
                 "                 by name\n",
-                "mutation  retag($count: bigint) [mcp: retag_people]\n",
+                "mutation  retag($count: bigint, $batch: int = 3) [mcp: retag_people]\n",
                 "    instruction: Use for bulk changes\n",
             )
         );

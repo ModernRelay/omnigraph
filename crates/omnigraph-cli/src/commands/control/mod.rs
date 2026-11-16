@@ -503,6 +503,7 @@ pub(crate) async fn execute_queries_list(
                         name: p.name.clone(),
                         type_name: p.type_name.clone(),
                         nullable: p.nullable,
+                        default: p.default.as_ref().map(omnigraph_api_types::literal_json),
                     })
                     .collect(),
             })

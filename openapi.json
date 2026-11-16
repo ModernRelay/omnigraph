@@ -16405,6 +16405,9 @@
           "nullable"
         ],
         "properties": {
+          "default": {
+            "description": "The declared default, the value an omitted parameter binds. A\nparameter with neither `nullable` nor a `default` is required."
+          },
           "item_kind": {
             "oneOf": [
               {
@@ -16424,7 +16427,7 @@
           },
           "nullable": {
             "type": "boolean",
-            "description": "`false` → the caller must supply it; `true` → optional."
+            "description": "Whether the parameter admits null."
           },
           "vector_dim": {
             "type": [

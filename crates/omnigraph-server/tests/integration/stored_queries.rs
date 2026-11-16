@@ -915,6 +915,11 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
                 true,
             ),
             (
+                "people_named",
+                "query people_named($name: String = \"Alice\", $note: String?) { match { $p: Person } where $p.name = $name return { $p.name } }",
+                true,
+            ),
+            (
                 "hidden",
                 "query hidden() { match { $p: Person } return { $p.name } }",
                 false,
@@ -948,6 +953,19 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
     assert_eq!(fp["params"][0]["kind"], "string");
     let ap = entries.iter().find(|q| q["name"] == "add_person").unwrap();
     assert_eq!(ap["mutation"], true, "stored insert → mutation");
+    // A declared default is listed, so a defaulted parameter reads as one
+    // the caller may omit; a nullable one without a default carries none.
+    let named = entries
+        .iter()
+        .find(|q| q["name"] == "people_named")
+        .unwrap();
+    assert_eq!(
+        named["params"],
+        json!([
+            {"name":"name","kind":"string","nullable":false,"default":"Alice"},
+            {"name":"note","kind":"string","nullable":true}
+        ])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
