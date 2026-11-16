@@ -1193,7 +1193,10 @@ identity (endpoints, edge selection, direction, endpoint types, hop bounds),
 search identity and its declared approximation, eligibility in both
 directions (every lowered conjunct is tested, and every tested conjunct is a lowered one, a
 constant `true`, or the identity equality key narrowing derives through
-`AcceptInput.keys`), correlated blocks, the exact projection and the origin
+`AcceptInput.keys`), the region of every conjunct (each is tested in the
+`optional`, `union` arm, correlated read or side of a `nearest` window's
+`TargetCut` that writes it, and in no other: `validate::requirements::Region`),
+correlated blocks, the exact projection and the origin
 of every projected score, order and cut, late materialization
 (`HydrateColumns`), and the policies the plan declares for its search.
 Every node declares its count cut (`PhysicalNode::row_cut`, a match over
@@ -1203,7 +1206,7 @@ validator justifies each one by its position: the root `Limit` and the final
 `Sort` (below the root `Limit`, its projections and a hydration) at the
 query's `limit`, and a ranked scan's cap as its declared policy sets it (a
 window's scan at its `k`). A `TargetCut` counts targets, not rows, and must
-keep exactly the query's window `k`; its own uncapped `Sort` orders no row
+keep exactly the query's window `k`, and a windowed scope must have one; its own uncapped `Sort` orders no row
 the query returns. Any other cut, a capped sort below the final one or a cut
 in a correlated block's tree, is refused as `row cut`. The order check recomputes the root's
 order from the operators (`optimizer::derived_order`, typed `OrderKey`s):
