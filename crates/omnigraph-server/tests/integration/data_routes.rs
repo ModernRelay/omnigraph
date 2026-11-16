@@ -3977,6 +3977,7 @@ async fn request_budgets_stop_at_the_server_ceiling() {
     };
     for (setting, above) in [
         ("traversal_work_limit", "9223372036854775807"),
+        ("read_work_limit", "9223372036854775807"),
         ("query_memory_bytes", "1099511627776"),
         ("write_max_bytes", "1099511627776"),
         ("load_source_max_bytes", "1099511627776"),
