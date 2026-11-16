@@ -8,7 +8,8 @@
 # notes: arithmetic and overflows at `I32`; `(0 - 3)` is an `I64` operand.
 # notes: `coalesce` and `if` widen their arguments to the common type, and
 # notes: overflow, truncating division and the sign of `%` hold at the widened
-# notes: type. Unary minus over an unsigned value is `T72`.
+# notes: type. Unary minus over an unsigned value is `T72`. A null dividend over a zero divisor is
+# notes: null, as every arithmetic over a null operand is.
 
 --- runner
 timeout_ms: 10000
@@ -171,6 +172,26 @@ query coalesce_evaluates_the_division_where_the_value_is_null() {
 }
 
 --- expect error: E2
+
+--- query
+query a_null_dividend_over_a_zero_divisor_is_null($z: I32) {
+    match { $p: Person }
+    where $p.handle = "p3"
+    return { $p.handle, $p.age / $z as quotient, $p.age % $z as remainder }
+}
+
+--- params
+{"z": 0}
+
+--- expect unordered
+{"p.handle":"p3"}
+
+--- expect shape
+p.handle: String
+quotient: I32?
+remainder: I32?
+
+--- expect same as reference
 
 --- query
 query unary_minus_over_an_unsigned_value() {

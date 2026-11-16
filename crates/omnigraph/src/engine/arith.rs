@@ -38,14 +38,19 @@ fn arrow_refusal(op: &str, error: ArrowError) -> OmniError {
     }
 }
 
-/// Whether any valid slot of a numeric array is zero (`-0.0` included).
-fn has_zero(values: &ArrayRef) -> Result<bool> {
+/// Whether a valid slot of the divisor array is zero (`-0.0` included) on a
+/// row whose dividend is not null.
+fn has_zero(dividends: &ArrayRef, values: &ArrayRef) -> Result<bool> {
     let literal: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![0]));
     let zero = arrow_cast::cast(&literal, values.data_type()).map_err(OmniError::arrow_internal)?;
     let values = super::expr::positive_zero(values)?;
     let matches = arrow_ord::cmp::eq(&values, &arrow_array::Scalar::new(zero))
         .map_err(OmniError::arrow_internal)?;
-    Ok(matches.true_count() > 0)
+    // Over a null dividend the operation is null, whatever the divisor.
+    Ok(matches
+        .iter()
+        .enumerate()
+        .any(|(row, zero)| zero == Some(true) && dividends.is_valid(row)))
 }
 
 /// Refuse a float array holding a non-finite valid slot.
@@ -81,7 +86,7 @@ pub(super) fn binary(op: ArithOp, left: &ArrayRef, right: &ArrayRef) -> Result<A
         )));
     }
     let symbol = op.symbol();
-    if matches!(op, ArithOp::Div | ArithOp::Rem) && has_zero(right)? {
+    if matches!(op, ArithOp::Div | ArithOp::Rem) && has_zero(left, right)? {
         return Err(refused(E2, format!("`{symbol}` has a zero divisor")));
     }
     let values = match op {
