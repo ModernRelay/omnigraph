@@ -439,6 +439,12 @@ async fn server_refuses_boot_on_type_broken_stored_query() {
         msg.contains("schema check"),
         "error should mention the schema check: {msg}"
     );
+    // The type refusal carries its code and where it fails, as a parse
+    // refusal does.
+    assert!(
+        msg.contains("query 'ghost': error[T") && msg.contains(" at line 1, column "),
+        "error should carry the refusal's code and position: {msg}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

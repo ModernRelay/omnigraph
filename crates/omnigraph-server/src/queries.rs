@@ -97,34 +97,48 @@ impl std::fmt::Display for LoadError {
             Some(name) => write!(f, "stored query '{name}': ")?,
             None => write!(f, "stored query registry: ")?,
         }
-        let Some(diagnostic) = &self.diagnostic else {
-            return write!(f, "{}", self.message);
-        };
-        write!(f, "error[{}]", diagnostic.code)?;
-        if let Some(at) = &diagnostic.position {
-            write!(f, " at line {}, column {}", at.line, at.column)?;
-        }
-        write!(f, ": {}", diagnostic.message)?;
-        if let Some(fix) = &diagnostic.fix {
-            write!(f, "; fix: {fix}")?;
-        }
-        if let Some(suggestion) = &diagnostic.suggestion {
-            let edits: Vec<String> = suggestion
-                .edits
-                .iter()
-                .map(|edit| {
-                    format!(
-                        "bytes {}..{} -> {:?}",
-                        edit.start, edit.end, edit.replacement
-                    )
-                })
-                .collect();
-            if !edits.is_empty() {
-                write!(f, "; edits: {}", edits.join(", "))?;
-            }
-        }
-        Ok(())
+        write!(
+            f,
+            "{}",
+            refusal_text(&self.message, self.diagnostic.as_deref())
+        )
     }
+}
+
+/// A stored query's refusal as the upgrade contract states it: its code,
+/// where it fails, the message, the fix and the fix's byte-range edits; the
+/// bare message when the refusal carries no diagnostic.
+pub fn refusal_text(
+    message: &str,
+    diagnostic: Option<&omnigraph_compiler::QueryDiagnostic>,
+) -> String {
+    let Some(diagnostic) = diagnostic else {
+        return message.to_string();
+    };
+    let mut out = format!("error[{}]", diagnostic.code);
+    if let Some(at) = &diagnostic.position {
+        out.push_str(&format!(" at line {}, column {}", at.line, at.column));
+    }
+    out.push_str(&format!(": {}", diagnostic.message));
+    if let Some(fix) = &diagnostic.fix {
+        out.push_str(&format!("; fix: {fix}"));
+    }
+    if let Some(suggestion) = &diagnostic.suggestion {
+        let edits: Vec<String> = suggestion
+            .edits
+            .iter()
+            .map(|edit| {
+                format!(
+                    "bytes {}..{} -> {:?}",
+                    edit.start, edit.end, edit.replacement
+                )
+            })
+            .collect();
+        if !edits.is_empty() {
+            out.push_str(&format!("; edits: {}", edits.join(", ")));
+        }
+    }
+    out
 }
 
 impl QueryRegistry {
@@ -329,7 +343,13 @@ pub fn format_check_breakages(label: &str, report: &CheckReport) -> String {
     let joined = report
         .breakages
         .iter()
-        .map(|b| format!("query '{}': {}", b.query, b.message))
+        .map(|b| {
+            format!(
+                "query '{}': {}",
+                b.query,
+                refusal_text(&b.message, b.diagnostic.as_ref())
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n  ");
     format!(
