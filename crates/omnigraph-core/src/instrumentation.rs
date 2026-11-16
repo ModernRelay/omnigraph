@@ -31,6 +31,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::io::WrappingObjectStore;
 
 use crate::error::{OmniError, Result};
+pub use crate::logical_calls::{LogicalCallCounter, LogicalCallCounts};
 use crate::storage::{ListDirBounds, StorageAdapter};
 
 #[macro_export]

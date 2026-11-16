@@ -164,13 +164,9 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "engine/plan_source/scan_access/planning_cost.rs",
 ];
 
-/// Out-of-line modules are parsed as standalone files, so the walker cannot see
-/// their parent's `mod` gate: `#[cfg(test)]` for each entry but
-/// `omnigraph-catalog/namespace.rs`, gated `#[cfg(any(test, feature = "test-util"))]`.
-/// Production gateway and primitive-definition files are deliberately *not*
-/// excluded: their current durable calls are exact-registered below, so adding
-/// a new call inside a trusted implementation still requires an explicit
-/// protocol disposition.
+/// Out-of-line modules are parsed standalone, so the walker cannot see their parent's
+/// `mod` gate: `cfg(test)`, or `any(test, feature = "test-util")` for `namespace.rs` and
+/// `read_through_contract.rs`; gateway and primitive files stay in, exact-registered below.
 const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
     "engine/plan_source/key_tests.rs",
     "engine/plan_source/scan_access/tests.rs",
@@ -178,6 +174,7 @@ const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
     "table_store/staged_tests.rs",
     "omnigraph-catalog/namespace.rs",
     "omnigraph-catalog/tests.rs",
+    "omnigraph-storage/read_through_contract.rs",
     "db/upgrade/tests.rs",
     "db/catalog_tests.rs",
     "core_tests.rs",
@@ -1092,6 +1089,10 @@ durable_calls! {
     ("omnigraph-core/instrumentation.rs", ".rename_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/instrumentation.rs", ".delete(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/instrumentation.rs", ".delete_prefix(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
+    ("omnigraph-core/logical_calls.rs", ".put_opts(", 1, WriteProtocol::Composed("logical call counter forwards its caller's put; the counter wraps an object store to count requests by verb and every write it forwards is registered at the caller's site")),
+    ("omnigraph-core/logical_calls.rs", ".put_part(", 1, WriteProtocol::Composed("logical call counter forwards its caller's multipart part")),
+    ("omnigraph-core/logical_calls.rs", ".complete(", 1, WriteProtocol::Composed("logical call counter forwards its caller's multipart completion")),
+    ("omnigraph-core/logical_calls.rs", ".abort(", 1, WriteProtocol::Composed("logical call counter forwards its caller's multipart abort")),
     ("omnigraph-core/lance_access.rs", ".put_opts(", 1, WriteProtocol::Composed("Lance-realm object-store seam forwarding (dst only)")),
     ("omnigraph-core/read_memo.rs", ".put_opts(", 1, WriteProtocol::Composed("statement read-memo forwarding: the memo intercepts immutable-path reads only and passes the caller's put untouched to the wrapped store")),
     ("omnigraph-core/storage.rs", ".write_bytes(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
@@ -1900,7 +1901,11 @@ fn call_inventory(ast: &syn::File) -> CallInventory {
 
 fn durable_protocol_scan_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
     let mut files = labeled_scan_files(engine_src, true);
-    files.extend(sibling_crate_files(engine_src, STORAGE_CRATE));
+    files.extend(
+        sibling_crate_files(engine_src, STORAGE_CRATE)
+            .into_iter()
+            .filter(|(relative, _)| !PROTOCOL_SCAN_EXCLUDED_FILES.contains(&relative.as_str())),
+    );
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
 }
@@ -3565,6 +3570,8 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::CountingStorageAdapter",
     "instrumentation.rs: omnigraph_core::instrumentation::ExternalPayloadReadHold",
     "instrumentation.rs: omnigraph_core::instrumentation::IndexBuildProbes",
+    "instrumentation.rs: omnigraph_core::instrumentation::LogicalCallCounter",
+    "instrumentation.rs: omnigraph_core::instrumentation::LogicalCallCounts",
     "instrumentation.rs: omnigraph_core::instrumentation::MergeTimingReading",
     "instrumentation.rs: omnigraph_core::instrumentation::MergeWriteProbes",
     "instrumentation.rs: omnigraph_core::instrumentation::ProbedStores",
@@ -3594,6 +3601,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "lib.rs: omnigraph_core::dst_clock",
     "lib.rs: omnigraph_core::dst_gate",
     "lib.rs: omnigraph_core::dst_ids",
+    "lib.rs: omnigraph_core::fts_compat::ANALYZER_GENERATION as FTS_ANALYZER_GENERATION",
     "seams.rs: omnigraph_core::seams::Behavior",
     "seams.rs: omnigraph_core::seams::Counted",
     "seams.rs: omnigraph_core::seams::Decide",

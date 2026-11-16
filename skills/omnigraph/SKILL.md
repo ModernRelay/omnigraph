@@ -219,7 +219,7 @@ destination line.
 | Data | `query`, `mutate`, `load --mode overwrite\|append\|merge`, `branch`, `commit`, `snapshot`, `export`, `blob`, `diff`, `changes`; direct or served targets |
 | Managed data | `graphs list` and common served graph commands, subject to endpoint capabilities and policy; no direct maintenance fallback |
 | Direct schema | `schema plan`; `schema apply` and `schema upgrade-system-columns` require standalone graph targets |
-| Direct maintenance | `optimize`, `index build`, `index rebuild --kind full-text`, `cleanup`; `upgrade --target ADDRESS` is standalone and offline |
+| Maintenance | `optimize` on a direct target, or on a cluster server as a recorded operation; `index build`, `index rebuild --kind full-text`, `cleanup` direct only; `upgrade --target ADDRESS` is standalone and offline |
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
 | Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
@@ -263,10 +263,11 @@ two agents given the same input should write the same graph and read the same
 meaning back. Decide conservatively what to model; once modeled, constrain
 precisely, because changing a commitment later is a rebuild (adding
 `@key`/`@range`/`@check`, an edge `@unique` or a required edge to an existing
-type, changing cardinality, removing a constraint from a property that stays,
-and `T` → `T?` are refused; `@index` additions, nullable additions, enum
-widening, renames, drops, `T?` → `T` and a node `@unique` apply in place, the
-last two only when the stored rows already satisfy them).
+type, raising an edge's `@card` minimum or lowering its maximum, removing a
+constraint from a property that stays, and `T` → `T?` are refused; `@index`
+additions, nullable additions, enum widening, widening a `@card` range,
+renames, drops, `T?` → `T` and a node `@unique` apply in place, the last two
+only when the stored rows already satisfy them).
 
 In short: Gruber's five criteria (clarity · coherence · extendibility · minimal
 encoding bias · minimal commitment) · neither too loose (one meaning, many

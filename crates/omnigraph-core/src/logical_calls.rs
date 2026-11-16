@@ -1,0 +1,520 @@
+//! Logical object-store call counting for one measured operation.
+//!
+//! These counters observe calls at Lance's [`WrappingObjectStore`] seam. One
+//! logical call may fan out into retries, pagination, or multipart requests
+//! below this wrapper, so these values are deliberately never described as
+//! physical requests, round trips, or cloud cost. The benchmark harness and
+//! the CLI's `--stats` output install one counter per store plane through
+//! [`crate::instrumentation::QueryIoProbes`].
+
+use std::fmt;
+use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::stream::BoxStream;
+use lance::io::WrappingObjectStore;
+use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
+use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as StoreResult,
+    UploadPart,
+};
+use serde::{Deserialize, Serialize};
+
+/// Logical store calls since the preceding [`LogicalCallCounter::take`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalCallCounts {
+    pub get: u64,
+    pub put: u64,
+    pub put_part: u64,
+    pub head: u64,
+    pub list: u64,
+    pub delete: u64,
+    pub copy: u64,
+    pub rename: u64,
+    pub multipart_complete: u64,
+    pub multipart_abort: u64,
+}
+
+impl LogicalCallCounts {
+    /// Whether the observed interval issued any operation that may mutate the
+    /// wrapped object store.
+    pub fn has_mutations(self) -> bool {
+        self.put != 0
+            || self.put_part != 0
+            || self.delete != 0
+            || self.copy != 0
+            || self.rename != 0
+            || self.multipart_complete != 0
+            || self.multipart_abort != 0
+    }
+}
+
+#[derive(Debug, Default)]
+struct Tally {
+    get: AtomicU64,
+    put: AtomicU64,
+    put_part: AtomicU64,
+    head: AtomicU64,
+    list: AtomicU64,
+    delete: AtomicU64,
+    copy: AtomicU64,
+    rename: AtomicU64,
+    multipart_complete: AtomicU64,
+    multipart_abort: AtomicU64,
+}
+
+/// Cloneable logical-call counter installed through `QueryIoProbes`.
+#[derive(Debug, Default, Clone)]
+pub struct LogicalCallCounter(Arc<Tally>);
+
+impl LogicalCallCounter {
+    /// This counter as the store wrapper a [`crate::instrumentation::QueryIoProbes`]
+    /// plane takes.
+    pub fn wrapper(&self) -> Arc<dyn WrappingObjectStore> {
+        Arc::new(self.clone())
+    }
+
+    /// Atomically read and reset all classes.
+    pub fn take(&self) -> LogicalCallCounts {
+        LogicalCallCounts {
+            get: self.0.get.swap(0, Ordering::Relaxed),
+            put: self.0.put.swap(0, Ordering::Relaxed),
+            put_part: self.0.put_part.swap(0, Ordering::Relaxed),
+            head: self.0.head.swap(0, Ordering::Relaxed),
+            list: self.0.list.swap(0, Ordering::Relaxed),
+            delete: self.0.delete.swap(0, Ordering::Relaxed),
+            copy: self.0.copy.swap(0, Ordering::Relaxed),
+            rename: self.0.rename.swap(0, Ordering::Relaxed),
+            multipart_complete: self.0.multipart_complete.swap(0, Ordering::Relaxed),
+            multipart_abort: self.0.multipart_abort.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+impl WrappingObjectStore for LogicalCallCounter {
+    fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        Arc::new(CountingStore {
+            target,
+            counter: self.clone(),
+        })
+    }
+
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        target: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        Some(Arc::new(CountingPaginatedStore {
+            target,
+            counter: self.clone(),
+        }))
+    }
+}
+
+struct CountingPaginatedStore {
+    target: Arc<dyn PaginatedListStore>,
+    counter: LogicalCallCounter,
+}
+
+#[async_trait]
+impl PaginatedListStore for CountingPaginatedStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: PaginatedListOptions,
+    ) -> StoreResult<PaginatedListResult> {
+        self.counter.0.list.fetch_add(1, Ordering::Relaxed);
+        self.target.list_paginated(prefix, options).await
+    }
+}
+
+#[derive(Debug)]
+struct CountingStore {
+    target: Arc<dyn ObjectStore>,
+    counter: LogicalCallCounter,
+}
+
+impl fmt::Display for CountingStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "CountingStore({})", self.target)
+    }
+}
+
+#[derive(Debug)]
+struct CountingMultipart {
+    inner: Box<dyn MultipartUpload>,
+    counter: LogicalCallCounter,
+}
+
+#[async_trait]
+impl MultipartUpload for CountingMultipart {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        self.counter.0.put_part.fetch_add(1, Ordering::Relaxed);
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> StoreResult<PutResult> {
+        self.counter
+            .0
+            .multipart_complete
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> StoreResult<()> {
+        self.counter
+            .0
+            .multipart_abort
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.abort().await
+    }
+}
+
+#[async_trait]
+#[deny(clippy::missing_trait_methods)]
+impl ObjectStore for CountingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> StoreResult<PutResult> {
+        self.counter.0.put.fetch_add(1, Ordering::Relaxed);
+        self.target.put_opts(location, payload, options).await
+    }
+
+    /// Initiation is not a logical count: the vocabulary of RFC 0031 and
+    /// RFC 0039 starts with the uploaded parts and records completion or
+    /// abort, so the upload is wrapped and counted part by part.
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> StoreResult<Box<dyn MultipartUpload>> {
+        let inner = self.target.put_multipart_opts(location, options).await?;
+        Ok(Box::new(CountingMultipart {
+            inner,
+            counter: self.counter.clone(),
+        }))
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> StoreResult<GetResult> {
+        if options.head {
+            self.counter.0.head.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counter.0.get.fetch_add(1, Ordering::Relaxed);
+        }
+        self.target.get_opts(location, options).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> StoreResult<Vec<Bytes>> {
+        self.counter.0.get.fetch_add(1, Ordering::Relaxed);
+        self.target.get_ranges(location, ranges).await
+    }
+
+    /// One logical delete-stream call, however many objects the stream names.
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, StoreResult<Path>>,
+    ) -> BoxStream<'static, StoreResult<Path>> {
+        self.counter.0.delete.fetch_add(1, Ordering::Relaxed);
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+        self.counter.0.list.fetch_add(1, Ordering::Relaxed);
+        self.target.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+        self.counter.0.list.fetch_add(1, Ordering::Relaxed);
+        self.target.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> StoreResult<ListResult> {
+        self.counter.0.list.fetch_add(1, Ordering::Relaxed);
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> StoreResult<()> {
+        self.counter.0.copy.fetch_add(1, Ordering::Relaxed);
+        self.target.copy_opts(from, to, options).await
+    }
+
+    /// Forwarded so the backend's atomic rename stays in place of the
+    /// trait's copy-plus-delete fallback.
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> StoreResult<()> {
+        self.counter.0.rename.fetch_add(1, Ordering::Relaxed);
+        self.target.rename_opts(from, to, options).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::ObjectStoreExt;
+    use object_store::memory::InMemory;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct RangeSpyStore {
+        target: Arc<dyn ObjectStore>,
+        get_opts: AtomicU64,
+        get_ranges: AtomicU64,
+        pages: Mutex<Vec<(Option<String>, PaginatedListOptions)>>,
+    }
+
+    impl fmt::Display for RangeSpyStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "RangeSpyStore({})", self.target)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RangeSpyStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> StoreResult<PutResult> {
+            self.target.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> StoreResult<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> StoreResult<GetResult> {
+            self.get_opts.fetch_add(1, Ordering::Relaxed);
+            self.target.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> StoreResult<Vec<Bytes>> {
+            self.get_ranges.fetch_add(1, Ordering::Relaxed);
+            self.target.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, StoreResult<Path>>,
+        ) -> BoxStream<'static, StoreResult<Path>> {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+            self.target.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> StoreResult<ListResult> {
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> StoreResult<()> {
+            self.target.copy_opts(from, to, options).await
+        }
+    }
+
+    #[async_trait]
+    impl PaginatedListStore for RangeSpyStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: PaginatedListOptions,
+        ) -> StoreResult<PaginatedListResult> {
+            let count = {
+                let mut pages = self.pages.lock().unwrap();
+                pages.push((prefix.map(str::to_string), options));
+                pages.len()
+            };
+            if count > 1 {
+                return Err(object_store::Error::Generic {
+                    store: "pagination spy",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "page response lost",
+                    )),
+                });
+            }
+            let prefix = prefix.map(Path::from);
+            Ok(PaginatedListResult {
+                result: self.target.list_with_delimiter(prefix.as_ref()).await?,
+                page_token: Some("opaque/next?+=token".to_string()),
+            })
+        }
+    }
+
+    #[test]
+    fn take_resets_every_tally() {
+        let counter = LogicalCallCounter::default();
+        counter.0.get.fetch_add(3, Ordering::Relaxed);
+        counter.0.put.fetch_add(1, Ordering::Relaxed);
+        counter.0.put_part.fetch_add(2, Ordering::Relaxed);
+
+        assert_eq!(
+            counter.take(),
+            LogicalCallCounts {
+                get: 3,
+                put: 1,
+                put_part: 2,
+                ..Default::default()
+            }
+        );
+        assert_eq!(counter.take(), LogicalCallCounts::default());
+    }
+
+    #[test]
+    fn zero_classes_remain_explicit_in_json() {
+        let value = serde_json::to_value(LogicalCallCounts::default()).unwrap();
+        for class in [
+            "get",
+            "put",
+            "put_part",
+            "head",
+            "list",
+            "delete",
+            "copy",
+            "rename",
+            "multipart_complete",
+            "multipart_abort",
+        ] {
+            assert_eq!(value[class], 0, "missing zero-valued class {class}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pagination_counts_each_delegated_page_and_preserves_request_context() {
+        let target = Arc::new(InMemory::new());
+        let location = Path::from("prefix/item");
+        target
+            .put(&location, PutPayload::from_static(b"page item"))
+            .await
+            .unwrap();
+        let spy = Arc::new(RangeSpyStore {
+            target,
+            get_opts: AtomicU64::new(0),
+            get_ranges: AtomicU64::new(0),
+            pages: Mutex::new(Vec::new()),
+        });
+        let counter = LogicalCallCounter::default();
+        let store = counter.wrap_paginated("test", spy.clone()).unwrap();
+        let context = Arc::new(42_u64);
+        let mut options = PaginatedListOptions {
+            offset: Some("prefix/before".to_string()),
+            delimiter: Some("/".into()),
+            max_keys: Some(7),
+            page_token: Some("opaque/first?+=token".to_string()),
+            ..Default::default()
+        };
+        options.extensions.insert(Arc::clone(&context));
+        let page = store
+            .list_paginated(Some("prefix/"), options)
+            .await
+            .unwrap();
+        assert_eq!(page.result.objects.len(), 1);
+        assert_eq!(page.result.objects[0].location, location);
+        assert!(page.result.common_prefixes.is_empty());
+        assert_eq!(page.page_token.as_deref(), Some("opaque/next?+=token"));
+        let one_list = LogicalCallCounts {
+            list: 1,
+            ..Default::default()
+        };
+        assert_eq!(counter.take(), one_list);
+
+        let mut next = PaginatedListOptions {
+            page_token: page.page_token,
+            ..Default::default()
+        };
+        next.extensions.insert(Arc::clone(&context));
+        let error = store.list_paginated(None, next).await.unwrap_err();
+        let object_store::Error::Generic { store, source } = error else {
+            panic!("the backend error must be preserved");
+        };
+        assert_eq!(store, "pagination spy");
+        assert_eq!(source.to_string(), "page response lost");
+        assert_eq!(
+            source.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(counter.take(), one_list);
+        assert_eq!(counter.take(), LogicalCallCounts::default());
+
+        let pages = spy.pages.lock().unwrap();
+        assert_eq!(pages.len(), 2);
+        for (index, (prefix, options)) in pages.iter().enumerate() {
+            assert_eq!(prefix.as_deref(), (index == 0).then_some("prefix/"));
+            assert_eq!(
+                options.offset.as_deref(),
+                (index == 0).then_some("prefix/before")
+            );
+            assert_eq!(options.delimiter.as_deref(), (index == 0).then_some("/"));
+            assert_eq!(options.max_keys, (index == 0).then_some(7));
+            assert_eq!(
+                options.page_token.as_deref(),
+                Some(if index == 0 {
+                    "opaque/first?+=token"
+                } else {
+                    "opaque/next?+=token"
+                })
+            );
+            assert_eq!(options.extensions.len(), 1);
+            assert!(Arc::ptr_eq(
+                options.extensions.get::<Arc<u64>>().unwrap(),
+                &context
+            ));
+        }
+        assert_eq!(spy.get_opts.load(Ordering::Relaxed), 0);
+        assert_eq!(spy.get_ranges.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn get_ranges_remains_one_delegated_logical_call() {
+        let location = Path::from("ranges");
+        let target = Arc::new(InMemory::new());
+        target
+            .put(&location, PutPayload::from_static(b"abcdef"))
+            .await
+            .unwrap();
+        let spy = Arc::new(RangeSpyStore {
+            target,
+            get_opts: AtomicU64::new(0),
+            get_ranges: AtomicU64::new(0),
+            pages: Mutex::new(Vec::new()),
+        });
+        let counter = LogicalCallCounter::default();
+        let store = counter.wrap("test", spy.clone());
+
+        let result = store.get_ranges(&location, &[0..2, 4..6]).await.unwrap();
+
+        assert_eq!(
+            result,
+            vec![Bytes::from_static(b"ab"), Bytes::from_static(b"ef")]
+        );
+        assert_eq!(spy.get_ranges.load(Ordering::Relaxed), 1);
+        assert_eq!(spy.get_opts.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            counter.take(),
+            LogicalCallCounts {
+                get: 1,
+                ..Default::default()
+            }
+        );
+    }
+}

@@ -6,6 +6,8 @@ timeout_ms: 60000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
 
 --- query
 query destination_projection() { match { $p: Person $p knows $q } return { $q.name } }

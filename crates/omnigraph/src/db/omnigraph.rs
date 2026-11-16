@@ -825,8 +825,8 @@ impl Omnigraph {
     /// (`docs/rfcs/2026-11-10-graph-shallow-clone.md`): the clone starts with
     /// every branch, version, commit and index of the base, every write lands
     /// under `root_uri`, and the base is never written. Both are local
-    /// directories in this phase, and `root_uri` is an empty directory or a
-    /// clone root a previous open built. A caller that wraps storage builds
+    /// directories or `s3://` prefixes of one endpoint, and `root_uri` is an
+    /// empty root or a clone root a previous open built. A caller that wraps storage builds
     /// it with [`crate::storage::storage_read_through`] and opens with
     /// [`Self::open_with_storage`], as the benchmark harness does to count
     /// store calls.
@@ -3996,8 +3996,8 @@ impl Omnigraph {
     /// supported analyzer generation after an upgrade; it does not rewrite old
     /// history.
     ///
-    /// Requires `maintain` or `change` on the selected branch before any
-    /// effect and records the actor in the graph publication.
+    /// Requires `maintain` on the selected branch before any effect and
+    /// records the actor in the graph publication.
     pub async fn rebuild_full_text_indices_on_as(
         &self,
         branch: &str,

@@ -10,6 +10,9 @@ Routes (`omnigraph-bench run --local-route`):
   direct        a restored working copy, Lance's direct local file path (the default)
   object-store  the same restored copy, every read and write through the object store
   read-through  an empty clone root read through the frozen fixture; nothing is restored
+  clone         with --store (and --product, --backend for an s3:// store): the clone reset level, every step
+                its own `omnigraph` process over an empty clone of the store's frozen base; a one-repetition
+                clone run before the passes builds the base, so no measured run builds one
 
 A pass is one `omnigraph-bench run` invocation of `--repetitions` repetitions per route, a fresh worker process
 per repetition. The routes run in one order in odd passes and in the reverse order in even passes, so a drift of
@@ -43,6 +46,7 @@ import sys
 import time
 
 ROUTES = ["direct", "object-store", "read-through"]
+CLONE = "clone"
 SCENARIOS = ["e2e-query-scan", "tiny-mutate", "e2e-merge-all-changed", "very-long-history-1000-write"]
 LANCE = ["get", "put", "put_part", "head", "list", "delete", "copy", "rename", "multipart_complete",
          "multipart_abort"]
@@ -53,10 +57,18 @@ PASSES = 4
 REPETITIONS = 10
 
 
-def invoke(bench, config, cache, out, scenario, route, repetitions, stem):
-    """One `omnigraph-bench run`: its JSON, its stderr and the wall time of the whole process land under out/<stem>."""
+def invoke(bench, config, cache, out, scenario, route, repetitions, stem, store=None):
+    """One `omnigraph-bench run`: its JSON, its stderr and the wall time of the whole process land under out/<stem>.
+    `store` is the (store, product, backend) triple of the clone route."""
     argv = [str(bench), "run", scenario, "--config", str(config), "--dataset-cache", str(cache),
-            "--repetitions", str(repetitions), "--local-route", route, "--json"]
+            "--repetitions", str(repetitions), "--json"]
+    if route == CLONE:
+        location, product, backend = store
+        argv += ["--store", str(location), "--product", str(product)]
+        if backend:
+            argv += ["--backend", str(backend)]
+    else:
+        argv += ["--local-route", route]
     started = time.monotonic()
     done = subprocess.run(argv, capture_output=True, text=True)
     wall = time.monotonic() - started
@@ -107,13 +119,14 @@ def summarize(out, scenarios):
         print(f"binary: {build['binary']}, sha256 {build['sha256']}, modified {build['modified']}")
     asked = json.loads((out / "run.json").read_text()) if (out / "run.json").exists() else {}
     scenarios = scenarios or asked.get("scenarios") or SCENARIOS
+    routes = asked.get("routes") or ROUTES
     failed, withheld = 0, 0
     for scenario in scenarios:
         print(f"\n## {scenario}")
         print("route\tn\tmin_us\tp50_us\tmax_us\tx direct\tx object-store\tp50 per pass"
               "\tprocess wall s per repetition, per pass\twall p50 s\twall x direct")
         medians, wall_medians, rows, missing = {}, {}, [], []
-        for route in ROUTES:
+        for route in routes:
             samples, passes, walls, without = samples_of(out, scenario, route)
             for name in without:
                 missing.append(f"{name} gave no sample")
@@ -142,7 +155,7 @@ def summarize(out, scenarios):
             print(f"{route}\t{len(elapsed)}\t{elapsed[0]}\t{p50:.0f}\t{elapsed[-1]}\t{vs_direct}\t{vs_object}"
                   f"\t{per_pass}\t{wall}\t{wall_p50}\t{wall_vs}")
         print("route\tLance calls on __manifest\tLance calls on tables\tcontrol calls\tsame in every sample")
-        for route in ROUTES:
+        for route in routes:
             samples, _, _, _ = samples_of(out, scenario, route)
             if not samples:
                 continue
@@ -189,12 +202,20 @@ def main(argv):
     parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("out"),
                         help="output directory of this run; a used one is refused, so every pass under it is "
                              "the named binary's")
+    parser.add_argument("--store", help="adds the clone route: a directory or an s3:// prefix holding the bases")
+    parser.add_argument("--product", type=pathlib.Path, help="the release `omnigraph` the clone route measures")
+    parser.add_argument("--backend", help="the declared S3 backend of an s3:// store (JSON or a file)")
     args = parser.parse_args(argv[1:])
     if args.command == "summarize":
         return summarize(args.out, args.scenario)
     scenarios = args.scenario or SCENARIOS
+    routes = ROUTES + [CLONE] if args.store else ROUTES
+    store = (args.store, args.product, args.backend) if args.store else None
     if args.bench is None or args.cache is None:
         print("run needs --bench and --cache", file=sys.stderr)
+        return 2
+    if args.store and (args.product is None or not args.product.is_file()):
+        print("the clone route needs --product, the release omnigraph binary", file=sys.stderr)
         return 2
     if args.repetitions < 1 or args.passes < 1:
         print("run needs at least one pass of one repetition", file=sys.stderr)
@@ -222,18 +243,24 @@ def main(argv):
         "passes": args.passes,
         "repetitions": args.repetitions,
         "scenarios": scenarios,
+        "routes": routes,
+        "store": args.store,
     }, indent=2))
     failed = 0
     for scenario in scenarios:
         if invoke(args.bench, args.config, args.cache, args.out, scenario, "direct", 1, f"{scenario}.warmup"):
             print(f"{scenario}: the warm-up run failed, so nothing was measured; stopping", file=sys.stderr)
             return 1
+        if store and invoke(args.bench, args.config, args.cache, args.out, scenario, CLONE, 1,
+                            f"{scenario}.clone-warmup", store):
+            print(f"{scenario}: the clone warm-up run failed, so nothing was measured; stopping", file=sys.stderr)
+            return 1
         for pass_index in range(1, args.passes + 1):
-            order = ROUTES if pass_index % 2 else list(reversed(ROUTES))
+            order = routes if pass_index % 2 else list(reversed(routes))
             for route in order:
                 stem = f"{scenario}.{route}.pass{pass_index}"
                 failed += 1 if invoke(args.bench, args.config, args.cache, args.out, scenario, route,
-                                      args.repetitions, stem) else 0
+                                      args.repetitions, stem, store) else 0
     verdict = summarize(args.out, scenarios)
     return 1 if failed or verdict else 0
 

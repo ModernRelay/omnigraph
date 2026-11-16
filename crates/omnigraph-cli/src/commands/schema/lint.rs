@@ -60,7 +60,7 @@ pub(crate) async fn execute_query_lint(
             "lint requires --schema <schema.pg> or a direct graph target (--target NAME|ADDRESS)"
         )
     })?;
-    let db = crate::admission::open_read_only_with_binding(binding, None).await?;
+    let db = crate::admission::open_read_only_with_binding(binding, None, None).await?;
     Ok(lint_query_file(
         &db.catalog(),
         &query_source,

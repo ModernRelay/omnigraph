@@ -1,0 +1,35 @@
+gqt format 1
+header keys: issue, red_on, notes, traversal, csv_slice_bytes, overwrite_chunk_rows, writer
+sections: runner, schema, seed, csv, load, query, mutate, concurrent, params, expect, bind, restart, loop, foreach, endloop, seam
+expect modes: ok, unordered, ordered, error:, affected:, outcome:, shape, plan, same as v1
+corpus timeout_ms: at most 10000
+rules:
+  line_endings: a case file is UTF-8 with `\n` line endings
+  header_shape: every line before the first section is a header `# <key>: <value>`
+  unknown_header_key: a header key is one of issue, red_on, notes, traversal, csv_slice_bytes, overwrite_chunk_rows, writer
+  duplicate_header: a header key appears at most once
+  missing_issue: every case carries `# issue: <N>` or `# issue: none` as a header
+  missing_red_on: a case whose `# issue:` names a number carries `# red_on:` naming where the red showed
+  file_name: an issue case is `issue_<N>_<short_name>.gqt` matching its `# issue:`; a feature case is `<short_name>.gqt` over [a-z0-9_]
+  missing_runner: the first section is `--- runner` with explicit configuration
+  runner_config: the runner section is YAML with `timeout_ms` in 1..=600000 and 1 to 16 distinct `environments`, each a known `target` with its `storage` and, under DST, 1 to 64 distinct `seeds`
+  section_order: `--- runner` leads the file; `--- schema` then `--- seed` follow it together, once each; no later section repeats them; a `--- seam` is followed by the step it arms
+  unknown_section: a section header names a known section kind
+  body_shape: a section's body has the shape its kind takes: a header-only section carries none, a seed or expect body carries no `#` lines, `--- csv <name>` names one bare file, a generator recipe is YAML within its limits
+  query_parse: a query, mutate, schema or concurrent-session body parses under its grammar
+  step_kind: a `--- query` holds one read declaration or read statement and a `--- mutate` one mutation declaration or write statement, each with the arguments its kind takes
+  expect_mode_missing: every `--- expect` names its mode; the modes depend on the step kind
+  unknown_expect_mode: an expect mode is ok, unordered, ordered, error: <needle>, affected: nodes=<N> edges=<M> or outcome: <word>
+  expect_mode_for_step: an expect mode fits its step: rows modes on a read, `ok`, `error:` and `affected:` on a write, `outcome:` on a merge, `shape`, `plan` and `same as v1` on a read's rows expect
+  expect_without_step: every `--- expect` follows the step it completes, and `shape`, `plan` and `same as v1` follow the expect they extend
+  missing_expect: every step is followed by its `--- expect` section
+  missing_shape: a rows expect (`unordered` or `ordered`) is followed by its `--- expect shape` section
+  params_placement: `--- params` follows a query or mutate declaration step, once, and no other step kind
+  loop_header: `--- loop $var <start> <end>` names a `$[a-z][a-z0-9_]*` variable and plain bounds with start below end, at most 10000 apart; `--- foreach $var <v1> [<v2> ...]` lists values over [A-Za-z0-9_.-]
+  loop_structure: a loop holds at least one step, closes with a bare `--- endloop`, and nests no loop, bind, seam or concurrent block
+  bind_shape: `--- bind commit $name` follows a write expected to succeed, once per name, with no body
+  unbound_name: a `${name}` operand, a `snapshot: $name` or a `from commit ${name}` names a commit bound by an earlier `--- bind commit $name`
+  substitution_placement: `${...}` appears only in a params or expect body and names the enclosing loop's variable or a bound commit
+  batch_bound: a generated load's batch stays within 16 MiB and 4096 rows, with `commits` in 1..=rows and `batch_rows` producing exactly `commits` nonempty batches
+  corpus_timeout: a case under the required corpus (the runner's `cases/`, not `cases_slow/`) declares `timeout_ms` of at most 10000
+  invalid_case: a rule the parser states in its message

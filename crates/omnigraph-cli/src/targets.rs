@@ -318,6 +318,9 @@ pub(crate) enum TargetProvenance {
 pub(crate) struct ResolvedTarget {
     pub(crate) binding: TargetBinding,
     pub(crate) provenance: TargetProvenance,
+    /// The base of a graph shallow clone (`--base`): the direct target is
+    /// opened reading through this graph's root.
+    pub(crate) base: Option<String>,
     storage: std::sync::OnceLock<
         std::result::Result<omnigraph::storage::CapturedStorageBinding, String>,
     >,
@@ -327,6 +330,7 @@ impl ResolvedTarget {
         Self {
             binding,
             provenance,
+            base: None,
             storage: std::sync::OnceLock::new(),
         }
     }

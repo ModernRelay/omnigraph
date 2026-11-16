@@ -148,8 +148,13 @@ mod tests {
             None,
         );
         let mut bytes = Vec::new();
-        presentation.write_read(&read_output(), &mut bytes).unwrap();
-        assert_eq!(bytes, b"name\nAlice\n");
+        let mut output = read_output();
+        output.row_count = 2;
+        output.rows =
+            serde_json::value::RawValue::from_string(r#"[{"name":"Alice"},{"name":""}]"#.into())
+                .unwrap();
+        presentation.write_read(&output, &mut bytes).unwrap();
+        assert_eq!(bytes, b"name\nAlice\n\"\"\n");
     }
 
     struct FailsAfterPrefix {

@@ -95,33 +95,16 @@ enum Command {
         command: DatasetCommand,
     },
     /// Run a named scenario/group, custom config selection, or a legacy case file.
-    Run {
-        /// Scenario/group name; a legacy case YAML path is also accepted.
-        case: Option<PathBuf>,
-        /// Explicit config; paths in it resolve beside the YAML file.
-        #[arg(long, conflicts_with_all = ["dataset", "queries"])]
+    Run(Box<RunArgs>),
+    /// Print a store's run records of a scenario or group as a series.
+    Report {
+        /// Scenario/group name; the catalog's run list when absent.
+        scenario: Option<String>,
+        #[arg(long)]
         config: Option<PathBuf>,
+        /// The fixture store whose `records/` are read.
         #[arg(long)]
-        dataset: Option<PathBuf>,
-        #[arg(long)]
-        queries: Option<PathBuf>,
-        #[arg(long)]
-        repetitions: Option<u32>,
-        #[arg(long, default_value = "target/gqt-datasets")]
-        dataset_cache: PathBuf,
-        #[arg(long)]
-        no_build: bool,
-        #[arg(long = "fixture")]
-        fixtures: Vec<String>,
-        #[command(flatten)]
-        server_args: ServerArgs,
-        #[arg(long)]
-        archive: Option<PathBuf>,
-        /// Engine-target route to the fixture: `direct` (a restored copy),
-        /// `object-store` (that copy, all I/O through the object store) or
-        /// `read-through` (the frozen template, nothing restored; no record).
-        #[arg(long, default_value = "direct", conflicts_with = "archive")]
-        local_route: omnigraph_bench::gqt_evidence::LocalRouteKind,
+        store: String,
         #[arg(long)]
         json: bool,
     },
@@ -131,6 +114,59 @@ enum Command {
     /// Private bounded fixture-builder endpoint used by the supervising runner.
     #[command(name = "__dataset-worker-v1", hide = true)]
     FixtureWorkerV1 { request: PathBuf, result: PathBuf },
+}
+
+/// The arguments of `run`, boxed in [`Command`] so the subcommand enum stays
+/// the size of its smallest variants.
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    /// Scenario/group name; a legacy case YAML path is also accepted.
+    case: Option<PathBuf>,
+    /// Explicit config; paths in it resolve beside the YAML file.
+    #[arg(long, conflicts_with_all = ["dataset", "queries"])]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    dataset: Option<PathBuf>,
+    #[arg(long)]
+    queries: Option<PathBuf>,
+    #[arg(long)]
+    repetitions: Option<u32>,
+    #[arg(long, default_value = "target/gqt-datasets")]
+    dataset_cache: PathBuf,
+    #[arg(long)]
+    no_build: bool,
+    #[arg(long = "fixture")]
+    fixtures: Vec<String>,
+    #[command(flatten)]
+    server_args: ServerArgs,
+    #[arg(long)]
+    archive: Option<PathBuf>,
+    /// Engine-target route to the fixture: `direct` (a restored copy),
+    /// `object-store` (that copy, all I/O through the object store) or
+    /// `read-through` (the frozen template, nothing restored; no record).
+    #[arg(long, default_value = "direct", conflicts_with = "archive")]
+    local_route: omnigraph_bench::gqt_evidence::LocalRouteKind,
+    /// Fixture store of a clone-reset run: a directory or an `s3://`
+    /// prefix holding frozen bases; every repetition runs the product's
+    /// `omnigraph` over an empty clone of the scenario's base.
+    #[arg(long, conflicts_with = "server")]
+    store: Option<String>,
+    /// The declared S3 backend of an `s3://` store: a JSON object or the
+    /// path of a file holding one (`implementation`, `implementation_version`,
+    /// `region`, `storage_class`, `versioning`, `image_digest`).
+    #[arg(long, requires = "store")]
+    backend: Option<String>,
+    /// The product binary a `--store` run measures; `omnigraph` beside
+    /// this executable when unset.
+    #[arg(long, requires = "store", conflicts_with = "at")]
+    product: Option<PathBuf>,
+    /// A commit to measure against the same base, repeatable: `<ref>`
+    /// takes the commit's `omnigraph` from the store's `builds/` (built
+    /// from an archive on a miss and put there); `<ref>=<path>` names it.
+    #[arg(long = "at", requires = "store", conflicts_with = "archive")]
+    at: Vec<String>,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -404,12 +440,36 @@ struct ServerArgs {
     /// Name of the environment variable containing the bearer token.
     #[arg(long, requires = "server")]
     server_token_env: Option<String>,
+    /// Where the client stands to the server; a level of the point.
+    #[arg(
+        long,
+        requires = "server",
+        default_value = "same-host",
+        value_parser = ["same-host", "same-region", "remote"]
+    )]
+    network_position: String,
 }
 
 impl ServerArgs {
-    fn resolve(self) -> Result<Option<omnigraph_bench::gqt_served::ServedInput>, Diagnostic> {
+    /// The served input and the declared network position, or `None` for an
+    /// embedded run.
+    fn resolve(
+        self,
+    ) -> Result<
+        Option<(
+            omnigraph_bench::gqt_served::ServedInput,
+            omnigraph_bench::case::NetworkPosition,
+        )>,
+        Diagnostic,
+    > {
+        use omnigraph_bench::case::NetworkPosition;
         let Some(server) = self.server else {
             return Ok(None);
+        };
+        let position = match self.network_position.as_str() {
+            "same-host" => NetworkPosition::SameHost,
+            "same-region" => NetworkPosition::SameRegion,
+            _ => NetworkPosition::Remote,
         };
         let graph = self.graph.ok_or_else(|| {
             Diagnostic::error("invalid_server_input", "graph", "--graph is required")
@@ -427,7 +487,7 @@ impl ServerArgs {
             &receipt,
             self.server_token_env.as_deref(),
         )
-        .map(Some)
+        .map(|input| Some((input, position)))
         .map_err(|e| Diagnostic::error("invalid_server_input", e.path, e.message))
     }
 }
@@ -600,30 +660,74 @@ async fn main() -> ExitCode {
         Command::Fixture { command } => run_fixture(command).await,
         Command::Suite { command } => run_suite(command).await,
         Command::Archive { command } => run_archive(command),
+        Command::Report {
+            scenario,
+            config,
+            store,
+            json,
+        } => run_report(scenario, config, store, json).await,
         Command::Projection { command } => run_projection(command).await,
         Command::WorkerV2 => omnigraph_bench::gqt_worker::run_worker_stdio_v2().await,
         Command::FixtureWorkerV1 { request, result } => {
             omnigraph_bench::dataset_worker::run_dataset_worker_files_v1(&request, &result).await
         }
         Command::Dataset { command } => run_dataset(command).await,
-        Command::Run {
-            case,
-            config,
-            dataset,
-            queries,
-            repetitions,
-            dataset_cache,
-            no_build,
-            fixtures,
-            server_args,
-            archive,
-            local_route,
-            json,
-        } => {
+        Command::Run(args) => {
+            let RunArgs {
+                case,
+                config,
+                dataset,
+                queries,
+                repetitions,
+                dataset_cache,
+                no_build,
+                fixtures,
+                server_args,
+                archive,
+                local_route,
+                store,
+                backend,
+                product,
+                at,
+                json,
+            } = *args;
             let served = match server_args.resolve() {
                 Ok(input) => input,
                 Err(diagnostic) => return bench_cli::failure(vec![diagnostic], json),
             };
+            let backend = match backend.as_deref().map(declared_backend).transpose() {
+                Ok(backend) => backend,
+                Err(diagnostic) => return bench_cli::failure(vec![diagnostic], json),
+            };
+            let store_environment = match (&store, &backend) {
+                (Some(store), Some(backend)) if store.starts_with("s3://") => Some(
+                    omnigraph_bench::gqt_case::GqtEnvironment::embedded(backend.clone()),
+                ),
+                (Some(store), None) if store.starts_with("s3://") => {
+                    return bench_cli::failure(
+                        vec![Diagnostic::error(
+                            "invalid_run_input",
+                            "backend",
+                            "an s3:// store needs --backend, the declared S3 backend the record carries",
+                        )],
+                        json,
+                    );
+                }
+                (Some(_), Some(_)) => {
+                    return bench_cli::failure(
+                        vec![Diagnostic::error(
+                            "invalid_run_input",
+                            "backend",
+                            "--backend describes an s3:// store; a local store's backend is probed",
+                        )],
+                        json,
+                    );
+                }
+                _ => None,
+            };
+            let run_reset = store
+                .is_some()
+                .then_some(omnigraph_bench::case::ResetMode::Clone);
             let legacy = if config.is_none() {
                 match case.as_deref().map(bench_cli::legacy_input).transpose() {
                     Ok(legacy) => legacy.unwrap_or(false),
@@ -663,26 +767,62 @@ async fn main() -> ExitCode {
                     },
                     None => None,
                 };
-                let suite = match catalog.resolve(selector, repetitions) {
-                    Ok(s) => s,
-                    Err(e) => return bench_cli::failure(e, json),
+                let environment = match (&served, store_environment) {
+                    (Some((input, position)), _) => omnigraph_bench::catalog::served_environment(
+                        input.receipt.backend.clone(),
+                        *position,
+                    ),
+                    (None, Some(environment)) => environment,
+                    (None, None) => omnigraph_bench::catalog::local_environment(),
                 };
+                let suite =
+                    match catalog.resolve_with(selector, repetitions, &environment, run_reset) {
+                        Ok(s) => s,
+                        Err(e) => return bench_cli::failure(e, json),
+                    };
+                if !at.is_empty() {
+                    let store = store.expect("--at requires --store");
+                    return run_at(
+                        suite,
+                        at,
+                        store,
+                        backend,
+                        dataset_cache,
+                        no_build,
+                        fixtures,
+                        json,
+                    )
+                    .await;
+                }
                 return run_resolved_suite(
                     suite,
                     None,
                     RunOptions {
                         dataset_cache: Some(dataset_cache),
-                        served,
+                        served: served.map(|(input, _)| input),
                         no_build,
                         fixture_bindings: fixtures,
                         worker_executable: std::env::current_exe().ok(),
                         local_route,
+                        store,
+                        backend,
+                        product,
                         ..Default::default()
                     },
                     archive,
                     json,
                 )
                 .await;
+            }
+            if !at.is_empty() {
+                return bench_cli::failure(
+                    vec![Diagnostic::error(
+                        "invalid_run_input",
+                        "at",
+                        "--at runs a catalog scenario or group, never a legacy case file",
+                    )],
+                    json,
+                );
             }
             let case = match path::absolute(case.expect("legacy route requires a path")) {
                 Ok(path) => path,
@@ -744,11 +884,14 @@ async fn main() -> ExitCode {
                 None,
                 RunOptions {
                     dataset_cache: Some(dataset_cache),
-                    served,
+                    served: served.map(|(input, _)| input),
                     no_build,
                     fixture_bindings: fixtures,
                     worker_executable: std::env::current_exe().ok(),
                     local_route,
+                    store,
+                    backend,
+                    product,
                     ..Default::default()
                 },
                 archive,
@@ -757,6 +900,27 @@ async fn main() -> ExitCode {
             .await
         }
     }
+}
+
+/// `--backend`: the declared S3 backend as a JSON object, inline or in a file.
+fn declared_backend(text: &str) -> Result<omnigraph_bench::case::Backend, Diagnostic> {
+    let source = if text.trim_start().starts_with('{') {
+        text.to_string()
+    } else {
+        fs::read_to_string(text).map_err(|e| {
+            Diagnostic::error("invalid_run_input", "backend", format!("{text}: {e}"))
+        })?
+    };
+    let backend: omnigraph_bench::case::Backend = serde_json::from_str(&source)
+        .map_err(|e| Diagnostic::error("invalid_run_input", "backend", e.to_string()))?;
+    if !matches!(backend, omnigraph_bench::case::Backend::S3 { .. }) {
+        return Err(Diagnostic::error(
+            "invalid_run_input",
+            "backend",
+            "--backend declares an S3 backend; a local store's backend is probed",
+        ));
+    }
+    Ok(backend)
 }
 
 #[derive(Debug, Serialize)]
@@ -1286,7 +1450,7 @@ async fn run_suite(command: SuiteCommand) -> ExitCode {
                 filesystem,
             } = *args;
             let served = match server_args.resolve() {
-                Ok(input) => input,
+                Ok(input) => input.map(|(input, _)| input),
                 Err(diagnostic) => return bench_cli::failure(vec![diagnostic], json),
             };
             let options = RunOptions {
@@ -1297,6 +1461,10 @@ async fn run_suite(command: SuiteCommand) -> ExitCode {
                 fixture_bindings: fixtures,
                 worker_executable: std::env::current_exe().ok(),
                 local_route: Default::default(),
+                store: None,
+                backend: None,
+                product: None,
+                product_commit: None,
             };
             if let Some(file) = file {
                 return run_suite_execution(&file, case.as_deref(), options, archive, json).await;
@@ -1328,7 +1496,7 @@ async fn run_suite(command: SuiteCommand) -> ExitCode {
                     vec![Diagnostic::error(
                         "invalid_server_input",
                         "server",
-                        "served runs select a catalog scenario whose YAML declares the server environment; explicit pairs are embedded only",
+                        "served runs select a catalog scenario; explicit pairs are embedded only",
                     )],
                     json,
                 );
@@ -1633,9 +1801,26 @@ async fn run_resolved_suite(
     archive: Option<PathBuf>,
     json: bool,
 ) -> ExitCode {
+    match execute_resolved_suite(suite, selector, options, archive, json).await {
+        Ok(output) if json => print_json_success(&output),
+        Ok(output) => print_execution(&output),
+        Err(code) => code,
+    }
+}
+
+/// Runs the selection and returns its output, or the exit code of a failure
+/// already printed. A `--store` run without `--archive` puts every completed
+/// record into the store.
+async fn execute_resolved_suite(
+    suite: ResolvedSuite,
+    selector: Option<&str>,
+    options: RunOptions,
+    archive: Option<PathBuf>,
+    json: bool,
+) -> Result<SuiteRunOutput, ExitCode> {
     let selected = match select_runs(&suite, selector) {
         Ok(selected) => selected,
-        Err(diagnostic) => return print_cli_failure(diagnostic, json),
+        Err(diagnostic) => return Err(print_cli_failure(diagnostic, json)),
     };
     for run in &selected {
         let validation = run.case.gqt().map_err(|e| e.to_string()).and_then(|plan| {
@@ -1643,17 +1828,17 @@ async fn run_resolved_suite(
                 .map_err(|e| e.to_string())
         });
         if let Err(message) = validation {
-            return bench_cli::failure(
+            return Err(bench_cli::failure(
                 vec![Diagnostic::error("invalid_run_input", "run", message)],
                 json,
-            );
+            ));
         }
     }
     let recording = match archive {
         Some(root) => match RecordingContext::new(root.clone()) {
             Ok(context) => Some(context),
             Err(error) => {
-                return print_recording_failure(
+                return Err(print_recording_failure(
                     &suite,
                     0,
                     None,
@@ -1662,11 +1847,24 @@ async fn run_resolved_suite(
                     Some(&root),
                     &error,
                     json,
-                );
+                ));
             }
         },
         None => None,
     };
+    let store = match (&options.store, &recording) {
+        (Some(uri), None) => match omnigraph_bench::store::FixtureStore::open(uri) {
+            Ok(store) => Some((store, Ulid::new())),
+            Err(error) => {
+                return Err(print_cli_failure(
+                    Diagnostic::error(&error.code, "store", error.message),
+                    json,
+                ));
+            }
+        },
+        _ => None,
+    };
+    let mut store_receipts = Vec::new();
     // Raw samples already become durable authority one record at a time. In
     // archive mode, retaining them all again in the CLI result would make
     // memory grow with the complete suite and defeat streaming publication.
@@ -1697,7 +1895,7 @@ async fn run_resolved_suite(
                     ) {
                         Ok(censored) => censored,
                         Err(recording_error) => {
-                            return print_recording_failure(
+                            return Err(print_recording_failure(
                                 &suite,
                                 completed_run_count,
                                 partial_run.as_ref(),
@@ -1706,7 +1904,7 @@ async fn run_resolved_suite(
                                 Some(&recording.archive_root),
                                 &recording_error.with_acquisition_failure(&error),
                                 json,
-                            );
+                            ));
                         }
                     }
                 } else {
@@ -1722,7 +1920,7 @@ async fn run_resolved_suite(
                             error.context.settled_sample = None;
                         }
                         Err(recording_error) => {
-                            return print_recording_failure(
+                            return Err(print_recording_failure(
                                 &suite,
                                 completed_run_count,
                                 Some(&partial),
@@ -1731,11 +1929,11 @@ async fn run_resolved_suite(
                                 Some(&recording.archive_root),
                                 &recording_error.with_acquisition_failure(&error),
                                 json,
-                            );
+                            ));
                         }
                     }
                 }
-                return print_runner_failure(
+                return Err(print_runner_failure(
                     &suite,
                     completed_run_count,
                     diagnostic_runs.as_deref(),
@@ -1743,25 +1941,25 @@ async fn run_resolved_suite(
                     recording.as_ref(),
                     &error,
                     json,
-                );
+                ));
             }
         };
         if !bound_points.insert(execution.point_id.clone()) {
-            return print_cli_failure(
+            return Err(print_cli_failure(
                 Diagnostic::error(
                     "duplicate_point_id",
                     "suite",
                     "two planned recipes bound to the same dataset point",
                 ),
                 json,
-            );
+            ));
         }
         if let Some(recording) = &recording {
             let invocation = invocation.expect("recording context minted an invocation");
             match recording.publish(run, &execution, invocation) {
                 Ok(receipt) => receipts.push(receipt),
                 Err(error) => {
-                    return print_recording_failure(
+                    return Err(print_recording_failure(
                         &suite,
                         completed_run_count.saturating_add(1),
                         Some(&execution),
@@ -1770,10 +1968,34 @@ async fn run_resolved_suite(
                         Some(&recording.archive_root),
                         &error,
                         json,
-                    );
+                    ));
                 }
             }
         } else {
+            if let Some((store, session)) = &store {
+                let record = match omnigraph_bench::gqt_record::build(
+                    &execution,
+                    invocation_in_session(*session),
+                    None,
+                ) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        return Err(print_cli_failure(
+                            Diagnostic::error("record_build_failed", "store", format!("{error:?}")),
+                            json,
+                        ));
+                    }
+                };
+                match store.put_record(&record).await {
+                    Ok(receipt) => store_receipts.push(receipt),
+                    Err(error) => {
+                        return Err(print_cli_failure(
+                            Diagnostic::error(&error.code, "store", error.message),
+                            json,
+                        ));
+                    }
+                }
+            }
             diagnostic_runs
                 .as_mut()
                 .expect("diagnostic mode retains executions")
@@ -1781,7 +2003,7 @@ async fn run_resolved_suite(
         }
         completed_run_count = completed_run_count.saturating_add(1);
     }
-    let output = SuiteRunOutput {
+    Ok(SuiteRunOutput {
         runner_output_version: RUNNER_OUTPUT_VERSION,
         suite: suite.definition.name,
         suite_path: suite.suite_path,
@@ -1795,11 +2017,606 @@ async fn run_resolved_suite(
             session_id: recording.session_id.to_string(),
             records: receipts,
         }),
+        store_records: store.map(|(store, session)| StoreRecordsOutput {
+            store: store.uri(),
+            session_id: session.to_string(),
+            records: store_receipts,
+        }),
+    })
+}
+
+/// One invocation identity inside a session: never below the session's
+/// timestamp and never the session id itself.
+fn invocation_in_session(session_id: Ulid) -> InvocationIdentityV1 {
+    let candidate = Ulid::new();
+    let mut invocation = if candidate.timestamp_ms() < session_id.timestamp_ms() {
+        Ulid::from_parts(session_id.timestamp_ms(), candidate.random())
+    } else {
+        candidate
+    };
+    if invocation == session_id {
+        invocation = Ulid::from_parts(invocation.timestamp_ms(), invocation.random() ^ 1);
+    }
+    InvocationIdentityV1 {
+        invocation_id: invocation.to_string(),
+        session_id: session_id.to_string(),
+        invoked_at_unix_ms: invocation.timestamp_ms(),
+    }
+}
+
+/// The records a `--store` run put: the store, the session they share and
+/// one receipt per completed run.
+#[derive(Debug, Serialize)]
+struct StoreRecordsOutput {
+    store: String,
+    session_id: String,
+    records: Vec<omnigraph_bench::store::StoreRecordReceiptV1>,
+}
+
+/// One `--at` target: the ref as given, the commit it resolved to and the
+/// product binary measured for it.
+#[derive(Debug, Serialize)]
+struct AtOutput {
+    reference: String,
+    commit: String,
+    product: omnigraph_bench::gqt_runner::ProductBinary,
+    output: SuiteRunOutput,
+}
+
+#[derive(Debug, Serialize)]
+struct AtRunOutput {
+    runner_output_version: u32,
+    store: String,
+    at: Vec<AtOutput>,
+}
+
+/// One `run --at` invocation's own, absolute staging directory under the
+/// dataset cache, removed when the invocation ends (the store holds every
+/// product that was put).
+struct ProductStaging(PathBuf);
+
+impl Drop for ProductStaging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `run --at a --at b`: every ref's product resolved and inspected before
+/// any run, then the selection run once per ref against the same store, the
+/// results side by side.
+#[allow(clippy::too_many_arguments)]
+async fn run_at(
+    suite: ResolvedSuite,
+    at: Vec<String>,
+    store: String,
+    backend: Option<omnigraph_bench::case::Backend>,
+    dataset_cache: PathBuf,
+    no_build: bool,
+    fixtures: Vec<String>,
+    json: bool,
+) -> ExitCode {
+    let environment = omnigraph_bench::gqt_runner::product_environment();
+    let fixture_store = match omnigraph_bench::store::FixtureStore::open(&store) {
+        Ok(store) => store,
+        Err(error) => {
+            return print_cli_failure(Diagnostic::error(&error.code, "store", error.message), json);
+        }
+    };
+    let scratch =
+        match std::path::absolute(dataset_cache.join("products").join(Ulid::new().to_string())) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                return print_cli_failure(
+                    Diagnostic::error("invalid_run_input", "dataset-cache", error.to_string()),
+                    json,
+                );
+            }
+        };
+    if let Err(error) = fs::create_dir_all(&scratch) {
+        return print_cli_failure(
+            Diagnostic::error("invalid_run_input", "dataset-cache", error.to_string()),
+            json,
+        );
+    }
+    let _staging = ProductStaging(scratch.clone());
+    let mut references = Vec::new();
+    for spec in &at {
+        let (reference, path) = match spec.split_once('=') {
+            Some((reference, path)) => (reference, Some(PathBuf::from(path))),
+            None => (spec.as_str(), None),
+        };
+        match git_commit(reference) {
+            Ok(commit) => references.push((reference, commit, path)),
+            Err(diagnostic) => return print_cli_failure(diagnostic, json),
+        }
+    }
+    let mut targets = Vec::new();
+    for (reference, commit, path) in references {
+        let path = match path {
+            Some(path) => path,
+            None => match product_at(&fixture_store, &commit, &scratch).await {
+                Ok(path) => path,
+                Err(diagnostic) => return print_cli_failure(diagnostic, json),
+            },
+        };
+        let product = match omnigraph_bench::gqt_runner::inspect_product(
+            &path,
+            Some(commit.clone()),
+            &environment,
+        ) {
+            Ok(product) => product,
+            Err(error) if error.code == "product_schema_mismatch" => {
+                return print_cli_failure(
+                    Diagnostic::error(
+                        "not_comparable",
+                        "at",
+                        format!("not comparable: {reference}: {}", error.message),
+                    ),
+                    json,
+                );
+            }
+            Err(error) => {
+                return print_cli_failure(
+                    Diagnostic::error(&error.code, "at", error.message),
+                    json,
+                );
+            }
+        };
+        targets.push((reference.to_string(), commit, product));
+    }
+    let mut outputs = Vec::new();
+    for (reference, commit, product) in targets {
+        let options = RunOptions {
+            dataset_cache: Some(dataset_cache.clone()),
+            no_build,
+            fixture_bindings: fixtures.clone(),
+            worker_executable: std::env::current_exe().ok(),
+            store: Some(store.clone()),
+            backend: backend.clone(),
+            product: Some(product.path.clone()),
+            product_commit: Some(commit.clone()),
+            ..Default::default()
+        };
+        match execute_resolved_suite(suite.clone(), None, options, None, json).await {
+            Ok(output) => outputs.push(AtOutput {
+                reference,
+                commit,
+                product,
+                output,
+            }),
+            Err(code) => {
+                if !outputs.is_empty() {
+                    let completed = AtRunOutput {
+                        runner_output_version: RUNNER_OUTPUT_VERSION,
+                        store,
+                        at: outputs,
+                    };
+                    if json {
+                        for target in &completed.at {
+                            eprintln!(
+                                "completed before `{reference}` failed: {} {} ({} record(s) put)",
+                                target.reference,
+                                &target.commit[..12],
+                                target
+                                    .output
+                                    .store_records
+                                    .as_ref()
+                                    .map(|records| records.records.len())
+                                    .unwrap_or(0)
+                            );
+                        }
+                    } else {
+                        eprintln!("`{reference}` failed; the refs completed before it:");
+                        print_at_table(&completed);
+                    }
+                }
+                return code;
+            }
+        }
+    }
+    let output = AtRunOutput {
+        runner_output_version: RUNNER_OUTPUT_VERSION,
+        store,
+        at: outputs,
     };
     if json {
-        print_json_success(&output)
-    } else {
-        print_execution(&output)
+        return print_json_success(&output);
+    }
+    print_at_table(&output);
+    ExitCode::SUCCESS
+}
+
+fn print_at_table(output: &AtRunOutput) {
+    println!("scenario\tref\tcommit\tversion\tn\tmin_us\tp50_us\tmax_us\tlance_calls_p50\trecords");
+    for target in &output.at {
+        for run in target.output.runs.as_deref().unwrap_or_default() {
+            let mut calls: Vec<u64> = run
+                .samples
+                .iter()
+                .filter_map(|sample| sample.logical_store_calls.as_ref())
+                .filter_map(|logical| {
+                    let manifest =
+                        omnigraph_bench::projection::sum_call_counts(logical.manifest).ok()?;
+                    let table = omnigraph_bench::projection::sum_call_counts(logical.table).ok()?;
+                    manifest.checked_add(table)
+                })
+                .collect();
+            calls.sort_unstable();
+            let lance = calls
+                .get((calls.len().max(1) - 1) / 2)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                run.case_id,
+                target.reference,
+                &target.commit[..12],
+                target.product.package_version,
+                run.samples.len(),
+                run.wall_clock.min_us,
+                run.wall_clock.p50_us,
+                run.wall_clock.max_us,
+                lance,
+                target
+                    .output
+                    .store_records
+                    .as_ref()
+                    .map(|records| records.records.len())
+                    .unwrap_or(0)
+            );
+        }
+    }
+}
+
+/// The full lowercase commit a ref names in the working directory's repository.
+fn git_commit(reference: &str) -> Result<String, Diagnostic> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", &format!("{reference}^{{commit}}")])
+        .output()
+        .map_err(|e| Diagnostic::error("invalid_run_input", "at", format!("git: {e}")))?;
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success()
+        || commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(Diagnostic::error(
+            "invalid_run_input",
+            "at",
+            format!(
+                "`{reference}` names no commit here: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    Ok(commit)
+}
+
+/// The commit's `omnigraph`: the store's cached build, else built from an
+/// archive of the commit (a clean tree by construction) with the spelling
+/// the release packaging uses, and put under the commit for the next run.
+async fn product_at(
+    store: &omnigraph_bench::store::FixtureStore,
+    commit: &str,
+    scratch: &Path,
+) -> Result<PathBuf, Diagnostic> {
+    let key = omnigraph_bench::store::BuildKey {
+        commit,
+        target_triple: env!("OMNIGRAPH_BENCH_TARGET_TRIPLE"),
+        product: "omnigraph",
+    };
+    let at = |error: omnigraph_bench::runner::RunnerError| {
+        Diagnostic::error(&error.code, "at", error.message)
+    };
+    let io = |context: &str, error: std::io::Error| {
+        Diagnostic::error("invalid_run_input", "at", format!("{context}: {error}"))
+    };
+    let directory = scratch.join(&commit[..12]);
+    fs::create_dir_all(&directory).map_err(|e| io("product scratch", e))?;
+    let destination = directory.join("omnigraph");
+    if destination.is_file() {
+        return Ok(destination);
+    }
+    if let Some(path) = store.resolve_build(key, &destination).await.map_err(at)? {
+        return Ok(path);
+    }
+    let source = directory.join("src");
+    let archive = directory.join("src.tar");
+    fs::create_dir_all(&source).map_err(|e| io("source directory", e))?;
+    for (program, args) in [
+        (
+            "git",
+            vec![
+                "archive",
+                "--format=tar",
+                "-o",
+                &*archive.to_string_lossy(),
+                commit,
+            ],
+        ),
+        (
+            "tar",
+            vec![
+                "-xf",
+                &*archive.to_string_lossy(),
+                "-C",
+                &*source.to_string_lossy(),
+            ],
+        ),
+        (
+            "cargo",
+            vec![
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "omnigraph-cli",
+                "--bin",
+                "omnigraph",
+            ],
+        ),
+    ] {
+        let mut command = std::process::Command::new(program);
+        command.args(&args);
+        if program == "cargo" {
+            command
+                .current_dir(&source)
+                .env("CARGO_TARGET_DIR", directory.join("target"))
+                .env("RUSTFLAGS", "")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS");
+        }
+        let output = command.output().map_err(|e| io(program, e))?;
+        if !output.status.success() {
+            return Err(Diagnostic::error(
+                "product_build_failed",
+                "at",
+                format!(
+                    "`{program} {}` exited {} for {commit}: {}",
+                    args.join(" "),
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .rev()
+                        .take(20)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            ));
+        }
+    }
+    fs::copy(directory.join("target/release/omnigraph"), &destination)
+        .map_err(|e| io("built binary", e))?;
+    store.put_build(key, &destination, true).await.map_err(at)?;
+    Ok(destination)
+}
+
+/// One record of a store in the series `report` prints.
+#[derive(Debug, Serialize)]
+struct ReportRow {
+    case_id: String,
+    point_id: String,
+    point_name: String,
+    machine: String,
+    invocation_id: String,
+    invoked_at_unix_ms: u64,
+    sut: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<String>,
+    version: String,
+    status: String,
+    requested_repetitions: u32,
+    observed_repetitions: u32,
+    min_us: u64,
+    p50_us: u64,
+    max_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p95_us: Option<u64>,
+    record: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportGroup {
+    case_id: String,
+    point_id: String,
+    point_name: String,
+    machine: String,
+    rows: Vec<ReportRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportOutput {
+    runner_output_version: u32,
+    store: String,
+    scenarios: Vec<String>,
+    groups: Vec<ReportGroup>,
+}
+
+/// `report <scenario|group> --store <uri>`: the store's records of the
+/// selection, one row per record, grouped by point and machine; never a
+/// factor across groups.
+async fn run_report(
+    selector: Option<String>,
+    config: Option<PathBuf>,
+    store: String,
+    json: bool,
+) -> ExitCode {
+    let catalog = match bench_cli::load(&bench_cli::CatalogArgs { config, json }) {
+        Ok(catalog) => catalog,
+        Err(diagnostics) => return bench_cli::failure(diagnostics, json),
+    };
+    let scenarios = match catalog.selection(selector.as_deref()) {
+        Ok(ids) => ids,
+        Err(diagnostics) => return bench_cli::failure(diagnostics, json),
+    };
+    let fixture_store = match omnigraph_bench::store::FixtureStore::open(&store) {
+        Ok(store) => store,
+        Err(error) => {
+            return print_cli_failure(Diagnostic::error(&error.code, "store", error.message), json);
+        }
+    };
+    let uris = match fixture_store.list_records().await {
+        Ok(uris) => uris,
+        Err(error) => {
+            return print_cli_failure(Diagnostic::error(&error.code, "store", error.message), json);
+        }
+    };
+    let mut rows = Vec::new();
+    for uri in uris {
+        let bytes = match fixture_store.read_record(&uri).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return print_cli_failure(
+                    Diagnostic::error(&error.code, "store", error.message),
+                    json,
+                );
+            }
+        };
+        let record: omnigraph_bench::gqt_record::AnyRunRecordV1 =
+            match serde_json::from_slice(&bytes) {
+                Ok(record) => record,
+                Err(error) => {
+                    return print_cli_failure(
+                        Diagnostic::error("record_invalid", "store", format!("{uri}: {error}")),
+                        json,
+                    );
+                }
+            };
+        let omnigraph_bench::gqt_record::AnyRunRecordV1::Gqt(record) = record else {
+            continue;
+        };
+        if !scenarios.contains(&record.run.case_id) {
+            continue;
+        }
+        rows.push(report_row(&record, uri));
+    }
+    rows.sort_by(|a, b| {
+        (&a.case_id, &a.point_id, &a.machine, a.invoked_at_unix_ms).cmp(&(
+            &b.case_id,
+            &b.point_id,
+            &b.machine,
+            b.invoked_at_unix_ms,
+        ))
+    });
+    let mut groups: Vec<ReportGroup> = Vec::new();
+    for row in rows {
+        match groups.last_mut() {
+            Some(group)
+                if group.case_id == row.case_id
+                    && group.point_id == row.point_id
+                    && group.machine == row.machine =>
+            {
+                group.rows.push(row)
+            }
+            _ => groups.push(ReportGroup {
+                case_id: row.case_id.clone(),
+                point_id: row.point_id.clone(),
+                point_name: row.point_name.clone(),
+                machine: row.machine.clone(),
+                rows: vec![row],
+            }),
+        }
+    }
+    let output = ReportOutput {
+        runner_output_version: RUNNER_OUTPUT_VERSION,
+        store,
+        scenarios,
+        groups,
+    };
+    if json {
+        return print_json_success(&output);
+    }
+    for group in &output.groups {
+        println!(
+            "## {} point={} machine={}",
+            group.case_id, group.point_name, group.machine
+        );
+        println!("invoked_at_unix_ms\tcommit\tsut\tversion\tn\tmin_us\tp50_us\tmax_us\tstatus");
+        for row in &group.rows {
+            println!(
+                "{}\t{}\t{}\t{}\t{}/{}\t{}\t{}\t{}\t{}",
+                row.invoked_at_unix_ms,
+                row.commit
+                    .as_deref()
+                    .map(|c| &c[..c.len().min(12)])
+                    .unwrap_or("-"),
+                row.sut,
+                row.version,
+                row.observed_repetitions,
+                row.requested_repetitions,
+                row.min_us,
+                row.p50_us,
+                row.max_us,
+                row.status
+            );
+        }
+    }
+    if output.groups.is_empty() {
+        println!(
+            "no records of {:?} under {}",
+            output.scenarios, output.store
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn report_row(record: &omnigraph_bench::gqt_record::GqtRunRecordV1, uri: String) -> ReportRow {
+    use omnigraph_bench::gqt_record::GqtSutIdentityV1;
+    let (sut, commit, version, declared_machine) = match &record.sut {
+        GqtSutIdentityV1::Embedded(sut) => (
+            "embedded",
+            Some(sut.source_commit.clone()),
+            sut.package_version.clone(),
+            None,
+        ),
+        GqtSutIdentityV1::Served(sut) => (
+            "declared-deployment",
+            Some(sut.receipt.server.source_commit.clone()),
+            sut.receipt.server.package_version.clone(),
+            sut.receipt
+                .machine
+                .as_ref()
+                .map(|machine| machine.machine_label.clone()),
+        ),
+        GqtSutIdentityV1::Product(sut) => (
+            "product-binary",
+            sut.source_commit
+                .clone()
+                .or_else(|| sut.requested_commit.clone()),
+            sut.package_version.clone(),
+            None,
+        ),
+    };
+    let wall = &record.measurements.wall_clock;
+    ReportRow {
+        case_id: record.run.case_id.clone(),
+        point_id: record.run.point_id.clone(),
+        point_name: record.run.point_name.clone(),
+        machine: record
+            .machine
+            .as_ref()
+            .map(|machine| machine.machine_label.clone())
+            .or(declared_machine)
+            .unwrap_or_else(|| "declared".into()),
+        invocation_id: record.invocation.invocation_id.clone(),
+        invoked_at_unix_ms: record.invocation.invoked_at_unix_ms,
+        sut,
+        commit,
+        version,
+        status: serde_json::to_value(record.acquisition.status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default(),
+        requested_repetitions: record.acquisition.requested_repetitions,
+        observed_repetitions: record.acquisition.observed_repetitions,
+        min_us: wall.min_us,
+        p50_us: wall.p50_us,
+        max_us: wall.max_us,
+        p95_us: wall.p95_us,
+        record: uri,
     }
 }
 
@@ -1819,6 +2636,9 @@ struct SuiteRunOutput {
     runs: Option<Vec<RunExecution>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     durable_archive: Option<DurableArchiveOutput>,
+    /// Present for a `--store` run: the records put into the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_records: Option<StoreRecordsOutput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1860,7 +2680,20 @@ fn print_execution(output: &SuiteRunOutput) -> ExitCode {
                 record.invocation_id, record.record_sha256, record.object_relative_path
             );
         }
-    } else {
+    }
+    if let Some(store) = &output.store_records {
+        println!(
+            "put {} run record{} into {} (session {})",
+            store.records.len(),
+            if store.records.len() == 1 { "" } else { "s" },
+            store.store,
+            store.session_id
+        );
+        for record in &store.records {
+            println!("  sha256={} object={}", record.record_sha256, record.uri);
+        }
+    }
+    if output.durable_archive.is_none() {
         println!("diagnostic output only; no durable benchmark record was written");
     }
     ExitCode::SUCCESS
@@ -1880,6 +2713,10 @@ fn print_run_execution(run: &RunExecution) {
                 .server_receipt
                 .as_ref()
                 .map(|r| r.dataset.logical_content_sha256.as_str()))
+            .or_else(|| run
+                .base
+                .as_ref()
+                .map(|b| b.summary.logical_content_sha256.as_str()))
             .unwrap_or("absent"),
         run.dataset_cache_hit
             .map(|hit| hit.to_string())
@@ -2532,6 +3369,7 @@ mod tests {
             local_route: None,
             completed_run_count: 1,
             runs: None,
+            store_records: None,
             durable_archive: Some(DurableArchiveOutput {
                 archive_format_version: 1,
                 archive_root: PathBuf::from("archive"),
