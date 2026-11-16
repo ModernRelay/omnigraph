@@ -8,19 +8,23 @@ open work in issues.
 
 Before every task and every change:
 
-1. Read [architectural invariants](docs/dev/invariants.md). Apply the hard
+1. Read [the contract and the work](docs/dev/contract.md): the observable
+   contract Omnigraph promises and the dated hypothesis of the work it serves.
+   Name the clause a change keeps and the workload row it serves.
+2. Read [architectural invariants](docs/dev/invariants.md). Apply the hard
    invariants and deny-list to implementation and review work.
-2. Consult the domain map in [Lance alignment](docs/dev/lance.md). Fetch and
+3. Consult the domain map in [Lance alignment](docs/dev/lance.md). Fetch and
    read the **complete content** of every page in the matching domain plus every
    page that is even slightly relevant. The index and summaries are not
    substitutes for the upstream pages. A reliable local form is
    `curl -sL <url> | pandoc -f html -t markdown`.
-3. Read [testing](docs/dev/testing.md). Find the existing owner and run a clean
+4. Read [testing](docs/dev/testing.md). Find the existing owner and run a clean
    focused baseline before changing tests. Extend an existing assertion,
    fixture, or parameterization before creating a parallel setup.
 
 Tools that support `@` imports include these automatically:
 
+@docs/dev/contract.md
 @docs/dev/invariants.md
 @docs/dev/lance.md
 @docs/dev/testing.md
@@ -77,6 +81,7 @@ authority model.
 |---|---|
 | Use Omnigraph | [User guide](docs/user/index.md) |
 | Change Omnigraph | [Developer guide](docs/dev/index.md) |
+| State the contract and the workload | [The contract and the work](docs/dev/contract.md) |
 | Review architectural rules | [Invariants](docs/dev/invariants.md) |
 | Align with Lance | [Lance guide](docs/dev/lance.md) |
 | Find test ownership | [Testing guide](docs/dev/testing.md) |
@@ -97,7 +102,7 @@ views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
 Always validate your assumptions and don't assume a certain function/modules/symbol will work in a certain way. Especially always validate your assumptions about Lance internals by reading the implementations in the upstream code.
 Reason from first principles about Omnigraph instead of in arbitrary database categories.
-Fundamentally, a database is **an observable contract, implemented by physical mechanisms optimized for an expected distribution of work**. Therefore, you should always be explicit and aware what observable contract and distribution of work you are implementing for and what tradeoffs you are making. Read [first principles data systems](docs/dev/systems.md)
+Fundamentally, a database is **an observable contract, implemented by physical mechanisms optimized for an expected distribution of work**. Therefore, you should always be explicit and aware what observable contract and distribution of work you are implementing for and what tradeoffs you are making. Read [first principles data systems](docs/dev/systems.md) for the method and [the contract and the work](docs/dev/contract.md) for Omnigraph's own contract clauses and workload hypothesis.
 
 The full rules live in [invariants](docs/dev/invariants.md). Keep these in
 working memory:

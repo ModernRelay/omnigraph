@@ -209,6 +209,8 @@ code, tests, guide, and—when irreversible—RFC.
 
 ## Review checklist
 
+- Which clause of [the contract](contract.md) does it keep or extend, and
+  which row of the workload hypothesis does it serve?
 - Does one snapshot or authority token cover the whole operation?
 - Is graph visibility still one manifest publication?
 - Is every pre-publication durable effect unreachable until the manifest names

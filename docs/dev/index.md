@@ -16,6 +16,7 @@ change boundaries, and test ownership. Design history and proposals belong in
 
 | Topic | Guide |
 |---|---|
+| The observable contract and the workload hypothesis | [The contract and the work](contract.md) |
 | Components, authority, and read/write/control flows | [Architecture](architecture.md) |
 | Non-negotiable guarantees and deny-list | [Architectural invariants](invariants.md) |
 | Query planning, traversal, search, and mutation orchestration | [Execution](execution.md) |
