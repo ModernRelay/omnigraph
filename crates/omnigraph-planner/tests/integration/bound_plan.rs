@@ -614,12 +614,6 @@ fn expression_mirror_preserves_every_typed_interior_and_nested_cast() {
             value_type(ScalarType::String, false),
         )
     };
-    let field = || Box::new(prop("d", "text"));
-    let rank = || IRExpr::Bm25 {
-        field: field(),
-        query: Box::new(text()),
-        ty: value_type(ScalarType::F32, false),
-    };
     let mut expressions = vec![
         IRExpr::Nearest {
             variable: "d".into(),
@@ -627,7 +621,6 @@ fn expression_mirror_preserves_every_typed_interior_and_nested_cast() {
             query: Box::new(text()),
             ty: value_type(ScalarType::F32, false),
         },
-        rank(),
         IRExpr::Not(
             Box::new(IRExpr::Param(
                 "flag".into(),

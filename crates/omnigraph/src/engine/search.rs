@@ -27,11 +27,6 @@ pub(super) struct SearchMode {
     /// ranked type satisfies an Expand's first hop. Read off the `Pass` by
     /// `Lowering::search_mode`; an RRF arm's pass never carries it.
     pub(super) answer_proven_empty: bool,
-    /// BM25 full-text search on the scan's binding.
-    pub(super) bm25: Option<Bm25Target>,
-    /// The plan places the scan's eligibility after scoring: its filter
-    /// runs as Lance's postfilter, so BM25 statistics read every row.
-    pub(super) eligibility_after_scoring: bool,
     /// The set a gate ANDs into the ranked scan as `id IN (...)`, read off the
     /// `Pass` by `Lowering::search_mode`; the arms an `rrf()` prefilter feeds
     /// are the plan's `Prefilter.feeds`.
@@ -45,13 +40,6 @@ pub(super) struct NearestTarget {
     pub(super) property: String,
     pub(super) vector: Vec<f32>,
     pub(super) k: usize,
-}
-
-/// `bm25($v.property, q)` as one scan runs it: the bound query text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Bm25Target {
-    pub(super) property: String,
-    pub(super) text: String,
 }
 
 /// The overfetch ladder's rung for one nearest scan: the candidates it asks
@@ -658,10 +646,8 @@ pub(super) async fn nearest_prefilter_gate(
         }
         EligibleOutcome::FallBack { fallback, eligible } => {
             let verdict = fall_back(fallback, eligible, Some(corpus));
-            let plan = match (fallback, prefilter.on_empty) {
-                (RrfGateFallback::EmptyEligible, omnigraph_planner::EmptyEligible::ProvenEmpty) => {
-                    NearestGatePlan::ProvenEmpty
-                }
+            let plan = match fallback {
+                RrfGateFallback::EmptyEligible => NearestGatePlan::ProvenEmpty,
                 _ => NearestGatePlan::Postfilter,
             };
             (plan, verdict)

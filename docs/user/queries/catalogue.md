@@ -203,7 +203,6 @@ binary's rows.
 | Sort | routable |
 | TableScan | routable |
 | TargetCut | refused_by_name |
-| TextSearch | refused_by_name |
 | Union | refused_by_name |
 | Validate | refused_by_name |
 <!-- /catalogue:logical_kinds -->

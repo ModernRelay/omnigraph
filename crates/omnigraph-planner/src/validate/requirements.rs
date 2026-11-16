@@ -32,8 +32,7 @@ pub trait KeyIds: Sync {
     fn canonical_key_id(&self, type_key: &str, value: &Literal, ty: &ExprType) -> Option<String>;
 }
 
-/// One retrieval a search order names: `nearest($v.p, q)` or `bm25($v.p, q)`,
-/// with the query argument as the plan's ranked scan carries it.
+/// One retrieval a search order names, `nearest($v.p, q)`, with the query argument as the plan's ranked scan carries it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Retrieval {
     pub kind: RankKind,
@@ -56,25 +55,8 @@ impl Retrieval {
                 property: property.clone(),
                 query: query.as_ref().clone(),
             }),
-            IRExpr::Bm25 { field, query, .. } => match field.as_ref() {
-                IRExpr::PropAccess {
-                    variable, property, ..
-                } => Some(Self {
-                    kind: RankKind::Bm25,
-                    binding: variable.clone(),
-                    property: property.clone(),
-                    query: query.as_ref().clone(),
-                }),
-                _ => None,
-            },
             _ => None,
         }
-    }
-
-    /// The approximation the retrieval's contract declares: `nearest`
-    /// membership is approximate even when a run scores flat; `bm25` is exact.
-    pub fn approximate(&self) -> bool {
-        self.kind == RankKind::Nearest
     }
 }
 
@@ -474,7 +456,7 @@ pub struct Requirements {
     pub(crate) aggregate: bool,
     /// A ranking drawn as a pattern step (`PatternStep::Rank`) rather than
     /// led by the `order`: its `nearest` window `k` in targets, `None` for
-    /// one with no window (`bm25`). Its score leads no sort, and the
+    /// one with no window. Its score leads no sort, and the
     /// eligibility conjuncts after it run over the selected rows.
     pub(crate) window: Option<Option<u64>>,
     /// That step's declared `recall:`; `recall: 1` probes without a cap.

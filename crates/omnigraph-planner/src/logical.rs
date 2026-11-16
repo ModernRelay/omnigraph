@@ -282,7 +282,6 @@ logical_kinds! {
     Sort => "Sort", Routable;
     TableScan => "TableScan", Routable;
     TargetCut => "TargetCut", RefusedByName;
-    TextSearch => "TextSearch", RefusedByName;
     Union => "Union", RefusedByName;
     Validate => "Validate", RefusedByName;
 }
@@ -334,7 +333,6 @@ impl IndexQuery {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeInput {
     Nearest,
-    FullText,
     EligibleIds,
     JoinFilter,
     DynamicExpression,
@@ -670,15 +668,6 @@ pub enum LogicalNode {
         /// any other bound takes the session's probe policy.
         recall: Option<f64>,
     },
-    /// A leading `order { bm25($v.prop, q) }`: the full-text ranking, `_score`.
-    TextSearch {
-        input: LogicalId,
-        binding: String,
-        property: String,
-        query: IRExpr,
-        reads: Vec<ColumnRef>,
-        leads: bool,
-    },
     /// `from rrf(arm, …)` (the GQ 3 RFC, section 4,
     /// Fusion): each arm's subtree yields rows binding `target` in its
     /// rank order; the node yields one row per target any arm selected, the
@@ -789,7 +778,6 @@ impl LogicalNode {
             Self::Union { .. } => LogicalKind::Union,
             Self::OuterReference { .. } => LogicalKind::OuterReference,
             Self::Nearest { .. } => LogicalKind::Nearest,
-            Self::TextSearch { .. } => LogicalKind::TextSearch,
             Self::Fuse { .. } => LogicalKind::Fuse,
             Self::Aggregate { .. } => LogicalKind::Aggregate,
         }
@@ -806,7 +794,6 @@ impl LogicalNode {
             | Self::RowDiff { input, .. }
             | Self::Expand { input, .. }
             | Self::Nearest { input, .. }
-            | Self::TextSearch { input, .. }
             | Self::TargetCut { input, .. }
             | Self::Score { input, .. }
             | Self::Let { input, .. }
@@ -845,7 +832,6 @@ impl LogicalNode {
             | Self::RowDiff { input, .. }
             | Self::Expand { input, .. }
             | Self::Nearest { input, .. }
-            | Self::TextSearch { input, .. }
             | Self::TargetCut { input, .. }
             | Self::Score { input, .. }
             | Self::Let { input, .. }
@@ -1234,19 +1220,6 @@ impl LogicalPlan {
                 }
                 value
             }
-            LogicalNode::TextSearch {
-                query,
-                binding,
-                property,
-                reads,
-                ..
-            } => json!({
-                "node": "TextSearch",
-                "binding": binding,
-                "property": property,
-                "typed_query": crate::typed::expr(query),
-                "reads": rendered(reads),
-            }),
             LogicalNode::Fuse {
                 arms,
                 target,

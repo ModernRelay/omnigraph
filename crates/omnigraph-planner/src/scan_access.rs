@@ -57,7 +57,6 @@ pub async fn finalize_scan_access(
             ScanAccess::Runtime {
                 input: match ranked.kind {
                     RankKind::Nearest => RuntimeInput::Nearest,
-                    RankKind::Bm25 => RuntimeInput::FullText,
                 },
             }
         } else if let Some(input) = source.scan_runtime_input(spec) {

@@ -10,7 +10,7 @@ use lance_index::is_system_index;
 use lance_table::format::IndexMetadata;
 
 use crate::error::{OmniError, Result};
-use crate::fts_compat::{DeclaredAnalyzers, verify_index};
+use crate::fts_compat::verify_index;
 
 /// Whether a `key_col IN (...)` scan on a dataset will be served by the
 /// persisted scalar (BTREE) index, or silently fall back to a full filtered
@@ -68,33 +68,21 @@ impl FtsFilterDemand {
 
 /// Check only full-text reads, against this exact snapshot's artifacts.
 /// SQL SDK filters are inspected as typed expressions, not string-matched.
-/// `declared` holds the analyzer each column's accepted schema declares.
-pub async fn validate_full_text_scan(
-    ds: &Dataset,
-    scanner: &Scanner,
-    columns: Option<HashSet<String>>,
-    declared: &DeclaredAnalyzers,
-) -> Result<()> {
+pub async fn validate_full_text_scan(ds: &Dataset, scanner: &Scanner) -> Result<()> {
     let filter_demand = match scanner.get_expr_filter().map_err(OmniError::storage)? {
         Some(filter) => FtsFilterDemand::from_filter(&filter),
         None => FtsFilterDemand::default(),
     };
-    validate_full_text_demand(ds, columns, filter_demand, declared).await
+    validate_full_text_demand(ds, filter_demand).await
 }
 
-/// The validation proper, over an already-derived demand: `columns` is
-/// the full-text query's column set (`Some(empty)` = every FTS column),
-/// `filter_demand` what the filters read through `contains_tokens`.
-pub async fn validate_full_text_demand(
-    ds: &Dataset,
-    columns: Option<HashSet<String>>,
-    filter_demand: FtsFilterDemand,
-    declared: &DeclaredAnalyzers,
-) -> Result<()> {
+/// The validation proper, over an already-derived demand: what the filters
+/// read through `contains_tokens`. A raw filter holds no schema, so any
+/// certified analysis of a segment it reads is accepted.
+pub async fn validate_full_text_demand(ds: &Dataset, filter_demand: FtsFilterDemand) -> Result<()> {
     crate::instrumentation::record_fts_validation();
-    let all_columns = columns.as_ref().is_some_and(HashSet::is_empty) || filter_demand.all_columns;
-    let mut requested = columns.unwrap_or_default();
-    requested.extend(filter_demand.columns);
+    let all_columns = filter_demand.all_columns;
+    let requested = filter_demand.columns;
     if !all_columns && requested.is_empty() {
         return Ok(());
     }
@@ -110,15 +98,7 @@ pub async fn validate_full_text_demand(
             (is_full_text_index(index) || index.index_details.is_none())
                 && (all_columns || index.fields.iter().any(|field| fields.contains(field)))
         }) {
-            // A segment over one field proves that field's declared analysis.
-            let expected = match index.fields.as_slice() {
-                [field] => ds
-                    .schema()
-                    .field_by_id(*field)
-                    .and_then(|field| declared.fingerprint(&field.name)),
-                _ => None,
-            };
-            verify_index(ds, index, expected).await?;
+            verify_index(ds, index, None).await?;
         }
         Ok(())
     })

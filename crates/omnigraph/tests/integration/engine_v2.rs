@@ -773,7 +773,6 @@ async fn explain_search_uses_vector_params_without_initializing_embeddings() {
         assert_eq!(unavailable, !available, "{source}");
         assert!(probes.node_scan_projections.lock().unwrap().is_empty());
         assert_eq!(probes.ann_scan_rows.load(Ordering::Relaxed), 0);
-        assert_eq!(probes.bm25_scan_rows.load(Ordering::Relaxed), 0);
         assert_eq!(probes.graph_build_count.load(Ordering::Relaxed), 0);
     }
 }

@@ -30,8 +30,8 @@ impl PlannedRanking {
     }
 
     /// The ranked `nearest` scans: the scan of a `nearest` order or window,
-    /// or every `nearest` scan of a fusion's arms, in node order. A `bm25` scan has
-    /// no candidate window, so a `bm25` ranking names none.
+    /// or every `nearest` scan of a fusion's arms, in node order. An exact
+    /// `bm25` has no candidate window, so a `bm25` ranking names none.
     pub fn nearest_scans(&self) -> &[NodeId] {
         &self.nearest_scans
     }
@@ -85,11 +85,7 @@ pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, Pl
             SearchFunction::Rrf,
             target,
             RRF_COLUMN,
-            scans
-                .iter()
-                .filter(|(_, kind, _)| *kind == RankKind::Nearest)
-                .map(|(id, ..)| *id)
-                .collect(),
+            scans.iter().map(|(id, ..)| *id).collect(),
         ),
         (None, []) => match exact_bm25.as_slice() {
             [binding] => (
@@ -105,11 +101,7 @@ pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, Pl
             binding
                 .ok_or_else(|| PlanError::Internal(format!("ranked scan {id} has no binding")))?,
             kind.score().0,
-            if *kind == RankKind::Nearest {
-                vec![*id]
-            } else {
-                Vec::new()
-            },
+            vec![*id],
         ),
         (None, scans) => {
             return Err(PlanError::Internal(format!(
@@ -140,7 +132,6 @@ pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, Pl
 fn search_function(kind: RankKind) -> SearchFunction {
     match kind {
         RankKind::Nearest => SearchFunction::Nearest,
-        RankKind::Bm25 => SearchFunction::Bm25,
     }
 }
 

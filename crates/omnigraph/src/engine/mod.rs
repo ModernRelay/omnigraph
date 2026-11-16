@@ -77,9 +77,7 @@ pub(crate) use explain::{explain_document, explain_load_rows, explain_rows};
 pub(crate) use graph::{EmbeddingResolver, GraphIndexHandle};
 use lower::Lowering;
 use plan_source::{ExplainedQuery, QuerySource, accept_query, explain_query};
-pub(crate) use plan_source::{
-    accept_replay, engine_bounds, replay_refused, replayed_coverage_holds,
-};
+pub(crate) use plan_source::{accept_replay, engine_bounds, replay_refused};
 pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};
 use run::{pass_rows, run_plan};
@@ -913,8 +911,6 @@ mod traversal_admission_tests {
                 direction: Direction::Out,
             }],
             feeds,
-            on_empty: omnigraph_planner::EmptyEligible::ProvenEmpty,
-            coverage_admits: true,
         };
         let mut plan = selected_plan();
         let input = 0;
@@ -962,7 +958,6 @@ mod traversal_admission_tests {
                 scope: RankScope::Order,
                 overfetch: vec![],
                 prefilter: None,
-                eligibility: omnigraph_planner::Eligibility::BeforeScoring,
                 policy: Some(omnigraph_planner::NearestPolicy::DEFAULT),
             }),
         };

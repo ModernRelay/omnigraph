@@ -20,7 +20,6 @@ pub(crate) fn expr(root: &IRExpr) -> Value {
                 let (op, children): (&'static str, Vec<&IRExpr>) = match expr {
                     IRExpr::PropAccess { .. } => ("property", vec![]),
                     IRExpr::Nearest { query, .. } => ("nearest", vec![query]),
-                    IRExpr::Bm25 { field, query, .. } => ("bm25", vec![field, query]),
                     IRExpr::Variable(_, _) => ("variable", vec![]),
                     IRExpr::Param(_, _) => ("param", vec![]),
                     IRExpr::Literal(_, _) => ("literal", vec![]),

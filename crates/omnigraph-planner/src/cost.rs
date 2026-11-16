@@ -480,7 +480,6 @@ fn estimate_rows_over(
         | LogicalNode::Sort { input, .. }
         | LogicalNode::Ordered { input, .. }
         | LogicalNode::RowDiff { input, .. }
-        | LogicalNode::TextSearch { input, .. }
         | LogicalNode::AntiJoin { input, .. }
         | LogicalNode::OptionalJoin { input, .. }
         | LogicalNode::TargetCut { input, .. }

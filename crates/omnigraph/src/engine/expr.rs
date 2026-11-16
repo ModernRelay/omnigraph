@@ -346,7 +346,6 @@ fn evaluate_boolean(
         }
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
-        | IRExpr::Bm25 { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Param(_, _)
         | IRExpr::Literal(_, _)
@@ -537,10 +536,7 @@ pub(super) fn evaluate_expr(
             typed_literal_to_array(lit, ty, batch.num_rows())?
         }
         IRExpr::AliasRef(name, _) => alias_column(batch, name)?,
-        IRExpr::Nearest { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::Aggregate { .. } => {
+        IRExpr::Nearest { .. } | IRExpr::Variable(_, _) | IRExpr::Aggregate { .. } => {
             return Err(OmniError::manifest(format!(
                 "unsupported expression in filter: {expr}"
             )));
@@ -753,9 +749,10 @@ pub(super) fn evaluate_projection(
         | IRExpr::Neg { .. }
         | IRExpr::Call { .. } => Ok((expr.to_string(), evaluate_expr(wide_batch, expr, params)?)),
         IRExpr::AliasRef(name, _) => Ok((name.clone(), alias_column(wide_batch, name)?)),
-        IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } | IRExpr::Aggregate { .. } => Err(
-            OmniError::manifest(format!("unsupported projection expression: {}", expr)),
-        ),
+        IRExpr::Nearest { .. } | IRExpr::Aggregate { .. } => Err(OmniError::manifest(format!(
+            "unsupported projection expression: {}",
+            expr
+        ))),
     }
 }
 

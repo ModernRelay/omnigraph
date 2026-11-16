@@ -34,7 +34,7 @@ use crate::validate::ValidationSummary;
 /// Version 9 (GQ 3): the node kind `RankFuse` was removed and `Fuse` added,
 /// a fusion of 2 to 16 arm subtrees, each naming how it ranks its targets,
 /// and the node kinds `TargetCut`, `Score`, `Let`, `Union`, `OptionalJoin`
-/// and `Correlate` were added.
+/// and `Correlate` were added, and `TextSearch` was removed.
 pub const EXPLAIN_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

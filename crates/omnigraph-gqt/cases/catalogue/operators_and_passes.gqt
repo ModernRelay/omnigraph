@@ -122,7 +122,6 @@ query logical_kinds() {
 {"k.name":"Score","k.coverage":"refused_by_name"}
 {"k.name":"Sort","k.coverage":"routable"}
 {"k.name":"TableScan","k.coverage":"routable"}
-{"k.name":"TextSearch","k.coverage":"refused_by_name"}
 {"k.name":"Union","k.coverage":"refused_by_name"}
 {"k.name":"TargetCut","k.coverage":"refused_by_name"}
 {"k.name":"Validate","k.coverage":"refused_by_name"}

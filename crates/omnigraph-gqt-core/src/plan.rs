@@ -12,11 +12,9 @@
 //! hash join $d
 //! hash join $d ran id_lookup
 //! anti join $x: key_set
-//! scan Doc as $d: ranked bm25
 //! scan Doc as $d: ranked nearest fetch 10
 //! scan Doc as $d: ranked nearest fetch 10 nprobes 20
 //! scan Doc as $d: ranked nearest diagnostics present
-//! scan Doc as $d: ranked bm25 eligibility after_scoring
 //! expand $d Knows $e: mode indexed_scan
 //! expand $d Knows $e: mode indexed_scan ran csr
 //! contains join $p.text contains $m.number
@@ -141,8 +139,6 @@ pub(crate) enum PlanLine {
         index: String,
         fetch: Option<u64>,
         nprobes: Option<u64>,
-        /// Where the scan applies its eligibility, when claimed.
-        eligibility: Option<String>,
         /// Every selected nearest scan must have a measured attempt.
         diagnostics: bool,
     },
@@ -646,42 +642,29 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             let mut words = ranked.split_whitespace();
             let kind = words
                 .next()
-                .filter(|kind| ["nearest", "bm25"].contains(kind))
-                .ok_or_else(|| refused("claims `ranked nearest` or `ranked bm25`"))?;
+                .filter(|kind| *kind == "nearest")
+                .ok_or_else(|| refused("claims `ranked nearest`"))?;
             let mut fetch = None;
             let mut nprobes = None;
-            let mut eligibility = None;
             let mut diagnostics = false;
             while let Some(key) = words.next() {
                 let value = words.next();
                 let count = value.and_then(|count| count.parse::<u64>().ok());
                 match (key, count, value) {
                     ("fetch", Some(count), _)
-                        if fetch.is_none()
-                            && nprobes.is_none()
-                            && eligibility.is_none()
-                            && !diagnostics =>
+                        if fetch.is_none() && nprobes.is_none() && !diagnostics =>
                     {
                         fetch = Some(count);
                     }
-                    ("nprobes", Some(count), _)
-                        if nprobes.is_none() && eligibility.is_none() && !diagnostics =>
-                    {
+                    ("nprobes", Some(count), _) if nprobes.is_none() && !diagnostics => {
                         nprobes = Some(count);
                     }
-                    ("eligibility", _, Some(placement))
-                        if eligibility.is_none()
-                            && !diagnostics
-                            && ["before_scoring", "after_scoring"].contains(&placement) =>
-                    {
-                        eligibility = Some(placement.to_string());
-                    }
-                    ("diagnostics", _, Some("present")) if kind == "nearest" && !diagnostics => {
+                    ("diagnostics", _, Some("present")) if !diagnostics => {
                         diagnostics = true;
                     }
                     _ => {
                         return Err(refused(
-                            "claims `ranked <kind>[ fetch <n>][ nprobes <n>][ eligibility <before_scoring|after_scoring>][ diagnostics present]`: each key optional, at most once, in that order; diagnostics requires nearest",
+                            "claims `ranked nearest[ fetch <n>][ nprobes <n>][ diagnostics present]`: each key optional, at most once, in that order",
                         ));
                     }
                 }
@@ -692,7 +675,6 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                 index: kind.to_string(),
                 fetch,
                 nprobes,
-                eligibility,
                 diagnostics,
             });
             continue;
@@ -974,7 +956,6 @@ struct PlannedRanking {
     kind: String,
     fetch: Option<u64>,
     nprobes: Option<u64>,
-    eligibility: Option<String>,
 }
 
 /// `<choice>[ ran <choice>]` over the words `allowed`: the planned choice
@@ -1073,7 +1054,7 @@ fn typed_node(value: &Value) -> Result<TypedNode, String> {
     let valid_arity = match op {
         "property" | "variable" | "param" | "literal" | "alias" | "count_rows" => args.is_empty(),
         "nearest" | "aggregate" | "not" | "is_null" | "cast" | "neg" => args.len() == 1,
-        "search" | "match_text" | "bm25" | "and" | "or" | "compare" | "arith" => args.len() == 2,
+        "search" | "match_text" | "and" | "or" | "compare" | "arith" => args.len() == 2,
         "fuzzy" => (2..=3).contains(&args.len()),
         "rrf" => (2..=4).contains(&args.len()),
         "if" => args.len() == 3,
@@ -1379,10 +1360,6 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
                     nprobes: ranked
                         .get("nprobes")
                         .map(|nprobes| nprobes.as_u64().unwrap_or(0)),
-                    eligibility: ranked
-                        .get("eligibility")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
                 }),
             runtime_filter: node
                 .get("runtime_filter")
@@ -1805,7 +1782,6 @@ pub(crate) fn plan_mismatch(
                 index: kind,
                 fetch,
                 nprobes,
-                eligibility,
                 diagnostics,
             } => {
                 let selected = match physical_scans(&nodes, type_name, binding.as_deref()) {
@@ -1870,15 +1846,6 @@ pub(crate) fn plan_mismatch(
                                 "expect plan: the `{kind}` scans of `{type_name}` fetch {fetches:?}, expected {fetch}"
                             ),
                         });
-                    }
-                }
-                if let Some(eligibility) = eligibility {
-                    let placements: Vec<Option<&str>> =
-                        of_kind.iter().map(|r| r.eligibility.as_deref()).collect();
-                    if !placements.contains(&Some(eligibility.as_str())) {
-                        return Some(format!(
-                            "expect plan: the `{kind}` scans of `{type_name}` apply eligibility {placements:?}, expected {eligibility}"
-                        ));
                     }
                 }
                 if let Some(nprobes) = nprobes {
@@ -2726,27 +2693,6 @@ mod tests {
         assert!(parse_plan_body(&[(0, "validation scope everything")]).is_err());
     }
 
-    /// The eligibility claim reads the ranked scan's declared placement.
-    #[test]
-    fn eligibility_claims_read_the_ranked_scans_placement() {
-        let explain = json!({"physical_plan": {"node": "Scan", "table": "node:Doc", "binding": "d",
-            "ranked": {"kind": "bm25", "fetch": null, "eligibility": "after_scoring"}}});
-        let lines =
-            parse_plan_body(&[(0, "scan Doc as $d: ranked bm25 eligibility after_scoring")])
-                .unwrap();
-        assert_eq!(check(&lines, &explain), None);
-        let lines =
-            parse_plan_body(&[(0, "scan Doc as $d: ranked bm25 eligibility before_scoring")])
-                .unwrap();
-        let mismatch = check(&lines, &explain).unwrap();
-        assert!(mismatch.contains("expected before_scoring"), "{mismatch}");
-        assert!(parse_plan_body(&[(0, "scan Doc: ranked bm25 eligibility sometimes")]).is_err());
-        assert!(
-            parse_plan_body(&[(0, "scan Doc: ranked bm25 eligibility after_scoring fetch 1")])
-                .is_err()
-        );
-    }
-
     #[test]
     fn a_read_column_fails_the_negative_form() {
         let lines = parse_plan_body(&[(0, "scan Doc: not columns [slug]")]).unwrap();
@@ -3299,7 +3245,6 @@ mod tests {
                 index: "nearest".to_string(),
                 fetch: Some(10),
                 nprobes: None,
-                eligibility: None,
                 diagnostics: false,
             }
         );
@@ -3316,7 +3261,6 @@ mod tests {
         });
         assert_eq!(check(&lines, &explain), None);
         for (claim, message) in [
-            ("scan Doc as $d: ranked bm25", "is ranked by [\"nearest\"]"),
             (
                 "scan Doc as $d: ranked nearest fetch 3",
                 "fetches 10, expected 3",
@@ -3336,11 +3280,11 @@ mod tests {
         }
         let unranked =
             json!({"physical_plan": {"node": "Scan", "table": "node:Doc", "binding": "d"}});
-        let lines = parse_plan_body(&[(0, "scan Doc as $d: ranked bm25")]).unwrap();
+        let lines = parse_plan_body(&[(0, "scan Doc as $d: ranked nearest")]).unwrap();
         assert!(check(&lines, &unranked).unwrap().contains("is not ranked"));
         let uncapped = json!({"physical_plan": {"node": "Scan", "table": "node:Doc", "binding": "d",
-            "ranked": {"kind": "bm25", "fetch": null}}});
-        let lines = parse_plan_body(&[(0, "scan Doc as $d: ranked bm25 fetch 10")]).unwrap();
+            "ranked": {"kind": "nearest", "fetch": null}}});
+        let lines = parse_plan_body(&[(0, "scan Doc as $d: ranked nearest fetch 10")]).unwrap();
         assert!(check(&lines, &uncapped).unwrap().contains("has no fetch"));
         let no_cap = json!({"physical_plan": {"node": "Scan", "table": "node:Doc", "binding": "d",
             "ranked": {"kind": "nearest", "fetch": 10, "nprobes": null}}});
@@ -3350,15 +3294,14 @@ mod tests {
         let fused = json!({"physical_plan": {"node": "Fuse", "inputs": [
             {"node": "Scan", "table": "node:Doc", "binding": "d",
              "ranked": {"kind": "nearest", "fetch": 3, "scope": "primary"}},
-            {"node": "Scan", "table": "node:Doc", "binding": "d",
-             "ranked": {"kind": "bm25", "fetch": null, "scope": "secondary"}}
+            {"node": "Scan", "table": "node:Doc", "binding": "d"}
         ]}});
-        let lines = parse_plan_body(&[
-            (0, "scan Doc as $d: ranked nearest fetch 3"),
-            (1, "scan Doc as $d: ranked bm25"),
-        ])
-        .unwrap();
-        assert_eq!(check(&lines, &fused), None, "one scan per arm");
+        let lines = parse_plan_body(&[(0, "scan Doc as $d: ranked nearest fetch 3")]).unwrap();
+        assert_eq!(
+            check(&lines, &fused),
+            None,
+            "an exact arm's unranked scan beside the ranked one"
+        );
         let lines = parse_plan_body(&[(0, "scan Doc as $d: ranked nearest fetch 4")]).unwrap();
         assert!(
             check(&lines, &fused)
@@ -3374,7 +3317,6 @@ mod tests {
                 index: "nearest".to_string(),
                 fetch: None,
                 nprobes: Some(20),
-                eligibility: None,
                 diagnostics: false,
             }
         );
@@ -3383,15 +3325,15 @@ mod tests {
             None,
             "`fetch` is optional beside `nprobes`"
         );
-        // Each nearest arm needs its own measured attempt. A BM25 sibling
-        // needs none, and the diagnostic can belong to a later probe position.
+        // Each nearest arm needs its own measured attempt. An exact sibling's
+        // unranked scan needs none, and the diagnostic can belong to a later
+        // probe position.
         let measured = json!({"physical_plan": {"node": "Fuse", "inputs": [
             {"node": "Scan", "id": 2, "table": "node:Doc", "binding": "d",
              "ranked": {"kind": "nearest", "fetch": 3}},
             {"node": "Scan", "id": 5, "table": "node:Doc", "binding": "d",
              "ranked": {"kind": "nearest", "fetch": 3}},
-            {"node": "Scan", "id": 7, "table": "node:Doc", "binding": "d",
-             "ranked": {"kind": "bm25"}}
+            {"node": "Scan", "id": 7, "table": "node:Doc", "binding": "d"}
         ]}});
         let mut value = json!({"rows": [], "search": [
             {"id": 2, "rung": 0, "decision": "probes", "attempts": [{"maximum_nprobes": 1, "flat": false, "rows": 0}, {"maximum_nprobes": 2, "flat": false, "rows": 3}]},
@@ -3462,13 +3404,12 @@ mod tests {
             "scan Doc as $d: ranked nearest diagnostics present diagnostics present",
             "scan Doc as $d: ranked nearest diagnostics present fetch 3",
             "scan Doc as $d: ranked nearest diagnostics present nprobes 3",
-            "scan Doc as $d: ranked nearest diagnostics present eligibility before_scoring",
-            "scan Doc as $d: ranked bm25 diagnostics present",
+            "scan Doc as $d: ranked bm25",
             "scan Doc as $d: ranked",
             "scan Doc as $d: ranked fuzzy",
-            "scan Doc as $d: ranked bm25 fetch",
-            "scan Doc as $d: ranked bm25 fetch ten",
-            "scan Doc as $d: ranked bm25 limit 10",
+            "scan Doc as $d: ranked nearest fetch",
+            "scan Doc as $d: ranked nearest fetch ten",
+            "scan Doc as $d: ranked nearest limit 10",
             "scan Doc as $d: ranked nearest nprobes 4 fetch 10",
             "scan Doc as $d: ranked nearest nprobes 4 nprobes 4",
             "scan Doc as $d: ranked nearest fetch 10 nprobes",

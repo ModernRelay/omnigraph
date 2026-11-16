@@ -26,7 +26,7 @@ pub use replay::{
     accept_replay, catalog_digest, decode_replay,
 };
 pub use requirements::{KeyIds, Requirements};
-pub use subset::{ChainNode, ChainRanking, Derivation, Rule, Step};
+pub use subset::{ChainNode, Derivation, Rule, Step};
 
 use crate::read_shape::ReadShape;
 use omnigraph_compiler::catalog::Catalog;
@@ -41,7 +41,7 @@ use crate::physical::PhysicalPlan;
 /// the query is a member of the closed exact fragment and every rewrite from
 /// its canonical form to the plan was reconstructed and compared;
 /// `invariants_only`: the plan was checked against the query's requirements
-/// (search identity, retained predicates, score origin, approximation,
+/// (search identity, retained predicates, score origin,
 /// order and cut, declared policies), which does not prove row-selection
 /// equivalence. Only the validator chooses it; nothing upgrades it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -20,9 +20,8 @@ use omnigraph_compiler::types::Direction;
 use omnigraph_planner::{
     AcceptInput, AcceptedBoundPlan, AcceptedPlan, AdjacencyProof, Bounds, DatasetPin,
     EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics, Explain,
-    FragmentStat, FullTextCoverage, GatePolicy, IndexFact, KeyIds, NodeTypeSpec, Operation,
-    PlanError, PlanSource, PrefilterMode, ReplayEnvelope, ReplayRefusal, SideId, TableRef,
-    Unrouted, ValidationLimits,
+    FragmentStat, GatePolicy, IndexFact, KeyIds, NodeTypeSpec, Operation, PlanError, PlanSource,
+    PrefilterMode, ReplayEnvelope, ReplayRefusal, SideId, TableRef, Unrouted, ValidationLimits,
 };
 use omnigraph_planner::{PatternStep, ReadShape};
 
@@ -133,9 +132,6 @@ struct TableStatistics {
     file_bytes: Option<u64>,
     column_bytes: HashMap<String, u64>,
     index_facts: Vec<IndexFact>,
-    /// The pinned version's current fragments: one with none holds no row a
-    /// full-text call could answer differently.
-    fragments: usize,
 }
 
 impl<'a> QuerySource<'a> {
@@ -283,18 +279,6 @@ impl<'a> QuerySource<'a> {
 }
 
 impl PlanSource for QuerySource<'_> {
-    /// A table the snapshot does not hold has no rows, so nothing is refused;
-    /// otherwise the coverage its pinned index facts and fragments establish,
-    /// the rule replay applies to the same version.
-    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
-        match self.table_stats.get(type_key) {
-            Some(stats) => {
-                FullTextCoverage::of_table(&stats.index_facts, property, stats.fragments)
-            }
-            None => FullTextCoverage::Full,
-        }
-    }
-
     fn canonical_key_id(
         &self,
         type_key: &str,
@@ -678,47 +662,6 @@ pub(crate) fn accept_replay(
     omnigraph_planner::accept_replay(envelope, &input).map_err(replay_refused)
 }
 
-/// Re-establish from the pinned snapshot every full-text coverage fact a
-/// replayed plan records, since a serialized fact cannot vouch for itself:
-/// a pinned dataset version fixes its index coverage, so a recorded value
-/// that differs, or one for a table the plan pins no version of, is invalid
-/// evidence. The dataset pins are checked first (`plan_pins_snapshot`).
-pub(crate) async fn replayed_coverage_holds(
-    plan: &omnigraph_planner::PhysicalPlan,
-    snapshot: &Snapshot,
-) -> Result<()> {
-    let refuse = |reason: String| replay_refused(ReplayRefusal::InvalidEvidence { reason });
-    for (key, recorded) in &plan.assumptions().full_text {
-        let Some((type_key, property)) = key.rsplit_once('.') else {
-            return Err(refuse(format!(
-                "the plan records full-text coverage under `{key}`, which names no table property"
-            )));
-        };
-        if !plan.assumptions().datasets.contains_key(type_key) {
-            return Err(refuse(format!(
-                "the plan records full-text coverage of `{key}` without pinning `{type_key}`"
-            )));
-        }
-        let actual = match snapshot.dataset(type_key) {
-            Some(_) => {
-                let dataset = snapshot.open_lance_dataset(type_key).await?;
-                FullTextCoverage::of_table(
-                    &indexes::gather(&dataset).await?,
-                    property,
-                    dataset.get_fragments().len(),
-                )
-            }
-            None => FullTextCoverage::Full,
-        };
-        if actual != *recorded {
-            return Err(refuse(format!(
-                "the plan records full-text coverage {recorded:?} of `{key}`; the pinned snapshot holds {actual:?}"
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// A refused replay as the caller sees it: replanning is a conflict to
 /// resolve by resubmitting the query, invalid evidence is a bad request, an
 /// exhausted limit is a resource outcome.
@@ -855,7 +798,6 @@ async fn query_table_statistics(
                 file_bytes: destination.then_some(size).flatten(),
                 column_bytes: HashMap::new(),
                 index_facts: indexes::gather(&dataset).await?,
-                fragments: dataset.get_fragments().len(),
             },
         );
     }

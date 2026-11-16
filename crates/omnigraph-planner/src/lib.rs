@@ -82,12 +82,11 @@ pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use output::{NodeObjectType, validate_output_schemas};
 pub use passes::{PassId, PassRow, PassStage, pass_rows};
 pub use physical::{
-    Assumptions, DatasetPin, Eligibility, EmptyEligible, Estimate, FuseArm, GatePolicy, Hop,
-    HydratedBinding, HydratedColumn, NearestPolicy, NodeId, OperatorRow, OrderKey, OverfetchRung,
-    PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineShape, PipelineSink, PipelineSource,
-    PipelineSpec, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankKind, RankScope,
-    RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows, score_column,
-    score_kind_name, validate_streams,
+    Assumptions, DatasetPin, Estimate, FuseArm, GatePolicy, Hop, HydratedBinding, HydratedColumn,
+    NearestPolicy, NodeId, OperatorRow, OrderKey, OverfetchRung, PhysicalNode, PhysicalNodeKind,
+    PhysicalPlan, PipelineShape, PipelineSink, PipelineSource, PipelineSpec, Prefilter,
+    PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankKind, RankScope, RankedAccess, ScanInput,
+    SideChain, StatisticSource, operator_rows, score_column, score_kind_name, validate_streams,
 };
 pub use ranking::{PlannedRanking, planned_ranking};
 pub use read_shape::{ArmRank, InnerRead, PatternStep, ReadShape};
@@ -95,8 +94,8 @@ pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
 pub use source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    FragmentCoverage, FragmentStat, FullTextCoverage, IndexFact, IndexKind, IndexSplitFuture,
-    MemorySource, NodeTypeSpec, PlanSource, SideId, btree_covers_column,
+    FragmentCoverage, FragmentStat, IndexFact, IndexKind, IndexSplitFuture, MemorySource,
+    NodeTypeSpec, PlanSource, SideId, btree_covers_column,
 };
 pub use validate::{
     AcceptInput, AcceptedBoundPlan, AcceptedPlan, Evidence, KeyIds, ReplayEnvelope, ReplayQuery,

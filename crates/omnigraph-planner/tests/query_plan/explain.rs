@@ -325,36 +325,6 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
     assert!(root_scan["properties"].get("schema").is_none());
 }
 
-/// A bare search order plans the score `Sort` the engine runs, with the
-/// query's limit as its fetch; a fusion plans the same `Sort` over its fused
-/// score column, and each arm keeps every cross-binding conjunct in its subtree.
-#[test]
-fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
-    let bm25 = IRExpr::Bm25 {
-        field: Box::new(prop("c", "text")),
-        query: Box::new(IRExpr::Param(
-            "t".to_string(),
-            value_type(ScalarType::String, false),
-        )),
-        ty: value_type(ScalarType::F32, false),
-    };
-    let (plan, _) = physical(
-        &ir(vec![scan("c")], vec![prop("c", "slug")], vec![bm25.clone()]),
-        &source(),
-    );
-    let json = plan.to_json();
-    assert_eq!(json["node"], "Page");
-    let sort = &json["inputs"][0];
-    assert_eq!(sort["node"], "Sort");
-    assert_eq!(sort["keys"], serde_json::json!(["$c._score desc"]));
-    assert_eq!(sort["fetch"], 10);
-    assert_eq!(sort["inputs"][0]["node"], "Projection");
-    let ranked = &sort["inputs"][0]["inputs"][0]["ranked"];
-    assert_eq!(ranked["kind"], "bm25");
-    assert_eq!(ranked["query"], "$t");
-    assert!(ranked["fetch"].is_null());
-}
-
 /// A `CrossJoin` collects its whole left side before it pairs, so that side
 /// is a build pipeline keeping its operators, the right side streams through
 /// the join, and a query's explain carries the plan's `pipelines`.

@@ -8,7 +8,7 @@ use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
-use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
+use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use serde_json::{Value, json};
 
 fn batch(rows: &[(i32, i32, i32, &str, i32)]) -> RecordBatch {
@@ -434,7 +434,7 @@ fn expression_guard_rejects_stable_and_volatile_functions() {
 }
 
 #[tokio::test]
-async fn first_scalar_parser_and_direct_exact_prefilter_follow_lance() {
+async fn first_scalar_parser_follows_lance() {
     for format in [LanceFileVersion::Legacy, LanceFileVersion::V2_2] {
         let (_dir, mut ds) = fixture(format).await;
         ds.drop_index("nullable_probe").await.unwrap();
@@ -478,65 +478,6 @@ async fn first_scalar_parser_and_direct_exact_prefilter_follow_lance() {
             },
         )
         .await;
-        ds.create_index(
-            &["text"],
-            IndexType::Inverted,
-            Some("text_fts".into()),
-            &InvertedIndexParams::default(),
-            false,
-        )
-        .await
-        .unwrap();
-        let mut scanner = ds.scan();
-        scanner
-            .full_text_search(
-                FullTextSearchQuery::new("abcd".into())
-                    .with_column("text".into())
-                    .unwrap(),
-            )
-            .unwrap();
-        scanner.filter_expr(ident("x").eq(lit(1i32)));
-        scanner.prefilter(true);
-        scanner.project(&["id"]).unwrap();
-        let plan = scanner.create_plan().await.unwrap();
-        let all = nodes(&plan);
-        assert!(!all.iter().any(|node| node.is::<MaterializeIndexExec>()));
-        let scalar: Vec<_> = all
-            .iter()
-            .filter_map(|node| node.downcast_ref::<ScalarIndexExec>())
-            .collect();
-        assert_eq!(scalar.len(), 1);
-        let access = inspect(&plan, &ds, scanner.get_expr_filter().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            access,
-            ScanAccess::IndexProbe {
-                query: mirror(scalar[0].expr()),
-                residual: None
-            }
-        );
-        let batches: Vec<RecordBatch> =
-            lance_datafusion::exec::execute_plan(plan, Default::default())
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap();
-        let ids: Vec<_> = batches
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column_by_name("id")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap()
-                    .values()
-                    .iter()
-                    .copied()
-            })
-            .collect();
-        assert_eq!(ids, [0]);
     }
 }
 

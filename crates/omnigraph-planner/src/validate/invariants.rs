@@ -1,7 +1,7 @@
 //! The checks every accepted plan passes (RFC 0047, "Checks have explicit
 //! boundaries"): binding and traversal identity, the eligibility predicates
 //! (every required conjunct placed, every placed conjunct required),
-//! correlated blocks, search identity and its declared approximation, the
+//! correlated blocks, search identity, the
 //! projection and the origin of every projected score, late hydration, the
 //! required order and the row cut, and the policy data the plan declares for
 //! its search. They establish that the plan keeps what the query requires
@@ -29,11 +29,10 @@ use crate::cost::AntiJoinStrategy;
 use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use crate::optimizer::{arm_score, contains_aggregate, derived_order};
 use crate::physical::{
-    Assumptions, Eligibility, EmptyEligible, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan,
-    RankKind, RankScope, RankedAccess, score_kind_name,
+    NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, RankKind, RankScope, RankedAccess,
+    score_kind_name,
 };
 use crate::read_shape::ArmRank;
-use crate::source::FullTextCoverage;
 use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::expr::ScalarFunc;
 use omnigraph_compiler::query::value::SCORE_COLUMN;
@@ -1211,8 +1210,8 @@ impl Requirements {
     }
 
     /// The scope ranks exactly the retrieval its leading `order` key or its
-    /// ranking step names, on its binding and property, with its argument
-    /// and the approximation its contract declares, in the scope it orders.
+    /// ranking step names, on its binding and property, with its argument,
+    /// in the scope it orders.
     fn check_search(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
         let ranked: Vec<(NodeId, &str, &RankedAccess)> = ranked_scans(plan)
             .into_iter()
@@ -1223,9 +1222,8 @@ impl Requirements {
             Some(Search::Rank(retrieval)) => {
                 // A windowed `nearest` fills its own window; every other
                 // ranking of the read is its ordering ranking.
-                let windowed = self.window.is_some() && retrieval.kind == RankKind::Nearest;
                 vec![(
-                    if windowed {
+                    if self.window.is_some() {
                         RankScope::Window
                     } else {
                         RankScope::Order
@@ -1245,7 +1243,7 @@ impl Requirements {
             ));
         }
         for (scope, retrieval) in &expected {
-            let Some((id, binding, access)) =
+            let Some((_, binding, access)) =
                 ranked.iter().find(|(_, _, access)| access.scope == *scope)
             else {
                 return Err(ValidationError::violated(
@@ -1272,22 +1270,7 @@ impl Requirements {
                     ),
                 ));
             }
-            if access.kind.approximate() != retrieval.approximate() {
-                return Err(ValidationError::violated(
-                    "approximation",
-                    format!(
-                        "the plan declares the {:?} retrieval of `${binding}` {}; its contract is {}",
-                        access.kind,
-                        exactness(access.kind.approximate()),
-                        exactness(retrieval.approximate())
-                    ),
-                ));
-            }
-            let type_key = match plan.node(*id) {
-                Some(PhysicalNode::Scan { spec, .. }) => spec.table.type_key.as_str(),
-                _ => "",
-            };
-            self.check_access(plan, type_key, access)?;
+            self.check_access(plan, access)?;
         }
         Ok(())
     }
@@ -1372,37 +1355,12 @@ impl Requirements {
     /// declares, from the cut its scope requires: an ordering `nearest`
     /// fetches the `limit` and may widen it by the declared ladder, a
     /// fusion's `nearest` arm fetches the `limit` (or the default arm size)
-    /// and never widens, and `bm25` fetches every match.
+    /// and never widens.
     fn check_access(
         &self,
         plan: &PhysicalPlan,
-        type_key: &str,
         access: &RankedAccess,
     ) -> Result<(), ValidationError> {
-        match (access.kind, access.eligibility) {
-            (RankKind::Nearest, Eligibility::AfterScoring) => {
-                return Err(ValidationError::violated(
-                    "declared policy",
-                    "a nearest scan draws its candidates from eligible rows; it filters before scoring",
-                ));
-            }
-            (RankKind::Bm25, Eligibility::BeforeScoring) => {
-                let recorded = plan
-                    .assumptions()
-                    .full_text
-                    .get(&Assumptions::full_text_key(type_key, &access.property));
-                if recorded != Some(&FullTextCoverage::Full) {
-                    return Err(ValidationError::violated(
-                        "prerequisite",
-                        format!(
-                            "the bm25 scan of `{type_key}.{}` filters before scoring under recorded coverage {recorded:?}; only full coverage keeps its scores independent of the filter",
-                            access.property
-                        ),
-                    ));
-                }
-            }
-            _ => {}
-        }
         let limit = self.limit.and_then(|limit| usize::try_from(limit).ok());
         // A ranking drawn as a pattern step declares its own window; today's
         // ordering ranking takes the read's `limit`.
@@ -1411,7 +1369,6 @@ impl Requirements {
             None => limit,
         };
         let (fetch, overfetch) = match (access.kind, access.scope) {
-            (RankKind::Bm25, _) => (None, Vec::new()),
             (RankKind::Nearest, RankScope::Order | RankScope::Window) => (
                 window,
                 window.map(OverfetchRung::ladder).unwrap_or_default(),
@@ -1444,7 +1401,6 @@ impl Requirements {
                         "a nearest scan's probe cap was read from no recorded `ann_nprobes`",
                     )
                 })?,
-            RankKind::Bm25 => None,
         };
         if access.nprobes != nprobes {
             return Err(ValidationError::violated(
@@ -1878,10 +1834,9 @@ impl Requirements {
 /// The adaptive search policies the plan declares (RFC 0047, "Execution and
 /// replay use the same acceptance path"): every `nearest` scan's probe
 /// ladder terminates and keeps its correctness fallbacks, and every
-/// pre-pass draws its eligible set from required first hops, feeds only the
-/// scans its kind may prefilter, decides an empty set as its kind must, and
-/// guards BM25 scans by their recorded coverage. The gate policy's
-/// thresholds are finite.
+/// pre-pass draws its eligible set from required first hops and feeds its
+/// own `nearest` scan alone, an empty set proving the answer empty. The gate
+/// policy's thresholds are finite.
 fn check_policies(plan: &PhysicalPlan, budget: &mut Budget) -> Result<(), ValidationError> {
     let policy = plan.assumptions().gate_policy;
     if !policy.ratio.is_finite() || policy.ratio < 0.0 {
@@ -1917,7 +1872,6 @@ fn check_policies(plan: &PhysicalPlan, budget: &mut Budget) -> Result<(), Valida
                     ));
                 }
             }
-            (RankKind::Bm25, None) => {}
             (kind, policy) => {
                 return Err(ValidationError::violated(
                     "declared policy",
@@ -1926,14 +1880,10 @@ fn check_policies(plan: &PhysicalPlan, budget: &mut Budget) -> Result<(), Valida
             }
         }
         if let Some(prefilter) = &access.prefilter {
-            if access.kind != RankKind::Nearest
-                || !matches!(access.scope, RankScope::Order | RankScope::Window)
-                || prefilter.feeds != [id]
-                || prefilter.on_empty != EmptyEligible::ProvenEmpty
-            {
+            if prefilter.feeds != [id] {
                 return Err(ValidationError::violated(
                     "declared policy",
-                    "only a nearest scan carries its own pre-pass, feeding itself and proving an empty eligible set empty",
+                    "a nearest scan's pre-pass feeds that scan alone",
                 ));
             }
             let binding = spec.binding.as_deref().unwrap_or_default();
@@ -2097,22 +2047,12 @@ fn keys_text(keys: &[IROrdering]) -> String {
         .join(", ")
 }
 
-fn exactness(approximate: bool) -> &'static str {
-    if approximate { "approximate" } else { "exact" }
-}
-
-/// The (kind, binding, property) a projected `nearest` or `bm25` call reads.
+/// The (kind, binding, property) a projected `nearest` call reads.
 fn projected_retrieval(expr: &IRExpr) -> Option<(RankKind, &str, &str)> {
     match expr {
         IRExpr::Nearest {
             variable, property, ..
         } => Some((RankKind::Nearest, variable, property)),
-        IRExpr::Bm25 { field, .. } => match field.as_ref() {
-            IRExpr::PropAccess {
-                variable, property, ..
-            } => Some((RankKind::Bm25, variable, property)),
-            _ => None,
-        },
         _ => None,
     }
 }

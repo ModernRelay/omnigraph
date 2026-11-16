@@ -891,19 +891,6 @@ pub(crate) fn edge_full_text_build(
     })
 }
 
-/// The analyzer fingerprint each column of `node_type` declares, which every
-/// full-text segment a search reads must be certified for.
-pub(crate) fn declared_analyzers(
-    node_type: &omnigraph_compiler::catalog::NodeType,
-) -> crate::table_store::fts_compat::DeclaredAnalyzers {
-    crate::table_store::fts_compat::DeclaredAnalyzers::new(
-        node_type
-            .full_text_fingerprints
-            .iter()
-            .map(|(column, fingerprint)| (column.clone(), fingerprint.clone())),
-    )
-}
-
 /// Whether a vector column currently has at least one non-null vector — the
 /// minimum for Lance IVF k-means to train (the `ivf_flat(1)` index we build
 /// needs >=1 vector). Used identically by index-work status planning (so an

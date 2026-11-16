@@ -211,15 +211,6 @@ impl<'a> Lowering<'a> {
                 mode.nearest_exact = rung.is_some_and(|rung| rung.exact);
                 mode.nearest_policy = ranked.policy;
             }
-            RankKind::Bm25 => {
-                let text = resolve_to_string(&ranked.query, self.params())?;
-                mode.bm25 = Some(Bm25Target {
-                    property: ranked.property.clone(),
-                    text,
-                });
-                mode.eligibility_after_scoring =
-                    ranked.eligibility == omnigraph_planner::Eligibility::AfterScoring;
-            }
         }
         Ok(mode)
     }
@@ -1455,7 +1446,6 @@ impl Lower for Walk<'_, '_> {
                 (
                     IRExpr::PropAccess { .. }
                     | IRExpr::Nearest { .. }
-                    | IRExpr::Bm25 { .. }
                     | IRExpr::Variable(_, _)
                     | IRExpr::Param(_, _)
                     | IRExpr::Literal(_, _)
@@ -1476,7 +1466,6 @@ impl Lower for Walk<'_, '_> {
                 (
                     IRExpr::PropAccess { .. }
                     | IRExpr::Nearest { .. }
-                    | IRExpr::Bm25 { .. }
                     | IRExpr::Variable(_, _)
                     | IRExpr::Param(_, _)
                     | IRExpr::Literal(_, _)
@@ -1561,7 +1550,6 @@ impl Lower for Walk<'_, '_> {
                     })?
                 }
                 IRExpr::Nearest { .. }
-                | IRExpr::Bm25 { .. }
                 | IRExpr::Variable(_, _)
                 | IRExpr::Param(_, _)
                 | IRExpr::Literal(_, _)
@@ -1753,7 +1741,6 @@ fn aggregate_argument(
         }
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
-        | IRExpr::Bm25 { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Param(_, _)
         | IRExpr::Literal(_, _)
@@ -1803,7 +1790,6 @@ fn hidden_columns(
             IRExpr::AliasRef(_, _) => {}
             expr if computed_key(expr) => {}
             IRExpr::Nearest { .. }
-            | IRExpr::Bm25 { .. }
             | IRExpr::Variable(_, _)
             | IRExpr::Param(_, _)
             | IRExpr::Literal(_, _)

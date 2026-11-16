@@ -913,11 +913,6 @@ pub(super) fn validate_plan_values(
                     query,
                     ty: _,
                 } => pending.push(query),
-                IRExpr::Bm25 {
-                    field,
-                    query,
-                    ty: _,
-                } => pending.extend([field.as_ref(), query.as_ref()]),
                 IRExpr::Aggregate {
                     func: _,
                     distinct: _,

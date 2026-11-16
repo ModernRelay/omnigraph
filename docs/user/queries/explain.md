@@ -78,22 +78,19 @@ run may take instead: `id_lookup` when the build refuses memory before the
 traversal is consumed, `null` when the plan declares none. A run takes no
 switch the plan does not declare; which side ran is in the
 [`profile`](#profile) rows, never in explain. A physical `Scan` row of a
-binding a `nearest` or `bm25` ranking ranks carries `ranked`: an object
-with `kind` (`nearest` or `bm25`), `property`, `query` (the argument as the
-query wrote it, a parameter name such as `$q` or a literal, never its bound
-value), `fetch` (the candidates the index is asked for: the query's limit
-for `nearest`, `null` for `bm25`, which is uncapped), `nprobes` on a
-`nearest` scan (the `ann_nprobes` setting when the plan was built, the IVF
+binding a `nearest` ranking ranks carries `ranked`: an object with `kind`
+(`nearest`), `property`, `query` (the argument as the query wrote it, a
+parameter name such as `$q` or a literal, never its bound value), `fetch`
+(the candidates the index is asked for, the query's limit or the window's
+`k`), `nprobes` (the `ann_nprobes` setting when the plan was built, the IVF
 partitions probed per index delta; `null` is no cap) and `scope` (`order`
 for the query's own ranking, `window` for a ranking drawn as a pattern step,
 a fusion's `nearest` arm included).
 A `nearest` scan's `policy` declares what the run may do when an attempt
 leaves it short: `probe_factor` (each rescan multiplies the probe cap),
 `flat_rescan_on_unreached`, `uncapped_on_missing_counters` and
-`flat_when_eligible_within_fetch`. A `bm25` scan's `eligibility` says where it
-applies its filter: `before_scoring` when the property's full-text index
-covers every fragment of the pinned version, `after_scoring` otherwise, so a
-filter never changes a BM25 score. A
+`flat_when_eligible_within_fetch`. A `bm25` ranks no scan: it is an exact
+`Score` row, which reads no full-text index. A
 physical
 `Fuse` row has one input per `rrf` arm, each the subtree the arm's ranking
 runs standing alone (a `nearest` window's ranked `Scan`, `Sort` and
@@ -149,11 +146,7 @@ value); `settings`, each setting it read with its spelling (`traversal`,
 `ann_nprobes`); `env`, each environment variable it read with the value it
 resolved (`OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`,
 `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS`, when the query traverses); `gate_policy`,
-the `rrf_plan` mode and the prefilter gate's admission thresholds;
-`full_text`, the full-text coverage of every property a `bm25` scan ranks,
-keyed `<table>.<property>` (`full` only when the index is known to cover every
-fragment, `partial` when coverage is incomplete or unknown, `absent` without a
-full-text index); and
+the `rrf_plan` mode and the prefilter gate's admission thresholds; and
 `memory_limit`, the query pool in bytes. Selector statements also capture
 `traversal_work_limit`, shared across the execution, and `has_wildcard_traversal`,
 retained through rewrites so historical replay can enforce the target rule. Every
@@ -235,7 +228,8 @@ profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
 `Executed::profile`). The row schema is `explain_version` 9 (version 9
 replaced the two-arm `RankFuse` node with `Fuse` and added `TargetCut`,
-`Score`, `Let`, `Union`, `OptionalJoin` and `Correlate`; version 8 added the
+`Score`, `Let`, `Union`, `OptionalJoin` and `Correlate`, and removed
+`TextSearch`; version 8 added the
 `DeltaSource` node a staged write's plan starts from): `pipelines`
 entries (on every planner document since version 7, on diff and merge
 documents only before it) carry a pipeline `id` and `depends_on`, with
@@ -243,7 +237,7 @@ documents only before it) carry a pipeline `id` and `depends_on`, with
 `physical_plan` node ids; an operator's emission is set by the shape wrapper
 the engine builds its stream through, the one the planner's cut names, so the
 printed pipelines are the executed ones. Saved physical
-plans use a `bound_plan_version: 13` envelope whose `body` contains `plan` and
+plans use a `bound_plan_version: 14` envelope whose `body` contains `plan` and
 `values`. Unversioned plans and other versions are refused with a regeneration
 instruction, including plans without traversal nodes.
 

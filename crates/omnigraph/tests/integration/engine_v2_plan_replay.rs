@@ -1180,7 +1180,6 @@ async fn saved_ranked_score_refuses_owner_and_type_drift() {
     for (scan, kind) in scans {
         let (column, other_column) = match kind {
             RankKind::Nearest => ("_distance", "_score"),
-            RankKind::Bm25 => ("_score", "_distance"),
         };
         assert_eq!(
             restored.plan.node(scan).unwrap().ranked().unwrap().score,
@@ -2693,12 +2692,10 @@ async fn an_envelope_of_another_version_asks_for_the_query_again() {
     }
 }
 
-/// An exact `bm25` reads no full-text index, so its plan records no
-/// full-text coverage and replays to the run's rows over a partially indexed
-/// property; an envelope that claims a coverage no ranked scan reads is
-/// refused at the door.
+/// An exact `bm25` reads no full-text index, so its plan replays to the
+/// run's rows over a partially indexed property.
 #[tokio::test]
-async fn a_replay_rechecks_recorded_full_text_coverage() {
+async fn an_exact_bm25_replays_over_a_partially_indexed_property() {
     const SOURCE: &str = r#"query recent($t: String) {
     match { let $pop = { match { $d: Doc } where $d.year >= 2000 return { $d } }, from bm25($pop, $d.text, $t) as $score }
     return { $d.slug, $score as score }
@@ -2733,34 +2730,12 @@ async fn a_replay_rechecks_recorded_full_text_coverage() {
         .query_inspected(ReadTarget::branch("main"), SOURCE, "recent", &params)
         .await
         .unwrap();
-    assert!(run.plan.plan.assumptions().full_text.is_empty());
     let envelope = run.replay_envelope(SOURCE, "recent");
-    let honest = db
+    let replay = db
         .replay_bound_plan(ReadTarget::branch("main"), &envelope)
         .await
         .unwrap();
-    assert_eq!(rows_of(&honest.result), rows_of(&run.result));
-    let mut forged: Value = serde_json::from_slice(&envelope).unwrap();
-    let mut assumptions = 0;
-    edit_objects(&mut forged, &mut |object| {
-        if object.contains_key("gate_policy") && object.contains_key("datasets") {
-            object.insert(
-                "full_text".to_string(),
-                serde_json::json!({ "node:Doc.text": "full" }),
-            );
-            assumptions += 1;
-        }
-    });
-    assert_eq!(assumptions, 1, "the plan's assumptions");
-    assert!(
-        db.replay_bound_plan(
-            ReadTarget::branch("main"),
-            &serde_json::to_vec(&forged).unwrap(),
-        )
-        .await
-        .is_err(),
-        "a recorded coverage no scan read is refused"
-    );
+    assert_eq!(rows_of(&replay.result), rows_of(&run.result));
 }
 
 #[tokio::test]

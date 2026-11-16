@@ -10,7 +10,6 @@ use arrow_schema::SchemaRef;
 use datafusion::prelude::{Expr, col, lit as df_lit};
 use datafusion::scalar::ScalarValue;
 use lance_core::ROW_ADDR;
-use lance_index::scalar::FullTextSearchQuery;
 
 /// `id IN (ids)` as one structured DataFusion `Expr` — the scan-pushdown
 /// shape shared by `hydrate_nodes` and the nearest prefilter gate's push.
@@ -42,21 +41,16 @@ pub(super) const PIPELINED_READAHEAD: usize = 2;
 pub(super) const PIPELINED_IO_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One node scan resolved before any Lance read: the dataset, the pushed
-/// filter (the literal filters, a gate's eligible set, a BM25 filter's member
-/// ids), the hoisted full-text query and the columns it reads.
+/// filter (the literal filters and a gate's eligible set) and the columns it
+/// reads.
 pub(super) struct NodeRead<'n> {
     ds: Dataset,
     pub(super) node_type: &'n omnigraph_compiler::catalog::NodeType,
     filter_expr: Option<Expr>,
-    fts_query: Option<FullTextSearchQuery>,
     scalar_index: Option<bool>,
     pub(super) columns: ScanColumns<'n>,
-    /// The gate proved the answer empty, or a BM25 filter matched no row: no
-    /// Lance read runs.
+    /// The gate proved the answer empty: no Lance read runs.
     pub(super) proven_empty: bool,
-    /// The pushed filter runs after the full-text search scores rows
-    /// (Lance's postfilter) instead of before it.
-    filter_after_scoring: bool,
 }
 
 impl<'n> NodeRead<'n> {
@@ -82,12 +76,6 @@ impl<'n> NodeRead<'n> {
                 .chain(
                     search_mode
                         .nearest
-                        .iter()
-                        .map(|target| target.property.as_str()),
-                )
-                .chain(
-                    search_mode
-                        .bm25
                         .iter()
                         .map(|target| target.property.as_str()),
                 ),
@@ -127,11 +115,9 @@ impl<'n> NodeRead<'n> {
             filter_expr: build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema)),
             ds,
             node_type,
-            fts_query: None,
             scalar_index: Some(true),
             columns,
             proven_empty: false,
-            filter_after_scoring: false,
         })
     }
 
@@ -171,24 +157,10 @@ impl<'n> NodeRead<'n> {
             });
         }
 
-        // A ranked full-text scan is an `rrf` arm's: its query is the arm's
-        // text over its property.
-        let fts_query = match search_mode.bm25.as_ref() {
-            Some(Bm25Target {
-                property: prop,
-                text,
-            }) => Some(
-                FullTextSearchQuery::new(text.clone())
-                    .with_column(prop.clone())
-                    .map_err(|error| OmniError::storage_context("fts with_column", error))?,
-            ),
-            None => None,
-        };
         let columns = ScanColumns::new(
             node_type,
             SearchColumns {
                 distance: search_mode.nearest.is_some(),
-                score: fts_query.is_some(),
             },
             binding_columns,
         );
@@ -200,11 +172,9 @@ impl<'n> NodeRead<'n> {
             ds,
             node_type,
             filter_expr,
-            fts_query,
             scalar_index: search_mode.scalar_index,
             columns,
             proven_empty,
-            filter_after_scoring: search_mode.eligibility_after_scoring,
         })
     }
 
@@ -218,9 +188,7 @@ impl<'n> NodeRead<'n> {
         }
         if let Some(expr) = &self.filter_expr {
             scanner.filter_expr(expr.clone());
-            // A BM25 scan whose plan places eligibility after scoring filters
-            // the scored rows instead of the candidates.
-            scanner.prefilter(!(self.filter_after_scoring && self.fts_query.is_some()));
+            scanner.prefilter(true);
         }
         if let Some((rows, bytes)) = pipelined_batch {
             scanner.batch_size(rows);
@@ -228,22 +196,14 @@ impl<'n> NodeRead<'n> {
             scanner.batch_readahead(PIPELINED_READAHEAD);
             scanner.io_buffer_size(PIPELINED_IO_BUFFER_BYTES);
         }
-        if let Some(fts_query) = &self.fts_query {
-            scanner
-                .full_text_search(
-                    fts_query.clone(),
-                    crate::db::omnigraph::table_ops::declared_analyzers(self.node_type),
-                )
-                .map_err(|error| OmniError::storage_context("full_text_search", error))?;
-        }
         Ok(())
     }
 
-    /// Every live row of the table reaches the consumer: no pushed filter
-    /// and no full-text query, so the read's first rows are the table's
-    /// first live rows and a `Limit` over it can reach Lance (#1335).
+    /// Every live row of the table reaches the consumer: no pushed filter,
+    /// so the read's first rows are the table's first live rows and a
+    /// `Limit` over it can reach Lance (#1335).
     pub(super) fn reads_every_row(&self) -> bool {
-        self.filter_expr.is_none() && self.fts_query.is_none()
+        self.filter_expr.is_none()
     }
 
     pub(super) fn plan_with_filter(
@@ -256,10 +216,8 @@ impl<'n> NodeRead<'n> {
     }
 
     /// The Lance plan of this read: the projection, the pushed filter as a
-    /// prefilter (as a postfilter on the scored rows where the plan places a
-    /// BM25 scan's eligibility after scoring), the `(rows, bytes)` batch
-    /// override, bounded readahead and I/O buffer of a pipelined read, the
-    /// full-text query, then `configure` (nearest).
+    /// prefilter, the `(rows, bytes)` batch override, bounded readahead and
+    /// I/O buffer of a pipelined read, then `configure` (nearest).
     pub(super) fn plan(
         &self,
         pipelined_batch: Option<(usize, usize)>,
@@ -591,11 +549,6 @@ pub(super) async fn execute_node_scan(
             );
         }
     }
-    if search_mode.bm25.is_some() {
-        crate::instrumentation::record_bm25_scan_rows(
-            batches.iter().map(|b| b.num_rows() as u64).sum(),
-        );
-    }
 
     let scan_result = if batches.is_empty() {
         read.columns.empty_batch(node_type)
@@ -642,7 +595,6 @@ pub(super) struct ScanColumns<'n> {
 #[derive(Default)]
 pub(in crate::engine) struct SearchColumns {
     pub distance: bool,
-    pub score: bool,
 }
 
 impl<'n> ScanColumns<'n> {
@@ -683,12 +635,9 @@ impl<'n> ScanColumns<'n> {
             .filter(|f| !node_type.blob_properties.contains(f.name()))
             .map(|f| f.name().as_str())
             .collect();
-        let mut search_cols: Vec<&'static str> = Vec::with_capacity(3);
+        let mut search_cols: Vec<&'static str> = Vec::with_capacity(2);
         if search.distance {
             search_cols.push("_distance");
-        }
-        if search.score {
-            search_cols.push("_score");
         }
         if binding_columns.is_some_and(|NeededColumns(columns)| columns.contains(ROW_ADDR)) {
             search_cols.push(ROW_ADDR);
@@ -755,13 +704,10 @@ pub(super) fn scan_output_schema(
     let node_type = catalog
         .query_node_type(type_name)
         .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
-    let nearest = search_mode.nearest.is_some();
-    let scores_fts = search_mode.bm25.is_some();
     let columns = ScanColumns::new(
         node_type,
         SearchColumns {
-            distance: nearest,
-            score: scores_fts,
+            distance: search_mode.nearest.is_some(),
         },
         binding_columns,
     );
@@ -778,7 +724,7 @@ pub(super) fn scan_output_schema(
 /// pruned scans (#564), which legitimately omit undemanded non-blob columns.
 /// Every column the scan produced beside the catalog's rides through after
 /// the catalog columns, as the no-blob path (batch passed through untouched)
-/// already delivers it: a search scan's `_distance`/`_score` must survive
+/// already delivers it: a search scan's `_distance` must survive
 /// this rebuild because the planned `Sort` leads with it.
 pub(super) fn add_null_blob_columns(
     batch: &RecordBatch,
@@ -1112,7 +1058,6 @@ fn typed_expr_to_df_expr(expr: &IRExpr, params: &ParamMap) -> Option<datafusion:
         IRExpr::Literal(literal, ty) => literal_to_expr(literal, ty),
         IRExpr::Param(name, ty) => literal_to_expr(params.get(name)?, ty),
         IRExpr::Nearest { .. }
-        | IRExpr::Bm25 { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Aggregate { .. }
         | IRExpr::AliasRef(_, _) => None,

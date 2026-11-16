@@ -5,7 +5,7 @@
 //! stemmer built an index. This certificate is derived index state, not a
 //! graph migration flag or protection against an out-of-band malicious writer.
 
-use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 use lance::{Dataset, index::scalar::IndexDetails};
 use lance_core::cache::CacheKey;
@@ -71,26 +71,6 @@ pub struct NativeBuild {
 #[serde(rename_all = "snake_case")]
 pub enum NativeNormalization {
     None,
-}
-
-/// The analyzer fingerprint each full-text column's accepted schema declares
-/// (`@index(fulltext, analyzer = ...)`, the GQ 3 RFC, section
-/// 4). The accepted schema chooses the analysis; an index proves it only by a
-/// certificate naming the same fingerprint, so a certificate of another
-/// analysis refuses. A column absent here is read by a caller that holds no
-/// schema (a raw scan filter): any certified analysis is accepted there.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DeclaredAnalyzers(BTreeMap<String, String>);
-
-impl DeclaredAnalyzers {
-    pub fn new(fingerprints: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self(fingerprints.into_iter().collect())
-    }
-
-    /// The fingerprint `column` declares, `None` when the caller holds none.
-    pub fn fingerprint(&self, column: &str) -> Option<&str> {
-        self.0.get(column).map(String::as_str)
-    }
 }
 
 /// Positive evidence only. No codec: proof never outlives the Lance session's

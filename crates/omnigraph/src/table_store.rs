@@ -54,7 +54,7 @@ use lance_datafusion::exec::{
     collect_execution_metrics,
 };
 use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
-use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
+use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
 use lance_select::mask::{RowAddrTreeMap, RowSetOps};
@@ -82,7 +82,6 @@ use crate::storage_layer::{
     BLOB_READ_IO_BUFFER_BYTES, FullTextColumn, IndexBuildSpec, KEYED_WRITE_MAX_BYTES,
     KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk,
 };
-use fts_compat::DeclaredAnalyzers;
 
 pub(crate) use crate::error::is_scratch_exhaustion;
 pub(crate) use omnigraph_core::dataset_index::FtsFilterDemand;
@@ -233,10 +232,6 @@ pub(crate) type PlannedScan = (Arc<dyn ExecutionPlan>, Option<Expr>);
 /// ordered plan after `scan_stream_with` chose the ordinary Lance executor.
 pub(crate) struct ScanTuning<'a> {
     scanner: &'a mut Scanner,
-    full_text_columns: Option<HashSet<String>>,
-    /// The analyzer each column's accepted schema declares, which the
-    /// full-text segments the scan reads must be certified for.
-    declared_analyzers: DeclaredAnalyzers,
     /// FTS-index demand of the typed filters set through this surface, unioned
     /// over every `filter_expr` call although Lance keeps only the last filter:
     /// a fail-closed over-approximation.
@@ -248,8 +243,6 @@ struct PreparedScan {
     scanner: Scanner,
     has_ordering: bool,
     has_sql_filter: bool,
-    full_text_columns: Option<HashSet<String>>,
-    declared_analyzers: DeclaredAnalyzers,
     filter_demand: FtsFilterDemand,
 }
 
@@ -285,20 +278,14 @@ impl PreparedScan {
         }
         let mut tuning = ScanTuning {
             scanner: &mut scanner,
-            full_text_columns: None,
-            declared_analyzers: DeclaredAnalyzers::default(),
             filter_demand: FtsFilterDemand::default(),
         };
         configure(&mut tuning)?;
-        let full_text_columns = tuning.full_text_columns;
-        let declared_analyzers = tuning.declared_analyzers;
         let filter_demand = tuning.filter_demand;
         Ok(Self {
             scanner,
             has_ordering,
             has_sql_filter: filter.is_some(),
-            full_text_columns,
-            declared_analyzers,
             filter_demand,
         })
     }
@@ -306,21 +293,9 @@ impl PreparedScan {
     /// The scanner, once its full-text reads are checked against `dataset`.
     async fn validated(self, dataset: &Dataset) -> Result<Scanner> {
         if self.has_sql_filter {
-            validate_full_text_scan(
-                dataset,
-                &self.scanner,
-                self.full_text_columns,
-                &self.declared_analyzers,
-            )
-            .await?;
-        } else if self.full_text_columns.is_some() || !self.filter_demand.is_empty() {
-            validate_full_text_demand(
-                dataset,
-                self.full_text_columns,
-                self.filter_demand,
-                &self.declared_analyzers,
-            )
-            .await?;
+            validate_full_text_scan(dataset, &self.scanner).await?;
+        } else if !self.filter_demand.is_empty() {
+            validate_full_text_demand(dataset, self.filter_demand).await?;
         }
         Ok(self.scanner)
     }
@@ -377,26 +352,6 @@ impl ScanTuning<'_> {
     pub(crate) fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
         self.scanner.prefilter(should_prefilter);
         self
-    }
-
-    /// A full-text query over a table whose columns declare `declared`: every
-    /// segment it reads must be certified for its column's declared analyzer.
-    pub(crate) fn full_text_search(
-        &mut self,
-        query: FullTextSearchQuery,
-        declared: DeclaredAnalyzers,
-    ) -> std::result::Result<&mut Self, lance::Error> {
-        // Compound queries can mix explicit and omitted columns. Any omitted
-        // leaf allows Lance to search all FTS columns, not just named leaves.
-        let columns = if query.query.is_missing_column() {
-            HashSet::new()
-        } else {
-            query.columns()
-        };
-        self.scanner.full_text_search(query)?;
-        self.full_text_columns = Some(columns);
-        self.declared_analyzers = declared;
-        Ok(self)
     }
 
     /// A kNN over `column` by `distance`, the field's declared distance,
@@ -3736,7 +3691,7 @@ impl TableStore {
         if let Some(filter) = &filter {
             let mut scanner = ds.scan();
             scanner.filter(filter).map_err(OmniError::storage)?;
-            validate_full_text_scan(ds, &scanner, None, &DeclaredAnalyzers::default()).await?;
+            validate_full_text_scan(ds, &scanner).await?;
         }
         ds.count_rows(filter).await.map_err(OmniError::storage)
     }
@@ -6475,7 +6430,7 @@ impl TableStore {
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
         if filter.is_some() {
-            validate_full_text_scan(ds, &scanner, None, &DeclaredAnalyzers::default()).await?;
+            validate_full_text_scan(ds, &scanner).await?;
         }
         let stream = scanner
             .try_into_stream()
@@ -7301,7 +7256,7 @@ impl TableStore {
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
         if filter.is_some() {
-            validate_full_text_scan(ds, &scanner, None, &DeclaredAnalyzers::default()).await?;
+            validate_full_text_scan(ds, &scanner).await?;
         }
         let count = scanner.count_rows().await.map_err(OmniError::storage)?;
         Ok(count as usize)

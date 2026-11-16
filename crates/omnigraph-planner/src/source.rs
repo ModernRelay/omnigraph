@@ -300,76 +300,11 @@ pub trait PlanSource {
         None
     }
 
-    /// How far the full-text index of `property` covers the pinned table
-    /// `type_key` names. The default claims an index of unproven coverage:
-    /// nothing is refused and every bm25 scan filters after scoring, the
-    /// placement under which every plan stays correct.
-    fn full_text_coverage(&self, _type_key: &str, _property: &str) -> FullTextCoverage {
-        FullTextCoverage::Partial
-    }
-
     /// The fingerprint of the catalogue table `type_key` names at this source:
     /// its rows and schema as the running binary derives them, so a plan records
     /// what it read and a replay checks it. `None` for a source with no catalogue.
     fn catalogue_fingerprint(&self, _type_key: &str) -> Option<String> {
         None
-    }
-}
-
-/// How far a property's full-text index covers the pinned dataset's
-/// fragments. Only full coverage makes a BM25 score independent of a filter
-/// applied before scoring: Lance scores the unindexed fragments flat, from
-/// statistics over the rows the filter admits. A segment of any coverage,
-/// even the untrained declaration every write records, carries the index's
-/// analyzer to the rows it does not cover.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FullTextCoverage {
-    /// Every fragment of the pinned version is in a full-text segment, which
-    /// a table with no fragment has vacuously.
-    Full,
-    /// A full-text index exists; some fragment is not in it.
-    Partial,
-    /// No segment on the property records a full-text index, and the table
-    /// has rows.
-    Absent,
-}
-
-impl FullTextCoverage {
-    /// The coverage the index facts of one table establish for `column`:
-    /// `Absent` with no index on it, `Full` only when it has a full-text
-    /// index and every full-text index on it has known coverage of every
-    /// current fragment, `Partial` otherwise. An index of unknown kind or
-    /// unknown coverage on the column never counts as full.
-    pub fn of_facts(facts: &[IndexFact], column: &str) -> Self {
-        let on_column: Vec<&IndexFact> =
-            facts.iter().filter(|fact| fact.column == column).collect();
-        let full_text = on_column
-            .iter()
-            .any(|fact| fact.kind == IndexKind::Inverted);
-        let unknown = on_column.iter().any(|fact| fact.kind == IndexKind::Unknown);
-        if !full_text {
-            return if unknown { Self::Partial } else { Self::Absent };
-        }
-        let full = !unknown
-            && on_column
-                .iter()
-                .filter(|fact| fact.kind == IndexKind::Inverted)
-                .all(|fact| {
-                    fact.coverage
-                        .is_some_and(|coverage| coverage.covered == coverage.total)
-                });
-        if full { Self::Full } else { Self::Partial }
-    }
-
-    /// [`Self::of_facts`] for a table version holding `fragments` current
-    /// fragments: one with none has no row a full-text call could answer
-    /// differently, so it is covered whatever its indexes.
-    pub fn of_table(facts: &[IndexFact], column: &str, fragments: usize) -> Self {
-        if fragments == 0 {
-            return Self::Full;
-        }
-        Self::of_facts(facts, column)
     }
 }
 
@@ -389,7 +324,6 @@ pub struct MemorySource {
     table_data_bytes: HashMap<String, u64>,
     column_data_bytes: HashMap<String, HashMap<String, u64>>,
     query_memory_pool_bytes: u64,
-    full_text: HashMap<(String, String), FullTextCoverage>,
     /// When set, a key's canonical id renders as `id:<value>`, a parameter
     /// resolved from these values.
     canonical_keys: Option<omnigraph_compiler::ir::ParamMap>,
@@ -434,17 +368,6 @@ impl MemorySource {
                 row_count: Some(rows),
             },
         );
-        self
-    }
-
-    pub fn with_full_text_coverage(
-        mut self,
-        type_key: &str,
-        property: &str,
-        coverage: FullTextCoverage,
-    ) -> Self {
-        self.full_text
-            .insert((type_key.to_string(), property.to_string()), coverage);
         self
     }
 
@@ -628,13 +551,6 @@ impl PlanSource for MemorySource {
 
     fn query_memory_pool_bytes(&self) -> u64 {
         self.query_memory_pool_bytes
-    }
-
-    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
-        self.full_text
-            .get(&(type_key.to_string(), property.to_string()))
-            .copied()
-            .unwrap_or(FullTextCoverage::Partial)
     }
 
     fn explain_dump_dir(&self) -> Option<std::path::PathBuf> {

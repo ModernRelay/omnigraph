@@ -11,7 +11,7 @@
 
 pub(crate) use omnigraph_core::dst_ids;
 pub(crate) use omnigraph_core::{
-    branch_control, branch_names, dataset_index, error, fts_compat, handle_cache, instrumentation,
+    branch_control, branch_names, dataset_index, error, handle_cache, instrumentation,
     lance_access, lance_clone, lance_commit, manifest_request, metadata, seams, staging, storage,
 };
 pub mod branch_detail;
@@ -467,13 +467,7 @@ impl SnapshotScanner {
 
     /// Execute the configured read without exposing its physical plan.
     pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
-        crate::dataset_index::validate_full_text_scan(
-            &self.dataset,
-            &self.scanner,
-            None,
-            &crate::fts_compat::DeclaredAnalyzers::default(),
-        )
-        .await?;
+        crate::dataset_index::validate_full_text_scan(&self.dataset, &self.scanner).await?;
         self.scanner
             .try_into_stream()
             .await
@@ -499,13 +493,7 @@ impl SnapshotDataset {
         if let Some(filter) = &filter {
             let mut scanner = self.dataset.scan();
             scanner.filter(filter).map_err(OmniError::storage)?;
-            crate::dataset_index::validate_full_text_scan(
-                &self.dataset,
-                &scanner,
-                None,
-                &crate::fts_compat::DeclaredAnalyzers::default(),
-            )
-            .await?;
+            crate::dataset_index::validate_full_text_scan(&self.dataset, &scanner).await?;
         }
         self.dataset
             .count_rows(filter)

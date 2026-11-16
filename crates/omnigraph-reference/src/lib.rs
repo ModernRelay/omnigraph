@@ -1339,7 +1339,7 @@ impl<'a> Interpreter<'a> {
             }
             // `search` and `match_text` are `terms(q, mode: any)`; `fuzzy`
             // adds an edit budget, two when unwritten (section 4, Migration).
-            IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } => {
+            IRExpr::Nearest { .. } => {
                 return unsupported("a ranking as a scalar");
             }
             IRExpr::Aggregate { .. } => return unsupported("an aggregate outside a group"),

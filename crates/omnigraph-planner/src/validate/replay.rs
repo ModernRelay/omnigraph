@@ -27,7 +27,8 @@ pub const REPLAY_VERSION: u32 = 1;
 /// The catalogue of checks and rewrite rules acceptance applies. A rule id
 /// keeps its meaning within one version. Version 3: GQ 3's node kinds
 /// (`TargetCut`, `Score`, `Let`, `Union`, `OptionalJoin`, `Correlate`,
-/// `Fuse`) and their checks, each conjunct held to its region among them.
+/// `Fuse`) and their checks, each conjunct held to its region among them;
+/// the `rank_bm25_scan` rule left with the native ranked `bm25` scan.
 pub const RULES_VERSION: u32 = 3;
 
 /// The compiler and operator semantics a plan was built under. Version 3:

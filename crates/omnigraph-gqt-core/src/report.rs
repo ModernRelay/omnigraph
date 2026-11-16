@@ -442,7 +442,7 @@ mod tests {
         );
 
         let mut wrong_kind = explain();
-        wrong_kind["physical_plan"]["inputs"][0]["ranked"]["kind"] = json!("bm25");
+        wrong_kind["physical_plan"]["inputs"][0]["ranked"]["kind"] = json!("unknown");
         assert!(
             validate(&base, &wrong_kind)
                 .unwrap_err()

@@ -33,9 +33,9 @@ use crate::logical::{
 };
 use crate::operation::TableRef;
 use crate::physical::{
-    Assumptions, Eligibility, EmptyEligible, Estimate, FuseArm, Hop, HydratedBinding,
-    NearestPolicy, NodeId, OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
-    Properties, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
+    Assumptions, Estimate, FuseArm, Hop, HydratedBinding, NearestPolicy, NodeId, OrderKey,
+    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankKind, RankScope,
+    RankedAccess, ScanInput, StatisticSource,
 };
 use crate::read_shape::InnerRead;
 use crate::source::SideId;
@@ -1048,7 +1048,6 @@ pub struct RankedMirror {
     pub scope: RankScope,
     pub overfetch: Vec<OverfetchRung>,
     pub prefilter: Option<PrefilterMirror>,
-    pub eligibility: Eligibility,
     pub policy: Option<NearestPolicy>,
 }
 
@@ -1064,7 +1063,6 @@ impl From<&RankedAccess> for RankedMirror {
             scope: ranked.scope,
             overfetch: ranked.overfetch.clone(),
             prefilter: ranked.prefilter.as_ref().map(PrefilterMirror::from),
-            eligibility: ranked.eligibility,
             policy: ranked.policy,
         }
     }
@@ -1082,7 +1080,6 @@ impl From<RankedMirror> for RankedAccess {
             scope: mirror.scope,
             overfetch: mirror.overfetch,
             prefilter: mirror.prefilter.map(Prefilter::from),
-            eligibility: mirror.eligibility,
             policy: mirror.policy,
         }
     }
@@ -1099,8 +1096,6 @@ pub struct PrefilterMirror {
     pub ranked_type: String,
     pub hops: Vec<HopMirror>,
     pub feeds: Vec<NodeId>,
-    pub on_empty: EmptyEligible,
-    pub coverage_admits: bool,
 }
 
 impl From<&Prefilter> for PrefilterMirror {
@@ -1116,8 +1111,6 @@ impl From<&Prefilter> for PrefilterMirror {
                 })
                 .collect(),
             feeds: prefilter.feeds.clone(),
-            on_empty: prefilter.on_empty,
-            coverage_admits: prefilter.coverage_admits,
         }
     }
 }
@@ -1135,8 +1128,6 @@ impl From<PrefilterMirror> for Prefilter {
                 })
                 .collect(),
             feeds: mirror.feeds,
-            on_empty: mirror.on_empty,
-            coverage_admits: mirror.coverage_admits,
         }
     }
 }
@@ -1728,11 +1719,6 @@ pub enum ExprMirror {
         query: Box<ExprMirror>,
         ty: ExprType,
     },
-    Bm25 {
-        field: Box<ExprMirror>,
-        query: Box<ExprMirror>,
-        ty: ExprType,
-    },
     Variable {
         name: String,
         ty: ExprType,
@@ -1812,11 +1798,6 @@ impl From<&IRExpr> for ExprMirror {
             } => Self::Nearest {
                 variable: variable.clone(),
                 property: property.clone(),
-                query: boxed(query),
-                ty: ty.clone(),
-            },
-            IRExpr::Bm25 { field, query, ty } => Self::Bm25 {
-                field: boxed(field),
                 query: boxed(query),
                 ty: ty.clone(),
             },
@@ -1904,11 +1885,6 @@ impl From<ExprMirror> for IRExpr {
             } => Self::Nearest {
                 variable,
                 property,
-                query: unboxed(*query),
-                ty,
-            },
-            ExprMirror::Bm25 { field, query, ty } => Self::Bm25 {
-                field: unboxed(*field),
                 query: unboxed(*query),
                 ty,
             },

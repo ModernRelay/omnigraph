@@ -224,7 +224,6 @@ fn each_access_variant_maps_to_one_scanner_flag() {
     assert_eq!(answer().use_scalar_index(), Some(true));
     for runtime in [
         RuntimeInput::Nearest,
-        RuntimeInput::FullText,
         RuntimeInput::EligibleIds,
         RuntimeInput::JoinFilter,
         RuntimeInput::DynamicExpression,

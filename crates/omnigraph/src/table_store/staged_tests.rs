@@ -3434,12 +3434,11 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
             unsafe_count,
             "characterize stock v11 reading actual v10 postings"
         );
-        let guarded = TableStore::scan_stream_with(&old, None, None, None, false, |scan| {
-            scan.full_text_search(FullTextSearchQuery::new(term.into()), Default::default())
-                .map_err(OmniError::storage)?;
-            Ok(())
-        })
-        .await;
+        // A read of the postings through the guarded scan surface: a
+        // `contains_tokens` filter.
+        let filter = format!("contains_tokens(text, '{term}')");
+        let guarded =
+            TableStore::scan_stream_with(&old, None, Some(&filter), None, false, |_| Ok(())).await;
         assert!(matches!(
             guarded,
             Err(OmniError::FullTextIndexRebuildRequired { .. })
@@ -3473,17 +3472,14 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
     assert_eq!(rebuilt.version().version, 3);
     assert_eq!(rebuilt.load_indices().await.unwrap().len(), 1);
     for term in ["organism", "university", "running"] {
+        let filter = format!("contains_tokens(text, '{term}')");
         let batches: Vec<_> =
-            TableStore::scan_stream_with(&rebuilt, None, None, None, false, |scan| {
-                scan.full_text_search(FullTextSearchQuery::new(term.into()), Default::default())
-                    .map_err(OmniError::storage)?;
-                Ok(())
-            })
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
+            TableStore::scan_stream_with(&rebuilt, None, Some(&filter), None, false, |_| Ok(()))
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
     }
     assert_eq!(store.count_rows(&old, None).await.unwrap(), 3);

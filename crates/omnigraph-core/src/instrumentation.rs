@@ -219,15 +219,6 @@ pub struct QueryIoProbes {
     pub manifest_stores: ProbedStores,
     pub history_stores: ProbedStores,
     pub table_stores: ProbedStores,
-    /// Uncapped retries taken after a capped BM25 scan under-filled. Engine
-    /// v2's BM25 scans carry no cap, so no engine path records one and the
-    /// count stays 0.
-    pub bm25_uncapped_retries: Arc<AtomicU64>,
-    /// Rows returned by BM25-ranked scans, summed over scans (capped and
-    /// uncapped passes alike). Lets a test pin the cap's MAGNITUDE — a factor
-    /// regression changes this count while every result assertion still
-    /// passes.
-    pub bm25_scan_rows: Arc<AtomicU64>,
     /// Rescans taken at the scan site after a maximum-bounded nearest scan
     /// returned fewer than `k` rows with partitions left unsearched (the
     /// probe ladder in `execute_node_scan`). Every scan of a nearest target
@@ -1160,18 +1151,6 @@ pub fn record_pushed_filter_exprs(n: u64) {
 /// probes are installed (production).
 pub fn record_in_memory_filter() {
     let _ = current(|p| p.in_memory_filters.fetch_add(1, Ordering::Relaxed));
-}
-
-/// Record one uncapped retry after a capped BM25 scan under-filled. No-op when
-/// no probes are installed (production).
-pub fn record_bm25_uncapped_retry() {
-    let _ = current(|p| p.bm25_uncapped_retries.fetch_add(1, Ordering::Relaxed));
-}
-
-/// Record `rows` returned by one BM25-ranked scan. No-op when no probes are
-/// installed (production).
-pub fn record_bm25_scan_rows(rows: u64) {
-    let _ = current(|p| p.bm25_scan_rows.fetch_add(rows, Ordering::Relaxed));
 }
 
 /// Record the requested ANN maximum of a nearest scan (zero = none). No-op

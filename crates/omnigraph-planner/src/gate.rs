@@ -28,7 +28,7 @@ use crate::registry::{Coverage, Entry, Route, coverage, lookup};
 use crate::route::RouteOverride;
 use crate::source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    FragmentStat, FullTextCoverage, IndexFact, NodeTypeSpec, PlanSource, SideId,
+    FragmentStat, IndexFact, NodeTypeSpec, PlanSource, SideId,
 };
 use crate::validate::subset::{Role, Rule, Tracer};
 use crate::validate::{self, AcceptInput, AcceptedPlan, ValidationError};
@@ -214,15 +214,6 @@ impl PlanSource for Recorded<'_> {
     fn gate_policy(&self) -> GatePolicy {
         self.source.gate_policy()
     }
-
-    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
-        let coverage = self.source.full_text_coverage(type_key, property);
-        self.read
-            .borrow_mut()
-            .full_text
-            .insert(Assumptions::full_text_key(type_key, property), coverage);
-        coverage
-    }
 }
 
 /// Every parameter name `expr` names.
@@ -232,10 +223,6 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             out.insert(name.clone());
         }
         IRExpr::Nearest { query, .. } => params_of_expr(query, out),
-        IRExpr::Bm25 { field, query, .. } => {
-            params_of_expr(field, out);
-            params_of_expr(query, out);
-        }
         IRExpr::Aggregate { arg, .. } => params_of_expr(arg, out),
         IRExpr::Binary { left, right, .. } => {
             params_of_expr(left, out);

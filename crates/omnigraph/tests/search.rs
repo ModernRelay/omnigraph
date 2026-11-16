@@ -2279,29 +2279,15 @@ async fn bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan() {
         .await
         .unwrap();
     db.ensure_indices_as(None).await.unwrap();
-    let db = db;
 
-    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
-    let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(probes.clone(), async {
-        query_main(
-            &db,
-            UNDERFILL_AGG_QUERY,
-            "recall_count",
-            &params(&[("$q", "needle")]),
-        )
-        .await
-    })
+    let result = query_main(
+        &db,
+        UNDERFILL_AGG_QUERY,
+        "recall_count",
+        &params(&[("$q", "needle")]),
+    )
     .await
     .unwrap();
-
-    assert_eq!(
-        probes
-            .bm25_scan_rows
-            .load(std::sync::atomic::Ordering::Relaxed),
-        0,
-        "an exact `bm25` runs no ranked full-text scan"
-    );
 
     let batch = result.concat_batches().unwrap();
     let totals = batch
@@ -2317,7 +2303,7 @@ async fn bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan() {
 }
 
 /// A fusion's exact `bm25` arms score every match of their population, with
-/// no candidate cap and no ranked full-text scan, so the fused `limit` fills
+/// no candidate cap, so the fused `limit` fills
 /// from the edge-bearing chunks after the fusion.
 #[tokio::test]
 #[serial]
@@ -2330,26 +2316,14 @@ async fn rrf_exact_arms_score_every_match_uncapped() {
         .unwrap();
     db.ensure_indices_as(None).await.unwrap();
 
-    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
-    let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(probes.clone(), async {
-        query_main(
-            &db,
-            UNDERFILL_RRF_QUERY,
-            "recall_rrf",
-            &params(&[("$q", "needle")]),
-        )
-        .await
-    })
+    let result = query_main(
+        &db,
+        UNDERFILL_RRF_QUERY,
+        "recall_rrf",
+        &params(&[("$q", "needle")]),
+    )
     .await
     .unwrap();
-    assert_eq!(
-        probes
-            .bm25_scan_rows
-            .load(std::sync::atomic::Ordering::Relaxed),
-        0,
-        "an exact `bm25` arm runs no ranked full-text scan"
-    );
     // Both arms rank identically (the second repeats the term), so fusion
     // preserves the tf order: the best-scoring edge-bearing chunks are 08
     // then 09.

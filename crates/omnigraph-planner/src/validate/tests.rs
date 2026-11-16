@@ -360,7 +360,6 @@ fn rules(derivation: &Derivation) -> Vec<&'static str> {
             Rule::AbsorbScanFilter { .. } => "absorb",
             Rule::PruneScanColumns { .. } => "prune",
             Rule::Lower => "lower",
-            Rule::RankBm25Scan { .. } => "rank",
             Rule::HydrateReturnColumns { .. } => "hydrate",
             Rule::NarrowKey { .. } => "narrow",
         })
@@ -1645,11 +1644,6 @@ fn a_nearest_plan_declares_its_policy_and_prepass() {
     let prefilter = access
         .prefilter
         .expect("the edge from `$d` declares a pre-pass");
-    assert_eq!(
-        prefilter.on_empty,
-        crate::physical::EmptyEligible::ProvenEmpty
-    );
-    assert!(prefilter.coverage_admits);
     assert_eq!(prefilter.hops.len(), 1);
     fixture
         .accept(plan)
@@ -1676,9 +1670,8 @@ fn a_stalling_or_unguarded_ladder_fails_the_declared_policy() {
 #[test]
 fn a_prepass_off_the_required_hops_fails_the_declared_policy() {
     let fixture = nearest();
-    let breaks: [fn(&mut crate::physical::Prefilter); 3] = [
+    let breaks: [fn(&mut crate::physical::Prefilter); 2] = [
         |prefilter| prefilter.hops[0].edge_type = "Other".to_string(),
-        |prefilter| prefilter.on_empty = crate::physical::EmptyEligible::Postfilter,
         |prefilter| prefilter.feeds.push(usize::MAX),
     ];
     for edit in breaks {
@@ -1992,12 +1985,11 @@ fn a_distinct_return_sorts_its_groups() {
 }
 
 /// Every full-text field has a profile, so the exact lexical scan answers a
-/// lexical predicate at every index state: an absent index plans, the plan
-/// is accepted, and it records no index coverage for the call
-/// (the GQ 3 RFC, section 4: no `FullTextIndexRequired`).
+/// lexical predicate whatever the property's index: a source declaring no
+/// index plans it, and the plan is accepted (the GQ 3 RFC, section 4: no
+/// `FullTextIndexRequired`).
 #[test]
-fn a_full_text_call_plans_at_every_index_state() {
-    use crate::source::FullTextCoverage;
+fn a_full_text_call_plans_without_an_index() {
     let search = r#"query q($q: String) {
     match { $d: Doc } where match_terms($d.title, terms($q, mode: any))
     return { $d.slug }
@@ -2015,23 +2007,9 @@ fn a_full_text_call_plans_at_every_index_state() {
     return { $p.slug }
 }"#;
     for query in [search, RANKED, inherited, nested] {
-        for coverage in [
-            FullTextCoverage::Absent,
-            FullTextCoverage::Partial,
-            FullTextCoverage::Full,
-        ] {
-            let mut fixture = Fixture::new(query, &[("q", Literal::String("graph".into()))]);
-            fixture.source = std::mem::take(&mut fixture.source)
-                .with_full_text_coverage("node:Doc", "title", coverage);
-            let plan = fixture.plan();
-            assert!(
-                plan.assumptions().full_text.is_empty(),
-                "{query}: {:?}",
-                plan.assumptions().full_text
-            );
-            fixture
-                .accept(plan)
-                .unwrap_or_else(|error| panic!("{query} under {coverage:?}: {error:?}"));
-        }
+        let fixture = Fixture::new(query, &[("q", Literal::String("graph".into()))]);
+        fixture
+            .accept(fixture.plan())
+            .unwrap_or_else(|error| panic!("{query}: {error:?}"));
     }
 }

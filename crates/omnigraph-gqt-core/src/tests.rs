@@ -1873,11 +1873,6 @@ mod result_contract {
                 },
             )
         };
-        let rank = || IRExpr::Bm25 {
-            field: Box::new(property()),
-            query: Box::new(text()),
-            ty: ty(ScalarType::F32, false),
-        };
         let expressions = vec![
             property(),
             text(),
@@ -1890,7 +1885,6 @@ mod result_contract {
                 query: Box::new(text()),
                 ty: ty(ScalarType::F32, false),
             },
-            rank(),
             IRExpr::Aggregate {
                 func: AggFunc::Count,
                 distinct: false,

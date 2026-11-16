@@ -28,8 +28,11 @@ use crate::physical::{NodeId, PhysicalPlan};
 /// version 11 an `rrf`'s `weights`, on its expression and its `RankFuse`.
 /// Version 13 replaces version 12's two-arm `RankFuse`, its `rrf`
 /// expression and its fused order key with a `Fuse` node over 2 to 16 arm
-/// subtrees, each with its rank kind.
-pub const BOUND_PLAN_VERSION: u32 = 13;
+/// subtrees, each with its rank kind. Version 14 removes from version 13
+/// the native ranked `bm25` scan: the `bm25` rank kind and expression, a
+/// ranked scan's `eligibility`, a pre-pass's `on_empty` and
+/// `coverage_admits`, and the assumptions' full-text coverage.
+pub const BOUND_PLAN_VERSION: u32 = 14;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

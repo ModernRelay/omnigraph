@@ -129,10 +129,9 @@ fn contains_aggregate_or_search(expr: &IRExpr) -> bool {
     let mut pending = vec![expr];
     while let Some(expr) = pending.pop() {
         match expr {
-            IRExpr::Aggregate { .. }
-            | IRExpr::Nearest { .. }
-            | IRExpr::Bm25 { .. }
-            | IRExpr::AliasRef(_, _) => return true,
+            IRExpr::Aggregate { .. } | IRExpr::Nearest { .. } | IRExpr::AliasRef(_, _) => {
+                return true;
+            }
             IRExpr::Not(arg, _)
             | IRExpr::IsNull { expr: arg, .. }
             | IRExpr::Neg { expr: arg, .. }
@@ -299,8 +298,7 @@ pub fn rrf_weight_values(weights: &IRExpr, arms: usize) -> Option<Vec<f64>> {
 impl IRExpr {
     /// The searched field of a full-text predicate, `search`, `fuzzy`,
     /// `match_text` or `match_terms`: a Boolean that is true where the row's
-    /// field matches the call's query. `None` for any other node, `bm25`
-    /// included (a score, not a predicate).
+    /// field matches the call's query. `None` for any other node.
     pub fn lexical_predicate_field(&self) -> Option<&IRExpr> {
         match self {
             Self::Call {
@@ -317,7 +315,6 @@ impl IRExpr {
         match self {
             Self::PropAccess { ty, .. }
             | Self::Nearest { ty, .. }
-            | Self::Bm25 { ty, .. }
             | Self::Binary { ty, .. }
             | Self::IsNull { ty, .. }
             | Self::Cast { ty, .. }
@@ -387,11 +384,6 @@ impl IRExpr {
                 query: b(query)?,
                 ty: ty.clone(),
             },
-            Self::Bm25 { field, query, ty } => Self::Bm25 {
-                field: b(field)?,
-                query: b(query)?,
-                ty: ty.clone(),
-            },
             Self::Aggregate {
                 func,
                 distinct,
@@ -448,7 +440,6 @@ impl IRExpr {
             | Self::Literal(_, _)
             | Self::AliasRef(_, _) => Vec::new(),
             Self::Nearest { query, .. } => vec![query],
-            Self::Bm25 { field, query, .. } => vec![field, query],
             Self::Aggregate { arg, .. }
             | Self::Not(arg, _)
             | Self::IsNull { expr: arg, .. }
@@ -496,7 +487,6 @@ impl IRExpr {
                 | Self::Literal(_, _)
                 | Self::AliasRef(_, _) => {}
                 Self::Nearest { query, .. } => pending.push(query),
-                Self::Bm25 { field, query, .. } => pending.extend([field.as_ref(), query.as_ref()]),
                 Self::Aggregate { arg, .. }
                 | Self::Not(arg, _)
                 | Self::IsNull { expr: arg, .. }
@@ -532,7 +522,6 @@ impl IRExpr {
                 | Self::Literal(_, _)
                 | Self::AliasRef(_, _) => {}
                 Self::Nearest { query, .. } => pending.push(query),
-                Self::Bm25 { field, query, .. } => pending.extend([field.as_ref(), query.as_ref()]),
                 Self::Aggregate { arg, .. }
                 | Self::Not(arg, _)
                 | Self::IsNull { expr: arg, .. }
@@ -564,7 +553,6 @@ impl IRExpr {
                     pending.push(query);
                 }
                 Self::Param(_, _) | Self::Literal(_, _) => {}
-                Self::Bm25 { field, query, .. } => pending.extend([query.as_ref(), field.as_ref()]),
                 Self::Aggregate { arg, .. }
                 | Self::Not(arg, _)
                 | Self::IsNull { expr: arg, .. }
@@ -601,7 +589,6 @@ impl IRExpr {
             | Self::Literal(_, ty)
             | Self::AliasRef(_, ty) => Some(ty),
             Self::Nearest { .. }
-            | Self::Bm25 { .. }
             | Self::Aggregate { .. }
             | Self::Binary { .. }
             | Self::Not(_, _)
@@ -651,20 +638,6 @@ impl IRExpr {
                         ));
                     }
                     pending.push(query);
-                }
-                Self::Bm25 { field, query, ty } => {
-                    let result = if matches!(expr, Self::Bm25 { .. }) {
-                        ScalarType::F32
-                    } else {
-                        ScalarType::Bool
-                    };
-                    expect(ty, scalar_type(result, false))?;
-                    if !scalar_is(field.ty(), ScalarType::String)
-                        || !scalar_is(query.ty(), ScalarType::String)
-                    {
-                        return Err(bad("search operands must be scalar String"));
-                    }
-                    pending.extend([field.as_ref(), query.as_ref()]);
                 }
                 Self::Binary {
                     left,
@@ -918,11 +891,6 @@ impl std::fmt::Display for IRExpr {
                 query,
                 ty: _,
             } => write!(f, "nearest(${variable}.{property}, {query})"),
-            IRExpr::Bm25 {
-                field,
-                query,
-                ty: _,
-            } => write!(f, "bm25({field}, {query})"),
             IRExpr::Variable(name, _) => write!(f, "${name}"),
             IRExpr::Param(name, _) if name == NOW_PARAM_NAME => f.write_str("now()"),
             IRExpr::Param(name, _) => write!(f, "${name}"),
@@ -1681,11 +1649,6 @@ pub enum IRExpr {
     Nearest {
         variable: String,
         property: String,
-        query: Box<IRExpr>,
-        ty: ExprType,
-    },
-    Bm25 {
-        field: Box<IRExpr>,
         query: Box<IRExpr>,
         ty: ExprType,
     },

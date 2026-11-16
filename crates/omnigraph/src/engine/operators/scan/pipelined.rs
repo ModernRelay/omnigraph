@@ -29,7 +29,7 @@ const SCAN_INPUT: &str = "v2 scan input";
 
 /// Whether a table read under `mode` streams: it ranks nothing.
 pub(super) fn streams(mode: &SearchMode) -> bool {
-    mode.bm25.is_none() && mode.nearest.is_none()
+    mode.nearest.is_none()
 }
 
 impl ScanExec {

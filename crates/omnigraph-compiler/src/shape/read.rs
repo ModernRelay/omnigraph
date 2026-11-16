@@ -86,10 +86,10 @@ pub enum PatternStep {
     /// A ranking drawn over the rows of the steps before it, its
     /// population, when it is not the read's leading `order` key cut by the
     /// read's `limit` (that ranking is `order_by`'s first key): `key` is the
-    /// ranking as a leading key holds it (`nearest`, `bm25`, `rrf`),
-    /// `binding` the ranked node column, and `window` the `nearest` window
-    /// `k` in targets (an `rrf`'s `nearest` arm's), `None` for `bm25`. The
-    /// steps after it run over the selected rows, which nothing refills.
+    /// `nearest` ranking as a leading key holds it, `binding` the ranked node
+    /// column, and `window` the `nearest` window `k` in targets (an `rrf`'s
+    /// `nearest` arm's). The steps after it run over the selected rows,
+    /// which nothing refills.
     Rank {
         key: IRExpr,
         binding: String,
@@ -3756,7 +3756,6 @@ fn holds_lexical_call(expr: &IRExpr) -> bool {
             // The predicates themselves were taken above.
             IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
-            | IRExpr::Bm25 { .. }
             | IRExpr::Variable(..)
             | IRExpr::Param(..)
             | IRExpr::Literal(..)
@@ -4151,10 +4150,6 @@ fn reference_null_tests(expr: &mut IRExpr, id: &str, optional: &HashSet<String>)
     let recurse = |e: &mut IRExpr| reference_null_tests(e, id, optional);
     match expr {
         IRExpr::Nearest { query, .. } => recurse(query),
-        IRExpr::Bm25 { field, query, .. } => {
-            recurse(field);
-            recurse(query);
-        }
         IRExpr::Aggregate { arg, .. }
         | IRExpr::Not(arg, _)
         | IRExpr::IsNull { expr: arg, .. }
@@ -4249,10 +4244,6 @@ fn bind_params(expr: &mut IRExpr, bindings: &[(String, IRExpr)]) {
     let recurse = |e: &mut IRExpr| bind_params(e, bindings);
     match expr {
         IRExpr::Nearest { query, .. } => recurse(query),
-        IRExpr::Bm25 { field, query, .. } => {
-            recurse(field);
-            recurse(query);
-        }
         IRExpr::Aggregate { arg, .. }
         | IRExpr::Not(arg, _)
         | IRExpr::IsNull { expr: arg, .. }
@@ -4283,10 +4274,6 @@ fn substitute(expr: &mut IRExpr, lets: &HashMap<String, IRExpr>) {
             }
         }
         IRExpr::Nearest { query, .. } => substitute(query, lets),
-        IRExpr::Bm25 { field, query, .. } => {
-            substitute(field, lets);
-            substitute(query, lets);
-        }
         IRExpr::Aggregate { arg, .. }
         | IRExpr::Not(arg, _)
         | IRExpr::IsNull { expr: arg, .. }
@@ -4308,10 +4295,6 @@ fn rename_expr(expr: &mut IRExpr, rename: &impl Fn(&mut String)) {
             variable, query, ..
         } => {
             rename(variable);
-            rename_expr(query, rename);
-        }
-        IRExpr::Bm25 { field, query, .. } => {
-            rename_expr(field, rename);
             rename_expr(query, rename);
         }
         IRExpr::Aggregate { arg, .. }

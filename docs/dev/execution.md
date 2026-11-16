@@ -141,8 +141,7 @@ A query runs against one resolved `ReadTarget`:
    `limit_param`, takes its bound count here, so the plan's cut is that count
    and a replay folds the count its own value table binds; a `nearest`
    window `k: $k`, a ranking step's `window_param`, takes its count, at
-   least 1, the same way), statistics, settings and the index
-   facts the full-text coverage of every ranked property is derived from.
+   least 1, the same way), statistics, settings and index facts.
 5. Plan the query and accept the plan (see [Plan acceptance](#plan-acceptance)).
 6. Bind the accepted plan's values and execute it against the same snapshot.
 7. Serialize result batches at the calling boundary.
@@ -413,8 +412,9 @@ and require regeneration when the stored version is unsupported.
 Envelope version 7 requires aggregate expressions to carry their `distinct`
 flag; version 8 types each node's ordering and declares ranked scans'
 eligibility and policy; version 9 records every `AntiJoin`'s `strategy`;
-version 11 carries an integer outside the `i64` range as its decimal text.
-Plans saved with earlier binaries must be regenerated before replay.
+version 11 carries an integer outside the `i64` range as its decimal text;
+version 14 drops the ranked `bm25` scan, its eligibility and the recorded
+full-text coverage. Plans saved with earlier binaries must be regenerated before replay.
 
 ### Expand path selection
 
@@ -573,14 +573,14 @@ planner as `Operation::Query`: `resolve_query` folds its pattern steps into a lo
 tree (one `TableScan` per `match` binding, `Join { kind: Cross }` for a
 second binding with no edge, `Expand`, `Filter`, `AntiJoin` with its inner
 tree over an `OuterReference` leaf standing for the enclosing rows, a leading
-search function as `Nearest` or `TextSearch`, a `Fuse` over its arm subtrees,
+`nearest` as `Nearest`, a `Fuse` over its arm subtrees,
 then `Projection`
 or `Aggregate`, with a `Projection` above `Aggregate` for Boolean expressions
 over aggregates, followed by `Sort` and `Limit`); the logical passes rewrite it
 (`predicate_pushdown` above, `aggregate_pushdown`, `projection_pushdown`); the
 planner lowers it into a `PhysicalPlan` without consulting the registry. The
-lowering is one-to-one except for ranking: a logical `Nearest` or
-`TextSearch` becomes the `ranked` access path of its binding's physical
+lowering is one-to-one except for ranking: a logical `Nearest` becomes the
+`ranked` access path of its binding's physical
 `Scan` (no node of its own) and the score key the physical `Sort` leads with,
 and a logical `Fuse` becomes a physical `Fuse` over its lowered arm subtrees
 ([Fusion](#fusion-one-operator-over-any-ranked-arm)); the fusion appends the
@@ -658,7 +658,7 @@ by `engine/scan.rs`, `engine/graph.rs`, `engine/expr.rs` and
 | `PhysicalNode` | Operator | Provider |
 |---|---|---|
 | `MetadataCount` | `MetadataCountExec`: exact live-row count from the pinned dataset, with the single output row charged to the query pool | omnigraph |
-| `Scan` | `ScanExec`: `execute_node_scan` with the projection and pushed filters read off the `ScanSpec`, the schema declared before running. A `ranked` scan runs under a `SearchMode` built from its `RankedAccess` (the index, the ranked property, the query argument), the bound plan's value table (the query vector by node id, the parameters) and the pass's `Pass` (the overfetch rung, the gate's eligible set), so Lance ranks while scanning and appends `_distance` or `_score`. A scan whose `ScanSpec` carries a `runtime_filter` marker holds a `RuntimeFilterSlot` its `ContainsJoin` fills before the scan executes, and takes the closed `RuntimeFilter` enum from it (`TextContainsAny` its one variant). Every unranked table read (no `ranked` access, so no search mode), marked or not, is a pipeline operator (`operators/scan/pipelined.rs`): it reads Lance batches of at most `lance_batch_rows(batch_bytes)` rows under the byte target `batch_bytes` (Lance 13 decodes whichever bound is smaller; the explicit row bound takes precedence over the `LANCE_DEFAULT_BATCH_SIZE` fallback), `PIPELINED_READAHEAD` (2) batches decoded ahead and at most `PIPELINED_IO_BUFFER_BYTES` (64 MiB) fetched ahead, both outside the pool; it holds each batch as `v2 scan input`, sieves it when a join left a filter (a batch kept whole or emptied is a slice of itself; a mixed selection is copied only once the batch's `v2 scan batch` charge admits the copy) and releases the input, and kept batches gather under one `v2 scan batch` charge until they reach the session's batch rows (the rows of a `Limit` directly over the scan's projection, when one is there) or the byte target, then leave as one batch held until the consumer takes it: Lance reads a batch per fragment, and a per-batch consumer (an indexed hop's lookup) would otherwise pay once per fragment. The table is never held whole, and a consumer that stops (a `Limit`) stops the read. When that `Limit` sits directly over the projection of a read with no pushed filter, no full-text query and no runtime-filter marker (no read plan has that shape now, since a read's `limit` cuts the tie rule's `Sort`), its rows also reach Lance as `Scanner::limit`: with no filter and no ordering Lance plans only the fragments that hold the first live rows, from the manifest's row and deletion counts (`Scanner::plan_scan_range`), instead of opening up to `fragment_readahead` fragments before the stream is dropped. A filtered read keeps the early stop alone, since Lance pushes no limit through a filter; only a marked scan records `runtime_filter_rows_read` (every row it reads, an inert scan's too), `runtime_filter_rows_dropped` and `runtime_filter_inert`. A ranked scan and its ANN ladder is a breaker through `execute_node_scan`, which collects its batches; a dependent scan reads one slice of its input at a time; all of them build the Lance scanner through one `NodeRead`, and read `_rowaddr` when the plan defers a return column of their binding | omnigraph |
+| `Scan` | `ScanExec`: `execute_node_scan` with the projection and pushed filters read off the `ScanSpec`, the schema declared before running. A `ranked` scan runs under a `SearchMode` built from its `RankedAccess` (the index, the ranked property, the query argument), the bound plan's value table (the query vector by node id, the parameters) and the pass's `Pass` (the overfetch rung, the gate's eligible set), so Lance ranks while scanning and appends `_distance`. A scan whose `ScanSpec` carries a `runtime_filter` marker holds a `RuntimeFilterSlot` its `ContainsJoin` fills before the scan executes, and takes the closed `RuntimeFilter` enum from it (`TextContainsAny` its one variant). Every unranked table read (no `ranked` access, so no search mode), marked or not, is a pipeline operator (`operators/scan/pipelined.rs`): it reads Lance batches of at most `lance_batch_rows(batch_bytes)` rows under the byte target `batch_bytes` (Lance 13 decodes whichever bound is smaller; the explicit row bound takes precedence over the `LANCE_DEFAULT_BATCH_SIZE` fallback), `PIPELINED_READAHEAD` (2) batches decoded ahead and at most `PIPELINED_IO_BUFFER_BYTES` (64 MiB) fetched ahead, both outside the pool; it holds each batch as `v2 scan input`, sieves it when a join left a filter (a batch kept whole or emptied is a slice of itself; a mixed selection is copied only once the batch's `v2 scan batch` charge admits the copy) and releases the input, and kept batches gather under one `v2 scan batch` charge until they reach the session's batch rows (the rows of a `Limit` directly over the scan's projection, when one is there) or the byte target, then leave as one batch held until the consumer takes it: Lance reads a batch per fragment, and a per-batch consumer (an indexed hop's lookup) would otherwise pay once per fragment. The table is never held whole, and a consumer that stops (a `Limit`) stops the read. When that `Limit` sits directly over the projection of a read with no pushed filter, no full-text query and no runtime-filter marker (no read plan has that shape now, since a read's `limit` cuts the tie rule's `Sort`), its rows also reach Lance as `Scanner::limit`: with no filter and no ordering Lance plans only the fragments that hold the first live rows, from the manifest's row and deletion counts (`Scanner::plan_scan_range`), instead of opening up to `fragment_readahead` fragments before the stream is dropped. A filtered read keeps the early stop alone, since Lance pushes no limit through a filter; only a marked scan records `runtime_filter_rows_read` (every row it reads, an inert scan's too), `runtime_filter_rows_dropped` and `runtime_filter_inert`. A ranked scan and its ANN ladder is a breaker through `execute_node_scan`, which collects its batches; a dependent scan reads one slice of its input at a time; all of them build the Lance scanner through one `NodeRead`, and read `_rowaddr` when the plan defers a return column of their binding | omnigraph |
 | `HashJoin` | `HashJoinExec`: the build (a table `ScanExec` of the destination with the pushed filters and projection) drained under the query pool and hashed on `<binding>.<id>`, the traversal (`probe`) joined in its own order, one `take` per side per probe batch, output charged as `hash join output`; the declared `id_lookup` fallback is a branch of the same operator (below); the first probe batch is read before the build, so an empty probe executes nothing on the build | omnigraph |
 | `Fuse` | `FuseExec` (`operators/fuse.rs`) over its arm subtrees, each lowered once as the plan its ranking runs standing alone, whose rows arrive in the arm's rank order: the arms are drained one after another in written order, and in each a target takes the next rank at its first row, adding `weight / (k + rank)` (the plan's `k`, 60 when absent, bound and checked in `1..=1000000` when lowered; the plan's `weights`, 1.0 when absent) to its fused score, summed in written order in `F64`. One row leaves per target any arm selected, the target's columns from the first arm that selected it and the fused score as `<target>._rrf`, and it neither sorts nor cuts. Every arm row and every fused target is charged to `read_work_limit`, and the held arm rows and per-target state to the query pool (`FuseExec`) | omnigraph |
 | `CrossJoin` | `CrossJoinExec`: the left input collected under the query pool, every left row paired with each right batch, output charged as `cross join output`; an empty left executes nothing on the right. The node's `filters` (conjuncts over both bindings) run in the join; every pair goes through one `PairBuffer`, which charges each right batch's row-size scratch before it grows it, filters the held pairs into a kept batch when it holds the session's batch size of pairs, when their estimated bytes reach the producer's batch bytes, and at each right batch's end, and sends the kept batches as one output once their rows reach the batch size or their bytes the batch bytes (the rest at the end), so an output exceeds the batch size by at most one kept batch | omnigraph |
@@ -1190,7 +1190,7 @@ the read shape. Ambiguous or unused intermediate columns are refused.
 The read shape supplies which return items and order keys read the score
 column. The checks: binding identity and traversal
 identity (endpoints, edge selection, direction, endpoint types, hop bounds),
-search identity and its declared approximation, eligibility in both
+search identity, eligibility in both
 directions (every lowered conjunct is tested, and every tested conjunct is a lowered one, a
 constant `true`, or the identity equality key narrowing derives through
 `AcceptInput.keys`), the region of every conjunct (each is tested in the
@@ -1218,14 +1218,13 @@ the query returns only order keys or constants, and identities of bindings
 the query does not name (anonymous endpoints, cycle temps) after every named
 one.
 
-A query of one binding, Boolean/integer/String eligibility, an optional
-leading `bm25()` over a String property, direct property sort keys, a limit
-and a projection of properties and the selected score is a member of the
-exact fragment (`validate/subset.rs`). For a member the optimizer records the
+A query of one binding, Boolean/integer/String eligibility, direct property
+sort keys, a limit and a projection of properties is a member of the exact
+fragment (`validate/subset.rs`). For a member the optimizer records the
 rules it applies (`AbsorbScanFilter`, `PruneScanColumns`, `Lower`,
-`RankBm25Scan`, `HydrateReturnColumns`, `NarrowKey`) over arena references;
+`HydrateReturnColumns`, `NarrowKey`) over arena references;
 the validator rebuilds the canonical chain
-`Limit(Sort(Project([Search](Filter(Scan)))))` from the typed lowering,
+`Limit(Sort(Project(Filter(Scan))))` from the typed lowering,
 re-applies every rule against its precondition and requires the result to
 equal the plan. The
 checker's arena keeps only each role's current node, releasing a replaced one
@@ -1240,19 +1239,10 @@ design keeps its diagnostic and is a bad request. The replay door
 source and name, the scope, the schema digest, the bound plan and a member's
 derivation. It checks the byte limit and the envelope's versions before
 decoding the plan, refuses another schema and a dataset the plan did not pin
-as conflicts, re-establishes every full-text coverage fact the plan records
-from the pinned snapshot, recompiles the query, and accepts the plan again; a
-recorded fact the snapshot contradicts, or a plan that fails a check
-(well-formedness included), is invalid evidence, a bad request.
-
-Full-text coverage is derived from the index facts the planner reads for the
-pinned dataset (`FullTextCoverage::of_table`): `absent` without an inverted
-index on the column, `full` only when every inverted segment there reports a
-known coverage of every fragment, `partial` otherwise; a table version with no
-fragment, and a type the snapshot does not hold, are `full`. Only the
-eligibility placement of a ranked `bm25` scan reads it, and replay derives
-every recorded coverage again from the pinned dataset. No query is refused for
-a full-text index's state.
+as conflicts, recompiles the query, and accepts the plan again; a plan that
+fails a check (well-formedness included) is invalid evidence, a bad request.
+Every `bm25` is the exact lexical scan's `Score`, which reads no full-text
+index, so no query is refused for a full-text index's state.
 
 ## Search and rank
 
@@ -1308,16 +1298,10 @@ rows in rank order (`check_arm_order`); a nested fusion is checked as an arm
 of its own. Each `nearest` arm's pre-pass is judged within its arm
 (`scope_root`).
 
-BM25 scans have no candidate cap. The final ordering applies the score,
-secondary keys and every binding's identity before the query limit; a full
-candidate window cannot prove that it contains the leading tied identities.
-A BM25 scan declares where it applies its eligibility (its pushed filter, a
-gate's eligible set and the members of its search predicates):
-`before_scoring`, Lance's prefilter, only when the property's full-text index
-covers every fragment at the pinned version, a fact the plan records in
-`Assumptions.full_text`; `after_scoring`, Lance's postfilter, otherwise.
-Lance scores uncovered fragments flat from statistics over the rows its
-prefilter admits, so filtering before scoring there would change scores.
+An exact `bm25` scores every match of its population and has no candidate
+cap. The final ordering applies the score, secondary keys and every binding's
+identity before the query limit; a full candidate window cannot prove that it
+contains the leading tied identities.
 
 A `nearest` scan carries a probe cap per index delta (the `ann_nprobes`
 session setting, `request` scope, default 20, `0` is no cap; the process
@@ -1341,7 +1325,7 @@ survivors exist; aggregate returns never overfetch. Before either, `nearest_pref
 (`RankedAccess.prefilter`) for each `nearest` constrained by a traversal of its
 pipeline, a fusion arm's included, and pushes the eligible ids into the scan
 as an `id IN (...)` prefilter; an empty eligible set proves that scan's rows
-empty and runs no scan (`Prefilter.on_empty`): the whole answer of a
+empty and runs no scan: the whole answer of a
 `nearest` standing alone, one arm's rows under a fusion. The gate is
 answer-changing by design (it ranks the eligible entities exactly instead of
 the global window's survivors). Acceptance checks that every hop of a pre-pass is a

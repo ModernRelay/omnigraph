@@ -20,7 +20,7 @@ use crate::logical::{
 };
 use crate::mirror::EdgeSelectionMirror;
 use crate::operation::TableRef;
-use crate::source::{FullTextCoverage, SideId};
+use crate::source::SideId;
 use omnigraph_compiler::query::codes::{P002, P003};
 
 /// The index of a node in a [`PhysicalPlan`].
@@ -32,22 +32,13 @@ pub type NodeId = usize;
 pub enum RankKind {
     /// `nearest($v.prop, q)`: the vector index appends `_distance`.
     Nearest,
-    /// `bm25($v.prop, q)`: the full-text index appends `_score`.
-    Bm25,
 }
 
 impl RankKind {
-    /// Whether the retrieval's contract is approximate: `nearest` membership
-    /// is, even when a run scores flat; `bm25` matching is exact.
-    pub fn approximate(self) -> bool {
-        self == Self::Nearest
-    }
-
     /// The column Lance appends and the direction the query sorts it by.
     pub fn score(self) -> (&'static str, bool) {
         match self {
             Self::Nearest => ("_distance", false),
-            Self::Bm25 => ("_score", true),
         }
     }
 }
@@ -163,23 +154,11 @@ pub struct Assumptions {
     /// Retained even when rewrites remove an expansion, for historical replay admission.
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_wildcard_traversal: bool,
-    /// The full-text coverage of every property a ranked scan's eligibility
-    /// placement read, keyed `<table key>.<property>`. A pinned dataset
-    /// version fixes it, so the dataset pins re-establish it on replay.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub full_text: BTreeMap<String, FullTextCoverage>,
     /// The fingerprint of every catalogue table the plan read, keyed by
     /// table key: the binary's rows and schema for that type. A replay is
     /// refused by a binary whose catalogue fingerprints differ.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub catalogue: BTreeMap<String, String>,
-}
-
-impl Assumptions {
-    /// The key a property's full-text coverage is recorded under.
-    pub fn full_text_key(type_key: &str, property: &str) -> String {
-        format!("{type_key}.{property}")
-    }
 }
 
 impl Assumptions {
@@ -237,23 +216,6 @@ pub struct Prefilter {
     pub ranked_type: String,
     pub hops: Vec<Hop>,
     pub feeds: Vec<NodeId>,
-    /// What an empty eligible set decides: the empty answer for a
-    /// standalone `nearest`, the unfiltered plan for a fusion.
-    pub on_empty: EmptyEligible,
-    /// Whether the recorded full-text coverage of every `bm25` scan in
-    /// `feeds` is full, the guard under which prefiltering keeps BM25
-    /// scores; true when it feeds no `bm25` scan.
-    pub coverage_admits: bool,
-}
-
-/// What a pre-pass's empty eligible set decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EmptyEligible {
-    /// No row survives the traversal: the answer is empty and no scan runs.
-    ProvenEmpty,
-    /// The scans run unfiltered.
-    Postfilter,
 }
 
 /// The adaptive policy of a `nearest` scan, declared before it runs: what
@@ -290,19 +252,6 @@ impl Prefilter {
     pub fn admits(&self) -> bool {
         !self.hops.is_empty() && !self.feeds.is_empty()
     }
-}
-
-/// Where a ranked scan applies its eligibility (its pushed filter, a gate's
-/// eligible set and the members of its search predicates): before the index
-/// scores rows, as Lance's prefilter, or after, on the scored rows. A BM25
-/// score is independent of a filter applied before scoring only when the
-/// property's full-text index covers every fragment; elsewhere eligibility
-/// applies after scoring, so the filter never changes a score.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Eligibility {
-    BeforeScoring,
-    AfterScoring,
 }
 
 /// One rerun of a `nearest` scan's overfetch ladder, taken in order after a
@@ -353,21 +302,16 @@ pub struct RankedAccess {
     /// Candidates the scan asks the index for; `None` is every match.
     pub fetch: Option<usize>,
     /// The IVF partitions a `nearest` scan may probe per index delta, the
-    /// `ann_nprobes` setting when the plan was built; `None` is no cap, and
-    /// on a `bm25` scan it is unread.
+    /// `ann_nprobes` setting when the plan was built; `None` is no cap.
     pub nprobes: Option<usize>,
     pub scope: RankScope,
-    /// The reruns the run may take above `fetch`; empty on a scan that never
-    /// reruns (`bm25`).
+    /// The reruns the run may take above `fetch`; empty on a scan with no
+    /// `fetch`.
     pub overfetch: Vec<OverfetchRung>,
     /// The pre-pass that feeds this scan; `None` when no traversal leaves
     /// the ranked binding.
     pub prefilter: Option<Prefilter>,
-    /// Where the scan applies its eligibility: always before scoring on a
-    /// `nearest` scan, whose candidate window is drawn from eligible rows;
-    /// on a `bm25` scan before scoring only under recorded full coverage.
-    pub eligibility: Eligibility,
-    /// The adaptive policy of a `nearest` scan; `None` on a `bm25` scan.
+    /// The adaptive policy of the `nearest` scan, which acceptance requires.
     pub policy: Option<NearestPolicy>,
 }
 
@@ -396,7 +340,6 @@ impl RankedAccess {
                 value["nprobes"] = json!(self.nprobes);
                 value["policy"] = json!(self.policy);
             }
-            RankKind::Bm25 => value["eligibility"] = json!(self.eligibility),
         }
         value
     }
@@ -800,7 +743,7 @@ macro_rules! physical_nodes {
             /// token, from the operator's definition and its inputs' orders
             /// (the function the declaration names first, which every
             /// `order:` token may call): a ranking scan leaves in score order (`nearest`
-            /// ascending `_distance`, `bm25` descending `_score`), an
+            /// ascending `_distance`), an
             /// id-ordered scan or a key merge in its key's order, a sort in
             /// exactly its comparator (its keys, then its identity keys), and
             /// an order-preserving operator (a dependent scan, a hash join's

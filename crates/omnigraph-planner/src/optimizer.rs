@@ -36,12 +36,11 @@ use crate::operation::{Operation, Side};
 use crate::output::{node_object_types, return_schema};
 use crate::passes::{PassId, PassStage};
 use crate::physical::{
-    Assumptions, Eligibility, EmptyEligible, Estimate, FuseArm, Hop, HydratedBinding,
-    HydratedColumn, NearestPolicy, NodeId, OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan,
-    Prefilter, Properties, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
-    TextContains,
+    Assumptions, Estimate, FuseArm, Hop, HydratedBinding, HydratedColumn, NearestPolicy, NodeId,
+    OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankKind,
+    RankScope, RankedAccess, ScanInput, StatisticSource, TextContains,
 };
-use crate::source::{FullTextCoverage, NodeTypeSpec, PlanSource, SideId};
+use crate::source::{NodeTypeSpec, PlanSource, SideId};
 use crate::validate::subset::{Role, Rule, Tracer};
 
 pub const ROW_ID: &str = "_rowid";
@@ -1056,26 +1055,6 @@ fn search_node(
                 recall,
             })
         }
-        IRExpr::Bm25 { field, query, .. } => {
-            let IRExpr::PropAccess {
-                variable,
-                property,
-                ty: _,
-            } = field.as_ref()
-            else {
-                return None;
-            };
-            let mut reads = Vec::new();
-            reads_of_expr(query, &mut reads);
-            Some(LogicalNode::TextSearch {
-                input,
-                binding: variable.clone(),
-                property: property.clone(),
-                query: query.as_ref().clone(),
-                reads,
-                leads,
-            })
-        }
         _ => None,
     }
 }
@@ -1654,10 +1633,6 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
             ..
         } => {
             out.push(ColumnRef::property(variable, property));
-            reads_of_expr(query, out);
-        }
-        IRExpr::Bm25 { field, query, .. } => {
-            reads_of_expr(field, out);
             reads_of_expr(query, out);
         }
         IRExpr::Aggregate { func, arg, .. } => match (func, arg.as_ref()) {
@@ -2634,9 +2609,7 @@ fn identity_reads(node: &LogicalNode) -> Vec<String> {
                 _ => None,
             })
             .collect(),
-        LogicalNode::Nearest { binding, .. } | LogicalNode::TextSearch { binding, .. } => {
-            vec![binding.clone()]
-        }
+        LogicalNode::Nearest { binding, .. } => vec![binding.clone()],
         // A full-text call a `Filter` or a `let` evaluates is membership of
         // the row's identity in the call's matches.
         LogicalNode::Filter { conjuncts, .. } => {
@@ -2687,7 +2660,6 @@ fn lexical_bindings(expr: &IRExpr, out: &mut Vec<String>) {
         // The predicates themselves were taken above.
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
-        | IRExpr::Bm25 { .. }
         | IRExpr::Variable(..)
         | IRExpr::Param(..)
         | IRExpr::Literal(..)
@@ -2758,14 +2730,6 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             reads,
             leads: _,
             recall: _,
-        }
-        | LogicalNode::TextSearch {
-            input: _,
-            binding: _,
-            property: _,
-            query: _,
-            reads,
-            leads: _,
         }
         | LogicalNode::Aggregate {
             input: _,
@@ -3264,22 +3228,6 @@ impl Lowering<'_> {
             )));
         }
         self.unmark(scan);
-        let mut access = access;
-        access.eligibility = match access.kind {
-            RankKind::Nearest => Eligibility::BeforeScoring,
-            RankKind::Bm25 => {
-                let type_key = match self.physical.node(scan) {
-                    Some(PhysicalNode::Scan { spec, .. }) => spec.table.type_key.clone(),
-                    _ => String::new(),
-                };
-                match self.source.full_text_coverage(&type_key, &access.property) {
-                    FullTextCoverage::Full => Eligibility::BeforeScoring,
-                    FullTextCoverage::Partial | FullTextCoverage::Absent => {
-                        Eligibility::AfterScoring
-                    }
-                }
-            }
-        };
         match self.physical.node_mut(scan) {
             Some(PhysicalNode::Scan { ranked, .. }) if ranked.is_none() => {
                 *ranked = Some(access);
@@ -3368,20 +3316,7 @@ impl Lowering<'_> {
         binding: &str,
         scan: NodeId,
         feeds: Vec<NodeId>,
-        on_empty: EmptyEligible,
     ) -> Result<Prefilter, PlanError> {
-        let coverage_admits = feeds.iter().all(|feed| match self.physical.node(*feed) {
-            Some(PhysicalNode::Scan {
-                spec,
-                ranked: Some(ranked),
-                ..
-            }) if ranked.kind == RankKind::Bm25 => {
-                self.source
-                    .full_text_coverage(&spec.table.type_key, &ranked.property)
-                    == FullTextCoverage::Full
-            }
-            _ => true,
-        });
         let ranked_type = match self.physical.node(scan) {
             Some(PhysicalNode::Scan { spec, .. }) => spec.table.node_type_name(),
             _ => None,
@@ -3397,8 +3332,6 @@ impl Lowering<'_> {
                 ranked_type,
                 hops: Vec::new(),
                 feeds,
-                on_empty,
-                coverage_admits,
             });
         }
         let mut introduced_by_scan = false;
@@ -3441,8 +3374,6 @@ impl Lowering<'_> {
             ranked_type,
             hops,
             feeds,
-            on_empty,
-            coverage_admits,
         })
     }
 
@@ -3893,7 +3824,6 @@ impl Lowering<'_> {
                     },
                     overfetch: fetch.map(OverfetchRung::ladder).unwrap_or_default(),
                     prefilter: None,
-                    eligibility: Eligibility::BeforeScoring,
                     policy: Some(NearestPolicy::DEFAULT),
                 };
                 let (score, scan) = self.rank(lowered, binding, access)?;
@@ -3902,13 +3832,7 @@ impl Lowering<'_> {
                     matches!(self.physical.node(*id), Some(PhysicalNode::Expand { src, .. }) if src == binding)
                 });
                 if expanded_from {
-                    let prefilter = self.prefilter(
-                        &top,
-                        binding,
-                        scan,
-                        vec![scan],
-                        EmptyEligible::ProvenEmpty,
-                    )?;
+                    let prefilter = self.prefilter(&top, binding, scan, vec![scan])?;
                     if let Some(PhysicalNode::Scan {
                         ranked: Some(ranked),
                         ..
@@ -3916,46 +3840,6 @@ impl Lowering<'_> {
                     {
                         ranked.prefilter = Some(prefilter);
                     }
-                }
-                if *leads {
-                    self.ranking = Some(Ranking::Scores(vec![score]));
-                }
-                Ok(lowered)
-            }
-            LogicalNode::TextSearch {
-                input,
-                binding,
-                property,
-                query,
-                leads,
-                ..
-            } => {
-                let lowered = self.lower(*input)?;
-                let access = RankedAccess {
-                    kind: RankKind::Bm25,
-                    score: rank_score(binding, RankKind::Bm25),
-                    property: property.clone(),
-                    query: query.clone(),
-                    fetch: None,
-                    nprobes: None,
-                    scope: RankScope::Order,
-                    overfetch: Vec::new(),
-                    prefilter: None,
-                    eligibility: Eligibility::BeforeScoring,
-                    policy: None,
-                };
-                let (score, scan) = self.rank(lowered, binding, access)?;
-                if let Some(PhysicalNode::Scan {
-                    ranked: Some(ranked),
-                    ..
-                }) = self.physical.node(scan)
-                {
-                    let eligibility = ranked.eligibility;
-                    self.tracer.record(
-                        &[Role::Search, Role::Scan],
-                        Rule::RankBm25Scan { eligibility },
-                        &[Role::Search],
-                    );
                 }
                 if *leads {
                     self.ranking = Some(Ranking::Scores(vec![score]));
@@ -4005,7 +3889,6 @@ impl Lowering<'_> {
                 ..
             } => {
                 let lowered = self.lower(*input)?;
-                self.tracer.record(&[Role::Search], Rule::Lower, &[]);
                 Ok(self.physical.add(PhysicalNode::Score {
                     input: lowered,
                     binding: binding.clone(),
