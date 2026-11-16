@@ -200,6 +200,8 @@ impl PairBuffer {
             DataFusionError::Internal("cross join pairs before a right batch".into())
         })?;
         let count = self.right_rows.len();
+        // Every pair formed is read work, the ones the filters drop included.
+        self.charge.charge_produced(count as u64)?;
         let work = self.charge.child(OUTPUT)?;
         work.entries::<u32>(count.saturating_mul(2))?;
         let indices = UInt32Array::from_iter_values(self.left_rows.drain(..));

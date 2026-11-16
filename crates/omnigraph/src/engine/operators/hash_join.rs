@@ -339,6 +339,7 @@ impl Probe {
         if probe_rows.is_empty() {
             return Ok(());
         }
+        work.charge_produced(probe_rows.len() as u64)?;
         let probe_columns: Vec<usize> = (0..batch.num_columns())
             .filter(|index| *index != id_index)
             .collect();

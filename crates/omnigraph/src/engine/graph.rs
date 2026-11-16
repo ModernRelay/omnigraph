@@ -1553,6 +1553,11 @@ where
                     ActiveExpandSource::Indexed(src) => src.interner.ids(),
                     ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => dst_idx.ids(),
                 };
+                // Every neighbor examined is read work, the hops that end
+                // below `min_hops` or at a visited node included.
+                memory
+                    .charge_produced((fwd.len() + rev.len()) as u64)
+                    .map_err(|error| memory.error(error))?;
                 // Admit what this node's neighbours can add before the walk.
                 let before = memory.charged();
                 memory

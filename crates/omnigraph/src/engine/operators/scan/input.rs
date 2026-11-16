@@ -115,6 +115,7 @@ impl Lookup {
             .await
             .map_err(external)?;
             let output = conform(output, &self.declared).map_err(external)?;
+            work.charge_produced(output.num_rows() as u64)?;
             sender.send_bounded(output, work).await?;
         }
         Ok(())

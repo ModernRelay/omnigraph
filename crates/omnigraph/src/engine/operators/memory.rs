@@ -34,10 +34,11 @@ pub(in crate::engine) struct QueryResources {
     read_seams: crate::instrumentation::ExternalReadSeams,
     buffers: Mutex<BufferRegistry>,
     registry_memory: MemoryReservation,
-    traversal: TraversalWork,
-    /// The rows every expansion of the read produced, against
-    /// `read_work_limit`.
-    read: TraversalWork,
+    /// The edge rows and hops of a statement with alternatives or a
+    /// wildcard, against `traversal_work_limit`.
+    traversal: WorkBudget,
+    /// The read's row work, against `read_work_limit`.
+    read: WorkBudget,
     work: QueryWorkScope,
     /// A csv load's shares of this pool, carved per run by `ValidateExec`.
     load_budget: Mutex<Option<Arc<LoadBudget>>>,
@@ -46,14 +47,14 @@ pub(in crate::engine) struct QueryResources {
 /// Monotonic statement-wide work admission. Child operators and repeated
 /// search passes share this counter; releasing memory never refunds work.
 #[derive(Debug)]
-struct TraversalWork {
+struct WorkBudget {
     /// The setting the limit came from, which a refusal names.
     resource: &'static str,
     limit: Option<NonZeroU64>,
     used: AtomicU64,
 }
 
-impl TraversalWork {
+impl WorkBudget {
     fn new(limit: Option<NonZeroU64>) -> Self {
         Self::named("traversal_work_limit", limit)
     }
@@ -234,8 +235,8 @@ impl QueryResources {
             probes: crate::instrumentation::current_query_memory_probes(),
             read_seams: crate::instrumentation::capture_external_read_seams(),
             buffers: Mutex::new(BufferRegistry::default()),
-            traversal: TraversalWork::new(traversal_limit),
-            read: TraversalWork::named("read_work_limit", read_limit),
+            traversal: WorkBudget::new(traversal_limit),
+            read: WorkBudget::named("read_work_limit", read_limit),
             work,
             load_budget: Mutex::new(None),
         }
@@ -698,7 +699,11 @@ impl WorkMemory {
         self.resources.traversal.charge(additional)
     }
 
-    /// Charge rows an expansion produced against the read's work budget.
+    /// Charge `rows` of work against the read's budget, `read_work_limit`:
+    /// every row an expansion or a join produces (a keyed lookup's
+    /// included), every pair a cross join forms, every neighbor a
+    /// hop-range walk examines, and the terms and term comparisons of the
+    /// exact lexical scan.
     pub(in crate::engine) fn charge_produced(&self, rows: u64) -> DfResult<()> {
         self.resources.read.charge(rows)
     }
@@ -1409,7 +1414,7 @@ mod tests {
 
     #[test]
     fn traversal_work_concurrent_admission_never_exceeds_cap_issue_659() {
-        let work = TraversalWork::new(NonZeroU64::new(1_000));
+        let work = WorkBudget::new(NonZeroU64::new(1_000));
         let accepted = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
                 .map(|_| scope.spawn(|| (0..1_000).filter(|_| work.charge(1).is_ok()).count()))
@@ -1425,7 +1430,7 @@ mod tests {
 
     #[test]
     fn traversal_work_refuses_overflow_without_wrapping_issue_659() {
-        let work = TraversalWork::new(NonZeroU64::new(u64::MAX));
+        let work = WorkBudget::new(NonZeroU64::new(u64::MAX));
         work.charge(u64::MAX).unwrap();
         assert!(work.charge(1).is_err());
         assert_eq!(work.used.load(Ordering::Relaxed), u64::MAX);
@@ -1433,7 +1438,7 @@ mod tests {
 
     #[test]
     fn traversal_work_refusal_does_not_admit_partial_request_issue_659() {
-        let work = TraversalWork::new(NonZeroU64::new(7));
+        let work = WorkBudget::new(NonZeroU64::new(7));
         work.charge(3).unwrap();
         assert!(work.charge(5).is_err());
         assert_eq!(work.used.load(Ordering::Relaxed), 3);
