@@ -291,6 +291,9 @@ which one fails if one does:
 
 Tell the user what they have, then offer the step that fits:
 
+- **See it in Studio:** Omnigraph Studio, the desktop app, shows the schema,
+  each type as a table, a node's links as a tree or canvas, and a branch's
+  changes before the merge. See [the next section](#see-the-graph-in-studio).
 - **More data:** bulk loads and imports in [data changes](data.md); CSV through
   `load csv` statements.
 - **Search:** embeddings and vector, keyword and hybrid ranking in
@@ -303,6 +306,65 @@ Tell the user what they have, then offer the step that fits:
   signs in to `https://platform.omnigraph.dev`; see
   [operator config and credentials](commands.md#operator-config--credentials)
   and the [operator reference](../../../docs/user/cli/targets.md).
+
+### See the graph in Studio
+
+Studio opens a graph that `omnigraph-server` serves, not a local folder such as
+`./graph.omni`, so serve the graph first. The user installs Studio from its
+[releases](https://github.com/ModernRelay/omnigraph-studio/releases/latest);
+the installer from step 1 already put `omnigraph-server` beside the CLI.
+
+Declare the graph in a `cluster.yaml` next to the schema:
+
+```yaml
+version: 1
+graphs:
+  knowledge:
+    schema: schema.pg
+    queries: queries.gq
+```
+
+Create the served copy and load the data into it. `cluster apply` creates the
+graph empty, so the seed is loaded again. Each of these writes keeps the
+cluster's lock when it finishes; once it has, read the `lock_id` from
+`omnigraph cluster status --target ./served --json` and release it before the
+next write and before the server starts:
+
+```bash
+mkdir served
+omnigraph cluster apply --target ./served --config . --json
+omnigraph cluster force-unlock <LOCK_ID> --target ./served
+omnigraph load --data seed.jsonl --mode merge --target ./served --graph knowledge
+omnigraph cluster force-unlock <LOCK_ID> --target ./served
+```
+
+Start the server in a process that keeps running, such as a background job or
+a second terminal. `--unauthenticated` lets every request in, so bind it to
+loopback only:
+
+```bash
+omnigraph-server --cluster "file://$PWD/served" --bind 127.0.0.1:8080 --unauthenticated
+```
+
+Register it as a target, then open Studio on it. `target add` rewrites the
+user's operator file (`~/.omnigraph/config.yaml`) and drops its comments, so
+tell the user before you run it:
+
+```bash
+echo '{"kind":"server","endpoint":"http://127.0.0.1:8080","auth":{"provider":"anonymous"}}' \
+  | omnigraph target add local
+omnigraph studio --target local --graph knowledge
+```
+
+Pass `--graph`: this server has no cluster policy, so it refuses to list its
+graphs, while queries and Studio work. Without Studio installed, `omnigraph
+studio` prints the link and refuses with `studio_unavailable`.
+
+The served copy is now a second graph. Writes through `--target local --graph
+knowledge` land in `./served`, not in `./graph.omni`. If the user keeps using
+the served one, update the agent file's `--target` to match, and add `served/`
+to `.gitignore`. See [Open Studio](../../../docs/user/cli/studio.md) and
+[cluster](cluster.md).
 
 Point them to the [quickstart](../../../docs/user/quickstart.md) and the
 [Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
