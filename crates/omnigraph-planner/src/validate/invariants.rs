@@ -16,7 +16,7 @@
 
 use std::collections::HashSet;
 
-use super::requirements::{BoundVariable, TieColumn};
+use super::requirements::{BoundVariable, Region, TieColumn};
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_compiler::types::{ExprType, ScalarType};
 
@@ -109,7 +109,7 @@ fn check_block_strategy(
 
 /// Every conjunct a pipeline's nodes test, wherever placement put it, with
 /// the node that tests it.
-fn conjuncts(plan: &PhysicalPlan, nodes: &[NodeId]) -> Vec<(NodeId, IRExpr)> {
+pub(super) fn conjuncts(plan: &PhysicalPlan, nodes: &[NodeId]) -> Vec<(NodeId, IRExpr)> {
     let mut out = Vec::new();
     for id in nodes {
         match plan.node(*id) {
@@ -151,6 +151,93 @@ fn conjuncts(plan: &PhysicalPlan, nodes: &[NodeId]) -> Vec<(NodeId, IRExpr)> {
         }
     }
     out
+}
+
+/// The region path of every node of the scope under `root`
+/// ([`Region`]): an `OptionalJoin`'s inner tree is inside its optional, each
+/// arm of a `Union` fold (a left spine of unions over the same bindings) is
+/// inside that arm, a `Correlate`'s inner tree is inside its read, and a
+/// `TargetCut`'s input is below its window. A block's inner tree and a
+/// fusion's arms are scopes of their own and are not walked.
+fn plan_regions(
+    plan: &PhysicalPlan,
+    root: NodeId,
+    budget: &mut Budget,
+) -> Result<std::collections::HashMap<NodeId, Vec<Region>>, ValidationError> {
+    fn fold_arms(
+        plan: &PhysicalPlan,
+        id: NodeId,
+        bindings: &[String],
+    ) -> (Vec<NodeId>, Vec<NodeId>) {
+        match plan.node(id) {
+            Some(PhysicalNode::Union {
+                left,
+                right,
+                bindings: own,
+            }) if own == bindings => {
+                let (mut spine, mut arms) = fold_arms(plan, *left, bindings);
+                spine.push(id);
+                arms.push(*right);
+                (spine, arms)
+            }
+            _ => (Vec::new(), vec![id]),
+        }
+    }
+    let mut regions = std::collections::HashMap::new();
+    let mut pending = vec![(root, Vec::<Region>::new())];
+    while let Some((id, path)) = pending.pop() {
+        budget.visit(1)?;
+        let Some(node) = plan.node(id) else {
+            continue;
+        };
+        let within = |region: Region| {
+            let mut nested = path.clone();
+            nested.push(region);
+            nested
+        };
+        match node {
+            PhysicalNode::OptionalJoin {
+                input,
+                inner,
+                outer_var,
+            } => {
+                pending.push((*input, path.clone()));
+                pending.push((*inner, within(Region::Optional(outer_var.clone()))));
+            }
+            PhysicalNode::Correlate {
+                input,
+                inner,
+                outer_var,
+                ..
+            } => {
+                if let Some(input) = input {
+                    pending.push((*input, path.clone()));
+                }
+                pending.push((*inner, within(Region::Correlate(outer_var.clone()))));
+            }
+            PhysicalNode::Union { bindings, .. } => {
+                let (spine, arms) = fold_arms(plan, id, bindings);
+                for node in spine {
+                    regions.insert(node, path.clone());
+                }
+                for (position, arm) in arms.into_iter().enumerate() {
+                    pending.push((arm, within(Region::UnionArm(bindings.clone(), position))));
+                }
+                continue;
+            }
+            PhysicalNode::TargetCut { input, .. } => pending.push((*input, within(Region::Window))),
+            PhysicalNode::AntiJoin { input, .. } => pending.push((*input, path.clone())),
+            PhysicalNode::Fuse { .. } => {}
+            other => pending.extend(
+                other
+                    .inputs()
+                    .into_iter()
+                    .map(|input| (input, path.clone())),
+            ),
+        }
+        regions.insert(id, path);
+    }
+    Ok(regions)
 }
 
 /// The expression an order key names: for an alias, the return item it
@@ -276,6 +363,7 @@ impl Requirements {
         self.check_optionals(plan, &top, budget)?;
         self.check_correlates(plan, &top, budget)?;
         self.check_unions(plan, &top)?;
+        self.check_regions(plan, root, &top, budget)?;
         self.check_scores(plan, &top, input)?;
         self.check_lets(plan, &top)?;
         self.check_search(plan, &top)?;
@@ -1007,6 +1095,77 @@ impl Requirements {
         Ok(())
     }
 
+    /// Every conjunct is tested in the regions of the scope that write it
+    /// ([`Region`]) and in no other: a required conjunct tested only in
+    /// another region, or a copy tested in a region that does not write it,
+    /// is refused. A conjunct the query writes nowhere is the eligibility
+    /// check's.
+    fn check_regions(
+        &self,
+        plan: &PhysicalPlan,
+        root: NodeId,
+        top: &[NodeId],
+        budget: &mut Budget,
+    ) -> Result<(), ValidationError> {
+        let regions = plan_regions(plan, root, budget)?;
+        let placed: Vec<(IRExpr, &[Region])> = conjuncts(plan, top)
+            .into_iter()
+            .map(|(id, conjunct)| (conjunct, regions.get(&id).map_or(&[][..], Vec::as_slice)))
+            .collect();
+        budget
+            .visit(u64::try_from(placed.len() * self.regions.len().max(1)).unwrap_or(u64::MAX))?;
+        let describe = |path: &[Region]| -> String {
+            if path.is_empty() {
+                return "the scope".to_string();
+            }
+            path.iter()
+                .map(|region| match region {
+                    Region::Optional(var) => format!("the optional over `${var}`"),
+                    Region::UnionArm(_, position) => format!("union arm {}", position + 1),
+                    Region::Correlate(_) => "the correlated read".to_string(),
+                    Region::Window => "below the window's cut".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        for (conjunct, path) in &self.regions {
+            if !placed
+                .iter()
+                .any(|(tested, at)| tested == conjunct && *at == path.as_slice())
+            {
+                return Err(ValidationError::violated(
+                    "predicate retention",
+                    format!(
+                        "the query tests `{conjunct}` in {}; the plan does not test it there",
+                        describe(path)
+                    ),
+                ));
+            }
+        }
+        for (conjunct, at) in &placed {
+            if constant_true(conjunct) {
+                continue;
+            }
+            let written: Vec<&Vec<Region>> = self
+                .regions
+                .iter()
+                .filter(|(own, _)| own == conjunct)
+                .map(|(_, path)| path)
+                .collect();
+            if !written.is_empty() && !written.iter().any(|path| path.as_slice() == *at) {
+                return Err(ValidationError::violated(
+                    "predicate origin",
+                    format!(
+                        "the plan tests `{conjunct}` in {}; the query writes it in {}",
+                        describe(at),
+                        describe(written[0])
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether `conjunct` is required outside every `optional`: the scope's
     /// eligibility holds each optional's conjuncts too, so one written in
     /// `where` as well counts once more than the optionals write it.
@@ -1174,6 +1333,17 @@ impl Requirements {
                     ),
                 ));
             }
+        }
+        // A `nearest` window keeps its `k` targets: the plan cuts them.
+        if let Some(window) = self.window.flatten()
+            && !scope
+                .iter()
+                .any(|id| matches!(plan.node(*id), Some(PhysicalNode::TargetCut { .. })))
+        {
+            return Err(ValidationError::violated(
+                "row cut",
+                format!("the query's window keeps {window} targets; the plan cuts no targets"),
+            ));
         }
         Ok(())
     }

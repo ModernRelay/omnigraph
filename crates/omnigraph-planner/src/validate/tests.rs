@@ -1047,6 +1047,137 @@ fn a_window_cut_of_another_k_fails_the_row_cut() {
     assert_eq!(check, "row cut", "{detail}");
 }
 
+/// A conjunct belongs to the scope that writes it: a copy of a conjunct
+/// tested in another scope, inside an `optional`'s inner tree, in another
+/// arm of a `union` or below a `nearest` window's `TargetCut`, changes which
+/// rows the scope keeps and is refused, although the conjunct is required
+/// somewhere in the read.
+#[test]
+fn a_conjunct_tested_in_another_scope_is_refused() {
+    let conjunct_of = |fixture: &Fixture, plan: &PhysicalPlan, written: &str| -> IRExpr {
+        let _ = fixture;
+        super::invariants::conjuncts(plan, &plan.live().map(|(id, _)| id).collect::<Vec<_>>())
+            .into_iter()
+            .map(|(_, conjunct)| conjunct)
+            .find(|conjunct| conjunct.to_string().contains(written))
+            .unwrap_or_else(|| panic!("the plan tests `{written}`"))
+    };
+    // A conjunct written after an `optional` copied into its inner tree.
+    let optional = Fixture::new(
+        r#"query q() {
+    match { $d: Doc, optional { $e: Doc, $d cites $e } }
+    where $d.year > 2000
+    return { $d.slug, $e.slug }
+}"#,
+        &[],
+    );
+    let mut plan = optional.plan();
+    optional.accept(plan.clone()).expect("the planned optional");
+    let conjunct = conjunct_of(&optional, &plan, "year");
+    let [join] = node_ids(&plan, |node| {
+        matches!(node, PhysicalNode::OptionalJoin { .. })
+    })[..] else {
+        panic!("one optional join");
+    };
+    let Some(PhysicalNode::OptionalJoin { inner, .. }) = plan.node(join).cloned() else {
+        unreachable!()
+    };
+    let filter = plan.add(PhysicalNode::Filter {
+        input: inner,
+        filters: vec![conjunct],
+    });
+    if let Some(PhysicalNode::OptionalJoin { inner, .. }) = plan.node_mut(join) {
+        *inner = filter;
+    }
+    let (check, detail) = optional.refused(plan);
+    assert_eq!(check, "predicate origin", "{detail}");
+    // One arm's conjunct copied into the other arm of a `union`.
+    let union = Fixture::new(
+        r#"query q() {
+    match { from union(
+        { match { $d: Doc } where $d.year > 2000 return { $d } },
+        { match { $d: Doc } where $d.open = true return { $d } }) }
+    return { $d.slug }
+}"#,
+        &[],
+    );
+    let mut plan = union.plan();
+    union.accept(plan.clone()).expect("the planned union");
+    let conjunct = conjunct_of(&union, &plan, "year");
+    let [fold] = node_ids(&plan, |node| matches!(node, PhysicalNode::Union { .. }))[..] else {
+        panic!("one union");
+    };
+    let Some(PhysicalNode::Union { right, .. }) = plan.node(fold).cloned() else {
+        unreachable!()
+    };
+    let filter = plan.add(PhysicalNode::Filter {
+        input: right,
+        filters: vec![conjunct],
+    });
+    if let Some(PhysicalNode::Union { right, .. }) = plan.node_mut(fold) {
+        *right = filter;
+    }
+    let (check, detail) = union.refused(plan);
+    assert_eq!(check, "predicate origin", "{detail}");
+    // A conjunct written after a `nearest` window copied below its cut,
+    // where it would choose the window's targets.
+    let windowed = Fixture::new(
+        "query q() { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 2) as $distance } where $d.year > 2000 return { $d.slug } }",
+        &[],
+    );
+    let mut plan = windowed.plan();
+    windowed.accept(plan.clone()).expect("the planned window");
+    let conjunct = conjunct_of(&windowed, &plan, "year");
+    let [cut] = node_ids(&plan, |node| matches!(node, PhysicalNode::TargetCut { .. }))[..] else {
+        panic!("one window cut");
+    };
+    let Some(PhysicalNode::TargetCut { input, .. }) = plan.node(cut).cloned() else {
+        unreachable!()
+    };
+    let filter = plan.add(PhysicalNode::Filter {
+        input,
+        filters: vec![conjunct],
+    });
+    if let Some(PhysicalNode::TargetCut { input, .. }) = plan.node_mut(cut) {
+        *input = filter;
+    }
+    let (check, detail) = windowed.refused(plan);
+    assert_eq!(check, "predicate origin", "{detail}");
+}
+
+/// A `nearest` window drawn as a pattern step keeps its `k` targets with a
+/// `TargetCut` over the sort that orders them; a plan without the two keeps
+/// every ranked row and is refused.
+#[test]
+fn a_window_without_its_target_cut_fails_the_row_cut() {
+    let windowed = Fixture::new(
+        "query q() { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 2) as $distance } where $d.year > 2000 return { $d.slug } }",
+        &[],
+    );
+    let mut plan = windowed.plan();
+    let [cut] = node_ids(&plan, |node| matches!(node, PhysicalNode::TargetCut { .. }))[..] else {
+        panic!("one window cut");
+    };
+    let Some(PhysicalNode::TargetCut { input: sort, .. }) = plan.node(cut).cloned() else {
+        unreachable!()
+    };
+    // The window's sort goes with its cut, which it orders for.
+    let below = match plan.node(sort) {
+        Some(PhysicalNode::Sort { input, .. }) => *input,
+        _ => sort,
+    };
+    let parents: Vec<usize> = node_ids(&plan, |node| node.inputs().contains(&cut));
+    for parent in parents {
+        if let Some(PhysicalNode::Filter { input, .. } | PhysicalNode::Projection { input, .. }) =
+            plan.node_mut(parent)
+        {
+            *input = below;
+        }
+    }
+    let (check, detail) = windowed.refused(plan);
+    assert_eq!(check, "row cut", "{detail}");
+}
+
 #[test]
 fn another_limit_fails_the_row_cut() {
     let fixture = filtered();

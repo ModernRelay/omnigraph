@@ -169,6 +169,87 @@ fn own_eligibility(inner: &[PatternStep]) -> Vec<IRExpr> {
     eligibility
 }
 
+/// A nested region of a scope a conjunct is tested in: inside an
+/// `optional`'s inner tree (on its correlation binding), in one arm of a
+/// `union` (its bindings and the arm's position), inside a correlated read's
+/// inner tree, or below a `nearest` window's cut. A conjunct is tested in the
+/// regions that write it and nowhere else: moved into or out of one, it
+/// changes which rows the region keeps.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Region {
+    Optional(String),
+    UnionArm(Vec<String>, usize),
+    Correlate(Option<String>),
+    Window,
+}
+
+/// Every eligibility conjunct of `steps` with the regions it is written in,
+/// under `path`. Blocks and fusion arms are checked as scopes of their own.
+pub(crate) fn conjunct_regions(
+    steps: &[PatternStep],
+    path: &[Region],
+    out: &mut Vec<(IRExpr, Vec<Region>)>,
+) {
+    // The steps before a `nearest` ranking step are its population, which
+    // the plan tests below the window's cut.
+    let window = steps.iter().rposition(|step| {
+        matches!(
+            step,
+            PatternStep::Rank {
+                key: IRExpr::Nearest { .. },
+                ..
+            }
+        )
+    });
+    for (index, step) in steps.iter().enumerate() {
+        let mut here = path.to_vec();
+        if window.is_some_and(|window| index < window) {
+            here.push(Region::Window);
+        }
+        let within = |region: Region| {
+            let mut nested = here.clone();
+            nested.push(region);
+            nested
+        };
+        match step {
+            PatternStep::NodeScan { filters, .. }
+            | PatternStep::Expand {
+                dst_filters: filters,
+                ..
+            } => {
+                let mut own = Vec::new();
+                push_conjuncts(&mut own, filters);
+                out.extend(own.into_iter().map(|conjunct| (conjunct, here.clone())));
+            }
+            PatternStep::Filter(filter) => {
+                let mut own = Vec::new();
+                push_conjuncts(&mut own, std::slice::from_ref(filter));
+                out.extend(own.into_iter().map(|conjunct| (conjunct, here.clone())));
+            }
+            PatternStep::Optional { outer_var, inner } => {
+                conjunct_regions(inner, &within(Region::Optional(outer_var.clone())), out)
+            }
+            PatternStep::Union { arms, bindings, .. } => {
+                for (position, arm) in arms.iter().enumerate() {
+                    conjunct_regions(
+                        arm,
+                        &within(Region::UnionArm(bindings.clone(), position)),
+                        out,
+                    );
+                }
+            }
+            PatternStep::Correlate {
+                outer_var, inner, ..
+            } => conjunct_regions(inner, &within(Region::Correlate(outer_var.clone())), out),
+            PatternStep::Rank { .. }
+            | PatternStep::Score { .. }
+            | PatternStep::Let { .. }
+            | PatternStep::AntiJoin { .. }
+            | PatternStep::Fuse { .. } => {}
+        }
+    }
+}
+
 /// The steps of `steps` with each `optional`'s own steps in its place: the
 /// names an `optional` introduces are the scope's, so its bindings,
 /// traversals, conjuncts and blocks are the scope's requirements too, and
@@ -372,6 +453,9 @@ pub struct Requirements {
     /// split at its top-level `and`; a constant `true` constrains nothing and
     /// is left out.
     pub(crate) eligibility: Vec<IRExpr>,
+    /// Each eligibility conjunct with the regions of the scope it is
+    /// written in ([`Region`]).
+    pub(crate) regions: Vec<(IRExpr, Vec<Region>)>,
     pub(crate) returns: Vec<IRProjection>,
     /// The return items that read the leading ranking's score column, by
     /// position, with that ranking.
@@ -618,7 +702,10 @@ impl Requirements {
         };
         let mut columns = Vec::new();
         tie_columns(pipeline, &mut columns);
+        let mut regions = Vec::new();
+        conjunct_regions(pipeline, &[], &mut regions);
         Ok(Self {
+            regions,
             bindings,
             tie_columns: columns,
             traversals,

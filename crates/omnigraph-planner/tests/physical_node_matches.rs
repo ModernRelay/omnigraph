@@ -83,6 +83,11 @@ const BEHAVIOUR_SITES: &[(&str, &str, &str)] = &[
         "the cuts of Limit, Scan and Sort justified against the query",
     ),
     (
+        "validate/invariants.rs",
+        "plan_regions",
+        "the nested regions of OptionalJoin, Correlate, Union and TargetCut, and the scopes AntiJoin and Fuse leave unwalked",
+    ),
+    (
         "validate/source.rs",
         "validate_catalogue_sources",
         "the catalogue-bound reads of MetadataCount, HydrateColumns, Scan and ContainsJoin",
