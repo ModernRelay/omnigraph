@@ -1263,6 +1263,7 @@ impl Omnigraph {
             committed: JudgedSide::Live {
                 base,
                 branch: txn.branch.clone(),
+                caller_head: txn.caller_expected_graph_head.clone(),
             },
             write_budget,
             catalog: Arc::clone(&txn.catalog),
