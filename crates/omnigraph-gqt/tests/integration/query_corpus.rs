@@ -1,7 +1,7 @@
 //! Every query text the repository documents or ships outside the GQT
 //! corpus parses: the fenced `gq` blocks of the user and developer guides,
-//! the agent skill and the README, and the `.gq` files of the guides and the
-//! engine's fixtures; a `.gq` file with a `.pg` beside it also type-checks. The
+//! the agent skill and the README, the inline examples of the MCP tools'
+//! descriptions, and the `.gq` files of the guides and the engine's fixtures; a `.gq` file with a `.pg` beside it also type-checks. The
 //! GQT runner holds the corpus's own sections; these texts have no runner, so
 //! a stale example would otherwise reach a reader.
 
@@ -109,6 +109,22 @@ fn corpus() -> Vec<Text> {
                     origin: format!("{origin}#{n}"),
                     schema: None,
                     source: source.clone(),
+                });
+            }
+        }
+    }
+    // The inline query examples of the MCP tools' descriptions, which an
+    // agent copies as written: every backticked span that opens with
+    // `query `.
+    for file in files(&root().join("crates/omnigraph-mcp/src"), "rs") {
+        let origin = relative(&file);
+        let text = std::fs::read_to_string(&file).unwrap();
+        for (n, span) in text.split('`').skip(1).step_by(2).enumerate() {
+            if span.starts_with("query ") && span.contains('{') {
+                out.push(Text {
+                    origin: format!("{origin}#{n}"),
+                    schema: None,
+                    source: span.to_string(),
                 });
             }
         }
