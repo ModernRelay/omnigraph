@@ -1072,24 +1072,37 @@ async fn a_hydrating_top_k_builds_one_operator_above_its_limit() {
     }
 }
 
+/// A fusion is one operator over its arms, each `nearest` arm the same
+/// window operators it runs standing alone: its ranked scan, the sort of its
+/// candidates and its target cut.
 #[tokio::test]
-async fn a_rank_fuse_is_one_operator_over_two_arm_scans() {
+async fn a_fuse_is_one_operator_over_its_arm_windows() {
     let dir = tempfile::tempdir().unwrap();
     let db = doc_graph(&dir).await;
     let params = vector("q", &[0.0, 0.0, 0.0, 0.0]);
     let (rows, run) = run(&db, DOC_QUERIES, "fused", &params).await;
     assert_eq!(rows, 3);
     assert_covers(&run);
-    let fuse = node_id(&run.plan, |node| {
-        matches!(node, PhysicalNode::RankFuse { .. })
-    });
-    assert_eq!(operator(&run, fuse), "RankFuseExec");
+    let fuse = node_id(&run.plan, |node| matches!(node, PhysicalNode::Fuse { .. }));
+    assert_eq!(operator(&run, fuse), "FuseExec");
     assert_eq!(row(&run, fuse).status, RowStatus::Executed);
-    for scope in [RankScope::Primary, RankScope::Secondary] {
-        let scan = node_id(&run.plan, |node| {
-            node.ranked().is_some_and(|ranked| ranked.scope == scope)
-        });
-        assert_eq!(operator(&run, scan), "ScanExec", "{scope:?}");
+    let arms = run.plan.node(fuse).unwrap().inputs();
+    assert_eq!(arms.len(), 2);
+    for arm in arms {
+        assert_eq!(operator(&run, arm), "TargetCutExec");
+    }
+    let scans: Vec<_> = run
+        .plan
+        .live()
+        .filter(|(_, node)| {
+            node.ranked()
+                .is_some_and(|ranked| ranked.scope == RankScope::Window)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(scans.len(), 2, "one window scan per arm");
+    for scan in scans {
+        assert_eq!(operator(&run, scan), "ScanExec");
     }
     let limit = node_id(&run.plan, |node| matches!(node, PhysicalNode::Limit { .. }));
     assert_eq!(operator(&run, limit), "LimitExec");

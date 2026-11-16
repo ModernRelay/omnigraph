@@ -118,47 +118,6 @@ const B_IN_PROGRESS: &[InProgress] = &[
         site: "a full-text call read as a value in `order`",
         text: "query q($s: String) { match { $d: Doc } return { $d.title } order { match_terms($d.body, terms($s, mode: any)) } }",
     },
-    // `ReadShape`: rankings and fusion.
-    InProgress {
-        construct: "two rrf arm windows that differ",
-        site: "two `rrf` arm windows that differ",
-        text: "query q($v: Vector(3), $w: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), nearest($all, $d.embedding, $w, k: 5)) as $score } return { $d.title } order { $d.title } }",
-    },
-    InProgress {
-        construct: "a bm25 arm beside a nearest arm",
-        site: "an `rrf` arm over `bm25` on a field whose index declares an analyzer",
-        text: "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",
-    },
-    InProgress {
-        construct: "a bm25 arm 1",
-        site: "an `rrf` arm over `bm25` on a field whose index declares an analyzer",
-        text: "query q($s: String, $v: Vector(3)) { match { let $pop = { match { $d: Doc, $p: Person, $p authored $d } where $p.age > 30 return { $d } }, from rrf(nearest($pop, $d.embedding, $v, k: 3), bm25($pop, $d.body, $s)) as $score, $p: Person, $p authored $d } return { $d.title, $p.name } order { $score desc } }",
-    },
-    InProgress {
-        construct: "an rrf arm that is an inline read with an `order`",
-        site: "an `rrf` arm ranked by its read's own `order` rather than by a ranking function",
-        text: "query q($s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.body, $s), { match { $d: Doc } return { $d } order { $d.id } }) as $score } return { $d.title, $score } }",
-    },
-    InProgress {
-        construct: "rrf arms over different populations",
-        site: "`rrf` arms over different populations",
-        text: "query q($s: String, $v: Vector(3)) { match { let $old = { match { $d: Doc, $p: Person, $p authored $d } where $p.age > 30 return { $d } }, let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($old, $d.embedding, $v, k: 3), bm25($all, $d.body, $s)) as $score } return { $d.title } order { $score desc } limit 3 }",
-    },
-    InProgress {
-        construct: "distance as an rrf arm",
-        site: "an `rrf` arm over `distance`",
-        text: "query q($v: Vector(3), $s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(distance($all, $d.embedding, $v), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",
-    },
-    InProgress {
-        construct: "bm25 as an rrf arm",
-        site: "an `rrf` arm over `bm25` on a field whose index declares an analyzer",
-        text: "query q($v: Vector(3), $s: String) { match { let $all = { match { $m: Memo } return { $m } }, from rrf(nearest($all, $m.embedding, $v, k: 3), bm25($all, $m.text, $s), k: 60) as $score } return { $m.slug } order { $score desc } limit 3 }",
-    },
-    InProgress {
-        construct: "an rrf of three arms",
-        site: "an `rrf` of other than two arms",
-        text: "query q($v: Vector(3), $s: String, $t: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), bm25($all, $d.body, $t)) as $score } return { $d.title } order { $score desc } limit 3 }",
-    },
     // `ReadShape`: the elements of a pattern.
     InProgress {
         construct: "a `let` inside an `optional` that binds no node",
@@ -413,7 +372,7 @@ const CLOSURE: &[Row] = &[
             ),
             (
                 "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",
-                Refused("B"),
+                Lowers,
             ),
             (
                 "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, $v) as $distance } return { $d.title, $distance } }",
@@ -431,31 +390,41 @@ const CLOSURE: &[Row] = &[
                 "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } return { max($score) as best, count($d) as n } }",
                 Lowers,
             ),
-            // "two rrf arm windows that differ"
+            // Two `nearest` arms with windows of their own.
             (
                 "query q($v: Vector(3), $w: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), nearest($all, $d.embedding, $w, k: 5)) as $score } return { $d.title } order { $d.title } }",
-                Refused("B"),
+                Lowers,
             ),
-            // "an rrf of three arms"
+            // Three arms with weights.
             (
-                "query q($v: Vector(3), $s: String, $t: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), bm25($all, $d.body, $t)) as $score } return { $d.title } order { $score desc } limit 3 }",
-                Refused("B"),
+                "query q($v: Vector(3), $s: String, $t: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), bm25($all, $d.body, $t), weights: [2.0, 1.0, 0.5]) as $score } return { $d.title } order { $score desc } limit 3 }",
+                Lowers,
             ),
             // An `rrf` over a population whose pattern fans out or filters:
             // one row per target.
             (
                 "query q($s: String, $v: Vector(3)) { match { let $pop = { match { $d: Doc, $p: Person, $p authored $d } where $p.age > 30 return { $d } }, from rrf(nearest($pop, $d.embedding, $v, k: 3), bm25($pop, $d.body, $s)) as $score, $p: Person, $p authored $d } return { $d.title, $p.name } order { $score desc } }",
-                Refused("B"),
+                Lowers,
             ),
-            // "rrf arms over different populations"
+            // Arms over different populations.
             (
                 "query q($s: String, $v: Vector(3)) { match { let $old = { match { $d: Doc, $p: Person, $p authored $d } where $p.age > 30 return { $d } }, let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($old, $d.embedding, $v, k: 3), bm25($all, $d.body, $s)) as $score } return { $d.title } order { $score desc } limit 3 }",
-                Refused("B"),
+                Lowers,
             ),
-            // "distance as an rrf arm"
+            // An exact `distance` arm.
             (
                 "query q($v: Vector(3), $s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(distance($all, $d.embedding, $v), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",
-                Refused("B"),
+                Lowers,
+            ),
+            // An inline read whose own `order` ranks its targets, and an
+            // exact `bm25` arm on another type's declared field.
+            (
+                "query q($s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.body, $s), { match { $d: Doc } return { $d } order { $d.id } }) as $score } return { $d.title, $score } }",
+                Lowers,
+            ),
+            (
+                "query q($v: Vector(3), $s: String) { match { let $all = { match { $m: Memo } return { $m } }, from rrf(nearest($all, $m.embedding, $v, k: 3), bm25($all, $m.text, $s), k: 60) as $score } return { $m.slug } order { $score desc } limit 3 }",
+                Lowers,
             ),
             // A lexical predicate is a Boolean operand like any other: under
             // `not` and `or`, compared with a value, inside `coalesce`, in a
@@ -806,7 +775,7 @@ fn names_site(message: &str, site: &str) -> bool {
 fn every_refusal_of_the_shapers_is_pinned() {
     let mut sites = refusal_sites(include_str!("../../../shape/read.rs"));
     sites.extend(refusal_sites(include_str!("../../../shape/write.rs")));
-    assert!(sites.len() > 20, "the site reader found {sites:#?}");
+    assert!(sites.len() > 10, "the site reader found {sites:#?}");
     let stage = |text: &str| -> (String, &'static str) {
         let d = outcome(text).expect_err(text);
         assert_eq!(d.code.as_str(), "T86", "{d}\n{text}");

@@ -821,6 +821,9 @@ async fn query_table_statistics(
                     read: _,
                 } => pending.push(inner),
                 PatternStep::Union { arms, .. } => pending.extend(arms.iter().map(Vec::as_slice)),
+                PatternStep::Fuse { arms, .. } => {
+                    pending.extend(arms.iter().map(|arm| arm.steps.as_slice()))
+                }
                 PatternStep::Filter(_)
                 | PatternStep::Rank { .. }
                 | PatternStep::Score { .. }

@@ -52,7 +52,6 @@ pub(crate) fn evaluate_constant(expr: &IRExpr, params: &ParamMap) -> Result<Lite
             IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
             | IRExpr::Bm25 { .. }
-            | IRExpr::Rrf { .. }
             | IRExpr::Variable(_, _)
             | IRExpr::Aggregate { .. }
             | IRExpr::AliasRef(_, _)
@@ -207,6 +206,13 @@ fn fold_pipeline(
                     fold_pipeline(arm, declared, params)?;
                 }
             }
+            // A fusion's `k` binds as it runs, where the engine refuses a
+            // value outside its range.
+            PatternStep::Fuse { arms, .. } => {
+                for arm in arms {
+                    fold_pipeline(&mut arm.steps, declared, params)?;
+                }
+            }
             // An inline read's own `limit $param` takes its bound count, as
             // the read's does.
             PatternStep::Correlate { inner, read, .. } => {
@@ -283,7 +289,6 @@ fn fold_expr(expr: &IRExpr, params: &ParamMap) -> Result<IRExpr> {
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
         | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Param(_, _)
         | IRExpr::Literal(_, _)
@@ -311,7 +316,6 @@ pub(super) fn is_constant(expr: &IRExpr) -> bool {
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
         | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Aggregate { .. }
         | IRExpr::AliasRef(_, _) => false,

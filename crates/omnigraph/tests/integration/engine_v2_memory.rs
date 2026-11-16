@@ -494,7 +494,7 @@ async fn result_collection_refuses_its_own_concatenation_and_releases() {
 /// Require a refusal from that owner, then prove the default budget completes.
 #[tokio::test]
 #[serial]
-async fn rrf_fusion_refuses_its_own_allocations_and_releases_both_legs() {
+async fn rrf_fusion_refuses_its_own_allocations_and_releases_every_arm() {
     let dir = tempfile::tempdir().unwrap();
     let db = session(
         Omnigraph::init(
@@ -545,7 +545,7 @@ node Doc {
                 if probes
                     .refusals()
                     .iter()
-                    .any(|name| name.contains("fuse_arms"))
+                    .any(|name| name.contains("FuseExec"))
                 {
                     fusion_refused = true;
                     break;

@@ -64,7 +64,7 @@ impl ProjectionContext {
                 | PhysicalNode::Correlate { .. }
                 | PhysicalNode::Union { .. }
                 | PhysicalNode::OuterReference { .. }
-                | PhysicalNode::RankFuse { .. }
+                | PhysicalNode::Fuse { .. }
                 | PhysicalNode::Projection { .. }
                 | PhysicalNode::Aggregate { .. }
                 | PhysicalNode::Sort { .. }
@@ -171,6 +171,9 @@ pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<
             PatternStep::Union { arms, .. } => {
                 arms.iter().for_each(|arm| collect_node_bindings(arm, out))
             }
+            PatternStep::Fuse { arms, .. } => arms
+                .iter()
+                .for_each(|arm| collect_node_bindings(&arm.steps, out)),
         }
     }
 }
@@ -344,7 +347,6 @@ fn evaluate_boolean(
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
         | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Param(_, _)
         | IRExpr::Literal(_, _)
@@ -537,7 +539,6 @@ pub(super) fn evaluate_expr(
         IRExpr::AliasRef(name, _) => alias_column(batch, name)?,
         IRExpr::Nearest { .. }
         | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Aggregate { .. } => {
             return Err(OmniError::manifest(format!(
@@ -752,13 +753,9 @@ pub(super) fn evaluate_projection(
         | IRExpr::Neg { .. }
         | IRExpr::Call { .. } => Ok((expr.to_string(), evaluate_expr(wide_batch, expr, params)?)),
         IRExpr::AliasRef(name, _) => Ok((name.clone(), alias_column(wide_batch, name)?)),
-        IRExpr::Nearest { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
-        | IRExpr::Aggregate { .. } => Err(OmniError::manifest(format!(
-            "unsupported projection expression: {}",
-            expr
-        ))),
+        IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } | IRExpr::Aggregate { .. } => Err(
+            OmniError::manifest(format!("unsupported projection expression: {}", expr)),
+        ),
     }
 }
 

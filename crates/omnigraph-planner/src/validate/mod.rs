@@ -248,10 +248,6 @@ pub(crate) fn check(
         "output schema",
         crate::output::validate_output_schemas(plan),
     )?;
-    formed(
-        "fusion row keys",
-        crate::optimizer::validate_rank_fuse_row_tiebreaks(plan),
-    )?;
     formed("catalogue source", source::validate_catalogue_sources(plan))?;
     let requirements = Requirements::derive(input, budget)?;
     requirements.check(plan, input, budget)?;

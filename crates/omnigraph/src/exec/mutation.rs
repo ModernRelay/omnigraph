@@ -531,7 +531,6 @@ fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a st
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
         | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Literal(_, _)
         | IRExpr::Aggregate { .. }
@@ -795,6 +794,7 @@ fn traverses(step: &omnigraph_planner::PatternStep) -> bool {
             | omnigraph_planner::PatternStep::Optional { .. }
             | omnigraph_planner::PatternStep::Union { .. }
             | omnigraph_planner::PatternStep::Correlate { .. }
+            | omnigraph_planner::PatternStep::Fuse { .. }
     )
 }
 

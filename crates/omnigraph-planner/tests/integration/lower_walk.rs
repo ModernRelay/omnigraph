@@ -2,23 +2,12 @@
 //! claim is the call sequence an engine sees, which no query result shows.
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
-use omnigraph_planner::EmptyEligible;
 use omnigraph_planner::{
-    AggregateFields, ColumnRef, ContainsJoinFields, CsvSourceFields, DeltaSourceFields,
-    ExpandFields, FragmentWriteFields, HashJoinFields, HydratedBinding, Lower, NodeId,
-    PhysicalNode, PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind,
-    RankedAccess, ScanInput, ScanSpec, SideId, SortMergeJoinFields, ValidateFields,
+    AggregateFields, ArmRank, ColumnRef, ContainsJoinFields, CsvSourceFields, DeltaSourceFields,
+    ExpandFields, FragmentWriteFields, FuseArm, FuseFields, HashJoinFields, HydratedBinding, Lower,
+    NodeId, PhysicalNode, PhysicalPlan, PlanError, RankedAccess, ScanInput, ScanSpec, SideId,
+    SortMergeJoinFields, ValidateFields,
 };
-
-fn no_prefilter() -> Prefilter {
-    Prefilter {
-        ranked_type: "Doc".to_string(),
-        hops: Vec::new(),
-        feeds: Vec::new(),
-        on_empty: EmptyEligible::Postfilter,
-        coverage_admits: true,
-    }
-}
 
 #[derive(Default)]
 struct Trace {
@@ -237,14 +226,14 @@ impl Lower for Trace {
         self.call("outer_reference", id, &[])
     }
 
-    fn rank_fuse(
+    fn fuse(
         &mut self,
         id: NodeId,
-        _: RankFuseFields<'_>,
-        primary: String,
-        secondary: String,
+        _: FuseFields<'_>,
+        arms: Vec<String>,
     ) -> Result<String, PlanError> {
-        self.call("rank_fuse", id, &[&primary, &secondary])
+        let arms: Vec<&str> = arms.iter().map(String::as_str).collect();
+        self.call("fuse", id, &arms)
     }
 
     fn projection(
@@ -466,25 +455,21 @@ fn an_anti_join_hands_over_its_outer_input_before_the_inner_tree_is_lowered() {
 }
 
 #[test]
-fn a_rank_fuse_lowers_each_arm_once_primary_first() {
+fn a_fuse_lowers_each_arm_once_in_written_order() {
     let mut plan = PhysicalPlan::new();
-    let primary = leaf(&mut plan, "d");
-    let secondary = leaf(&mut plan, "d");
-    let arm = |input: NodeId, kind: RankKind| RankArm {
-        input,
-        binding: "d".to_string(),
-        kind,
-    };
-    let fuse = plan.add(PhysicalNode::RankFuse {
-        arms: [
-            arm(primary, RankKind::Nearest),
-            arm(secondary, RankKind::Bm25),
-        ],
+    let arms: Vec<NodeId> = (0..3).map(|_| leaf(&mut plan, "d")).collect();
+    let fuse = plan.add(PhysicalNode::Fuse {
+        arms: arms
+            .iter()
+            .zip([ArmRank::Nearest, ArmRank::Bm25, ArmRank::Distance])
+            .map(|(input, rank)| FuseArm {
+                input: *input,
+                rank,
+            })
+            .collect(),
+        target: "d".to_string(),
         k: None,
         weights: None,
-        limit: Some(3),
-        prefilter: no_prefilter(),
-        row_tiebreak: Vec::new(),
     });
     plan.set_root(fuse);
 
@@ -496,8 +481,9 @@ fn a_rank_fuse_lowers_each_arm_once_primary_first() {
         [
             "outer_reference#0()",
             "outer_reference#1()",
-            "rank_fuse#2(outer_reference#0(),outer_reference#1())",
-            "finish#2(rank_fuse#2(outer_reference#0(),outer_reference#1()))",
+            "outer_reference#2()",
+            "fuse#3(outer_reference#0(),outer_reference#1(),outer_reference#2())",
+            "finish#3(fuse#3(outer_reference#0(),outer_reference#1(),outer_reference#2()))",
         ]
     );
 }
@@ -545,18 +531,15 @@ fn a_node_with_two_consumers_refuses_the_lowering() {
 
     let mut plan = PhysicalPlan::new();
     let shared = leaf(&mut plan, "d");
-    let arm = || RankArm {
+    let arm = || FuseArm {
         input: shared,
-        binding: "d".to_string(),
-        kind: RankKind::Bm25,
+        rank: ArmRank::Bm25,
     };
-    let fuse = plan.add(PhysicalNode::RankFuse {
-        arms: [arm(), arm()],
+    let fuse = plan.add(PhysicalNode::Fuse {
+        arms: vec![arm(), arm()],
+        target: "d".to_string(),
         k: None,
         weights: None,
-        limit: Some(3),
-        prefilter: no_prefilter(),
-        row_tiebreak: Vec::new(),
     });
     plan.set_root(fuse);
 

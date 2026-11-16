@@ -126,12 +126,6 @@ impl Pass {
     pub(super) fn is_proven_empty(&self, id: NodeId) -> bool {
         self.proven_empty.contains(&id)
     }
-
-    /// Whether any scan of this pass was proven empty: the pipeline over it
-    /// feeds nothing.
-    pub(super) fn answer_proven_empty(&self) -> bool {
-        !self.proven_empty.is_empty()
-    }
 }
 
 /// Shared eligible-id set, `Debug`-opaque so a logged `SearchMode` prints the
@@ -301,15 +295,6 @@ impl SearchMode {
     }
 }
 
-/// `rrf(a, b, k, weights)` as the fusion runs it: the rank constant and
-/// each arm's weight, in arm order. The query's `limit` cuts the fused rows
-/// in the `Sort` above the fusion, never here.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct RrfMode {
-    pub(super) k: u32,
-    pub(super) weights: [f64; 2],
-}
-
 #[derive(Debug, PartialEq)]
 enum NearestQuery {
     Vector(Vec<f32>),
@@ -428,31 +413,37 @@ async fn resolve_query_vector(
     }
 }
 
-/// The rank constant defaults only when the optional expression is absent.
+/// The rank constant, in `1..=1000000`; it defaults only when the optional
+/// expression is absent. A parameter bound outside the range refuses the
+/// read.
 pub(super) fn resolve_rrf_k(expr: Option<&IRExpr>, params: &ParamMap) -> Result<u32> {
+    use omnigraph_compiler::ir::core::{RRF_DEFAULT_K, RRF_MAX_K};
     let Some(expr) = expr else {
-        return Ok(60);
+        return Ok(RRF_DEFAULT_K as u32);
     };
     let value = resolve_to_int(expr, params)?;
-    u32::try_from(value)
+    u64::try_from(value)
         .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| OmniError::manifest("rrf k must be greater than 0 and fit U32"))
+        .filter(|value| (1..=RRF_MAX_K).contains(value))
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            OmniError::manifest(format!(
+                "rrf k must be an integer in 1..={RRF_MAX_K}, got {value}"
+            ))
+        })
 }
 
 /// The arms' weights: every arm `1.0` when the plan stores none, otherwise
 /// the stored `[F64]` literal, one weight in `(0, 1000000]` per arm.
-pub(super) fn resolve_rrf_weights(expr: Option<&IRExpr>) -> Result<[f64; 2]> {
+pub(super) fn resolve_rrf_weights(expr: Option<&IRExpr>, arms: usize) -> Result<Vec<f64>> {
     let Some(expr) = expr else {
-        return Ok([1.0; 2]);
+        return Ok(vec![1.0; arms]);
     };
-    omnigraph_compiler::ir::rrf_weight_values(expr, 2)
-        .and_then(|weights| <[f64; 2]>::try_from(weights).ok())
-        .ok_or_else(|| {
-            OmniError::manifest_internal(
-                "rrf weights must be one F64 in (0, 1000000] per arm, as the query writes them",
-            )
-        })
+    omnigraph_compiler::ir::rrf_weight_values(expr, arms).ok_or_else(|| {
+        OmniError::manifest_internal(
+            "rrf weights must be one F64 in (0, 1000000] per arm, as the query writes them",
+        )
+    })
 }
 
 /// Resolve the nearest() target property's vector dimension and the embedding
@@ -489,113 +480,8 @@ pub(super) fn nearest_property_dim_and_model(
     Ok((dim, recorded_model))
 }
 
-/// The rrf prefilter gate: decide, before the arms run, between two ANSWER-IDENTICAL
-/// plans — prefilter (the uncapped bm25 arms rank only the traversal's
-/// eligible ids) and postfilter (the uncapped corpus-wide arms, v0.9 rrf
-/// semantics). The plan declares the pre-pass (`RankFuse.prefilter`: the
-/// ranked type, the required first hops, the scans it feeds) and the policy
-/// (`Assumptions.gate_policy`); the gate reads the store and decides.
-///
-/// INVARIANT (single owner): with bm25 arms prefiltered and nearest arms
-/// untouched, over FTS-index-covered data,
-/// up to BM25 score ties, the candidate plans are answer-identical;
-/// cardinality decides cost only. A mis-estimate wastes time, never flips a
-/// winner — re-coupling answer content to the estimate would recreate the
-/// PR #574 cap starvation one level up. Every fence below guards that
-/// identity:
-/// - the eligible set MUST over-approximate the traversal's survivors (a
-///   superset only costs speedup; a subset changes answers) — every
-///   shape the planner's `prefilter` admits is an instance;
-/// - full FTS fragment coverage, the plan's recorded fact
-///   (`Prefilter::coverage_admits`; uncovered fragments are scored
-///   filter-dependently, so a mask would change their scores);
-/// - `nearest` arms are never prefiltered (their constitutive `k` makes a
-///   prefiltered run answer-different) — the caller's threading rule;
-/// - an empty eligible set runs postfilter (same empty join, and `IN ()`
-///   edge semantics never arise).
-///
-/// Fallible steps fall back to postfilter — a query must never fail because
-/// an optimization could not start. The gate reads the eligible COUNT only;
-/// id strings materialize only after the prefilter plan is chosen, so the
-/// broad regime never builds them. Every decision records a
-/// `rrf_gate_verdicts` probe entry.
-pub(super) async fn rrf_prefilter_gate(
-    context: &EngineContext<'_>,
-    prefilter: &Prefilter,
-    policy: GatePolicy,
-) -> (Option<EligibleIds>, RrfGateVerdict) {
-    let fall_back =
-        |fallback: RrfGateFallback, forced: bool, eligible: Option<u64>, corpus: Option<u64>| {
-            tracing::debug!(
-                ?fallback,
-                forced,
-                "rrf prefilter gate fell back to the postfilter plan"
-            );
-            let verdict = RrfGateVerdict {
-                plan: RrfGatePlan::Postfilter,
-                fallback: Some(fallback),
-                forced,
-                eligible,
-                corpus,
-            };
-            record_rrf_gate_verdict(verdict.clone());
-            (None, verdict)
-        };
-
-    if policy.mode == PrefilterMode::ForcePostfilter {
-        return fall_back(RrfGateFallback::Forced, true, None, None);
-    }
-    let forced = policy.mode == PrefilterMode::ForcePrefilter;
-    if !prefilter.admits() {
-        return fall_back(RrfGateFallback::Shape, forced, None, None);
-    }
-    let ranked_type = prefilter.ranked_type.as_str();
-    let node_key = format!("node:{ranked_type}");
-    let Some(node_entry) = context
-        .snapshot
-        .and_then(|snapshot| snapshot.dataset(&node_key))
-    else {
-        return fall_back(RrfGateFallback::Shape, forced, None, None);
-    };
-    let corpus = node_entry.entity_count;
-    if !prefilter.coverage_admits {
-        return fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
-    }
-
-    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
-    let (mut ids, eligible_count) = match adjacency_eligible_ids(
-        &context.graph_index,
-        context.catalog,
-        ranked_type,
-        &prefilter.hops,
-        corpus,
-        forced,
-        policy,
-    )
-    .await
-    {
-        EligibleOutcome::Ids { ids, eligible } => (ids, eligible),
-        EligibleOutcome::FallBack { fallback, eligible } => {
-            return fall_back(fallback, forced, eligible, Some(corpus));
-        }
-    };
-    #[cfg(debug_assertions)]
-    if let Some(dropped) = crate::instrumentation::rrf_gate_subset_drop() {
-        ids.retain(|id| *id != dropped);
-    }
-    let verdict = RrfGateVerdict {
-        plan: RrfGatePlan::Prefilter,
-        fallback: None,
-        forced,
-        eligible: Some(eligible_count),
-        corpus: Some(corpus),
-    };
-    record_rrf_gate_verdict(verdict.clone());
-    (Some(EligibleIds(Arc::new(ids))), verdict)
-}
-
-/// Outcome of the adjacency eligible-id computation shared by the rrf and
-/// nearest prefilter gates.
+/// Outcome of the adjacency eligible-id computation of the nearest
+/// prefilter gate.
 pub(super) enum EligibleOutcome {
     /// The eligible ids, materialized; `eligible` is their count.
     Ids { ids: Vec<String>, eligible: u64 },
@@ -841,6 +727,9 @@ pub(super) fn collect_referenced_edge_names(
             PatternStep::Union { arms, .. } => arms
                 .iter()
                 .for_each(|arm| collect_referenced_edge_names(arm, out)),
+            PatternStep::Fuse { arms, .. } => arms
+                .iter()
+                .for_each(|arm| collect_referenced_edge_names(&arm.steps, out)),
             PatternStep::NodeScan { .. }
             | PatternStep::Filter(_)
             | PatternStep::Rank { .. }

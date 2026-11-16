@@ -33,9 +33,9 @@ use crate::logical::{
 };
 use crate::operation::TableRef;
 use crate::physical::{
-    Assumptions, Eligibility, EmptyEligible, Estimate, Hop, HydratedBinding, NearestPolicy, NodeId,
-    OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankArm, RankKind,
-    RankScope, RankedAccess, ScanInput, StatisticSource,
+    Assumptions, Eligibility, EmptyEligible, Estimate, FuseArm, Hop, HydratedBinding,
+    NearestPolicy, NodeId, OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
+    Properties, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
 };
 use crate::read_shape::InnerRead;
 use crate::source::SideId;
@@ -361,14 +361,11 @@ pub enum NodeMirror {
         read: InnerReadMirror,
         tiebreak: Vec<ColumnRef>,
     },
-    #[serde(rename = "RankFuseWithTiebreak")]
-    RankFuse {
-        arms: [RankArm; 2],
+    Fuse {
+        arms: Vec<FuseArm>,
+        target: String,
         k: Option<ExprMirror>,
         weights: Option<ExprMirror>,
-        limit: Option<usize>,
-        prefilter: PrefilterMirror,
-        row_tiebreak: Vec<ColumnRef>,
     },
     Projection {
         input: NodeId,
@@ -635,20 +632,16 @@ impl From<&PhysicalNode> for NodeMirror {
             PhysicalNode::OuterReference { outer_var } => Self::OuterReference {
                 outer_var: outer_var.clone(),
             },
-            PhysicalNode::RankFuse {
+            PhysicalNode::Fuse {
                 arms,
+                target,
                 k,
                 weights,
-                limit,
-                prefilter,
-                row_tiebreak,
-            } => Self::RankFuse {
+            } => Self::Fuse {
                 arms: arms.clone(),
+                target: target.clone(),
                 k: k.as_ref().map(ExprMirror::from),
                 weights: weights.as_ref().map(ExprMirror::from),
-                limit: *limit,
-                prefilter: PrefilterMirror::from(prefilter),
-                row_tiebreak: row_tiebreak.clone(),
             },
             PhysicalNode::Projection {
                 input,
@@ -931,20 +924,16 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 bindings,
             },
             NodeMirror::OuterReference { outer_var } => Self::OuterReference { outer_var },
-            NodeMirror::RankFuse {
+            NodeMirror::Fuse {
                 arms,
+                target,
                 k,
                 weights,
-                limit,
-                prefilter,
-                row_tiebreak,
-            } => Self::RankFuse {
+            } => Self::Fuse {
                 arms,
+                target,
                 k: k.map(IRExpr::from),
                 weights: weights.map(IRExpr::from),
-                limit,
-                prefilter: Prefilter::from(prefilter),
-                row_tiebreak,
             },
             NodeMirror::Projection {
                 input,
@@ -1744,13 +1733,6 @@ pub enum ExprMirror {
         query: Box<ExprMirror>,
         ty: ExprType,
     },
-    Rrf {
-        primary: Box<ExprMirror>,
-        secondary: Box<ExprMirror>,
-        k: Option<Box<ExprMirror>>,
-        weights: Option<Box<ExprMirror>>,
-        ty: ExprType,
-    },
     Variable {
         name: String,
         ty: ExprType,
@@ -1836,19 +1818,6 @@ impl From<&IRExpr> for ExprMirror {
             IRExpr::Bm25 { field, query, ty } => Self::Bm25 {
                 field: boxed(field),
                 query: boxed(query),
-                ty: ty.clone(),
-            },
-            IRExpr::Rrf {
-                primary,
-                secondary,
-                k,
-                weights,
-                ty,
-            } => Self::Rrf {
-                primary: boxed(primary),
-                secondary: boxed(secondary),
-                k: k.as_deref().map(boxed),
-                weights: weights.as_deref().map(boxed),
                 ty: ty.clone(),
             },
             IRExpr::Variable(name, ty) => Self::Variable {
@@ -1941,19 +1910,6 @@ impl From<ExprMirror> for IRExpr {
             ExprMirror::Bm25 { field, query, ty } => Self::Bm25 {
                 field: unboxed(*field),
                 query: unboxed(*query),
-                ty,
-            },
-            ExprMirror::Rrf {
-                primary,
-                secondary,
-                k,
-                weights,
-                ty,
-            } => Self::Rrf {
-                primary: unboxed(*primary),
-                secondary: unboxed(*secondary),
-                k: k.map(|inner| unboxed(*inner)),
-                weights: weights.map(|inner| unboxed(*inner)),
                 ty,
             },
             ExprMirror::Variable { name, ty } => Self::Variable(name, ty),
@@ -2150,9 +2106,6 @@ pub enum OrderKeyMirror {
     Identity {
         column: ColumnRef,
     },
-    Fused {
-        bindings: Vec<String>,
-    },
 }
 
 impl From<&OrderKey> for OrderKeyMirror {
@@ -2170,9 +2123,6 @@ impl From<&OrderKey> for OrderKeyMirror {
             },
             OrderKey::Identity(column) => Self::Identity {
                 column: column.clone(),
-            },
-            OrderKey::Fused { bindings } => Self::Fused {
-                bindings: bindings.clone(),
             },
         }
     }
@@ -2192,7 +2142,6 @@ impl From<OrderKeyMirror> for OrderKey {
                 nulls_first,
             },
             OrderKeyMirror::Identity { column } => Self::Identity(column),
-            OrderKeyMirror::Fused { bindings } => Self::Fused { bindings },
         }
     }
 }

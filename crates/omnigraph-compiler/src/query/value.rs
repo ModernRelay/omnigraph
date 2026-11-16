@@ -87,8 +87,8 @@ pub const DISTANCE_COLUMN: &str = "_distance";
 /// See [`DISTANCE_COLUMN`].
 pub const SCORE_COLUMN: &str = "_score";
 
-/// The fused score `RankFuse` appends under the primary arm's binding
-/// (`{var}._rrf`, RFC 0047 §One total order), reserved like the two above.
+/// The fused score a `Fuse` appends under its target's binding
+/// (`{var}._rrf`), reserved like the two above.
 pub const RRF_COLUMN: &str = "_rrf";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

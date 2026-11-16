@@ -16,7 +16,6 @@ use serde_json::{Value, json};
 use crate::mirror::EdgeSelectionMirror;
 use crate::operation::TableRef;
 use crate::optimizer::gq_conjunct;
-use crate::physical::RankKind;
 use crate::source::SideId;
 
 /// The index of a node in a [`LogicalPlan`], distinct from a physical node id.
@@ -268,6 +267,7 @@ logical_kinds! {
     Expand => "Expand", RefusedByName;
     Filter => "Filter", Routable;
     FragmentWrite => "FragmentWrite", RefusedByName;
+    Fuse => "Fuse", RefusedByName;
     Join => "Join", Routable;
     Let => "Let", RefusedByName;
     Limit => "Limit", Routable;
@@ -277,7 +277,6 @@ logical_kinds! {
     OptionalJoin => "OptionalJoin", RefusedByName;
     OuterReference => "OuterReference", RefusedByName;
     Projection => "Projection", Routable;
-    RankFuse => "RankFuse", RefusedByName;
     RowDiff => "RowDiff", Routable;
     Score => "Score", RefusedByName;
     Sort => "Sort", Routable;
@@ -511,13 +510,12 @@ impl FragmentWriteSpec {
     }
 }
 
-/// One `nearest(...)` or `bm25(...)` arm of an `rrf()`, as the query wrote it.
+/// One arm of a [`LogicalNode::Fuse`]: the subtree whose rows it ranks, in
+/// the order `rank` states (`ArmRank`), each target at its first row.
 #[derive(Debug, Clone)]
-pub struct SearchArm {
-    pub binding: String,
-    pub property: String,
-    pub kind: RankKind,
-    pub query: IRExpr,
+pub struct FuseInput {
+    pub input: LogicalId,
+    pub rank: crate::read_shape::ArmRank,
 }
 
 #[derive(Debug, Clone)]
@@ -677,19 +675,18 @@ pub enum LogicalNode {
         reads: Vec<ColumnRef>,
         leads: bool,
     },
-    /// A leading `order { rrf(a, b) }`: both arms run the input tree, ranked
-    /// on their targets, and fuse. `k` is the rank constant and `weights`
-    /// the arms' weights as written (`None`: every arm `1.0`); `limit` the
-    /// query's limit, which sizes a nearest arm.
-    RankFuse {
-        input: LogicalId,
-        arms: Box<[SearchArm; 2]>,
+    /// `from rrf(arm, …)` (docs/rfcs/2026-11-07-gq-3.md, section 4,
+    /// Fusion): each arm's subtree yields rows binding `target` in its
+    /// rank order; the node yields one row per target any arm selected, the
+    /// target's columns and `Σ weight / (k + rank)` over the arms that
+    /// selected it as `target._rrf`. `k` and `weights` as written (`None`:
+    /// 60, and every arm `1.0`).
+    Fuse {
+        arms: Vec<FuseInput>,
+        target: String,
         k: Option<IRExpr>,
         weights: Option<IRExpr>,
-        limit: Option<u64>,
         reads: Vec<ColumnRef>,
-        row_tiebreak: Vec<ColumnRef>,
-        leads: bool,
     },
     /// The rows of the first `targets` distinct `binding` identities of its
     /// input, which arrives sorted by the ranking's score then that identity:
@@ -789,7 +786,7 @@ impl LogicalNode {
             Self::OuterReference { .. } => LogicalKind::OuterReference,
             Self::Nearest { .. } => LogicalKind::Nearest,
             Self::TextSearch { .. } => LogicalKind::TextSearch,
-            Self::RankFuse { .. } => LogicalKind::RankFuse,
+            Self::Fuse { .. } => LogicalKind::Fuse,
             Self::Aggregate { .. } => LogicalKind::Aggregate,
         }
     }
@@ -806,7 +803,6 @@ impl LogicalNode {
             | Self::Expand { input, .. }
             | Self::Nearest { input, .. }
             | Self::TextSearch { input, .. }
-            | Self::RankFuse { input, .. }
             | Self::TargetCut { input, .. }
             | Self::Score { input, .. }
             | Self::Let { input, .. }
@@ -820,6 +816,7 @@ impl LogicalNode {
                 vec![*input, *inner]
             }
             Self::Correlate { input, inner, .. } => input.iter().copied().chain([*inner]).collect(),
+            Self::Fuse { arms, .. } => arms.iter().map(|arm| arm.input).collect(),
             Self::MergeClassify {
                 base,
                 source,
@@ -845,7 +842,6 @@ impl LogicalNode {
             | Self::Expand { input, .. }
             | Self::Nearest { input, .. }
             | Self::TextSearch { input, .. }
-            | Self::RankFuse { input, .. }
             | Self::TargetCut { input, .. }
             | Self::Score { input, .. }
             | Self::Let { input, .. }
@@ -859,6 +855,7 @@ impl LogicalNode {
                 vec![input, inner]
             }
             Self::Correlate { input, inner, .. } => input.iter_mut().chain([inner]).collect(),
+            Self::Fuse { arms, .. } => arms.iter_mut().map(|arm| &mut arm.input).collect(),
             Self::MergeClassify {
                 base,
                 source,
@@ -1246,21 +1243,19 @@ impl LogicalPlan {
                 "typed_query": crate::typed::expr(query),
                 "reads": rendered(reads),
             }),
-            LogicalNode::RankFuse {
+            LogicalNode::Fuse {
                 arms,
+                target,
                 k,
                 weights,
                 reads,
-                row_tiebreak,
-                ..
             } => json!({
-                "node": "RankFuse",
-                "targets": arms.iter().map(|arm| &arm.binding).collect::<Vec<_>>(),
-                "typed_queries": arms.iter().map(|arm| crate::typed::expr(&arm.query)).collect::<Vec<_>>(),
+                "node": "Fuse",
+                "target": target,
+                "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
                 "typed_k": k.as_ref().map(crate::typed::expr),
                 "typed_weights": weights.as_ref().map(crate::typed::expr),
                 "reads": rendered(reads),
-                "row_tiebreak": tiebreak_text(row_tiebreak),
             }),
             LogicalNode::Aggregate {
                 reads,

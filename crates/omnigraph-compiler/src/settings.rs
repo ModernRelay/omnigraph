@@ -72,7 +72,7 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         default: "auto",
         scope: SettingScope::Process,
         env: "OMNIGRAPH_RRF_PLAN",
-        doc: "the reciprocal rank fusion plan on a traversal-constrained `nearest`, for diagnosis",
+        doc: "the prefilter gate of a traversal-constrained `nearest`, an `rrf` arm included: decide by size, or force one plan, for diagnosis",
     },
     SettingSpec {
         name: "merge_lineage",
@@ -339,8 +339,8 @@ pub enum Engine {
     V2,
 }
 
-/// `rrf_plan`: the reciprocal rank fusion plan on a traversal-constrained
-/// `nearest`.
+/// `rrf_plan`: the prefilter gate of a traversal-constrained `nearest`, an
+/// `rrf` arm included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RrfPlan {
     Auto,

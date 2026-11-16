@@ -132,7 +132,6 @@ fn contains_aggregate_or_search(expr: &IRExpr) -> bool {
             IRExpr::Aggregate { .. }
             | IRExpr::Nearest { .. }
             | IRExpr::Bm25 { .. }
-            | IRExpr::Rrf { .. }
             | IRExpr::AliasRef(_, _) => return true,
             IRExpr::Not(arg, _)
             | IRExpr::IsNull { expr: arg, .. }
@@ -319,7 +318,6 @@ impl IRExpr {
             Self::PropAccess { ty, .. }
             | Self::Nearest { ty, .. }
             | Self::Bm25 { ty, .. }
-            | Self::Rrf { ty, .. }
             | Self::Binary { ty, .. }
             | Self::IsNull { ty, .. }
             | Self::Cast { ty, .. }
@@ -394,17 +392,6 @@ impl IRExpr {
                 | Self::AliasRef(_, _) => {}
                 Self::Nearest { query, .. } => pending.push(query),
                 Self::Bm25 { field, query, .. } => pending.extend([field.as_ref(), query.as_ref()]),
-                Self::Rrf {
-                    primary,
-                    secondary,
-                    k,
-                    weights,
-                    ..
-                } => {
-                    pending.extend([primary.as_ref(), secondary.as_ref()]);
-                    pending.extend(k.as_deref());
-                    pending.extend(weights.as_deref());
-                }
                 Self::Aggregate { arg, .. }
                 | Self::Not(arg, _)
                 | Self::IsNull { expr: arg, .. }
@@ -435,17 +422,6 @@ impl IRExpr {
                 | Self::AliasRef(_, _) => {}
                 Self::Nearest { query, .. } => pending.push(query),
                 Self::Bm25 { field, query, .. } => pending.extend([field.as_ref(), query.as_ref()]),
-                Self::Rrf {
-                    primary,
-                    secondary,
-                    k,
-                    weights,
-                    ..
-                } => {
-                    pending.extend([primary.as_ref(), secondary.as_ref()]);
-                    pending.extend(k.as_deref());
-                    pending.extend(weights.as_deref());
-                }
                 Self::Aggregate { arg, .. }
                 | Self::Not(arg, _)
                 | Self::IsNull { expr: arg, .. }
@@ -478,17 +454,6 @@ impl IRExpr {
                 }
                 Self::Param(_, _) | Self::Literal(_, _) => {}
                 Self::Bm25 { field, query, .. } => pending.extend([query.as_ref(), field.as_ref()]),
-                Self::Rrf {
-                    primary,
-                    secondary,
-                    k,
-                    weights,
-                    ..
-                } => {
-                    pending.extend(weights.as_deref());
-                    pending.extend(k.as_deref());
-                    pending.extend([secondary.as_ref(), primary.as_ref()]);
-                }
                 Self::Aggregate { arg, .. }
                 | Self::Not(arg, _)
                 | Self::IsNull { expr: arg, .. }
@@ -526,7 +491,6 @@ impl IRExpr {
             | Self::AliasRef(_, ty) => Some(ty),
             Self::Nearest { .. }
             | Self::Bm25 { .. }
-            | Self::Rrf { .. }
             | Self::Aggregate { .. }
             | Self::Binary { .. }
             | Self::Not(_, _)
@@ -590,36 +554,6 @@ impl IRExpr {
                         return Err(bad("search operands must be scalar String"));
                     }
                     pending.extend([field.as_ref(), query.as_ref()]);
-                }
-                Self::Rrf {
-                    primary,
-                    secondary,
-                    k,
-                    weights,
-                    ty,
-                } => {
-                    expect(ty, scalar_type(ScalarType::F64, false))?;
-                    if weights
-                        .as_deref()
-                        .is_some_and(|weights| rrf_weight_values(weights, 2).is_none())
-                    {
-                        return Err(bad(
-                            "rrf weights must be a non-null [F64] literal of one weight in (0, 1000000] per arm",
-                        ));
-                    }
-                    for arm in [primary.as_ref(), secondary.as_ref()] {
-                        if !matches!(arm, Self::Nearest { .. } | Self::Bm25 { .. })
-                            || !scalar_is(arm.ty(), ScalarType::F32)
-                        {
-                            return Err(bad("rrf arms must be stored nearest or bm25 scores"));
-                        }
-                    }
-                    if k.as_ref().is_some_and(|value| !integer_type(value.ty())) {
-                        return Err(bad("rrf k must be an integer scalar"));
-                    }
-                    pending.extend([primary.as_ref(), secondary.as_ref()]);
-                    pending.extend(k.as_deref());
-                    pending.extend(weights.as_deref());
                 }
                 Self::Binary {
                     left,
@@ -878,22 +812,6 @@ impl std::fmt::Display for IRExpr {
                 query,
                 ty: _,
             } => write!(f, "bm25({field}, {query})"),
-            IRExpr::Rrf {
-                primary,
-                secondary,
-                k,
-                weights,
-                ty: _,
-            } => {
-                write!(f, "rrf({primary}, {secondary}")?;
-                if let Some(k) = k {
-                    write!(f, ", {k}")?;
-                }
-                if let Some(weights) = weights {
-                    write!(f, ", weights: {weights}")?;
-                }
-                f.write_str(")")
-            }
             IRExpr::Variable(name, _) => write!(f, "${name}"),
             IRExpr::Param(name, _) if name == NOW_PARAM_NAME => f.write_str("now()"),
             IRExpr::Param(name, _) => write!(f, "${name}"),
@@ -1162,60 +1080,17 @@ mod render_tests {
             },
         };
         assert_eq!(nearest.to_string(), "nearest($d.embedding, $q)");
-        let mut rrf = IRExpr::Rrf {
-            primary: Box::new(nearest),
-            secondary: Box::new(IRExpr::Bm25 {
-                field: Box::new(prop("d", "text")),
-                query: Box::new(IRExpr::Literal(
-                    Literal::String("needle".to_string()),
-                    crate::types::ExprType::from_prop(&crate::types::PropType::scalar(
-                        crate::types::ScalarType::String,
-                        false,
-                    )),
-                )),
-                ty: crate::types::ExprType::Value {
-                    scalar: crate::types::ScalarType::F32,
-                    list: false,
-                    nullable: false,
-                },
-            }),
-            k: Some(Box::new(IRExpr::Literal(
-                Literal::Integer(60),
-                crate::types::ExprType::from_prop(&crate::types::PropType::scalar(
-                    crate::types::ScalarType::I64,
-                    false,
-                )),
-            ))),
-            weights: None,
-            ty: crate::types::ExprType::Value {
-                scalar: crate::types::ScalarType::F64,
-                list: false,
-                nullable: false,
-            },
-        };
-        assert_eq!(
-            rrf.to_string(),
-            "rrf(nearest($d.embedding, $q), bm25($d.text, \"needle\"), 60)"
-        );
-        rrf.check_types().unwrap();
-        // Unit weights keep the unweighted spelling; others are stored and
-        // printed, and a malformed list fails the stored types.
-        assert_eq!(rrf_weights_expr(&[1.0, 1.0]), None);
-        let IRExpr::Rrf { weights, .. } = &mut rrf else {
-            unreachable!()
-        };
-        *weights = rrf_weights_expr(&[1.0, 5.0]).map(Box::new);
-        assert_eq!(
-            rrf.to_string(),
-            "rrf(nearest($d.embedding, $q), bm25($d.text, \"needle\"), 60, weights: [1.0, 5.0])"
-        );
-        rrf.check_types().unwrap();
-        for bad in [vec![2.0], vec![1.0, 0.0], vec![1.0, RRF_MAX_WEIGHT * 2.0]] {
-            let IRExpr::Rrf { weights, .. } = &mut rrf else {
-                unreachable!()
-            };
-            *weights = rrf_weights_expr(&bad).map(Box::new);
-            assert!(rrf.check_types().is_err(), "{bad:?}");
+        // Unit weights keep the unweighted spelling; others are stored as an
+        // `[F64]` literal of one weight per arm, and a malformed list is no
+        // list of weights.
+        assert_eq!(rrf_weights_expr(&[1.0, 1.0, 1.0]), None);
+        let weights = rrf_weights_expr(&[1.0, 5.0, 2.0]).unwrap();
+        assert_eq!(weights.to_string(), "[1.0, 5.0, 2.0]");
+        assert_eq!(rrf_weight_values(&weights, 3), Some(vec![1.0, 5.0, 2.0]));
+        assert_eq!(rrf_weight_values(&weights, 2), None);
+        for bad in [vec![1.0, 0.0], vec![1.0, RRF_MAX_WEIGHT * 2.0]] {
+            let weights = rrf_weights_expr(&bad).unwrap();
+            assert_eq!(rrf_weight_values(&weights, 2), None, "{bad:?}");
         }
         let count = IRExpr::Aggregate {
             func: AggFunc::Count,
@@ -1701,16 +1576,6 @@ pub enum IRExpr {
     Bm25 {
         field: Box<IRExpr>,
         query: Box<IRExpr>,
-        ty: ExprType,
-    },
-    /// `rrf(primary, secondary, k, weights)`: `k` absent is the default
-    /// constant; `weights` absent is every arm weighted `1.0`, otherwise a
-    /// non-null `[F64]` literal with one weight per arm in written order.
-    Rrf {
-        primary: Box<IRExpr>,
-        secondary: Box<IRExpr>,
-        k: Option<Box<IRExpr>>,
-        weights: Option<Box<IRExpr>>,
         ty: ExprType,
     },
     Variable(String, ExprType),

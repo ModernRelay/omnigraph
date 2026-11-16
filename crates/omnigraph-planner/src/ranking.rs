@@ -9,7 +9,7 @@ use omnigraph_compiler::query::value::RRF_COLUMN;
 use omnigraph_compiler::result::{Ranking, SearchFunction};
 
 use crate::error::PlanError;
-use crate::physical::{NodeId, PhysicalNode, PhysicalPlan, RankKind, RankScope};
+use crate::physical::{NodeId, PhysicalNode, PhysicalPlan, RankKind};
 
 /// What the plan says of its ranking; the run that executes it says whether
 /// the search was exhaustive.
@@ -29,8 +29,8 @@ impl PlannedRanking {
         &self.score_columns
     }
 
-    /// The ranked `nearest` scans: the ordered scan of a `nearest` order,
-    /// or the `nearest` arms of a fusion, in node order. A `bm25` scan has
+    /// The ranked `nearest` scans: the scan of a `nearest` order or window,
+    /// or every `nearest` scan of a fusion's arms, in node order. A `bm25` scan has
     /// no candidate window, so a `bm25` ranking names none.
     pub fn nearest_scans(&self) -> &[NodeId] {
         &self.nearest_scans
@@ -48,23 +48,25 @@ impl PlannedRanking {
 }
 
 /// The ranking `plan` orders by, `None` when its order is no search.
-/// Acceptance admits one ranked scan in the query's order, or one fusion of
-/// two arms, and nothing else. A plan with neither ranks by its exact
-/// `bm25`, a `Score` node the exact lexical scan answers, which is always
-/// exhaustive.
+/// Acceptance admits one ranked scan in the query's order or drawn as a
+/// window, or one fusion (its arms nested fusions or not), and nothing
+/// else. A fusion's ranking is exhaustive when every `nearest` scan of its
+/// arms searched everything over its population; its exact arms always
+/// are. A plan with neither ranks by its exact `bm25`, a `Score` node the
+/// exact lexical scan answers, which is always exhaustive.
 ///
 /// # Errors
 ///
 /// An internal error for a plan acceptance should have refused: ranked scans
 /// of another shape, or a ranked scan with no binding.
 pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, PlanError> {
-    let mut fusions = Vec::new();
+    let mut fused = None;
     let mut ordered = Vec::new();
-    let mut arms = Vec::new();
     let mut exact_bm25 = Vec::new();
     for (id, node) in plan.live() {
         match node {
-            PhysicalNode::RankFuse { arms, .. } => fusions.push(arms),
+            // Nested fusions rank one target, under one name.
+            PhysicalNode::Fuse { target, .. } => fused = Some(target.as_str()),
             PhysicalNode::Score {
                 binding,
                 kind: omnigraph_compiler::ir::core::ScoreKind::Bm25,
@@ -74,58 +76,48 @@ pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, Pl
                 spec,
                 ranked: Some(ranked),
                 ..
-            } => {
-                let scan = (id, ranked.kind, spec.binding.as_deref());
-                match ranked.scope {
-                    RankScope::Order | RankScope::Window => ordered.push(scan),
-                    RankScope::Primary | RankScope::Secondary => arms.push(scan),
-                }
-            }
+            } => ordered.push((id, ranked.kind, spec.binding.as_deref())),
             _ => {}
         }
     }
-    let (by, binding, column, nearest_scans) =
-        match (fusions.as_slice(), ordered.as_slice(), arms.as_slice()) {
-            ([], [], []) => match exact_bm25.as_slice() {
-                [binding] => (
-                    SearchFunction::Bm25,
-                    *binding,
-                    omnigraph_compiler::query::value::SCORE_COLUMN,
-                    Vec::new(),
-                ),
-                _ => return Ok(None),
+    let (by, binding, column, nearest_scans) = match (fused, ordered.as_slice()) {
+        (Some(target), scans) => (
+            SearchFunction::Rrf,
+            target,
+            RRF_COLUMN,
+            scans
+                .iter()
+                .filter(|(_, kind, _)| *kind == RankKind::Nearest)
+                .map(|(id, ..)| *id)
+                .collect(),
+        ),
+        (None, []) => match exact_bm25.as_slice() {
+            [binding] => (
+                SearchFunction::Bm25,
+                *binding,
+                omnigraph_compiler::query::value::SCORE_COLUMN,
+                Vec::new(),
+            ),
+            _ => return Ok(None),
+        },
+        (None, [(id, kind, binding)]) => (
+            search_function(*kind),
+            binding
+                .ok_or_else(|| PlanError::Internal(format!("ranked scan {id} has no binding")))?,
+            kind.score().0,
+            if *kind == RankKind::Nearest {
+                vec![*id]
+            } else {
+                Vec::new()
             },
-            ([], [(id, kind, binding)], []) => (
-                search_function(*kind),
-                binding.ok_or_else(|| {
-                    PlanError::Internal(format!("ranked scan {id} has no binding"))
-                })?,
-                kind.score().0,
-                if *kind == RankKind::Nearest {
-                    vec![*id]
-                } else {
-                    Vec::new()
-                },
-            ),
-            ([[primary, _]], [], [_, _]) => (
-                SearchFunction::Rrf,
-                primary.binding.as_str(),
-                RRF_COLUMN,
-                arms.iter()
-                    .filter(|(_, kind, _)| *kind == RankKind::Nearest)
-                    .map(|(id, ..)| *id)
-                    .collect(),
-            ),
-            _ => {
-                return Err(PlanError::Internal(format!(
-                    "the plan holds {} fusions, {} ordered ranked scans and {} fusion arms; \
-                     acceptance admits one ordered scan or one fusion of two arms",
-                    fusions.len(),
-                    ordered.len(),
-                    arms.len()
-                )));
-            }
-        };
+        ),
+        (None, scans) => {
+            return Err(PlanError::Internal(format!(
+                "the plan holds {} ranked scans and no fusion; acceptance admits one ranked scan or one fusion",
+                scans.len()
+            )));
+        }
+    };
     let score_columns = return_list(plan, plan.root())?
         .unwrap_or_default()
         .iter()

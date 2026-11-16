@@ -3592,7 +3592,6 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::with_query_io_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_query_memory_limit",
     "instrumentation.rs: omnigraph_core::instrumentation::with_query_memory_probes",
-    "instrumentation.rs: omnigraph_core::instrumentation::with_rrf_gate_subset_drop",
     "instrumentation.rs: omnigraph_core::instrumentation::with_stage_write_probes",
     "lib.rs: lance_access::object_store_seam",
     "lib.rs: lance_access::store_registry as dst_lance_store_registry",

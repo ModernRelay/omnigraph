@@ -32,7 +32,6 @@ use crate::error::{OmniError, Result};
 use crate::graph_index::GraphIndex;
 use crate::instrumentation::{
     RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_ann_prefilter_verdict,
-    record_rrf_gate_verdict,
 };
 use crate::runtime_cache::CompiledQuery;
 
@@ -255,7 +254,12 @@ async fn run_once(
     ctx: &QueryContext,
     pass: &Pass,
     rung: usize,
-) -> Result<(RecordBatch, ScanReports, Vec<ReportRow>, Option<usize>)> {
+) -> Result<(
+    RecordBatch,
+    ScanReports,
+    Vec<ReportRow>,
+    HashMap<NodeId, usize>,
+)> {
     let lowered = lowering.lower_query(pass)?;
     lowered.record_in_memory_filters();
     let batch = run_plan(&lowered, lowering.plan, ctx).await?;
@@ -265,51 +269,46 @@ async fn run_once(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let rows = pass_rows(&lowered, lowering.plan, rung)?;
-    // The targets a window's cut kept this pass, which the ladder fills.
+    // The targets each window's cut kept this pass, which the ladder fills.
     let selected = lowering
         .plan
         .live()
-        .find_map(|(id, node)| matches!(node, PhysicalNode::TargetCut { .. }).then_some(id))
-        .and_then(|id| lowered.operators.get(&id))
-        .and_then(|op| op.metrics())
-        .and_then(|metrics| metrics.sum_by_name(operators::SELECTED_TARGETS))
-        .map(|value| value.as_usize());
+        .filter(|(_, node)| matches!(node, PhysicalNode::TargetCut { .. }))
+        .filter_map(|(id, _)| {
+            let kept = lowered
+                .operators
+                .get(&id)
+                .and_then(|op| op.metrics())
+                .and_then(|metrics| metrics.sum_by_name(operators::SELECTED_TARGETS))?;
+            Some((id, kept.as_usize()))
+        })
+        .collect();
     Ok((batch, report, rows, selected))
 }
 
-/// The standalone `nearest` scan of a search order: what the plan declares
-/// for its pre-pass and its overfetch ladder.
+/// A `nearest` scan of the plan: what it declares for its pre-pass and its
+/// overfetch ladder. A search order has one; a fusion has one per `nearest`
+/// arm, each filling its own window over its own population.
 struct NearestScan<'p> {
     id: NodeId,
     prefilter: Option<&'p Prefilter>,
     overfetch: &'p [OverfetchRung],
-    /// A window drawn as a pattern step: the targets its `TargetCut` keeps,
-    /// which the ladder fills instead of the read's `limit`.
-    window: Option<usize>,
+    /// A window drawn as a pattern step: the `TargetCut` above the scan and
+    /// the targets it keeps, which the ladder fills instead of the read's
+    /// `limit`.
+    window: Option<(NodeId, usize)>,
 }
 
-/// An `rrf()` with both its arms: the `RankFuse` node and the pre-pass it
-/// declares.
-struct Fusion<'p> {
-    id: NodeId,
-    prefilter: &'p Prefilter,
-}
-
-/// The ranked scans of `plan` the run's gates and ladder act on.
-struct RankedScans<'p> {
-    nearest: Option<NearestScan<'p>>,
-    fusion: Option<Fusion<'p>>,
-}
-
-fn ranked_scans(plan: &PhysicalPlan) -> RankedScans<'_> {
-    let mut nearest = None;
-    let mut arms = [false, false];
-    let mut fuse = None;
+/// The `nearest` scans of `plan` the run's gates and ladder act on, in node
+/// order.
+fn nearest_scans(plan: &PhysicalPlan) -> Vec<NearestScan<'_>> {
+    let cuts: Vec<(NodeId, HashSet<NodeId>)> = plan
+        .live()
+        .filter(|(_, node)| matches!(node, PhysicalNode::TargetCut { .. }))
+        .map(|(id, _)| (id, plan.subtree(id).into_iter().collect()))
+        .collect();
+    let mut scans = Vec::new();
     for (id, node) in plan.live() {
-        if let PhysicalNode::RankFuse { prefilter, .. } = node {
-            fuse = Some((id, prefilter));
-            continue;
-        }
         let PhysicalNode::Scan {
             ranked: Some(ranked),
             ..
@@ -317,30 +316,26 @@ fn ranked_scans(plan: &PhysicalPlan) -> RankedScans<'_> {
         else {
             continue;
         };
-        match ranked.scope {
-            RankScope::Order | RankScope::Window => {
-                if ranked.kind == RankKind::Nearest && ranked.fetch.is_some() {
-                    nearest = Some(NearestScan {
-                        id,
-                        prefilter: ranked.prefilter.as_ref(),
-                        overfetch: &ranked.overfetch,
-                        window: (ranked.scope == RankScope::Window)
-                            .then_some(ranked.fetch)
-                            .flatten(),
-                    });
-                }
-            }
-            RankScope::Primary => arms[0] = true,
-            RankScope::Secondary => arms[1] = true,
+        if ranked.kind != RankKind::Nearest || ranked.fetch.is_none() {
+            continue;
         }
+        let window = match ranked.scope {
+            RankScope::Window => cuts
+                .iter()
+                .filter(|(_, below)| below.contains(&id))
+                .min_by_key(|(_, below)| below.len())
+                .zip(ranked.fetch)
+                .map(|((cut, _), k)| (*cut, k)),
+            RankScope::Order => None,
+        };
+        scans.push(NearestScan {
+            id,
+            prefilter: ranked.prefilter.as_ref(),
+            overfetch: &ranked.overfetch,
+            window,
+        });
     }
-    RankedScans {
-        nearest,
-        fusion: match (arms, fuse) {
-            ([true, true], Some((id, prefilter))) => Some(Fusion { id, prefilter }),
-            _ => None,
-        },
-    }
+    scans
 }
 
 /// The rows the query's `limit` clause admits: the `Limit` at the plan's
@@ -511,11 +506,6 @@ fn validate_traversal_admission(plan: &PhysicalPlan) -> Result<Option<std::num::
                     ));
                 }
             }
-            PhysicalNode::RankFuse { prefilter, .. } if cap.is_some() && prefilter.admits() => {
-                return Err(OmniError::manifest_internal(
-                    "budgeted traversal cannot use the CSR prefilter",
-                ));
-            }
             PhysicalNode::Scan {
                 ranked: Some(ranked),
                 ..
@@ -608,176 +598,157 @@ async fn execute_with_context(
     let mut executed = ExecutionReport::default();
     let policy = bound.plan.assumptions().gate_policy;
     let lowering = Lowering::new(&bound, context);
-    let RankedScans { nearest, fusion } = ranked_scans(&bound.plan);
-    if let Some(Fusion { id, prefilter }) = fusion {
-        let (eligible, verdict) = Box::pin(rrf_prefilter_gate(context, prefilter, policy)).await;
-        let plan = if eligible.is_some() {
-            "prefilter"
-        } else {
-            "postfilter"
-        };
-        executed.decide(id, 0, report::Taken::gate(plan, &verdict));
-        let mut pass = Pass::default();
-        if let Some(ids) = eligible {
-            for id in &prefilter.feeds {
-                pass = pass.prefiltered(*id, ids.clone());
-            }
-        }
-        let lowered = lowering.lower_query(&pass)?;
-        lowered.record_in_memory_filters();
-        let fused = Box::pin(run_plan(&lowered, &bound.plan, ctx)).await?;
-        executed.record(pass_rows(&lowered, &bound.plan, 0)?);
-        // Each nearest arm's probe ladder, by its scan, after the fusion's gate.
-        let reports = lowered
-            .report
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        for (scan, report) in &reports {
-            executed.record_probes(*scan, 0, report);
-        }
-        let run = PlanRun {
-            result: QueryResult::new(fused.schema(), vec![fused]),
-            plan: bound,
-            evidence,
-            report: executed,
-        };
-        return Ok((run, reports));
-    }
+    let nearest = nearest_scans(&bound.plan);
 
+    // Each `nearest` scan's gate: a fusion arm's ranks its own population,
+    // as the same `nearest` standing alone does.
     let mut pass = Pass::default();
-    if let Some(NearestScan {
-        id,
-        prefilter: Some(prefilter),
-        ..
-    }) = &nearest
-    {
+    let mut empty: HashSet<NodeId> = HashSet::new();
+    for scan in &nearest {
+        let Some(prefilter) = scan.prefilter else {
+            continue;
+        };
         let (plan, verdict) = Box::pin(nearest_prefilter_gate(context, prefilter, policy)).await;
         let (taken, next) = match plan {
-            NearestGatePlan::Prefilter(ids) => ("prefilter", pass.prefiltered(*id, ids)),
+            NearestGatePlan::Prefilter(ids) => ("prefilter", pass.prefiltered(scan.id, ids)),
             NearestGatePlan::Postfilter => ("postfilter", pass),
-            NearestGatePlan::ProvenEmpty => ("proven_empty", pass.proven_empty(*id)),
+            NearestGatePlan::ProvenEmpty => {
+                empty.insert(scan.id);
+                ("proven_empty", pass.proven_empty(scan.id))
+            }
         };
-        executed.decide(*id, 0, report::Taken::gate(taken, &verdict));
+        executed.decide(scan.id, 0, report::Taken::gate(taken, &verdict));
         pass = next;
     }
 
-    let (result_batch, reports, rows, mut selected) =
+    let (mut result_batch, mut reports, rows, mut selected) =
         Box::pin(run_once(&lowering, ctx, &pass, 0)).await?;
     executed.record(rows);
-    let nearest_report = |reports: &ScanReports| {
-        nearest
-            .as_ref()
-            .and_then(|scan| reports.get(&scan.id))
-            .cloned()
-            .unwrap_or_default()
-    };
-    let report = nearest_report(&reports);
-    if let Some(NearestScan { id, .. }) = &nearest {
-        executed.record_probes(*id, 0, &report);
+    for scan in &nearest {
+        executed.record_probes(
+            scan.id,
+            0,
+            &reports.get(&scan.id).cloned().unwrap_or_default(),
+        );
     }
-    let mut result_batch = result_batch;
-    let mut report = report;
-    let mut reports = reports;
     let aggregate = bound
         .plan
         .live()
         .any(|(_, node)| matches!(node, PhysicalNode::Aggregate { .. }));
-    // A window drawn as a pattern step fills its own `k` targets, grouped or
-    // not; today's ordering ranking fills the read's `limit` rows.
-    let goal = match &nearest {
-        Some(NearestScan {
-            window: Some(k), ..
-        }) => Some((*k, true)),
-        Some(_) if !aggregate => declared_limit(&bound.plan).map(|limit| (limit, false)),
-        _ => None,
-    };
-    if let (Some(NearestScan { id, overfetch, .. }), Some((limit, windowed))) = (&nearest, goal) {
-        let id = *id;
-        if !pass.answer_proven_empty() {
-            let short = |batch: &RecordBatch, selected: Option<usize>| {
-                if windowed {
-                    selected.unwrap_or(0) < limit
-                } else {
-                    batch.num_rows() < limit
+    // Each window drawn as a pattern step fills its own `k` targets, grouped
+    // or not; today's ordering ranking fills the read's `limit` rows. A scan
+    // its gate proved empty has nothing to fill.
+    let goals: Vec<(&NearestScan<'_>, usize, Option<NodeId>)> = nearest
+        .iter()
+        .filter(|scan| !empty.contains(&scan.id))
+        .filter_map(|scan| match scan.window {
+            Some((cut, k)) => Some((scan, k, Some(cut))),
+            None if !aggregate => declared_limit(&bound.plan).map(|limit| (scan, limit, None)),
+            None => None,
+        })
+        .collect();
+    let mut taken: HashMap<NodeId, usize> = HashMap::new();
+    let mut label = 0usize;
+    loop {
+        // Every short scan whose last attempt was full takes its next rung;
+        // the pass reruns the plan with each scan at its own rung.
+        let mut wider = pass.clone();
+        let mut advanced = Vec::new();
+        for (scan, goal, cut) in &goals {
+            let short = match cut {
+                Some(cut) => selected.get(cut).copied().unwrap_or(0) < *goal,
+                None => result_batch.num_rows() < *goal,
+            };
+            if !short {
+                continue;
+            }
+            let Some(full) = reports
+                .get(&scan.id)
+                .and_then(|report| report.nearest_scan)
+                .inspect(|scan| {
+                    crate::instrumentation::record_query_ladder_report(
+                        crate::instrumentation::QueryLadderReport {
+                            rows: scan.rows,
+                            k: scan.k,
+                            maximum_nprobes: scan.maximum_nprobes,
+                            exhausted: scan.exhausted,
+                            dataset_rows: scan.dataset_rows,
+                        },
+                    );
+                })
+                .filter(|scan| scan.rows >= scan.k && !scan.exhausted)
+            else {
+                continue;
+            };
+            let at = taken.get(&scan.id).copied().unwrap_or(0);
+            let Some(NextPass { rung, step }) = next_overfetch_rung(scan.overfetch, at, full)
+            else {
+                continue;
+            };
+            taken.insert(scan.id, rung);
+            crate::instrumentation::record_ann_overfetch();
+            wider = match step {
+                PassStep::Wider { k, maximum } => {
+                    tracing::debug!(
+                        goal,
+                        k,
+                        maximum_nprobes = ?maximum,
+                        "nearest answer short after a full scan; rerunning with more candidates"
+                    );
+                    wider.with_nearest_k(scan.id, k, maximum)
+                }
+                PassStep::Exact { k } => {
+                    tracing::debug!(
+                        goal,
+                        rows_hydrated = k,
+                        "nearest answer still short at the overfetch ceiling; rerunning exact over the whole type"
+                    );
+                    crate::instrumentation::record_ann_exact_pass();
+                    wider.with_exact_nearest(scan.id, k)
                 }
             };
-            let full_scan = |report: &ScanReport| {
-                report
-                    .nearest_scan
-                    .inspect(|scan| {
-                        crate::instrumentation::record_query_ladder_report(
-                            crate::instrumentation::QueryLadderReport {
-                                rows: scan.rows,
-                                k: scan.k,
-                                maximum_nprobes: scan.maximum_nprobes,
-                                exhausted: scan.exhausted,
-                                dataset_rows: scan.dataset_rows,
-                            },
-                        );
-                    })
-                    .filter(|scan| scan.rows >= scan.k && !scan.exhausted)
-            };
-            let mut taken = 0usize;
-            while short(&result_batch, selected) {
-                let Some(scan) = full_scan(&report) else {
-                    break;
-                };
-                let Some(NextPass { rung, step }) = next_overfetch_rung(overfetch, taken, scan)
-                else {
-                    break;
-                };
-                taken = rung;
-                crate::instrumentation::record_ann_overfetch();
-                let rows_before = result_batch.num_rows();
-                let wider = match step {
-                    PassStep::Wider { k, maximum } => {
-                        tracing::debug!(
-                            limit,
-                            rows = rows_before,
-                            k,
-                            maximum_nprobes = ?maximum,
-                            "nearest answer short after a full scan; rerunning with more candidates"
-                        );
-                        pass.with_nearest_k(id, k, maximum)
-                    }
-                    PassStep::Exact { k } => {
-                        tracing::debug!(
-                            limit,
-                            rows = rows_before,
-                            rows_hydrated = k,
-                            "nearest answer still short at the overfetch ceiling; rerunning exact over the whole type"
-                        );
-                        crate::instrumentation::record_ann_exact_pass();
-                        pass.with_exact_nearest(id, k)
-                    }
-                };
-                let (retried, retried_reports, rows, retried_selected) =
-                    Box::pin(run_once(&lowering, ctx, &wider, rung)).await?;
-                selected = retried_selected;
-                executed.record(rows);
-                let retried_report = nearest_report(&retried_reports);
-                executed.record_probes(id, rung, &retried_report);
-                result_batch = retried;
-                report = retried_report;
-                reports = retried_reports;
-                if let PassStep::Exact { k } = step {
-                    if result_batch.num_rows() > rows_before {
-                        tracing::warn!(
-                            limit,
-                            rows_before,
-                            rows = result_batch.num_rows(),
-                            rows_hydrated = k,
-                            "the overfetch ceiling hid survivors; the exact pass over the whole type found them"
-                        );
-                    } else {
-                        tracing::debug!(
-                            limit,
-                            rows = result_batch.num_rows(),
-                            rows_hydrated = k,
-                            "the exact pass added no row: fewer survivors than limit exist"
-                        );
-                    }
+            advanced.push((scan.id, rung, step));
+        }
+        if advanced.is_empty() {
+            break;
+        }
+        // One label per pass, never repeated: the rung of a lone scan.
+        label = advanced
+            .iter()
+            .map(|(_, rung, _)| *rung)
+            .max()
+            .unwrap_or(label)
+            .max(label + 1);
+        pass = wider;
+        let rows_before = result_batch.num_rows();
+        let (retried, retried_reports, rows, retried_selected) =
+            Box::pin(run_once(&lowering, ctx, &pass, label)).await?;
+        selected = retried_selected;
+        executed.record(rows);
+        for scan in &nearest {
+            executed.record_probes(
+                scan.id,
+                label,
+                &retried_reports.get(&scan.id).cloned().unwrap_or_default(),
+            );
+        }
+        result_batch = retried;
+        reports = retried_reports;
+        for (_, _, step) in &advanced {
+            if let PassStep::Exact { k } = step {
+                if result_batch.num_rows() > rows_before {
+                    tracing::warn!(
+                        rows_before,
+                        rows = result_batch.num_rows(),
+                        rows_hydrated = k,
+                        "the overfetch ceiling hid survivors; the exact pass over the whole type found them"
+                    );
+                } else {
+                    tracing::debug!(
+                        rows = result_batch.num_rows(),
+                        rows_hydrated = k,
+                        "the exact pass added no row: fewer survivors than limit exist"
+                    );
                 }
             }
         }
@@ -934,9 +905,7 @@ mod traversal_admission_tests {
 
     #[test]
     fn replay_refuses_ranked_topology_prefilter_bypasses_issue_659() {
-        use omnigraph_planner::{
-            ColumnRef, Hop, RankArm, RankedAccess, ScanInput, ScanSpec, SideId, TableRef,
-        };
+        use omnigraph_planner::{Hop, RankedAccess, ScanInput, ScanSpec, SideId, TableRef};
         let prefilter = |feeds| Prefilter {
             ranked_type: "Person".into(),
             hops: vec![Hop {
@@ -1006,33 +975,6 @@ mod traversal_admission_tests {
             unreachable!()
         };
         ranked.prefilter = Some(prefilter(vec![input]));
-        let error = validate_traversal_admission(&plan).unwrap_err();
-        assert!(
-            error.to_string().contains("cannot use the CSR prefilter"),
-            "{error}"
-        );
-
-        let mut plan = selected_plan();
-        let input = plan.root();
-        let arm = |kind| RankArm {
-            input,
-            binding: "p".into(),
-            kind,
-        };
-        let root = plan.add(PhysicalNode::RankFuse {
-            arms: [arm(RankKind::Nearest), arm(RankKind::Bm25)],
-            k: None,
-            weights: None,
-            limit: Some(1),
-            prefilter: prefilter(vec![]),
-            row_tiebreak: vec![ColumnRef::property("q", "@id")],
-        });
-        plan.set_root(root);
-        validate_traversal_admission(&plan).unwrap();
-        let Some(PhysicalNode::RankFuse { prefilter, .. }) = plan.node_mut(root) else {
-            unreachable!()
-        };
-        prefilter.feeds.push(0);
         let error = validate_traversal_admission(&plan).unwrap_err();
         assert!(
             error.to_string().contains("cannot use the CSR prefilter"),

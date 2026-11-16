@@ -1,5 +1,6 @@
 use super::*;
 use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
+use omnigraph_planner::read_shape::{ArmRank, FuseArm};
 
 /// Synthetic IR coverage: the executor currently rejects a secondary nearest
 /// ordering, so a real-source GQT case cannot exercise this demand rule.
@@ -100,71 +101,44 @@ fn metadata_count_rewrite_converges() {
 }
 
 #[test]
-fn search_expression_arms_attribute_identity_field_and_nested_columns() {
-    let op = ir(
-        vec![scan("c")],
-        vec![prop("c", "slug")],
-        vec![IRExpr::Rrf {
-            primary: Box::new(IRExpr::Call {
-                func: ScalarFunc::MatchTerms {
-                    mode: TermsMode::Any,
+fn fusion_targets_read_the_node_object_in_every_arm() {
+    // Each arm ranks `a` over its own population; every arm's scan of the
+    // target reads the node object the fusion carries from the first arm
+    // that selected a target.
+    let nearest = FuseArm {
+        steps: vec![
+            scan("a"),
+            PatternStep::Rank {
+                key: IRExpr::Nearest {
+                    variable: "a".to_string(),
+                    property: "embedding".to_string(),
+                    query: Box::new(IRExpr::Param(
+                        "q".to_string(),
+                        value_type(ScalarType::String, false),
+                    )),
+                    ty: value_type(ScalarType::F32, false),
                 },
-                args: vec![prop("c", "title"), prop("c", "probe"), prop("c", "edits")],
-                ty: value_type(ScalarType::Bool, false),
-            }),
-            secondary: Box::new(IRExpr::Bm25 {
-                field: Box::new(prop("c", "body")),
-                query: Box::new(IRExpr::Literal(
-                    Literal::String("q".into()),
-                    value_type(ScalarType::String, false),
-                )),
-                ty: value_type(ScalarType::F32, false),
-            }),
-            k: Some(Box::new(prop("c", "k_ref"))),
-            weights: None,
-            ty: value_type(ScalarType::F64, false),
-        }],
-    );
-    // A lexical predicate reads its binding's identity, not its field, which
-    // the exact lexical scan reads itself; its text and budget are read.
-    let (plan, _) = planned(&op);
-    assert_eq!(
-        projection_of(&plan, "c"),
-        set(&["__id", "slug", "probe", "edits", "body", "k_ref"])
-    );
-}
-
-#[test]
-fn rank_fuse_targets_read_the_node_object_in_both_arms() {
-    let op = ir(
-        vec![scan("a"), scan("b")],
-        vec![prop("a", "x")],
-        vec![IRExpr::Rrf {
-            primary: Box::new(IRExpr::Nearest {
-                variable: "a".to_string(),
-                property: "embedding".to_string(),
-                query: Box::new(IRExpr::Param(
-                    "q".to_string(),
-                    value_type(ScalarType::String, false),
-                )),
-                ty: value_type(ScalarType::F32, false),
-            }),
-            secondary: Box::new(IRExpr::Bm25 {
-                field: Box::new(prop("b", "text")),
-                query: Box::new(IRExpr::Literal(
-                    Literal::String("q".into()),
-                    value_type(ScalarType::String, false),
-                )),
-                ty: value_type(ScalarType::F32, false),
-            }),
-            k: None,
-            weights: None,
-            ty: value_type(ScalarType::F64, false),
-        }],
-    );
+                binding: "a".to_string(),
+                window: Some(3),
+                window_param: None,
+                recall: None,
+            },
+        ],
+        rank: ArmRank::Nearest,
+    };
+    let mut op = ir(nearest.steps.clone(), vec![prop("a", "x")], vec![]);
+    let Operation::Query(shape) = &mut op else {
+        unreachable!("a read")
+    };
+    shape.pipeline = vec![PatternStep::Fuse {
+        arms: vec![nearest.clone(), nearest],
+        target: "a".to_string(),
+        target_type: "T".to_string(),
+        k: None,
+        weights: None,
+    }];
     let (plan, _) = planned(&op);
     assert_eq!(projection_of(&plan, "a"), object_columns());
-    assert_eq!(projection_of(&plan, "b"), object_columns());
 }
 
 #[test]

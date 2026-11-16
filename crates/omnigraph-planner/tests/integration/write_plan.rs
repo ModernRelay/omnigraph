@@ -231,7 +231,7 @@ fn an_upsert_of_nodes_resolves_to_delta_source_and_validate() {
         "a kept table's lookup scans without index facts"
     );
     let document = explain.to_value();
-    assert_eq!(document["explain_version"], 8);
+    assert_eq!(document["explain_version"], 9);
     assert_eq!(document["route"], "executor");
     assert_eq!(document["reason"]["kind"], "write_on_executor");
     assert_eq!(document["reason"]["write"], "mutation");

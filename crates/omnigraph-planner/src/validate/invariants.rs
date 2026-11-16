@@ -18,19 +18,21 @@ use std::collections::HashSet;
 
 use super::requirements::{BoundVariable, TieColumn};
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
-use omnigraph_compiler::query::value::RRF_COLUMN;
 use omnigraph_compiler::types::{ExprType, ScalarType};
 
 use super::budget::Budget;
-use super::requirements::{Block, ExactScore, Requirements, Retrieval, Search, constant_true};
+use super::requirements::{
+    Block, ExactScore, FuseRequirements, Requirements, Retrieval, Search, constant_true,
+};
 use super::{AcceptInput, ValidationError};
 use crate::cost::AntiJoinStrategy;
 use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
-use crate::optimizer::{RRF_NEAREST_ARM_K, contains_aggregate, derived_order};
+use crate::optimizer::{arm_score, contains_aggregate, derived_order};
 use crate::physical::{
     Assumptions, Eligibility, EmptyEligible, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan,
     RankKind, RankScope, RankedAccess, score_kind_name,
 };
+use crate::read_shape::ArmRank;
 use crate::source::FullTextCoverage;
 use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::expr::ScalarFunc;
@@ -103,64 +105,6 @@ fn check_block_strategy(
             }
         ),
     ))
-}
-
-/// One pipeline a query's eligibility constrains: `own`, the nodes that
-/// produce its rows, and `after`, the nodes those rows pass through above a
-/// fusion (empty without one).
-struct Constrained {
-    own: Vec<NodeId>,
-    after: Vec<NodeId>,
-    /// Whether a fusion splits the rows: `own` is one arm, `after` what the
-    /// fused rows pass through.
-    fused: bool,
-}
-
-impl Constrained {
-    /// Every node the pipeline's rows reach.
-    fn reached(&self) -> Vec<NodeId> {
-        self.own.iter().chain(&self.after).copied().collect()
-    }
-}
-
-/// The pipelines whose rows a query's eligibility constrains: one per `rrf`
-/// arm, each its own copy of the match, followed by the nodes above the
-/// fusion; or the whole top level.
-fn constrained_pipelines(
-    plan: &PhysicalPlan,
-    budget: &mut Budget,
-) -> Result<Vec<Constrained>, ValidationError> {
-    let top = pipeline(plan, plan.root(), budget)?;
-    let fuse = top.iter().find_map(|id| match plan.node(*id) {
-        Some(PhysicalNode::RankFuse { arms, .. }) => Some((*id, arms.clone())),
-        _ => None,
-    });
-    let Some((fuse, arms)) = fuse else {
-        return Ok(vec![Constrained {
-            own: top,
-            after: Vec::new(),
-            fused: false,
-        }]);
-    };
-    let mut below = HashSet::new();
-    let mut arm_pipelines = Vec::new();
-    for arm in &arms {
-        let own = pipeline(plan, arm.input, budget)?;
-        below.extend(own.iter().copied());
-        arm_pipelines.push(own);
-    }
-    let after: Vec<NodeId> = top
-        .into_iter()
-        .filter(|id| *id != fuse && !below.contains(id))
-        .collect();
-    Ok(arm_pipelines
-        .into_iter()
-        .map(|own| Constrained {
-            own,
-            after: after.clone(),
-            fused: true,
-        })
-        .collect())
 }
 
 /// Every conjunct a pipeline's nodes test, wherever placement put it, with
@@ -288,45 +232,166 @@ impl Requirements {
         input: &AcceptInput<'_>,
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
-        // A fused query's eligibility belongs inside each arm (retention);
-        // what its rows pass through after the fusion is checked with the
-        // arm for origin, extra traversals and blocks.
-        // The elements written after a fusion's `from` run over its fused
-        // rows: their conjuncts and blocks belong above it, the
-        // population's in each arm.
-        for pipeline in &constrained_pipelines(plan, budget)? {
-            let reached = pipeline.reached();
-            self.check_bindings(plan, &reached)?;
-            let (population, after): (Vec<IRExpr>, Vec<IRExpr>) = if pipeline.fused {
-                self.eligibility
+        self.check_scope(plan, plan.root(), true, input, budget)?;
+        check_policies(plan, budget)?;
+        Ok(())
+    }
+
+    /// The checks of one scope over the pipeline under `root`: the read's
+    /// own (`outermost`), with its projection, hydration, order and cut, or
+    /// a fusion arm's, whose rows the fusion ranks. A fusion's arms are
+    /// scopes of their own (`check_fusion`), so the scope's nodes stop at
+    /// them.
+    fn check_scope(
+        &self,
+        plan: &PhysicalPlan,
+        root: NodeId,
+        outermost: bool,
+        input: &AcceptInput<'_>,
+        budget: &mut Budget,
+    ) -> Result<(), ValidationError> {
+        let mut top = pipeline(plan, root, budget)?;
+        let mut held = HashSet::new();
+        match &self.fuse {
+            Some(fuse) => {
+                held = self.check_fusion(plan, &top, fuse, input, budget)?;
+                top.retain(|id| !held.contains(id));
+            }
+            None => {
+                if top
                     .iter()
-                    .cloned()
-                    .partition(|conjunct| !self.after_rank.contains(conjunct))
-            } else {
-                (self.eligibility.clone(), Vec::new())
-            };
-            self.check_eligibility(plan, &pipeline.own, &reached, &population, input, budget)?;
-            self.check_retained(plan, &pipeline.after, &after)?;
-            let (own_blocks, after_blocks): (Vec<&Block>, Vec<&Block>) = self
-                .blocks
-                .iter()
-                .partition(|block| !(pipeline.fused && block.after_rank));
-            self.check_blocks(plan, &pipeline.own, &own_blocks, budget)?;
-            self.check_blocks(plan, &pipeline.after, &after_blocks, budget)?;
+                    .any(|id| matches!(plan.node(*id), Some(PhysicalNode::Fuse { .. })))
+                {
+                    return Err(ValidationError::violated(
+                        "search identity",
+                        "the plan fuses retrievals the query does not fuse",
+                    ));
+                }
+            }
         }
-        let top = pipeline(plan, plan.root(), budget)?;
+        self.check_bindings(plan, &top)?;
+        self.check_eligibility(plan, &top, &top, &self.eligibility, input, budget)?;
+        let blocks: Vec<&Block> = self.blocks.iter().collect();
+        self.check_blocks(plan, &top, &blocks, budget)?;
         self.check_optionals(plan, &top, budget)?;
         self.check_correlates(plan, &top, budget)?;
         self.check_unions(plan, &top)?;
         self.check_scores(plan, &top, input)?;
         self.check_lets(plan, &top)?;
-        self.check_search(plan)?;
-        self.check_row_cuts(plan, budget)?;
-        self.check_returns(plan, &top, budget)?;
-        self.check_hydration(plan, &top)?;
-        self.check_order_and_cut(plan, &top, input, budget)?;
-        check_policies(plan, budget)?;
+        self.check_search(plan, &top)?;
+        let scope: Vec<NodeId> = plan
+            .subtree(root)
+            .into_iter()
+            .filter(|id| !held.contains(id))
+            .collect();
+        self.check_row_cuts(plan, root, &scope, budget)?;
+        if outermost {
+            self.check_returns(plan, &top, budget)?;
+            self.check_hydration(plan, &top)?;
+            self.check_order_and_cut(plan, &top, input, budget)?;
+        }
         Ok(())
+    }
+
+    /// The scope's fusion is the query's: one `Fuse` node outside every
+    /// other's arms, of the written target, with the written `k` and
+    /// `weights`, one arm per written arm in written order, each ranking as
+    /// written, its rows arriving in that rank order (`check_arm_order`) and
+    /// its subtree holding exactly the arm's requirements. Returns every
+    /// node of the arms' subtrees.
+    fn check_fusion(
+        &self,
+        plan: &PhysicalPlan,
+        top: &[NodeId],
+        fuse: &FuseRequirements,
+        input: &AcceptInput<'_>,
+        budget: &mut Budget,
+    ) -> Result<HashSet<NodeId>, ValidationError> {
+        let mut fusions = Vec::new();
+        let mut held = HashSet::new();
+        for id in top {
+            if let Some(PhysicalNode::Fuse { arms, .. }) = plan.node(*id) {
+                fusions.push(*id);
+                for arm in arms {
+                    held.extend(pipeline(plan, arm.input, budget)?);
+                }
+            }
+        }
+        let outer: Vec<NodeId> = fusions
+            .into_iter()
+            .filter(|id| !held.contains(id))
+            .collect();
+        let [id] = outer[..] else {
+            return Err(ValidationError::violated(
+                "search identity",
+                format!(
+                    "the query fuses one ranking's arms; the plan's scope holds {} fusions",
+                    outer.len()
+                ),
+            ));
+        };
+        let Some(PhysicalNode::Fuse {
+            arms,
+            target,
+            k,
+            weights,
+        }) = plan.node(id)
+        else {
+            unreachable!("`outer` holds fusions");
+        };
+        if *target != fuse.target {
+            return Err(ValidationError::violated(
+                "search identity",
+                format!(
+                    "the fusion ranks `${target}`; the query fuses `${}`",
+                    fuse.target
+                ),
+            ));
+        }
+        if arms.len() != fuse.arms.len() {
+            return Err(ValidationError::violated(
+                "search identity",
+                format!(
+                    "the fusion has {} arms; the query fuses {}",
+                    arms.len(),
+                    fuse.arms.len()
+                ),
+            ));
+        }
+        if *k != fuse.k {
+            return Err(ValidationError::violated(
+                "search identity",
+                "the fusion's `k` is not the one the query writes",
+            ));
+        }
+        if *weights != fuse.weights
+            || weights.as_ref().is_some_and(|weights| {
+                omnigraph_compiler::ir::rrf_weight_values(weights, arms.len()).is_none()
+            })
+        {
+            return Err(ValidationError::violated(
+                "search identity",
+                "the fusion's `weights` are not the ones the query writes",
+            ));
+        }
+        let mut nodes = HashSet::new();
+        for (index, (arm, (rank, required))) in arms.iter().zip(&fuse.arms).enumerate() {
+            if arm.rank != *rank {
+                return Err(ValidationError::violated(
+                    "search identity",
+                    format!(
+                        "the fusion's arm {} ranks as {}; the query's arm is {}",
+                        index + 1,
+                        arm.rank.name(),
+                        rank.name()
+                    ),
+                ));
+            }
+            check_arm_order(plan, arm, target)?;
+            required.check_scope(plan, arm.input, false, input, budget)?;
+            nodes.extend(plan.subtree(arm.input));
+        }
+        Ok(nodes)
     }
 
     /// Every written binding is read with its type: a node binding by a scan
@@ -345,6 +410,11 @@ impl Requirements {
                 ) => {
                     spec.binding.as_deref() == Some(name.as_str())
                         && spec.table.node_type_name() == Some(type_name.as_str())
+                }
+                // A fusion binds its target; each arm's own scope reads it
+                // with its type.
+                (Some(PhysicalNode::Fuse { target, .. }), BoundVariable::Node { .. }) => {
+                    target == name
                 }
                 (
                     Some(PhysicalNode::Expand {
@@ -961,17 +1031,14 @@ impl Requirements {
                 > in_optionals
     }
 
-    /// The plan ranks exactly the retrievals the leading `order` key names,
-    /// each on its binding and property, with its argument and the
-    /// approximation its contract declares, in the scope it orders.
-    fn check_search(&self, plan: &PhysicalPlan) -> Result<(), ValidationError> {
-        let ranked = ranked_scans(plan);
-        let fuse = plan.live().find_map(|(_, node)| match node {
-            PhysicalNode::RankFuse {
-                arms, k, weights, ..
-            } => Some((arms, k, weights)),
-            _ => None,
-        });
+    /// The scope ranks exactly the retrieval its leading `order` key or its
+    /// ranking step names, on its binding and property, with its argument
+    /// and the approximation its contract declares, in the scope it orders.
+    fn check_search(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
+        let ranked: Vec<(NodeId, &str, &RankedAccess)> = ranked_scans(plan)
+            .into_iter()
+            .filter(|(id, ..)| top.contains(id))
+            .collect();
         let expected: Vec<(RankScope, &Retrieval)> = match &self.search {
             None => Vec::new(),
             Some(Search::Rank(retrieval)) => {
@@ -987,10 +1054,6 @@ impl Requirements {
                     retrieval,
                 )]
             }
-            Some(Search::Fuse { arms, .. }) => vec![
-                (RankScope::Primary, &arms[0]),
-                (RankScope::Secondary, &arms[1]),
-            ],
         };
         if ranked.len() != expected.len() {
             return Err(ValidationError::violated(
@@ -1047,49 +1110,6 @@ impl Requirements {
             };
             self.check_access(plan, type_key, access)?;
         }
-        match (&self.search, fuse) {
-            (
-                Some(Search::Fuse { arms, k, weights }),
-                Some((planned, planned_k, planned_weights)),
-            ) => {
-                for (arm, retrieval) in planned.iter().zip(arms.iter()) {
-                    if arm.binding != retrieval.binding || arm.kind != retrieval.kind {
-                        return Err(ValidationError::violated(
-                            "search identity",
-                            format!(
-                                "the fusion's arm ranks `${}` by {:?}; the query names {:?} of `${}`",
-                                arm.binding, arm.kind, retrieval.kind, retrieval.binding
-                            ),
-                        ));
-                    }
-                }
-                if planned_k != k {
-                    return Err(ValidationError::violated(
-                        "search identity",
-                        "the fusion's `k` is not the one the query writes",
-                    ));
-                }
-                if planned_weights != weights {
-                    return Err(ValidationError::violated(
-                        "search identity",
-                        "the fusion's `weights` are not the ones the query writes",
-                    ));
-                }
-            }
-            (Some(Search::Fuse { .. }), None) => {
-                return Err(ValidationError::violated(
-                    "search identity",
-                    "the query fuses two retrievals; the plan has no fusion",
-                ));
-            }
-            (_, Some(_)) => {
-                return Err(ValidationError::violated(
-                    "search identity",
-                    "the plan fuses retrievals the query does not fuse",
-                ));
-            }
-            (_, None) => {}
-        }
         Ok(())
     }
 
@@ -1102,13 +1122,15 @@ impl Requirements {
     fn check_row_cuts(
         &self,
         plan: &PhysicalPlan,
+        root: NodeId,
+        scope: &[NodeId],
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
-        budget.visit(u64::try_from(plan.live().count()).unwrap_or(u64::MAX))?;
+        budget.visit(u64::try_from(scope.len()).unwrap_or(u64::MAX))?;
         let limit = self
             .limit
             .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
-        let root = below_hydration(plan, plan.root());
+        let root = below_hydration(plan, root);
         let mut id = match plan.node(root) {
             Some(PhysicalNode::Limit { input, .. }) => *input,
             _ => root,
@@ -1117,7 +1139,10 @@ impl Requirements {
             id = *input;
         }
         let final_sort = matches!(plan.node(id), Some(PhysicalNode::Sort { .. })).then_some(id);
-        for (id, node) in plan.live() {
+        for &id in scope {
+            let Some(node) = plan.node(id) else {
+                continue;
+            };
             if let PhysicalNode::TargetCut { targets, .. } = node {
                 let window = self.window.flatten();
                 if window != u64::try_from(*targets).ok() {
@@ -1201,9 +1226,6 @@ impl Requirements {
                 window,
                 window.map(OverfetchRung::ladder).unwrap_or_default(),
             ),
-            (RankKind::Nearest, RankScope::Primary | RankScope::Secondary) => {
-                (Some(window.unwrap_or(RRF_NEAREST_ARM_K)), Vec::new())
-            }
         };
         if access.fetch != fetch || access.overfetch != overfetch {
             return Err(ValidationError::violated(
@@ -1220,12 +1242,7 @@ impl Requirements {
             .get(omnigraph_compiler::settings::SettingId::AnnNprobes.name());
         let nprobes = match access.kind {
             // A step that declares `recall: 1` searches every partition.
-            RankKind::Nearest
-                if self.recall == Some(1.0)
-                    && matches!(access.scope, RankScope::Order | RankScope::Window) =>
-            {
-                None
-            }
+            RankKind::Nearest if self.recall == Some(1.0) => None,
             RankKind::Nearest => setting
                 .map(|value| match value.as_str() {
                     "0" => None,
@@ -1303,21 +1320,12 @@ impl Requirements {
             }
         }
         for (_, call) in &self.projected_ranks {
-            let origin = self.written_search.as_ref().is_some_and(|lead| {
-                lead == call
-                    || matches!(lead, IRExpr::Rrf { primary, secondary, .. }
-                        if **primary == *call || **secondary == *call)
+            let origin = self.written_search.as_ref() == Some(call);
+            let planned = projected_retrieval(call).is_some_and(|(kind, binding, property)| {
+                ranked_scans(plan).into_iter().any(|(_, scanned, access)| {
+                    scanned == binding && access.kind == kind && access.property == property
+                })
             });
-            let planned = match call {
-                IRExpr::Rrf { .. } => plan
-                    .live()
-                    .any(|(_, node)| matches!(node, PhysicalNode::RankFuse { .. })),
-                call => projected_retrieval(call).is_some_and(|(kind, binding, property)| {
-                    ranked_scans(plan).into_iter().any(|(_, scanned, access)| {
-                        scanned == binding && access.kind == kind && access.property == property
-                    })
-                }),
-            };
             if !origin || !planned {
                 return Err(ValidationError::violated(
                     "score origin",
@@ -1398,7 +1406,7 @@ impl Requirements {
     }
 
     /// The final sort's comparator as RFC 0047 defines it: a ranking's score
-    /// (a fused ranking's `_rrf` descending) then the written keys; over
+    /// then the written keys; over
     /// group rows (an aggregate or a `return distinct`) the written keys then
     /// the tie rule's group keys ([`Self::with_group_keys`]); no sort where
     /// the query neither orders nor cuts its rows. A `limit` with no `order`
@@ -1429,7 +1437,6 @@ impl Requirements {
                 let (column, descending) = retrieval.kind.score();
                 vec![(retrieval.binding.as_str(), column, descending)]
             }
-            Some(Search::Fuse { arms, .. }) => vec![(arms[0].binding.as_str(), RRF_COLUMN, true)],
         };
         Some(
             lead.into_iter()
@@ -1698,98 +1705,124 @@ fn check_policies(plan: &PhysicalPlan, budget: &mut Budget) -> Result<(), Valida
     }
     for (id, node) in plan.live() {
         budget.visit(1)?;
-        match node {
-            PhysicalNode::Scan {
-                ranked: Some(access),
-                spec,
-                ..
-            } => {
-                match (access.kind, access.policy) {
-                    (RankKind::Nearest, Some(policy)) => {
-                        if policy.probe_factor < 2
-                            || !policy.flat_rescan_on_unreached
-                            || !policy.uncapped_on_missing_counters
-                        {
-                            return Err(ValidationError::violated(
-                                "declared policy",
-                                format!(
-                                    "the nearest scan's policy {policy:?} lets its probe ladder stall or drops a fallback that keeps its rows in order"
-                                ),
-                            ));
-                        }
-                    }
-                    (RankKind::Bm25, None) => {}
-                    (kind, policy) => {
-                        return Err(ValidationError::violated(
-                            "declared policy",
-                            format!("a {kind:?} scan declares the nearest policy {policy:?}"),
-                        ));
-                    }
-                }
-                if let Some(prefilter) = &access.prefilter {
-                    if access.kind != RankKind::Nearest
-                        || !matches!(access.scope, RankScope::Order | RankScope::Window)
-                        || prefilter.feeds != [id]
-                        || prefilter.on_empty != EmptyEligible::ProvenEmpty
-                    {
-                        return Err(ValidationError::violated(
-                            "declared policy",
-                            "only a standalone nearest scan carries its own pre-pass, feeding itself and proving an empty eligible set empty",
-                        ));
-                    }
-                    let binding = spec.binding.as_deref().unwrap_or_default();
-                    check_prefilter(plan, plan.root(), binding, prefilter, budget)?;
-                }
-            }
-            PhysicalNode::RankFuse {
-                arms, prefilter, ..
-            } => {
-                if prefilter.on_empty != EmptyEligible::Postfilter {
+        let PhysicalNode::Scan {
+            ranked: Some(access),
+            spec,
+            ..
+        } = node
+        else {
+            continue;
+        };
+        match (access.kind, access.policy) {
+            (RankKind::Nearest, Some(policy)) => {
+                if policy.probe_factor < 2
+                    || !policy.flat_rescan_on_unreached
+                    || !policy.uncapped_on_missing_counters
+                {
                     return Err(ValidationError::violated(
                         "declared policy",
-                        "a fusion's empty eligible set proves nothing; its arms run unfiltered",
-                    ));
-                }
-                let mut admits = true;
-                for feed in &prefilter.feeds {
-                    match plan.node(*feed) {
-                        Some(PhysicalNode::Scan {
-                            spec,
-                            ranked: Some(ranked),
-                            ..
-                        }) if ranked.kind == RankKind::Bm25 => {
-                            admits &=
-                                plan.assumptions()
-                                    .full_text
-                                    .get(&Assumptions::full_text_key(
-                                        &spec.table.type_key,
-                                        &ranked.property,
-                                    ))
-                                    == Some(&FullTextCoverage::Full);
-                        }
-                        _ => {
-                            return Err(ValidationError::violated(
-                                "declared policy",
-                                "a fusion's pre-pass feeds only its bm25 arms",
-                            ));
-                        }
-                    }
-                }
-                if admits != prefilter.coverage_admits {
-                    return Err(ValidationError::violated(
-                        "prerequisite",
                         format!(
-                            "the fusion's pre-pass claims coverage admits {}; the recorded coverage of its bm25 arms admits {admits}",
-                            prefilter.coverage_admits
+                            "the nearest scan's policy {policy:?} lets its probe ladder stall or drops a fallback that keeps its rows in order"
                         ),
                     ));
                 }
-                check_prefilter(plan, arms[0].input, &arms[0].binding, prefilter, budget)?;
             }
-            _ => {}
+            (RankKind::Bm25, None) => {}
+            (kind, policy) => {
+                return Err(ValidationError::violated(
+                    "declared policy",
+                    format!("a {kind:?} scan declares the nearest policy {policy:?}"),
+                ));
+            }
+        }
+        if let Some(prefilter) = &access.prefilter {
+            if access.kind != RankKind::Nearest
+                || !matches!(access.scope, RankScope::Order | RankScope::Window)
+                || prefilter.feeds != [id]
+                || prefilter.on_empty != EmptyEligible::ProvenEmpty
+            {
+                return Err(ValidationError::violated(
+                    "declared policy",
+                    "only a nearest scan carries its own pre-pass, feeding itself and proving an empty eligible set empty",
+                ));
+            }
+            let binding = spec.binding.as_deref().unwrap_or_default();
+            check_prefilter(plan, scope_root(plan, id), binding, prefilter, budget)?;
         }
     }
     Ok(())
+}
+
+/// The root of the scope `id` belongs to: the input of the innermost
+/// fusion arm whose subtree holds it, else the plan's root. A ranking in an
+/// arm ranks that arm's population alone.
+fn scope_root(plan: &PhysicalPlan, id: NodeId) -> NodeId {
+    let mut root = plan.root();
+    let mut size = usize::MAX;
+    for (_, node) in plan.live() {
+        let PhysicalNode::Fuse { arms, .. } = node else {
+            continue;
+        };
+        for arm in arms {
+            let subtree = plan.subtree(arm.input);
+            if subtree.len() < size && subtree.contains(&id) {
+                root = arm.input;
+                size = subtree.len();
+            }
+        }
+    }
+    root
+}
+
+/// A fusion arm's rows arrive in its rank order, each target's rows
+/// together at its rank: a `nearest` window's `TargetCut` of the target over
+/// a sort leading with its distance ascending; an exact score's or a nested
+/// fusion's rows sorted by the target's score in its kind's direction
+/// (`arm_score`), then the target's identity, with no cut; an ordered
+/// read's uncorrelated `Correlate`, which orders and cuts its own rows and
+/// returns the target.
+fn check_arm_order(
+    plan: &PhysicalPlan,
+    arm: &crate::physical::FuseArm,
+    target: &str,
+) -> Result<(), ValidationError> {
+    let refused = |detail: String| Err(ValidationError::violated("search identity", detail));
+    let score = arm_score(target, arm.rank);
+    let ordered = match (arm.rank, plan.node(arm.input)) {
+        (ArmRank::Nearest, Some(PhysicalNode::TargetCut { input, binding, .. })) => {
+            binding == target
+                && matches!(plan.node(*input), Some(PhysicalNode::Sort { order_by, fetch: None, .. })
+                    if order_by.first() == score.as_ref())
+        }
+        (
+            ArmRank::Ordered,
+            Some(PhysicalNode::Correlate {
+                input: None, read, ..
+            }),
+        ) => !read.order_by.is_empty() && read.references().any(|name| name == target),
+        (
+            ArmRank::Distance | ArmRank::Bm25 | ArmRank::Fused,
+            Some(PhysicalNode::Sort {
+                order_by,
+                fetch: None,
+                tiebreak,
+                ..
+            }),
+        ) => {
+            order_by.as_slice() == score.as_slice()
+                && tiebreak.as_slice() == [ColumnRef::property(target, IDENTITY_MEMBER)]
+        }
+        _ => false,
+    };
+    if ordered {
+        Ok(())
+    } else {
+        refused(format!(
+            "the fusion's {} arm (node {}) does not yield its rows of `${target}` in its rank order",
+            arm.rank.name(),
+            arm.input
+        ))
+    }
 }
 
 /// Every hop of a pre-pass is a required first hop of `binding` in the

@@ -37,6 +37,7 @@ mod filter;
 #[cfg(test)]
 mod fixtures;
 mod fragment_sink;
+mod fuse;
 mod hash_join;
 mod hydrate;
 mod key_groups;
@@ -48,7 +49,6 @@ mod metadata_count;
 mod optional_join;
 mod pair_buffer;
 mod projection;
-mod rank_fuse;
 mod scan;
 mod score;
 mod shape;
@@ -73,6 +73,7 @@ pub(super) use expand::{
 };
 pub(super) use filter::FilterExec;
 pub(super) use fragment_sink::LanceFragmentSink;
+pub(super) use fuse::{FuseExec, FuseMethod};
 pub(super) use hash_join::{HashJoinExec, LookupSpec};
 pub(super) use hydrate::HydrateExec;
 pub(super) use key_groups::KeyGroups;
@@ -81,7 +82,6 @@ pub(super) use limit::LimitExec;
 pub(super) use metadata_count::MetadataCountExec;
 pub(super) use optional_join::OptionalJoinExec;
 pub(super) use projection::ProjectionExec;
-pub(super) use rank_fuse::{ArmOrder, RankFuseExec};
 use scan::{Filled, Needles};
 pub(super) use scan::{RuntimeFilterSlot, ScanExec, ScanSource};
 pub(super) use score::ScoreExec;
@@ -248,16 +248,6 @@ pub(super) fn conform(batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBa
         })
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(Arc::clone(schema), columns).map_err(OmniError::arrow_internal)
-}
-
-/// A produced batch re-declared by position: the RRF fusion concatenates
-/// slices of both legs positionally, as v1's `build_fused_batch` does.
-pub(super) fn conform_positional(batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
-    if batch.num_rows() == 0 {
-        return Ok(RecordBatch::new_empty(Arc::clone(schema)));
-    }
-    RecordBatch::try_new(Arc::clone(schema), batch.columns().to_vec())
-        .map_err(OmniError::arrow_internal)
 }
 
 /// `left` beside `right`, refused on a shared column name the way

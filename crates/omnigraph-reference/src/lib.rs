@@ -858,24 +858,9 @@ impl<'a> Interpreter<'a> {
                 let k = self.count(k)? as f64;
                 let mut fused: Vec<(Value, f64)> = Vec::new();
                 for (i, arm) in arms.iter().enumerate() {
-                    let (rel, score, descending) = self.scored_arm(arm, env)?;
-                    let mut best: Vec<(Value, f64)> = Vec::new();
-                    for row in &rel.rows {
-                        let (Some(t), Some(s)) =
-                            (get(row, target), get(row, &score).and_then(Value::as_f64))
-                        else {
-                            continue;
-                        };
-                        if !best.iter().any(|(b, _)| b == t) {
-                            best.push((t.clone(), s));
-                        }
-                    }
-                    best.sort_by(|a, b| {
-                        let o = a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal);
-                        (if descending { o.reverse() } else { o }).then(cmp_values(&a.0, &b.0))
-                    });
+                    let best = self.ranked_targets(arm, target, env)?;
                     let w = weights.get(i).copied().unwrap_or(1.0);
-                    for (rank, (t, _)) in best.into_iter().enumerate() {
+                    for (rank, t) in best.into_iter().enumerate() {
                         let add = w / (k + (rank + 1) as f64);
                         match fused.iter_mut().find(|(f, _)| *f == t) {
                             Some((_, s)) => *s += add,
@@ -945,19 +930,50 @@ impl<'a> Interpreter<'a> {
         })
     }
 
-    /// An `rrf` arm's relation, its score column and its direction.
-    fn scored_arm(&mut self, arm: &Term, env: &Row) -> R<(Rel, String, bool)> {
-        let (out, descending) = match arm {
-            Term::ApproxTopK { out, .. } => (out.clone(), false),
+    /// An `rrf` arm's distinct targets in rank order: a ranking function's
+    /// by its own score in its kind's direction, then the target; an inline
+    /// read with an `order` by each target's first row in that order.
+    fn ranked_targets(&mut self, arm: &Term, target: &str, env: &Row) -> R<Vec<Value>> {
+        let scored = match arm {
+            Term::ApproxTopK { out, .. } => Some((out.clone(), false)),
             Term::Score {
                 out,
                 kind: ScoreKind::Distance,
                 ..
-            } => (out.clone(), false),
-            Term::Score { out, .. } => (out.clone(), true),
-            _ => return unsupported("an `rrf` arm that is not a ranking"),
+            } => Some((out.clone(), false)),
+            Term::Score { out, .. } | Term::Fuse { out, .. } => Some((out.clone(), true)),
+            _ => None,
         };
-        Ok((self.term(arm, env)?, out, descending))
+        let rel = self.term(arm, env)?;
+        let Some((score, descending)) = scored else {
+            if !rel.ordered {
+                return unsupported("an `rrf` arm that is not a ranking or an ordered read");
+            }
+            let mut targets: Vec<Value> = Vec::new();
+            for row in &rel.rows {
+                if let Some(t) = get(row, target)
+                    && !targets.contains(t)
+                {
+                    targets.push(t.clone());
+                }
+            }
+            return Ok(targets);
+        };
+        let mut best: Vec<(Value, f64)> = Vec::new();
+        for row in &rel.rows {
+            let (Some(t), Some(s)) = (get(row, target), get(row, &score).and_then(Value::as_f64))
+            else {
+                continue;
+            };
+            if !best.iter().any(|(b, _)| b == t) {
+                best.push((t.clone(), s));
+            }
+        }
+        best.sort_by(|a, b| {
+            let o = a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal);
+            (if descending { o.reverse() } else { o }).then(cmp_values(&a.0, &b.0))
+        });
+        Ok(best.into_iter().map(|(t, _)| t).collect())
     }
 
     fn aggregate(&self, agg: &Agg, rows: &[Row], env: &Row) -> R<Value> {
@@ -1323,7 +1339,7 @@ impl<'a> Interpreter<'a> {
             }
             // `search` and `match_text` are `terms(q, mode: any)`; `fuzzy`
             // adds an edit budget, two when unwritten (section 4, Migration).
-            IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } | IRExpr::Rrf { .. } => {
+            IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } => {
                 return unsupported("a ranking as a scalar");
             }
             IRExpr::Aggregate { .. } => return unsupported("an aggregate outside a group"),

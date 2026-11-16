@@ -172,7 +172,7 @@ fn require_push_node(node: &PhysicalNode) -> Result<()> {
         | PhysicalNode::Correlate { .. }
         | PhysicalNode::Union { .. }
         | PhysicalNode::OuterReference { .. }
-        | PhysicalNode::RankFuse { .. }
+        | PhysicalNode::Fuse { .. }
         | PhysicalNode::Projection { .. }
         | PhysicalNode::Aggregate { .. }
         | PhysicalNode::Sort { .. }

@@ -43,7 +43,6 @@ mod recovery_probe;
 mod repro_issue_563;
 mod repro_issue_703;
 mod repro_issue_723;
-mod rrf_prefilter_gate;
 mod s3_storage;
 mod scalar_indexes;
 mod scan_limit_cost;

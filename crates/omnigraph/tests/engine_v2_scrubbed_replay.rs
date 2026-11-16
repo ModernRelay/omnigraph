@@ -258,9 +258,22 @@ const NEAREST: &str = r#"query by_vector($q: Vector(4)) {
     limit 3
 }"#;
 
+/// A fusion of a `nearest` window and an exact `distance` arm with a third,
+/// ordered arm: each arm the plan it takes standing alone.
+const FUSED: &str = r#"query fused($q: Vector(4)) {
+    match {
+      let $pop = { match { $d: Doc } return { $d } },
+      from rrf(nearest($pop, $d.embedding, $q, k: 3), distance($pop, $d.embedding, [7.0, 0.0, 0.0, 0.0]), { match { $d: Doc } return { $d } order { $d.slug desc } limit 2 }) as $score,
+    }
+    return { $d.slug, $score }
+    order { $score desc }
+}"#;
+
 /// Rust for the replay door, which no case reaches: each plan replays under
 /// its own `nprobes` with no session in hand, and the plan gathered under 1
-/// replays in the session set to 64; rows are `input_ann_nprobes.gqt`'s.
+/// replays in the session set to 64; rows are `input_ann_nprobes.gqt`'s. A
+/// fusion's `nearest` arm carries its probe cap as the same `nearest`
+/// standing alone does.
 #[tokio::test]
 async fn ann_nprobes_is_a_field_of_the_ranked_scan_and_the_rows_do_not_move() {
     let dir = tempfile::tempdir().unwrap();
@@ -330,6 +343,36 @@ async fn ann_nprobes_is_a_field_of_the_ranked_scan_and_the_rows_do_not_move() {
         runs[0],
         "a one-partition index returns the same rows under any cap, so which cap the replay ran under is not observable here"
     );
+
+    let mut fused = Vec::new();
+    for nprobes in ["1", "64"] {
+        let session = with_setting(&v2, "ann_nprobes", nprobes);
+        let run = session
+            .query_inspected(ReadTarget::branch("main"), FUSED, "fused", &params)
+            .await
+            .unwrap();
+        let planned: Vec<Option<usize>> = run
+            .plan
+            .plan
+            .live()
+            .filter_map(|(_, node)| node.ranked())
+            .map(|ranked| ranked.nprobes)
+            .collect();
+        assert_eq!(planned, [Some(nprobes.parse().unwrap())], "one window scan");
+        fused.push((rows_of(&run.result), run.replay_envelope(FUSED, "fused")));
+    }
+    assert_eq!(fused[0].0, fused[1].0);
+    assert_eq!(
+        fused[0].0.len(),
+        8,
+        "the exact arm selects every Doc: {:?}",
+        fused[0].0
+    );
+    let crossed = with_setting(&v2, "ann_nprobes", "64")
+        .replay_bound_plan(ReadTarget::branch("main"), &fused[0].1)
+        .await
+        .expect("the door takes a fused plan gathered under another session's cap");
+    assert_eq!(rows_of(&crossed.result), fused[0].0);
 }
 
 /// The profile surface: one row per report row in the explain row schema,

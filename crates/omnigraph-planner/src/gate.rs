@@ -236,19 +236,6 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             params_of_expr(field, out);
             params_of_expr(query, out);
         }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-            weights,
-            ..
-        } => {
-            params_of_expr(primary, out);
-            params_of_expr(secondary, out);
-            for option in [k, weights].into_iter().flatten() {
-                params_of_expr(option, out);
-            }
-        }
         IRExpr::Aggregate { arg, .. } => params_of_expr(arg, out),
         IRExpr::Binary { left, right, .. } => {
             params_of_expr(left, out);

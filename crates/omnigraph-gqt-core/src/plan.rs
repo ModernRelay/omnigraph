@@ -42,7 +42,7 @@ use serde_json::Value;
 use crate::load_plan::PipelineClaim;
 use crate::report::Report;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ diagnostics present]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ diagnostics present]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `fuse $var: arms [nearest, bm25, distance, ordered, rrf]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
@@ -128,9 +128,10 @@ pub(crate) enum PlanLine {
         outer_var: String,
         strategy: String,
     },
-    /// Every selected physical scan is ranked, and one of them by the named
-    /// index, asking it for `fetch` candidates and under the probe cap
-    /// `nprobes` (`0` no cap) when claimed; an `rrf()` has one scan per arm.
+    /// One of the selected physical scans is ranked by the named index,
+    /// asking it for `fetch` candidates and under the probe cap `nprobes`
+    /// (`0` no cap) when claimed; a fusion's `nearest` arms each rank their
+    /// own scan, and its exact arms scan the target unranked.
     ScanRanked {
         type_name: String,
         binding: Option<String>,
@@ -178,9 +179,11 @@ pub(crate) enum PlanLine {
         selection_kind: String,
         members: Vec<(String, String)>,
     },
-    /// Exact downstream identity keys declared by a physical RankFuse.
-    RankFuse {
-        tiebreak: Vec<String>,
+    /// A physical `Fuse` of `target` whose arms rank as `arms`, in written
+    /// order.
+    Fuse {
+        target: String,
+        arms: Vec<String>,
     },
     /// An in-memory `Filter` node stays in the plan reading exactly `reads`.
     Filter {
@@ -396,19 +399,27 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             });
             continue;
         }
-        if let Some(claim) = line.strip_prefix("rank fuse ") {
-            let tiebreak = if claim.trim() == "no row tiebreak" {
-                Vec::new()
-            } else {
-                claim
-                    .trim()
-                    .strip_prefix("row tiebreak")
-                    .and_then(identity_key_list)
-                    .ok_or_else(|| {
-                        refused("claims `row tiebreak [$a.@id, $e.@type]` or `no row tiebreak`")
-                    })?
-            };
-            lines.push(PlanLine::RankFuse { tiebreak });
+        if let Some(claim) = line.strip_prefix("fuse ") {
+            let (target, arms) = claim
+                .split_once(':')
+                .and_then(|(target, arms)| {
+                    let target = target.trim().strip_prefix('$')?;
+                    let arms = arms.trim().strip_prefix("arms")?.trim();
+                    let arms = arms.strip_prefix('[')?.strip_suffix(']')?;
+                    let arms: Vec<String> = arms
+                        .split(',')
+                        .map(|arm| arm.trim().to_string())
+                        .filter(|arm| !arm.is_empty())
+                        .collect();
+                    let known = ["nearest", "bm25", "distance", "ordered", "rrf"];
+                    arms.iter()
+                        .all(|arm| known.contains(&arm.as_str()))
+                        .then(|| (target.to_string(), arms))
+                })
+                .ok_or_else(|| {
+                    refused("claims `fuse $var: arms [nearest, bm25, distance, ordered, rrf]`")
+                })?;
+            lines.push(PlanLine::Fuse { target, arms });
             continue;
         }
         if let Some(claim) = line.strip_prefix("sort ") {
@@ -1006,7 +1017,8 @@ struct PlannedNodes {
     contains_joins: Vec<PlannedContainsJoin>,
     cross_joins: Vec<Vec<String>>,
     sorts: Vec<Result<Vec<String>, String>>,
-    fusions: Vec<Result<Vec<String>, String>>,
+    /// Each `Fuse`: its target and how each arm ranks.
+    fusions: Vec<(String, Vec<String>)>,
     selections: Vec<(String, String, Value)>,
     /// `(binding, sorted columns)` of every `HydrateColumns` binding.
     hydrations: Vec<(String, Vec<String>)>,
@@ -1381,7 +1393,16 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
                 .collect(),
         ),
         Some("Sort") => out.sorts.push(declared_keys(node, "tiebreak")),
-        Some("RankFuse") => out.fusions.push(declared_keys(node, "row_tiebreak")),
+        Some("Fuse") => out.fusions.push((
+            text("target").to_string(),
+            node.get("arms")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+        )),
         _ => {}
     }
     if let Some(inputs) = node.get("inputs").and_then(Value::as_array) {
@@ -1675,14 +1696,15 @@ pub(crate) fn plan_mismatch(
                     ));
                 }
             }
-            PlanLine::RankFuse { tiebreak } => {
-                let declared = match nodes.fusions.iter().cloned().collect::<Result<Vec<_>, _>>() {
-                    Ok(declared) => declared,
-                    Err(missing) => return Some(missing),
-                };
-                if !declared.contains(tiebreak) {
+            PlanLine::Fuse { target, arms } => {
+                if !nodes
+                    .fusions
+                    .iter()
+                    .any(|(fused, ranked)| fused == target && ranked == arms)
+                {
                     return Some(format!(
-                        "expect plan: no RankFuse row tie-breaks on {tiebreak:?}; found {declared:?}"
+                        "expect plan: no `Fuse` of `${target}` over arms {arms:?}; the plan fuses {:?}",
+                        nodes.fusions
                     ));
                 }
             }
@@ -1775,14 +1797,16 @@ pub(crate) fn plan_mismatch(
                     Ok(selected) => selected,
                     Err(mismatch) => return Some(mismatch),
                 };
-                let mut rankings = Vec::with_capacity(selected.len());
-                for scan in &selected {
-                    let Some(ranked) = &scan.ranked else {
-                        return Some(format!(
-                            "expect plan: the scan of `{type_name}` is not ranked, expected `ranked {kind}`"
-                        ));
-                    };
-                    rankings.push(ranked);
+                // A fusion's exact arms scan the target unranked beside its
+                // ranked arms: the claim reads the ranked scans.
+                let rankings: Vec<&PlannedRanking> = selected
+                    .iter()
+                    .filter_map(|scan| scan.ranked.as_ref())
+                    .collect();
+                if rankings.is_empty() {
+                    return Some(format!(
+                        "expect plan: the scan of `{type_name}` is not ranked, expected `ranked {kind}`"
+                    ));
                 }
                 let of_kind: Vec<&&PlannedRanking> = rankings
                     .iter()
@@ -2239,7 +2263,7 @@ mod tests {
             {"node":"ContainsJoin", "typed_conjunct":typed_property(), "typed_residual":[typed_property()]},
             {"node":"AntiJoin", "typed_left":typed_property(), "typed_right":typed_property()},
             {"node":"Sort", "typed_keys":[typed_property()], "tiebreak":[]},
-            {"node":"RankFuse", "typed_k":typed_property(), "row_tiebreak":[]}
+            {"node":"Fuse", "typed_k":typed_property(), "target":"p", "arms":["bm25", "bm25"]}
         ]}});
         let claims = parse_plan_body(&[
             (0, "type $p.age: I64?"),
@@ -2300,7 +2324,7 @@ mod tests {
                 "aggregate",
             ),
             (
-                json!({"node":"RankFuse", "k":"$p.age", "typed_k":tree.clone()}),
+                json!({"node":"Fuse", "k":"$p.age", "typed_k":tree.clone()}),
                 "typed_k",
             ),
             (
@@ -2326,7 +2350,7 @@ mod tests {
             assert!(validate_typed_plan(&empty).is_err(), "{empty}");
         }
         assert_eq!(
-            validate_typed_plan(&json!({"node":"RankFuse","k":null})),
+            validate_typed_plan(&json!({"node":"Fuse","k":null})),
             Ok(())
         );
         assert_eq!(
@@ -2540,23 +2564,31 @@ mod tests {
             ),
             (1, "expand $a $b: mode indexed_scan"),
             (2, "sort tiebreak [$e.@type, $e.@id]"),
-            (3, "rank fuse row tiebreak [$e.@type, $e.@id]"),
+            (3, "fuse $a: arms [nearest, bm25]"),
         ])
         .unwrap();
         let doc = json!({"physical_plan":{"node":"Sort","tiebreak":["$e.@type","$e.@id"],"inputs":[
-            {"node":"RankFuse","row_tiebreak":["$e.@type","$e.@id"],"inputs":[
+            {"node":"Fuse","target":"a","arms":["nearest","bm25"],"inputs":[
                 {"node":"Expand","src":"a","dst":"b","mode":"indexed_scan","edges":{"kind":"alternation","members":[{"edge_type":"Knows","direction":"out"},{"edge_type":"Likes","direction":"in"}]}}
             ]}
         ]}});
         assert_eq!(check(&claims, &doc), None);
         for replacement in [json!(["$e.@id"]), json!(["$e.@id", "$e.@type"])] {
             let mut wrong = doc.clone();
-            wrong["physical_plan"]["tiebreak"] = replacement.clone();
-            assert!(check(&claims, &wrong).is_some());
-            let mut wrong = doc.clone();
-            wrong["physical_plan"]["inputs"][0]["row_tiebreak"] = replacement;
+            wrong["physical_plan"]["tiebreak"] = replacement;
             assert!(check(&claims, &wrong).is_some());
         }
+        for arms in [
+            json!(["bm25", "nearest"]),
+            json!(["nearest"]),
+            json!(["nearest", "bm25", "distance"]),
+        ] {
+            let mut wrong = doc.clone();
+            wrong["physical_plan"]["inputs"][0]["arms"] = arms;
+            assert!(check(&claims, &wrong).is_some());
+        }
+        assert!(parse_plan_body(&[(0, "fuse $a: arms [nearest, rank]")]).is_err());
+        assert!(parse_plan_body(&[(0, "fuse a: arms [nearest]")]).is_err());
         for replacement in [json!("out"), json!("both")] {
             let mut wrong = doc.clone();
             wrong["physical_plan"]["inputs"][0]["inputs"][0]["edges"]["members"][1]["direction"] =
@@ -3276,7 +3308,7 @@ mod tests {
         let lines =
             parse_plan_body(&[(0, "scan Doc as $d: ranked nearest fetch 10 nprobes 0")]).unwrap();
         assert_eq!(check(&lines, &no_cap), None, "0 spells no cap");
-        let fused = json!({"physical_plan": {"node": "RankFuse", "inputs": [
+        let fused = json!({"physical_plan": {"node": "Fuse", "inputs": [
             {"node": "Scan", "table": "node:Doc", "binding": "d",
              "ranked": {"kind": "nearest", "fetch": 3, "scope": "primary"}},
             {"node": "Scan", "table": "node:Doc", "binding": "d",
@@ -3314,7 +3346,7 @@ mod tests {
         );
         // Each nearest arm needs its own measured attempt. A BM25 sibling
         // needs none, and the diagnostic can belong to a later probe position.
-        let measured = json!({"physical_plan": {"node": "RankFuse", "inputs": [
+        let measured = json!({"physical_plan": {"node": "Fuse", "inputs": [
             {"node": "Scan", "id": 2, "table": "node:Doc", "binding": "d",
              "ranked": {"kind": "nearest", "fetch": 3}},
             {"node": "Scan", "id": 5, "table": "node:Doc", "binding": "d",

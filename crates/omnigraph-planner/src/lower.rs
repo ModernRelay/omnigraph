@@ -1,8 +1,8 @@
 //! Lowering a [`PhysicalPlan`] to an engine's operators. The walk lives
 //! here, so an engine writes one method per [`PhysicalNode`] variant and a
 //! variant without a method does not compile. A ranked scan is one `scan`
-//! call with its [`RankedAccess`]; the two arms of a `RankFuse` are two
-//! subtrees, each lowered once.
+//! call with its [`RankedAccess`]; the arms of a `Fuse` are subtrees, each
+//! lowered once.
 
 use std::collections::HashSet;
 
@@ -18,7 +18,7 @@ use crate::logical::{
     ValidateSpec,
 };
 use crate::physical::{
-    HydratedBinding, NodeId, PhysicalNode, PhysicalPlan, RankArm, RankedAccess, ScanInput,
+    FuseArm, HydratedBinding, NodeId, PhysicalNode, PhysicalPlan, RankedAccess, ScanInput,
 };
 
 #[cfg(doc)]
@@ -32,14 +32,13 @@ pub struct AggregateFields<'p> {
     pub aggregates: &'p [Option<AggregateSpec>],
 }
 
-/// The configuration of a [`PhysicalNode::RankFuse`] beside its two inputs.
+/// The configuration of a [`PhysicalNode::Fuse`] beside its arm inputs.
 #[derive(Debug, Clone, Copy)]
-pub struct RankFuseFields<'p> {
-    pub arms: &'p [RankArm; 2],
+pub struct FuseFields<'p> {
+    pub arms: &'p [FuseArm],
+    pub target: &'p str,
     pub k: Option<&'p IRExpr>,
     pub weights: Option<&'p IRExpr>,
-    pub limit: Option<usize>,
-    pub row_tiebreak: &'p [ColumnRef],
 }
 
 /// The fields of [`PhysicalNode::Correlate`] beside its inputs.
@@ -321,13 +320,12 @@ pub trait Lower {
 
     fn outer_reference(&mut self, id: NodeId, outer_var: &str) -> Result<Self::Op, Self::Error>;
 
-    /// Called with both arm subtrees lowered, the primary first.
-    fn rank_fuse(
+    /// Called with every arm subtree lowered, in written order.
+    fn fuse(
         &mut self,
         id: NodeId,
-        fields: RankFuseFields<'_>,
-        primary: Self::Op,
-        secondary: Self::Op,
+        fields: FuseFields<'_>,
+        arms: Vec<Self::Op>,
     ) -> Result<Self::Op, Self::Error>;
 
     fn projection(
@@ -688,27 +686,25 @@ impl PhysicalPlan {
                 l.correlate(id, fields, outer, inner)
             }
             PhysicalNode::OuterReference { outer_var } => l.outer_reference(id, outer_var),
-            PhysicalNode::RankFuse {
+            PhysicalNode::Fuse {
                 arms,
+                target,
                 k,
                 weights,
-                limit,
-                row_tiebreak,
-                ..
             } => {
-                let primary = self.lower_node(arms[0].input, l)?;
-                let secondary = self.lower_node(arms[1].input, l)?;
-                l.rank_fuse(
+                let mut lowered = Vec::with_capacity(arms.len());
+                for arm in arms {
+                    lowered.push(self.lower_node(arm.input, l)?);
+                }
+                l.fuse(
                     id,
-                    RankFuseFields {
+                    FuseFields {
                         arms,
+                        target,
                         k: k.as_ref(),
                         weights: weights.as_ref(),
-                        limit: *limit,
-                        row_tiebreak,
                     },
-                    primary,
-                    secondary,
+                    lowered,
                 )
             }
             PhysicalNode::Projection {

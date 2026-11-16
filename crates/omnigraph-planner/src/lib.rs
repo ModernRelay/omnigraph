@@ -66,13 +66,13 @@ pub use explain::Explain;
 pub use gate::{Decision, Unrouted, accept_query, accept_query_explained, plan_query, route};
 pub use logical::{
     Census, ColumnRef, ConsultedImage, CsvSourceSpec, DeltaSourceSpec, FragmentWriteSpec,
-    IndexQuery, JoinKind, KeyJoinKind, LogicalId, LogicalKind, LogicalNode, LogicalPlan, Predicate,
-    RuntimeFilterKind, RuntimeFilterSpec, RuntimeInput, ScanAccess, ScanSpec, SearchArm,
+    FuseInput, IndexQuery, JoinKind, KeyJoinKind, LogicalId, LogicalKind, LogicalNode, LogicalPlan,
+    Predicate, RuntimeFilterKind, RuntimeFilterSpec, RuntimeInput, ScanAccess, ScanSpec,
     ValidateSpec,
 };
 pub use lower::{
     AggregateFields, ContainsJoinFields, CorrelateFields, CsvSourceFields, DeltaSourceFields,
-    ExpandFields, FragmentWriteFields, HashJoinFields, Lower, RankFuseFields, SortMergeJoinFields,
+    ExpandFields, FragmentWriteFields, FuseFields, HashJoinFields, Lower, SortMergeJoinFields,
     ValidateFields,
 };
 pub use operation::{
@@ -82,15 +82,15 @@ pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use output::{NodeObjectType, validate_output_schemas};
 pub use passes::{PassId, PassRow, PassStage, pass_rows};
 pub use physical::{
-    Assumptions, DatasetPin, Eligibility, EmptyEligible, Estimate, GatePolicy, Hop,
+    Assumptions, DatasetPin, Eligibility, EmptyEligible, Estimate, FuseArm, GatePolicy, Hop,
     HydratedBinding, HydratedColumn, NearestPolicy, NodeId, OperatorRow, OrderKey, OverfetchRung,
     PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineShape, PipelineSink, PipelineSource,
-    PipelineSpec, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind,
-    RankScope, RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows, score_column,
+    PipelineSpec, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankKind, RankScope,
+    RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows, score_column,
     score_kind_name, validate_streams,
 };
 pub use ranking::{PlannedRanking, planned_ranking};
-pub use read_shape::{InnerRead, PatternStep, ReadShape};
+pub use read_shape::{ArmRank, InnerRead, PatternStep, ReadShape};
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
 pub use source::{

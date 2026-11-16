@@ -248,6 +248,7 @@ impl Session {
                     | PatternStep::Optional { .. }
                     | PatternStep::Union { .. }
                     | PatternStep::Correlate { .. }
+                    | PatternStep::Fuse { .. }
             )
         });
         let graph_index = if traverses {
@@ -362,6 +363,7 @@ impl Session {
                     | PatternStep::Optional { .. }
                     | PatternStep::Union { .. }
                     | PatternStep::Correlate { .. }
+                    | PatternStep::Fuse { .. }
             )
         });
         let graph_index = match (&index_source, needs_graph) {

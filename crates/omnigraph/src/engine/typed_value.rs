@@ -652,10 +652,10 @@ pub(super) fn validate_plan_values(
                         .scores
                         .insert((binding.as_str(), column), (data_type, false));
                 }
-                PhysicalNode::RankFuse { arms, .. } => {
+                PhysicalNode::Fuse { target, .. } => {
                     owners.scores.insert(
                         (
-                            arms[0].binding.as_str(),
+                            target.as_str(),
                             omnigraph_compiler::query::value::RRF_COLUMN,
                         ),
                         (DataType::Float64, false),
@@ -821,7 +821,7 @@ pub(super) fn validate_plan_values(
                 PhysicalNode::AntiJoin { .. }
                 | PhysicalNode::OptionalJoin { .. }
                 | PhysicalNode::Union { .. } => {}
-                PhysicalNode::RankFuse { k, weights, .. } => {
+                PhysicalNode::Fuse { k, weights, .. } => {
                     pending.extend(k);
                     pending.extend(weights);
                 }
@@ -918,17 +918,6 @@ pub(super) fn validate_plan_values(
                     query,
                     ty: _,
                 } => pending.extend([field.as_ref(), query.as_ref()]),
-                IRExpr::Rrf {
-                    primary,
-                    secondary,
-                    k,
-                    weights,
-                    ty: _,
-                } => {
-                    pending.extend([primary.as_ref(), secondary.as_ref()]);
-                    pending.extend(k.as_deref());
-                    pending.extend(weights.as_deref());
-                }
                 IRExpr::Aggregate {
                     func: _,
                     distinct: _,

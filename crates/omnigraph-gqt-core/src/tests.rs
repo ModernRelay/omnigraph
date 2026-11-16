@@ -1891,13 +1891,6 @@ mod result_contract {
                 ty: ty(ScalarType::F32, false),
             },
             rank(),
-            IRExpr::Rrf {
-                primary: Box::new(rank()),
-                secondary: Box::new(rank()),
-                k: None,
-                weights: None,
-                ty: ty(ScalarType::F64, false),
-            },
             IRExpr::Aggregate {
                 func: AggFunc::Count,
                 distinct: false,

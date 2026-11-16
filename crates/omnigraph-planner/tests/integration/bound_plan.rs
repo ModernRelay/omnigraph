@@ -6,11 +6,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
+use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, ParamMap};
 use omnigraph_compiler::query::value::{CompOp, Literal};
 use omnigraph_compiler::result::SearchFunction;
 use omnigraph_compiler::{ExprType, PropType, SYSTEM_COLUMNS_V3, ScalarType};
-use omnigraph_planner::read_shape::{PatternStep, ReadShape};
+use omnigraph_planner::read_shape::{ArmRank, FuseArm, PatternStep, ReadShape};
 use omnigraph_planner::{
     BOUND_PLAN_VERSION, BoundPlan, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan,
     RankKind, RankScope, TableRef, ValueTable, plan_query, planned_ranking,
@@ -220,67 +221,6 @@ fn a_wide_bound_value_reads_back_exactly_issue_918() {
 }
 
 #[test]
-fn fused_saved_node_refuses_a_reader_without_declared_row_keys() {
-    let arm = IRExpr::Bm25 {
-        field: Box::new(prop("d", "text")),
-        query: Box::new(IRExpr::Literal(
-            Literal::String("needle".into()),
-            value_type(ScalarType::String, false),
-        )),
-        ty: value_type(ScalarType::F32, false),
-    };
-    let bound = BoundPlan {
-        plan: plan(IRExpr::Rrf {
-            primary: Box::new(arm.clone()),
-            secondary: Box::new(arm),
-            k: None,
-            weights: None,
-            ty: value_type(ScalarType::F64, false),
-        }),
-        values: Default::default(),
-    };
-    let encoded = serde_json::to_value(&bound).unwrap();
-    let node = encoded["body"]["plan"]["slots"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|node| node["node"] == "RankFuseWithTiebreak")
-        .unwrap()
-        .clone();
-    assert_eq!(node["row_tiebreak"], serde_json::json!([]));
-    let mut missing = encoded.clone();
-    let slot = missing["body"]["plan"]["slots"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|node| node["node"] == "RankFuseWithTiebreak")
-        .unwrap();
-    slot.as_object_mut().unwrap().remove("row_tiebreak");
-    let error = serde_json::from_value::<BoundPlan>(missing).unwrap_err();
-    assert!(error.to_string().contains("row_tiebreak"), "{error}");
-
-    #[derive(serde::Deserialize)]
-    #[serde(tag = "node")]
-    #[allow(dead_code)]
-    enum OldReader {
-        RankFuse {
-            arms: serde_json::Value,
-            k: Option<serde_json::Value>,
-            limit: Option<usize>,
-            prefilter: serde_json::Value,
-        },
-    }
-    let error = serde_json::from_value::<OldReader>(node).err().unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("unknown variant `RankFuseWithTiebreak`"),
-        "{error}"
-    );
-    assert_eq!(round_trip(&bound), bound);
-}
-
-#[test]
 fn a_nearest_plan_with_its_vector_reads_back_equal() {
     let plan = plan(IRExpr::Nearest {
         variable: "d".to_string(),
@@ -324,62 +264,114 @@ fn a_nearest_plan_with_its_vector_reads_back_equal() {
     assert!(matches!(&ranked.query, IRExpr::Param(name, _) if name == "q"));
 }
 
-#[test]
-fn a_fused_plan_reads_back_with_both_arms() {
-    let plan = plan(IRExpr::Rrf {
-        primary: Box::new(IRExpr::Nearest {
-            variable: "d".to_string(),
-            property: "embedding".to_string(),
-            query: Box::new(IRExpr::Literal(
-                Literal::List(vec![
-                    Literal::Float(1.0),
-                    Literal::Float(0.0),
-                    Literal::Float(0.0),
-                    Literal::Float(0.0),
-                ]),
-                ExprType::Value {
-                    scalar: ScalarType::F64,
-                    list: true,
-                    nullable: false,
+/// A fusion of a `nearest` arm and an exact `distance` arm over the type,
+/// each its own pipeline, `k: 30`.
+fn fused_query() -> ReadShape {
+    let vector = || {
+        IRExpr::Literal(
+            Literal::List(vec![
+                Literal::Float(1.0),
+                Literal::Float(0.0),
+                Literal::Float(0.0),
+                Literal::Float(0.0),
+            ]),
+            ExprType::Value {
+                scalar: ScalarType::F64,
+                list: true,
+                nullable: false,
+            },
+        )
+    };
+    let nearest = FuseArm {
+        steps: vec![
+            doc_scan("d"),
+            PatternStep::Rank {
+                key: IRExpr::Nearest {
+                    variable: "d".to_string(),
+                    property: "embedding".to_string(),
+                    query: Box::new(vector()),
+                    ty: value_type(ScalarType::F32, false),
                 },
-            )),
-            ty: value_type(ScalarType::F32, false),
-        }),
-        secondary: Box::new(IRExpr::Bm25 {
-            field: Box::new(prop("d", "text")),
-            query: Box::new(IRExpr::Literal(
-                Literal::String("needle".to_string()),
-                value_type(ScalarType::String, false),
-            )),
-            ty: value_type(ScalarType::F32, false),
-        }),
-        k: Some(Box::new(IRExpr::Literal(
+                binding: "d".to_string(),
+                window: Some(3),
+                window_param: None,
+                recall: None,
+            },
+        ],
+        rank: ArmRank::Nearest,
+    };
+    let distance = FuseArm {
+        steps: vec![
+            doc_scan("d"),
+            PatternStep::Score {
+                binding: "d".to_string(),
+                type_name: "Doc".to_string(),
+                property: "embedding".to_string(),
+                kind: ScoreKind::Distance,
+                query: vector(),
+            },
+        ],
+        rank: ArmRank::Distance,
+    };
+    let mut shape = query(prop("d", "slug"));
+    shape.pipeline = vec![PatternStep::Fuse {
+        arms: vec![nearest, distance],
+        target: "d".to_string(),
+        target_type: "Doc".to_string(),
+        k: Some(IRExpr::Literal(
             Literal::Integer(30),
             value_type(ScalarType::I64, false),
-        ))),
+        )),
         weights: None,
-        ty: value_type(ScalarType::F64, false),
-    });
-    let primary = ranked_scan(&plan, RankScope::Primary);
-    let secondary = ranked_scan(&plan, RankScope::Secondary);
-    assert_ne!(primary, secondary, "each arm has its own scan");
+    }];
+    shape.order_by = vec![IROrdering {
+        expr: IRExpr::PropAccess {
+            variable: "d".to_string(),
+            property: "_rrf".to_string(),
+            ty: value_type(ScalarType::F64, false),
+        },
+        descending: true,
+    }];
+    shape
+}
+
+#[test]
+fn a_fused_plan_reads_back_with_every_arm() {
+    let plan = futures::executor::block_on(plan_query(
+        &fused_query(),
+        &source(),
+        &fixture_bounds::BOUNDS,
+    ))
+    .expect("the fusion plans");
+    let window = ranked_scan(&plan, RankScope::Window);
     let fuse = plan
         .live()
-        .find_map(|(id, node)| matches!(node, PhysicalNode::RankFuse { .. }).then_some(id))
-        .expect("a RankFuse");
+        .find_map(|(id, node)| matches!(node, PhysicalNode::Fuse { .. }).then_some(id))
+        .expect("a Fuse");
     assert_eq!(plan.node(fuse).unwrap().inputs().len(), 2);
     let bound = BoundPlan {
         plan,
         values: ValueTable {
             params: Arc::new(Default::default()),
-            vectors: BTreeMap::from([(primary, vec![1.0, 0.0, 0.0, 0.0])]),
+            vectors: BTreeMap::from([(window, vec![1.0, 0.0, 0.0, 0.0])]),
         },
     };
     let back = round_trip(&bound);
     assert_eq!(back, bound);
+    let encoded = serde_json::to_value(&bound).unwrap();
+    let node = encoded["body"]["plan"]["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["node"] == "Fuse")
+        .unwrap()
+        .clone();
+    assert_eq!(node["arms"][0]["rank"], "nearest");
+    assert_eq!(node["arms"][1]["rank"], "distance");
+    assert_eq!(node["target"], "d");
     let changed = BoundPlan {
         values: ValueTable {
-            vectors: BTreeMap::from([(primary, vec![0.0, 1.0, 0.0, 0.0])]),
+            vectors: BTreeMap::from([(window, vec![0.0, 1.0, 0.0, 0.0])]),
             ..back.values.clone()
         },
         ..back.clone()
@@ -387,30 +379,19 @@ fn a_fused_plan_reads_back_with_both_arms() {
     assert_ne!(changed, bound, "the value table is part of equality");
 
     // The plan read back reports the ranking the plan does: a fusion whose
-    // nearest arm alone decides whether a run was exhaustive.
+    // nearest arm alone decides whether a run was exhaustive, its exact arm
+    // always exhaustive.
     let planned = planned_ranking(&bound.plan).unwrap().expect("rrf ranks");
     assert_eq!(
         planned_ranking(&back.plan).unwrap().as_ref(),
         Some(&planned)
     );
     assert_eq!(planned.by(), SearchFunction::Rrf);
-    assert_eq!(planned.nearest_scans(), [primary]);
+    assert_eq!(planned.nearest_scans(), [window]);
     assert!(
         planned.score_columns().is_empty(),
         "no column returns the fused score"
     );
-
-    // An arm whose ranked scan lost its ranking is a plan acceptance refuses,
-    // never a fusion reported over one arm.
-    let mut broken = bound.plan.clone();
-    let Some(PhysicalNode::Scan { ranked, .. }) = broken.node_mut(secondary) else {
-        panic!("the secondary arm ranks a scan");
-    };
-    *ranked = None;
-    assert!(matches!(
-        planned_ranking(&broken),
-        Err(omnigraph_planner::PlanError::Internal(_))
-    ));
 }
 
 fn doc_scan(variable: &str) -> PatternStep {
@@ -647,16 +628,6 @@ fn expression_mirror_preserves_every_typed_interior_and_nested_cast() {
             ty: value_type(ScalarType::F32, false),
         },
         rank(),
-        IRExpr::Rrf {
-            primary: Box::new(rank()),
-            secondary: Box::new(rank()),
-            k: Some(Box::new(IRExpr::Literal(
-                Literal::Integer(60),
-                value_type(ScalarType::I64, false),
-            ))),
-            weights: None,
-            ty: value_type(ScalarType::F64, false),
-        },
         IRExpr::Not(
             Box::new(IRExpr::Param(
                 "flag".into(),

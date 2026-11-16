@@ -612,9 +612,10 @@ reads [..]` a pushed filter reading exactly those columns (`binding.property`);
 an in-memory `Filter` node stays in the plan reading exactly those columns.
 `sort tiebreak [$a.@id, $e.@type, $e.@id]` states the exact ordered metadata
 keys a physical `Sort` appends after user order keys. `$a` abbreviates `$a.@id`;
-`sort no tiebreak` requires an empty list. `rank fuse row tiebreak [...]` checks
-the exact downstream keys of `RankFuse`, and `rank fuse no row tiebreak` requires
-none. Dropping a type key or swapping key order fails these assertions.
+`sort no tiebreak` requires an empty list. Dropping a type key or swapping key
+order fails these assertions. `fuse $d: arms [nearest, bm25]` states that a
+physical `Fuse` of `$d` ranks its arms as written, in order (`nearest`,
+`distance`, `bm25`, `ordered` or `rrf`).
 `hydrate $d: columns [..]` states that a physical `HydrateColumns` fetches
 exactly those columns of `$d` by row address above the root limit (pass
 `late_materialization`); the `scan` lines keep reading the logical plan, whose
@@ -652,7 +653,7 @@ nullable, are accepted here but cannot be returned as public result columns.
 `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]` claims
 one entry of the document's `pipelines` by position: the physical plan cut at
 every node whose operator emits nothing before it has seen its whole input
-(`Sort`, `Aggregate`, `AntiJoin`, `RankFuse`, a costed multi-hop `Expand`)
+(`Sort`, `Aggregate`, `AntiJoin`, `Fuse`, a costed multi-hop `Expand`)
 and at a join's build side. The source is the entry's first node, the
 operators follow in run order, the sink is the node the pipeline drains into
 (a breaker by its name, a build side as `HashJoin(build)`, or the `consumer`)
@@ -745,8 +746,10 @@ facts by another route keeps the case green.
 
 A nearest ranked-scan line may end in `diagnostics present`, for example
 `scan Doc as $d: ranked nearest fetch 3 diagnostics present`. Every selected
-nearest scan must report at least one measured attempt; an RRF with two
-nearest arms must report both, while a BM25 sibling is not selected. A missing
+nearest scan must report at least one measured attempt; a fusion with two
+nearest arms must report both, while an exact arm's unranked scan of the same
+type is not selected. A `ranked` claim reads the ranked scans among the
+selected ones. A missing
 scan, missing report, or missing diagnostic fails the assertion. Other attempts
 may have no metrics, and their positions are never renumbered. The clause is
 refused on BM25 and takes no duration or counter value.

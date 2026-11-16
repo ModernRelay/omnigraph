@@ -30,21 +30,22 @@ use omnigraph_planner::logical::{EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use omnigraph_planner::{
     Accumulator, AggregateFields, AntiJoinStrategy, BoundPlan, ColumnRef, ContainsJoinFields,
     CorrelateFields, CsvSourceFields, DeltaSourceFields, ExpandFields, FragmentWriteFields,
-    HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError,
-    Predicate, ROW_ADDRESS_PREFIX, RankArm, RankFuseFields, RankKind, RankedAccess,
-    RuntimeFilterKind, RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
-    ValidateFields, ValueTable,
+    FuseFields, HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan,
+    PlanError, Predicate, ROW_ADDRESS_PREFIX, RankKind, RankedAccess, RuntimeFilterKind,
+    RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields, ValidateFields,
+    ValueTable,
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
 use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerAvgUdaf, ExactIntegerUdaf};
 use super::operators::{
-    AntiJoinMaskExec, ArmOrder, CatalogueExec, ContainsJoinExec, CorrelateExec, CorrelateGroup,
+    AntiJoinMaskExec, CatalogueExec, ContainsJoinExec, CorrelateExec, CorrelateGroup,
     CorrelateOuter, CorrelateRead, CrossJoinExec, CsvSourceExec, ExpandExec, ExpandExecution,
-    ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec, LanceFragmentSink, LetExec,
-    LimitExec, LookupSpec, MetadataCountExec, OptionalJoinExec, OuterReferenceExec, OuterSlot,
-    ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec, ScanSource, ScoreExec, SortExec,
-    SortKey, TargetCutExec, UnionExec, ValidateExec, fresh_tag_column, tagged_schema,
+    ExpandStep, FilterExec, FuseExec, FuseMethod, GraphEnv, HashJoinExec, HydrateExec,
+    LanceFragmentSink, LetExec, LimitExec, LookupSpec, MetadataCountExec, OptionalJoinExec,
+    OuterReferenceExec, OuterSlot, ProjectionExec, RuntimeFilterSlot, ScanExec, ScanSource,
+    ScoreExec, SortExec, SortKey, TargetCutExec, UnionExec, ValidateExec, fresh_tag_column,
+    tagged_schema,
 };
 use super::*;
 use crate::loader::LoadMode;
@@ -1323,50 +1324,23 @@ impl Lower for Walk<'_, '_> {
         self.built(id, leaf)
     }
 
-    fn rank_fuse(
-        &mut self,
-        id: NodeId,
-        fields: RankFuseFields<'_>,
-        primary: Plan,
-        secondary: Plan,
-    ) -> Lowers<Plan> {
-        let RankFuseFields {
-            arms,
+    fn fuse(&mut self, id: NodeId, fields: FuseFields<'_>, arms: Vec<Plan>) -> Lowers<Plan> {
+        let FuseFields {
+            arms: declared,
+            target,
             k,
             weights,
-            limit: _,
-            row_tiebreak,
         } = fields;
-        let k = resolve_rrf_k(k, self.lowering.params())?;
-        let weights = resolve_rrf_weights(weights)?;
-        let id_column = format!(
-            "{}.{}",
-            arms[0].binding, self.lowering.catalog.system_columns.id
-        );
-        let fused_score = format!(
-            "{}.{}",
-            arms[0].binding,
-            omnigraph_compiler::query::value::RRF_COLUMN
-        );
-        let order = |arm: &RankArm| {
-            let (property, descending) = arm.kind.score();
-            ArmOrder {
-                score_column: format!("{}.{property}", arm.binding),
-                descending,
-            }
+        let method = FuseMethod {
+            k: resolve_rrf_k(k, self.lowering.params())?,
+            weights: resolve_rrf_weights(weights, declared.len())?,
         };
-        let fuse = RankFuseExec::new(
-            primary,
-            secondary,
-            RrfMode { k, weights },
-            id_column,
-            fused_score,
-            [order(&arms[0]), order(&arms[1])],
-            row_tiebreak
-                .iter()
-                .map(|key| tiebreak_column(key, self.lowering.catalog.system_columns.id))
-                .collect::<Result<Vec<_>>>()?,
-        );
+        let fuse = FuseExec::try_new(
+            arms,
+            method,
+            target,
+            self.lowering.catalog.system_columns.id,
+        )?;
         self.built(id, fuse)
     }
 
@@ -1482,7 +1456,6 @@ impl Lower for Walk<'_, '_> {
                     IRExpr::PropAccess { .. }
                     | IRExpr::Nearest { .. }
                     | IRExpr::Bm25 { .. }
-                    | IRExpr::Rrf { .. }
                     | IRExpr::Variable(_, _)
                     | IRExpr::Param(_, _)
                     | IRExpr::Literal(_, _)
@@ -1504,7 +1477,6 @@ impl Lower for Walk<'_, '_> {
                     IRExpr::PropAccess { .. }
                     | IRExpr::Nearest { .. }
                     | IRExpr::Bm25 { .. }
-                    | IRExpr::Rrf { .. }
                     | IRExpr::Variable(_, _)
                     | IRExpr::Param(_, _)
                     | IRExpr::Literal(_, _)
@@ -1590,7 +1562,6 @@ impl Lower for Walk<'_, '_> {
                 }
                 IRExpr::Nearest { .. }
                 | IRExpr::Bm25 { .. }
-                | IRExpr::Rrf { .. }
                 | IRExpr::Variable(_, _)
                 | IRExpr::Param(_, _)
                 | IRExpr::Literal(_, _)
@@ -1783,7 +1754,6 @@ fn aggregate_argument(
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
         | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Param(_, _)
         | IRExpr::Literal(_, _)
@@ -1834,7 +1804,6 @@ fn hidden_columns(
             expr if computed_key(expr) => {}
             IRExpr::Nearest { .. }
             | IRExpr::Bm25 { .. }
-            | IRExpr::Rrf { .. }
             | IRExpr::Variable(_, _)
             | IRExpr::Param(_, _)
             | IRExpr::Literal(_, _)

@@ -75,14 +75,12 @@ pub fn score_column(kind: ScoreKind) -> (&'static str, arrow_schema::DataType) {
     }
 }
 
-/// Where a ranked scan's rows go: the query's `order`, or one arm of an
-/// `rrf()` fusion.
+/// Where a ranked scan's rows go: the query's `order`, or a window drawn
+/// as a pattern step (a `nearest` standing alone or a fusion arm).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RankScope {
     Order,
-    Primary,
-    Secondary,
     /// A ranking drawn as a pattern step: the scan's candidates feed a
     /// `TargetCut` of the window `k` (its `fetch`), whose selected targets
     /// the overfetch ladder fills, not the read's `limit`.
@@ -360,11 +358,10 @@ pub struct RankedAccess {
     pub nprobes: Option<usize>,
     pub scope: RankScope,
     /// The reruns the run may take above `fetch`; empty on a scan that never
-    /// reruns (`bm25`, an arm of `rrf()`).
+    /// reruns (`bm25`).
     pub overfetch: Vec<OverfetchRung>,
     /// The pre-pass that feeds this scan; `None` when no traversal leaves
-    /// the ranked binding, and on every arm of `rrf()`, whose pre-pass the
-    /// `RankFuse` declares.
+    /// the ranked binding.
     pub prefilter: Option<Prefilter>,
     /// Where the scan applies its eligibility: always before scoring on a
     /// `nearest` scan, whose candidate window is drawn from eligible rows;
@@ -405,13 +402,13 @@ impl RankedAccess {
     }
 }
 
-/// One arm of a `RankFuse`: the subtree the arm runs and the ranked binding
-/// whose score orders it.
+/// One arm of a [`PhysicalNode::Fuse`]: the subtree whose rows the arm
+/// ranks, which arrive in the order `rank` states (`ArmRank`), and how it
+/// ranks them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RankArm {
+pub struct FuseArm {
     pub input: NodeId,
-    pub binding: String,
-    pub kind: RankKind,
+    pub rank: crate::read_shape::ArmRank,
 }
 
 /// A table scan, or the per-slice id lookup of a traversal's destination:
@@ -495,9 +492,6 @@ pub enum OrderKey {
     /// A binding's identity metadata key (`@id`, or `@type` of a selected
     /// edge): ascending, nulls first.
     Identity(ColumnRef),
-    /// The fused reciprocal rank of an `rrf()` over its arms' bindings,
-    /// descending.
-    Fused { bindings: Vec<String> },
 }
 
 impl OrderKey {
@@ -520,13 +514,6 @@ impl std::fmt::Display for OrderKey {
                 expr, descending, ..
             } => write!(f, "{expr} {}", if *descending { "desc" } else { "asc" }),
             Self::Identity(column) => write!(f, "${column} asc"),
-            Self::Fused { bindings } => {
-                let targets: Vec<String> = bindings
-                    .iter()
-                    .map(|binding| format!("${binding}"))
-                    .collect();
-                write!(f, "rrf({}) desc", targets.join(", "))
-            }
         }
     }
 }
@@ -639,8 +626,8 @@ impl ChildSlots for Option<NodeId> {
     }
 }
 
-impl ChildSlots for [RankArm; 2] {
-    const COUNTS: &'static [usize] = &[2];
+impl ChildSlots for Vec<FuseArm> {
+    const COUNTS: &'static [usize] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
     fn ids(&self) -> Vec<NodeId> {
         self.iter().map(|arm| arm.input).collect()
@@ -784,7 +771,7 @@ macro_rules! physical_nodes {
             /// The inputs the node's operator drains whole before its streamed
             /// input runs, each kind's `sides:` token: a join's build side, the
             /// collected left of a cross or contains join, a correlated block's
-            /// inner tree, a fusion's secondary arm. Each is its own pipeline,
+            /// inner tree, a fusion's arms after the first. Each is its own pipeline,
             /// drained into the node ([`PipelineSink::Node`]); the engine
             /// collects exactly these through its `CollectedSide`.
             #[allow(unused_variables)]
@@ -799,9 +786,9 @@ macro_rules! physical_nodes {
             /// kind declares one, so a new node kind cannot compile without a
             /// classification; a field that gives an existing kind a cut still
             /// needs its token changed by hand. A fusion declares none: it
-            /// emits every arm row, and its `limit` sizes only the nearest
-            /// arm's window, which that arm's scan declares as its fetch. Plan
-            /// acceptance justifies every declared cut against the query.
+            /// emits every target its arms select, and a `nearest` arm's
+            /// window is that arm's own `TargetCut`. Plan acceptance
+            /// justifies every declared cut against the query.
             #[allow(unused_variables)]
             pub fn row_cut(&self) -> Option<usize> {
                 match self {
@@ -819,8 +806,8 @@ macro_rules! physical_nodes {
             /// an order-preserving operator (a dependent scan, a hash join's
             /// probe, a filter, a projection, a limit, a page, a hydration, a
             /// row compare, a validation) in its input's order; every other
-            /// operator declares none. A fusion declares none: it appends the
-            /// fused score as a column, and the `Sort` above it orders by that
+            /// operator declares none. A fusion declares none: its targets
+            /// leave unordered, and a `Sort` above it orders by the fused
             /// score.
             #[allow(unused_variables)]
             pub fn order(
@@ -1081,20 +1068,25 @@ physical_nodes! {
         outer_var: String,
     } => "OuterReference" []
         shape: PipelineShape::Streaming, sides: vec![], cut: None, order: None;
-    /// `rrf(a, b)`: two arms, each its own copy of the pipeline with one
-    /// ranked scan, every arm row emitted with `<primary binding>._rrf`; `k`
-    /// and `weights` as written (`None`: every arm `1.0`), `limit` only the
-    /// nearest arm's window, `prefilter` feeds `bm25`.
-    RankFuse {
-        arms: [RankArm; 2],
+    /// `from rrf(arm, …)` (docs/rfcs/2026-11-07-gq-3.md, section 4,
+    /// Fusion): each arm's subtree yields rows binding `target` in its rank
+    /// order, each target ranked at its first row from 1; one row leaves
+    /// per target any arm selected, carrying the target's columns from the
+    /// first arm that selected it and `Σ weight / (k + rank)` over the arms
+    /// that selected it, summed in written order in `F64`, as
+    /// `target._rrf`. `k` and `weights` as written (`None`: 60, and every
+    /// arm `1.0`). The first arm streams; every other arm is a collected
+    /// side.
+    Fuse {
+        arms: Vec<FuseArm>,
+        target: String,
         k: Option<IRExpr>,
         weights: Option<IRExpr>,
-        limit: Option<usize>,
-        prefilter: Prefilter,
-        /// Downstream row keys after the arm score and fused node identity.
-        row_tiebreak: Vec<ColumnRef>,
-    } => "RankFuse" [arms: [RankArm; 2]]
-        shape: PipelineShape::Breaker, sides: vec![arms[1].input], cut: None, order: None;
+    } => "Fuse" [arms: Vec<FuseArm>]
+        shape: PipelineShape::Breaker,
+        sides: arms.iter().skip(1).map(|arm| arm.input).collect(),
+        cut: None,
+        order: None;
     Projection {
         input: NodeId,
         return_exprs: Vec<IRProjection>,
@@ -1436,7 +1428,7 @@ impl PhysicalPlan {
     }
 
     /// The subtree under `id` in post-order, `id` last.
-    pub(crate) fn subtree(&self, id: NodeId) -> Vec<NodeId> {
+    pub fn subtree(&self, id: NodeId) -> Vec<NodeId> {
         let mut order = Vec::new();
         self.visit(id, &mut order);
         order
@@ -1661,25 +1653,19 @@ impl PhysicalPlan {
                 "node": node.name(),
                 "outer_var": outer_var,
             }),
-            PhysicalNode::RankFuse {
+            PhysicalNode::Fuse {
                 arms,
+                target,
                 k,
                 weights,
-                limit,
-                row_tiebreak,
-                ..
             } => json!({
-                "node": "RankFuse",
-                "arms": arms
-                    .iter()
-                    .map(|arm| json!({ "binding": arm.binding, "kind": arm.kind }))
-                    .collect::<Vec<Value>>(),
+                "node": "Fuse",
+                "target": target,
+                "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
                 "k": k.as_ref().map(ToString::to_string),
                 "typed_k": k.as_ref().map(crate::typed::expr),
                 "weights": weights.as_ref().map(ToString::to_string),
                 "typed_weights": weights.as_ref().map(crate::typed::expr),
-                "limit": limit,
-                "row_tiebreak": tiebreak_text(row_tiebreak),
             }),
             PhysicalNode::Aggregate {
                 return_exprs,
@@ -1969,7 +1955,7 @@ impl PhysicalPlan {
             Some(PhysicalNode::OptionalJoin { .. }) => "OptionalJoin(inner)".to_string(),
             Some(PhysicalNode::Correlate { .. }) => "Correlate(inner)".to_string(),
             Some(PhysicalNode::Union { .. }) => "Union(right)".to_string(),
-            Some(PhysicalNode::RankFuse { .. }) => "RankFuse(secondary)".to_string(),
+            Some(PhysicalNode::Fuse { .. }) => "Fuse(arm)".to_string(),
             Some(node) => node.name().to_string(),
             None => "tombstone".to_string(),
         }

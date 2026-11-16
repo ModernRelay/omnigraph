@@ -21,18 +21,6 @@ pub(crate) fn expr(root: &IRExpr) -> Value {
                     IRExpr::PropAccess { .. } => ("property", vec![]),
                     IRExpr::Nearest { query, .. } => ("nearest", vec![query]),
                     IRExpr::Bm25 { field, query, .. } => ("bm25", vec![field, query]),
-                    IRExpr::Rrf {
-                        primary,
-                        secondary,
-                        k,
-                        weights,
-                        ..
-                    } => {
-                        let mut args = vec![primary.as_ref(), secondary.as_ref()];
-                        args.extend(k.as_deref());
-                        args.extend(weights.as_deref());
-                        ("rrf", args)
-                    }
                     IRExpr::Variable(_, _) => ("variable", vec![]),
                     IRExpr::Param(_, _) => ("param", vec![]),
                     IRExpr::Literal(_, _) => ("literal", vec![]),

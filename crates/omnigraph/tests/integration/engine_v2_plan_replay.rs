@@ -20,9 +20,13 @@ const WILDCARD_LIKES_QUERY: &str = r#"query selected() {
     order { $p.name, $d.title, $e.@type }
 }"#;
 
-/// A present but shortened saved key list must refuse before it changes the page.
+/// A fusion over two exact `bm25` arms yields one row per target; the
+/// selected traversal after it multiplies the target by edge, and the final
+/// sort's tie rule orders the rows by the destination's identity, then the
+/// selected edge's type and id, before the `limit`: the page holds the
+/// smaller destination's `Likes` edge, on every replay.
 #[tokio::test]
-async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
+async fn a_fusion_ranks_targets_and_the_selected_edges_after_it_replay_issue_659() {
     let dir = tempfile::tempdir().unwrap();
     let db = session(
         Omnigraph::init(
@@ -72,18 +76,11 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
         order { $score desc }
         limit 1
     }"#;
-    // Fusion does not rank an exact `bm25` arm: the read is refused at type
-    // check (`T86`), before a plan or a row tie-break exists.
-    let Err(error) = db
-        .query_inspected("main", query, "selected_page", &ParamMap::new())
-        .await
-    else {
-        panic!("an `rrf` over `bm25` arms ran");
-    };
-    let text = error.to_string();
-    assert!(
-        text.contains("T86") && text.contains("an `rrf` arm over `bm25`"),
-        "{text}"
+    let Replayed { result, .. } = replayed(&db, query, "selected_page", &ParamMap::new()).await;
+    assert_eq!(
+        result,
+        [serde_json::json!({"edge_type": "Likes", "edge_id": "shared", "target": smaller})],
+        "the larger destination is {larger}"
     );
 }
 
@@ -560,6 +557,16 @@ query within($q: Vector(4)) {
     return { $d.slug, $distance }
     order { $distance }
     limit 3
+}
+query fused_three($q: Vector(4), $r: Vector(4)) {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      let $linked = { match { $d: Doc, $t: Doc, $d knows $t } return { $d } },
+      from rrf(nearest($linked, $d.embedding, $q, k: 2), bm25($all, $d.text, "needle 3"), distance($all, $d.embedding, $r), weights: [2.0, 1.0, 0.5]) as $score,
+    }
+    return { $d.slug, $score }
+    order { $score desc }
+    limit 4
 }
 query fused_vectors($q: Vector(4), $r: Vector(4)) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $r, k: 3), k: 60) as $score, $d: Doc }
@@ -1438,8 +1445,8 @@ async fn a_fusion_replays() {
         .collect();
     assert_eq!(
         kinds,
-        ["gate", "probes", "probes"],
-        "the fusion's gate records one verdict, then each nearest arm its probe attempts: {search:#?}"
+        ["probes", "probes"],
+        "each nearest arm records its probe attempts; a population with no traversal has no gate: {search:#?}"
     );
 
     // A predicate the query never wrote, placed above the fusion rather than
@@ -1448,9 +1455,9 @@ async fn a_fusion_replays() {
     let fuse = forged
         .plan
         .live()
-        .find(|(_, node)| matches!(node, PhysicalNode::RankFuse { .. }))
+        .find(|(_, node)| matches!(node, PhysicalNode::Fuse { .. }))
         .map(|(id, _)| id)
-        .expect("the fused query plans a RankFuse");
+        .expect("the fused query plans a Fuse");
     let parent = forged
         .plan
         .live()
@@ -1500,7 +1507,7 @@ async fn a_fusion_replays() {
     // would fuse other scores, so the replay door refuses it.
     let mut unweighted = plan.clone();
     match unweighted.plan.node_mut(fuse) {
-        Some(PhysicalNode::RankFuse { weights, .. }) => {
+        Some(PhysicalNode::Fuse { weights, .. }) => {
             assert_eq!(
                 weights
                     .as_ref()
@@ -1509,7 +1516,7 @@ async fn a_fusion_replays() {
             );
             *weights = None;
         }
-        other => panic!("the fusion is a RankFuse: {other:?}"),
+        other => panic!("the fusion is a Fuse: {other:?}"),
     }
     let error = match db
         .replay_bound_plan(
@@ -1547,6 +1554,92 @@ async fn a_fusion_replays() {
         probed[0], probed[1],
         "each arm records under its own scan: {search:#?}"
     );
+}
+
+/// A fusion of three arms, a `nearest` window over a traversal population
+/// beside an exact `bm25` arm and an exact `distance` arm over the type,
+/// replays with its rows, its trace and its search decisions: the window's
+/// gate over its own population, then its probes on each rung. A saved plan
+/// whose arm ranks another way, or whose arms are reordered, is refused at
+/// the replay door.
+#[tokio::test]
+async fn a_three_arm_fusion_with_exact_arms_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = docs(&dir).await;
+    let mut params =
+        ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
+    params.insert(
+        "r".to_string(),
+        Literal::List(vec![
+            Literal::Float(9.0),
+            Literal::Float(0.0),
+            Literal::Float(0.0),
+            Literal::Float(0.0),
+        ]),
+    );
+    let Replayed {
+        result,
+        search,
+        plan,
+        envelope,
+        ..
+    } = replayed(&db, DOC_QUERIES, "fused_three", &params).await;
+    let slugs: Vec<&str> = result
+        .iter()
+        .map(|row| row["d.slug"].as_str().unwrap())
+        .collect();
+    // The window holds the two linked Docs nearest the origin, d00 and d04,
+    // whose doubled weight leads; d03 matches both terms and ranks first in
+    // `bm25`, d01 second among the Docs that match one term, and both hold
+    // more than d09, nearest to `$r`, at half weight.
+    assert_eq!(slugs, ["d00", "d04", "d03", "d01"], "{result:#?}");
+    let kinds: Vec<&str> = search
+        .iter()
+        .map(|decision| decision["decision"].as_str().unwrap())
+        .collect();
+    // Three of ten Docs are linked, above the gate's ratio, so the window
+    // scans unfiltered; its first attempt selects one linked Doc, and its
+    // overfetch ladder reruns it wider to fill its two, as the same
+    // `nearest` standing alone does.
+    assert_eq!(kinds, ["gate", "probes", "probes"], "{search:#?}");
+
+    let fuse = plan
+        .plan
+        .live()
+        .find(|(_, node)| matches!(node, PhysicalNode::Fuse { .. }))
+        .map(|(id, _)| id)
+        .expect("the fused query plans a Fuse");
+    let refused = async |edited: omnigraph_planner::BoundPlan| {
+        let error = match db
+            .replay_bound_plan(
+                ReadTarget::branch("main"),
+                &with_plan(&envelope, serde_json::to_value(&edited).unwrap()),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(replay) => panic!("an edited fusion replayed: {:?}", rows_of(&replay.result)),
+        };
+        assert!(
+            matches!(&error, OmniError::Manifest(error) if error.kind == ManifestErrorKind::BadRequest),
+            "{error}"
+        );
+        error.to_string()
+    };
+    let mut reranked = plan.clone();
+    let Some(PhysicalNode::Fuse { arms, .. }) = reranked.plan.node_mut(fuse) else {
+        unreachable!("the fusion")
+    };
+    arms[1].rank = omnigraph_planner::ArmRank::Distance;
+    let error = refused(reranked).await;
+    assert!(error.contains("search identity"), "{error}");
+    let mut swapped = plan.clone();
+    let Some(PhysicalNode::Fuse { arms, .. }) = swapped.plan.node_mut(fuse) else {
+        unreachable!("the fusion")
+    };
+    arms.swap(1, 2);
+    let error = refused(swapped).await;
+    assert!(error.contains("search identity"), "{error}");
 }
 
 /// A read reports the ranking its order names: the search function, whether

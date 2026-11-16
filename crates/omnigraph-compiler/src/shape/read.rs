@@ -170,6 +170,80 @@ pub enum PatternStep {
         inner: Vec<PatternStep>,
         read: InnerRead,
     },
+    /// `from rrf(arm, …)`, the core's `Fuse` (docs/rfcs/2026-11-07-gq-3.md,
+    /// section 4, Fusion): each arm is its own pipeline from nothing, the
+    /// steps the same ranking would take standing alone, ending on the rows
+    /// it ranks; every arm binds `target`, a node of `target_type`. Each arm
+    /// ranks the distinct targets of its rows in its [`ArmRank`] order from
+    /// 1, and the step yields one row per target any arm selected: the
+    /// target's columns and `Σ weight / (k + rank)` over the arms that
+    /// selected it, summed in written order, as the target's `_rrf` column.
+    /// The steps after it extend from the target.
+    Fuse {
+        arms: Vec<FuseArm>,
+        target: String,
+        target_type: String,
+        /// The rank constant as written (a literal or a parameter bound at
+        /// execution); `None` is the default, 60.
+        k: Option<IRExpr>,
+        /// The weights as written, one per arm; `None` is every arm `1.0`.
+        weights: Option<IRExpr>,
+    },
+}
+
+/// One arm of a [`PatternStep::Fuse`]: its steps and how it ranks.
+#[derive(Debug, Clone)]
+pub struct FuseArm {
+    pub steps: Vec<PatternStep>,
+    pub rank: ArmRank,
+}
+
+/// How a fusion arm orders its targets, which then take ranks 1, 2, … in
+/// that order, each at its first row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmRank {
+    /// `nearest`: its window's rows by distance ascending, then the target's
+    /// identity. The arm's last step is its `Rank` step.
+    Nearest,
+    /// `distance`: the exact distance ascending, then the target's identity.
+    /// The arm's last step is its `Score` step.
+    Distance,
+    /// `bm25`: the exact score descending, then the target's identity. The
+    /// arm's last step is its `Score` step.
+    Bm25,
+    /// An inline read with an `order`: its rows in that order, the tie rule
+    /// breaking equal keys. The arm's last step is its uncorrelated
+    /// `Correlate`.
+    Ordered,
+    /// An `rrf`: its fused score descending, then the target's identity.
+    /// The arm's step is its `Fuse`.
+    Fused,
+}
+
+impl ArmRank {
+    /// The score column the arm orders by on its target, with its
+    /// direction (`true`: descending); `None` for an ordered read, whose
+    /// rows arrive in its own order.
+    pub fn score(self) -> Option<(&'static str, bool)> {
+        match self {
+            Self::Nearest | Self::Distance => Some((DISTANCE_COLUMN, false)),
+            Self::Bm25 => Some((SCORE_COLUMN, true)),
+            Self::Fused => Some((RRF_COLUMN, true)),
+            Self::Ordered => None,
+        }
+    }
+
+    /// The arm's name as explain and diagnostics spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Nearest => "nearest",
+            Self::Distance => "distance",
+            Self::Bm25 => "bm25",
+            Self::Ordered => "ordered",
+            Self::Fused => "rrf",
+        }
+    }
 }
 
 /// What a `from` over an inline read with its own aggregate, `distinct`,
@@ -262,6 +336,9 @@ impl ReadShape {
                 | PatternStep::Optional { inner, .. }
                 | PatternStep::Correlate { inner, .. } => pending.extend(inner),
                 PatternStep::Union { arms, .. } => pending.extend(arms.iter().flatten()),
+                PatternStep::Fuse { arms, .. } => {
+                    pending.extend(arms.iter().flat_map(|arm| &arm.steps))
+                }
                 PatternStep::NodeScan { .. }
                 | PatternStep::Filter(_)
                 | PatternStep::Rank { .. }
@@ -322,6 +399,8 @@ struct Ranking {
     /// `nearest`'s declared `recall:`, `None` when omitted or not a
     /// `nearest`.
     recall: Option<f64>,
+    /// An `rrf`: a [`PatternStep::Fuse`] of its arms, each its own pipeline.
+    fused: bool,
 }
 
 /// A body split at the ranking it draws.
@@ -414,6 +493,9 @@ fn physical_names(pipeline: &[PatternStep]) -> HashSet<String> {
                 .for_each(|arm| names.extend(physical_names(arm))),
             PatternStep::Correlate { read, .. } => {
                 names.extend(read.references().map(str::to_string));
+            }
+            PatternStep::Fuse { target, .. } => {
+                names.insert(target.clone());
             }
             PatternStep::Filter(_)
             | PatternStep::AntiJoin { .. }
@@ -865,12 +947,6 @@ impl<'a> Shaper<'a> {
             .unwrap_or_else(|| scalar(ScalarType::I64))
     }
 
-    /// A refusal at the whole read; the caller that knows the construct
-    /// sets it ([`ShapeError::at`]).
-    fn refuse(&self, what: impl std::fmt::Display) -> ShapeError {
-        unsupported(self.name, what, Construct::Read)
-    }
-
     /// The identity keys of an order key that is a reference, a binding or
     /// a return item holding one: `(@type, @id)` for an edge whose selector
     /// has several types, `@id` otherwise (one type: the type is constant).
@@ -1021,9 +1097,13 @@ impl<'a> Shaper<'a> {
         } = self
             .split_ranking(body)
             .map_err(|e| e.at(Construct::Element(FROM, None)))?;
-        // The pattern, with every `let` value read where its name is.
+        // The pattern, with every `let` value read where its name is. A
+        // fusion's arms are each placed on their own (`fuse_step`).
+        let fused = ranking.as_ref().is_some_and(|ranking| ranking.fused);
         let mut facts = Facts::default();
-        self.facts(body, &mut facts)?;
+        if !fused {
+            self.facts(body, &mut facts)?;
+        }
         let mut after_facts = Facts::default();
         if let Some(after) = &after {
             self.facts(after, &mut after_facts)?;
@@ -1133,6 +1213,7 @@ impl<'a> Shaper<'a> {
         // `Rank` step, which records it.
         let windowed = ranking.as_ref().is_some_and(|ranking| {
             after.is_some()
+                || ranking.fused
                 || ranking.exact.is_some()
                 || ranking.recall.is_some()
                 || limit_param.is_some()
@@ -1243,68 +1324,22 @@ impl<'a> Shaper<'a> {
         let mut fresh = FreshNames::default();
         let mut bound = HashSet::new();
         if let Some(ranking) = ranking.as_ref().filter(|_| windowed) {
-            // The population as its inline read states it, the names it
-            // binds without returning renamed apart from the later elements.
-            let mut population = Facts::default();
-            match ranked_node.map(ranked_input) {
-                Some(Term::Project {
-                    input,
-                    items,
-                    keep: false,
-                }) => self.inline_read(input, items, &[], &mut population)?,
-                _ => self.facts(body, &mut population)?,
-            }
-            let population_lets = std::mem::take(&mut population.lets);
-            population.substitute(&population_lets);
-            self.place(
-                &population,
-                &ranked,
-                &mut pipeline,
-                &mut bound,
-                &HashSet::new(),
-                &mut fresh,
-            )?;
-            // A window read from a parameter takes its bound count when the
-            // engine gathers the planning inputs.
-            let (window, window_param) = match ranking.windows.as_slice() {
-                _ if ranking.exact.is_some() => (None, None),
-                [] => (None, None),
-                [first, rest @ ..] if rest.iter().all(|w| w == first) => match first {
-                    Count::Literal(k) => (Some(*k), None),
-                    Count::Param(p) => (None, Some(p.clone())),
-                },
-                _ => {
-                    return Err(self.refuse_at(
-                        "two `rrf` arm windows that differ",
-                        Construct::Element(FROM, None),
-                    ));
+            let mut inlined = 0;
+            match ranked_node {
+                Some(fuse @ Term::Fuse { .. }) if ranking.fused => {
+                    pipeline.push(self.fuse_step(fuse, &mut inlined, &mut fresh)?);
+                    bound.insert(ranking.column.clone());
                 }
-            };
-            pipeline.push(match &ranking.exact {
-                Some((property, kind, query)) => PatternStep::Score {
-                    binding: ranking.column.clone(),
-                    type_name: population
-                        .types
-                        .get(&ranking.column)
-                        .cloned()
-                        .ok_or_else(|| {
-                            ShapeError::Internal(format!(
-                                "an exact score ranks `{}`, which its population binds as no node",
-                                ranking.column
-                            ))
-                        })?,
-                    property: property.clone(),
-                    kind: *kind,
-                    query: query.clone(),
-                },
-                None => PatternStep::Rank {
-                    key: ranking.key.clone(),
-                    binding: ranking.column.clone(),
-                    window,
-                    window_param,
-                    recall: ranking.recall,
-                },
-            });
+                _ => self.ranking_steps(
+                    ranked_node,
+                    body,
+                    ranking,
+                    &mut inlined,
+                    &mut pipeline,
+                    &mut bound,
+                    &mut fresh,
+                )?,
+            }
             // The later elements and `where` read the score by its name.
             let mut score = HashMap::new();
             score.insert(
@@ -1441,9 +1476,9 @@ impl<'a> Shaper<'a> {
     /// Whether today's ranked scan runs the ranking as the read's leading
     /// `order` key cut by the read's `limit`: the score leads the `order` in
     /// its ranking's direction (absent over groups, which it does not
-    /// order), and each `nearest` window is the read's `limit` (`100` under
-    /// `rrf` without one). Any other ranking is a `Rank` step over its
-    /// population.
+    /// order), and its `nearest` window is the read's `limit`. Any other
+    /// ranking is a `Rank` step over its population, and an `rrf` is a
+    /// `Fuse` step.
     fn ranked_scan_runs(
         &self,
         ranking: &Ranking,
@@ -1463,15 +1498,9 @@ impl<'a> Shaper<'a> {
             // No `order`: the cut takes the ranking's own order.
             None => grouped || limit.is_none(),
         };
-        let fused = matches!(ranking.key, IRExpr::Rrf { .. });
-        let expected = match (limit, fused) {
-            (Some(n), _) => Some(n),
-            (None, true) => Some(RRF_NEAREST_ARM_WINDOW),
-            (None, false) => None,
-        };
         leads
             && ranking.windows.iter().all(|w| match w {
-                Count::Literal(k) => Some(*k) == expected,
+                Count::Literal(k) => Some(*k) == limit,
                 Count::Param(_) => false,
             })
     }
@@ -1585,6 +1614,7 @@ impl<'a> Shaper<'a> {
                     windows: vec![k.clone()],
                     exact: None,
                     recall: *recall,
+                    fused: false,
                 }),
             )),
             // `bm25` is the exact score: `bm25_v1` over the field corpus,
@@ -1624,6 +1654,7 @@ impl<'a> Shaper<'a> {
                         ),
                     )),
                     recall: None,
+                    fused: false,
                 }),
             )),
             Term::Score {
@@ -1648,108 +1679,213 @@ impl<'a> Shaper<'a> {
                     windows: Vec::new(),
                     exact: Some((property.clone(), ScoreKind::Distance, query.clone())),
                     recall: None,
+                    fused: false,
                 }),
             )),
             Term::Score { .. } => Err(ShapeError::Internal(
                 "a `Score` whose kind and query disagree, which the type checker never writes"
                     .into(),
             )),
-            Term::Fuse { .. } => Ok((self.fused_population(body)?, Some(self.fused(body)?))),
+            // `rrf`: each arm is shaped as its own pipeline
+            // (`Shaper::fuse_step`); the fusion's targets are the rows the
+            // elements after the `from` extend.
+            Term::Fuse { target, out, .. } => Ok((
+                body,
+                Some(Ranking {
+                    key: IRExpr::PropAccess {
+                        variable: target.clone(),
+                        property: RRF_COLUMN.to_string(),
+                        ty: scalar(ScalarType::F64),
+                    },
+                    out: out.clone(),
+                    column: target.clone(),
+                    score: (RRF_COLUMN, scalar(ScalarType::F64)),
+                    descending: true,
+                    windows: Vec::new(),
+                    exact: None,
+                    recall: None,
+                    fused: true,
+                }),
+            )),
             other => Ok((other, None)),
         }
     }
 
-    /// The pattern of the one population every arm of an `rrf` ranks: the
-    /// fusion runs its arms over it and yields one row per target, and the
-    /// elements after the `from` extend from that target.
-    fn fused_population<'t>(&self, fuse: &'t Term) -> Result<&'t Term, ShapeError> {
-        let Term::Fuse { arms, .. } = fuse else {
-            unreachable!("called on a Fuse")
+    /// The steps of one ranking drawn as a pattern step: its population
+    /// (`population`, the pattern under its node `node`) placed as its
+    /// inline read states it, the ranked binding scanned first under a
+    /// `nearest` and the names it binds without returning renamed apart,
+    /// then its `Rank` step (a `nearest` window) or `Score` step (an exact
+    /// score). A ranking standing alone and a fusion arm take the same
+    /// steps. `inlined` numbers the renamed names across the read.
+    #[allow(clippy::too_many_arguments)]
+    fn ranking_steps(
+        &self,
+        node: Option<&Term>,
+        population: &Term,
+        ranking: &Ranking,
+        inlined: &mut usize,
+        pipeline: &mut Vec<PatternStep>,
+        bound: &mut HashSet<String>,
+        fresh: &mut FreshNames,
+    ) -> Result<(), ShapeError> {
+        let mut facts = Facts {
+            inlined: *inlined,
+            ..Facts::default()
         };
-        // An arm that is not a ranking function's relation is a read whose
-        // own `order` ranks its targets (the type checker refuses any other
-        // arm, `T75`).
-        if arms.iter().any(|arm| {
-            !matches!(
-                arm,
-                Term::ApproxTopK { .. } | Term::Score { .. } | Term::Fuse { .. }
-            )
-        }) {
-            return Err(self.refuse(
-                "an `rrf` arm ranked by its read's own `order` rather than by a ranking function",
-            ));
+        match node.map(ranked_input) {
+            Some(Term::Project {
+                input,
+                items,
+                keep: false,
+            }) => self.inline_read(input, items, &[], &mut facts)?,
+            _ => self.facts(population, &mut facts)?,
         }
-        let mut populations = arms.iter().map(ranked_input);
-        let first = populations
-            .next()
-            .ok_or_else(|| ShapeError::Internal("an `rrf` has no arm".to_string()))?;
-        if populations.any(|population| population != first) {
-            return Err(self.refuse("`rrf` arms over different populations"));
-        }
-        self.population(first)
+        *inlined = facts.inlined;
+        let lets = std::mem::take(&mut facts.lets);
+        facts.substitute(&lets);
+        let ranked: Vec<String> = match ranking.exact {
+            None => vec![ranking.column.clone()],
+            Some(_) => Vec::new(),
+        };
+        self.place(&facts, &ranked, pipeline, bound, &HashSet::new(), fresh)?;
+        pipeline.push(match &ranking.exact {
+            Some((property, kind, query)) => PatternStep::Score {
+                binding: ranking.column.clone(),
+                type_name: facts.types.get(&ranking.column).cloned().ok_or_else(|| {
+                    ShapeError::Internal(format!(
+                        "an exact score ranks `{}`, which its population binds as no node",
+                        ranking.column
+                    ))
+                })?,
+                property: property.clone(),
+                kind: *kind,
+                query: query.clone(),
+            },
+            None => {
+                // A window read from a parameter takes its bound count when
+                // the engine gathers the planning inputs.
+                let (window, window_param) = match ranking.windows.as_slice() {
+                    [] => (None, None),
+                    [Count::Literal(k)] => (Some(*k), None),
+                    [Count::Param(p)] => (None, Some(p.clone())),
+                    _ => {
+                        return Err(ShapeError::Internal(
+                            "a `nearest` with more than one window".to_string(),
+                        ));
+                    }
+                };
+                PatternStep::Rank {
+                    key: ranking.key.clone(),
+                    binding: ranking.column.clone(),
+                    window,
+                    window_param,
+                    recall: ranking.recall,
+                }
+            }
+        });
+        Ok(())
     }
 
-    /// `rrf`: the ranking of its fused targets, each arm's key ranking the
-    /// population (`fused_population`).
-    fn fused(&self, fuse: &Term) -> Result<Ranking, ShapeError> {
+    /// `rrf(arm, …)` as a [`PatternStep::Fuse`]: each arm its own pipeline
+    /// from nothing, the steps the same ranking takes standing alone
+    /// (`ranking_steps`), or an inline read whose own `order` ranks its
+    /// targets, placed as a `from` over it is.
+    fn fuse_step(
+        &self,
+        fuse: &Term,
+        inlined: &mut usize,
+        fresh: &mut FreshNames,
+    ) -> Result<PatternStep, ShapeError> {
         let Term::Fuse {
             arms,
             target,
             k,
             weights,
-            out,
+            ..
         } = fuse
         else {
-            unreachable!("fuse_leaf returns a Fuse")
+            return Err(ShapeError::Internal("a fusion that is not a `Fuse`".into()));
         };
-        let mut windows = Vec::new();
-        let mut arm = |t: &Term| -> Result<IRExpr, ShapeError> {
-            match self.ranking(t)? {
-                (_, Some(r)) if matches!(r.exact, Some((_, ScoreKind::Distance, _))) => {
-                    Err(self.refuse("an `rrf` arm over `distance`"))
+        let mut shaped = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let mut steps = Vec::new();
+            let mut bound = HashSet::new();
+            let rank = match self.ranking(arm)? {
+                (_, Some(ranking)) if ranking.fused => {
+                    steps.push(self.fuse_step(arm, inlined, fresh)?);
+                    ArmRank::Fused
                 }
-                (_, Some(r)) if r.exact.is_some() => Err(self.refuse(
-                    "an `rrf` arm over `bm25` on a field whose index declares an analyzer",
-                )),
-                (_, Some(r)) => {
-                    windows.extend(r.windows);
-                    Ok(r.key)
+                (population, Some(ranking)) => {
+                    self.ranking_steps(
+                        Some(arm),
+                        population,
+                        &ranking,
+                        inlined,
+                        &mut steps,
+                        &mut bound,
+                        fresh,
+                    )?;
+                    match ranking.exact {
+                        None => ArmRank::Nearest,
+                        Some((_, ScoreKind::Distance, _)) => ArmRank::Distance,
+                        Some((_, ScoreKind::Bm25, _)) => ArmRank::Bm25,
+                    }
                 }
-                (_, None) => Err(ShapeError::Internal(
-                    "an `rrf` arm that is not a ranking, which `fused_population` refuses first"
-                        .into(),
-                )),
-            }
-        };
-        let [primary, secondary] = arms.as_slice() else {
-            return Err(self.refuse("an `rrf` of other than two arms"));
-        };
-        let (primary, secondary) = (arm(primary)?, arm(secondary)?);
+                // An inline read whose own `order` ranks its targets (the
+                // type checker refuses any other arm, `T75`).
+                (_, None) => {
+                    let (input, items, bindings) = read_parts(arm)
+                        .filter(|(input, ..)| orders(input))
+                        .ok_or_else(|| {
+                            ShapeError::Internal(
+                                "an `rrf` arm that is neither a ranking nor an inline read with an `order`, which the type checker refuses (T75)".into(),
+                            )
+                        })?;
+                    let mut facts = Facts {
+                        inlined: *inlined,
+                        ..Facts::default()
+                    };
+                    self.inline_read(input, items, bindings, &mut facts)?;
+                    *inlined = facts.inlined;
+                    self.place(&facts, &[], &mut steps, &mut bound, &HashSet::new(), fresh)?;
+                    if !matches!(
+                        steps.as_slice(),
+                        [PatternStep::Correlate {
+                            outer_var: None,
+                            ..
+                        }]
+                    ) {
+                        return Err(ShapeError::Internal(
+                            "an ordered `rrf` arm that is not one uncorrelated read".into(),
+                        ));
+                    }
+                    ArmRank::Ordered
+                }
+            };
+            shaped.push(FuseArm { steps, rank });
+        }
+        let target_type = arms
+            .first()
+            .and_then(|arm| node_type_in(arm, target))
+            .ok_or_else(|| {
+                ShapeError::Internal(format!("the `rrf` target `{target}` binds no node type"))
+            })?;
         // The default constant is the unwritten one.
         let k = match k {
             Count::Literal(n) if *n == RRF_DEFAULT_K => None,
-            Count::Literal(n) => Some(Box::new(IRExpr::Literal(
+            Count::Literal(n) => Some(IRExpr::Literal(
                 Literal::Integer(i128::from(*n)),
                 scalar(ScalarType::I64),
-            ))),
-            Count::Param(p) => Some(Box::new(IRExpr::Param(p.clone(), self.param_type(p)))),
+            )),
+            Count::Param(p) => Some(IRExpr::Param(p.clone(), self.param_type(p))),
         };
-        Ok(Ranking {
-            key: IRExpr::Rrf {
-                primary: Box::new(primary),
-                secondary: Box::new(secondary),
-                k,
-                weights: rrf_weights_expr(weights).map(Box::new),
-                ty: scalar(ScalarType::F64),
-            },
-            out: out.clone(),
-            column: target.clone(),
-            score: (RRF_COLUMN, scalar(ScalarType::F64)),
-            descending: true,
-            windows,
-            exact: None,
-            // An `rrf` arm's `recall:` is the fusion's to read.
-            recall: None,
+        Ok(PatternStep::Fuse {
+            arms: shaped,
+            target: target.clone(),
+            target_type,
+            k,
+            weights: rrf_weights_expr(weights),
         })
     }
 
@@ -3482,6 +3618,9 @@ impl<'a> Shaper<'a> {
                 PatternStep::Correlate { read, .. } => {
                     physical_names.extend(read.references().map(str::to_string));
                 }
+                PatternStep::Fuse { target, .. } => {
+                    physical_names.insert(target.clone());
+                }
                 PatternStep::Filter(_)
                 | PatternStep::AntiJoin { .. }
                 | PatternStep::Rank { .. }
@@ -3600,7 +3739,6 @@ fn holds_lexical_call(expr: &IRExpr) -> bool {
             IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
             | IRExpr::Bm25 { .. }
-            | IRExpr::Rrf { .. }
             | IRExpr::Variable(..)
             | IRExpr::Param(..)
             | IRExpr::Literal(..)
@@ -3726,6 +3864,16 @@ fn groups_or_cuts(term: &Term) -> bool {
     }
 }
 
+/// Whether an inline read's body under its final projection orders its
+/// rows: an `order`, under its `limit` if it has one.
+fn orders(term: &Term) -> bool {
+    match term {
+        Term::Cut { input, .. } => orders(input),
+        Term::Order { .. } => true,
+        _ => false,
+    }
+}
+
 /// The `Env` leaf a correlated pattern starts from, along its first
 /// inputs: the outer columns it reads. A nested scope's own `Env` (a
 /// block's, an `optional`'s, an inline read's) is off that path.
@@ -3784,10 +3932,6 @@ fn optional_pattern(inner: &Term) -> Option<&Term> {
         && aggs.len() == 1)
         .then_some(left.as_ref())
 }
-
-/// The window an `rrf`'s `nearest` arm draws when the read has no `limit`
-/// (today's arm window).
-const RRF_NEAREST_ARM_WINDOW: u64 = 100;
 
 /// An aggregate's result as its signature states it: nullable, since an
 /// aggregate over no rows has no value.
@@ -3952,6 +4096,17 @@ fn rename_inner_bindings(
                 expressions.extend(read.exprs_mut());
                 pending.extend(inner);
             }
+            PatternStep::Fuse {
+                arms,
+                target,
+                k,
+                weights,
+                ..
+            } => {
+                rename(target);
+                expressions.extend(k.iter_mut().chain(weights.iter_mut()));
+                pending.extend(arms.iter_mut().flat_map(|arm| arm.steps.iter_mut()));
+            }
         }
     }
     for expr in expressions {
@@ -3981,18 +4136,6 @@ fn reference_null_tests(expr: &mut IRExpr, id: &str, optional: &HashSet<String>)
         IRExpr::Bm25 { field, query, .. } => {
             recurse(field);
             recurse(query);
-        }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-            ..
-        } => {
-            recurse(primary);
-            recurse(secondary);
-            if let Some(k) = k {
-                recurse(k);
-            }
         }
         IRExpr::Aggregate { arg, .. }
         | IRExpr::Not(arg, _)
@@ -4092,18 +4235,6 @@ fn bind_params(expr: &mut IRExpr, bindings: &[(String, IRExpr)]) {
             recurse(field);
             recurse(query);
         }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-            ..
-        } => {
-            recurse(primary);
-            recurse(secondary);
-            if let Some(k) = k {
-                recurse(k);
-            }
-        }
         IRExpr::Aggregate { arg, .. }
         | IRExpr::Not(arg, _)
         | IRExpr::IsNull { expr: arg, .. }
@@ -4138,18 +4269,6 @@ fn substitute(expr: &mut IRExpr, lets: &HashMap<String, IRExpr>) {
             substitute(field, lets);
             substitute(query, lets);
         }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-            ..
-        } => {
-            substitute(primary, lets);
-            substitute(secondary, lets);
-            if let Some(k) = k {
-                substitute(k, lets);
-            }
-        }
         IRExpr::Aggregate { arg, .. }
         | IRExpr::Not(arg, _)
         | IRExpr::IsNull { expr: arg, .. }
@@ -4176,18 +4295,6 @@ fn rename_expr(expr: &mut IRExpr, rename: &impl Fn(&mut String)) {
         IRExpr::Bm25 { field, query, .. } => {
             rename_expr(field, rename);
             rename_expr(query, rename);
-        }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-            ..
-        } => {
-            rename_expr(primary, rename);
-            rename_expr(secondary, rename);
-            if let Some(k) = k {
-                rename_expr(k, rename);
-            }
         }
         IRExpr::Aggregate { arg, .. }
         | IRExpr::Not(arg, _)

@@ -26,7 +26,10 @@ use crate::physical::{NodeId, PhysicalPlan};
 /// fingerprints. Version 11 adds to version 10 a literal arm for an integer
 /// outside the `i64` range, carried as its decimal text. Version 12 adds to
 /// version 11 an `rrf`'s `weights`, on its expression and its `RankFuse`.
-pub const BOUND_PLAN_VERSION: u32 = 12;
+/// Version 13 replaces version 12's two-arm `RankFuse`, its `rrf`
+/// expression and its fused order key with a `Fuse` node over 2 to 16 arm
+/// subtrees, each with its rank kind.
+pub const BOUND_PLAN_VERSION: u32 = 13;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

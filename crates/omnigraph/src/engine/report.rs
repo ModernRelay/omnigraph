@@ -226,7 +226,6 @@ impl Taken {
             fallback: verdict.fallback.map(|fallback| match fallback {
                 RrfGateFallback::Threshold => "threshold",
                 RrfGateFallback::Shape => "shape",
-                RrfGateFallback::Coverage => "coverage",
                 RrfGateFallback::BuildErr => "build_error",
                 RrfGateFallback::EmptyEligible => "empty_eligible",
                 RrfGateFallback::Forced => "forced",

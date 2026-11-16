@@ -363,9 +363,11 @@ async fn doc_user_index_count(db: &Omnigraph) -> usize {
         .count()
 }
 
-/// An `rrf` arm over `bm25` is refused at type check (`T86`) before any
-/// index state matters; a `nearest` read degrades to the flat search while
-/// the declared indexes are pending after the load.
+/// RFC-022 data writes publish only their exact table effects. Declared FTS
+/// and vector indexes may therefore still be pending immediately after load;
+/// a fusion of a `nearest` arm and an exact `bm25` arm stays logically
+/// correct: the `nearest` arm degrades to Lance's flat search and the exact
+/// lexical scan reads no index.
 #[tokio::test]
 #[serial]
 async fn deferred_indexes_do_not_block_hybrid_reads() {
@@ -381,23 +383,15 @@ async fn deferred_indexes_do_not_block_hybrid_reads() {
         0,
         "load must leave declared physical indexes to the reconciler"
     );
-    let error = query_main(
+    let result = query_main(
         &db,
         MOCK_SEARCH_QUERIES,
         "hybrid_search_vector",
         &vector_and_string_params("$vq", &mock_embedding("alpha", 4), "$tq", "alpha"),
     )
     .await
-    .unwrap_err();
-    assert!(refuses_an_rrf_bm25_arm(&error), "{error}");
-}
-
-/// Whether `error` is the type checker's refusal of an `rrf` arm over `bm25`
-/// (`T86`): every full-text field has a profile, and fusion does not rank an
-/// exact `bm25` arm.
-fn refuses_an_rrf_bm25_arm(error: &omnigraph::error::OmniError) -> bool {
-    let text = error.to_string();
-    text.contains("T86") && text.contains("an `rrf` arm over `bm25`")
+    .expect("pending FTS/vector indexes must degrade to flat search");
+    assert_eq!(result_slugs(&result)[0], "alpha-doc");
 }
 
 struct EnvGuard {
@@ -487,6 +481,25 @@ query nearest_all($q: Vector(4)) {
     return { $d.slug }
     order { $distance }
     limit 10
+}
+
+query rrf_friends($q: Vector(4)) {
+    match {
+      let $friends = { match { $d: Doc, $t: Doc, $d knows $t } return { $d } },
+      from rrf(nearest($friends, $d.embedding, $q, k: 10), distance($friends, $d.embedding, [4.0, 0.0, 0.0, 0.0])) as $score,
+    }
+    return { $d.slug }
+    order { $score desc, $d.slug }
+}
+
+query rrf_friends_and_all($q: Vector(4)) {
+    match {
+      let $friends = { match { $d: Doc, $t: Doc, $d knows $t } return { $d } },
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($friends, $d.embedding, $q, k: 10), nearest($all, $d.embedding, $q, k: 10)) as $score,
+    }
+    return { $d.slug }
+    order { $score desc, $d.slug }
 }
 
 query rrf_keep($q: Vector(4)) {
@@ -1014,6 +1027,70 @@ async fn issue_567_unfiltered_nearest_keeps_the_probe_cap() {
             .ann_overfetches
             .load(std::sync::atomic::Ordering::Relaxed),
         0
+    );
+}
+
+/// A fusion's `nearest` arm is the standalone `nearest` over its population:
+/// over the edge-bearing docs its gate admits only those five, so the arm
+/// ranks every one of them exactly although the nearest docs of the type
+/// have no edge, and beside an exact arm the fused ranking is exhaustive.
+/// Beside a second `nearest` arm over the whole type, which `ann_nprobes = 1`
+/// leaves with unsearched partitions, it is not.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_fused_nearest_arm_ranks_its_population_and_reports_exhaustive() {
+    use omnigraph::instrumentation::{QueryIoProbes, RrfGatePlan, with_query_io_probes};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = issue_567_partitioned_docs(uri).await;
+    let db = with_setting(&db, "ann_nprobes", "1");
+    let edge_docs: Vec<String> = (0..ISSUE_567_EDGE_DOCS)
+        .map(|row| format!("n{row:05}"))
+        .collect();
+
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &db,
+            ISSUE_567_QUERIES,
+            "rrf_friends",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    let verdicts = probes.ann_prefilter_verdicts.lock().unwrap().clone();
+    assert_eq!(verdicts.len(), 1, "one nearest arm, one verdict");
+    assert_eq!(verdicts[0].plan, RrfGatePlan::Prefilter);
+    let mut slugs = result_slugs(&result);
+    slugs.sort();
+    assert_eq!(slugs, edge_docs, "every edge-bearing doc, nothing else");
+    let ranking = result.ranking().unwrap();
+    assert_eq!(ranking.by, omnigraph_compiler::result::SearchFunction::Rrf);
+    assert!(
+        ranking.exhaustive,
+        "the arm scored every admitted row and the exact arm is exhaustive"
+    );
+
+    let result = query_main(
+        &db,
+        ISSUE_567_QUERIES,
+        "rrf_friends_and_all",
+        &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+    let slugs = result_slugs(&result);
+    assert!(
+        edge_docs.iter().all(|doc| slugs.contains(doc)),
+        "the first arm keeps every edge-bearing doc: {slugs:?}"
+    );
+    assert!(
+        !result.ranking().unwrap().exhaustive,
+        "the arm over the whole type left partitions unsearched"
     );
 }
 
@@ -1969,23 +2046,25 @@ async fn rrf_with_string_nearest_matches_explicit_vector_under_mock_embeddings()
     let dir = tempfile::tempdir().unwrap();
     let db = init_mock_embedding_search_db(&dir).await;
 
-    // Both spellings of the vector arm meet the same refusal of the `bm25`
-    // arm (`T86`), before any embedding runs.
-    for (query, params) in [
-        (
-            "hybrid_search_vector",
-            vector_and_string_params("$vq", &mock_embedding("alpha", 4), "$tq", "alpha"),
-        ),
-        (
-            "hybrid_search_string",
-            params(&[("$vq", "alpha"), ("$tq", "alpha")]),
-        ),
-    ] {
-        let error = query_main(&db, MOCK_SEARCH_QUERIES, query, &params)
-            .await
-            .unwrap_err();
-        assert!(refuses_an_rrf_bm25_arm(&error), "{query}: {error}");
-    }
+    let explicit = query_main(
+        &db,
+        MOCK_SEARCH_QUERIES,
+        "hybrid_search_vector",
+        &vector_and_string_params("$vq", &mock_embedding("alpha", 4), "$tq", "alpha"),
+    )
+    .await
+    .unwrap();
+    let embedded = query_main(
+        &db,
+        MOCK_SEARCH_QUERIES,
+        "hybrid_search_string",
+        &params(&[("$vq", "alpha"), ("$tq", "alpha")]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result_slugs(&embedded), result_slugs(&explicit));
+    assert_eq!(result_slugs(&embedded)[0], "alpha-doc");
 }
 
 #[tokio::test]
@@ -2237,11 +2316,12 @@ async fn bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan() {
     );
 }
 
-/// An `rrf` over `bm25` arms is refused at type check (`T86`), so no arm
-/// scans.
+/// A fusion's exact `bm25` arms score every match of their population, with
+/// no candidate cap and no ranked full-text scan, so the fused `limit` fills
+/// from the edge-bearing chunks after the fusion.
 #[tokio::test]
 #[serial]
-async fn rrf_arms_scan_uncapped_in_one_pass() {
+async fn rrf_exact_arms_score_every_match_uncapped() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = session(Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap());
@@ -2251,11 +2331,10 @@ async fn rrf_arms_scan_uncapped_in_one_pass() {
     db.ensure_indices_as(None).await.unwrap();
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
-    let postfilter_db = with_setting(&db, "rrf_plan", "force_postfilter");
     let probes = QueryIoProbes::default();
-    let error = with_query_io_probes(probes.clone(), async {
+    let result = with_query_io_probes(probes.clone(), async {
         query_main(
-            &postfilter_db,
+            &db,
             UNDERFILL_RRF_QUERY,
             "recall_rrf",
             &params(&[("$q", "needle")]),
@@ -2263,13 +2342,21 @@ async fn rrf_arms_scan_uncapped_in_one_pass() {
         .await
     })
     .await
-    .unwrap_err();
-    assert!(refuses_an_rrf_bm25_arm(&error), "{error}");
+    .unwrap();
     assert_eq!(
         probes
             .bm25_scan_rows
             .load(std::sync::atomic::Ordering::Relaxed),
-        0
+        0,
+        "an exact `bm25` arm runs no ranked full-text scan"
+    );
+    // Both arms rank identically (the second repeats the term), so fusion
+    // preserves the tf order: the best-scoring edge-bearing chunks are 08
+    // then 09.
+    assert_eq!(
+        result_slugs(&result),
+        vec!["chunk-08".to_string(), "chunk-09".to_string()],
+        "the fused limit must be filled, in rank order, from the edge-bearing chunks"
     );
 }
 
@@ -2359,27 +2446,26 @@ query uncapped_all($q: String) {
     );
 }
 
-// An `rrf` of two `bm25` arms (title and body) is refused at type check
-// (`T86`).
+// An `rrf` of two exact `bm25` arms (title and body): neither arm is a
+// `nearest`, and fusion runs.
 #[tokio::test]
 #[serial]
 async fn rrf_fuses_two_fts_fields() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_search_db(&dir).await;
-    let error = query_main(
+    let r = query_main(
         &db,
-        r#"query rrf_two_fts($q: String) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $q), bm25($all, $d.body, $q), k: 60) as $score, $d: Doc }
-    return { $d.slug, $d.title }
-    order { $score desc }
-    limit 3
-}"#,
+        SEARCH_QUERIES,
         "rrf_two_fts",
         &params(&[("$q", "learning")]),
     )
     .await
-    .unwrap_err();
-    assert!(refuses_an_rrf_bm25_arm(&error), "{error}");
+    .unwrap();
+    assert_eq!(
+        result_slugs(&r),
+        vec!["dl-basics", "ml-intro", "rl-intro"],
+        "the title arm is an all-way tie, so the identity tie order fuses to dl/ml/rl"
+    );
 }
 
 // RRF fuses two vector arms (no embedding creds — explicit vectors). A doc near

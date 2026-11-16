@@ -783,12 +783,14 @@ fn edited_hop_bounds_fail_traversal_identity() {
     assert_eq!(check, "traversal identity", "{detail}");
 }
 
-/// The first key of the final sort, removed.
+/// The first key of the final sort, removed: the last sort lowered, above
+/// every sort a fusion arm or a window holds.
 fn drop_first_sort_key(plan: &mut PhysicalPlan) {
-    for id in node_ids(plan, |node| matches!(node, PhysicalNode::Sort { .. })) {
-        if let Some(PhysicalNode::Sort { order_by, .. }) = plan.node_mut(id) {
-            order_by.remove(0);
-        }
+    let sorts = node_ids(plan, |node| matches!(node, PhysicalNode::Sort { .. }));
+    if let Some(id) = sorts.into_iter().max()
+        && let Some(PhysicalNode::Sort { order_by, .. }) = plan.node_mut(id)
+    {
+        order_by.remove(0);
     }
 }
 
@@ -890,11 +892,19 @@ fn another_query_argument_fails_search_identity() {
     assert_eq!(check, "search identity", "{detail}");
 }
 
-fn fusion_weights(plan: &mut PhysicalPlan) -> &mut Option<IRExpr> {
-    let id = node_ids(plan, |node| matches!(node, PhysicalNode::RankFuse { .. }))[0];
+fn fusion_arms(plan: &mut PhysicalPlan) -> &mut Vec<crate::physical::FuseArm> {
+    let id = node_ids(plan, |node| matches!(node, PhysicalNode::Fuse { .. }))[0];
     match plan.node_mut(id) {
-        Some(PhysicalNode::RankFuse { weights, .. }) => weights,
-        _ => unreachable!("a RankFuse"),
+        Some(PhysicalNode::Fuse { arms, .. }) => arms,
+        _ => unreachable!("a Fuse"),
+    }
+}
+
+fn fusion_weights(plan: &mut PhysicalPlan) -> &mut Option<IRExpr> {
+    let id = node_ids(plan, |node| matches!(node, PhysicalNode::Fuse { .. }))[0];
+    match plan.node_mut(id) {
+        Some(PhysicalNode::Fuse { weights, .. }) => weights,
+        _ => unreachable!("a Fuse"),
     }
 }
 
@@ -940,6 +950,67 @@ fn other_fusion_weights_fail_search_identity() {
     *fusion_weights(&mut plan) = written;
     let (check, detail) = unweighted.refused(plan);
     assert_eq!(check, "search identity", "{detail}");
+}
+
+/// A fusion's plan is the query's arm for arm (RFC 0047, search identity):
+/// the planned three-arm fusion, a `nearest` window over a filtered
+/// population beside an exact `distance` arm and an ordered read, is
+/// accepted, and a saved plan whose arm ranks another way, whose arms are
+/// reordered, whose fusion ranks another target, whose window arm lost its
+/// population's filter or whose arm's rows no longer arrive in its rank
+/// order is refused.
+#[test]
+fn an_altered_fusion_arm_is_refused() {
+    let fixture = Fixture::new(
+        "query q($v: Vector(2)) { match { let $recent = { match { $d: Doc } where $d.year > 2000 return { $d } }, let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($recent, $d.embedding, $v, k: 2), distance($all, $d.embedding, [1.0, 0.0]), { match { $d: Doc } return { $d } order { $d.year desc } limit 3 }, weights: [2.0, 1.0, 0.5]) as $score } return { $d.slug } order { $score desc } limit 2 }",
+        &[(
+            "v",
+            Literal::List(vec![Literal::Float(0.0), Literal::Float(1.0)]),
+        )],
+    );
+    let planned = fixture.plan();
+    fixture
+        .accept(planned.clone())
+        .expect("the planned fusion is the query's");
+    let fuse = node_ids(&planned, |node| matches!(node, PhysicalNode::Fuse { .. }))[0];
+    let edited = |edit: &dyn Fn(&mut PhysicalPlan)| {
+        let mut plan = planned.clone();
+        edit(&mut plan);
+        fixture.refused(plan)
+    };
+    let (check, detail) = edited(&|plan| {
+        fusion_arms(plan)[1].rank = crate::read_shape::ArmRank::Bm25;
+    });
+    assert_eq!(check, "search identity", "{detail}");
+    let (check, detail) = edited(&|plan| fusion_arms(plan).swap(0, 2));
+    assert_eq!(check, "search identity", "{detail}");
+    let (check, detail) = edited(&|plan| {
+        if let Some(PhysicalNode::Fuse { target, .. }) = plan.node_mut(fuse) {
+            *target = "e".to_string();
+        }
+    });
+    assert_eq!(check, "search identity", "{detail}");
+    let (check, detail) = edited(&|plan| {
+        for id in node_ids(plan, |node| matches!(node, PhysicalNode::Scan { .. })) {
+            if let Some(PhysicalNode::Scan { spec, .. }) = plan.node_mut(id) {
+                spec.filter = None;
+            }
+        }
+        for id in node_ids(plan, |node| matches!(node, PhysicalNode::Filter { .. })) {
+            if let Some(PhysicalNode::Filter { filters, .. }) = plan.node_mut(id) {
+                filters.clear();
+            }
+        }
+    });
+    assert_eq!(check, "predicate retention", "{detail}");
+    let (check, detail) = edited(&|plan| {
+        let exact = fusion_arms(plan)[1].input;
+        if let Some(PhysicalNode::Sort { order_by, .. }) = plan.node_mut(exact) {
+            order_by[0].descending = true;
+        }
+    });
+    assert_eq!(check, "search identity", "{detail}");
+    assert!(detail.contains("rank order"), "{detail}");
 }
 
 /// A `nearest` window drawn as a pattern step is a cut of its `k` targets:

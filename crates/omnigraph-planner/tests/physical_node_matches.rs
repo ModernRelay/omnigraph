@@ -70,17 +70,12 @@ const BEHAVIOUR_SITES: &[(&str, &str, &str)] = &[
     (
         "ranking.rs",
         "planned_ranking",
-        "a Scan's ranked access and a RankFuse's arms",
+        "a Scan's ranked access and a Fuse's target",
     ),
     (
         "ranking.rs",
         "return_list",
         "the return expressions of a Projection or an Aggregate",
-    ),
-    (
-        "validate/invariants.rs",
-        "check_policies",
-        "the declared policies of a Scan and a RankFuse",
     ),
     (
         "validate/invariants.rs",

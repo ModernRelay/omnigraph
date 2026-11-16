@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::read_shape::PatternStep;
+use crate::read_shape::{ArmRank, PatternStep};
 use omnigraph_compiler::ir::is_fresh_variable;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
 use omnigraph_compiler::query::value::{DISTANCE_COLUMN, Literal, RRF_COLUMN, SCORE_COLUMN};
@@ -85,15 +85,21 @@ pub(crate) enum BoundVariable {
     Edge { type_names: Vec<String> },
 }
 
-/// The search a leading `order` key names.
+/// The search a leading `order` key or a ranking step names.
 #[derive(Debug, Clone)]
 pub(crate) enum Search {
     Rank(Retrieval),
-    Fuse {
-        arms: Box<[Retrieval; 2]>,
-        k: Option<IRExpr>,
-        weights: Option<IRExpr>,
-    },
+}
+
+/// A fusion of the scope (`PatternStep::Fuse`): its target, the
+/// requirements of each arm's own steps with how the arm ranks, and its
+/// constant and weights as written.
+#[derive(Debug, Clone)]
+pub(crate) struct FuseRequirements {
+    pub(crate) target: String,
+    pub(crate) arms: Vec<(ArmRank, Requirements)>,
+    pub(crate) k: Option<IRExpr>,
+    pub(crate) weights: Option<IRExpr>,
 }
 
 /// One traversal of the top-level scope, as the IR states it.
@@ -115,9 +121,6 @@ pub(crate) struct Traversal {
 pub(crate) struct Block {
     pub outer_var: String,
     pub predicate: SubqueryPredicate,
-    /// Written after a ranking drawn as a pattern step, over its selected
-    /// rows.
-    pub after_rank: bool,
 }
 
 /// An `optional { }` of the top-level scope: its correlation binding and
@@ -159,7 +162,8 @@ fn own_eligibility(inner: &[PatternStep]) -> Vec<IRExpr> {
             | PatternStep::AntiJoin { .. }
             | PatternStep::Optional { .. }
             | PatternStep::Union { .. }
-            | PatternStep::Correlate { .. } => {}
+            | PatternStep::Correlate { .. }
+            | PatternStep::Fuse { .. } => {}
         }
     }
     eligibility
@@ -317,6 +321,14 @@ pub(crate) fn tie_columns(steps: &[PatternStep], out: &mut Vec<TieColumn>) {
                     }
                 }
             }
+            // A fusion's rows are its targets.
+            PatternStep::Fuse { target, .. } => push(
+                out,
+                TieColumn::Identity {
+                    binding: target.clone(),
+                    selected: false,
+                },
+            ),
             PatternStep::Filter(_)
             | PatternStep::Rank { .. }
             | PatternStep::Score { .. }
@@ -352,14 +364,14 @@ pub struct Requirements {
     /// plan.
     pub(crate) lets: Vec<IRExpr>,
     pub(crate) search: Option<Search>,
+    /// The fusion the scope's rows come from, each arm a scope of its own
+    /// (an `rrf`'s `from`, which leads its pattern).
+    pub(crate) fuse: Option<FuseRequirements>,
     /// Every eligibility conjunct of the top-level scope (inline matches,
     /// `match` filters and the filters of a deferred traversal destination),
     /// split at its top-level `and`; a constant `true` constrains nothing and
     /// is left out.
     pub(crate) eligibility: Vec<IRExpr>,
-    /// The conjuncts of `eligibility` written after a ranking drawn as a
-    /// pattern step, which run over its selected rows.
-    pub(crate) after_rank: Vec<IRExpr>,
     pub(crate) returns: Vec<IRProjection>,
     /// The return items that read the leading ranking's score column, by
     /// position, with that ranking.
@@ -404,13 +416,34 @@ impl Requirements {
         budget: &mut Budget,
     ) -> Result<Self, ValidationError> {
         let ir = input.ir;
+        Self::scope(
+            &ir.pipeline,
+            &ir.return_exprs,
+            &ir.order_by,
+            ir.distinct,
+            ir.limit,
+            budget,
+        )
+    }
+
+    /// The requirements of one scope: the read's top-level pattern with its
+    /// `return`, `order` and `limit`, or a fusion arm's steps, which return,
+    /// order and cut nothing of their own.
+    fn scope(
+        pipeline: &[PatternStep],
+        return_exprs: &[IRProjection],
+        order_by: &[IROrdering],
+        distinct: bool,
+        limit: Option<u64>,
+        budget: &mut Budget,
+    ) -> Result<Self, ValidationError> {
         let mut eligibility = Vec::new();
         let mut traversals = Vec::new();
         let mut blocks = Vec::new();
         let mut bindings: BTreeMap<String, BoundVariable> = BTreeMap::new();
         let mut rank_step: Option<(&IRExpr, Option<u64>)> = None;
         let mut recall = None;
-        let mut rank_at: Option<usize> = None;
+        let mut fuse = None;
         let mut steps = Vec::new();
         let mut optionals = Vec::new();
         let mut unions = Vec::new();
@@ -418,7 +451,7 @@ impl Requirements {
         let mut lets = Vec::new();
         let mut correlates = Vec::new();
         flatten(
-            &ir.pipeline,
+            pipeline,
             &mut steps,
             &mut optionals,
             &mut unions,
@@ -449,7 +482,33 @@ impl Requirements {
                 } => {
                     rank_step = Some((key, *window));
                     recall = *declared;
-                    rank_at = Some(eligibility.len());
+                }
+                PatternStep::Fuse {
+                    arms,
+                    target,
+                    target_type,
+                    k,
+                    weights,
+                } => {
+                    bindings.insert(
+                        target.clone(),
+                        BoundVariable::Node {
+                            type_name: target_type.clone(),
+                        },
+                    );
+                    let mut required = Vec::with_capacity(arms.len());
+                    for arm in arms {
+                        required.push((
+                            arm.rank,
+                            Self::scope(&arm.steps, &[], &[], false, None, budget)?,
+                        ));
+                    }
+                    fuse = Some(FuseRequirements {
+                        target: target.clone(),
+                        arms: required,
+                        k: k.clone(),
+                        weights: weights.clone(),
+                    });
                 }
                 PatternStep::NodeScan {
                     variable,
@@ -514,7 +573,6 @@ impl Requirements {
                 } => blocks.push(Block {
                     outer_var: outer_var.clone(),
                     predicate: predicate.clone(),
-                    after_rank: rank_at.is_some(),
                 }),
                 PatternStep::Optional { .. }
                 | PatternStep::Union { .. }
@@ -525,51 +583,32 @@ impl Requirements {
                 }
             }
         }
-        let mut keys = ir.order_by.as_slice();
+        let mut keys = order_by;
         let leading = match rank_step {
             Some((key, _)) => Some(key),
             None => keys.first().map(|key| &key.expr),
         };
-        let search = match leading {
-            Some(IRExpr::Rrf {
-                primary,
-                secondary,
-                k,
-                weights,
-                ..
-            }) => match (Retrieval::of(primary), Retrieval::of(secondary)) {
-                (Some(primary), Some(secondary)) => Some(Search::Fuse {
-                    arms: Box::new([primary, secondary]),
-                    k: k.as_deref().cloned(),
-                    weights: weights.as_deref().cloned(),
-                }),
-                _ => None,
-            },
-            Some(expr) => Retrieval::of(expr).map(Search::Rank),
-            None => None,
-        };
+        let search = leading.and_then(Retrieval::of).map(Search::Rank);
         if search.is_some() && rank_step.is_none() {
             keys = &keys[1..];
         }
         // Group rows (aggregates or `return distinct`) bind every key to the
         // return item it names, as the planner does, before constants drop.
-        let grouped = ir.distinct
-            || ir
-                .return_exprs
+        let grouped = distinct
+            || return_exprs
                 .iter()
                 .any(|projection| crate::optimizer::contains_aggregate(&projection.expr));
         let order = keys
             .iter()
             .map(|key| IROrdering {
-                expr: crate::optimizer::bind_order_key(&key.expr, &ir.return_exprs, grouped),
+                expr: crate::optimizer::bind_order_key(&key.expr, return_exprs, grouped),
                 descending: key.descending,
             })
             .filter(|key| !matches!(key.expr, IRExpr::Literal(_, _)))
             .collect();
         let written_search = search.as_ref().and(leading).cloned();
         let projected_ranks = match &written_search {
-            Some(lead) => ir
-                .return_exprs
+            Some(lead) => return_exprs
                 .iter()
                 .enumerate()
                 .filter(|(_, projection)| reads_score(&projection.expr))
@@ -578,7 +617,7 @@ impl Requirements {
             None => Vec::new(),
         };
         let mut columns = Vec::new();
-        tie_columns(&ir.pipeline, &mut columns);
+        tie_columns(pipeline, &mut columns);
         Ok(Self {
             bindings,
             tie_columns: columns,
@@ -590,14 +629,14 @@ impl Requirements {
             scores,
             lets,
             search,
-            after_rank: rank_at.map_or_else(Vec::new, |at| eligibility[at..].to_vec()),
+            fuse,
             eligibility,
-            returns: ir.return_exprs.clone(),
+            returns: return_exprs.to_vec(),
             projected_ranks,
             written_search,
             order,
-            ordered: !ir.order_by.is_empty(),
-            limit: ir.limit,
+            ordered: !order_by.is_empty(),
+            limit,
             aggregate: grouped,
             window: rank_step.map(|(_, window)| window),
             recall,

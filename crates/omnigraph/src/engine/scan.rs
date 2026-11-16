@@ -13,7 +13,7 @@ use lance_core::ROW_ADDR;
 use lance_index::scalar::FullTextSearchQuery;
 
 /// `id IN (ids)` as one structured DataFusion `Expr` — the scan-pushdown
-/// shape shared by `hydrate_nodes` and the rrf prefilter gate's arm push.
+/// shape shared by `hydrate_nodes` and the nearest prefilter gate's push.
 /// The structured form routes the IN-list through the `id` BTREE scalar
 /// index (index-search → take) rather than evaluating a string filter via
 /// DataFusion `InListEval`, which is O(N×M) and was measured at 72× the
@@ -1113,7 +1113,6 @@ fn typed_expr_to_df_expr(expr: &IRExpr, params: &ParamMap) -> Option<datafusion:
         IRExpr::Param(name, ty) => literal_to_expr(params.get(name)?, ty),
         IRExpr::Nearest { .. }
         | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Aggregate { .. }
         | IRExpr::AliasRef(_, _) => None,

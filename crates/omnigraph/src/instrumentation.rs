@@ -1,7 +1,5 @@
 //! Public surface of omnigraph_core::instrumentation as the engine exposes it.
 
-#[cfg(debug_assertions)]
-pub use omnigraph_core::instrumentation::with_rrf_gate_subset_drop;
 pub(crate) use omnigraph_core::instrumentation::*;
 pub use omnigraph_core::instrumentation::{
     CountingStorageAdapter, ExternalPayloadReadHold, LogicalCallCounter, LogicalCallCounts,

@@ -11,8 +11,8 @@ use omnigraph_compiler::ir::{IRExpr, SubqueryPredicate};
 use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::{ExprType, PropType, ScalarType};
 use omnigraph_planner::{
-    AntiJoinStrategy, EmptyEligible, KeyJoinKind, NodeId, PhysicalNode, PhysicalNodeKind,
-    PhysicalPlan, Prefilter, RankArm, RankKind,
+    AntiJoinStrategy, ArmRank, FuseArm, KeyJoinKind, NodeId, PhysicalNode, PhysicalNodeKind,
+    PhysicalPlan,
 };
 
 fn leaf(plan: &mut PhysicalPlan) -> NodeId {
@@ -21,12 +21,8 @@ fn leaf(plan: &mut PhysicalPlan) -> NodeId {
     })
 }
 
-fn arm(input: NodeId, kind: RankKind) -> RankArm {
-    RankArm {
-        input,
-        binding: "d".to_string(),
-        kind,
-    }
+fn arm(input: NodeId, rank: ArmRank) -> FuseArm {
+    FuseArm { input, rank }
 }
 
 fn truth() -> IRExpr {
@@ -107,22 +103,15 @@ fn multi_input_samples(plan: &mut PhysicalPlan) -> Vec<PhysicalNode> {
             }),
             tiebreak: Vec::new(),
         },
-        PhysicalNode::RankFuse {
-            arms: [
-                arm(leaf(plan), RankKind::Nearest),
-                arm(leaf(plan), RankKind::Bm25),
+        PhysicalNode::Fuse {
+            arms: vec![
+                arm(leaf(plan), ArmRank::Nearest),
+                arm(leaf(plan), ArmRank::Bm25),
+                arm(leaf(plan), ArmRank::Ordered),
             ],
+            target: "d".to_string(),
             k: None,
             weights: None,
-            limit: None,
-            prefilter: Prefilter {
-                ranked_type: "Doc".to_string(),
-                hops: Vec::new(),
-                feeds: Vec::new(),
-                on_empty: EmptyEligible::Postfilter,
-                coverage_admits: true,
-            },
-            row_tiebreak: Vec::new(),
         },
     ]
 }

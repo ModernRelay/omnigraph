@@ -481,7 +481,6 @@ fn estimate_rows_over(
         | LogicalNode::Ordered { input, .. }
         | LogicalNode::RowDiff { input, .. }
         | LogicalNode::TextSearch { input, .. }
-        | LogicalNode::RankFuse { input, .. }
         | LogicalNode::AntiJoin { input, .. }
         | LogicalNode::OptionalJoin { input, .. }
         | LogicalNode::TargetCut { input, .. }
@@ -492,6 +491,10 @@ fn estimate_rows_over(
             Some(estimate_rows(plan, *input, source)?.min(*rows as u64))
         }
         LogicalNode::Correlate { .. } => None,
+        // At most every target of every arm.
+        LogicalNode::Fuse { arms, .. } => arms.iter().try_fold(0u64, |total, arm| {
+            Some(total.saturating_add(estimate_rows(plan, arm.input, source)?))
+        }),
         LogicalNode::Nearest { input, k, .. } => {
             let input_rows = estimate_rows(plan, *input, source)?;
             Some(k.map_or(input_rows, |k| k.min(input_rows)))
