@@ -9893,3 +9893,416 @@ async fn column_patch_keeps_blob_files_row_ids_and_key_index_coverage_issue_1264
         );
     }
 }
+
+// ─── Scalar index kinds beside BTREE: BITMAP, LABEL_LIST and NGRAM ──────────
+//
+// `@index` builds a BITMAP for an enum or `Bool`, a LABEL_LIST for a list and
+// an NGRAM beside the BTREE of a String (docs/rfcs/2026-11-07-gq-3.md section
+// 4, docs/dev/lance.md). The engine pushes the predicates below to Lance
+// unchanged and relies on Lance's scanner returning the scan's rows with or
+// without the index; these guards pin that per kind on a stable-row-ID V2_2
+// table with an unindexed tail fragment, as graph tables are written.
+
+/// A V2_2 table of `id`, an enum-like `status`, a `flag`, a `tags` list and a
+/// free `text`, every value column nullable, with `indexes` built on the first
+/// fragment and a second fragment appended after them.
+async fn scalar_kind_dataset(uri: &str, indexes: &[(&str, IndexType, &str)]) -> Dataset {
+    use arrow_array::builder::{BooleanBuilder, ListBuilder, StringBuilder};
+
+    type Row = (
+        &'static str,
+        Option<&'static str>,
+        Option<bool>,
+        Option<&'static [Option<&'static str>]>,
+        Option<&'static str>,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, true),
+        Field::new("flag", DataType::Boolean, true),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let batch = |rows: &[Row]| {
+        let mut status = StringBuilder::new();
+        let mut flag = BooleanBuilder::new();
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        let mut text = StringBuilder::new();
+        for (_, s, f, t, x) in rows {
+            status.append_option(*s);
+            flag.append_option(*f);
+            match t {
+                Some(items) => {
+                    for item in *items {
+                        tags.values().append_option(*item);
+                    }
+                    tags.append(true);
+                }
+                None => tags.append(false),
+            }
+            text.append_option(*x);
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(status.finish()),
+                Arc::new(flag.finish()),
+                Arc::new(tags.finish()),
+                Arc::new(text.finish()),
+            ],
+        )
+        .unwrap()
+    };
+    let indexed: &[Row] = &[
+        (
+            "r1",
+            Some("active"),
+            Some(true),
+            Some(&[Some("rust"), Some("db")]),
+            Some("Hello World"),
+        ),
+        (
+            "r2",
+            Some("archived"),
+            Some(false),
+            Some(&[Some("go")]),
+            Some("hello there"),
+        ),
+        ("r3", None, None, None, None),
+        ("r4", Some("draft"), Some(true), Some(&[]), Some("a-b c")),
+        (
+            "r5",
+            Some("active"),
+            Some(false),
+            Some(&[None, Some("db")]),
+            Some("café crème"),
+        ),
+        (
+            "r6",
+            Some("archived"),
+            None,
+            Some(&[None]),
+            Some("WORLDWIDE web"),
+        ),
+    ];
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch(indexed))], schema.clone()),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for (column, index_type, name) in indexes {
+        dataset
+            .create_index(
+                &[column],
+                *index_type,
+                Some(name.to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+    let tail: &[Row] = &[
+        (
+            "t1",
+            Some("active"),
+            Some(true),
+            Some(&[Some("rust")]),
+            Some("hello world again"),
+        ),
+        ("t2", None, None, None, None),
+    ];
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch(tail))], schema.clone()),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+/// The ids `filter` selects, with and without scalar indexes, and the plan of
+/// the indexed scan.
+async fn scalar_kind_select(
+    dataset: &Dataset,
+    filter: datafusion::prelude::Expr,
+) -> (Vec<String>, Vec<String>, String) {
+    let ids = |use_index: bool| {
+        let filter = filter.clone();
+        async move {
+            let mut scanner = dataset.scan();
+            scanner.project(&["id"]).unwrap();
+            scanner.filter_expr(filter);
+            scanner.use_scalar_index(use_index);
+            let plan = scanner.explain_plan(true).await.unwrap();
+            let batches: Vec<RecordBatch> = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let mut ids: Vec<String> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch.column_by_name("id").unwrap().as_string::<i32>();
+                    (0..batch.num_rows())
+                        .map(|row| column.value(row).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            ids.sort();
+            (ids, plan)
+        }
+    };
+    let (indexed, plan) = ids(true).await;
+    let (scanned, _) = ids(false).await;
+    (indexed, scanned, plan)
+}
+
+fn scalar_kind_ids(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|id| id.to_string()).collect()
+}
+
+/// A BITMAP index answers equality, inequality, `IN`, ranges, `IS NULL` and a
+/// Boolean test exactly through Lance's sargable parser, keeps null rows out
+/// of `!=` and of a negated equality, and leaves the appended tail to the
+/// scan. The engine builds a BITMAP, not a BTREE, for an enum or `Bool`
+/// property on the strength of this guard.
+#[tokio::test]
+async fn bitmap_answers_equality_ranges_membership_and_nulls_exactly() {
+    use datafusion::prelude::{col, lit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("bitmap.lance");
+    let dataset = scalar_kind_dataset(
+        uri.to_str().unwrap(),
+        &[
+            ("status", IndexType::Bitmap, "status_bitmap"),
+            ("flag", IndexType::Bitmap, "flag_bitmap"),
+        ],
+    )
+    .await;
+    let cases: Vec<(datafusion::prelude::Expr, &str, &[&str])> = vec![
+        (
+            col("status").eq(lit("active")),
+            "status_bitmap",
+            &["r1", "r5", "t1"],
+        ),
+        (
+            col("status").not_eq(lit("active")),
+            "status_bitmap",
+            &["r2", "r4", "r6"],
+        ),
+        (
+            datafusion::prelude::not(col("status").eq(lit("active"))),
+            "status_bitmap",
+            &["r2", "r4", "r6"],
+        ),
+        (
+            col("status").in_list(vec![lit("draft"), lit("archived")], false),
+            "status_bitmap",
+            &["r2", "r4", "r6"],
+        ),
+        (
+            col("status").lt(lit("b")),
+            "status_bitmap",
+            &["r1", "r2", "r5", "r6", "t1"],
+        ),
+        (col("status").is_null(), "status_bitmap", &["r3", "t2"]),
+        (
+            col("status").is_not_null(),
+            "status_bitmap",
+            &["r1", "r2", "r4", "r5", "r6", "t1"],
+        ),
+        (
+            col("flag").eq(lit(true)),
+            "flag_bitmap",
+            &["r1", "r4", "t1"],
+        ),
+        (col("flag").eq(lit(false)), "flag_bitmap", &["r2", "r5"]),
+        (col("flag").not_eq(lit(true)), "flag_bitmap", &["r2", "r5"]),
+        (col("flag").is_null(), "flag_bitmap", &["r3", "r6", "t2"]),
+    ];
+    for (filter, index, expected) in cases {
+        let (indexed, scanned, plan) = scalar_kind_select(&dataset, filter.clone()).await;
+        assert_eq!(
+            indexed,
+            scalar_kind_ids(expected),
+            "{filter} through the index"
+        );
+        assert_eq!(
+            scanned, indexed,
+            "{filter}: the index must select the scan's rows"
+        );
+        assert!(
+            plan.contains(index),
+            "{filter} must be served by `{index}`:\n{plan}"
+        );
+    }
+}
+
+/// A LABEL_LIST index answers `array_has(list, value)` exactly, the
+/// membership the engine pushes for `value in $x.list`: a list holding a null
+/// item still matches its other items, a null or empty list never matches,
+/// and a negated membership keeps the null list out. A null needle is not
+/// answered by the index (Lance leaves it to the scan). The appended tail is
+/// scanned.
+#[tokio::test]
+async fn label_list_answers_list_membership_exactly_and_never_matches_a_null() {
+    use datafusion::functions_nested::expr_fn::array_has;
+    use datafusion::prelude::{col, lit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("label_list.lance");
+    let dataset = scalar_kind_dataset(
+        uri.to_str().unwrap(),
+        &[("tags", IndexType::LabelList, "tags_label_list")],
+    )
+    .await;
+    let cases: Vec<(datafusion::prelude::Expr, bool, &[&str])> = vec![
+        (array_has(col("tags"), lit("rust")), true, &["r1", "t1"]),
+        (array_has(col("tags"), lit("db")), true, &["r1", "r5"]),
+        (array_has(col("tags"), lit("missing")), true, &[]),
+        (
+            datafusion::prelude::not(array_has(col("tags"), lit("db"))),
+            true,
+            &["r2", "r4", "r6", "t1"],
+        ),
+        (
+            array_has(
+                col("tags"),
+                lit(datafusion::scalar::ScalarValue::Utf8(None)),
+            ),
+            false,
+            &[],
+        ),
+    ];
+    for (filter, uses_index, expected) in cases {
+        let (indexed, scanned, plan) = scalar_kind_select(&dataset, filter.clone()).await;
+        assert_eq!(
+            indexed,
+            scalar_kind_ids(expected),
+            "{filter} through the index"
+        );
+        assert_eq!(
+            scanned, indexed,
+            "{filter}: the index must select the scan's rows"
+        );
+        assert_eq!(
+            plan.contains("tags_label_list"),
+            uses_index,
+            "{filter}: index use\n{plan}"
+        );
+    }
+}
+
+/// An NGRAM index answers `contains(text, needle)` with a candidate superset:
+/// it indexes the lowercased, ASCII-folded alphanumeric trigrams of each value,
+/// so a needle that differs from the value only in case or accents is a
+/// candidate, and Lance rechecks every candidate with the case-sensitive
+/// `contains`. A needle of fewer than three characters is not sent to the
+/// index. A null value never matches, and a negated `contains` is not
+/// answered by the index.
+///
+/// The defect the engine works around: a needle of three or more characters
+/// with no alphanumeric trigram (`a-b`, `o W`) is sent to the index, which
+/// yields no token and answers "at least nothing"; Lance's filtered read then
+/// reads only that guaranteed set and returns no row of an indexed fragment,
+/// where the scan returns the matches. The engine pushes such a needle as
+/// `replace(text, needle, '') != text` (`engine::scan`), which no index parser
+/// answers and which returns the scan's rows. When the first half of the
+/// second loop goes red, Lance rechecks that result: drop the rewrite.
+#[tokio::test]
+async fn ngram_returns_a_case_folded_superset_that_lance_rechecks() {
+    use datafusion::functions::expr_fn::{contains, replace};
+    use datafusion::prelude::{col, lit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("ngram.lance");
+    let dataset = scalar_kind_dataset(
+        uri.to_str().unwrap(),
+        &[("text", IndexType::NGram, "text_ngram")],
+    )
+    .await;
+    let cases: Vec<(datafusion::prelude::Expr, bool, &[&str])> = vec![
+        (contains(col("text"), lit("World")), true, &["r1"]),
+        (contains(col("text"), lit("world")), true, &["t1"]),
+        (contains(col("text"), lit("WORLD")), true, &["r6"]),
+        (contains(col("text"), lit("hello")), true, &["r2", "t1"]),
+        (contains(col("text"), lit("cafe")), true, &[]),
+        (contains(col("text"), lit("café")), true, &["r5"]),
+        (contains(col("text"), lit("zzz")), true, &[]),
+        (contains(col("text"), lit("lo")), false, &["r1", "r2", "t1"]),
+        (
+            datafusion::prelude::not(contains(col("text"), lit("hello"))),
+            false,
+            &["r1", "r4", "r5", "r6"],
+        ),
+    ];
+    for (filter, uses_index, expected) in cases {
+        let (indexed, scanned, plan) = scalar_kind_select(&dataset, filter.clone()).await;
+        assert_eq!(
+            indexed,
+            scalar_kind_ids(expected),
+            "{filter} through the index"
+        );
+        assert_eq!(
+            scanned, indexed,
+            "{filter}: the index must select the scan's rows"
+        );
+        assert_eq!(
+            plan.contains("text_ngram"),
+            uses_index,
+            "{filter}: index use\n{plan}"
+        );
+    }
+    for (needle, expected) in [("a-b", &["r4"][..]), ("o W", &["r1"][..])] {
+        let (indexed, scanned, plan) =
+            scalar_kind_select(&dataset, contains(col("text"), lit(needle))).await;
+        assert_eq!(
+            scanned,
+            scalar_kind_ids(expected),
+            "contains `{needle}` by the scan"
+        );
+        assert!(
+            plan.contains("text_ngram"),
+            "contains `{needle}` reaches the index:\n{plan}"
+        );
+        assert!(
+            indexed.is_empty(),
+            "Lance 13 drops every indexed row for a trigram-less needle `{needle}`; got {indexed:?}"
+        );
+        let rewritten = replace(col("text"), lit(needle), lit("")).not_eq(col("text"));
+        let (indexed, scanned, plan) = scalar_kind_select(&dataset, rewritten.clone()).await;
+        assert_eq!(
+            indexed,
+            scalar_kind_ids(expected),
+            "{rewritten} through the index"
+        );
+        assert_eq!(scanned, indexed, "{rewritten}");
+        assert!(
+            !plan.contains("text_ngram"),
+            "{rewritten} uses no index:\n{plan}"
+        );
+    }
+}
