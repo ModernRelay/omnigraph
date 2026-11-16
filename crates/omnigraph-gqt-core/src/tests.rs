@@ -3690,3 +3690,77 @@ fn every_near_miss_word_is_a_dispatched_spelling() {
         );
     }
 }
+
+/// A host whose reference interpreter answers with fixed rows, or refuses.
+struct FixedReferenceHost {
+    reference: Result<Vec<Value>, String>,
+}
+
+impl ExecutionHost for FixedReferenceHost {
+    type StepGuard = ();
+
+    fn admit_case(&self, _case: &Case) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn arm_seams(&self, seams: &[SeamDirective], step: &Step) -> Result<(), String> {
+        PlainHost.arm_seams(seams, step)
+    }
+
+    fn finish_seams(&self, guard: ()) -> Result<(), String> {
+        PlainHost.finish_seams(guard)
+    }
+
+    fn reference_rows<'a>(
+        &'a self,
+        _session: &'a Session,
+        _read: &'a omnigraph_compiler::ir::core::CoreRead,
+        _branch: &'a str,
+        _params: &'a omnigraph_compiler::ParamMap,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Value>, String>> {
+        futures::future::ready(self.reference.clone()).boxed()
+    }
+}
+
+/// `--- expect same as reference` fails its step when the reference's rows
+/// differ from the engine's, and when the reference refuses a query the
+/// engine answered; it passes when they agree.
+#[tokio::test]
+async fn a_reference_disagreement_or_refusal_fails_the_step() {
+    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect same as reference\n");
+    let case = parse_case("reference_comparison", &text).unwrap();
+    for (reference, failure) in [
+        (Ok(vec![serde_json::json!({"p.name": "alice"})]), None),
+        (
+            Ok(vec![serde_json::json!({"p.name": "bob"})]),
+            Some("the engine and the reference disagree"),
+        ),
+        (
+            Err("E2: a divisor is zero".to_string()),
+            Some("the reference refused: E2: a divisor is zero"),
+        ),
+    ] {
+        let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let host = FixedReferenceHost { reference };
+        let result = execute_steps(
+            &case,
+            Path::new("unused.gqt"),
+            false,
+            session,
+            &uri,
+            None,
+            &host,
+        )
+        .await;
+        match failure {
+            None => assert!(result.is_ok(), "agreeing rows failed the step"),
+            Some(needle) => {
+                let error = match result {
+                    Ok(_) => panic!("the step passed although {needle}"),
+                    Err(error) => format!("{error:?}"),
+                };
+                assert!(error.contains(needle), "{needle} not in {error}");
+            }
+        }
+    }
+}
