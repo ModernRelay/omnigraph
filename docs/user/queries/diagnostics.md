@@ -281,16 +281,16 @@ The machine-applicable suggestion writes `as $distance` after the ranking
 An `as` on any other `from`, an inline read returning a named score
 included, is `T85` too, and the suggestion removes it.
 
-## Terms this release does not lower
+## Terms the planner does not lower
 
 A read or write the type checker accepts, the planner runs. A term that
-type-checks but that this release's planner has no plan for is refused at
+type-checks but that the planner has no plan for is refused at
 type check with `T86`, at the construct it was written as (the `let`, the
 `optional`, the `from`, the `limit`, the order key, the block's comparison,
 the write group's `match`, the statement), before any storage is read. The
 message names the stage of the language programme that adds it: `B` for a
-construct of edition 3 that this release does not run yet, `Rec` for a read
-that calls itself.
+construct of edition 3 the planner does not lower, `Rec` for a read that
+calls itself.
 
 | Refused | Stage |
 |---|---|
@@ -298,8 +298,8 @@ that calls itself.
 | A ranking beside another pattern component or correlated on an outer name, two rankings in one pattern, a ranking inside an `optional`, a `union` arm or an inline read, a ranking over a read with its own aggregate, `distinct`, `order` or `limit` | B |
 | A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope; an inline read returning an outer name under another name; a called read's `limit $k` bound to a computed argument | B |
 | A node an `optional` introduces, or an edge reference, returned whole; a `let` inside an `optional` that binds no node of its own | B |
-| A full-text call (`search`, `fuzzy`, `match_text`, `match_terms`) read as a value in `return`, `order` or a block's aggregate | B |
-| On a field whose index declares no analyzer: `match_terms` with an edit budget other than `max_edits: 0`, or `bm25` over `terms(…)` with `mode: all` or an edit budget (the exact lexical scan answers the edit relation for a declared analyzer only); an `rrf` arm over `bm25` on a field that declares one | B |
+| A full-text call (`match_terms`) read as a value in `return`, `order` or a block's aggregate | B |
+| An `rrf` arm over `bm25` | B |
 | A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B |
 | A read that calls itself (`Fix`) | Rec |
 
@@ -312,10 +312,10 @@ error[T86]: type error: T86: `q`: this release's planner does not lower an `rrf`
   --> line 1, column 94
 ```
 
-`T86` prints a fix only where a form this release runs has the same rows and
+`T86` prints a fix only where a form the planner runs has the same rows and
 result columns, and none above has one: returning an `optional` node's
 properties instead of the node, for example, changes the result columns.
-`P006` is no longer a refusal: see [Planner codes](#planner-codes).
+`P006` is not a refusal: see [Planner codes](#planner-codes).
 
 ## Planner codes
 

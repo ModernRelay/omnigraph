@@ -186,7 +186,7 @@ that only binds an outer name to filter its row, `not exists { $p: Person
 where $p.name = "bob" }`, is that filter, and the fix writes it in the
 block's place, `not ($p.name = "bob")`, or `not coalesce($p.age > 30, false)`
 where the predicate can be null, which keeps the rows whose test is null. A
-text search is written the same way, `not (search($d.title, $q))`: a
+text search is written the same way, `not (match_terms($d.title, terms($q, mode: any)))`: a
 full-text call is a Boolean operand, never null. An `optional` whose only
 element re-mentions an outer name, `optional { $p: Person where ... }`, keeps
 every row, matched or not, and introduces no name: it is `T68` with no edit.

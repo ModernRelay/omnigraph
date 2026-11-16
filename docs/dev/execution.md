@@ -94,24 +94,24 @@ A query runs against one resolved `ReadTarget`:
    it. Binding resolves its query vector by node id as it does a `nearest`
    scan's, and plan acceptance requires one `Score` per written `distance`
    over the same binding, property and query.
-   A `from bm25(rel, $x.f, q)` on a field whose index declares an analyzer
-   profile is drawn the same way, a `Score` of kind `bm25`: its query is the
-   `match_terms(field, terms(…))` predicate the score retains, so its rows are
-   the matches and its column `<binding>._score` (`F64`), read by the
-   identity column the node adds to its reads. Before the shaper places
-   anything, every `search`, `match_text` and `fuzzy` over such a field is
-   rewritten to the `match_terms` it means (`mode: any`, `fuzzy`'s budget or
-   2), so every full-text call there is a `Filter` or `Let` operand answered
-   by the exact lexical scan (below), and `match_terms` with an edit budget is
-   lowered only there. Plan acceptance also requires each such `Score` to
-   retain the `match_terms` of its own field (predicate retention), to score a
-   type that declares the profile and the `bm25_v1` scorer (scoring corpus),
-   and every `F64` `_score` the read returns, orders by or filters on to come
-   from one (score origin). The planner asks for no full-text index coverage
-   on such a field (`PlanSource::full_text_declares_analyzer`), so a declared
-   but unbuilt index answers instead of `FullTextIndexRequired`. An `rrf` arm
-   over such a `bm25` is not lowered (`T86`): the fusion ranks its arms on
-   ranked scans.
+   A `from bm25(rel, $x.f, q)` is drawn the same way, a `Score` of kind
+   `bm25`: its query is the `match_terms(field, terms(…))` predicate the score
+   retains, so its rows are the matches and its column `<binding>._score`
+   (`F64`), read by the identity column the node adds to its reads. Every
+   full-text field has a profile (`english_v1` where its index names none),
+   so every `match_terms` is a `Filter` or `Let` operand and every `bm25` a
+   `Score`, both answered by the exact lexical scan (below); nothing derives
+   a choice between an exact and a native path. A lexical predicate reads its
+   binding's identity, not its field (`optimizer::reads_of_expr`), since the
+   scan reads the field from the table. Plan acceptance requires each `Score`
+   of kind `bm25` to retain the `match_terms` of its own field (predicate
+   retention), to score a type that declares a full-text index with the
+   `bm25_v1` scorer (scoring corpus), and every `F64` `_score` the read
+   returns, orders by or filters on to come from one (score origin). The
+   planner reads no full-text index coverage for these nodes. An `rrf` arm
+   over `bm25` is not lowered (`T86`): the fusion ranks its arms on ranked
+   scans. A plan whose one ranking is such a `Score` reports the ranking
+   `bm25`, always exhaustive (`ranking::planned_ranking`).
    A `let` whose value can fail (arithmetic), and a value an inline read
    returns that can fail, is `PatternStep::Let`, then the logical and
    physical `Let` (a new node kind: no existing node evaluates a value on
@@ -203,7 +203,7 @@ whose only element is such a binding of the same type becomes its predicate in
 the block's place (`coalesce(…, false)` when the predicate can be null, as a
 probe typing the block with the re-mention correlating reports); a full-text
 call is a Boolean operand and never null, so a block filtering on one becomes
-`not (search(…))`. The inserted binding makes the triple's
+`not (match_terms(…))`. The inserted binding makes the triple's
 ends both bound, so the core term is the derived form's `Scan` and `Expand` to
 a fresh column with the identity `Filter`; the shaper reads that filter as the
 triple between the two bindings and places the binding from the bound end, so
@@ -522,12 +522,8 @@ error on execute, the error `explain_query` gives for it.
 
 Filter placement is a planner decision, the `predicate_pushdown` pass
 on a query plan (`place_query_filters`, per scope: the top-level tree and
-each correlated block's inner tree on its own): a search filter, a full-text
-call (`search`, `fuzzy`, `match_text`) standing alone or compared `= true`,
-moves to the scan of its field's binding; a conjunct that uses a full-text
-call any other way (under `not` or `or`, compared with another value, inside
-`coalesce`), and every `match_terms` conjunct, stays a `Filter`, never a
-join's own conjuncts; a scalar filter on exactly one binding that
+each correlated block's inner tree on its own): every conjunct that holds a
+`match_terms` stays a `Filter`, never a scan's or a join's own conjuncts; a scalar filter on exactly one binding that
 `QuerySource::filter_pushable` accepts moves to that binding's scan
 (`ScanSpec.filter`, a `Predicate::Gq` carrying the `IRFilter`), including
 the dependent scan that hydrates an expansion destination; a
@@ -536,8 +532,8 @@ binding inside a negation stays an in-memory `Filter` node where the query
 wrote it. A scan with a
 SQL-string filter inspects its planned filter for full-text demand (a
 `contains_tokens` call); full-text index coverage
-(`FullTextIndexRebuildRequired`) is checked only when a full-text query or a
-`contains_tokens` demand is present. A scan with no full-text query, no
+(`FullTextIndexRebuildRequired`) is checked only when a native full-text query
+(an `rrf` arm's) or a `contains_tokens` demand is present. A scan with no full-text query, no
 SQL-string filter and no `contains_tokens` call in its typed filters skips
 both.
 
@@ -1225,14 +1221,10 @@ Full-text coverage is derived from the index facts the planner reads for the
 pinned dataset (`FullTextCoverage::of_table`): `absent` without an inverted
 index on the column, `full` only when every inverted segment there reports a
 known coverage of every fragment, `partial` otherwise; a table version with no
-fragment, and a type the snapshot does not hold, are `full`. Resolution reads
-the coverage of every property a full-text call names
-(`optimizer::full_text_targets`: `search`, `fuzzy`, `match_text` and
-`match_terms` in any filter, `bm25` in the leading order key or an `rrf()` arm) and refuses
-`absent` with `FullTextIndexRequired`, the typed 409; an untrained segment is
-`partial`, since it carries the analyzer. Acceptance refuses a plan that
-records no coverage, or `absent`, for a call it makes, and replay derives
-every recorded coverage again from the pinned dataset.
+fragment, and a type the snapshot does not hold, are `full`. Only the
+eligibility placement of a ranked `bm25` scan reads it, and replay derives
+every recorded coverage again from the pinned dataset. No query is refused for
+a full-text index's state.
 
 ## Search and rank
 

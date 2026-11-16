@@ -76,8 +76,7 @@ replacement vectors; neither `merge` nor `overwrite` does that automatically.
 A ranking is a relation drawn into `match` with `from`, which names its score
 with `as`: `from nearest(rel, $c.embedding, $q, k: n) as $distance`,
 `from bm25(rel, $d.title, $q) as $score` (any term of the String `$q`; `terms($q)`
-asks for every term, which only a field that declares an analyzer lowers,
-`T86` elsewhere),
+asks for every term, `terms($q, max_edits: n)` an edit budget),
 `from rrf(arm, arm, k: 60, weights: [1.0, 1.0]) as $score`. `rel` is the population, a relation
 named with `let` before the ranking, `let $pop = { match { … } where … return { $c } }`,
 whose `return` lists every binding the rest of the query reads (an inline read
@@ -150,6 +149,7 @@ query top_titles($q: String) {
 
 `let` names the population once and both arms rank it. `rrf` takes two arms;
 identical arms, or arms that rank two different bindings, are refused (`T75`).
+An arm over `bm25` is not run (`T86`): fuse two `nearest` arms.
 A target scores the sum over the arms that selected it of
 `weight / (k + rank)`, ranks counted from 1; `weights: [w, w]` (one number in
 `(0, 1000000]` per arm, default 1.0, another length `T75`) gives an arm more
@@ -163,7 +163,7 @@ read that needs a population column draws it again after the `from`
 query hybrid($vq: Vector(1536), $tq: String) {
     match {
         let $all = { match { $d: Doc } return { $d } },
-        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60) as $score,
+        from rrf(nearest($all, $d.embedding, $vq, k: 10), nearest($all, $d.embedding, $tq, k: 10), k: 60) as $score,
     }
     return { $d.slug, $d.title }
     order { $score desc }
@@ -191,7 +191,7 @@ returns the column `relevance`), and an alias in `return` renames it like any
 column. A `let` name bound to a ranking carries an unnamed score too, so its
 `from` takes `as`; an inline read that returns a named score takes none
 (`T85`). Full-text predicates are not return
-items in this release (`T86`).
+items (`T86`).
 
 A ranking may feed aggregates, but it only selects the rows that are
 aggregated: the `k` window under `nearest`, every text match under
@@ -222,24 +222,23 @@ draws from no ranking has no `ranking`.
 
 ```gq fragment
 match { $d: Doc }
-where search($d.title, $q)                    // full-text filter
-  and fuzzy($d.title, $q, max_edits: 2)       // fuzzy filter, max 2 edits
-  and match_text($d.body, $q)                 // regular full-text filter (not phrase search)
-  and match_terms($d.body, terms($q))         // every analyzed term of $q; mode: any for one
+where match_terms($d.title, terms($q, mode: any))                 // any analyzed term of $q
+  and match_terms($d.title, terms($q, mode: any, max_edits: 2))   // within 2 edits
+  and match_terms($d.body, terms($q))                             // every analyzed term (mode: all)
 ```
 
-A full-text call (`search`, `fuzzy`, `match_text`, `bm25`) needs a full-text
-index on its property: a one-column `@index` or `@key` on a free-text String
-node property. A call on any other property, an enum included, is refused at
-type checking (`T27`); compare enums with `=`. The field's analyzer decides
-what matches (next section). `search`, `fuzzy`, `match_text` and
-`match_terms` are Boolean operands like any other in a `where`: true where the
-row is among the call's matches, false elsewhere, never null. Write
-`not search($d.title, $q)`, `search(...) or ...` or `search(...) = false`;
-the rows are the same whether or not the index covers them yet. Read as a
-value in `return`, `order` or a block's aggregate, a call is `T86`, and so is
-`match_terms` with an edit budget other than `max_edits: 0` on a field that
-declares no analyzer.
+`match_terms` is the one lexical predicate. `search`, `match_text` and `fuzzy`
+are refused (`T6`) with their fix: `match_terms(f, terms(q, mode: any))`, and
+`max_edits: 2` for a `fuzzy` without a budget. A full-text call (`match_terms`,
+`bm25`) needs a full-text index on its property: a one-column `@index` or
+`@key` on a free-text String node property. A call on any other property, an
+enum included, is refused at type checking (`T27`); compare enums with `=`.
+The field's analyzer decides what matches (next section). `match_terms` is a
+Boolean operand like any other in a `where`: true where the row is among the
+call's matches, false elsewhere, never null. Write `not match_terms(...)`,
+`match_terms(...) or ...` or `match_terms(...) = false`; the rows are the same
+whether or not the index covers them yet. Read as a value in `return`,
+`order` or a block's aggregate, a call is `T86`.
 
 ### Analyzers
 
@@ -250,35 +249,36 @@ The schema, never the query, chooses a field's analysis:
 |---|---|---|---|
 | `standard_v1` | yes | no | no |
 | `standard_folded_v1` | yes | no | yes |
-| `english_v1` | yes | English stemmer, then English stop words | yes |
+| `english_v1` | yes | Snowball English stemmer, then the profile's stop list | yes |
 
-All split on every non-alphanumeric character and keep tokens of any length.
-`"run"` matches `"Runners were RUNNING"` under `english_v1` only; `"cafe"`
-matches `"Café"` under `standard_folded_v1` and `english_v1`. A field written
-`@index` or `@index(fulltext)` without `analyzer` keeps the old default
-(stemming, stop words, folding and a 40-byte token filter); `lint` reports it
-as `L202` and names `english_v1`. `scorer = "none"` keeps the field matchable
-and makes `bm25` over it `T87`, alone or as an `rrf` arm; use a `where`
-filter there. No call takes an analyzer (`terms(…)` with one is `T71`).
+A field written `@index` or `@index(fulltext)` without `analyzer` is
+`english_v1`. All split on every non-alphanumeric character (Lance's `simple`
+tokenizer) and keep tokens of any length. `"run"` matches
+`"Runners were RUNNING"` under `english_v1` only; `"cafe"` matches `"Café"`
+under `standard_folded_v1` and `english_v1`. `english_v1`'s stop list holds
+NLTK's 198 English stop words and each one's stem, so `only` and `very` match
+nothing and `"human beings"` analyzes to `human`; a query of only stop words is
+`T20` when the read runs. `scorer = "none"` keeps the field matchable and
+makes `bm25` over it `T87`, also as an `rrf` arm (`T87` comes before `T86`);
+use a `where` filter there. No call takes an analyzer (`terms(…)` with one is
+`T71`).
 
-On a field that declares an analyzer, every full-text call is exact and reads
-no index: an exact scan normalizes each value to NFC, analyzes it with the
-profile and decides each row, so built, partly built and unbuilt indexes give
-the same rows and none is refused with `full_text_index_required`.
+Every full-text call is exact and reads no index: the exact lexical scan
+normalizes each value to NFC, analyzes it with the profile and decides each
+row, so built, partly built and unbuilt indexes give the same rows.
 `match_terms($d.f, terms($q, mode: all | any, max_edits: 0..=2))` matches a
 query term to a stored term within the budget (one edit per inserted, deleted
-or substituted character; a swap costs two); `search` and `match_text` mean
-`mode: any`, and `fuzzy` adds its budget (2 when unwritten). `bm25` there is
-`bm25_v1`, an `F64` scored against the whole field (every entity with a
-non-empty value, before filters), so a filter never changes a surviving
-row's score; the plan shows a `Score` node, not a ranked scan. `rrf` with such
-a `bm25` arm is `T86` in this release. A query over 64 KiB or 1,024 distinct
-terms, or a value over 16 MiB, fails with `resource_limit_exceeded`; the
-scan's terms and comparisons count against `read_work_limit`. On a field
-without an analyzer the calls read the index as before (`bm25` an `F32`).
-Changing a field's analyzer is a schema apply that replaces its index; on a
-field without a profile, a search of a snapshot whose index was built for
-another analysis is refused with `full_text_index_rebuild_required`.
+or substituted character; a swap costs two). `bm25` is `bm25_v1`, an `F64`
+scored against the whole field (every entity whose value has at least one
+analyzed term, before filters), so a filter never changes a surviving row's
+score; the plan shows a `Score` node, not a ranked scan. `rrf` with a `bm25`
+arm is `T86`. A query over 64 KiB or 1,024 distinct terms, or a value over
+16 MiB, fails with a resource-limit error (HTTP 413, detail `resource_limit`
+with `resource` `lexical_query_bytes`, `lexical_query_terms` or
+`lexical_value_bytes`); the scan's terms and comparisons count against
+`read_work_limit`. Changing a field's profile is a schema apply that replaces
+its index with an untrained one; `index build` builds the postings, which no
+query reads.
 
 ## The Key Pattern: Scope First, Rank Second
 
@@ -299,9 +299,10 @@ query related_chunks($artifact_slug: String, $q: Vector(1536)) {
 Scoping fixes the answer, not always the cost: a `nearest` or `rrf` scan
 prefilters to the traversal's eligible entities only when they are few:
 within `OMNIGRAPH_RRF_GATE_RATIO` of the ranked type (default 10%) and at most
-`OMNIGRAPH_RRF_GATE_MAX_IDS` (default 100000). Otherwise, and
-always for a standalone `bm25`, the ranked type is scanned and the traversal
-keeps the rows it reaches.
+`OMNIGRAPH_RRF_GATE_MAX_IDS` (default 100000). Otherwise the ranked type is
+scanned and the traversal keeps the rows it reaches. A `bm25` scores the
+population's rows, but its statistics come from the whole field, so the exact
+lexical scan reads that field across the whole type.
 
 The ranked binding starts the traversal whichever binding the population
 declares first, and whether or not it is declared: with
@@ -312,8 +313,7 @@ A standalone `nearest` ranking widens an underfilled candidate set, finally
 using an exact scan if needed to fill the limit with available survivors.
 An `rrf` vector arm retains a top-k window: an entity outside that window has
 no vector contribution, so filtering through a traversal can shorten or change
-the fused answer. Full-text arms in `rrf` remain unbounded over their eligible
-matches.
+the fused answer.
 
 A `nearest` scan uses only the IVF_FLAT vector index Omnigraph builds for the
 field's declared distance; an index built for another distance or written
@@ -364,14 +364,9 @@ For a served graph, declare a named provider under `providers.embedding` in
 be `${ENV_VAR}` references and are resolved by the server at startup. Generated
 vectors are finite, nonzero, and L2-normalized.
 
-A full-text call over a field that declares no analyzer can fail with HTTP
-`409` before any scan.
-`full_text_index_required` (a table version holds rows but no part of the
-index) clears with
-`omnigraph index build --target <target> --branch <branch>`.
-`full_text_index_rebuild_required` (an index without a certified analyzer,
-such as one built before Lance 11) clears with `index rebuild --kind full-text`
-on each live branch that needs search; see
-[`commands.md`](commands.md#index-rebuild--explicit-analyzer-upgrade). Retrying
-clears neither, and historical snapshots of the old version stay refused.
-Ordinary reads and vector search depend on neither.
+No GQ query reads a full-text index, so none fails for one. A raw
+`contains_tokens` scan filter (an SDK read, not GQ) reads the postings and fails
+with HTTP `409` `full_text_index_rebuild_required` on an index without a valid
+certificate, such as one built before Lance 11; it clears with
+`index rebuild --kind full-text` on the branch; see
+[`commands.md`](commands.md#index-rebuild--explicit-analyzer-upgrade).

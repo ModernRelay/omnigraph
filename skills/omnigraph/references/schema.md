@@ -170,12 +170,14 @@ Changing the key field is effectively a replace — it invalidates every externa
 
 ### Constraints: `@index` and a node's `@unique` are added in place
 
-Adding `@index` is metadata only. Declaring, changing or removing a full-text
-`analyzer` or `scorer` also applies in place (`schema plan` shows `change
-full-text analysis`): the apply replaces the property's index with one built
-for the new analysis, `omnigraph index build` then builds its postings, and
-searches scan with the new analysis meanwhile. A rename keeps the analysis
-and the index. Changing a vector's `distance` is in place too (`schema plan`
+Adding `@index` is metadata only. Changing a full-text field's profile or
+`scorer` also applies in place (`schema plan` shows `change full-text
+analysis`): the apply replaces the property's index with an untrained one
+for the new analysis and `omnigraph index build` then builds its postings.
+Every query reads the field with its profile through the exact lexical scan,
+never the index, so its rows follow the new analysis at once. Writing out
+`analyzer = "english_v1"`, or removing it, changes no index. A rename keeps
+the analysis and the index. Changing a vector's `distance` is in place too (`schema plan`
 shows `change vector distance`) and writes no table: `distance` and `nearest`
 answer from the exact scan with the new distance until `omnigraph index build`
 (or `optimize`) replaces the index; stored zero vectors are not rechecked and
@@ -219,8 +221,8 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 **Property-level shorthand:**
 - `@key` — single-property node key
 - `@unique` — single-property uniqueness constraint
-- `@index` — single-property index intent (currently materialized automatically only for node properties). A String property used in `search`, `fuzzy`, `match_text` or `bm25` must declare it, or the call is refused at type check (`T27`); an enum takes no full-text index (compare it with `=`)
-- `@index(fulltext, analyzer = "english_v1", scorer = "none")` — a node String property's full-text index with its analysis. `analyzer` is one of `standard_v1` (lowercase only), `standard_folded_v1` (lowercase, ASCII folding) or `english_v1` (lowercase, English stemmer, English stop words, ASCII folding); none has a token-length filter. `scorer` is `bm25_v1` (default) or `none`, which keeps matching and makes `bm25` over the field `T87`. Without `analyzer` (or a bare `@index`) the field keeps the old default analysis, and `omnigraph lint` reports `L202` naming `english_v1` as the closest profile. An unknown profile, scorer or option is a schema error listing the admitted names; analysis is refused on interface and edge properties. See [`search.md`](search.md#analyzers)
+- `@index` — single-property index intent (currently materialized automatically only for node properties). A String property used in `match_terms` or `bm25` must declare it, or the call is refused at type check (`T27`); an enum takes no full-text index (compare it with `=`)
+- `@index(fulltext, analyzer = "english_v1", scorer = "none")` — a node String property's full-text index with its analysis. `analyzer` is one of `standard_v1` (lowercase only), `standard_folded_v1` (lowercase, ASCII folding) or `english_v1` (lowercase, English stemmer, English stop words, ASCII folding); none has a token-length filter. `scorer` is `bm25_v1` (default) or `none`, which keeps matching and makes `bm25` over the field `T87`. Without `analyzer` (or a bare `@index`) the field is `english_v1`. An unknown profile, scorer or option is a schema error listing the admitted names; analysis is refused on interface and edge properties. See [`search.md`](search.md#analyzers)
 - `@embed("source_prop")` — associates a node Vector property with a String source; does not populate it during writes
 - `@description("...")` — metadata (no migration impact)
 

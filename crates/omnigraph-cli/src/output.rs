@@ -138,7 +138,7 @@ pub(crate) fn write_full_text_rebuild(
         Vec::new()
     } else {
         vec![
-            "Full-text indexes were rebuilt with each property's declared analyzer, or the default English analyzer where none is declared; any previous custom tokenizer settings were replaced.",
+            "Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced.",
         ]
     };
     if json {
@@ -2284,7 +2284,7 @@ mod tests {
     #[test]
     fn maintenance_full_text_reports_keep_warning_stream_and_noop_distinct() {
         use omnigraph::db::{FullTextIndexRebuildResult, RebuiltFullTextIndex};
-        let warning = "Full-text indexes were rebuilt with each property's declared analyzer, or the default English analyzer where none is declared; any previous custom tokenizer settings were replaced.";
+        let warning = "Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced.";
         let result = FullTextIndexRebuildResult {
             branch: "dev".into(),
             graph_commit_id: Some("commit-1".into()),

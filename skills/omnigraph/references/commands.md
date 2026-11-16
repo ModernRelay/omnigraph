@@ -344,7 +344,7 @@ rows uncovered, in one graph commit on that branch; a second run is a no-op with
 a null `graph_commit_id`. Read `indexes` (`kind`, `action`: `built` or
 `refreshed`) and `pending_indexes`: full-text coverage stays pending with the
 `index rebuild --kind full-text` remedy, as do vector properties with no vectors.
-The remedy for `FullTextIndexRequired` on any branch.
+No query waits on it: matching and `bm25` read the rows, not the index.
 
 ### `index rebuild` — explicit analyzer upgrade
 

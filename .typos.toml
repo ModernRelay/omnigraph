@@ -30,6 +30,11 @@ write_cluster_applyable_state = "write_cluster_applyable_state" # CLI test helpe
 
 [type.rust.extend-words]
 alph = "alph"         # prefix-filter probe value in literal_filters.rs
+abov = "abov"         # Snowball English stems of stop words in english_v1's stop list (schema/analysis.rs)
+becaus = "becaus"     # same list
+befor = "befor"       # same list
+ourselv = "ourselv"   # same list
+yourselv = "yourselv" # same list
 celle = "celle"       # matrix cell "e" in server/tests/multi_graph.rs (cella … cellj)
 froms = "froms"       # plural of `from`, paired with `tos`, in the DST edge fixtures
 nmae = "nmae"         # deliberately wrong parameter name (stored_queries.rs, vocabulary guard lib.rs tests)

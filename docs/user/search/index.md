@@ -1,6 +1,6 @@
 # Search
 
-OmniGraph combines vector, full-text, and graph patterns in one `.gq` query.
+Omnigraph combines vector, full-text, and graph patterns in one `.gq` query.
 Search predicates filter a matched node set; a ranking is a relation that
 `match` draws rows from with `from`, its score a column the `from` names
 with `as`.
@@ -11,12 +11,9 @@ with `as`.
 |---|---|
 | `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by the field's declared [distance](distances.md) (`l2` unless declared), with the exact distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
 | `distance(rel, $d.embedding, $q)` | Every row of `rel` with the exact distance of its vector to `$q`, under the field's declared [distance](distances.md), as the score; a row whose vector is null is dropped. `$q` may be a vector or text, as for `nearest`. |
-| `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their BM25 relevance as the score. `$q` is a String, which matches any of its terms, or a `terms(…)` value. On a field whose index declares an [analyzer](analyzers.md#exact-matching-and-scoring), the score is `bm25_v1`, an `F64`, over the whole field, and `terms(…)` may ask for every term and an edit budget. On a field without one, the score is Lance's BM25, an `F32`, and only `terms($q, mode: any)` is lowered (`T86`). |
-| `rrf(ranking, ranking, k: 60, weights: [w, w])` | Two rankings of one population fused with Reciprocal Rank Fusion: the result has the ranked node column and the fused score, named by the `as` of the `from` that draws it, and nothing else. The default `k` is 60 and every weight defaults to 1.0. |
-| `search($d.body, $q)` | Full-text token search. |
-| `fuzzy($d.body, $q, max_edits: n)` | Full-text search with edit-distance tolerance; on a field that declares an analyzer, `match_terms($d.body, terms($q, mode: any, max_edits: n))`. |
-| `match_text($d.body, $q)` | Match a full-text query in a `match` block. |
-| `match_terms($d.body, terms($q, mode: all, max_edits: n))` | True where the property holds every analyzed term of `$q` (`mode: all`, the default) or one of them (`mode: any`), each within `n` edits (0 to 2, default 0; an edit budget needs a declared analyzer). |
+| `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their [`bm25_v1`](analyzers.md#exact-matching-and-scoring) relevance, an `F64` over the whole field, as the score. `$q` is a String, which matches any of its terms, or a `terms(…)` value, which may ask for every term and an edit budget. |
+| `rrf(ranking, ranking, k: 60, weights: [w, w])` | Two rankings of one population fused with Reciprocal Rank Fusion: the result has the ranked node column and the fused score, named by the `as` of the `from` that draws it, and nothing else. The default `k` is 60 and every weight defaults to 1.0. An arm over `bm25` is not run (`T86`). |
+| `match_terms($d.body, terms($q, mode: all, max_edits: n))` | True where the property holds every analyzed term of `$q` (`mode: all`, the default) or one of them (`mode: any`), each within `n` edits (0 to 2, default 0). |
 
 The first argument of a ranking is the population it ranks: a relation a `let`
 names before the ranking, `let $pop = { match { ... } return { $d } }`, whose
@@ -46,35 +43,26 @@ Search arguments use their declared types. `nearest` requires its window `k`
 nearest targets of the population with every row each has, and the read's
 `limit`, which may be larger, smaller or absent, cuts the rows after that. A
 window read from a parameter takes the count the parameter is bound to when
-the read runs, in an `rrf` arm too; a count below 1 is refused. `fuzzy`
-defaults `max_edits` to 2 when omitted; a literal must be 0 to 2 (`T71`), a
-parameter 0 to 2 on a declared analyzer, else up to 4,294,967,295. `rrf` takes `k` as an integer
+the read runs, in an `rrf` arm too; a count below 1 is refused. `terms(…)`
+defaults `max_edits` to 0; a literal or a parameter must be 0 to 2 (`T71`).
+`rrf` takes `k` as an integer
 literal from 1 to 1,000,000 or an integer parameter, and `weights` as a list
 literal of one number per arm, each above 0 and at most 1,000,000; a list of
 another length is refused (`T75`) and a weight out of range (`T71`). Options
-are named: `fuzzy($d.body, $q, 2)` is refused (`T71`) with `max_edits: 2` as
-its fix. A supplied null is an error, including a nullable parameter that was
+are named: `nearest($pop, $d.embedding, $q, 10)` is refused (`T71`) with
+`k: 10` as its fix. A supplied null is an error, including a nullable parameter that was
 omitted from the parameter map. Query text and vectors must also be non-null;
 vector elements must convert to finite F32 values.
 
 Filters in the population's `match` are applied before ranking, so `limit 10`
 means the top ten matches that satisfy the graph and property filters.
 
-A `bm25` ranking reads every matching entity before applying the final
-limit. Equal scores are then ordered by entity identity, including when the
-smallest identity lies beyond the first search candidates.
+A `bm25` ranking scores every matching entity before applying the final
+limit. Equal scores are then ordered by entity identity.
 
-Full-text rankings inside `rrf` are
-never bounded this way: each full-text arm scans every matching entity, and
-fusion ranks the entities that satisfy the graph and property filters, so
-bounding an arm could silently drop an entity's contribution and shift fused
-results. When a traversal in the population constrains the ranked variable
-and the graph shows few entities could satisfy it, the full-text arms
-instead rank only those entities (an unbounded, index-served prefilter —
-results are identical, the scan is just smaller); broad traversals keep the
-full scan. A `nearest` ranking inside `rrf` is inherently top-k, as vector
-search always is: an entity outside its window adds no vector contribution
-to its fused score.
+A `nearest` ranking inside `rrf` is inherently top-k, as vector search always
+is: an entity outside its window adds no vector contribution to its fused
+score.
 
 `rrf` yields one row per target with the target and its fused score, and no
 other column of the population: a population whose pattern reaches a target
@@ -84,7 +72,7 @@ draws it again there, correlated on the target:
 
 ```gq fragment
 let $pop = { match { $d: Doc, $t: Tag, $d tagged $t } return { $d } },
-from rrf(nearest($pop, $d.embedding, $q, k: 10), bm25($pop, $d.body, $s)) as $score,
+from rrf(nearest($pop, $d.embedding, $q, k: 10), nearest($pop, $d.embedding, $s, k: 10)) as $score,
 $t: Tag,
 $d tagged $t,
 ```
@@ -163,7 +151,8 @@ cap remains a recall/latency tradeoff.
 
 ## Full-text search
 
-Use full-text functions for token search, fuzzy terms, and relevance. Use the
+Use `match_terms` and `bm25` for token search, edit-tolerant terms, and
+relevance. Use the
 query language's exact `contains(...)` and `starts_with(...)` functions for
 literal, case-sensitive substring and prefix matching.
 
@@ -173,23 +162,23 @@ other String property is refused at type checking (`T27`); for an enum,
 compare its values with `=` instead. The check reads only the schema.
 
 The index's analysis comes from the schema: `@index(fulltext, analyzer =
-"english_v1")` declares one of three profiles, and `scorer = "none"` keeps a
-field matchable but refuses `bm25` over it (`T87`). An index declared without
-`analyzer` keeps the default analysis earlier releases used, which folds case,
-stems and folds accents, so `"deep"` matches `"Deep Learning"`. See
-[Full-text analyzers](analyzers.md).
+"english_v1")` declares one of three profiles, an index without `analyzer`
+takes `english_v1`, and `scorer = "none"` keeps a field matchable but refuses
+`bm25` over it (`T87`). `english_v1` folds case, stems and folds accents, so
+`"deep"` matches `"Deep Learning"`. See [Full-text analyzers](analyzers.md).
 
-`search`, `match_text`, `fuzzy` and `match_terms` are Boolean operands like
-any other in a `where`: true where the row is among the call's matches, false
-elsewhere, and never null, so a row whose property is null is false. `not
-search(...)`, `search(...) or ...`, `search(...) = false` and `not
-coalesce(search(...), false)` all run, inside blocks too, and keep exactly the
-rows the call's matches decide: a call standing alone is answered by its
-binding's scan, and any other use by the same full-text query over the whole
-table, so a row an index has not covered yet answers as an indexed one does. A
-full-text call read as a value, in `return`, `order` or a block's aggregate,
-is not lowered in this release (`T86`), nor, on a field with no declared
-[analyzer](analyzers.md#exact-matching-and-scoring), is `match_terms` with an edit budget.
+`match_terms` is a Boolean operand like any other in a `where`: true where the
+row is among the call's matches, false elsewhere, and never null, so a row
+whose property is null is false. `not match_terms(...)`, `match_terms(...) or
+...`, `match_terms(...) = false` and `not coalesce(match_terms(...), false)`
+all run, inside blocks too, and keep exactly the rows the call's matches
+decide. The exact lexical scan answers every call from the field's rows and
+reads no index, so a row an index has not covered yet answers as an indexed
+one does. A full-text call read as a value, in `return`, `order` or a block's
+aggregate, is not lowered (`T86`). `search`, `match_text` and `fuzzy` are not
+functions: each is refused (`T6`) with its `match_terms` fix,
+`match_terms($d.body, terms($q, mode: any))`, and `max_edits: 2` for a `fuzzy`
+without a budget.
 
 Separate `not` blocks may reuse a local variable name for different node
 types. Each full-text call uses the index on the type and property bound
@@ -209,8 +198,8 @@ The column `as` names, `$score` here, holds the relevance the ranking used.
 `rrf` gives the fused score as an `F64`. Without an alias the result column
 takes the name `as` gave the score (`as $relevance`, returned as
 `$relevance`, is the column `relevance`); an alias in `return` renames it like
-any column. A search predicate, `search(...)`, `fuzzy(...)`, `match_text(...)`
-or `match_terms(...)`, is a filter and not a return item in this release (`T86`). An aggregate reads the score as a
+any column. A lexical predicate, `match_terms(...)`, is a filter and not a
+return item (`T86`). An aggregate reads the score as a
 column of every row the ranking keeps: `return { max($score) as best }` is
 the best score among them, and over a `nearest` window, among its targets.
 
@@ -222,13 +211,15 @@ not accelerate equality, `starts_with(...)`, or literal substring `contains(...)
 Reciprocal Rank Fusion combines rankings without assuming their raw scores use
 the same scale. Name the population once with `let` and rank it in both arms;
 `from rrf(...) as $score` draws one row per target with the fused score under
-the name its `as` writes, `$score` here:
+the name its `as` writes, `$score` here. An arm over `bm25` is not run
+(`T86`), so both arms here are `nearest`, one over a vector and one over text
+the embedding provider converts:
 
 ```gq
 query hybrid($vector: Vector(4), $text: String) {
   match {
     let $all = { match { $d: Document } return { $d } },
-    from rrf(nearest($all, $d.embedding, $vector, k: 10), bm25($all, $d.body, $text), k: 60) as $score,
+    from rrf(nearest($all, $d.embedding, $vector, k: 10), nearest($all, $d.embedding, $text, k: 10), k: 60) as $score,
   }
   return { $d.slug, $d.title }
   order { $score desc }
@@ -268,10 +259,10 @@ query passages($matter: String, $q: String) {
 }
 ```
 
-The ranking starts the traversal: the query scans every `Passage`, ranks it
-and keeps the passages the traversal reaches from the selected revision, in
-score order. Ranking a destination therefore costs a scan of the ranked type,
-however few entities the other end reaches. A `nearest` ranking ranks the
+The exact `bm25` scores the population's rows: the passages the traversal
+reaches from the selected revision, in score order. Their statistics are the
+field corpus, so the exact lexical scan reads `Passage.text` across the whole
+table however few passages the traversal reaches. A `nearest` ranking ranks the
 reached entities, never a global top list that the traversal later cuts.
 
 ## What a ranked read reports
@@ -297,11 +288,11 @@ larger is more relevant.
 
 `exhaustive` says what this run did. When it is `true`, no row the search
 admitted and did not return ranks above a returned row. `bm25` scores every
-match, so it is always exhaustive. A `nearest` search is exhaustive when it
+match with the exact lexical scan, so it is always exhaustive. A `nearest` search is exhaustive when it
 searched every partition of the vector index, scored every row without one,
 or returned every row it admitted. It is `false` when the `ann_nprobes` cap
 left partitions unsearched, so a nearer row may exist; raising the cap
-searches more. An `rrf` is exhaustive when its `nearest` arm is.
+searches more. An `rrf` is exhaustive when its `nearest` arms are.
 
 `score_columns` lists the returned columns that hold the ranking's own
 score, in return order. Two columns that return one score both appear; a
@@ -318,7 +309,7 @@ declaration, Omnigraph currently creates:
 | Property | Index use |
 |---|---|
 | Enum, number, Boolean, Date, or DateTime | Equality, range, membership, and null filters |
-| Free-text String | Full-text functions, with the declared [analyzer](analyzers.md) |
+| Free-text String | A full-text index built with the field's [analyzer](analyzers.md), which no query reads |
 | Vector | `nearest` |
 
 Node ids and edge ids/endpoints are indexed automatically. Lists and Blobs do
@@ -327,16 +318,9 @@ declarations do not currently create property indexes.
 
 Indexes are derived performance data. A new declaration may still be pending,
 and newly written entities may fall outside existing coverage. Queries remain
-correct by scanning missing or uncovered data: full-text functions match the
-scanned rows with the index's analyzer, and vector search falls back to an
-exact scan when needed. Every write records a declared full-text index's
-analyzer before its postings are built. A table version written by an older
-release may hold rows and no part of the index at all; on a field with no
-declared analyzer a full-text call on it is refused before any scan with HTTP `409` and a
-`full_text_index_required` detail naming `Type.property`, never answered
-with a case-sensitive scan. Build the index to lift it:
-`omnigraph index build --target <target> --branch <branch>`, on any branch.
-Historical snapshots of that version stay refused. Run:
+correct by scanning missing or uncovered data: `match_terms` and `bm25` read
+the field's rows with its profile and no index at all, and vector search falls
+back to an exact scan when needed. Run:
 
 ```bash
 omnigraph optimize --target ./graph.omni

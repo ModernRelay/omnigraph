@@ -63,8 +63,8 @@ See [Authorization and actors](../operations/policy.md).
 
 - `insert`, `update`, `delete` and `load` targeting an `@` type: the rows
   are the engine's.
-- `search`, `fuzzy`, `match_text`, `bm25`, `nearest` and `rrf` over a
-  catalogue binding: catalogue rows have no index. Scalar predicates,
+- `match_terms`, `bm25`, `nearest` and `rrf` over a catalogue binding:
+  catalogue properties declare no index (`T27` for the full-text calls). Scalar predicates,
   projection, aggregation, ordering, limits and joins work as on any type.
 - Under `og_catalog`: any stored type, any write, blob, branch, commit,
   snapshot, export, change feed or stored query.

@@ -1033,7 +1033,7 @@ fn optimize_json_succeeds_on_local_graph() {
     assert_eq!(
         rebuilt["warnings"],
         serde_json::json!([
-            "Full-text indexes were rebuilt with each property's declared analyzer, or the default English analyzer where none is declared; any previous custom tokenizer settings were replaced."
+            "Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced."
         ])
     );
     assert_eq!(
@@ -1065,7 +1065,7 @@ fn optimize_json_succeeds_on_local_graph() {
     let human = stdout_string(&human_output);
     let stderr = String::from_utf8(human_output.stderr).unwrap();
     assert!(
-        stderr.contains("warning: Full-text indexes were rebuilt with each property's declared analyzer, or the default English analyzer where none is declared; any previous custom tokenizer settings were replaced."),
+        stderr.contains("warning: Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced."),
         "{stderr}"
     );
     assert!(

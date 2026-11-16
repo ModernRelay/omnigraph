@@ -188,15 +188,10 @@ A `409` is not one universal retry signal:
   merging again.
 - A full-text incompatibility includes
   `full_text_index_rebuild_required: { "index": "…", "reason": "…" }` with
-  `code: "conflict"`. This condition persists until an operator rebuilds the
-  affected branch's indexes; do not automatically retry the same query. Follow
-  the [full-text upgrade procedure](upgrade.md#full-text-index-upgrade).
-- A full-text index with no part at the query's snapshot includes
-  `full_text_index_required: { "index": "Type.property" }` with
-  `code: "conflict"`. It persists until the branch's index is built
-  (`omnigraph index build --target <target> --branch <branch>`); do not retry
-  the same query. See
-  [Search indexes](../search/index.md#indexes).
+  `code: "conflict"`. Only a raw `contains_tokens` scan filter reads a
+  full-text index; no GQ query does. The condition persists until an operator
+  rebuilds the affected branch's indexes; do not automatically retry the same
+  read. Follow the [full-text upgrade procedure](upgrade.md#full-text-index-upgrade).
 - “Already initialized” means the target already contains a graph. Choose a new
   root or deliberately use the command's destructive option when appropriate.
 - `code: "writer_fenced"` means the branch's [writer epoch](#writer-epoch)

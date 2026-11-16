@@ -19,7 +19,6 @@ names a non-canonical form also has `fix`, the text that replaces the form.
 | Code | Severity | Finding |
 |---|---|---|
 | `L201` | warning | a nullable property that no update query in the file sets |
-| `L202` | info | a full-text index that declares no [analyzer](../search/analyzers.md), with the profile to declare |
 
 ## Canonical forms
 

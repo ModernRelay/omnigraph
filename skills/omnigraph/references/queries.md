@@ -39,7 +39,7 @@ Lint returns:
 - `"status": "ok"` — all queries passed
 - `"errors": N` — count of type errors (exit 1 when nonzero)
 - `"warnings": N` — count of `L201` warnings (a nullable property that no update query sets)
-- `"infos": N` — `L202` (declare an analyzer profile) and the canonical forms, each finding with its `fix`: `L203` (`count { } > 0` → `exists`), `L206` (nested `union` → flat), `L207` (`<e>` ends and alternation members in name order), `L208` (drop `asc`), `L209` (drop an alias equal to its column), `L210` (options in registry order, defaults dropped), `L211` (`bm25` over `terms(q, mode: any)` → the String); `L204`/`L205` (`count { } >= 1` / `= 0`: same rows as `exists` / `not exists`, your choice). Write the canonical form
+- `"infos": N` — the canonical forms, each finding with its `fix`: `L203` (`count { } > 0` → `exists`), `L206` (nested `union` → flat), `L207` (`<e>` ends and alternation members in name order), `L208` (drop `asc`), `L209` (drop an alias equal to its column), `L210` (options in registry order, defaults dropped), `L211` (`bm25` over `terms(q, mode: any)` → the String); `L204`/`L205` (`count { } >= 1` / `= 0`: same rows as `exists` / `not exists`, your choice). Write the canonical form
 
 Run lint after every `.gq` or `.pg` edit. Wire into precommit.
 
@@ -308,18 +308,16 @@ range fails the read instead of printing.
 
 ```gq fragment
 match { $d: Doc }
-where search($d.title, $q)     // full-text; needs @index or @key on the String (T27)
+where match_terms($d.title, terms($q, mode: any))     // any analyzed term; needs @index or @key on the String (T27)
 ```
 
 ```gq fragment
 match { $d: Doc }
-where fuzzy($d.title, $q, max_edits: 2)     // fuzzy match, max 2 edits
+where match_terms($d.title, terms($q, mode: any, max_edits: 2))     // within 2 edits
 ```
 
-```gq fragment
-match { $d: Doc }
-where match_text($d.body, $q)  // regular full-text match (not phrase search)
-```
+`search`, `match_text` and `fuzzy` are refused (`T6`) with the `match_terms`
+call as the fix (`max_edits: 2` for a `fuzzy` without a budget).
 
 ### Vector/ranking
 
@@ -351,21 +349,22 @@ of nearest targets it keeps with all their rows; the `limit` is a separate cut.
 BM25 needs neither, though a limit is recommended for bounded output.
 
 Return the score by the name `as` gave it (`as $near` returns the column
-`near`), or alias it; see [`search.md`](search.md#projecting-scores). Search predicates
-(`search`, `fuzzy`, `match_text`) are Boolean operands in `where`, under
-`not` and `or` too, and are not return items in this release (`T86`). A ranked read's JSON carries a `ranking` object; see
+`near`), or alias it; see [`search.md`](search.md#projecting-scores). The lexical
+predicate `match_terms` is a Boolean operand in `where`, under `not` and `or`
+too, and is not a return item (`T86`). A ranked read's JSON carries a `ranking` object; see
 [`search.md`](search.md#what-a-ranked-read-reports).
 
 ### Hybrid (reciprocal rank fusion)
 
 Name the population once with `let` and rank it in both arms; the two arms must
-differ and rank one binding (`T75`):
+differ and rank one binding (`T75`), and an arm over `bm25` is not run
+(`T86`):
 
 ```gq
 query hybrid_search($vq: Vector(3072), $tq: String) {
     match {
         let $all = { match { $d: Doc } return { $d } },
-        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60) as $score,
+        from rrf(nearest($all, $d.embedding, $vq, k: 10), nearest($all, $d.embedding, $tq, k: 10), k: 60) as $score,
     }
     return { $d.slug, $d.title }
     order { $score desc }

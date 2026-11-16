@@ -234,7 +234,8 @@ all dropped.
 
 A changed full-text analyzer replaces the property's index in the same
 publication with one built for the new analysis; `omnigraph index build`
-builds its postings, and searches scan with the new analysis meanwhile (see
+builds its postings; matching and ranking read the rows with the new analysis
+whatever the index's state (see
 [Analyzers and scorers](../search/analyzers.md)). A changed vector distance
 writes no table: the index built for the old distance is no longer used, reads
 answer from the exact scan, and `omnigraph index build` replaces the index (see
