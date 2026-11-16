@@ -74,11 +74,12 @@ pub(crate) async fn open_read_only_with_binding(
 /// is admitted first (before the opener's capability probe), and the policy
 /// the applied revision binds to it is installed on the handle, so every
 /// `_as` writer judges the declared actor as a server judges a served one. A
-/// standalone graph has no policy. `storage` is the adapter the caller opens
-/// the graph with.
+/// standalone graph has no policy. `storage` builds the adapter the caller
+/// opens the graph with; it runs only once the graph is admitted, since
+/// building a read-through adapter under `--base` writes the clone marker.
 pub(crate) async fn open_writable(
     binding: &CapturedStorageBinding,
-    storage: Arc<dyn omnigraph::storage::StorageAdapter>,
+    storage: impl Future<Output = Result<Arc<dyn omnigraph::storage::StorageAdapter>>>,
     stderr: &mut dyn Write,
 ) -> Result<omnigraph::db::Omnigraph> {
     let policy = match ensure_graph_with_binding(binding, stderr).await? {
@@ -86,7 +87,7 @@ pub(crate) async fn open_writable(
         None => None,
     };
     crate::command_outcome::writable_open();
-    let db = omnigraph::db::Omnigraph::open_with_storage(binding.uri(), storage).await?;
+    let db = omnigraph::db::Omnigraph::open_with_storage(binding.uri(), storage.await?).await?;
     Ok(match policy {
         Some(policy) => db.with_policy(policy),
         None => db,

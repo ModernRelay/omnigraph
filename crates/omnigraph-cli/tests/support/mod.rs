@@ -1036,6 +1036,10 @@ rules:
       actors: { group: cluster_operators }
       actions: [branch_create]
       target_branch_scope: any
+  - id: cluster-operators-reclaim
+    allow:
+      actors: { group: cluster_operators }
+      actions: [reclaim]
 "#,
     )
     .unwrap();

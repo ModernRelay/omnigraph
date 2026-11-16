@@ -97,7 +97,7 @@ pub(crate) async fn run_optimize(
     let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
     let db = crate::admission::open_writable(
         &binding,
-        omnigraph::storage::storage_for_binding(&binding)?,
+        async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
         stderr,
     )
     .await?;
@@ -119,7 +119,7 @@ pub(crate) async fn run_index(
             let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
             let db = crate::admission::open_writable(
                 &binding,
-                omnigraph::storage::storage_for_binding(&binding)?,
+                async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
                 stderr,
             )
             .await?;
@@ -177,7 +177,7 @@ pub(crate) async fn rebuild_full_text_indexes(
     let uri = binding.uri();
     let db = crate::admission::open_writable(
         binding,
-        omnigraph::storage::storage_for_binding(binding)?,
+        async { Ok(omnigraph::storage::storage_for_binding(binding)?) },
         stderr,
     )
     .await?;
@@ -231,7 +231,7 @@ pub(crate) async fn run_cleanup(
     let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
     let db = crate::admission::open_writable(
         &binding,
-        omnigraph::storage::storage_for_binding(&binding)?,
+        async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
         stderr,
     )
     .await?;

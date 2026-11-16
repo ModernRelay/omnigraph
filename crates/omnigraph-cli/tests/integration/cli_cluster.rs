@@ -3290,10 +3290,25 @@ async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
     .unwrap();
     let graph = temp.path().join("graphs/knowledge.omni");
     let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    // A write under `--base` builds a read-through adapter, which writes the
+    // clone marker, so it must be refused before that adapter is built.
+    let clone_base = tempdir().unwrap();
+    let base_graph = clone_base.path().join("base.omni");
+    init_graph(&base_graph);
+    let data = clone_base.path().join("row.jsonl");
+    fs::write(
+        &data,
+        "{\"type\": \"Person\", \"data\": {\"name\": \"Eve\"}}\n",
+    )
+    .unwrap();
+    let (data, base_graph) = (data.to_str().unwrap(), base_graph.to_str().unwrap());
     for args in [
         vec!["optimize", "--json"],
         vec!["cleanup", "--keep", "1", "--confirm", "--json"],
         vec!["branch", "create", "must-not-exist"],
+        vec![
+            "load", "--data", data, "--mode", "append", "--base", base_graph,
+        ],
     ] {
         let output = output_failure(cli().args(&args).arg("--target").arg(&graph).arg("--yes"));
         assert!(
@@ -3301,6 +3316,7 @@ async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
             "{args:?}: {output:?}"
         );
     }
+    assert!(!graph.join("__clone").exists());
     assert_eq!(
         fs::read(temp.path().join("__cluster/state.json")).unwrap(),
         before

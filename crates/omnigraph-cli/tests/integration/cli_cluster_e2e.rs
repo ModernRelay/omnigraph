@@ -152,8 +152,16 @@ fn cluster_e2e_s3_direct_root_deploys_unlocks_and_maintains_issue_1163() {
     );
     assert!(status()["lock_id"].is_null());
 
+    // The graph's applied policy judges maintenance by its actor.
     for maintenance in [
-        vec!["optimize", "--graph", "knowledge", "--json"],
+        vec![
+            "optimize",
+            "--graph",
+            "knowledge",
+            "--as",
+            "act-operator",
+            "--json",
+        ],
         vec![
             "cleanup",
             "--graph",
@@ -162,6 +170,8 @@ fn cluster_e2e_s3_direct_root_deploys_unlocks_and_maintains_issue_1163() {
             "1",
             "--confirm",
             "--yes",
+            "--as",
+            "act-operator",
             "--json",
         ],
     ] {

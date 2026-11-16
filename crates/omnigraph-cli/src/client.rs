@@ -486,7 +486,7 @@ impl GraphClient {
         stderr: &mut dyn Write,
     ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
-        let storage = crate::admission::embedded_storage(binding, base).await?;
+        let storage = crate::admission::embedded_storage(binding, base);
         let db = crate::admission::open_writable(binding, storage, stderr).await?;
         let db = match external_blob_policy {
             Some(policy) => db.with_external_blob_policy(policy)?,
