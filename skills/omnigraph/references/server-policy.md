@@ -241,11 +241,14 @@ Served requests always use the server's policy engine. Embedded engine hosts
 can also install a policy engine, and every mutating engine entry point then
 enforces it.
 
-The standalone CLI opening a direct `--target` does **not** load the
-cluster server's Cedar bundle. Its `--as` value records actor attribution but
-does not recreate server authorization. Protect raw graph storage with object
-store IAM/ACLs and restrict who can run direct maintenance. Served writes reject
-client-supplied actor identity because only the token may select it.
+A direct CLI write or maintenance command on a cluster graph (a root
+target with `--graph`, or the graph's own store) installs the policy the
+cluster applied to that graph, the one `omnigraph access` reports. It refuses
+an actor the policy does not admit, or no `--as`, with `forbidden` before any
+effect, as the server would. A standalone graph has no policy. The direct actor
+is self-declared, so this is not authentication: protect raw graph storage with
+object store IAM/ACLs. Served writes reject client-supplied actor identity
+because only the token may select it.
 
 Canonical contracts: [server operations](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/server.md)
 and [authorization](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/policy.md).

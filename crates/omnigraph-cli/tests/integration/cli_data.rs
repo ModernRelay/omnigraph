@@ -1324,12 +1324,6 @@ fn optimize_timeout_bounds_a_stalled_submission() {
 }
 
 #[test]
-fn optimize_with_as_flag_errors() {
-    let output = output_failure(cli().args(["optimize", "--as", "act-op"]));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("optimize does not accept --as"));
-}
-
-#[test]
 fn retired_address_flags_refuse_before_resolving_a_target() {
     for flag in ["--store", "--server", "--cluster", "--profile", "--uri"] {
         let output =
@@ -6547,6 +6541,192 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
     ]));
     let refusal = parse_stdout_json(&refused);
     assert_eq!(refusal["code"], "target_unknown", "{refusal}");
+}
+
+/// A graph policy where only `act-writer` may change `main`, `act-reader`
+/// may only read, and only `act-maintainer` may maintain and reclaim.
+const WRITER_READER_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  writers: [act-writer]
+  maintainers: [act-maintainer]
+  everyone: [act-writer, act-reader]
+protected_branches: [main]
+rules:
+  - id: maintainers-maintain
+    allow:
+      actors: { group: maintainers }
+      actions: [maintain]
+      branch_scope: any
+  - id: maintainers-reclaim
+    allow:
+      actors: { group: maintainers }
+      actions: [reclaim]
+  - id: everyone-reads
+    allow:
+      actors: { group: everyone }
+      actions: [read]
+      branch_scope: any
+  - id: writers-change
+    allow:
+      actors: { group: writers }
+      actions: [change]
+      branch_scope: any
+"#;
+
+/// A direct write to a cluster graph is judged by the policy the cluster
+/// applied to it, as `access` reports and as a server would judge it: through
+/// the root target and through the graph's own store, for loads, mutations
+/// and maintenance. A refused write publishes nothing; an actor the policy
+/// admits writes, and the commit records it.
+#[test]
+fn direct_writes_to_a_cluster_graph_obey_its_applied_policy_issue_1414() {
+    let cluster = converged_loaded_cluster("knowledge", Some(WRITER_READER_POLICY_YAML));
+    let root = cluster.path().to_path_buf();
+    let store = root.join("graphs").join("knowledge.omni");
+    let temp = tempdir().unwrap();
+    let mutation = temp.path().join("insert.gq");
+    write_query_file(
+        &mutation,
+        r#"
+query insert_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+"#,
+    );
+    let with_actor = |command: &mut Command, actor: Option<&str>| {
+        if let Some(actor) = actor {
+            command.args(["--as", actor]);
+        }
+    };
+    let may_change_main = |actor: Option<&str>| -> bool {
+        let mut command = cli();
+        command.arg("access").arg("--target").arg(&root).args([
+            "--graph",
+            "knowledge",
+            "--branch",
+            "main",
+            "--json",
+        ]);
+        with_actor(&mut command, actor);
+        let report = parse_stdout_json(&output_success(&mut command));
+        report["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action == "change")
+    };
+    // One command per address: the root with `--graph`, and the store.
+    let addressed = |command: &mut Command, by_store: bool| {
+        if by_store {
+            command.arg("--target").arg(&store);
+        } else {
+            command
+                .arg("--target")
+                .arg(&root)
+                .args(["--graph", "knowledge"]);
+        }
+    };
+    let mut row = 0;
+    let mut writes = |actor: Option<&str>, by_store: bool| -> Vec<std::process::Output> {
+        row += 1;
+        let data = temp.path().join(format!("row-{row}.jsonl"));
+        fs::write(
+            &data,
+            format!("{{\"type\": \"Person\", \"data\": {{\"name\": \"p{row}\", \"age\": 1}}}}\n"),
+        )
+        .unwrap();
+        let mut load = cli();
+        load.arg("load");
+        addressed(&mut load, by_store);
+        load.arg("--data")
+            .arg(&data)
+            .args(["--mode", "append", "--json"]);
+        with_actor(&mut load, actor);
+        let mut mutate = cli();
+        mutate.arg("mutate");
+        addressed(&mut mutate, by_store);
+        mutate
+            .arg("--query")
+            .arg(&mutation)
+            .arg("--params")
+            .arg(format!(r#"{{"name":"m{row}","age":2}}"#))
+            .arg("--json");
+        with_actor(&mut mutate, actor);
+        [load, mutate]
+            .into_iter()
+            .map(|mut command| {
+                let output = command.output().unwrap();
+                // A direct write keeps its cluster admission; release it so
+                // the next command is admitted.
+                unlock_cluster_fixture(&root);
+                output
+            })
+            .collect()
+    };
+
+    for actor in [Some("act-outsider"), Some("act-reader"), None] {
+        assert!(!may_change_main(actor), "{actor:?}");
+        for by_store in [false, true] {
+            let before = manifest_dataset_version(&store);
+            for output in writes(actor, by_store) {
+                assert!(!output.status.success(), "{actor:?}: {output:?}");
+                let refusal = parse_stdout_json(&output);
+                assert_eq!(refusal["code"], "forbidden", "{actor:?}: {refusal}");
+                assert_eq!(
+                    refusal["disposition"]["effects"], "none",
+                    "{actor:?}: {refusal}"
+                );
+                let message = refusal["error"].as_str().unwrap();
+                assert!(message.contains("'change'"), "{message}");
+                if actor.is_none() {
+                    assert!(message.contains("names no actor"), "{message}");
+                }
+            }
+            assert_eq!(manifest_dataset_version(&store), before, "{actor:?}");
+        }
+    }
+
+    assert!(may_change_main(Some("act-writer")));
+    for by_store in [false, true] {
+        let before = manifest_dataset_version(&store);
+        for output in writes(Some("act-writer"), by_store) {
+            assert!(output.status.success(), "{output:?}");
+            let report = parse_stdout_json(&output);
+            assert_eq!(report["commit"]["actor_id"], "act-writer", "{report}");
+        }
+        assert_eq!(manifest_dataset_version(&store), before + 2);
+    }
+
+    // Maintenance takes the same handle and names its actor with `--as`:
+    // changing data grants neither `maintain` nor `reclaim`.
+    let maintenance: [(&[&str], &str); 3] = [
+        (&["index", "build", "--branch", "main"], "'maintain'"),
+        (&["optimize"], "'maintain'"),
+        (
+            &["cleanup", "--keep", "100", "--confirm", "--yes"],
+            "'reclaim'",
+        ),
+    ];
+    let maintain = |args: &[&str], actor: &str| {
+        let mut command = cli();
+        command.args(args);
+        addressed(&mut command, false);
+        command.args(["--as", actor, "--json"]);
+        let output = command.output().unwrap();
+        unlock_cluster_fixture(&root);
+        output
+    };
+    for (args, action) in maintenance {
+        let before = manifest_dataset_version(&store);
+        let refused = maintain(args, "act-writer");
+        assert!(!refused.status.success(), "{args:?}: {refused:?}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains(action), "{args:?}: {stderr}");
+        assert_eq!(manifest_dataset_version(&store), before, "{args:?}");
+        let admitted = maintain(args, "act-maintainer");
+        assert!(admitted.status.success(), "{args:?}: {admitted:?}");
+    }
 }
 
 #[test]

@@ -300,6 +300,62 @@ impl AppliedPolicies {
         })
     }
 
+    /// The policy bound to `graph` alone. Only bundles that bind it are read,
+    /// so a damaged payload the graph does not use cannot block it, while a
+    /// bound bundle that is absent, oversized or invalid refuses, as does a
+    /// policy entry without bindings or a second bundle binding the graph.
+    pub(crate) async fn load_graph(
+        backend: &ClusterStore,
+        state: &ClusterState,
+        graph: &str,
+    ) -> Result<Option<Arc<PolicyEngine>>, Diagnostic> {
+        if state.applied_revision.resources.len() > MAX_AUTHORIZATION_RESOURCES {
+            return Err(refusal(
+                "policy_bounds_exceeded",
+                CLUSTER_STATE_FILE,
+                "applied resource count exceeds the authorization bound",
+            ));
+        }
+        let binding = format!("graph.{graph}");
+        let mut engine = None;
+        for (address, entry) in &state.applied_revision.resources {
+            let kind = resource_kind(address);
+            if !matches!(kind, ResourceKind::Policy(_)) {
+                continue;
+            }
+            let bindings = entry.applies_to.as_ref().ok_or_else(|| {
+                refusal(
+                    "applied_policy_invalid",
+                    address,
+                    "applied policy has no scope bindings",
+                )
+            })?;
+            if !bindings.iter().any(|bound| bound == &binding) {
+                continue;
+            }
+            let source = backend
+                .read_verified_payload_bounded(&kind, &entry.digest, address, MAX_POLICY_BYTES)
+                .await?;
+            if source.len() > MAX_POLICY_BYTES {
+                return Err(refusal(
+                    "policy_bounds_exceeded",
+                    address,
+                    "applied policy bytes exceed the authorization bound",
+                ));
+            }
+            let loaded = PolicyEngine::load_graph_from_source(&source, graph)
+                .map_err(|err| refusal("applied_policy_invalid", address, err.to_string()))?;
+            if engine.replace(Arc::new(loaded)).is_some() {
+                return Err(refusal(
+                    "applied_policy_invalid",
+                    address,
+                    "more than one policy binds the graph",
+                ));
+            }
+        }
+        Ok(engine)
+    }
+
     pub(crate) fn check_cluster(&self, actor: &str) -> Result<(), Diagnostic> {
         check(
             self.cluster.as_ref().ok_or_else(|| {

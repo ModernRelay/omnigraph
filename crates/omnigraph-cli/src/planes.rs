@@ -327,6 +327,9 @@ fn accepts_actor(command: &Command) -> bool {
         | Command::Index { .. }
         | Command::RebuildFullTextIndexes(_)
         | Command::Mcp(_) => true,
+        // A cluster graph's applied policy judges maintenance by this actor
+        // (`maintain`, `reclaim`); a served optimize asserts it.
+        Command::Optimize(_) | Command::Cleanup(_) => true,
         // The actor a direct target's policy decides for.
         Command::Access(_) => true,
         Command::Branch { command } => match command {
@@ -388,8 +391,6 @@ fn accepts_actor(command: &Command) -> bool {
         | Command::Organization { .. }
         | Command::Init(_)
         | Command::Upgrade(_)
-        | Command::Optimize(_)
-        | Command::Cleanup(_)
         | Command::Lint(_)
         | Command::Alias(_)
         | Command::Embed(_)
@@ -835,8 +836,8 @@ mod tests {
             (&["diff", "--from", "a", "--to", "b"], false),
             (&["changes", "poll"], false),
             (&["changes", "baseline", "--out", "out"], false),
-            (&["optimize"], false),
-            (&["cleanup"], false),
+            (&["optimize"], true),
+            (&["cleanup"], true),
             (&["mcp"], true),
             (&["mcp", "--write"], true),
             // Studio's actor is its credential's; the link asserts none.

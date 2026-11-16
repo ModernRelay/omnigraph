@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
-use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
+use omnigraph::db::{ReadTarget, SnapshotId};
 use omnigraph::settings::{SessionSettings, SettingId, SettingValue, Source};
 use omnigraph::storage::CapturedStorageBinding;
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent, Session};
@@ -412,8 +412,9 @@ impl GraphClient {
         matches!(self, GraphClient::Remote { .. })
     }
 
-    /// Writable verbs alone acquire durable cluster admission. Direct-store
-    /// access carries no Cedar policy (RFC-011), the actor rides the `_as` APIs.
+    /// Writable verbs alone acquire durable cluster admission. A cluster
+    /// graph's applied policy is installed on the handle, and the declared
+    /// actor rides the `_as` APIs into it.
     async fn open_write(
         uri: &str,
         binding: &CapturedStorageBinding,
@@ -477,7 +478,7 @@ impl GraphClient {
     /// its fresh handle when given: the one way a CLI run admits a source
     /// outside the graph (a `load csv "file://…"` statement run directly).
     async fn open_write_session_with_external_blob_policy(
-        uri: &str,
+        _uri: &str,
         binding: &CapturedStorageBinding,
         base: Option<&str>,
         settings: &[(SettingId, SettingValue)],
@@ -485,13 +486,8 @@ impl GraphClient {
         stderr: &mut dyn Write,
     ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
-        crate::admission::ensure_graph_with_binding(binding, stderr).await?;
-        crate::command_outcome::writable_open();
-        let db = Omnigraph::open_with_storage(
-            uri,
-            crate::admission::embedded_storage(binding, base).await?,
-        )
-        .await?;
+        let storage = crate::admission::embedded_storage(binding, base).await?;
+        let db = crate::admission::open_writable(binding, storage, stderr).await?;
         let db = match external_blob_policy {
             Some(policy) => db.with_external_blob_policy(policy)?,
             None => db,
