@@ -3249,10 +3249,9 @@ impl Ctx<'_> {
     /// row that `not ( … )` drops; the fix writes `coalesce(…, false)` there,
     /// which keeps every row. The block is typed with the re-mention
     /// correlating to learn that; a refusal inside it is returned first,
-    /// since it is the block's own. A lexical predicate (`search`, `fuzzy`,
-    /// `match_text`, `match_terms`) is a Boolean operand like any other, so a
-    /// block filtering on one is written the same way,
-    /// `not (search($d.title, $q))`.
+    /// since it is the block's own. The lexical predicate `match_terms` is a
+    /// Boolean operand like any other, so a block filtering on one is written
+    /// the same way, `not (match_terms($d.title, terms($q, mode: any)))`.
     fn re_mention_only(&mut self, sc: &Scope, block: &Block, outer: &[Col]) -> R<()> {
         let pattern = &block.pattern;
         let [

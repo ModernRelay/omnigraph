@@ -1503,7 +1503,7 @@ query edges() {
     return { $a.slug, $b.slug, $c.note }
 }
 query title_search($term: String) {
-    match { $d: Doc } where search($d.title, $term)
+    match { $d: Doc } where match_terms($d.title, terms($term, mode: any))
     return { $d.slug }
     order { $d.slug }
 }
@@ -2276,7 +2276,7 @@ fn genuine_lance11_storage_upgrade_round_trip() {
     // `terms`, so its file names that query `title_search`.
     let added_queries = r#"
 query title_search($term: String) {
-    match { $d: Doc } where search($d.title, $term)
+    match { $d: Doc } where match_terms($d.title, terms($term, mode: any))
     return { $d.slug }
     order { $d.slug }
 }
