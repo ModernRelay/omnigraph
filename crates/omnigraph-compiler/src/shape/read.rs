@@ -405,6 +405,14 @@ struct Ranking {
     fused: bool,
 }
 
+impl Ranking {
+    /// The names the ranking binds for the elements after it: the ranked
+    /// node column and the score's name.
+    fn bound_names(&self) -> [String; 2] {
+        [self.column.clone(), self.out.clone()]
+    }
+}
+
 /// A body split at the ranking it draws.
 struct Split<'t> {
     /// The pattern the ranking ranks (the whole body when it draws none).
@@ -535,6 +543,11 @@ struct Facts {
     optional_names: HashSet<String>,
     /// The type of every node variable the scope binds.
     types: HashMap<String, String>,
+    /// Names an enclosing step binds that these facts read without
+    /// binding: the population's names for the elements after a ranking,
+    /// the outer scope's for an `optional`'s own. An `optional` here
+    /// introduces none of them.
+    outer_names: HashSet<String>,
     /// Each `let` name and its value, earlier `let`s already read into it.
     lets: HashMap<String, IRExpr>,
     /// How many inline reads' hidden names were renamed apart so far.
@@ -610,6 +623,7 @@ impl Facts {
                 .collect(),
             optional_names: self.optional_names.clone(),
             types: self.types.clone(),
+            outer_names: self.outer_names.clone(),
             lets: HashMap::new(),
             inlined: self.inlined,
             checks: Vec::new(),
@@ -633,6 +647,7 @@ impl Facts {
             correlates,
             optional_names,
             types,
+            outer_names: _,
             lets: _,
             inlined: _,
             checks,
@@ -1135,7 +1150,13 @@ impl<'a> Shaper<'a> {
         if !fused {
             self.facts(body, &mut facts)?;
         }
-        let mut after_facts = Facts::default();
+        let mut after_facts = Facts {
+            outer_names: facts.names().into_iter().collect(),
+            ..Facts::default()
+        };
+        if let Some(ranking) = &ranking {
+            after_facts.outer_names.extend(ranking.bound_names());
+        }
         if let Some(after) = &after {
             self.facts(after, &mut after_facts)?;
         }
@@ -2100,8 +2121,13 @@ impl<'a> Shaper<'a> {
     fn optional(&self, outer: &Term, pattern: &Term, facts: &mut Facts) -> Result<(), ShapeError> {
         self.facts(outer, facts)?;
         let at = || Construct::Element(&[ElementKind::Optional], None);
+        // The names the scope binds before it are the outer columns; a
+        // rebinding of one inside is `T68`.
+        let mut outer_columns: HashSet<String> = facts.names().into_iter().collect();
+        outer_columns.extend(facts.outer_names.iter().cloned());
         let mut inner = Facts {
             inlined: facts.inlined,
+            outer_names: outer_columns.clone(),
             ..Facts::default()
         };
         self.facts(pattern, &mut inner)?;
@@ -2109,9 +2135,6 @@ impl<'a> Shaper<'a> {
         // The optional's own elements and `where` read its `let`s in place.
         let inner_lets = std::mem::take(&mut inner.lets);
         inner.substitute(&inner_lets);
-        // The names the scope binds before it are the outer columns; a
-        // rebinding of one inside is `T68`.
-        let outer_columns: HashSet<String> = facts.names().into_iter().collect();
         let introduced: Vec<String> = inner
             .names()
             .into_iter()
