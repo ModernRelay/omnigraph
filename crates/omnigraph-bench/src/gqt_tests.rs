@@ -209,7 +209,7 @@ async fn retained_unattached_chain(root: &Path) -> (Vec<GraphCommit>, Vec<GraphC
     (chain, published)
 }
 #[test]
-fn original_pairs_and_groups_preserve_pre_migration_identity() {
+fn original_pairs_and_suites_preserve_pre_migration_identity() {
     let catalog = recorded_catalog();
     let baseline: serde_json::Value =
         serde_json::from_str(include_str!("../tests/fixtures/gqt-catalog-identity.json")).unwrap();
@@ -262,9 +262,9 @@ fn original_pairs_and_groups_preserve_pre_migration_identity() {
             scenario.repetitions(&catalog.definition.defaults)
         );
     }
-    let groups: std::collections::BTreeMap<String, Vec<(String, u32)>> =
-        serde_json::from_str(include_str!("../tests/fixtures/gqt-catalog-groups.json")).unwrap();
-    assert_eq!(groups.len(), 8);
+    let suites: std::collections::BTreeMap<String, Vec<(String, u32)>> =
+        serde_json::from_str(include_str!("../tests/fixtures/gqt-catalog-suites.json")).unwrap();
+    assert_eq!(suites.len(), 8);
     let selection = |name: Option<&str>| {
         catalog
             .resolve_in(name, None, &recorded_environment())
@@ -274,10 +274,10 @@ fn original_pairs_and_groups_preserve_pre_migration_identity() {
             .map(|run| (run.case.id().to_owned(), run.repetitions))
             .collect::<Vec<_>>()
     };
-    for (group, expected) in &groups {
-        assert_eq!(selection(Some(group)), *expected, "group {group}");
+    for (suite, expected) in &suites {
+        assert_eq!(selection(Some(suite)), *expected, "suite {suite}");
     }
-    assert_eq!(selection(None), groups["local-fast"]);
+    assert_eq!(selection(None), suites["local-fast"]);
     assert_eq!(
         selection(Some("search")),
         vec![
@@ -397,14 +397,14 @@ fn query_shape_catalog_selects_complete_queries_with_bounded_plans() {
     use crate::case::{EnginePreparation, PageCacheCondition, ProcessLifecycle};
 
     let catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
-    for (group, expected) in [
+    for (suite, expected) in [
         ("query-shapes", QUERY_SHAPES.to_vec()),
         (
             "traversal",
             TRAVERSAL_SHAPES.iter().map(|(id, _)| *id).collect(),
         ),
     ] {
-        let selected = catalog.resolve(Some(group), None).unwrap();
+        let selected = catalog.resolve(Some(suite), None).unwrap();
         assert_eq!(
             selected
                 .runs
@@ -412,7 +412,7 @@ fn query_shape_catalog_selects_complete_queries_with_bounded_plans() {
                 .map(|run| (run.case.id(), run.repetitions))
                 .collect::<Vec<_>>(),
             expected.into_iter().map(|id| (id, 1)).collect::<Vec<_>>(),
-            "{group}"
+            "{suite}"
         );
     }
     for (name, warm) in query_shape_cases() {
@@ -1601,4 +1601,34 @@ async fn gqt_record_build_rejects_receipts_outside_the_frozen_program() {
         error.to_string().contains("unknown receipt ordinal"),
         "{error}"
     );
+}
+
+/// The names a `--store` child inherits: the credential sources object_store
+/// renews (container endpoint, web identity, the region) must stay in the
+/// list, or a run longer than one session dies at the expiry with no error here.
+#[test]
+fn child_environment_passes_every_renewing_credential_source() {
+    let names = crate::gqt_runner::CHILD_ENVIRONMENT;
+    for name in [
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_ROLE_SESSION_NAME",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+    ] {
+        assert!(names.contains(&name), "{name} is not passed to the child");
+    }
+    for name in [
+        "GITHUB_TOKEN",
+        "ACTIONS_RUNTIME_TOKEN",
+        "OMNIGRAPH_BENCH_PRODUCT",
+    ] {
+        assert!(
+            !names.contains(&name),
+            "{name} reaches the measured process"
+        );
+    }
 }

@@ -35,7 +35,7 @@ fn strict_config_rejects_unknown_versions_fields_and_duplicate_yaml_keys() {
         source.replacen("version: 2", "version: 3", 1),
         format!("{source}\nunknown: true\n"),
         format!("{source}\nversion: 2\n"),
-        format!("{source}\ngroups:\n  small: [custom-tiny-read]\n  small: [custom-tiny-read]\n"),
+        format!("{source}\nsuites:\n  small: [custom-tiny-read]\n  small: [custom-tiny-read]\n"),
     ] {
         assert!(Catalog::from_source(&catalog.path, &changed).is_err());
     }
@@ -63,21 +63,21 @@ fn selection_is_explicit_unique_and_does_not_load_unselected_sources() {
     assert!(explicit.resolve(Some("absent"), None).is_err());
     assert!(explicit.resolve(Some("typo"), None).is_err());
     config
-        .groups
+        .suites
         .insert("small".into(), vec!["custom-tiny-read".into()]);
     config.run = vec!["small".into(), "custom-tiny-read".into()];
     assert!(changed(&catalog, &config).is_err());
     config.run.clear();
     config
-        .groups
+        .suites
         .insert("custom-tiny-read".into(), vec!["absent".into()]);
     assert!(changed(&catalog, &config).is_err());
-    config.groups.remove("custom-tiny-read");
+    config.suites.remove("custom-tiny-read");
     config
-        .groups
+        .suites
         .insert("unknown".into(), vec!["missing".into()]);
     assert!(changed(&catalog, &config).is_err());
-    config.groups.clear();
+    config.suites.clear();
     config.scenarios[1].id = "custom-tiny-read".into();
     assert!(changed(&catalog, &config).is_err());
 }
@@ -235,4 +235,30 @@ fn workload_descriptor_inspection_refuses_excessive_expansion_before_enumeration
     );
     let case = omnigraph_gqt_core::parse_case("many_steps", &source).unwrap();
     assert!(crate::gqt_case::workload_steps(&case).is_err());
+}
+
+#[test]
+fn the_old_groups_key_is_refused_naming_suites() {
+    let (_directory, catalog) = setup();
+    let source = std::fs::read_to_string(&catalog.path).unwrap();
+    let refused = Catalog::from_source(
+        &catalog.path,
+        &format!("{source}\ngroups:\n  small: [custom-tiny-read]\n"),
+    )
+    .unwrap_err();
+    assert!(
+        refused
+            .iter()
+            .any(|d| d.message.contains("groups") && d.message.contains("suites")),
+        "{refused:?}"
+    );
+    let accepted = Catalog::from_source(
+        &catalog.path,
+        &format!("{source}\nsuites:\n  small: [custom-tiny-read]\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        accepted.selection(Some("small")).unwrap(),
+        ["custom-tiny-read"]
+    );
 }

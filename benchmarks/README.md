@@ -9,7 +9,7 @@ omnigraph-bench run tiny-read
 omnigraph-bench run --config benchmarks/custom.example.yaml
 ```
 
-The [shared config](benchmarks.yaml) defines all scenarios and groups. GQT files
+The [shared config](benchmarks.yaml) defines all scenarios and suites. GQT files
 hold the data, operations and expected results:
 
 ```text
@@ -17,7 +17,7 @@ benchmarks/
   fixtures/            # starting states; registered references/preparation together
   workloads/           # operations and verification
   deferred/            # inactive sources awaiting language/executor support
-  benchmarks.yaml      # scenario names, groups and run settings
+  benchmarks.yaml      # scenario names, suites and run settings
   custom.example.yaml  # optional example to copy
   README.md
 ```
@@ -25,12 +25,17 @@ benchmarks/
 Use `omnigraph-bench --help`, `help config` or `help cache` for the complete
 workflow. `help --json` describes this binary's commands for agents. Discovery
 works with a debug build; measurements require the qualified release build
-[described below](#run-locally).
+[described below](#run-locally). A second catalog with the same layout, kept
+elsewhere, joins this one on the command line: `--catalog benchmarks --catalog
+/path/to/other`, repeatable on `run`, `report`, `show` and `list`; a name
+resolves in the first catalog that declares it. A catalog suite is a named
+list of scenario ids; the `suite` subcommand reads another file, a
+`*.suite-v1.yaml` of legacy cases, and is not this.
 
 ## End-to-end workloads
 
 All active benchmarks are fixture/workload GQT pairs in the shared catalog.
-The `end-to-end`, `query-shapes` and `traversal` groups contain bounded graph
+The `end-to-end`, `query-shapes` and `traversal` suites contain bounded graph
 operation representatives. Run `omnigraph-bench list scenarios` for the exact
 inventory. The default remains `local-fast`.
 
@@ -52,7 +57,7 @@ read-only query scenarios of `query-shapes` and the three hop traversals of
 `traversal` run against a provisioned `omnigraph-server`: their workloads hold
 a warm-up read, the measured read, a `--- restart` and a verification read, and
 on the server the restart is the long-running lifecycle's no-op (a step
-receipt with no door opened). Six of the group's scenarios have no served door:
+receipt with no door opened). Six of the suite's scenarios have no served door:
 `e2e-query-destination-search`, `e2e-nearest-prefilter`,
 `e2e-nearest-nprobes-one` and `e2e-rrf-traversal` need indexes (search,
 nearest and RRF), and `e2e-traversal-selective-csr` and
@@ -118,7 +123,7 @@ workstation and on a qualified Linux XFS volume alike; the reset level follows
 the environment unless `protocol.reset` overrides it. `show` reports the resolved value for the host and the record
 carries the run's. The resolved backend is part of a scenario's point identity,
 so APFS and XFS runs of one id are distinct points; `branch-merge-d50-process-cold`
-and `branch-merge-d50-history64` (groups `aws-xfs-process-cold` and
+and `branch-merge-d50-history64` (suites `aws-xfs-process-cold` and
 `aws-xfs-history64`) are the lab's XFS points by where the lab runs them.
 `show` reports all effective settings before a run. `deadline_seconds: null`
 removes the measurement deadline; the supervisor remains bounded. Protocol
@@ -179,7 +184,7 @@ These inputs establish correctness conditions, not performance results.
 | Repeated deletion/recreation | `repeated-deletion-recreation-{rows,branches}` | Four bounded cycles followed by the next insertion or branch creation. Every cycle verifies exact rows; the final branch inventory and reopened views are checked. Row churn and branch churn are separate treatments. |
 | Threshold crossings | `threshold-crossings-{before,at,after,production-control}` | A configured history-release boundary: two, three, or four updates at `history_release_bytes = 2048`, plus a three-update control at the production budget 262144, followed by an insert. Exact main/child contents are checked. |
 | Equal current state, different history | `equal-current-{narrow-one-batch,wide-one-batch,wide-four-batches}` | Four identical final rows after eight past/restore cycles. Prior payload width varies from 8 to 4096 bytes; a separate treatment publishes each load in four batches. Build witnesses check equal current contents and 18/18/66 reachable commits. |
-| Unattached branch root write (group `unattached-writes`, with `tiny-mutate-unattached`) | `very-long-history-32-write-unattached`, `unattached-chain-32-write` | The history checkpoint's next update written `as unattached branch` instead of on `main`: the row is checked at the snapshot before and after a restart, `main` keeps the fixture's value, and the snapshot is dropped. The chain case keeps the same 32 updates as one retained unattached chain (a root and 31 children) with `main` at the seed. Each twin pairs with the ordinary write on the same fixture (`very-long-history-32-write`, `tiny-mutate`). |
+| Unattached branch root write (suite `unattached-writes`, with `tiny-mutate-unattached`) | `very-long-history-32-write-unattached`, `unattached-chain-32-write` | The history checkpoint's next update written `as unattached branch` instead of on `main`: the row is checked at the snapshot before and after a restart, `main` keeps the fixture's value, and the snapshot is dropped. The chain case keeps the same 32 updates as one retained unattached chain (a root and 31 children) with `main` at the seed. Each twin pairs with the ordinary write on the same fixture (`very-long-history-32-write`, `tiny-mutate`). |
 
 An unattached record costs the root write only. A child `on` an earlier
 snapshot cannot be the selected step: its base id is bound by a write earlier
@@ -207,7 +212,7 @@ suite admission also cover the larger recipes without executing them.
 
 ### Opt-in history scale
 
-The `history-1000`, `history-10000` and `history-100000` groups select read,
+The `history-1000`, `history-10000` and `history-100000` suites select read,
 next-write and reopen operations over fixed live contents with the named
 number of real updates. Their recipes live in `fixtures/`; nightly names its
 21 ordinary recipes explicitly and does not select these larger inputs.
@@ -225,7 +230,7 @@ omnigraph-bench run history-1000 --dataset-cache /qualified/cache --json
 ```
 
 These inputs have not been run as a scale campaign. Their authored scale is
-not a timing claim; no one-million-update recipe is included. The groups use
+not a timing claim; no one-million-update recipe is included. The suites use
 one repetition by default. Cache construction and verification remain outside
 the selected operation timer.
 
@@ -535,7 +540,7 @@ verified at its snapshot and dropped; `branch-merge-d50-as-commit` and
 1. Add a fixture GQT and schema-less workload GQT with explicit expectations.
 2. Use `show --workload FILE` and `init` to generate the exact measured selector.
 3. Add the scenario to `benchmarks.yaml`, or keep the custom config separately.
-4. Inspect it with `show NAME --config FILE`; optionally add its ID to a group.
+4. Inspect it with `show NAME --config FILE`; optionally add its ID to a suite.
 5. Run the explicit selection on a qualified release host.
 
 The final point ID binds a dataset logical witness, verified by embedded

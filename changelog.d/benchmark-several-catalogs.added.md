@@ -1,0 +1,1 @@
+- `omnigraph-bench --catalog <DIR|FILE>`, repeatable on `run`, `report`, `show`, `list` and `cache status`, reads several catalogs: a name resolves in the first that declares it.
