@@ -959,19 +959,17 @@ pub(crate) fn render_prop_type(prop_type: &omnigraph_compiler::PropType) -> Stri
     }
 }
 
-/// `analyzer = "english_v1", scorer = "none"`, or `edition 2 analysis` when
-/// the index declares neither.
+/// `analyzer = "english_v1", scorer = "none"`: the profile and scorer the
+/// index resolves to, an omitted analyzer or scorer named by its default.
 fn render_full_text_analysis(
     analysis: Option<&omnigraph_compiler::schema::analysis::FullTextAnalysis>,
 ) -> String {
-    let Some(analysis) = analysis else {
-        return "edition 2 analysis".to_string();
-    };
-    let analyzer = analysis.analyzer.map_or_else(
-        || "edition 2 analysis".to_string(),
-        |profile| format!("analyzer = \"{profile}\""),
-    );
-    format!("{analyzer}, scorer = \"{}\"", analysis.scorer)
+    let resolved = omnigraph_compiler::schema::analysis::FullTextAnalysis::resolved(analysis);
+    format!(
+        "analyzer = \"{}\", scorer = \"{}\"",
+        resolved.profile(),
+        resolved.scorer
+    )
 }
 
 pub(crate) fn render_annotations(

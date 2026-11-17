@@ -44,7 +44,6 @@ codes! {
 
     // Typechecker.
     T1 = "unknown node type";
-    T2 = "type has no such property";
     T3 = "a literal or binding-match value is invalid for its property, or names an undeclared parameter";
     T4 = "unknown edge type";
     T5 = "variable is not an endpoint of the traversed edge";
@@ -56,22 +55,16 @@ codes! {
     T11 = "a mutation property or meta-field is unavailable in this context";
     T12 = "insert omits a required property";
     T13 = "duplicate assignment";
-    T14 = "mutation variable is not a declared parameter";
     T15 = "traversal hop bounds or nearest operands are invalid";
     T16 = "update is not supported for edge types";
-    T17 = "nearest ordering requires a limit";
-    T19 = "search or fuzzy operands are invalid";
-    T20 = "match_text or bm25 operands are invalid";
-    T21 = "rrf operands are invalid or its ordering lacks a limit";
+    T17 = "a `nearest` call lacks its window `k`";
+    T19 = "a full-text call's field or `terms` operand is invalid";
+    T20 = "a lexical query is not a String or `terms` value, or has no searchable terms";
     T22 = "undirected traversal needs a same-endpoint-type edge";
     T23 = "a node or edge binding is used in an incompatible role";
     T24 = "a Blob property is not a read value";
     T25 = "two projections produce the same result column";
     T27 = "a full-text call needs a full-text index on its property";
-    T32 = "a retrieval cannot sit under an aggregate";
-    T33 = "a projected rank must repeat the executed retrieval";
-    T35 = "a search predicate cannot be projected";
-    T36 = "an alias cannot be projected";
     // T38 is withdrawn: a lexical predicate is a Boolean operand like any
     // other (the GQ 3 RFC, section 5).
     T39 = "an exists or aggregate block must reference an outer-bound variable";
@@ -80,8 +73,6 @@ codes! {
     T42 = "an order key must appear in return or name an alias";
     T43 = "a Boolean expression in return needs an alias";
     T44 = "a call is not allowed in a mutation condition, assignment or binding match";
-    T45 = "a property value cannot appear where a constant is required";
-    T46 = "a Boolean literal where a bare property name was meant";
     T47 = "parameter name is reserved";
     T48 = "unknown parameter type";
     T49 = "variable name is reserved for the compiler";
@@ -89,13 +80,9 @@ codes! {
     T51 = "unknown type";
     T52 = "nested list literals are not supported";
     T53 = "list literal elements must share one scalar type";
-    T54 = "a relevance ranking does not accept the asc modifier";
     T55 = "an unattached base parameter is undeclared or not a String";
     T56 = "distinct does not apply to an aggregated return";
     T57 = "distinct applies only to count";
-    T58 = "a Boolean return item compares aggregates with constants only";
-    // T59 is no longer raised: `rrf` arms that rank two bindings are T75.
-    T59 = "an rrf() ranks two bindings one traversal connects";
     // The GQ 3 RFC, section 5. T60 to T64, T66 and T67 are
     // unallocated.
     T65 = "a ranking is written as a call in order or return; it is a relation function";
