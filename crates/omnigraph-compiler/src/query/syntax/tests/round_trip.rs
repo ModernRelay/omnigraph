@@ -1127,7 +1127,7 @@ fn whitespace_may_follow_a_minus_sign() {
         ),
     ] {
         assert_eq!(
-            parse_source(&spaced).unwrap_or_else(|e| panic!("{spaced}: {e}")),
+            parse_source(spaced).unwrap_or_else(|e| panic!("{spaced}: {e}")),
             parse_source(tight).unwrap_or_else(|e| panic!("{tight}: {e}")),
             "{spaced}"
         );
