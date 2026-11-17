@@ -4806,6 +4806,14 @@ async fn next_exact_staged_chunk(
                 .map_err(OmniError::arrow_internal)?
         }
     } else {
+        // `concat` copies each slot's whole offset range, so a slice that
+        // shares its parent's buffers (a null row over a wide row's bytes)
+        // would bring those bytes along a second time. Keep each slice's own
+        // rows first, as validation does.
+        let slices = slices
+            .into_iter()
+            .map(|slice| crate::table_store::compact_retained_batch(slice).map(|(batch, _)| batch))
+            .collect::<Result<Vec<_>>>()?;
         arrow_select::concat::concat_batches(schema, &slices).map_err(OmniError::arrow_internal)?
     };
     let usage = crate::table_store::write_batch_bytes(&chunk)?;

@@ -210,9 +210,10 @@ coverage.
 A merge that writes rows is also bounded by the Blob payload it copies; see
 [Blob limits](../blobs.md#limits).
 
-Before it publishes, a merge that is not a fast forward holds every changed
-row's scalar columns in memory to check constraints; Vector and Blob columns
-are left out. Across all tables this is bounded by 32 MiB, or by
+Before it publishes, a merge holds every changed row's scalar columns in
+memory to check constraints; Vector and Blob columns are left out. This
+includes a fast forward, unless it only inserts nodes of types with no
+`@range`, `@check`, enum, non-key `@unique` or required-edge constraint. Across all tables this is bounded by 32 MiB, or by
 [`write_max_bytes`](../queries/settings.md) when it is set higher; a lower
 value does not lower this bound. A larger delta is refused as
 `branch-merge retained validation delta bytes`, with no effect. The bound

@@ -8943,6 +8943,8 @@ pub(crate) fn batch_holds_only_its_rows(batch: &RecordBatch) -> Result<bool> {
 /// itself when it holds only its rows, otherwise a copy of them. A caller
 /// that retains batches charges this size, so the charge is what the batch
 /// keeps alive and does not depend on how a scan happened to share buffers.
+/// Every site that keeps or rebuilds scanned batches (validation, and the
+/// merge's publication chunks) goes through this, so a batch has one cost.
 pub(crate) fn compact_retained_batch(batch: RecordBatch) -> Result<(RecordBatch, u64)> {
     let batch = if batch_holds_only_its_rows(&batch)? {
         batch
