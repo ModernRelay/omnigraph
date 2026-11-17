@@ -5706,9 +5706,11 @@ dependencies = [
 name = "omnigraph-reference"
 version = "0.15.1"
 dependencies = [
+ "frostem",
  "libm",
  "omnigraph-compiler",
  "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]

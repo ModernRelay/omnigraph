@@ -866,7 +866,7 @@ fn lexical_predicates_match_any_term_and_a_null_document_never() {
 }
 
 #[test]
-fn a_profile_fixes_folding_and_the_token_length_filter() {
+fn a_profile_fixes_its_whole_pipeline() {
     let catalog = catalog();
     // `standard_v1`: lowercase alone, so `café` stays and `graphs` is not
     // stemmed.
@@ -874,6 +874,11 @@ fn a_profile_fixes_folding_and_the_token_length_filter() {
     assert_eq!(
         standard.tokens("Graphs and Café").unwrap(),
         vec!["graphs", "and", "café"]
+    );
+    // NFC comes before tokenization: a decomposed `é` is one letter.
+    assert_eq!(
+        standard.tokens("Cafe\u{301}").unwrap(),
+        standard.tokens("Café").unwrap()
     );
     // `standard_folded_v1`: folded, and no profile filters tokens by length.
     let folded = Analysis::of(&catalog, Some("Doc"), "text").unwrap();
@@ -887,18 +892,23 @@ fn a_profile_fixes_folding_and_the_token_length_filter() {
         folded.tokens("Ωmega"),
         Err(Refusal::Unsupported(_))
     ));
-    // `english_v1`, the profile of an index that names none, stems and
-    // removes stop words, which this crate cannot do: refused.
-    assert!(matches!(
-        Analysis::of(&catalog, Some("Note"), "body"),
-        Err(Refusal::Unsupported(_))
-    ));
-    assert!(matches!(
-        run_refused(
-            "query q() { match { $n: Note } where match_terms($n.body, terms(\"graph\", mode: any)) return { $n.slug } }"
+    // `english_v1`, the profile of an index that names none: the English
+    // stemmer, then the stop list of each word and its stem, so `beings`
+    // (`be`) is dropped and `only` (`onli`) too; folding after stemming
+    // keeps `résumés` (`résumé`) and `resumes` (`resum`) apart.
+    let english = Analysis::of(&catalog, Some("Note"), "body").unwrap();
+    assert_eq!(
+        english
+            .tokens("Human beings only read Graphs, résumés and resumes")
+            .unwrap(),
+        vec!["human", "read", "graph", "resume", "resum"]
+    );
+    assert_eq!(
+        rows(
+            "query q() { match { $n: Note } where match_terms($n.body, terms(\"graphs\", mode: any)) return { $n.slug } }"
         ),
-        Refusal::Unsupported(_)
-    ));
+        vec![json!({"n.slug": "n1"})]
+    );
 }
 
 #[test]
@@ -906,6 +916,8 @@ fn bm25_v1_scores_by_the_rfc_formula() {
     let analysis = Analysis {
         fold: false,
         max_bytes: None,
+        stem: false,
+        stop_words: None,
     };
     let corpus = vec![
         vec!["a".to_string(), "b".to_string()],

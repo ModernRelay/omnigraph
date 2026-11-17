@@ -8,9 +8,11 @@ repository = "https://github.com/ModernRelay/omnigraph"
 publish = false
 
 [dependencies]
+frostem = { workspace = true, features = ["english"] }
 libm = { workspace = true }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1" }
 serde_json = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [lints]
 workspace = true

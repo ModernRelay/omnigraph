@@ -2,7 +2,9 @@
 //! checks: it reads the compiler's core IR and a JSONL export, never the
 //! planner, the engine or Lance. `libm` is the math library `bm25_v1`'s
 //! numeric profile names (the GQ 3 RFC, section 4), so the
-//! oracle computes the IDF with the same `log1p` the RFC fixes.
+//! oracle computes the IDF with the same `log1p` the RFC fixes;
+//! `frostem` is the Snowball English stemmer and `unicode-normalization`
+//! the NFC that `english_v1` and every profile name (section 4, Schema).
 
 use std::path::Path;
 
@@ -21,7 +23,16 @@ fn the_interpreter_depends_on_the_compiler_alone() {
         .filter_map(|l| l.split_once('=').map(|(name, _)| name.trim()))
         .filter(|name| !name.is_empty())
         .collect();
-    assert_eq!(deps, ["libm", "omnigraph-compiler", "serde_json"]);
+    assert_eq!(
+        deps,
+        [
+            "frostem",
+            "libm",
+            "omnigraph-compiler",
+            "serde_json",
+            "unicode-normalization"
+        ]
+    );
     let source = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
     for forbidden in [
         "omnigraph_planner",

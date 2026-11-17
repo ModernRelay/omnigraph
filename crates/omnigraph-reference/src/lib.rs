@@ -1770,23 +1770,27 @@ fn cast(v: Value, ty: &ExprType) -> R<Value> {
 }
 
 /// The analysis of a full-text property (section 4, Schema: Text): its
-/// profile's pipeline, `english_v1` where the index names none. Lowercasing,
-/// the simple tokenizer, the token-length filter and ASCII folding are
-/// evaluated. A profile that stems or removes stop words (`english_v1`) is
-/// refused: this crate carries no stemmer, and its stop list holds stems,
-/// so neither can be applied alone. NFC is not applied either, since it
-/// needs Unicode data this crate does not carry.
+/// profile's pipeline, `english_v1` where the index names none. NFC, the
+/// simple tokenizer, lowercasing, the token-length filter, the English
+/// (Snowball) stemmer, the stop list of each word and its stem, and ASCII
+/// folding are evaluated, in the profile's order. The stemmer is the
+/// Snowball algorithm the profile names, and the stop list is the one the
+/// profile declares (the compiler's).
 #[derive(Debug, Clone, Copy)]
 struct Analysis {
     fold: bool,
     /// Tokens of this many bytes or more are dropped, as Lance's token-length
     /// filter drops them.
     max_bytes: Option<usize>,
+    /// The profile stems with the English Snowball stemmer.
+    stem: bool,
+    /// The stop list the profile removes, after stemming.
+    stop_words: Option<&'static [&'static str]>,
 }
 
 impl Analysis {
     fn of(catalog: &Catalog, owner: Option<&str>, property: &str) -> R<Self> {
-        use omnigraph_compiler::schema::analysis::AnalyzerFilter;
+        use omnigraph_compiler::schema::analysis::{AnalyzerFilter, AnalyzerLanguage};
         let Some(profile) = owner
             .and_then(|t| catalog.node_types.get(t))
             .and_then(|t| t.full_text_profile(property))
@@ -1796,31 +1800,41 @@ impl Analysis {
             ));
         };
         let pipeline = profile.pipeline();
-        if pipeline
-            .filters
-            .iter()
-            .any(|f| matches!(f, AnalyzerFilter::Stem(_) | AnalyzerFilter::StopWords(_)))
-        {
-            return unsupported(format!(
-                "the {profile} profile, whose stemmer this crate does not carry"
-            ));
-        }
         Ok(Self {
             fold: pipeline.filters.contains(&AnalyzerFilter::AsciiFolding),
             max_bytes: pipeline.max_token_length,
+            stem: pipeline
+                .filters
+                .contains(&AnalyzerFilter::Stem(AnalyzerLanguage::English)),
+            stop_words: pipeline.stop_words(),
         })
     }
 
-    /// The analyzed tokens of `text`: split on every character that is not
-    /// alphanumeric, long tokens dropped, lowercased, folded.
+    /// The analyzed tokens of `text`: NFC, then split on every character
+    /// that is not alphanumeric, long tokens dropped, lowercased, stemmed,
+    /// stop words removed, folded.
     fn tokens(&self, text: &str) -> R<Vec<String>> {
+        use unicode_normalization::UnicodeNormalization;
+        let text: String = text.nfc().collect();
+        let stemmer = self
+            .stem
+            .then(|| frostem::Stemmer::new(frostem::Algorithm::English));
         let mut out = Vec::new();
         for word in text.split(|c: char| !c.is_alphanumeric()) {
             if word.is_empty() || self.max_bytes.is_some_and(|m| word.len() >= m) {
                 continue;
             }
-            let lower = word.to_lowercase();
-            out.push(if self.fold { fold(&lower)? } else { lower });
+            let mut token = word.to_lowercase();
+            if let Some(stemmer) = &stemmer {
+                token = stemmer.stem(&token).into_owned();
+            }
+            if self
+                .stop_words
+                .is_some_and(|stop| stop.contains(&token.as_str()))
+            {
+                continue;
+            }
+            out.push(if self.fold { fold(&token)? } else { token });
         }
         Ok(out)
     }
