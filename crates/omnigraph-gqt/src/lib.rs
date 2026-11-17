@@ -44,9 +44,15 @@ pub(crate) const RETIRED_SETTING_ENVIRONMENT: [&str; 1] = ["OMNIGRAPH_TRAVERSAL_
 /// `Omnigraph::open_clone` over that base, as the first open was.
 struct GqtHost {
     base: Option<String>,
+    /// The physical layout of a layout variant run, whose plans are not
+    /// held to the case's `--- expect plan`.
+    layout: Option<Layout>,
 }
 
-const PLAIN_HOST: GqtHost = GqtHost { base: None };
+const PLAIN_HOST: GqtHost = GqtHost {
+    base: None,
+    layout: None,
+};
 
 impl ExecutionHost for GqtHost {
     type StepGuard = Vec<dst_runner::seams::ArmedSeam>;
@@ -106,6 +112,9 @@ impl ExecutionHost for GqtHost {
     }
     fn compares_reference(&self) -> bool {
         !dst_runner::active()
+    }
+    fn checks_plans(&self) -> bool {
+        self.layout.is_none()
     }
     fn reference_rows<'a>(
         &'a self,
@@ -261,6 +270,7 @@ async fn execute_case_inner(
         let session = case_session(db, case)?;
         let host = GqtHost {
             base: base.map(str::to_owned),
+            layout: None,
         };
         return omnigraph_gqt_core::execute_steps(case, path, bless, session, uri, None, &host)
             .await
@@ -581,4 +591,141 @@ pub async fn judge_read_against_reference(
         engine: render_engine,
         reference: render_reference,
     })
+}
+
+/// A physical layout of a case's seeded graph (the layout variants,
+/// `tests/gq_layout_tests.rs`): the same rows stored and indexed four ways,
+/// under which every direct-engine case must keep its expected rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// `a`: no index is built, so every read scans.
+    NoIndexes,
+    /// `b`: every index the schema declares is built.
+    Indexed,
+    /// `c`: every index built, then the seed's second half of keyed nodes
+    /// written again, so their rows sit in fragments no index covers and
+    /// the uncovered tail is scanned beside the index.
+    PartialCoverage,
+    /// `d`: the seed's second half and then its first quarter of keyed
+    /// nodes written again, leaving several fragments with deleted rows and
+    /// their re-inserted copies, then every index built.
+    Fragmented,
+}
+
+impl Layout {
+    pub const ALL: [Layout; 4] = [
+        Layout::NoIndexes,
+        Layout::Indexed,
+        Layout::PartialCoverage,
+        Layout::Fragmented,
+    ];
+
+    pub fn letter(self) -> char {
+        match self {
+            Layout::NoIndexes => 'a',
+            Layout::Indexed => 'b',
+            Layout::PartialCoverage => 'c',
+            Layout::Fragmented => 'd',
+        }
+    }
+
+    pub fn of_letter(letter: char) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|layout| layout.letter() == letter)
+    }
+}
+
+/// The verdict of `case` with its seed stored in `layout`: every step runs
+/// as in the corpus, the reference comparison included, except that a
+/// step's `--- expect plan` is not held (it names the case's own access
+/// path).
+pub async fn execute_with_layout(case: &Case, path: &Path, layout: Layout) -> Result<(), String> {
+    let fixture = case
+        .fixture
+        .as_ref()
+        .ok_or("invalid_case: a layout variant needs the case's schema and seed")?;
+    let dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
+    let uri = dir
+        .path()
+        .to_str()
+        .ok_or_else(|| "temp path is not utf-8".to_string())?
+        .to_string();
+    let db = Omnigraph::init(&uri, &fixture.schema)
+        .await
+        .map_err(|e| format!("init failed: {e}"))?;
+    let db = with_case_external_blob_policy(db, case)?;
+    let session = case_session(db, case)?;
+    fixture.seed.load(&session).await?;
+    let index = |session: &Session| {
+        let session = session.clone();
+        async move {
+            session
+                .ensure_indices_as(None)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("ensure_indices failed: {e}"))
+        }
+    };
+    match layout {
+        Layout::NoIndexes => {}
+        Layout::Indexed => index(&session).await?,
+        Layout::PartialCoverage => {
+            index(&session).await?;
+            rewrite_keyed_nodes(&session, &fixture.seed, |i, n| i >= n / 2).await?;
+        }
+        Layout::Fragmented => {
+            rewrite_keyed_nodes(&session, &fixture.seed, |i, n| i >= n / 2).await?;
+            rewrite_keyed_nodes(&session, &fixture.seed, |i, n| i < n.div_ceil(4)).await?;
+            index(&session).await?;
+        }
+    }
+    let host = GqtHost {
+        base: None,
+        layout: Some(layout),
+    };
+    omnigraph_gqt_core::execute_steps(case, path, false, session, &uri, None, &host)
+        .await
+        .map(|_| ())
+}
+
+/// Writes again, by key (`LoadMode::Merge`), the seed lines of keyed node
+/// types that `pick(position, count)` selects: the same logical rows, moved
+/// to a new fragment with their old copies deleted. A generated seed is
+/// left as it is.
+async fn rewrite_keyed_nodes(
+    session: &Session,
+    seed: &omnigraph_gqt_core::Seed,
+    pick: impl Fn(usize, usize) -> bool,
+) -> Result<(), String> {
+    let omnigraph_gqt_core::Seed::Inline(text) = seed else {
+        return Ok(());
+    };
+    let catalog = session.catalog();
+    let keyed: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<Value>(line).ok().is_some_and(|row| {
+                row.get("type")
+                    .and_then(Value::as_str)
+                    .and_then(|t| catalog.node_types.get(t))
+                    .is_some_and(|node| node.key.is_some())
+            })
+        })
+        .collect();
+    let n = keyed.len();
+    let picked: Vec<&str> = keyed
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| pick(*i, n))
+        .map(|(_, line)| line)
+        .collect();
+    if picked.is_empty() {
+        return Ok(());
+    }
+    session
+        .load_jsonl(&picked.join("\n"), omnigraph::loader::LoadMode::Merge)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("layout rewrite failed: {e}"))
 }

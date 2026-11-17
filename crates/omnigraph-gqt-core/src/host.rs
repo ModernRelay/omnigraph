@@ -71,6 +71,14 @@ pub trait ExecutionHost: Sync {
         .boxed()
     }
 
+    /// Whether this host holds a step's `--- expect plan` against the plan
+    /// it ran. A physical-layout variant (`gq_layout_tests.rs`) does not: a
+    /// plan claim names the access path of the case's own layout, while the
+    /// rows, shapes and refusals hold under every layout.
+    fn checks_plans(&self) -> bool {
+        true
+    }
+
     /// Whether this host compares every read step with the core reference
     /// interpreter: the GQT runner on the direct engine does; DST, served
     /// and measuring executors run the case without it.

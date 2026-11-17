@@ -48,5 +48,10 @@ omnigraph-storage = { path = "../omnigraph-storage", version = "0.15.1", feature
 name = "gq_logic_tests"
 harness = false
 
+# Every direct-engine case under each physical layout; tests/gq_layout_tests.rs.
+[[test]]
+name = "gq_layout_tests"
+harness = false
+
 [lints]
 workspace = true

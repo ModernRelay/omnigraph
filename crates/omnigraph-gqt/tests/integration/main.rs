@@ -5,6 +5,7 @@ mod effective_settings;
 mod fix_convergence;
 mod law_engine_reference;
 mod law_scalar_evaluators;
+mod layout_hunts;
 mod query_corpus;
 mod replay_coverage;
 mod result_evidence;

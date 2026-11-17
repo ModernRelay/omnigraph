@@ -105,6 +105,10 @@ pub struct Case {
     /// The `# writer: held` pin: the case's process claims the writer epoch
     /// of `main` after the fixture loads and before the first step.
     writer_held: bool,
+    /// The `# layout: skipped <letters>: <reason>` opt-out: the physical
+    /// layouts (`a` to `d`, `gq_layout_tests.rs`) the case is not re-run
+    /// under, and why.
+    pub layout_skips: Option<(Vec<char>, String)>,
     pub items: Vec<Item>,
     pub needs_indices: bool,
     /// `--- csv <name>` sections: the CSV text a `load csv "<name>"` step
@@ -655,6 +659,7 @@ struct Header {
     csv_slice_bytes: Option<usize>,
     overwrite_chunk_rows: Option<usize>,
     writer_held: bool,
+    layout_skips: Option<(Vec<char>, String)>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -663,8 +668,8 @@ enum IssueRef {
     Num(u64),
 }
 
-/// The seven header keys, in the spelling the canonical form requires.
-const HEADER_KEYS: [&str; 7] = [
+/// The eight header keys, in the spelling the canonical form requires.
+const HEADER_KEYS: [&str; 8] = [
     "issue",
     "red_on",
     "notes",
@@ -672,7 +677,38 @@ const HEADER_KEYS: [&str; 7] = [
     "csv_slice_bytes",
     "overwrite_chunk_rows",
     "writer",
+    "layout",
 ];
+
+/// The physical layouts a case can opt out of (`gq_layout_tests.rs`).
+pub const LAYOUT_LETTERS: [char; 4] = ['a', 'b', 'c', 'd'];
+
+/// `skipped <letters>: <reason>`, the one form of `# layout:`.
+fn parse_layout_skips(value: &str) -> Result<(Vec<char>, String), String> {
+    let fix = "write `# layout: skipped <letters>: <reason>`, the letters among `a`, `b`, `c`, `d` separated by `, `, and the reason the case's rows depend on its own layout";
+    let rest = value
+        .strip_prefix("skipped ")
+        .ok_or_else(|| format!("`# layout:` takes `skipped <letters>: <reason>`; {fix}"))?;
+    let (letters, reason) = rest
+        .split_once(": ")
+        .ok_or_else(|| format!("`# layout:` names no reason; {fix}"))?;
+    let mut skips = Vec::new();
+    for letter in letters.split(", ") {
+        let mut chars = letter.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) if LAYOUT_LETTERS.contains(&c) && !skips.contains(&c) => skips.push(c),
+            _ => {
+                return Err(format!(
+                    "`# layout:` names `{letter}`, not a layout letter; {fix}"
+                ));
+            }
+        }
+    }
+    if reason.trim().is_empty() {
+        return Err(format!("`# layout:` names no reason; {fix}"));
+    }
+    Ok((skips, reason.to_string()))
+}
 
 /// Canonical spelling for one header key and its trimmed value.
 fn canonical_header_line(key: &str, value: &str) -> String {
@@ -732,6 +768,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, (Option<IssueRef>, Vec<CaseErr
     let mut csv_slice_bytes: Option<usize> = None;
     let mut overwrite_chunk_rows: Option<usize> = None;
     let mut writer_held = false;
+    let mut layout_skips: Option<(Vec<char>, String)> = None;
     for (idx, line) in lines.iter().enumerate() {
         let line_no = idx + 1;
         if line.trim().is_empty() {
@@ -765,6 +802,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, (Option<IssueRef>, Vec<CaseErr
             "csv_slice_bytes" => csv_slice_bytes.is_some(),
             "overwrite_chunk_rows" => overwrite_chunk_rows.is_some(),
             "writer" => writer_held,
+            "layout" => layout_skips.is_some(),
             _ => false,
         };
         if duplicate {
@@ -860,6 +898,13 @@ fn parse_header(lines: &[&str]) -> Result<Header, (Option<IssueRef>, Vec<CaseErr
                 }
                 writer_held = true;
             }
+            "layout" => match parse_layout_skips(value) {
+                Ok(skips) => layout_skips = Some(skips),
+                Err(message) => {
+                    errors.push(value_error(message));
+                    continue;
+                }
+            },
             other => unreachable!("split_header_line admits only HEADER_KEYS, got `{other}`"),
         }
     }
@@ -898,6 +943,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, (Option<IssueRef>, Vec<CaseErr
             csv_slice_bytes,
             overwrite_chunk_rows,
             writer_held,
+            layout_skips,
         }),
         (issue, _) => Err((issue, errors)),
     }
@@ -3759,6 +3805,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
         csv_slice_bytes: header.csv_slice_bytes,
         overwrite_chunk_rows: header.overwrite_chunk_rows,
         writer_held: header.writer_held,
+        layout_skips: header.layout_skips,
         items,
         needs_indices,
         csv_sections,
@@ -4406,6 +4453,7 @@ async fn run_query_step(
                     explain, report, ..
                 }),
             ) = (&step.plan, &inspection)
+                && host.checks_plans()
             {
                 validate_plan_columns(&plan.lines, &session.catalog()).map_err(&fail)?;
                 let report = report.as_ref().ok();
@@ -5147,7 +5195,7 @@ async fn run_control_step(
                 )
             });
             check_write_expect(host, name, expect, outcome).map_err(&fail)?;
-            if let Some(expect) = plan {
+            if let Some(expect) = plan.as_ref().filter(|_| host.checks_plans()) {
                 let Some((Some(accepted), executed)) = executed else {
                     return Err(fail(
                         "`--- expect plan` on a load whose receipt carries no plan".to_string(),
@@ -5212,7 +5260,7 @@ async fn run_control_step(
                     Err(e) => return Err(fail(format!("`{name}` failed: {e}"))),
                 },
             }
-            if let Some(expect) = plan {
+            if let Some(expect) = plan.as_ref().filter(|_| host.checks_plans()) {
                 check_write_plans(host, expect, &plans, "merge").map_err(fail)?;
             }
             Ok(commit)
@@ -5340,7 +5388,7 @@ async fn run_mutate_step(
                 .map_err(fail);
         }
     };
-    if let Some(expect) = &step.plan {
+    if let Some(expect) = step.plan.as_ref().filter(|_| host.checks_plans()) {
         let plans: Vec<Value> = receipt.plans.iter().map(|plan| plan.to_value()).collect();
         check_write_plans(host, expect, &plans, "mutation").map_err(fail)?;
     }
