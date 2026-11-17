@@ -231,7 +231,7 @@ ordering and limiting, so the limit counts distinct rows. Aggregates with
 or aliases, including property keys (`T42`).
 
 Order is total under the tie rule: after the written keys (ascending puts nulls
-first, descending last), each entity id in the order the pattern binds it (a
+first, descending last), each entity id in the order the pattern writes it (a
 traversal's destination before its edge), then a `from`'s value columns, all
 ascending; group rows use their keys, bare nodes (by id) first. Ids are read
 only when they can change the order. A `limit` with no `order` cuts this order

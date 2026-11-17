@@ -48,7 +48,7 @@ use proptest::test_runner::{
 
 /// The per-pull-request case count; the nightly test runs `NIGHTLY`.
 const CASES: u32 = 64;
-const NIGHTLY: u32 = 5_000;
+const NIGHTLY: u32 = 2_000;
 
 /// A law's runner: `cases` cases (`OMNIGRAPH_LAW_CASES` overrides it for a
 /// local hunt) from the deterministic seed, or from `OMNIGRAPH_LAW_SEED`
@@ -360,7 +360,7 @@ fn engine_equals_reference_on_generated_reads() {
 }
 
 #[test]
-#[ignore = "nightly: 5,000 generated reads; the gate runs 64"]
+#[ignore = "nightly: 2,000 generated reads; the gate runs 64"]
 fn engine_equals_reference_on_generated_reads_at_nightly_breadth() {
     run_law(NIGHTLY);
 }

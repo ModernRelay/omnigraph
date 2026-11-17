@@ -26,7 +26,7 @@ export budget and must not share a binary with the other export tests.
 
 | Package | Primary owners | Shared support |
 |---|---|---|
-| `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests | Module-local fixtures |
+| `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests | Module-local fixtures; `arbitrary`, the generators every [generated law](#generated-laws) draws from |
 | `omnigraph-planner` | In-source optimizer/cost tests and `tests/integration/query_plan.rs`, `tests/integration/registry.rs`, `tests/integration/lower_walk.rs`; plan assertions over real snapshots live in GQT | `PlanSource` fixtures for metadata and refusal states |
 | `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
 | `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, core, catalog, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed | None |
@@ -43,7 +43,7 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-bench` | In-source configuration tests, the local-route agreement tests (`routes_agree` in `src/gqt_tests.rs`: one scenario on the direct, object-store and read-through routes with the same verification and equal storage calls) and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
 | `omnigraph-gqt-core` | In-source format, expectation and ordinary execution tests | Shared parser and executor used by the GQT runner and benchmark harness |
 | `omnigraph-reference` | In-source `src/tests.rs`, one test per core operator of the RFC's operator table, `Fix` and `Call` included, and per lowered form (`optional`, `union`'s positional names, a call bound in the caller's scope, `distance`, an edge binding, `limit $n`, the lazy `if` and `coalesce`, an inline read's group per outer row, a block against an outer scalar, `rrf`'s one row per target), the lexical rules (any-term matching, a null document, the edit budget, a profile's whole pipeline, `english_v1`'s stemmer and stop list included, `bm25_v1`), parameter binding and the refusals; `tests/dependencies.rs`, which holds the crate to the compiler, `serde_json`, `libm`, the Snowball stemmer (`frostem`) and `unicode-normalization`, and the GQT runner to being its one dependent | Module-local fixtures; GQT's comparison of every read step on the direct engine ([GQT README](../../crates/omnigraph-gqt/README.md#reference-comparison)) is its corpus-wide use |
-| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus runner self-tests, the corpus layout check and `tests/integration/query_corpus.rs`, which parses every documented query text (the guides' and the skill's ```` ```gq ```` blocks, the `.gq` files) and type-checks each `.gq` file that has a `.pg` beside it | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; author-marked slow cases under `crates/omnigraph-gqt/cases_slow/`, run by the `GQT slow nightly` workflow and never by `cargo test`; format in RFC 0045 |
+| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), `tests/gq_layout_tests.rs`, every case again under each physical layout, the generated laws in `tests/integration/law_*.rs`, plus runner self-tests, the corpus layout check and `tests/integration/query_corpus.rs`, which parses every documented query text (the guides' and the skill's ```` ```gq ```` blocks, the `.gq` files) and type-checks each `.gq` file that has a `.pg` beside it | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; author-marked slow cases under `crates/omnigraph-gqt/cases_slow/`, run by the `GQT slow nightly` workflow and never by `cargo test`; format in RFC 0045 |
 
 Do not copy server or CLI process setup into a new suite. Their support modules own hermetic configuration, binary startup, temporary roots, and common assertions.
 
@@ -640,6 +640,38 @@ in `search.rs`, plus synthetic missing/zero/unknown/maximum metric inputs and
 replay separation in `engine/search.rs` and `engine/report/tests.rs`.
 
 The `--- expect plan` of an inspected step reads the explain document of that same `Executed`, never a second planning run; its `ran` lines read the report of that run (`crates/omnigraph-gqt-core/src/report.rs` reads the rows). A parameter refusal, a settings error and a query that failed produce no `Executed` and keep their ordinary checks.
+
+### Generated laws
+
+The GQ 3 implementation is held to laws over generated inputs, not to a
+handful of examples. One generator module, `omnigraph_compiler::arbitrary`
+(gated on `cfg(test)` or the compiler's `test-util` feature, which only
+dev-dependencies enable; `forbidden_apis.rs` pins that), draws schemas,
+graphs, well-typed GQ 3 reads and scalar expressions from one choice
+stream, so proptest shrinks the schema, the graph and the query to minimal
+forms. Each law lives with the owner of its boundary:
+
+| Law | Owner | Per pull request | Nightly |
+|---|---|---|---|
+| Generated reads type-check (generator soundness) | compiler `arbitrary::tests` | 2,000 reads | 100,000 |
+| 1. Engine equals the reference interpreter, under every traversal mode and with every index built; metamorphic: a tautology, reversed conjuncts that cannot fail, `rrf` arms swapped | `omnigraph-gqt` `integration/law_engine_reference.rs` | 64 reads | 2,000 |
+| 2. Per-row, bound-parameter, folded and reference evaluation of a scalar expression agree, and its type is the RFC's join | `omnigraph-gqt` `integration/law_scalar_evaluators.rs` | 300 expressions | 6,000 |
+| 3. Typed expressions and the charged term grow by a constant per unit of every construct family | compiler `check::tests::compile_cost` | 200 reads | 5,000 |
+| 4. Every single edit of a generated plan's replay envelope is refused or replays the run | engine `integration/plan_replay.rs` | 24 plans, 40 edits each | 300 plans, 100 edits |
+| 6b. Every direct-engine case keeps its rows under each physical layout | `omnigraph-gqt` `tests/gq_layout_tests.rs` ([GQT README](../../crates/omnigraph-gqt/README.md#physical-layouts)) | layouts `a`, `b` | `a` to `d` |
+
+The nightly twins are `#[ignore = "nightly: …"]` tests enrolled by exact
+name: the compiler's and the engine's in `tests-slow-nightly.yml`, the
+`omnigraph-gqt` ones and the four layouts in `gqt-slow-nightly.yml`.
+Seeds are deterministic (proptest's ChaCha RNG); a failing case is written
+to the law's file under `tests/regressions/` beside its crate, checked in,
+and replayed first by every later run. To hunt locally, set
+`OMNIGRAPH_LAW_CASES` (the count) and `OMNIGRAPH_LAW_SEED` (another seed);
+`OMNIGRAPH_LAW_TRACE` prints the reads that returned no row. A failure
+prints the shrunk query, the schema, the graph and both answers. Every
+generator finding is a defect: fixed at the root with the shrunk case as a
+regression (a `.gqt` case when rows show it), or pinned as a
+`#[ignore = "hunt: …"]` test beside its law when the fix is not contained.
 
 ### GQT execution through DST
 

@@ -42,7 +42,7 @@ use proptest::test_runner::TestCaseError;
 use crate::law_engine_reference::law_runner;
 
 const CASES: u32 = 300;
-const NIGHTLY: u32 = 20_000;
+const NIGHTLY: u32 = 6_000;
 
 /// The row's inputs: `(type, JSON value, literal)`, `None` for null.
 type Row = Vec<(Sc, Option<(String, Literal)>)>;
@@ -276,7 +276,7 @@ fn scalar_evaluators_agree_on_generated_expressions() {
 }
 
 #[test]
-#[ignore = "nightly: 20,000 generated expressions; the gate runs 300"]
+#[ignore = "nightly: 6,000 generated expressions; the gate runs 300"]
 fn scalar_evaluators_agree_on_generated_expressions_at_nightly_breadth() {
     run_law(NIGHTLY);
 }

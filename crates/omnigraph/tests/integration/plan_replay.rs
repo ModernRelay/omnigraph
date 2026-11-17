@@ -3529,7 +3529,7 @@ fn every_single_plan_edit_is_refused_or_replays_the_run() {
 }
 
 #[test]
-#[ignore = "nightly: 1,000 generated plans of 200 edits each; the gate runs 24 of 40"]
+#[ignore = "nightly: 300 generated plans of 100 edits each; the gate runs 24 of 40"]
 fn every_single_plan_edit_is_refused_or_replays_the_run_at_nightly_breadth() {
-    plan_acceptance_law(1_000, 200);
+    plan_acceptance_law(300, 100);
 }

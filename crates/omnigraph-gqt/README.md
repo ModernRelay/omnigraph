@@ -909,6 +909,38 @@ export does not carry, or whose data is beyond nested loops in the case's
 budget, opts out with that reason. When the RFC's semantics change, the
 interpreter changes in the same pull request.
 
+## Physical layouts
+
+Indexes, fragments and deletion vectors are derived state, so no case's
+rows may depend on them. `tests/gq_layout_tests.rs` (one libtest test per
+case, as `gq_logic_tests.rs`) re-runs every case that declares
+`target: omnigraph-engine` on the local filesystem with its seed stored in
+each physical layout (`omnigraph_gqt::Layout`):
+
+| Layout | The seeded graph |
+|---|---|
+| `a` | no index built; every read scans |
+| `b` | every index the schema declares built (`ensure_indices`) |
+| `c` | every index built, then the second half of the seed's keyed nodes written again (`load` merge), so their rows sit in fragments no index covers |
+| `d` | the second half and then the first quarter of the keyed nodes written again, leaving several fragments with deleted rows and their re-inserted copies, then every index built |
+
+Every step runs as in the corpus, the reference comparison included, and
+must keep the case's rows, shapes and refusals. A step's `--- expect plan`
+(and a load's or merge's plan expectation) is not held: it names the access
+path of the case's own layout. `OMNIGRAPH_GQT_LAYOUTS` picks the layouts,
+`a,b` when unset (the `GQ Logic Tests` gate); `GQT slow nightly` runs
+`a,b,c,d`. A case whose rows or refusal depend on its own layout opts out
+with a header naming the layouts and the reason, printed beside the result:
+
+```text
+# layout: skipped b, c, d: its refusal is the endpoint-set memory admission, estimated from index coverage
+```
+
+A difference found under a layout is a defect: a shrunk case pinned as a
+`hunt:` test (`tests/integration/layout_hunts.rs`) names it, and the corpus
+case it came from opts out of that layout with `hunt:` and the test's name in
+its reason until the fix lands.
+
 ## Run and reproduce
 
 Run the complete package (the workspace Cargo configuration enables seeded

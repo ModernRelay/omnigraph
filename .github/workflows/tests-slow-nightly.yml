@@ -97,7 +97,10 @@ jobs:
             merge_fast_forward::hydration_chunks_stay_bounded_when_row_widths_step_up \
             merge_fast_forward::hydration_chunks_stay_bounded_when_wide_rows_interleave \
             query::syntax::tests::round_trip::print_then_parse_is_the_identity_on_generated_declarations_at_nightly_breadth \
-            query::syntax::tests::round_trip::a_displayed_expression_types_to_the_expression_at_nightly_breadth
+            query::syntax::tests::round_trip::a_displayed_expression_types_to_the_expression_at_nightly_breadth \
+            arbitrary::tests::generated_reads_type_check_at_nightly_breadth \
+            query::check::tests::compile_cost::compile_cost_grows_linearly_in_every_construct_family_at_nightly_breadth \
+            plan_replay::every_single_plan_edit_is_refused_or_replays_the_run_at_nightly_breadth
           do
             filter="${filter:+$filter + }test(=$test_name)"
             owners+=(--passed "$test_name")

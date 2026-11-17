@@ -178,7 +178,8 @@ anonymous node. Binding `$p` again adds constraints on the same rows rather
 than introducing a second `$p`. Variable names beginning `__` are reserved.
 
 Without `order`, `limit n` returns the first `n` rows under the tie rule:
-each entity id in the order the pattern binds it, then a `from`'s value
+each entity id in the order the pattern binds it (an `optional`'s and a
+union's names where they are written), then a `from`'s value
 columns (group rows: their keys, bare nodes first). It reads every match to
 find them. Add `order { … }` when the rows you mean are not the smallest ids.
 `limit $n` reads the count from a parameter, which must be bound to a
