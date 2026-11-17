@@ -407,8 +407,102 @@ async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
     }
 }
 
+/// A served graph whose stored query fails to compile stays served (the
+/// GQ 3 RFC, Compatibility): that query alone is unavailable. `GET /queries`
+/// lists it with its refusal (code, position, fix, byte edits), invoking it
+/// answers `stored_query_unavailable` with the same diagnostic, and the
+/// graph serves every other query.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_query_that_fails_to_compile_is_unavailable_and_the_graph_serves() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    std::fs::write(&policy_path, INVOKE_POLICY_YAML).unwrap();
+    let registry = stored_query_registry_per_query(&[
+        ("find_person", FIND_PERSON_GQ, true),
+        // A type refusal: no `Widget` in the schema.
+        (
+            "ghost",
+            "query ghost() { match { $w: Widget } return { $w.name } }",
+            true,
+        ),
+        // A parse refusal whose fix is machine-applicable.
+        (
+            "shout",
+            "query shout() { match { $p: Person } return { $p.name || \"!\" as s } }",
+            true,
+        ),
+    ]);
+    let state = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        vec![("act-invoke".to_string(), "t-invoke".to_string())],
+        Some(&policy_path),
+        registry,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("the graph stays served: {err}"));
+    let app = omnigraph_server::build_app(state);
+
+    let (status, body) = json_response(&app, get_request(&g("/queries"), "t-invoke")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let served: Vec<&str> = body["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| q["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(served, ["find_person"], "{body}");
+    let unavailable = body["unavailable"].as_array().expect("unavailable listed");
+    assert_eq!(unavailable.len(), 2, "{body}");
+    let ghost = unavailable.iter().find(|q| q["name"] == "ghost").unwrap();
+    assert!(
+        ghost["diagnostic"]["code"]
+            .as_str()
+            .unwrap()
+            .starts_with('T'),
+        "{ghost}"
+    );
+    assert!(ghost["diagnostic"]["position"]["line"].is_u64(), "{ghost}");
+    let shout = unavailable.iter().find(|q| q["name"] == "shout").unwrap();
+    assert_eq!(shout["diagnostic"]["code"], "Q012", "{shout}");
+    assert!(shout["diagnostic"]["fix"].is_string(), "{shout}");
+    assert!(
+        !shout["diagnostic"]["suggestion"]["edits"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the byte edits ride the listing: {shout}"
+    );
+    assert!(
+        shout["error"].as_str().unwrap().contains("error[Q012]"),
+        "{shout}"
+    );
+
+    // Invoking it answers the same refusal; nothing runs.
+    let (status, body) = json_response(&app, invoke_request("shout", "t-invoke", json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stored_query_unavailable", "{body}");
+    assert_eq!(body["diagnostic"], shout["diagnostic"], "{body}");
+    assert_eq!(body["disposition"]["effects"], "none", "{body}");
+
+    // The graph serves its other queries.
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "find_person",
+            "t-invoke",
+            json!({ "params": { "name": "Alice" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["row_count"], 1, "{body}");
+}
+
+/// The strict registry keeps today's behavior: one stored query that fails
+/// to compile refuses the graph.
 #[tokio::test]
-async fn server_refuses_boot_on_type_broken_stored_query() {
+async fn a_strict_registry_refuses_boot_on_type_broken_stored_query() {
     // A stored query referencing a type not in the schema (`Widget`)
     // must abort boot, naming the offending query.
     let temp = init_loaded_graph().await;

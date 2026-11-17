@@ -60,10 +60,43 @@ impl StoredQuery {
     }
 }
 
+/// A stored query this server does not serve: its source fails to compile
+/// under this release (a parse or a type refusal, or a declaration the
+/// registry key does not name). The graph stays served; this query alone is
+/// unavailable, listed with its refusal, and invoking it answers that
+/// refusal (the GQ 3 RFC, Compatibility).
+#[derive(Debug, Clone)]
+pub struct UnavailableQuery {
+    pub name: String,
+    /// Full `.gq` source text the query was registered with.
+    pub source: Arc<str>,
+    /// The refusal's one-line rendering.
+    pub message: String,
+    /// The compiler's diagnostic (code, position, fix, byte edits) behind
+    /// the message, when the refusal carries one.
+    pub diagnostic: Option<omnigraph_compiler::QueryDiagnostic>,
+}
+
+impl UnavailableQuery {
+    /// The refusal as the upgrade contract states it ([`refusal_text`]).
+    pub fn refusal(&self) -> String {
+        refusal_text(&self.message, self.diagnostic.as_ref())
+    }
+}
+
 /// A loaded, identity-checked stored-query registry for one graph.
+///
+/// A registry is strict or per-query. A strict one ([`Self::from_specs`])
+/// refuses as a whole: one entry that fails to load or to type-check
+/// refuses the registry, and with it the graph. A per-query one
+/// ([`Self::from_specs_per_query`], the server's default) keeps every entry
+/// that loads and type-checks and holds each other one as an
+/// [`UnavailableQuery`].
 #[derive(Debug, Clone, Default)]
 pub struct QueryRegistry {
     by_name: BTreeMap<String, StoredQuery>,
+    unavailable: BTreeMap<String, UnavailableQuery>,
+    strict: bool,
 }
 
 /// In-memory registry spec: a query's name + already-read `.gq` source. The
@@ -145,8 +178,87 @@ impl QueryRegistry {
     /// Build a registry from in-memory specs: parse each source, select
     /// the declaration whose symbol equals the manifest key, and assert
     /// they agree. Collects every failure. No schema type-checking here
-    /// — that is [`check`].
+    /// — that is [`check`]. The registry is strict: one failure refuses it.
     pub fn from_specs(specs: Vec<RegistrySpec>) -> Result<Self, Vec<LoadError>> {
+        let (mut registry, errors) = Self::load(specs);
+        if errors.is_empty() {
+            registry.strict = true;
+            Ok(registry)
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// [`Self::from_specs`], per query: an entry that fails to load is held
+    /// as an [`UnavailableQuery`] with its refusal, and the others load. A
+    /// failure no entry owns refuses the registry.
+    pub fn from_specs_per_query(specs: Vec<RegistrySpec>) -> Result<Self, Vec<LoadError>> {
+        let sources: BTreeMap<String, Arc<str>> = specs
+            .iter()
+            .map(|spec| (spec.name.clone(), Arc::from(spec.source.as_str())))
+            .collect();
+        let (mut registry, errors) = Self::load(specs);
+        let mut registry_errors = Vec::new();
+        for error in errors {
+            let Some(name) = error.query.clone() else {
+                registry_errors.push(error);
+                continue;
+            };
+            registry.by_name.remove(&name);
+            registry.unavailable.insert(
+                name.clone(),
+                UnavailableQuery {
+                    source: sources.get(&name).cloned().unwrap_or_else(|| Arc::from("")),
+                    name,
+                    message: error.message,
+                    diagnostic: error.diagnostic.map(|d| *d),
+                },
+            );
+        }
+        if registry_errors.is_empty() {
+            Ok(registry)
+        } else {
+            Err(registry_errors)
+        }
+    }
+
+    /// Whether one failing entry refuses the registry, and its graph.
+    pub fn is_strict(&self) -> bool {
+        self.strict
+    }
+
+    /// Hold each query `report` names as broken as an [`UnavailableQuery`]
+    /// with its refusal, out of the queries served.
+    pub fn withdraw_breakages(&mut self, report: &CheckReport) {
+        for breakage in &report.breakages {
+            let Some(query) = self.by_name.remove(&breakage.query) else {
+                continue;
+            };
+            self.unavailable.insert(
+                query.name.clone(),
+                UnavailableQuery {
+                    name: query.name,
+                    source: query.source,
+                    message: breakage.message.clone(),
+                    diagnostic: breakage.diagnostic.clone(),
+                },
+            );
+        }
+    }
+
+    /// The queries this server does not serve, by name.
+    pub fn unavailable(&self) -> impl Iterator<Item = &UnavailableQuery> {
+        self.unavailable.values()
+    }
+
+    /// The unavailable query of this name.
+    pub fn lookup_unavailable(&self, name: &str) -> Option<&UnavailableQuery> {
+        self.unavailable.get(name)
+    }
+
+    /// Every entry loaded, and every failure an entry or the registry
+    /// owns.
+    fn load(specs: Vec<RegistrySpec>) -> (Self, Vec<LoadError>) {
         let mut by_name = BTreeMap::new();
         let mut errors = Vec::new();
 
@@ -221,11 +333,13 @@ impl QueryRegistry {
             }
         }
 
-        if errors.is_empty() {
-            Ok(Self { by_name })
-        } else {
-            Err(errors)
-        }
+        (
+            Self {
+                by_name,
+                ..Self::default()
+            },
+            errors,
+        )
     }
 
     pub fn lookup(&self, name: &str) -> Option<&StoredQuery> {
@@ -236,8 +350,9 @@ impl QueryRegistry {
         self.by_name.values()
     }
 
+    /// No query, served or unavailable.
     pub fn is_empty(&self) -> bool {
-        self.by_name.is_empty()
+        self.by_name.is_empty() && self.unavailable.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -247,9 +362,11 @@ impl QueryRegistry {
 
 /// A stored query that fails to type-check against the live schema —
 /// e.g. it references a node/edge type or property that was renamed or
-/// removed by a migration. Breakages **block server boot** (same posture
-/// as bad policy YAML), surfacing schema drift at the deploy boundary
-/// rather than silently at invocation time.
+/// removed by a migration, or written in a syntax this release refuses. In a
+/// strict registry breakages **block the graph's startup** (same posture as
+/// bad policy YAML); in a per-query one each broken query alone is
+/// withdrawn ([`QueryRegistry::withdraw_breakages`]), surfacing the drift at
+/// the deploy boundary rather than silently at invocation time.
 #[derive(Debug, Clone)]
 pub struct Breakage {
     pub query: String,

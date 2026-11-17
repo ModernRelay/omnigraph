@@ -111,6 +111,15 @@ pub(crate) async fn server_ready(
         .filter(|entry| matches!(entry, GraphEntry::Loading(_)))
         .count();
     let blocked_graph_count = served_graph_count - ready_graph_count - loading_graph_count;
+    let unavailable_query_count = entries
+        .iter()
+        .map(|entry| match entry {
+            GraphEntry::Ready(view) | GraphEntry::Transitioning(view) => {
+                api::unavailable_queries(view.handle()).len()
+            }
+            GraphEntry::Loading(_) | GraphEntry::Blocked(_) => 0,
+        })
+        .sum();
     let ready =
         !draining && loading_graph_count == 0 && (served_graph_count == 0 || ready_graph_count > 0);
     let output = ReadinessOutput {
@@ -134,6 +143,7 @@ pub(crate) async fn server_ready(
         ready_graph_count,
         loading_graph_count,
         blocked_graph_count,
+        unavailable_query_count,
         shutdown_grace_seconds: state.shutdown_grace.as_secs(),
     };
     let status = if ready {
@@ -200,6 +210,12 @@ pub(crate) async fn server_graphs_list(
                 GraphEntry::Blocked(graph) => Some(graph.failure),
             };
             let available = !stopping && matches!(entry, GraphEntry::Ready(_));
+            let unavailable_queries = match &entry {
+                GraphEntry::Ready(view) | GraphEntry::Transitioning(view) => {
+                    api::unavailable_queries(view.handle())
+                }
+                GraphEntry::Loading(_) | GraphEntry::Blocked(_) => Vec::new(),
+            };
             GraphInfo {
                 graph_id: entry.key().graph_id.as_str().to_string(),
                 uri: entry.uri().to_string(),
@@ -226,6 +242,7 @@ pub(crate) async fn server_graphs_list(
                         GraphEntry::Blocked(_) => GraphAvailabilityAction::ApplyCorrectionOrRestart,
                     }
                 },
+                unavailable_queries,
             }
         })
         .collect();
@@ -2212,7 +2229,7 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
-        (status = 409, description = "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding (full_text_index_rebuild_required), which retrying does not clear", body = ErrorOutput),
+        (status = 409, description = "Stored mutation write-authority conflict, a full-text index requires explicit rebuilding (full_text_index_rebuild_required), which retrying does not clear, or the stored query fails to compile under this release (stored_query_unavailable, with its diagnostic)", body = ErrorOutput),
         (status = 413, description = "Stored keyed mutation exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "A stored mutation could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
@@ -2335,6 +2352,15 @@ async fn invoke_stored_query(
         Authz::Denied(_) => return Err(ApiError::not_found(NOT_FOUND)),
     }
 
+    // A stored query whose source fails to compile under this release is
+    // unavailable: its refusal, never a run (the graph serves the others).
+    if let Some(unavailable) = handle
+        .queries
+        .as_ref()
+        .and_then(|registry| registry.lookup_unavailable(&name))
+    {
+        return Err(ApiError::stored_query_unavailable(unavailable));
+    }
     // Resolve against the per-graph registry (same 404 on a miss).
     let stored = handle
         .queries
@@ -2460,7 +2486,11 @@ pub(crate) async fn server_list_queries(
             .collect(),
         None => Vec::new(),
     };
-    Ok(Json(QueriesCatalogOutput { queries }))
+    let unavailable = api::unavailable_queries(&handle);
+    Ok(Json(QueriesCatalogOutput {
+        queries,
+        unavailable,
+    }))
 }
 
 #[utoipa::path(

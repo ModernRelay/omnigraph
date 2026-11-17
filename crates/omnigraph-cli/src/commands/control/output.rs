@@ -55,6 +55,11 @@ pub(crate) struct QueriesListItem {
 #[derive(serde::Serialize)]
 pub(crate) struct QueriesListOutput {
     pub(crate) queries: Vec<QueriesListItem>,
+    /// Stored queries whose source this binary refuses to parse, each with
+    /// its refusal, as a served graph's catalog lists them; `queries
+    /// validate` type-checks the others too.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unavailable: Vec<omnigraph_api_types::UnavailableQueryOutput>,
 }
 
 pub(super) fn write_policy_explain(
@@ -126,7 +131,7 @@ pub(super) fn write_queries_list(
 ) -> Result<()> {
     if json {
         write_json(output, stdout)?;
-    } else if output.queries.is_empty() {
+    } else if output.queries.is_empty() && output.unavailable.is_empty() {
         writeln!(stdout, "(no stored queries registered)")?;
     } else {
         for q in &output.queries {
@@ -161,6 +166,12 @@ pub(super) fn write_queries_list(
             )?;
         }
     }
+    if !json {
+        // A query whose source this binary refuses: its name and refusal.
+        for q in &output.unavailable {
+            writeln!(stdout, "unavailable {}: {}", q.name, q.error)?;
+        }
+    }
     Ok(())
 }
 
@@ -173,7 +184,7 @@ pub(super) fn write_queries_catalog(
 ) -> Result<()> {
     if json {
         write_json(catalog, stdout)?;
-    } else if catalog.queries.is_empty() {
+    } else if catalog.queries.is_empty() && catalog.unavailable.is_empty() {
         writeln!(stdout, "(no stored queries registered)")?;
     } else {
         for q in &catalog.queries {
@@ -195,6 +206,11 @@ pub(super) fn write_queries_catalog(
                 },
                 stdout,
             )?;
+        }
+        // A query whose source fails to compile under the server's release:
+        // its name and its refusal, which its printed fix repairs.
+        for q in &catalog.unavailable {
+            writeln!(stdout, "unavailable {}: {}", q.name, q.error)?;
         }
     }
     Ok(())
@@ -337,6 +353,12 @@ mod tests {
                     },
                 ],
             }],
+            unavailable: vec![omnigraph_api_types::UnavailableQueryOutput {
+                name: "legacy".into(),
+                error: "error[Q009] at line 1, column 1: `mutation` is not a declaration keyword"
+                    .into(),
+                diagnostic: None,
+            }],
         };
         let mut human = Vec::new();
         write_queries_list(&output, false, &mut human).unwrap();
@@ -347,6 +369,7 @@ mod tests {
                 "    description: Find people\n",
                 "                 by name\n",
                 "    instruction: \n",
+                "unavailable legacy: error[Q009] at line 1, column 1: `mutation` is not a declaration keyword\n",
             )
         );
         let mut encoded = Vec::new();
@@ -357,7 +380,9 @@ mod tests {
                 "queries": [{"name":"people", "mcp_expose":true, "tool_name":null,
                     "mutation":false, "description":"Find people\nby name", "instruction":"",
                     "params":[{"name":"name", "type":"String", "nullable":true},
-                        {"name":"limit", "type":"I32", "nullable":false, "default":10}]}]
+                        {"name":"limit", "type":"I32", "nullable":false, "default":10}]}],
+                "unavailable": [{"name":"legacy",
+                    "error":"error[Q009] at line 1, column 1: `mutation` is not a declaration keyword"}]
             })
         );
         assert_eq!(encoded.last(), Some(&b'\n'));
@@ -366,7 +391,15 @@ mod tests {
             assert!(write_queries_list(&output, json, &mut full).is_err());
         }
         let mut empty = Vec::new();
-        write_queries_list(&QueriesListOutput { queries: vec![] }, false, &mut empty).unwrap();
+        write_queries_list(
+            &QueriesListOutput {
+                queries: vec![],
+                unavailable: vec![],
+            },
+            false,
+            &mut empty,
+        )
+        .unwrap();
         assert_eq!(empty, b"(no stored queries registered)\n");
     }
 
@@ -416,6 +449,11 @@ mod tests {
                     ],
                 },
             ],
+            unavailable: vec![omnigraph_api_types::UnavailableQueryOutput {
+                name: "legacy".into(),
+                error: "error[Q012] at line 1, column 50: `||` is not GQ; fix: concat(a, b)".into(),
+                diagnostic: None,
+            }],
         };
         let mut human = Vec::new();
         write_queries_catalog(&catalog, false, &mut human).unwrap();
@@ -428,6 +466,7 @@ mod tests {
                 "                 by name\n",
                 "mutation  retag($count: bigint, $batch: int = 3) [mcp: retag_people]\n",
                 "    instruction: Use for bulk changes\n",
+                "unavailable legacy: error[Q012] at line 1, column 50: `||` is not GQ; fix: concat(a, b)\n",
             )
         );
         let mut encoded = Vec::new();
@@ -442,8 +481,15 @@ mod tests {
             assert!(write_queries_catalog(&catalog, json, &mut full).is_err());
         }
         let mut empty = Vec::new();
-        write_queries_catalog(&QueriesCatalogOutput { queries: vec![] }, false, &mut empty)
-            .unwrap();
+        write_queries_catalog(
+            &QueriesCatalogOutput {
+                queries: vec![],
+                unavailable: vec![],
+            },
+            false,
+            &mut empty,
+        )
+        .unwrap();
         assert_eq!(empty, b"(no stored queries registered)\n");
     }
 
@@ -551,6 +597,7 @@ mod tests {
                 write_available: true,
                 failure: None,
                 action: GraphAvailabilityAction::None,
+                unavailable_queries: Vec::new(),
             }],
         };
         let mut human = Vec::new();

@@ -155,6 +155,24 @@ pub fn stored_query_registry(specs: &[(&str, &str, bool)]) -> QueryRegistry {
     .expect("specs parse and key==symbol")
 }
 
+/// [`stored_query_registry`], per query: an entry that fails to load is
+/// held unavailable with its refusal, as a served graph's registry is by
+/// default.
+pub fn stored_query_registry_per_query(specs: &[(&str, &str, bool)]) -> QueryRegistry {
+    QueryRegistry::from_specs_per_query(
+        specs
+            .iter()
+            .map(|(name, source, expose)| RegistrySpec {
+                name: name.to_string(),
+                source: source.to_string(),
+                expose: *expose,
+                tool_name: None,
+            })
+            .collect(),
+    )
+    .expect("no registry-wide failure")
+}
+
 pub async fn app_with_stored_queries(
     specs: &[(&str, &str, bool)],
     tokens: &[(&str, &str)],

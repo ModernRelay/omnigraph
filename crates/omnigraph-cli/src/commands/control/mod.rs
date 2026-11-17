@@ -329,7 +329,23 @@ fn registry_from_serving_queries(
             tool_name: None,
         })
         .collect();
-    QueryRegistry::from_specs(specs)
+    QueryRegistry::from_specs_per_query(specs)
+}
+
+/// The registry's queries that fail to parse, each a breakage with its
+/// refusal.
+fn unavailable_issues(registry: &QueryRegistry) -> Vec<QueriesIssue> {
+    registry
+        .unavailable()
+        .map(|unavailable| QueriesIssue {
+            query: unavailable.name.clone(),
+            message: unavailable.message.clone(),
+            diagnostic: unavailable
+                .diagnostic
+                .as_ref()
+                .map(omnigraph_api_types::DiagnosticOutput::from),
+        })
+        .collect()
 }
 
 fn registry_load_issues(errors: Vec<omnigraph_server::queries::LoadError>) -> Vec<QueriesIssue> {
@@ -371,6 +387,9 @@ pub(crate) async fn execute_queries_validate(
             continue;
         }
         matched_any = true;
+        // Per query: a query that fails to parse is a breakage beside the
+        // type refusals of the others, so one pass reports every query the
+        // upgrade must rewrite.
         let registry =
             match registry_from_serving_queries(&snapshot.queries, Some(&serving_graph.graph_id)) {
                 Ok(registry) => registry,
@@ -379,6 +398,8 @@ pub(crate) async fn execute_queries_validate(
                     continue;
                 }
             };
+        total += registry.unavailable().count();
+        breakages.extend(unavailable_issues(&registry));
         let graph_binding = binding.for_uri(&serving_graph.root.to_string_lossy())?;
         let db = crate::admission::open_read_only_with_binding(
             &graph_binding,
@@ -449,6 +470,10 @@ pub(crate) async fn execute_queries_list(
     })?;
 
     let output = QueriesListOutput {
+        unavailable: registry
+            .unavailable()
+            .map(omnigraph_server::api::unavailable_query_output)
+            .collect(),
         queries: registry
             .iter()
             .map(|q| QueriesListItem {
@@ -488,10 +513,13 @@ mod tests {
             name: "broken".to_string(),
             source: "query broken { match { $p: Person } return { $p.name } }".to_string(),
         }];
-        let failures = registry_from_serving_queries(&queries, Some("g")).unwrap_err();
+        // A query that fails to parse is held unavailable with its
+        // refusal, which validation reports as a breakage.
+        let registry = registry_from_serving_queries(&queries, Some("g")).unwrap();
+        assert!(registry.lookup("broken").is_none());
         let output = QueriesValidateOutput {
             ok: false,
-            breakages: registry_load_issues(failures),
+            breakages: unavailable_issues(&registry),
             warnings: Vec::new(),
         };
         let json = serde_json::to_value(output).unwrap();

@@ -1830,6 +1830,7 @@ fn error_code_schema_has_expected_variants() {
             "too_many_requests",
             "service_unavailable",
             "graph_unavailable",
+            "stored_query_unavailable",
             "internal",
             "cancelled",
             "deadline_exceeded",

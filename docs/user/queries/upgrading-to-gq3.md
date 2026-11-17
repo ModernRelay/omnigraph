@@ -9,18 +9,41 @@ the fixes the compiler prints.
 
 ## Stored queries at upgrade
 
-The procedure for upgrading a deployment's stored queries together with the
-binary is pending and is not described yet. A stored query that does not
-compile is refused, as an invalid source always was: in `cluster plan` with
-its diagnostic, and at server boot, where the boot log names the query and
-gives the code, the position, the message, the fix and its edits, for a
-source that does not parse and for one that fails the type check alike:
+An older server cannot load GQ 3 sources, and this release cannot load
+older ones, so a deployment's stored queries change in the same step as the
+binary:
+
+1. **Validate with the new binary first.** Before stopping anything, run the
+   new CLI against the applied cluster: `omnigraph queries validate --target
+   <cluster-root>` (add `--json` for the structured form). It reads the
+   applied registry and schemas and reports every stored query that fails,
+   parse and type refusals together, each with its code, position, fix and
+   byte-range edits; byte offsets count into the stored query's own source.
+2. **Rewrite the failing queries from their printed fixes.** Edit the `.gq`
+   files your `cluster.yaml` names, applying each fix, and check the bundle
+   with the new binary (`omnigraph cluster validate --config <bundle>`).
+3. **Apply the rewritten registry with the binary switch.** Stop the old
+   server, apply the bundle directly with the new CLI (`omnigraph cluster
+   apply --target <cluster-root> --config <bundle>`; direct apply requires
+   stopped serving), then start the new server. The old server never reads
+   a GQ 3 source.
+
+A stored query that still fails to compile does not stop its graph. The new
+server serves the graph with that query alone unavailable: `GET
+/graphs/{graph_id}/queries`, `omnigraph queries list` and the MCP `queries`
+tool list it under `unavailable` with its diagnostic, `GET /graphs` reports
+it per graph and `GET /readyz` counts it, and invoking it answers HTTP 409
+`stored_query_unavailable` carrying the same diagnostic. The boot log names
+it as well:
 
 ```text
-stored query 'NAME': error[CODE] at line L, column C: MESSAGE; fix: FIX; edits: bytes S..E -> "TEXT"
+stored query unavailable: error[CODE] at line L, column C: MESSAGE; fix: FIX; edits: bytes S..E -> "TEXT"
 ```
 
-Byte offsets count into the stored query's own source.
+Fix the source and apply it through the running server. An operator who
+wants the whole graph refused instead sets `OMNIGRAPH_STRICT_STORED_QUERIES=1`:
+the graph is then blocked with `invalid_stored_queries`, as before this
+release, and with `--require-all-graphs` the server refuses to start.
 
 ## The respelling map
 

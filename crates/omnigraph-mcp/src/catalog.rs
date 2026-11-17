@@ -65,7 +65,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "queries",
         title: "List stored queries",
-        description: "List a graph's stored queries: each `name`, its description and instruction, whether it is a `mutation`, and typed `params` (`name`, `kind`, `nullable`, `default` when one is declared; `item_kind` for lists, `vector_dim` for vectors). A parameter with neither `nullable` nor a `default` is required; an omitted one with a `default` binds it. Run a stored read with `query` and a stored mutation with `mutate`, each passing its `name` and no `query`. Invocation is authorized separately, so a listed query can still be refused.",
+        description: "List a graph's stored queries: each `name`, its description and instruction, whether it is a `mutation`, and typed `params` (`name`, `kind`, `nullable`, `default` when one is declared; `item_kind` for lists, `vector_dim` for vectors). A parameter with neither `nullable` nor a `default` is required; an omitted one with a `default` binds it. Run a stored read with `query` and a stored mutation with `mutate`, each passing its `name` and no `query`. Invocation is authorized separately, so a listed query can still be refused. `unavailable` lists the stored queries whose source fails to compile under the server's release, each with its `diagnostic`; invoking one answers `stored_query_unavailable` with it, and the operator rewrites its source from the printed fix.",
         input: graph_schema,
         output: Some(queries_output_schema),
         effect: Effect::Read,
@@ -670,7 +670,20 @@ pub(super) fn queries_output_schema() -> Value {
                 }},
             },
             "required": ["name", "tool_name", "mutation", "params"],
-        }}},
+        }},
+        "unavailable": {
+            "description": "Stored queries whose source fails to compile under the server's release, so the server does not serve them; absent when there are none.",
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "error": {"type": "string"},
+                    "diagnostic": {"type": "object", "description": "The refusal: its `code`, `position`, `expected`, `fix` and `suggestion` byte edits against the stored source."},
+                },
+                "required": ["name", "error"],
+            },
+        }},
         "required": ["queries"],
     })
 }

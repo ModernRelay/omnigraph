@@ -1563,6 +1563,27 @@ impl ApiError {
             .with_details(ApiErrorDetails::BranchStartRefusal(details))
     }
 
+    /// HTTP 409 `stored_query_unavailable`: the stored query's source fails
+    /// to compile under this release, with the refusal its listing reports
+    /// as the `diagnostic` detail. Nothing ran.
+    pub(crate) fn stored_query_unavailable(query: &queries::UnavailableQuery) -> Self {
+        let mut response = Self::new(
+            ErrorCode::StoredQueryUnavailable,
+            format!(
+                "stored query '{}' is unavailable: its source fails to compile under this \
+                 release: {}",
+                query.name,
+                query.refusal()
+            ),
+        );
+        if let Some(diagnostic) = &query.diagnostic {
+            response.details = Some(Box::new(ApiErrorDetails::Diagnostic(
+                api::DiagnosticOutput::from(diagnostic),
+            )));
+        }
+        response
+    }
+
     /// A refused query: HTTP 400 with the one-line message, plus the
     /// compiler's structured diagnostic when the refusal carries one.
     fn from_compiler(err: &omnigraph_compiler::error::CompilerError) -> Self {
@@ -3964,13 +3985,31 @@ fn validate_registry_against_catalog(
 /// the single gate every open path funnels through, so no opener can
 /// attach a registry that has not been schema-checked. `label` names the
 /// graph in messages.
+///
+/// A per-query registry (the default) refuses nothing: each query that
+/// fails the check is withdrawn and held unavailable with its refusal, which
+/// is logged, so the graph stays served; a strict one refuses the graph.
 fn validate_and_attach(
-    queries: QueryRegistry,
+    mut queries: QueryRegistry,
     catalog: &Catalog,
     label: &str,
 ) -> Result<Option<Arc<QueryRegistry>>> {
-    validate_registry_against_catalog(&queries, catalog, label)
-        .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+    if queries.is_strict() {
+        validate_registry_against_catalog(&queries, catalog, label)
+            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+    } else {
+        let report = check(&queries, catalog);
+        queries.withdraw_breakages(&report);
+        log_registry_warnings(label, &report);
+    }
+    for unavailable in queries.unavailable() {
+        warn!(
+            graph = label,
+            query = %unavailable.name,
+            "stored query unavailable: {}",
+            unavailable.refusal()
+        );
+    }
     Ok(if queries.is_empty() {
         None
     } else {

@@ -3918,3 +3918,98 @@ async fn live_deployment_fixture(mode: &str) {
         StatusCode::OK
     );
 }
+
+/// A served graph whose stored query fails to compile under this release
+/// (the GQ 3 upgrade) stays served with that query alone unavailable: the
+/// health routes report it, `GET /readyz` its count and `GET /graphs` its
+/// refusal, and the graph's own catalog lists it with the same diagnostic.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_served_graph_reports_its_unavailable_stored_queries_on_the_health_routes() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("people.pg"),
+        "node Person { name: String @key }\n",
+    )
+    .unwrap();
+    fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }\n").unwrap();
+    fs::write(temp.path().join("policy.yaml"), "version: 1\ngroups:\n  admins: [operator]\nrules:\n  - id: admins\n    allow:\n      actors: { group: admins }\n      actions: [read, invoke_query]\n").unwrap();
+    fs::write(temp.path().join("cluster-policy.yaml"), "version: 1\ngroups:\n  admins: [operator]\nrules:\n  - id: inventory\n    allow:\n      actors: { group: admins }\n      actions: [graph_list]\n").unwrap();
+    fs::write(temp.path().join("cluster.yaml"), "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries:\n      find_person:\n        file: ./people.gq\npolicies:\n  access:\n    file: ./policy.yaml\n    applies_to: [knowledge]\n  management:\n    file: ./cluster-policy.yaml\n    applies_to: [cluster]\n").unwrap();
+    apply_cluster_fixture(temp.path()).await;
+    let mut settings = cluster_settings(temp.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
+    let omnigraph_server::ServerConfigMode::Multi {
+        mut graphs,
+        config_path,
+        server_policy,
+        ..
+    } = settings.mode;
+    // The registry a newer binary loads from sources an older one applied:
+    // one query refused by this release's grammar.
+    let knowledge = graphs
+        .iter_mut()
+        .find(|graph| graph.graph_id == "knowledge")
+        .unwrap();
+    assert!(!knowledge.queries.is_strict(), "per query by default");
+    knowledge.queries = omnigraph_server::queries::QueryRegistry::from_specs_per_query(vec![
+        omnigraph_server::queries::RegistrySpec {
+            name: "find_person".into(),
+            source: fs::read_to_string(temp.path().join("people.gq")).unwrap(),
+            expose: true,
+            tool_name: None,
+        },
+        omnigraph_server::queries::RegistrySpec {
+            name: "legacy".into(),
+            source: "query legacy() { match { $p: Person } return { $p.name || \"!\" as s } }"
+                .into(),
+            expose: true,
+            tool_name: None,
+        },
+    ])
+    .unwrap();
+    let state = omnigraph_server::open_multi_graph_state(
+        graphs,
+        vec![("operator".into(), "operator-token".into())],
+        server_policy.as_ref(),
+        config_path,
+        false,
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    let (status, readiness) = json_response(&app, get_request("/readyz", "")).await;
+    assert_eq!(status, StatusCode::OK, "{readiness}");
+    assert_eq!(readiness["status"], "serving", "{readiness}");
+    assert_eq!(readiness["unavailable_query_count"], 1, "{readiness}");
+
+    let (status, listed) = json_response(&app, get_request("/graphs", "operator-token")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let graph = &listed["graphs"][0];
+    assert_eq!(graph["state"], "ready", "{listed}");
+    assert_eq!(
+        graph["unavailable_queries"][0]["name"], "legacy",
+        "{listed}"
+    );
+    let diagnostic = &graph["unavailable_queries"][0]["diagnostic"];
+    assert_eq!(diagnostic["code"], "Q012", "{listed}");
+    assert!(diagnostic["fix"].is_string(), "{listed}");
+
+    let (status, catalog) = json_response(
+        &app,
+        get_request("/graphs/knowledge/queries", "operator-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{catalog}");
+    assert_eq!(catalog["queries"][0]["name"], "find_person", "{catalog}");
+    assert_eq!(
+        catalog["unavailable"][0]["diagnostic"], *diagnostic,
+        "{catalog}"
+    );
+}

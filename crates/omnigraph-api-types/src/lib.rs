@@ -1918,11 +1918,32 @@ pub struct QueryCatalogEntry {
     pub params: Vec<ParamDescriptor>,
 }
 
+/// A stored query the server does not serve: its source fails to compile
+/// under the server's release. The graph stays served; invoking this query
+/// answers `stored_query_unavailable` with the same diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UnavailableQueryOutput {
+    /// Registry key / invoke path segment (`POST /queries/{name}`).
+    pub name: String,
+    /// The refusal's one-line rendering.
+    pub error: String,
+    /// The compiler's refusal: its code, position, fix and byte-range
+    /// edits against the stored source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<DiagnosticOutput>,
+}
+
 /// Response for `GET /queries`: every stored query in a graph's
-/// registry, each with typed parameters.
+/// registry, each with typed parameters, and every stored query the server
+/// does not serve because its source fails to compile, each with its
+/// refusal.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueriesCatalogOutput {
     pub queries: Vec<QueryCatalogEntry>,
+    /// Stored queries that fail to compile under this server's release,
+    /// by name; absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<UnavailableQueryOutput>,
 }
 
 /// Total map from a resolved scalar to its catalog kind. Exhaustive on
@@ -2426,6 +2447,11 @@ pub struct ReadinessOutput {
     pub loading_graph_count: usize,
     /// Unavailable graphs outside startup, including closed transitions.
     pub blocked_graph_count: usize,
+    /// Stored queries of served graphs that fail to compile under this
+    /// release and are unavailable; `GET /graphs` names them with their
+    /// refusals.
+    #[serde(default)]
+    pub unavailable_query_count: usize,
     /// The bound on graceful shutdown, after which the process exits 2.
     pub shutdown_grace_seconds: u64,
 }
@@ -2557,6 +2583,10 @@ error_codes! {
     /// A known graph is not being served. The request did not start, so it
     /// may be retried once the graph is served again.
     GraphUnavailable = "graph_unavailable", [503];
+    /// The stored query's source fails to compile under this server's
+    /// release, so the server does not serve it; see `diagnostic`. Nothing
+    /// ran. The operator applies a rewritten registry.
+    StoredQueryUnavailable = "stored_query_unavailable", [409];
     /// The server failed. An error before any write took no effect; see the
     /// server log.
     Internal = "internal", [500];
@@ -2641,6 +2671,7 @@ impl ErrorCode {
             | Self::WriterFenced
             | Self::ExternalBlobSource
             | Self::ChangeFeedGap
+            | Self::StoredQueryUnavailable
             | Self::Internal => DispositionAction::Refresh,
         }
     }
@@ -3785,6 +3816,11 @@ pub struct GraphInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<GraphStartupFailure>,
     pub action: GraphAvailabilityAction,
+    /// Stored queries of a served graph that fail to compile under this
+    /// server's release, each with its refusal; the graph serves every
+    /// other query. Absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_queries: Vec<UnavailableQueryOutput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

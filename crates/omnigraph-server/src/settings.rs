@@ -114,6 +114,31 @@ fn settings_from_snapshot_inner(
     snapshot: omnigraph_cluster::ServingSnapshot,
     deployment: bool,
 ) -> Result<ServerConfig> {
+    settings_from_snapshot_with(
+        cluster_dir,
+        cli_bind,
+        cli_allow_unauthenticated,
+        cli_require_all_graphs,
+        snapshot,
+        deployment,
+        env_flag(STRICT_STORED_QUERIES_ENV),
+    )
+}
+
+/// The boot setting that keeps refusing a whole graph when one of its
+/// stored queries fails to compile, instead of serving the graph with that
+/// query unavailable.
+pub const STRICT_STORED_QUERIES_ENV: &str = "OMNIGRAPH_STRICT_STORED_QUERIES";
+
+pub(crate) fn settings_from_snapshot_with(
+    cluster_dir: &Path,
+    cli_bind: Option<String>,
+    cli_allow_unauthenticated: bool,
+    cli_require_all_graphs: bool,
+    snapshot: omnigraph_cluster::ServingSnapshot,
+    deployment: bool,
+    strict_stored_queries: bool,
+) -> Result<ServerConfig> {
     for diagnostic in &snapshot.diagnostics {
         warn!(
             code = %diagnostic.code,
@@ -186,7 +211,14 @@ fn settings_from_snapshot_inner(
                 tool_name: None,
             })
             .collect();
-        let registry = match QueryRegistry::from_specs(specs) {
+        // A stored query that fails to compile makes only itself
+        // unavailable; the strict setting keeps refusing the whole graph.
+        let loaded = if strict_stored_queries {
+            QueryRegistry::from_specs(specs)
+        } else {
+            QueryRegistry::from_specs_per_query(specs)
+        };
+        let registry = match loaded {
             Ok(registry) => registry,
             Err(errors) => {
                 let details = errors
@@ -684,6 +716,7 @@ mod tests {
 
     use super::{
         DEFAULT_SHUTDOWN_GRACE, Path, PathBuf, open_multi_graph_state, settings_from_snapshot,
+        settings_from_snapshot_with,
     };
     use super::{
         GraphId, GraphKey, GraphStartupConfig, RegistryLookup, ServerConfig, ServerConfigMode,
@@ -1628,6 +1661,7 @@ mod tests {
     /// bytes, so both graph URIs return to their local roots before startup
     /// admission probes cluster membership; only the served sibling is opened.
     #[tokio::test]
+    #[serial]
     async fn boot_quarantines_overlapping_external_blob_base_and_strict_boot_refuses() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1803,6 +1837,38 @@ graphs:
                     api_key: None,
                 });
             }
+            // A stored query that fails to compile refuses its graph only
+            // under the strict setting; by default the graph keeps no
+            // settings failure and the query alone is unavailable.
+            if failure == StartupFailure::InvalidStoredQueries {
+                let lenient = settings_from_snapshot_with(
+                    dir.path(),
+                    None,
+                    true,
+                    false,
+                    snapshot.clone(),
+                    false,
+                    false,
+                )
+                .unwrap();
+                let ServerConfigMode::Multi { graphs, .. } = lenient.mode;
+                let knowledge = graphs
+                    .iter()
+                    .find(|graph| graph.graph_id == "knowledge")
+                    .unwrap();
+                assert_eq!(knowledge.startup_failure, None);
+                assert_eq!(
+                    knowledge
+                        .queries
+                        .lookup_unavailable("broken")
+                        .map(|query| query.name.as_str()),
+                    Some("broken")
+                );
+            }
+            // The strict boot setting, from its environment variable, keeps
+            // refusing the whole graph.
+            let _strict = (failure == StartupFailure::InvalidStoredQueries)
+                .then(|| EnvGuard::set(&[(super::STRICT_STORED_QUERIES_ENV, Some("1"))]));
             let config = settings_from_snapshot(dir.path(), None, true, false, snapshot).unwrap();
             let ServerConfigMode::Multi {
                 graphs,
