@@ -57,6 +57,7 @@ fn dump_failure_child() {
         order_by: vec![],
         limit: None,
         limit_param: None,
+        written_columns: Vec::new(),
     }));
     let source = MemorySource::default();
     let expected = route(

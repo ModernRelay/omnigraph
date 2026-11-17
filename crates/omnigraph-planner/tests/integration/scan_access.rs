@@ -159,6 +159,7 @@ fn query(two: bool) -> ReadShape {
         order_by: vec![],
         limit: None,
         limit_param: None,
+        written_columns: Vec::new(),
     }
 }
 fn prepared(query: &ReadShape, source: &ProbeSource) -> Decision {

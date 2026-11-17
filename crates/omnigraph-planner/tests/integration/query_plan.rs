@@ -201,6 +201,7 @@ fn ir(pipeline: Vec<PatternStep>, returns: Vec<IRExpr>, order_by: Vec<IRExpr>) -
             .collect(),
         limit: Some(10),
         limit_param: None,
+        written_columns: Vec::new(),
     }))
 }
 

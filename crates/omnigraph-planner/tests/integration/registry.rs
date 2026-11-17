@@ -359,6 +359,7 @@ fn documents_query() -> Operation {
         order_by: Vec::new(),
         limit: None,
         limit_param: None,
+        written_columns: Vec::new(),
     }))
 }
 
