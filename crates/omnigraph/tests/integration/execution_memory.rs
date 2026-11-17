@@ -2308,3 +2308,66 @@ query pairs() {
         );
     }
 }
+
+/// The exact `bm25` reads its field corpus once for the corpus statistics,
+/// keeping no document, then scores each row of its population from the
+/// row's own text, so its memory is the scored window's and one value's
+/// analysis, not the corpus's. Thirty thousand documents, every one
+/// matching each of forty query terms, hold several times the 4 MiB pool;
+/// the ten best are answered within it, and the pool is released.
+#[tokio::test]
+#[serial]
+async fn bm25_scores_a_corpus_several_times_the_pool_within_it() {
+    const SCHEMA: &str = r#"
+node Doc { slug: String @key  text: String @index(fulltext, analyzer = "standard_v1") }
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let words: Vec<String> = (0..40).map(|w| format!("term{w:02}")).collect();
+    let documents = 30_000;
+    let mut lines = Vec::with_capacity(documents);
+    let mut corpus_bytes = 0;
+    for d in 0..documents {
+        // Document d repeats term(d % 40) once more than the others, so the
+        // scores differ and the window is decided.
+        let text = format!(
+            "{} {} {} {}",
+            words.join(" "),
+            words[d % words.len()],
+            "pad".repeat(1 + d % 7),
+            "x".repeat(200)
+        );
+        corpus_bytes += text.len();
+        lines.push(
+            serde_json::json!({"type":"Doc","data":{"slug":format!("d{d:05}"),"text":text}})
+                .to_string(),
+        );
+    }
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    assert!(corpus_bytes > 3 * 4 * MIB as usize, "{corpus_bytes}");
+    let query = r#"query best($q: String) {
+        match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $q) as $score }
+        return { $d.slug, $score }
+        order { $score desc }
+        limit 10
+    }"#;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(
+            4 * MIB,
+            query_main(&db, query, "best", &params(&[("q", &words.join(" "))])),
+        ),
+    )
+    .await
+    .unwrap();
+    let batch = result.concat_batches().unwrap();
+    assert_eq!(batch.num_rows(), 10);
+    assert_released(&probes);
+}

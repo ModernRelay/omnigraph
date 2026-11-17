@@ -518,14 +518,6 @@ pub(crate) async fn members(
     Ok(ids)
 }
 
-/// One matching value kept for scoring once the corpus statistics are known.
-struct Match {
-    id: String,
-    len: u64,
-    /// Per query term, its stored alternatives as `(edits, occurrences)`.
-    hits: Vec<Vec<(u8, u64)>>,
-}
-
 /// The corpus statistics of `bm25_v1`: the field corpus size, its total
 /// token count and, per query term, the documents holding an alternative.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -575,29 +567,83 @@ impl Corpus {
     }
 }
 
-/// `bm25_v1` of every entity of `type_name` whose `property` matches `query`,
-/// by identity, against the field corpus.
+/// What scoring a value by `bm25_v1` needs once its field corpus has been
+/// read: the field's analyzer profile, the query, and the corpus statistics
+/// with each query term's IDF. It holds nothing per document, so a
+/// population of any size is scored in the memory one value's analysis
+/// takes, row by row as the population streams.
+pub(crate) struct Bm25Scorer {
+    profile: AnalyzerProfile,
+    query: LexicalQuery,
+    corpus: Corpus,
+    idf: Vec<f64>,
+}
+
+impl Bm25Scorer {
+    /// Each of `values` scored, in order: its `bm25_v1` score, or `None` for
+    /// a value outside the matches (a null, a value with no analyzed term,
+    /// one that misses the query's mode). Each value's analysis is charged
+    /// to `memory` while it is held and its tokens and comparisons to the
+    /// query's work.
+    pub(crate) fn score(
+        &self,
+        values: &StringArray,
+        memory: &WorkMemory,
+    ) -> Result<Vec<Option<f64>>> {
+        let mut scan = FieldScan::new(Analyzer::of(self.profile)?, &self.query, memory)?;
+        let mut out = Vec::with_capacity(values.len());
+        for row in 0..values.len() {
+            let document = match values.is_valid(row) {
+                true => scan.document(values.value(row))?,
+                false => None,
+            };
+            let score = match document {
+                Some(document) => {
+                    let hits = scan.hits(&document)?;
+                    match hits.matched(self.query.all) {
+                        true => Some(self.corpus.score(&self.idf, document.len, &hits.by_term)?),
+                        false => None,
+                    }
+                }
+                None => None,
+            };
+            scan.row_done();
+            out.push(score);
+        }
+        scan.report();
+        Ok(out)
+    }
+}
+
+/// The `bm25_v1` corpus statistics of `type_name`'s `property` at `snapshot`
+/// for `query`: one streamed pass over the field that counts the field
+/// corpus, its tokens and each query term's document frequency, keeping no
+/// document.
 pub(crate) async fn bm25(
     snapshot: &Snapshot,
     catalog: &Catalog,
     type_name: &str,
     property: &str,
-    query: &LexicalQuery,
+    query: LexicalQuery,
     memory: &WorkMemory,
-) -> Result<HashMap<String, f64>> {
-    let mut scan = FieldScan::new(field_analyzer(catalog, type_name, property)?, query, memory)?;
+) -> Result<Bm25Scorer> {
+    let profile = declared_profile(catalog, type_name, property).ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "the exact lexical scan reads `{type_name}.{property}`, whose index declares no analyzer"
+        ))
+    })?;
+    let mut scan = FieldScan::new(Analyzer::of(profile)?, &query, memory)?;
     let mut corpus = Corpus {
         holding: vec![0; query.terms.len()],
         ..Corpus::default()
     };
-    let mut matches: Vec<Match> = Vec::new();
     scan_field(
         snapshot,
         catalog,
         type_name,
         property,
         memory,
-        |id, value| {
+        |_, value| {
             let document = match value {
                 Some(value) => scan.document(value)?,
                 None => None,
@@ -616,36 +662,20 @@ pub(crate) async fn bm25(
                     *holding = checked(*holding, 1, "a term's document frequency")?;
                 }
             }
-            if hits.matched(query.all) {
-                let alternatives: usize = hits.by_term.iter().map(Vec::len).sum();
-                memory
-                    .string(id.len())
-                    .map_err(|error| memory.error(error))?;
-                memory
-                    .entries::<(u8, u64)>(alternatives.saturating_add(hits.by_term.len()))
-                    .map_err(|error| memory.error(error))?;
-                matches.push(Match {
-                    id: id.to_string(),
-                    len: document.len,
-                    hits: hits.by_term,
-                });
-            }
             scan.row_done();
             Ok(())
         },
     )
     .await?;
     scan.report();
+    drop(scan);
     let idf = corpus.idf();
-    memory
-        .entries::<(String, f64)>(matches.len())
-        .map_err(|error| memory.error(error))?;
-    let mut scores = HashMap::with_capacity(matches.len());
-    for found in matches {
-        let score = corpus.score(&idf, found.len, &found.hits)?;
-        scores.insert(found.id, score);
-    }
-    Ok(scores)
+    Ok(Bm25Scorer {
+        profile,
+        query,
+        corpus,
+        idf,
+    })
 }
 
 #[cfg(test)]

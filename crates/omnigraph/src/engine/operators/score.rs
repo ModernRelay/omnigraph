@@ -22,8 +22,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use std::collections::HashMap;
-
 use crate::engine::lexical::{LexicalScore, answered_first};
 
 use arrow_array::{
@@ -54,7 +52,8 @@ const LEXICAL_SCAN: &str = "exact lexical scan";
 
 pub(crate) struct ScoreExec {
     input: Arc<dyn ExecutionPlan>,
-    /// The vector column in the input, or under `bm25` its identity column.
+    /// The scored column in the input: the vector, or under `bm25` the
+    /// text.
     column: String,
     /// The appended score column.
     score: String,
@@ -64,7 +63,7 @@ pub(crate) struct ScoreExec {
 }
 
 /// What a score reads: the bound query vector of a `distance`, or the exact
-/// lexical scan whose `bm25_v1` scores it appends by identity.
+/// lexical scan's corpus statistics, which score each row's text.
 #[derive(Clone)]
 enum ScoreSource {
     Distance(Arc<Vec<f32>>, VectorDistance),
@@ -72,23 +71,24 @@ enum ScoreSource {
 }
 
 impl ScoreExec {
-    /// `bm25`: the rows whose identity column `id_column` names a match of
-    /// `scores`, with its score appended as `score`.
+    /// `bm25`: the rows whose value of the scored field, `value_column`,
+    /// matches the query, each with its `bm25_v1` score against the field
+    /// corpus `scores` reads appended as `score`.
     pub(crate) fn bm25(
         input: Arc<dyn ExecutionPlan>,
-        id_column: String,
+        value_column: String,
         score: String,
         scores: Arc<LexicalScore>,
     ) -> Result<Self> {
         let input_schema = input.schema();
         match input_schema
-            .field_with_name(&id_column)
+            .field_with_name(&value_column)
             .map(|f| f.data_type())
         {
             Ok(DataType::Utf8) => {}
             _ => {
                 return Err(OmniError::manifest_internal(format!(
-                    "the exact `bm25` reads the identity column '{id_column}', which its input does not carry as a string"
+                    "the exact `bm25` scores the field '{value_column}', which its input does not carry as a string"
                 )));
             }
         }
@@ -97,7 +97,7 @@ impl ScoreExec {
         let shape = Streaming::new(Arc::new(Schema::new(fields)));
         Ok(Self {
             input,
-            column: id_column,
+            column: value_column,
             score,
             source: ScoreSource::Bm25(scores),
             shape,
@@ -155,35 +155,20 @@ impl ScoreExec {
 fn lexically_scored(
     batch: &RecordBatch,
     column: usize,
-    scores: &HashMap<String, f64>,
+    scorer: &crate::engine::lexical_scan::Bm25Scorer,
+    analysis: &WorkMemory,
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
-    let ids = batch
+    let values = batch
         .column(column)
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest_internal("the scored identity is not a string"))?;
-    let mut out = Vec::with_capacity(ids.len());
-    let mut keep = Vec::with_capacity(ids.len());
-    for row in 0..ids.len() {
-        match ids
-            .is_valid(row)
-            .then(|| scores.get(ids.value(row)))
-            .flatten()
-        {
-            Some(score) => {
-                out.push(*score);
-                keep.push(true);
-            }
-            None => {
-                out.push(0.0);
-                keep.push(false);
-            }
-        }
-    }
-    let keep = BooleanArray::from(keep);
+        .ok_or_else(|| OmniError::manifest_internal("the scored field is not a string"))?;
+    let scores = scorer.score(values, analysis)?;
+    let keep = BooleanArray::from_iter(scores.iter().map(|score| Some(score.is_some())));
+    let out = Float64Array::from_iter_values(scores.iter().map(|score| score.unwrap_or(0.0)));
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    columns.push(Arc::new(Float64Array::from(out)));
+    columns.push(Arc::new(out));
     let whole =
         RecordBatch::try_new(Arc::clone(schema), columns).map_err(OmniError::arrow_internal)?;
     if keep.true_count() == keep.len() {
@@ -371,6 +356,7 @@ impl ExecutionPlan for ScoreExec {
             let scores = Arc::clone(scores);
             input = answered_first(input, async move { scores.answer(scan).await });
         }
+        let analysis = WorkMemory::new(Arc::clone(&ctx), LEXICAL_SCAN)?;
         let memory = WorkMemory::new(ctx, OUTPUT)?;
         let source = self.source.clone();
         let schema = self.schema();
@@ -379,9 +365,9 @@ impl ExecutionPlan for ScoreExec {
                 ScoreSource::Distance(query, distance) => {
                     scored(&batch, column, query, *distance, &schema)
                 }
-                ScoreSource::Bm25(scores) => scores
-                    .scores()
-                    .and_then(|scores| lexically_scored(&batch, column, scores, &schema)),
+                ScoreSource::Bm25(scores) => scores.scorer().and_then(|scorer| {
+                    lexically_scored(&batch, column, scorer, &analysis, &schema)
+                }),
             }
             .map_err(external)?;
             let lease = memory.child(OUTPUT)?;

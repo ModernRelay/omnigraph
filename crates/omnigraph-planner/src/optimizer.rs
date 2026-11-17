@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use crate::read_shape::{ArmRank, PatternStep, ReadShape};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, is_fresh_variable};
 use omnigraph_compiler::query::codes::{P002, P004};
 use omnigraph_compiler::query::file::LoadStmtMode;
@@ -637,17 +636,10 @@ fn resolve_pipeline(
             } => {
                 let input = bound(current, "score")?;
                 let schema = schema_of(plan, input)?;
-                // `distance` reads the vector; an exact `bm25` finds each
-                // row's score by its identity, the retained `match_terms`
-                // reading only that (`reads_of_expr`).
-                let mut reads = Vec::new();
-                if *kind == ScoreKind::Distance {
-                    reads.push(ColumnRef::property(binding, property));
-                }
+                // Each row is scored from its own value of the scored
+                // property: `distance`'s vector, `bm25`'s text.
+                let mut reads = vec![ColumnRef::property(binding, property)];
                 reads_of_expr(query, &mut reads);
-                if *kind == ScoreKind::Bm25 {
-                    reads.push(ColumnRef::property(binding, IDENTITY_MEMBER));
-                }
                 reads.dedup();
                 plan.add(
                     LogicalNode::Score {

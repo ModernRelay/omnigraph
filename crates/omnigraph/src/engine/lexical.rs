@@ -15,7 +15,7 @@
 //! the read's work budget, and records the rows it read and the tokens it
 //! analyzed on its node's operator, which the execution report carries.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StringArray};
@@ -145,8 +145,7 @@ impl LexicalSource {
             source: self.clone(),
             type_name: type_name.to_string(),
             call: call.clone(),
-            scores: OnceLock::new(),
-            held: Mutex::new(None),
+            scorer: OnceLock::new(),
         })
     }
 }
@@ -244,14 +243,14 @@ impl LexicalColumns {
     }
 }
 
-/// The exact `bm25` of one `Score` node: the `bm25_v1` score of every match
-/// by identity, answered once when the operator first runs.
+/// The exact `bm25` of one `Score` node: its field corpus's `bm25_v1`
+/// statistics, read once when the operator first runs, which score each row
+/// of its population from the row's own value.
 pub(crate) struct LexicalScore {
     source: LexicalSource,
     type_name: String,
     call: IRExpr,
-    scores: OnceLock<Arc<HashMap<String, f64>>>,
-    held: Mutex<Option<WorkMemory>>,
+    scorer: OnceLock<Arc<super::lexical_scan::Bm25Scorer>>,
 }
 
 impl std::fmt::Debug for LexicalScore {
@@ -261,9 +260,9 @@ impl std::fmt::Debug for LexicalScore {
 }
 
 impl LexicalScore {
-    /// Run the exact lexical scan once, charging the scores to `memory`.
+    /// Read the field corpus once, its work charged to `memory`.
     pub(crate) async fn answer(&self, memory: WorkMemory) -> Result<()> {
-        if self.scores.get().is_some() {
+        if self.scorer.get().is_some() {
             return Ok(());
         }
         let snapshot = self.source.snapshot()?;
@@ -273,26 +272,24 @@ impl LexicalScore {
             &self.call,
             &self.source.params,
         )?;
-        let scores = super::lexical_scan::bm25(
+        let scorer = super::lexical_scan::bm25(
             snapshot,
             &self.source.catalog,
             &self.type_name,
             &property,
-            &query,
+            query,
             &memory,
         )
         .await?;
-        let _ = self.scores.set(Arc::new(scores));
-        *super::operators::memory::locked(&self.held) = Some(memory);
+        let _ = self.scorer.set(Arc::new(scorer));
         Ok(())
     }
 
-    /// The score of the match `id`; `None` for an identity that does not
-    /// match. An error before the scan ran.
-    pub(crate) fn scores(&self) -> Result<&HashMap<String, f64>> {
-        self.scores
+    /// The corpus's scorer. An error before the corpus was read.
+    pub(crate) fn scorer(&self) -> Result<&super::lexical_scan::Bm25Scorer> {
+        self.scorer
             .get()
-            .map(|scores| scores.as_ref())
+            .map(|scorer| scorer.as_ref())
             .ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "the exact `bm25` over `{}` was read before its scan ran",

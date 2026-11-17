@@ -1,6 +1,7 @@
 # issue: none
 # notes: A ranked scan reads only the columns its query needs: `return { $d.slug }` under a
-# notes: `nearest` or `bm25` order reads the id and the key alone, and a bare `$d` reads the node's
+# notes: `nearest` order reads the id and the key alone, under a `bm25` the scored `title` too
+# notes: (each row is scored from its own text), and a bare `$d` reads the node's
 # notes: returned scalar properties but not the unreturned `embedding`. Sixty docs alternate
 # notes: "alpha doc" / "beta doc" titles, doc n sits at distance n from the origin, and every
 # notes: alpha doc ties on BM25 score, so the bm25 step's ten rows are the id tie-break's
@@ -143,7 +144,7 @@ d.slug: String
 
 --- expect plan
 pipeline 0: Scan -> Score -> Projection => Sort
-scan Doc as $d: columns [__id, slug]
+scan Doc as $d: columns [__id, slug, title]
 
 --- query
 query nearest_whole($q: Vector(4)) {
