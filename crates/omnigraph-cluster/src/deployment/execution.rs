@@ -2324,7 +2324,10 @@ fn authorize_graph_deletion(
         let actor = caller.actor().ok_or_else(|| {
             refusal(
                 "policy_denied",
-                "graph deletion requires an actor when policy is installed",
+                format!(
+                    "deleting graph '{graph}' runs under its applied policy and needs an actor; \
+                     pass --as with an actor that policy permits read and schema_apply"
+                ),
             )
         })?;
         policy.check_graph(actor, graph, PolicyAction::Read)?;
@@ -2333,30 +2336,47 @@ fn authorize_graph_deletion(
     Ok(())
 }
 
-/// Recovery that settles a started schema change or deletes a graph acts as
-/// the caller under that graph's applied policy, and the engine refuses a
-/// policy-bound write that names no actor. Refuse it before admission, so the
-/// refusal takes no lock and changes nothing; the policy still judges a named
-/// actor when recovery runs.
-fn require_recovery_actor(
+/// Who may recover each graph of an outstanding deployment: the one decision
+/// recovery makes, before admission so a refusal takes no lock and changes
+/// nothing, and again under admission against the re-read policy. A deletion
+/// needs what forward deletion needs. Settling a started schema change acts as
+/// the caller: an identity needs `read` and `schema_apply`, and a storage owner
+/// on a graph with an applied policy needs an actor that policy permits
+/// `schema_apply` on `main`, the check the engine makes when it settles. Other
+/// work runs no graph action as the caller. The engine keeps its own gate.
+fn authorize_recovery(
     policy: &AppliedPolicies,
     caller: &DeploymentCaller,
     pending: &OutstandingDeployment,
 ) -> Result<(), Diagnostic> {
-    if caller.actor().is_some() {
-        return Ok(());
-    }
     for (graph, entry) in &pending.graphs {
-        let acts_as_caller = entry.delete.is_some()
-            || (matches!(entry.state, GraphDeploymentState::Started) && entry.create.is_none());
-        if acts_as_caller && policy.graph(graph).is_some() {
-            return Err(refusal(
-                "policy_denied",
-                format!(
-                    "recovering graph '{graph}' runs under its applied policy and needs an \
-                     actor; pass --as with an actor that policy permits schema_apply"
-                ),
-            ));
+        if entry.delete.is_some() {
+            authorize_graph_deletion(policy, caller, graph)?;
+            continue;
+        }
+        if !matches!(entry.state, GraphDeploymentState::Started) || entry.create.is_some() {
+            continue;
+        }
+        match caller {
+            DeploymentCaller::AuthenticatedIdentity(identity) => {
+                policy.check_graph(identity.actor(), graph, PolicyAction::Read)?;
+                policy.check_graph(identity.actor(), graph, PolicyAction::SchemaApply)?;
+            }
+            DeploymentCaller::StorageOwner { actor } => {
+                if policy.graph(graph).is_none() {
+                    continue;
+                }
+                let actor = actor.as_deref().ok_or_else(|| {
+                    refusal(
+                        "policy_denied",
+                        format!(
+                            "recovering graph '{graph}' runs under its applied policy and needs \
+                             an actor; pass --as with an actor that policy permits schema_apply"
+                        ),
+                    )
+                })?;
+                policy.check_graph(actor, graph, PolicyAction::SchemaApply)?;
+            }
         }
     }
     Ok(())
@@ -2933,7 +2953,7 @@ async fn reconcile_deployment_in_store(
         ));
     }
     if let Some(pending) = before.outstanding.as_ref() {
-        require_recovery_actor(&preflight_policy, caller, pending)?;
+        authorize_recovery(&preflight_policy, caller, pending)?;
     }
     let admission = admission::acquire_with_store(
         &store,
@@ -2963,13 +2983,13 @@ async fn reconcile_deployment_in_store(
             "outstanding achieved authority changed",
         ));
     }
+    authorize_recovery(&policy, caller, &pending)?;
     let bundle = store.read_deployment_bundle(&pending.input_digest).await?;
     validate_bundle(&bundle, admission.canonical_root())?;
     validate_pending_input(&state, &pending, &bundle)?;
     install_catalog_payloads(&store, &state, &bundle).await?;
     for (graph, entry) in pending.graphs {
         let result = if let Some(delete) = &entry.delete {
-            authorize_graph_deletion(&policy, caller, &graph)?;
             if matches!(entry.state, GraphDeploymentState::Settled { .. }) {
                 continue;
             }
@@ -3110,10 +3130,6 @@ async fn reconcile_deployment_in_store(
                             "query-only work cannot carry started graph effects",
                         )
                     })?;
-                    if let DeploymentCaller::AuthenticatedIdentity(identity) = caller {
-                        policy.check_graph(identity.actor(), &graph, PolicyAction::Read)?;
-                        policy.check_graph(identity.actor(), &graph, PolicyAction::SchemaApply)?;
-                    }
                     admission
                         .validate_graph_uri(&store.graph_root(&graph))
                         .await?;

@@ -199,9 +199,10 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
         dir.path().join("graph.policy.yaml"),
         format!("version: 1\ngroups:\n  operators: {actors}\nrules:\n  - id: read\n    allow: {{ actors: {{ group: operators }}, actions: [read] }}\n  - id: schema\n    allow: {{ actors: {{ group: operators }}, actions: [schema_apply], target_branch_scope: any }}\n"),
     ).unwrap();
+    // principal:manager manages the cluster but holds no graph action.
     fs::write(
         dir.path().join("cluster.policy.yaml"),
-        format!("version: 1\ngroups:\n  operators: {actors}\nrules:\n  - id: config\n    allow: {{ actors: {{ group: operators }}, actions: [config_manage] }}\n"),
+        "version: 1\ngroups:\n  operators: [principal:original, principal:recovery, principal:adopter, principal:manager]\nrules:\n  - id: config\n    allow: { actors: { group: operators }, actions: [config_manage] }\n",
     ).unwrap();
     fs::write(
         dir.path().join("cluster.yaml"),
@@ -311,13 +312,13 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
     // the installed graph policy judges. Nothing ran, so it is a policy
     // refusal before admission, not an unknown outcome: no lock, no ledger or
     // graph change, and the original work stays outstanding.
-    let missing_actor = DeploymentCaller::storage_owner(None);
-    let error = Box::pin(reconcile_deployment(root, &id, true, &missing_actor))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, "policy_denied", "{error:?}");
-    assert!(error.message.contains("--as"), "{error:?}");
-    assert!(!dir.path().join("__cluster/lock.json").exists());
+    // The same holds for every caller the policy refuses, not only a missing
+    // actor: a storage owner whose --as lacks schema_apply, and an identity
+    // that manages the cluster but cannot read the graph.
+    let refused = refused_recovery_callers();
+    for caller in &refused {
+        refuse_recovery_before_admission(dir.path(), &id, caller).await;
+    }
     assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before_denial);
     assert_eq!(file_bytes(&graph), graph_bytes);
 
@@ -353,12 +354,9 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
     force_unlock_storage_root(root, &lock).await.unwrap();
     // Once a fence is persisted, the refusal must preserve its exact identity
     // and expose the same policy cause rather than generic uncertainty.
-    let error = Box::pin(reconcile_deployment(root, &id, true, &missing_actor))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, "policy_denied", "{error:?}");
-    assert!(error.message.contains("--as"), "{error:?}");
-    assert!(!dir.path().join("__cluster/lock.json").exists());
+    for caller in &refused {
+        refuse_recovery_before_admission(dir.path(), &id, caller).await;
+    }
     let retained: serde_json::Value =
         serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
     assert_eq!(
@@ -448,12 +446,106 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
         original_state["applied_revision"]["result_revision"]
     );
     assert!(finished.get("outstanding").is_none());
+    let lock = deployment_status(root, Some(&id), &adopter)
+        .await
+        .unwrap()
+        .lock_id
+        .unwrap();
+    force_unlock_storage_root(root, &lock).await.unwrap();
+
+    // A pending deletion: recovery needs what forward deletion needs, `read`
+    // and `schema_apply`, and a caller without them is refused before
+    // admission too.
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs: {}\npolicies:\n  management:\n    file: cluster.policy.yaml\n    applies_to: [cluster]\n",
+    )
+    .unwrap();
+    let mut deletion = String::new();
+    {
+        let _fail = cluster_seams::DEPLOYMENT_AFTER_STARTED.fire_always();
+        let error = Box::pin(apply_deployment(
+            dir.path(),
+            None,
+            &original,
+            |issued, _, _| deletion = issued.to_string(),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "injected_failpoint");
+    }
+    let pending: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
     assert!(
-        deployment_status(root, Some(&id), &adopter)
+        pending["outstanding"]["graphs"]["knowledge"]["delete"]["root"]
+            .as_str()
+            .is_some(),
+        "{pending}"
+    );
+    let lock = deployment_status(root, Some(&deletion), &original)
+        .await
+        .unwrap()
+        .lock_id
+        .unwrap();
+    force_unlock_storage_root(root, &lock).await.unwrap();
+    let ledger_before_denial = fs::read(&ledger_path).unwrap();
+    let cluster_bytes = file_bytes(dir.path());
+    for caller in &refused {
+        refuse_recovery_before_admission(dir.path(), &deletion, caller).await;
+    }
+    assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before_denial);
+    assert!(
+        file_bytes(dir.path()) == cluster_bytes,
+        "refused deletion recovery must not change graph, ledger or admission bytes"
+    );
+    let DeploymentLookup::Complete { result } =
+        Box::pin(reconcile_deployment(root, &deletion, true, &adopter))
             .await
             .unwrap()
-            .lock_id
-            .is_some()
+    else {
+        panic!("expected terminal deletion result");
+    };
+    assert!(
+        matches!(
+            result.graphs["knowledge"],
+            GraphDeploymentResult::Deleted { .. }
+        ),
+        "{:?}",
+        result.graphs
+    );
+}
+
+/// Callers the test graph's policy refuses for recovery: a storage owner with
+/// no actor, a storage owner whose actor holds no graph action, and an
+/// identity that manages the cluster but holds no graph action.
+fn refused_recovery_callers() -> [DeploymentCaller; 3] {
+    [
+        DeploymentCaller::storage_owner(None),
+        DeploymentCaller::storage_owner(Some("principal:outsider".into())),
+        DeploymentCaller::AuthenticatedIdentity(
+            IdentityAuthorization::authenticated("principal:manager").unwrap(),
+        ),
+    ]
+}
+
+/// A policy refusal known before any effect is reported as `policy_denied`
+/// before admission: no lock is taken.
+async fn refuse_recovery_before_admission(dir: &Path, id: &str, caller: &DeploymentCaller) {
+    let error = Box::pin(reconcile_deployment(
+        dir.to_str().unwrap(),
+        id,
+        true,
+        caller,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "policy_denied", "{caller:?}: {error:?}");
+    if caller.actor().is_none() {
+        assert!(error.message.contains("--as"), "{error:?}");
+    }
+    assert!(
+        !dir.join("__cluster/lock.json").exists(),
+        "{caller:?} took the lock"
     );
 }
 
