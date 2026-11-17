@@ -31,6 +31,7 @@ mod diff;
 mod graph_read;
 mod lease;
 mod operations;
+mod policy_binding;
 mod serve;
 mod state_lock;
 mod store;

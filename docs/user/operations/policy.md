@@ -69,7 +69,10 @@ policies:
 ```
 
 A bundle may target graph IDs or the `cluster` scope, but not both. Only one
-bundle may bind a given scope. The target `og_catalog` binds the
+bundle may bind a given scope. `cluster validate` refuses a configuration that
+breaks either rule, and the server, direct writes, `access` and the `policy`
+commands refuse an applied state that breaks one, so they always select the
+same bundle for a graph. The target `og_catalog` binds the
 [engine catalogue](../queries/catalogue.md), which every server serves and no
 `graphs:` entry declares: its `read` rule decides catalogue reads with the
 resource `og_catalog` and no branch, and the bundle is applied and activated
