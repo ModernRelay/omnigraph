@@ -310,12 +310,11 @@ Tell the user what they have, then offer the step that fits:
 
 ### See the graph in Studio
 
-Studio opens a graph that `omnigraph-server` serves, not a local folder such as
-`./graph.omni`, so serve the graph first. The user installs Studio from its
+Studio opens only a graph that `omnigraph-server` serves, not `./graph.omni`.
+The user installs Studio from its
 [releases](https://github.com/ModernRelay/omnigraph-studio/releases/latest);
-the installer from step 1 already put `omnigraph-server` beside the CLI.
-
-Declare the graph in a `cluster.yaml` next to the schema:
+step 1's installer already put `omnigraph-server` beside the CLI. Declare the
+graph in a `cluster.yaml` next to the schema:
 
 ```yaml
 version: 1
@@ -325,11 +324,11 @@ graphs:
     queries: queries.gq
 ```
 
-Create the served copy and load the data into it. `cluster apply` creates the
-graph empty, so the seed is loaded again. Each of these writes keeps the
-cluster's lock when it finishes; once it has, read the `lock_id` from
-`omnigraph cluster status --target ./served --json` and release it before the
-next write and before the server starts:
+Create a served copy in `./served` and load the seed again, since
+`cluster apply` creates the graph empty. Each write leaves the cluster locked:
+release it with the `lock_id` from
+`omnigraph cluster status --target ./served --json` before the next write and
+before the server starts.
 
 ```bash
 mkdir served
@@ -339,17 +338,15 @@ omnigraph load --data seed.jsonl --mode merge --target ./served --graph knowledg
 omnigraph cluster force-unlock <LOCK_ID> --target ./served
 ```
 
-Start the server in a process that keeps running, such as a background job or
-a second terminal. `--unauthenticated` lets every request in, so bind it to
-loopback only:
+Run the server in a process that keeps running (a background job or a second
+terminal), on loopback only, because `--unauthenticated` lets every request in:
 
 ```bash
 omnigraph-server --cluster "file://$PWD/served" --bind 127.0.0.1:8080 --unauthenticated
 ```
 
-Register it as a target, then open Studio on it. `target add` rewrites the
-user's operator file (`~/.omnigraph/config.yaml`) and drops its comments, so
-tell the user before you run it:
+Register it and open Studio. Tell the user first: `target add` rewrites
+`~/.omnigraph/config.yaml` and drops its comments.
 
 ```bash
 echo '{"kind":"server","endpoint":"http://127.0.0.1:8080","auth":{"provider":"anonymous"}}' \
@@ -357,32 +354,27 @@ echo '{"kind":"server","endpoint":"http://127.0.0.1:8080","auth":{"provider":"an
 omnigraph studio --target local --graph knowledge
 ```
 
-Pass `--graph`: this server has no cluster policy, so it refuses to list its
-graphs, while queries and Studio work. Without Studio installed, `omnigraph
-studio` prints the link and refuses with `studio_unavailable`.
-
-The served copy is now a second graph. Writes through `--target local --graph
-knowledge` land in `./served`, not in `./graph.omni`. If the user keeps using
-the served one, update the agent file's `--target` to match, and add `served/`
-to `.gitignore`. See [Open Studio](../../../docs/user/cli/studio.md) and
-[cluster](cluster.md).
+`--graph` is required: a server without a cluster policy refuses to list its
+graphs. Without Studio installed, `omnigraph studio` prints the link and fails
+with `studio_unavailable`. `./served` is a second graph, so writes through
+`--target local` land there, not in `./graph.omni`; if the user keeps it, point
+the agent file's `--target` at it and add `served/` to `.gitignore`. See
+[Open Studio](../../../docs/user/cli/studio.md) and [cluster](cluster.md).
 
 ### Show the user things in Studio
 
-From Studio 0.4.8, agents can steer Studio's window over MCP. Its tools open a
-type's table, a node's page, a canvas or tree walked from a node, the schema's
-map, a branch's review or history, a commit, or a query tab with text in it
-that is not run. No tool writes to the graph, runs a query or returns property
-values: read and write with the CLI, then use Studio to show the user what you
-found. The agent panel inside Studio has these tools already.
+From 0.4.8, Studio serves MCP tools that open views in its window: a type's
+table, a node's page, a canvas or tree from a node, the schema's map, a branch's
+review or history, a commit, or a query tab that is not run. They never write,
+run queries or return property values, so read and write with the CLI and use
+Studio to show the user what you found. Agents in Studio's own panel have the
+tools already.
 
-An agent outside Studio needs the user's say-so. Ask the user to turn on
-**Settings › Agent › Let agents outside Studio show things in Studio**, which
-is off by default. Studio then shows the command that adds it to Claude Code
-and the `config.toml` entry for Codex, each with a Copy button. Either the user
-runs it, or you run the same command, which reads the token from Studio's data
-directory so it never appears on screen. On macOS the directory is
-`~/Library/Application Support/Omnigraph Studio`:
+An agent outside Studio needs **Settings › Agent › Let agents outside Studio
+show things in Studio** on. It ships off in 0.4.8 and on in later releases, and
+only the user changes it. Studio then offers a Claude Code command and a Codex
+`config.toml` entry to copy. You can run the same command; it reads the token
+from a file, so the token never appears on screen (macOS path):
 
 ```bash
 D="$HOME/Library/Application Support/Omnigraph Studio/ui-tools"
@@ -390,18 +382,17 @@ claude mcp add --transport http omnigraph-studio "$(jq -r .url "$D/endpoint.json
   --header "Authorization: Bearer $(cat "$D/token")"
 ```
 
-The address and the token change each time Studio starts, so add the server
-again after a restart (`claude mcp remove omnigraph-studio` first). Most agents
-load MCP servers when a session starts, so tell the user to start a new session
-before you use the tools.
+Most agents load MCP servers when a session starts, so the user starts a new
+session before you use the tools. In 0.4.8 the address and token change each
+time Studio starts, so after a restart run `claude mcp remove omnigraph-studio`
+and add it again; later releases keep both by default (port 24187, the token in
+the system keychain).
 
-Call `studio_windows` first: it lists each window's id, server, graph and
-branch, and every other tool names a window by that id. Then, for example,
-`graph_open_type` opens a type's table and `graph_open_branch` opens a branch's
-review against main. The server's `tools/list` describes the rest. If the user
-connected Studio, add a line to the agent file's section: before asking the
-user to approve a merge, open the branch's review in Studio with
-`graph_open_branch`.
+Call `studio_windows` first: it gives each window's id, server, graph and
+branch, and every other tool takes a window id. `graph_open_type` opens a table,
+`graph_open_branch` a branch's review against main, and `tools/list` describes
+the rest. If Studio is connected, add a rule to the agent file: before asking
+the user to approve a merge, open the branch's review with `graph_open_branch`.
 
 Point them to the [quickstart](../../../docs/user/quickstart.md) and the
 [Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
