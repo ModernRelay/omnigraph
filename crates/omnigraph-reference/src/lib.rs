@@ -199,6 +199,10 @@ struct Entity {
 pub struct Graph {
     nodes: HashMap<String, Vec<Entity>>,
     edges: HashMap<String, Vec<Entity>>,
+    /// Each entity's position in its type's rows by id, so reading a
+    /// reference's entity is a lookup, not a scan of its type. Scans still
+    /// read the rows in export order.
+    positions: HashMap<(bool, String), HashMap<String, usize>>,
 }
 
 impl Graph {
@@ -255,15 +259,33 @@ impl Graph {
                 });
             }
         }
+        for (edge, types) in [(false, &graph.nodes), (true, &graph.edges)] {
+            for (type_name, rows) in types {
+                let mut by_id = HashMap::with_capacity(rows.len());
+                for (i, entity) in rows.iter().enumerate() {
+                    by_id.entry(entity.id.clone()).or_insert(i);
+                }
+                graph.positions.insert((edge, type_name.clone()), by_id);
+            }
+        }
         Ok(graph)
     }
 
+    fn entity(&self, edge: bool, type_name: &str, id: &str) -> Option<&Entity> {
+        let position = *self
+            .positions
+            .get(&(edge, type_name.to_string()))?
+            .get(id)?;
+        let rows = if edge { &self.edges } else { &self.nodes };
+        rows.get(type_name)?.get(position)
+    }
+
     fn node(&self, type_name: &str, id: &str) -> Option<&Entity> {
-        self.nodes.get(type_name)?.iter().find(|e| e.id == id)
+        self.entity(false, type_name, id)
     }
 
     fn edge(&self, type_name: &str, id: &str) -> Option<&Entity> {
-        self.edges.get(type_name)?.iter().find(|e| e.id == id)
+        self.entity(true, type_name, id)
     }
 }
 
