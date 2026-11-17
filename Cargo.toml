@@ -149,6 +149,26 @@ debug = 0
 [profile.dev.package."*"]
 opt-level = 2
 
+# Lance 13's NGRAM index lowercases a value before ASCII folding
+# (`TEXT_PREPPER`), so a character that lowercases to itself and folds to
+# capitals (`™` to `TM`) yields a trigram
+# with capitals, which `ngram_to_token` maps with wrapping `u8` arithmetic.
+# A release build wraps, alike on build and search, and the recheck keeps
+# rows exact; overflow checks and a `debug_assert!` panic in a debug build.
+# lance-index's arithmetic is built here as a release build builds it, so
+# every profile runs the code that ships. Drop this at the bump whose
+# prepper folds before lowercasing, when
+# `lance_surface_guards.rs::ngram_maps_a_folded_capital_trigram_by_wrapping`
+# goes red.
+[profile.dev.package.lance-index]
+opt-level = 2
+overflow-checks = false
+debug-assertions = false
+
+[profile.dst.package.lance-index]
+overflow-checks = false
+debug-assertions = false
+
 [profile.release]
 opt-level = 2
 lto = "thin"

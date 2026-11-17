@@ -9993,6 +9993,97 @@ async fn label_list_answers_list_membership_exactly_and_never_matches_a_null() {
     }
 }
 
+/// Lance 13's NGRAM prepper (`TEXT_PREPPER`) lowercases a value and then
+/// ASCII-folds it, so a character that lowercases to itself and folds to
+/// capitals yields a trigram with capitals: `x™` prepares to `xTM`.
+/// `ngram_to_token` maps only lowercase letters and
+/// digits, and maps a capital with wrapping `u8` arithmetic: a release build
+/// wraps, alike when it builds the index and when it searches it, and Lance
+/// rechecks every candidate, so rows stay exact; a debug build's overflow
+/// checks and `debug_assert!` panic. The workspace builds lance-index's
+/// arithmetic as a release build does (`Cargo.toml`), so the index builds
+/// over such values here and `contains` returns the scan's rows. When the
+/// first assertion goes red, the prepper folds before lowercasing: drop that
+/// profile override.
+#[tokio::test]
+async fn ngram_maps_a_folded_capital_trigram_by_wrapping() {
+    use datafusion::functions::expr_fn::contains;
+    use datafusion::prelude::{col, lit};
+    use lance_index::scalar::ngram::{NGRAM_TOKENIZER, TEXT_PREPPER};
+    use lance_tokenizer::TokenStream;
+
+    let prepared = |text: &str| -> Vec<String> {
+        let mut prepper = TEXT_PREPPER.clone();
+        let mut tokenizer = NGRAM_TOKENIZER.clone();
+        let mut out = Vec::new();
+        let mut raw = prepper.token_stream(text);
+        while raw.advance() {
+            let mut trigrams = tokenizer.token_stream(&raw.token().text);
+            while trigrams.advance() {
+                out.push(trigrams.token().text.clone());
+            }
+        }
+        out
+    };
+    assert_eq!(prepared("x\u{2122}"), ["xTM"]);
+    assert_eq!(prepared("d\u{2122}n"), ["dTM", "TMn"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("ngram_capitals.lance");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["r1", "r2", "r3"])),
+            Arc::new(StringArray::from(vec![
+                Some("x\u{2122} vitamin"),
+                Some("brand\u{2122}name"),
+                Some("plain xtm text"),
+            ])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::NGram,
+            Some("text_ngram".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    for (needle, expected) in [
+        ("x\u{2122} vit", &["r1"][..]),
+        ("d\u{2122}n", &["r2"][..]),
+        ("xtm", &["r3"][..]),
+    ] {
+        let (indexed, scanned, plan) =
+            scalar_kind_select(&dataset, contains(col("text"), lit(needle))).await;
+        assert_eq!(indexed, scalar_kind_ids(expected), "contains `{needle}`");
+        assert_eq!(scanned, indexed, "contains `{needle}`");
+        assert!(
+            plan.contains("text_ngram"),
+            "contains `{needle}` probes the index:\n{plan}"
+        );
+    }
+}
+
 /// An NGRAM index answers `contains(text, needle)` with a candidate superset:
 /// it indexes the lowercased, ASCII-folded alphanumeric trigrams of each value,
 /// so a needle that differs from the value only in case or accents is a
