@@ -2485,6 +2485,27 @@ fn where_expr_text(w: &Pair<Rule>) -> String {
     pred_text(&e)
 }
 
+/// The predicates of a `not { … }` block whose every element is a filter
+/// and which has no `where`, in written order; `None` for any other block.
+fn only_filters(negation: &Pair<Rule>) -> Option<Vec<String>> {
+    let body = child(negation, Rule::block_body)?;
+    if child(&body, Rule::where_clause).is_some() {
+        return None;
+    }
+    let elements = child(&body, Rule::elements)?;
+    let mut preds = Vec::new();
+    for e in elements.into_inner().filter(|e| e.as_rule() == Rule::element) {
+        let k = kind(&e);
+        if k.as_rule() != Rule::filter_rec || keyword_filter(&k).is_some() {
+            return None;
+        }
+        let x = k.clone().into_inner().next()?;
+        expr(x.clone()).ok()?;
+        preds.push(pred_text(&x));
+    }
+    (!preds.is_empty()).then_some(preds)
+}
+
 /// The text between the outermost braces of `p`, trimmed.
 fn inner_text(p: &Pair<Rule>) -> String {
     let t = p.as_str();
@@ -2587,8 +2608,15 @@ impl Pieces {
                 );
             }
             Rule::negation_rec => {
-                self.preds
-                    .push(format!("not exists {{ {} }}", inner_text(&k)));
+                // A block whose only content is a filter of outer names
+                // (`not { $p.name = "bob" }`) kept the rows its filter did
+                // not hold on, a null one included: the respelling map's
+                // `not coalesce(φ, false)`. Any other block is `not exists`.
+                let filters = only_filters(&k);
+                self.preds.push(match filters {
+                    Some(preds) => format!("not coalesce({}, false)", preds.join(" and ")),
+                    None => format!("not exists {{ {} }}", inner_text(&k)),
+                });
                 note_problem(
                     &mut self.problem,
                     Q012,

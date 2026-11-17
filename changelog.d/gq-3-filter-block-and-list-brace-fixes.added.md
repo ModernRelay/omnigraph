@@ -1,0 +1,1 @@
+- Two more old forms print a fix: `not { φ }` holding only filters becomes `not coalesce(φ, false)`, and a list compared with `=` to an element becomes `"v" in $x.list`.

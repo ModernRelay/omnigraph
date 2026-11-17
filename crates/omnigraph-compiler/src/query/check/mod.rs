@@ -5436,6 +5436,9 @@ impl Ctx<'_> {
                     .expr(sc, right, sub)
                     .map_err(|e| at_operand(e, right, written));
                 let (l, r) = self.both(sc, l, r)?;
+                if let Some(d) = list_equality_membership(*op, &l, &r, left, right, written) {
+                    return Err(E::D(d));
+                }
                 let compared = literal_against_property(&l, &r, written, 1)
                     .and_then(|()| literal_against_property(&r, &l, written, 0))
                     .and_then(|()| compare(*op, l, r));
@@ -7384,6 +7387,65 @@ fn untyped_null_refusal() -> E {
         "nothing fixes the type of this `null`: a `null` is a value where the other branch of `if`, another argument of `coalesce` or the property it is assigned to gives it a type",
         "if(<condition>, <value>, null), or coalesce(<value>, …)",
     )
+}
+
+/// `T7` for a list compared with `=` or `!=` to a value of its element type,
+/// which edition 2's property brace on a list meant as membership
+/// (`$p: Person { tags: "rust" }`, whose brace fix writes `$p.tags =
+/// "rust"`): the fix is the membership test, `"rust" in $p.tags`, negated
+/// under `!=`.
+fn list_equality_membership(
+    op: CompOp,
+    l: &SExpr,
+    r: &SExpr,
+    left: &Expr,
+    right: &Expr,
+    written: &SourceSpan,
+) -> Option<QueryDiagnostic> {
+    if !matches!(op, CompOp::Eq | CompOp::Ne) {
+        return None;
+    }
+    let (Ty::Value(a), Ty::Value(b)) = (&l.ty, &r.ty) else {
+        return None;
+    };
+    let (list, item, list_ty, item_ty) = match (a.list, b.list) {
+        (true, false) => (left, right, a, b),
+        (false, true) => (right, left, b, a),
+        _ => return None,
+    };
+    let mut element = list_ty.clone();
+    element.list = false;
+    if !types_compatible(item_ty, &element) && !types_compatible(&element, item_ty) {
+        return None;
+    }
+    let print = crate::query::syntax::print::expr;
+    let membership = format!("{} in {}", print(item), print(list));
+    let replacement = match op {
+        CompOp::Ne => format!("not ({membership})"),
+        _ => membership,
+    };
+    let mut d = QueryDiagnostic::typecheck(
+        T7,
+        format!(
+            "cannot compare {} with {}: a list holds a value, which `in` tests",
+            a.display_name(),
+            b.display_name()
+        ),
+    )
+    .with_fix(replacement.clone());
+    if written.end > written.start {
+        d = d.with_suggestion(Suggestion {
+            applicability: Applicability::MachineApplicable,
+            edits: vec![TextEdit {
+                start: written.start,
+                end: written.end,
+                replacement,
+            }],
+        });
+        d.position = Some(written.position);
+        d.end = Some(written.end_position);
+    }
+    Some(d)
 }
 
 /// A comparison with the `null` literal, null on every row: the test is

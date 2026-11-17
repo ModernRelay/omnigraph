@@ -619,9 +619,9 @@ byte edits. Rewrite from the fix and this map:
 | Older form | GQ 3 | Code |
 |---|---|---|
 | `mutation name(…)` | `query name(…)` | `Q009` |
-| a filter in `match`; `$x: T { p: v }` | `match { $x: T } where $x.p = v and …` | `Q017`, `Q010` |
+| a filter in `match`; `$x: T { p: v }` | `match { $x: T } where $x.p = v and …` (over a list property, then `"v" in $x.p`, `T7`) | `Q017`, `Q010` |
 | items separated by whitespace | commas | `Q016` |
-| `not { P }` | `not exists { P }` in `where` | `Q012` |
+| `not { P }` | `not exists { P }` in `where`; `not { φ }` holding only filters is `not coalesce(φ, false)` | `Q012` |
 | `not exists { $p: Person where φ }` (re-mentions an outer binding) | `not (φ)`, or `not coalesce(φ, false)` when φ can be null | `T68` |
 | a block's or `optional`'s triple naming a new variable | bind it inside: `count { $c: Company, $p worksAt $c }` | `T84` |
 | `$c worksAt $p` against `WorksAt: Person -> Company` | `$p worksAt $c` | `T82` |

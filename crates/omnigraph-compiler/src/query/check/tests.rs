@@ -2731,3 +2731,31 @@ fn a_null_literal_takes_the_type_its_context_fixes() {
     );
     assert_eq!(d.fix.as_deref(), Some("$p.city is null"), "{d}");
 }
+
+/// Edition 2's property brace on a list property tested membership; its
+/// brace fix writes an equality, which `T7` refuses with the membership test
+/// as its suggestion, negated under `!=`.
+#[test]
+fn a_list_compared_with_its_element_type_suggests_membership() {
+    for (written, fixed) in [
+        (
+            "query q() { match { $d: Doc } where $d.tags = \"rust\" return { $d.title } }",
+            "query q() { match { $d: Doc } where \"rust\" in $d.tags return { $d.title } }",
+        ),
+        (
+            "query q($t: String) { match { $d: Doc } where $t != $d.tags return { $d.title } }",
+            "query q($t: String) { match { $d: Doc } where not ($t in $d.tags) return { $d.title } }",
+        ),
+    ] {
+        let d = refused_with(written, "T7");
+        let edits = &d.suggestion.as_ref().expect("a suggestion").edits;
+        let applied = crate::query::syntax::parse::apply_edits(written, edits);
+        assert_eq!(applied, fixed);
+        check_source(&catalog(), &applied)
+            .unwrap()
+            .into_iter()
+            .for_each(|(_, r)| {
+                r.unwrap();
+            });
+    }
+}

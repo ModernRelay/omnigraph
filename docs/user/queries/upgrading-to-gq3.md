@@ -54,9 +54,10 @@ fix.
 |---|---|---|
 | `mutation name(…) { … }` | `query name(…) { … }` | `Q009` |
 | a filter clause in `match`, `match { $p: Person  $p.age > 30 }` | a conjunct of the `where` after the braces, in written order, joined by `and`: `match { $p: Person } where $p.age > 30` | `Q017` |
-| `$x: T { p: v }` | `$x: T` and the conjunct `$x.p = v`, leading the `where` | `Q010` |
+| `$x: T { p: v }` | `$x: T` and the conjunct `$x.p = v`, leading the `where`; over a list property, the next pass's `"v" in $x.p` | `Q010`, then `T7` |
 | elements, `return` items, order keys, arguments or assignments separated by whitespace | commas | `Q016` |
 | `not { P }` | `not exists { P }` in `where` | `Q012` |
+| `not { φ }`, a block holding only filters, `not { $p.age > 30 }` | `not coalesce(φ, false)`, which keeps the rows a null `φ` kept | `Q012` |
 | a block whose only element re-mentions an outer binding to filter it, `not exists { $p: Person where $p.name = "bob" }` | that filter, `not ($p.name = "bob")`, or `not coalesce($p.age > 30, false)` where the predicate can be null | `T68` |
 | a block's filter clauses | the block's own `where`, inside its braces | `Q017` |
 | a block, `optional` or inline read naming a new variable only in a triple, `count { $p worksAt $c }` | the binding inserted with the edge's end type, `count { $c: Company, $p worksAt $c }` | `T84` |
