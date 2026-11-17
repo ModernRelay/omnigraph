@@ -478,8 +478,9 @@ fn normalized_schema(text: &str) -> String {
         .join("\n")
 }
 
-/// The fixture's seed through `/load`, as `Seed::load` sends it to a
-/// session: the inline rows overwrite on `main`, generated batches append.
+/// The fixture as `seed_case` applies it to a session: the seed through
+/// `/load` (inline rows overwrite `main`, generated batches append), then
+/// each declared branch as a `branch create` at `/mutate` plus its recipe.
 async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
     match &fixture.seed {
         Seed::Inline(text) if text.trim().is_empty() => Ok(()),
@@ -492,7 +493,39 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
                 .load_generated(generated, MAIN_BRANCH, LoadMode::Append)
                 .await
         }
+    }?;
+    let Some(branches) = &fixture.branches else {
+        return Ok(());
+    };
+    for name in branches.names() {
+        let request = ChangeRequest {
+            query: format!(
+                "branch create {} from {}",
+                branch_name(&name),
+                branch_name(branches.from())
+            ),
+            name: None,
+            params: None,
+            branch: None,
+            settings: None,
+        };
+        client
+            .post::<_, ChangeOutput>("/mutate", &request)
+            .await?
+            .map_err(|error| {
+                format!(
+                    "branches fixture: branch create {name} from {}: {error}",
+                    branches.from()
+                )
+            })?;
+        if let Some(generated) = branches.recipe(&name)? {
+            client
+                .load_generated(&generated, &name, LoadMode::Append)
+                .await
+                .map_err(|error| format!("branches fixture: load {name}: {error}"))?;
+        }
     }
+    Ok(())
 }
 
 /// The `--- params` as they go on the wire: the JSON the case spells,
