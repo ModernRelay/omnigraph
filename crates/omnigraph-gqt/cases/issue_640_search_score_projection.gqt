@@ -182,7 +182,7 @@ query search_projected($q: String) {
 --- params
 {"q": "needle"}
 
---- expect error: T86: `search_projected`: this release's planner does not lower a full-text call read as a value in `return`
+--- expect error: T86: `search_projected`: this release does not support a full-text call read as a value in `return` yet
 
 --- query
 query alias_projected_again() {

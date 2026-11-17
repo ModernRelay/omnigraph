@@ -999,7 +999,7 @@ fn the_closure_table() {
         refuse(
             "query w($h: String) { insert Person { handle: $h, name: $h } }\nquery q() { match { from w(\"a\") } return { 1 as one } }",
             "T74",
-            "A7",
+            "never from a write",
         ),
     );
     for (k, v) in &rows {

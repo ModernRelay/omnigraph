@@ -176,7 +176,7 @@ query second_group_reads_the_first() {
   update $c set { city: $q.name }
 }
 
---- expect error: T86: `second_group_reads_the_first`: this release's planner does not lower a write group whose selection reads a table an earlier group of the write changes (`node:Person`)
+--- expect error: T86: `second_group_reads_the_first`: this release does not support a write group whose selection reads a table an earlier group of the write changes (`node:Person`) yet
 
 --- mutate
 query close_nothing() {

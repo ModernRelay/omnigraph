@@ -2,7 +2,8 @@
 //! 5): a declaration the type checker accepts must lower. The shapers in
 //! [`crate::shape`] are the one statement of what lowers; a term they do not
 //! lower is refused here with `T86` at the construct it was written as,
-//! naming the stage that adds it. A suggestion would have to write a lowered
+//! naming the construct; the stage that adds it is the shaper's record
+//! ([`crate::shape::ProgrammeStage`]), never the message's. A suggestion would have to write a lowered
 //! form with the same rows and the same result columns; no term refused in
 //! this release has one, so `T86` prints none.
 

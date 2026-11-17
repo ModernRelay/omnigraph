@@ -1,5 +1,5 @@
 # issue: none
-# notes: The compiler refuses a catalogue edge, which stage S adds with `T4`; nothing executes.
+# notes: The compiler refuses a catalogue edge, which this release does not support yet, with `T4`; nothing executes.
 
 --- runner
 timeout_ms: 10000

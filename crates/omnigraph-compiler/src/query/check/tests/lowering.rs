@@ -1,10 +1,13 @@
 //! The release's lowering admission (the GQ 3 RFC, section
 //! 5, "A read the type checker accepts, the planner lowers"): a term the
-//! planner does not lower is `T86` at its construct, naming the stage that
-//! adds it, and the closure table is the test. Every freeze-list row of
-//! section 6 that the RFC marks as working is represented by texts that type
-//! check and shape; a construct of a row this release does not lower yet is
-//! `T86` naming its stage.
+//! planner does not lower is `T86` at its construct, naming the construct
+//! and saying this release does not support it yet, and the closure table
+//! is the test. Every freeze-list row of section 6 that the RFC marks as
+//! working is represented by texts that type check and shape; a construct
+//! of a row this release does not lower yet is `T86`. The stage that adds
+//! each refused construct is recorded here ([`B_IN_PROGRESS`] for stage B,
+//! [`LATER`] for later stages) and by the shaper's [`crate::shape::ProgrammeStage`], and
+//! the two must agree; no message names a stage.
 
 use super::SCHEMA;
 use crate::catalog::{Catalog, build_catalog};
@@ -12,6 +15,7 @@ use crate::ir::core::CoreDecl;
 use crate::query::check::check_source;
 use crate::query::diagnostic::QueryDiagnostic;
 use crate::schema::parser::parse_schema;
+use crate::shape::ShapeError;
 use crate::shape::read::ReadShape;
 use crate::shape::write::WriteShape;
 
@@ -28,14 +32,15 @@ use Outcome::{Lowers, Refused};
 
 /// A freeze-list row: its surface and its representative texts. Every row
 /// of the table says its surface works in this release; a refusal the row
-/// itself states (a self-call, `T86` naming Rec) is its text's outcome.
+/// itself states (a self-call, `T86` of a stage Rec construct) is its
+/// text's outcome.
 struct Row {
     surface: &'static str,
     texts: &'static [(&'static str, Outcome)],
 }
 
 /// A construct of a row the RFC marks as working that this build does not
-/// lower yet: `T86` naming B, at the shaper's refusal whose term is
+/// lower yet: `T86` of stage B, at the shaper's refusal whose term is
 /// `site` (its text, a `format!` string's literal parts in order).
 struct InProgress {
     construct: &'static str,
@@ -44,9 +49,11 @@ struct InProgress {
 }
 
 /// Every construct the RFC marks as working that this build refuses with
-/// `T86` naming B. Stage B ships in part: the list must shrink to empty
-/// before the release ships B whole. Every refusal of the shapers that
-/// names B has an entry here, one per call site at least
+/// `T86`, each of stage B. Stage B ships in part: the list must shrink to
+/// empty before the release ships B whole, and it is the acceptance test of
+/// the planner's direct lowering of the core term, which reaches these
+/// forms. Every refusal of the shapers of stage B has an entry here, one
+/// per call site at least
 /// ([`every_refusal_of_the_shapers_is_pinned`]); a term the type checker
 /// never writes is a [`crate::shape::ShapeError::Internal`] defect, not a
 /// refusal, and has none.
@@ -174,8 +181,8 @@ const B_IN_PROGRESS: &[InProgress] = &[
     },
 ];
 
-/// The shapers' refusals that name a later stage, each with a text that
-/// reaches it.
+/// The shapers' refusals of a later stage, each with the stage, its term
+/// and a text that reaches it.
 const LATER: &[(&str, &str, &str)] =
     &[("Rec", "a read that calls itself (`Fix`)", super::REACHABLE)];
 
@@ -594,6 +601,44 @@ fn outcome(text: &str) -> Result<(), QueryDiagnostic> {
     Ok(())
 }
 
+/// The stage the shaper records for the first term of `text` it does not
+/// lower: the code's record, which no message names.
+fn shaper_stage(text: &str) -> &'static str {
+    let catalog = catalog();
+    let decls = crate::query::check::type_source(&catalog, text)
+        .unwrap_or_else(|e| panic!("parse: {e}\n{text}"));
+    for (_, checked) in decls {
+        let core = checked
+            .unwrap_or_else(|e| panic!("does not type: {e}\n{text}"))
+            .core;
+        let shaped = match &core {
+            CoreDecl::Read(read) => ReadShape::of(read, &catalog).map(|_| ()),
+            CoreDecl::Write(write) => WriteShape::of(write, &catalog).map(|_| ()),
+        };
+        if let Err(ShapeError::Unlowered(u)) = shaped {
+            return u.stage.code();
+        }
+    }
+    panic!("every declaration shapes:\n{text}")
+}
+
+/// A `T86`'s message: it names the construct, says this release does not
+/// support it yet and names no stage; the stage is the shaper's record.
+fn refused_stage(d: &QueryDiagnostic, text: &str) -> &'static str {
+    assert_eq!(d.code.as_str(), "T86", "{d}\n{text}");
+    assert!(
+        d.message.contains("this release does not support") && d.message.ends_with(" yet"),
+        "a T86 that does not say this release does not support its construct yet: {d}"
+    );
+    for stage in ["stage", " B ", "(B)", "Rec", "the break"] {
+        assert!(
+            !d.message.contains(stage),
+            "a T86 naming a stage ({stage}): {d}"
+        );
+    }
+    shaper_stage(text)
+}
+
 #[test]
 fn every_row_marked_works_lowers_and_every_other_construct_names_its_stage() {
     let mut pending = Vec::new();
@@ -602,11 +647,7 @@ fn every_row_marked_works_lowers_and_every_other_construct_names_its_stage() {
             let got = match outcome(text) {
                 Ok(()) => Lowers,
                 Err(d) => {
-                    assert_eq!(d.code.as_str(), "T86", "{}: {d}\n{text}", row.surface);
-                    let stage = ["B", "Rec"]
-                        .into_iter()
-                        .find(|s| d.message.contains(&format!("stage {s} ")))
-                        .unwrap_or_else(|| panic!("{}: no stage named: {d}", row.surface));
+                    let stage = refused_stage(&d, text);
                     assert!(d.position.is_some(), "{}: no position: {d}", row.surface);
                     // A suggestion must keep the rows and the result
                     // columns; no refused term of this release has one.
@@ -629,7 +670,7 @@ fn every_row_marked_works_lowers_and_every_other_construct_names_its_stage() {
     for text in pending {
         assert!(
             B_IN_PROGRESS.iter().any(|entry| entry.text == text),
-            "a refusal naming B that `B_IN_PROGRESS` does not list:\n{text}"
+            "a stage B refusal that `B_IN_PROGRESS` does not list:\n{text}"
         );
     }
 }
@@ -765,12 +806,13 @@ fn names_site(message: &str, site: &str) -> bool {
         })
 }
 
-/// Every refusal the shapers can make is pinned: a refusal naming B by
+/// Every refusal the shapers can make is pinned: a refusal of stage B by
 /// the constructs of [`B_IN_PROGRESS`] that reach it, at least one per
-/// call site, and one naming a later stage by [`LATER`]. Each text type
-/// checks to `T86` stating the site's term and naming its stage, so a new
-/// refusal without an entry, an entry whose refusal is gone, or a text that
-/// no longer reaches its refusal fails here.
+/// call site, and one of a later stage by [`LATER`]. Each text type checks
+/// to `T86` stating the site's term, and the shaper records the entry's
+/// stage, so a new refusal without an entry, an entry whose refusal is gone,
+/// an entry whose stage moved, or a text that no longer reaches its refusal
+/// fails here.
 #[test]
 fn every_refusal_of_the_shapers_is_pinned() {
     let mut sites = refusal_sites(include_str!("../../../shape/read.rs"));
@@ -778,11 +820,7 @@ fn every_refusal_of_the_shapers_is_pinned() {
     assert!(sites.len() > 10, "the site reader found {sites:#?}");
     let stage = |text: &str| -> (String, &'static str) {
         let d = outcome(text).expect_err(text);
-        assert_eq!(d.code.as_str(), "T86", "{d}\n{text}");
-        let stage = ["B", "Rec"]
-            .into_iter()
-            .find(|s| d.message.contains(&format!("stage {s} ")))
-            .unwrap_or_else(|| panic!("no stage named: {d}"));
+        let stage = refused_stage(&d, text);
         (d.message, stage)
     };
     let mut unpinned = Vec::new();

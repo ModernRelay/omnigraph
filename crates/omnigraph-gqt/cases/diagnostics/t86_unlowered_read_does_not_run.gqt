@@ -1,8 +1,8 @@
 # issue: none
-# notes: A read whose term this release's planner does not lower is refused at type check with `T86`, naming the stage that adds it:
-# notes: an `optional`'s node returned whole (stage B) and a read that calls itself (`Fix`, stage Rec); nothing executes.
-# notes: The `optional` itself runs. An edge reference returned whole is stage B: the result has no edge object, so an
-# notes: edge is read through its fields.
+# notes: A read whose term this release's planner does not lower is refused at type check with `T86`, naming the construct
+# notes: and saying this release does not support it yet, never the stage that adds it: an `optional`'s node returned
+# notes: whole and a read that calls itself (`Fix`); nothing executes. The `optional` itself runs. An edge reference
+# notes: returned whole is refused too: the result has no edge object, so an edge is read through its fields.
 
 --- runner
 timeout_ms: 10000
@@ -63,7 +63,7 @@ query whole($h: String) { match { $p: Person, optional { $q: Person, $p knows $q
 --- params
 {"h": "ada"}
 
---- expect error: type error: T86: `whole`: this release's planner does not lower a node an `optional` introduces returned whole (a nullable node object); stage B (the break) adds it
+--- expect error: type error: T86: `whole`: this release does not support a node an `optional` introduces returned whole (a nullable node object) yet
 
 --- query
 query reachable($from: String) {
@@ -78,10 +78,10 @@ query reachable($from: String) {
 --- params
 {"from": "ada"}
 
---- expect error: type error: T86: `reachable`: this release's planner does not lower a read that calls itself (`Fix`); stage Rec (recursion, the `Fix` evaluator) adds it
+--- expect error: type error: T86: `reachable`: this release does not support a read that calls itself (`Fix`) yet
 
 --- query
 query edge_whole() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }
 
---- expect error: type error: T86: `edge_whole`: this release's planner does not lower an edge reference returned whole (the result has no edge object); stage B (the break) adds it
+--- expect error: type error: T86: `edge_whole`: this release does not support an edge reference returned whole (the result has no edge object) yet
 

@@ -1520,7 +1520,7 @@ fn read_tail(input: &str, body: &mut ReadBody, tail: Vec<Pair<Rule>>) -> R<()> {
                     input,
                     Q015,
                     format!(
-                        "`{}` is paging, which stage P adds as a continuation token over the total order; this release has `limit` only",
+                        "`{}` is paging, which this release does not support yet; it has `limit` only",
                         section
                             .as_str()
                             .split_whitespace()
@@ -2945,7 +2945,7 @@ fn star_range(input: &str, triple: &Pair<Rule>) -> Refusal {
         .clone()
         .into_inner()
         .any(|p| p.as_rule() == Rule::traversal_bounds);
-    let message = "a hop range is written `{min,max}` after the edge, with no `*`; only `shortest` takes an unbounded range, which stage Path adds";
+    let message = "a hop range is written `{min,max}` after the edge, with no `*`; only `shortest` takes an unbounded range, and this release does not support `shortest` yet";
     if bounded {
         let (s, e) = span_of(&star);
         refusal(
@@ -4054,16 +4054,18 @@ fn bare_name(word: Pair<Rule>) -> Refusal {
             "remove it",
         );
     }
-    let stage = match w {
-        "offset" | "skip" => Some("paging, stage P"),
-        "returning" => Some("the writes RFC, stage W1"),
+    // The stage that adds each: paging is stage P, `returning` the writes
+    // RFC's stage W1.
+    let later = match w {
+        "offset" | "skip" => Some("paging"),
+        "returning" => Some("a write's returned rows"),
         _ => None,
     };
-    if let Some(stage) = stage {
+    if let Some(later) = later {
         return refusal_note(
             input,
             Q015,
-            format!("`{w}` is {stage}; it has no meaning in this release"),
+            format!("`{w}` is {later}, which this release does not support yet"),
             span,
             "remove it",
         );

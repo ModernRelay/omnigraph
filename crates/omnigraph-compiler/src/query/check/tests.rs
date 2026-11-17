@@ -986,7 +986,7 @@ fn a_step_counts_the_nodes_it_adds() {
 }
 
 #[test]
-fn if_commit_and_valid_are_refused_with_the_writes_rfc_named() {
+fn if_commit_and_valid_are_refused_as_not_supported_yet() {
     for a in ["@if_commit($h)", "@valid($h)"] {
         let message = refused(
             &format!(
@@ -994,7 +994,15 @@ fn if_commit_and_valid_are_refused_with_the_writes_rfc_named() {
             ),
             "T80",
         );
-        assert!(message.contains("writes RFC"), "{message}");
+        // The message names the construct, never the stage that adds it.
+        assert!(
+            message.contains(&format!(
+                "does not support `{}` yet",
+                &a[..a.find('(').unwrap()]
+            )) && !message.contains("RFC")
+                && !message.contains("stage"),
+            "{message}"
+        );
     }
 }
 
@@ -1016,7 +1024,10 @@ fn an_unknown_annotation_is_refused_and_metadata_is_retained() {
         "query q() @budget(rows = 10) { match { $p: Person } return { $p } }",
         "T80",
     );
-    assert!(m.contains("stage (N)"), "{m}");
+    assert!(
+        m.contains("does not support `@budget(rows = …)` yet") && !m.contains("stage"),
+        "{m}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,7 +1450,10 @@ fn a_call_binds_its_arguments_and_never_substitutes() {
         "query r() { match { $p: Person } return { $p } }\nquery w() { match { from r() }  update $p set { city: null } }",
         "T74",
     );
-    assert!(m.contains("W2"), "{m}");
+    assert!(
+        m.contains("does not support a declared read called from a write yet") && !m.contains("W2"),
+        "{m}"
+    );
     // Arity and argument types.
     refused(
         "query f($h: String) { match { $p: Person } where $p.handle = $h return { $p } }\nquery q() { match { from f() } return { $p } }",

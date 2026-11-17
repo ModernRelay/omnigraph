@@ -34,7 +34,7 @@ codes! {
     Q012 = "a respelling the language refuses; the fix prints the legal form";
     Q013 = "a write's elements are written without match, or after a statement; the fix is the group's match";
     Q014 = "a spelling from another language; the fix prints the GQ form";
-    Q015 = "a form a later stage adds; the message names the stage";
+    Q015 = "a form this release does not support yet; the message names the form";
     Q016 = "two items of a list are separated by whitespace alone; the fix is the comma";
     Q017 = "a filter, a where or a comparison inside the match braces; the fix moves it to the where after them";
     Q018 = "a bare name where a value is read; a bare name is a return alias in order only";
@@ -104,7 +104,7 @@ codes! {
     T83 = "two declarations of one name in a source unit";
     T84 = "a name an inner scope, a block, an optional or an inline read, uses in a triple without binding it";
     T85 = "a `from` over a relation carrying an unnamed score without `as`, or an `as` on a `from` whose relation carries none";
-    T86 = "a term this release's planner does not lower; the message names the stage that adds it";
+    T86 = "a term this release's planner does not lower; the message names the construct";
     // The GQ 3 RFC, section 4, Errors: `scorer = "none"`
     // allows matching and makes a ranking call on the field a type error.
     T87 = "a ranking call on a field whose full-text index declares `scorer = \"none\"`";

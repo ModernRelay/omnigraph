@@ -289,25 +289,24 @@ type-checks but that the planner has no plan for is refused at
 type check with `T86`, at the construct it was written as (the `let`, the
 `optional`, the `from`, the `limit`, the order key, the block's comparison,
 the write group's `match`, the statement), before any storage is read. The
-message names the stage of the language programme that adds it: `B` for a
-construct of edition 3 the planner does not lower, `Rec` for a read that
-calls itself.
+message names the construct and says this release does not support it yet;
+a later release lowers it.
 
-| Refused | Stage |
-|---|---|
-| A ranking beside another pattern component or correlated on an outer name, two rankings in one pattern, a ranking inside an `optional`, a `union` arm or an inline read, a ranking over a read with its own aggregate, `distinct`, `order` or `limit` | B |
-| A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope; an inline read returning an outer name under another name; a called read's `limit $k` bound to a computed argument | B |
-| A node an `optional` introduces, or an edge reference, returned whole; a `let` inside an `optional` that binds no node of its own | B |
-| A full-text call (`match_terms`) read as a value in `return`, `order` or a block's aggregate | B |
-| A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B |
-| A read that calls itself (`Fix`) | Rec |
+| Refused |
+|---|
+| A ranking beside another pattern component or correlated on an outer name, two rankings in one pattern, a ranking inside an `optional`, a `union` arm or an inline read, a ranking over a read with its own aggregate, `distinct`, `order` or `limit` |
+| A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope; an inline read returning an outer name under another name; a called read's `limit $k` bound to a computed argument |
+| A node an `optional` introduces, or an edge reference, returned whole; a `let` inside an `optional` that binds no node of its own |
+| A full-text call (`match_terms`) read as a value in `return`, `order` or a block's aggregate |
+| A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment |
+| A read that calls itself (`Fix`) |
 
 ```text
 query q($s: String) { match { $d: Doc } return { $d.title, match_terms($d.body, terms($s, mode: any)) as hit } }
 ```
 
 ```text
-error[T86]: type error: T86: `q`: this release's planner does not lower a full-text call read as a value in `return`; stage B (the break) adds it
+error[T86]: type error: T86: `q`: this release does not support a full-text call read as a value in `return` yet
   --> line 1, column 60
 ```
 

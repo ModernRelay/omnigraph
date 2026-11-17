@@ -1617,7 +1617,8 @@ struct Budget {
 
 /// The annotations of a declaration (section 5): the metadata allow-list is
 /// retained unread, `@budget(plan = n, rounds = n)` is typed, and every other
-/// name is refused, naming the stage that types it where one does.
+/// name is refused; a name a later stage types is refused as not supported
+/// yet, never naming the stage.
 fn annotations(decl: &Decl) -> R<Budget> {
     let mut budget = Budget::default();
     for a in &decl.annotations {
@@ -1664,10 +1665,7 @@ fn annotation(a: &Annotation, budget: &mut Budget) -> R<()> {
             "if_commit" | "valid" => {
                 return Err(err(
                     T80,
-                    format!(
-                        "`@{}` belongs to the writes RFC (stage W1) and is not read in this release",
-                        a.name
-                    ),
+                    format!("this release does not support `@{}` yet", a.name),
                 ));
             }
             other => {
@@ -1698,9 +1696,7 @@ fn annotation(a: &Annotation, budget: &mut Budget) -> R<()> {
                 "rows" | "ms" | "on_exceed" => {
                     return Err(err(
                         T80,
-                        format!(
-                            "`@budget({key} = …)` is typed by the agent-interaction stage (N), not by this release"
-                        ),
+                        format!("this release does not support `@budget({key} = …)` yet"),
                     ));
                 }
                 other => {
@@ -1893,7 +1889,7 @@ impl Ctx<'_> {
             return Err(err(
                 T74,
                 format!(
-                    "`{}` is a write; a read cannot draw rows from a write (A7)",
+                    "`{}` is a write; a read draws rows only from reads, never from a write",
                     decl.name
                 ),
             ));
@@ -2948,7 +2944,7 @@ impl Ctx<'_> {
             return Err(err(
                 T1,
                 format!(
-                    "`{type_name}` is an interface; a binding names a node type; an interface population is a later stage"
+                    "`{type_name}` is an interface; a binding names a node type, and this release does not support an interface population yet"
                 ),
             ));
         }
@@ -3029,7 +3025,7 @@ impl Ctx<'_> {
         if catalogue {
             return Err(err(
                 T4,
-                "a catalogue edge (`@property`, `@from`, …) is the schema catalogue's (stage S); this release has none",
+                "this release does not support a catalogue edge (`@property`, `@from`, …) yet",
             ));
         }
         let mut declared_nodes = sc.declared_nodes.clone();
@@ -4324,7 +4320,7 @@ impl Ctx<'_> {
             return Err(err(
                 T74,
                 format!(
-                    "a write body calls the declared read `{}`; a declared read called from a write is stage W2 (section 11), after the writes RFC",
+                    "a write body calls the declared read `{}`; this release does not support a declared read called from a write yet",
                     c.name
                 ),
             ));
@@ -4333,7 +4329,7 @@ impl Ctx<'_> {
             return Err(err(
                 T74,
                 format!(
-                    "`{}` is a write; a read draws rows only from reads (A7)",
+                    "`{}` is a write; a read draws rows only from reads, never from a write",
                     c.name
                 ),
             ));
@@ -4390,7 +4386,7 @@ impl Ctx<'_> {
                         return Err(err(
                             T69,
                             format!(
-                                "`{}`'s parameter `${pname}` is a scalar; relation arguments are refused (the closure table)",
+                                "`{}`'s parameter `${pname}` is a scalar; a declared read takes scalar arguments only",
                                 c.name
                             ),
                         ));

@@ -6,7 +6,8 @@
 //! statements and the selection reads they run over. These two functions are
 //! the one statement of what this release lowers: the type checker runs them
 //! on every declaration it accepts and refuses a term they do not lower with
-//! `T86` at the construct ([`Unlowered`]), and the planner calls the same
+//! `T86` at the construct ([`Unlowered`]), naming the construct and recording
+//! the stage that adds it ([`ProgrammeStage`]) in the code only, and the planner calls the same
 //! functions to build its plans, so a term the type checker accepted that
 //! arrives unlowered is a defect (`P006`), never a refusal a query's author
 //! sees.
@@ -18,11 +19,20 @@ pub mod write;
 /// "Sequence") that adds the lowering of a term this release's planner
 /// refuses. A relation parameter (stage RP) and a path (stage Path) start at
 /// tokens this release's parser refuses, so no type-checked term names them.
+///
+/// The stage is the code's record, never the message's (the RFC's `T86`
+/// rule): a refusal names its construct and says this release does not
+/// support it yet, since a stage named in the message would go stale when
+/// the stage ships. Every refusal of [`read::ReadShape`] and
+/// [`write::WriteShape`] is stage [`ProgrammeStage::B`] unless its call site
+/// sets another; the closure table (`B_IN_PROGRESS` and `LATER` in the
+/// type checker's lowering tests) lists each construct with its stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgrammeStage {
     /// The break: edition 3 as sections 1 to 7 state it. This release ships
-    /// it in part, so a construct of the break that the planner does not
-    /// lower yet names it.
+    /// it in part; a construct of the break the planner does not lower yet
+    /// is a defect that blocks B, reached by lowering the core term
+    /// directly.
     B,
     /// Recursion: the `Fix` evaluator.
     Rec,
@@ -34,14 +44,6 @@ impl ProgrammeStage {
         match self {
             Self::B => "B",
             Self::Rec => "Rec",
-        }
-    }
-
-    /// What the stage is, as a refusal names it.
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::B => "the break",
-            Self::Rec => "recursion, the `Fix` evaluator",
         }
     }
 }
@@ -84,7 +86,8 @@ pub enum Construct {
 }
 
 /// A term this release's planner does not lower: the declaration, what the
-/// term is, the construct it was written as and the stage that adds it. It
+/// term is, the construct it was written as and the stage that adds it,
+/// which the message never names. It
 /// carries no rewrite: a suggestion must keep the rows and the result
 /// columns, and no term refused in this release has a lowered form that
 /// does.
@@ -116,14 +119,12 @@ impl Unlowered {
         self
     }
 
-    /// The refusal's message: the declaration, the term and the stage.
+    /// The refusal's message: the declaration and the construct, which this
+    /// release does not support yet. The stage stays in the code.
     pub fn message(&self) -> String {
         format!(
-            "`{}`: this release's planner does not lower {}; stage {} ({}) adds it",
-            self.name,
-            self.what,
-            self.stage.code(),
-            self.stage.title()
+            "`{}`: this release does not support {} yet",
+            self.name, self.what
         )
     }
 }

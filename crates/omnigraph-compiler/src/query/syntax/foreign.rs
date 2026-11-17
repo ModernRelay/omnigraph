@@ -225,7 +225,7 @@ fn scan(input: &str) -> Vec<Habit> {
                 out.push(Habit {
                     span: (i, i + 1),
                     edit: None,
-                    message: "the type-variable binding `$x: $t` is the polymorphic types stage (Poly); a binding names one type now".into(),
+                    message: "this release does not support a type-variable binding `$x: $t` yet; a binding names one type".into(),
                     note: "$x: <Type>".into(),
                     code: Q015,
                     applicability: Applicability::NeedsReview,
@@ -308,7 +308,7 @@ fn scan(input: &str) -> Vec<Habit> {
                             replacement: String::new(),
                         }),
                         message: format!(
-                            "`{word}::` is a schema namespace, which the schema namespaces RFC adds after this release"
+                            "`{word}::` is a schema namespace, which this release does not support yet"
                         ),
                         note: String::new(),
                         code: Q015,
@@ -359,7 +359,8 @@ fn braced_block(input: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// A form a later stage adds, refused naming the stage (section 5).
+/// A form a later stage adds, refused naming the form; the message never
+/// names the stage (section 5).
 fn later_word(input: &str, start: usize, end: usize, prev: u8, depth: i32) -> Option<Habit> {
     if matches!(prev, b'.' | b'$' | b'@') {
         return None;
@@ -387,14 +388,14 @@ fn later_word(input: &str, start: usize, end: usize, prev: u8, depth: i32) -> Op
         "returning" => {
             let close = braced_block(input, end)?;
             Some(note(
-                "`returning { … }` is the writes RFC's (stage W1); until it lands a write reports no rows",
+                "this release does not support `returning { … }` yet; a write reports no rows",
                 delete_block(close),
             ))
         }
         "assert" if after.starts_with('{') => {
             let close = braced_block(input, end)?;
             Some(note(
-                "`assert { read }` is the writes RFC's sink (stage W1)",
+                "this release does not support `assert { read }` yet",
                 delete_block(close),
             ))
         }
@@ -402,7 +403,7 @@ fn later_word(input: &str, start: usize, end: usize, prev: u8, depth: i32) -> Op
             let close = braced_block(input, end)?;
             let open = end + (input[end..].len() - after.len());
             let mut h = note(
-                "`batch` was withdrawn: several declarations in one request already share its snapshot (a request shape, stage N); write the declarations one after another",
+                "`batch` was withdrawn: several declarations in one request already share its snapshot; write the declarations one after another",
                 Some(TextEdit {
                     start,
                     end: open + 1,
@@ -414,7 +415,7 @@ fn later_word(input: &str, start: usize, end: usize, prev: u8, depth: i32) -> Op
             Some(h)
         }
         "is" if after.starts_with(|c: char| c.is_ascii_uppercase()) => Some(note(
-            "`$x is T` is the polymorphic types stage (Poly); a binding `$x: T` selects one type now",
+            "this release does not support a type test `$x is T` yet; a binding `$x: T` selects one type",
             None,
         )),
         "Commit" | "Branch" if depth == 0 && input[..start].trim_end().ends_with(':') => {
