@@ -17017,6 +17017,12 @@
               "verify"
             ]
           },
+          "plan_budget_limit": {
+            "type": "integer",
+            "description": "the largest plan budget a declaration may declare with `@budget(plan = n)`, the nodes its expanded core term may hold; a declaration declaring more is refused (`T89`) before it is compiled, never clamped",
+            "maximum": 9223372036854775807,
+            "minimum": 1
+          },
           "query_memory_bytes": {
             "type": "integer",
             "description": "the memory pool one read query runs under, and the allowance one load statement's retained read-reuse buffers are admitted against; tracked work past it is refused, and a raised value is memory one query or load may hold",

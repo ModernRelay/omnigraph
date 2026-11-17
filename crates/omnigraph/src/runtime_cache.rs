@@ -376,6 +376,9 @@ pub(crate) struct CompiledQueryKey {
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledQuery {
     pub(crate) ir: Arc<ReadShape>,
+    /// The plan budget the declaration declares, `@budget(plan = n)`,
+    /// which every session admits against its own `plan_budget_limit`.
+    pub(crate) declared_plan: Option<u64>,
 }
 
 impl CompiledQuery {
@@ -400,7 +403,10 @@ impl CompiledQuery {
             omnigraph_planner::read_shape::shape(&core, catalog)
                 .map_err(crate::exec::plan_refusal)?,
         );
-        Ok(Self { ir })
+        Ok(Self {
+            ir,
+            declared_plan: omnigraph_compiler::query::check::declared_plan(decl),
+        })
     }
 }
 

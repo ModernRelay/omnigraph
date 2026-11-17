@@ -230,7 +230,10 @@ Each optional adds a fixed number of nodes to the read's plan, so one read
 holds as many as its plan budget allows (4096 nodes unless the declaration
 writes `@budget(plan = n)`); an optional nested in another doubles the inner
 one. A read whose plan outgrows the budget is refused with `T70` as soon as
-it does.
+it does. A declared budget above the session's ceiling,
+[`plan_budget_limit`](settings.md) (65536 by default; on a server, the
+operator's), is refused with `T89` before the read is compiled, never
+clamped.
 
 ## Values and inline reads
 

@@ -124,6 +124,17 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         doc: "how much work one read may do: the results its expansions and joins produce, the pairs a product forms, the neighbors a hop range examines, every traversal together, and the tokens and term comparisons of its exact lexical scans; exhaustion fails the read with an error naming it, never a partial result",
     },
     SettingSpec {
+        name: "plan_budget_limit",
+        kind: SettingKind::Integer {
+            min: 1,
+            max: Some(i64::MAX),
+        },
+        default: "65536",
+        scope: SettingScope::Request,
+        env: "OMNIGRAPH_PLAN_BUDGET_LIMIT",
+        doc: "the largest plan budget a declaration may declare with `@budget(plan = n)`, the nodes its expanded core term may hold; a declaration declaring more is refused (`T89`) before it is compiled, never clamped",
+    },
+    SettingSpec {
         name: "write_max_bytes",
         kind: SettingKind::Integer { min: 1, max: None },
         default: "33554432",
@@ -178,6 +189,7 @@ pub enum SettingId {
     StageWriteConcurrency,
     TraversalWorkLimit,
     ReadWorkLimit,
+    PlanBudgetLimit,
     WriteMaxBytes,
     LoadSourceMaxBytes,
     QueryMemoryBytes,
@@ -195,6 +207,7 @@ impl SettingId {
         SettingId::StageWriteConcurrency,
         SettingId::TraversalWorkLimit,
         SettingId::ReadWorkLimit,
+        SettingId::PlanBudgetLimit,
         SettingId::WriteMaxBytes,
         SettingId::LoadSourceMaxBytes,
         SettingId::QueryMemoryBytes,
@@ -416,6 +429,7 @@ pub struct SessionSettings {
     stage_write_concurrency: usize,
     traversal_work_limit: u64,
     read_work_limit: u64,
+    plan_budget_limit: u64,
     write_max_bytes: u64,
     load_source_max_bytes: u64,
     query_memory_bytes: u64,
@@ -436,6 +450,7 @@ impl Default for SessionSettings {
             stage_write_concurrency: 1,
             traversal_work_limit: 1,
             read_work_limit: 1,
+            plan_budget_limit: 1,
             write_max_bytes: 1,
             load_source_max_bytes: 1,
             query_memory_bytes: 1,
@@ -508,6 +523,10 @@ impl SessionSettings {
                 self.read_work_limit = u64::try_from(parse_integer(id, value)?)
                     .expect("invariant: the row's range is 1..=i64::MAX");
             }
+            SettingId::PlanBudgetLimit => {
+                self.plan_budget_limit = u64::try_from(parse_integer(id, value)?)
+                    .expect("invariant: the row's range is 1..=i64::MAX");
+            }
             SettingId::StageWriteConcurrency => {
                 let width = parse_integer(id, value)?;
                 self.stage_write_concurrency =
@@ -544,6 +563,7 @@ impl SessionSettings {
             SettingId::AnnNprobes => self.ann_nprobes = from.ann_nprobes,
             SettingId::TraversalWorkLimit => self.traversal_work_limit = from.traversal_work_limit,
             SettingId::ReadWorkLimit => self.read_work_limit = from.read_work_limit,
+            SettingId::PlanBudgetLimit => self.plan_budget_limit = from.plan_budget_limit,
             SettingId::StageWriteConcurrency => {
                 self.stage_write_concurrency = from.stage_write_concurrency;
             }
@@ -573,6 +593,7 @@ impl SessionSettings {
             SettingId::StageWriteConcurrency => self.stage_write_concurrency.to_string(),
             SettingId::TraversalWorkLimit => self.traversal_work_limit.to_string(),
             SettingId::ReadWorkLimit => self.read_work_limit.to_string(),
+            SettingId::PlanBudgetLimit => self.plan_budget_limit.to_string(),
             SettingId::WriteMaxBytes => self.write_max_bytes.to_string(),
             SettingId::LoadSourceMaxBytes => self.load_source_max_bytes.to_string(),
             SettingId::QueryMemoryBytes => self.query_memory_bytes.to_string(),
@@ -629,6 +650,13 @@ impl SessionSettings {
     /// The rows one read's expansions may produce, all together.
     pub fn read_work_limit(&self) -> u64 {
         self.read_work_limit
+    }
+
+    /// The largest plan budget a declaration may declare,
+    /// `@budget(plan = n)`; one declaring more is refused before it is
+    /// compiled.
+    pub fn plan_budget_limit(&self) -> u64 {
+        self.plan_budget_limit
     }
 
     pub fn stage_write_concurrency(&self) -> usize {
@@ -1095,7 +1123,7 @@ mod tests {
         let err = SettingId::parse("merge_linage").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting `merge_linage`; expected one of rrf_plan, merge_lineage, change_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, read_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir"
+            "unknown setting `merge_linage`; expected one of rrf_plan, merge_lineage, change_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, read_work_limit, plan_budget_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir"
         );
         let err = SessionSettings::default()
             .with("merge_lineage", "v3")

@@ -784,6 +784,57 @@ fn set_flag_reaches_the_embedded_session_and_a_set_line_wins_over_it() {
     );
 }
 
+/// A declared `@budget(plan = n)` above `plan_budget_limit` is refused with
+/// `T89` before the declaration is compiled: embedded, under the
+/// invocation's `--set`, and served, where `--set` travels as the request's
+/// `settings` field and lowers the server's ceiling for it.
+#[test]
+fn a_declared_plan_budget_above_plan_budget_limit_is_refused() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let within = "query q() @budget(plan = 30) { match { $p: Person } return { $p.name } }";
+    let above = "query q() @budget(plan = 31) { match { $p: Person } return { $p.name } }";
+    output_success(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg(within)
+            .arg("--set")
+            .arg("plan_budget_limit=30"),
+    );
+    let stderr = stderr_string(&output_failure(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg(above)
+            .arg("--set")
+            .arg("plan_budget_limit=30"),
+    ));
+    assert!(
+        stderr.contains("T89") && stderr.contains("`plan_budget_limit` = 30"),
+        "{stderr}"
+    );
+
+    let (_cluster, server) = served_graph();
+    output_success(
+        served("query", &server)
+            .arg("-e")
+            .arg(within)
+            .arg("--set")
+            .arg("plan_budget_limit=30"),
+    );
+    let stderr = stderr_string(&output_failure(
+        served("query", &server)
+            .arg("-e")
+            .arg(above)
+            .arg("--set")
+            .arg("plan_budget_limit=30"),
+    ));
+    assert!(
+        stderr.contains("T89") && stderr.contains("`plan_budget_limit` = 30"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn set_flag_refusals_happen_before_any_open_or_round_trip() {
     let temp = tempdir().unwrap();

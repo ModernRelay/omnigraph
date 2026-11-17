@@ -1171,7 +1171,8 @@ impl AppState {
 
 /// Refuse request settings that raise a resource budget past this server's
 /// ceiling: the larger of its own value and the built-in default. A served
-/// request may lower `traversal_work_limit`, `read_work_limit`, `query_memory_bytes`,
+/// request may lower `traversal_work_limit`, `read_work_limit`, `plan_budget_limit`,
+/// `query_memory_bytes`,
 /// `write_max_bytes` and `load_source_max_bytes`, or raise one back to the
 /// default an operator lowered it from; going further is the operator's
 /// decision, made through the process environment, since a raised budget is
@@ -1194,6 +1195,11 @@ pub(crate) fn refuse_raised_budgets(
             SettingId::ReadWorkLimit,
             requested.read_work_limit(),
             server.read_work_limit().max(default.read_work_limit()),
+        ),
+        (
+            SettingId::PlanBudgetLimit,
+            requested.plan_budget_limit(),
+            server.plan_budget_limit().max(default.plan_budget_limit()),
         ),
         (
             SettingId::QueryMemoryBytes,

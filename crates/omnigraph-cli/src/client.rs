@@ -557,6 +557,9 @@ impl GraphClient {
                 SettingId::ReadWorkLimit => {
                     request.read_work_limit = Some(given.get(SettingId::ReadWorkLimit).parse()?)
                 }
+                SettingId::PlanBudgetLimit => {
+                    request.plan_budget_limit = Some(given.get(SettingId::PlanBudgetLimit).parse()?)
+                }
                 SettingId::WriteMaxBytes => {
                     request.write_max_bytes = Some(given.get(SettingId::WriteMaxBytes).parse()?)
                 }

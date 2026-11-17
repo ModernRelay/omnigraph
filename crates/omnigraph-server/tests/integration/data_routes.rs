@@ -3978,6 +3978,7 @@ async fn request_budgets_stop_at_the_server_ceiling() {
     for (setting, above) in [
         ("traversal_work_limit", "9223372036854775807"),
         ("read_work_limit", "9223372036854775807"),
+        ("plan_budget_limit", "9223372036854775807"),
         ("query_memory_bytes", "1099511627776"),
         ("write_max_bytes", "1099511627776"),
         ("load_source_max_bytes", "1099511627776"),
@@ -4036,6 +4037,45 @@ async fn request_budgets_stop_at_the_server_ceiling() {
     )
     .await;
     assert_settings_refusal_needle(status, &body, "OMNIGRAPH_TRAVERSAL_WORK_LIMIT");
+}
+
+/// A declared `@budget(plan = n)` is admitted against the server's
+/// `plan_budget_limit`: above it the read is refused with `T89` before it
+/// is compiled, never clamped, and a request cannot raise the setting past
+/// the server's ceiling to admit it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declared_plan_budget_stops_at_the_server_ceiling() {
+    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
+        (variable == "OMNIGRAPH_PLAN_BUDGET_LIMIT").then(|| "40".to_string())
+    })
+    .unwrap();
+    let (_temp, app) =
+        app_for_loaded_graph_with_process_defaults(ProcessDefaults { settings, sources }).await;
+    let read = |source: &str, settings: Value| {
+        json_post("/query", &json!({"query": source, "settings": settings}))
+    };
+    let within = "query q() @budget(plan = 40) { match { $p: Person } return { $p.name } }";
+    let above = "query q() @budget(plan = 41) { match { $p: Person } return { $p.name } }";
+    let (status, body) = json_response(&app, read(within, json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "at the ceiling: {body}");
+    let (status, body) = json_response(&app, read(above, json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("T89") && error.contains("`plan_budget_limit` = 40"),
+        "{body}"
+    );
+    // As every request budget: a request may raise the setting back toward
+    // the built-in default an operator lowered it from, and no further.
+    let (status, body) = json_response(&app, read(above, json!({"plan_budget_limit": 41}))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "raised back toward the default: {body}"
+    );
+    let (status, body) =
+        json_response(&app, read(above, json!({"plan_budget_limit": 65537}))).await;
+    assert_settings_refusal_needle(status, &body, "OMNIGRAPH_PLAN_BUDGET_LIMIT");
 }
 
 fn assert_settings_refusal_needle(status: StatusCode, body: &Value, needle: &str) {
@@ -4366,6 +4406,7 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "default",
                 "request"
             ),
+            show_row("plan_budget_limit", "65536", "65536", "default", "request"),
             show_row(
                 "write_max_bytes",
                 "33554432",

@@ -1694,10 +1694,14 @@ impl Session {
     ) -> Result<crate::MutationReceipt> {
         let decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(query_lookup_error)?;
+        let settings = self.effective(query_source)?;
+        // A declared plan budget above the session's ceiling is refused
+        // (`T89`) before anything is resolved or compiled.
+        omnigraph_compiler::query::check::admit_plan_budget(&decl, settings.plan_budget_limit())
+            .map_err(omnigraph_compiler::error::CompilerError::query)?;
         let (route, branch) = self
             .resolve_write_route(&decl.write_mode, branch, params, actor_id)
             .await?;
-        let settings = self.effective(query_source)?;
         let reader = SelectionReader {
             handle: self,
             settings: &settings,

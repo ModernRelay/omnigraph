@@ -69,7 +69,7 @@ impl Session {
         let settings = self.effective(query_source)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
 
-        let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
+        let compiled = self.compile_named_query(&catalog, query_source, query_name, &settings)?;
         admit_wildcard_target(
             matches!(&resolved.requested, ReadTarget::Snapshot(_)),
             compiled.ir().has_wildcard_traversal(),
@@ -108,7 +108,7 @@ impl Session {
         let settings = self.effective(query_source)?;
         let (snapshot, catalog) = self.capture_historical_read_view(version).await?;
 
-        let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
+        let compiled = self.compile_named_query(&catalog, query_source, query_name, &settings)?;
         admit_wildcard_target(true, compiled.ir().has_wildcard_traversal())?;
         if let CompiledRead::Explain(query) = &compiled {
             return engine::explain_rows(query, params, Some(&snapshot), &catalog, &settings).await;
@@ -146,7 +146,7 @@ impl Session {
     ) -> Result<serde_json::Value> {
         let settings = self.effective(query_source)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
-        let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
+        let compiled = self.compile_named_query(&catalog, query_source, query_name, &settings)?;
         admit_wildcard_target(
             matches!(&resolved.requested, ReadTarget::Snapshot(_)),
             compiled.ir().has_wildcard_traversal(),
@@ -229,7 +229,7 @@ impl Session {
         let settings = self.effective(query_source)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
         let CompiledRead::Query(query) =
-            self.compile_named_query(&catalog, query_source, query_name)?
+            self.compile_named_query(&catalog, query_source, query_name, &settings)?
         else {
             return Err(OmniError::manifest(
                 "the inspection door runs no `explain` statement",
@@ -314,8 +314,15 @@ impl Session {
             has_wildcard,
         )?;
         engine::plan_pins_snapshot(plan, Some(&resolved.snapshot))?;
-        let CompiledRead::Query(query) =
-            self.compile_named_query(&catalog, &envelope.query.source, &envelope.query.name)?
+        // The ceiling a recompiled declaration is admitted under; nothing
+        // of it reaches execution, which the plan alone sizes.
+        let settings = self.effective(&envelope.query.source)?;
+        let CompiledRead::Query(query) = self.compile_named_query(
+            &catalog,
+            &envelope.query.source,
+            &envelope.query.name,
+            &settings,
+        )?
         else {
             return Err(OmniError::manifest(
                 "a replay envelope names an `explain` statement, which runs nothing",
@@ -397,19 +404,33 @@ impl Omnigraph {
     /// Compile the read statement `query_name` of `query_source` (a declaration,
     /// or `explain` over one), cached in `ReadCaches::compiled_queries`; errors are
     /// never cached. A hit needs the memoized catalog `Arc` of the schema gate.
+    ///
+    /// A declaration whose `@budget(plan = n)` is above the session's
+    /// `plan_budget_limit` is refused (`T89`) before it is compiled; a cached
+    /// one is admitted against the session's ceiling too, since the cache
+    /// spans sessions.
     fn compile_named_query(
         &self,
         catalog: &Arc<Catalog>,
         query_source: &str,
         query_name: &str,
+        settings: &crate::settings::SessionSettings,
     ) -> Result<CompiledRead> {
+        let ceiling = settings.plan_budget_limit();
         let cache = &self.read_caches().compiled_queries;
         let key = crate::runtime_cache::CompiledQueryCache::key_for(query_source, query_name);
-        if let Some(compiled) = cache.get(catalog, &key) {
+        if let Some(compiled) = cache.get(catalog, &key)
+            && compiled
+                .query()
+                .declared_plan
+                .is_none_or(|declared| declared <= ceiling)
+        {
             return Ok(compiled);
         }
         let statement = omnigraph_compiler::find_read_statement(query_source, query_name)
             .map_err(super::query_lookup_error)?;
+        omnigraph_compiler::query::check::admit_plan_budget(statement.decl(), ceiling)
+            .map_err(omnigraph_compiler::error::CompilerError::query)?;
         let query = CompiledQuery::compile(catalog, statement.decl())?;
         let compiled = if statement.is_explain() {
             CompiledRead::Explain(query)

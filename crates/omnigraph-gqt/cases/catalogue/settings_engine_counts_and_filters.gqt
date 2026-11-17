@@ -33,6 +33,7 @@ query settings_with_defaults() {
 {"s.name":"stage_write_concurrency","s.kind":"integer(1..=64)","s.default":"8","s.scope":"process"}
 {"s.name":"traversal_work_limit","s.kind":"integer(1..=9223372036854775807)","s.default":"1000000","s.scope":"request"}
 {"s.name":"read_work_limit","s.kind":"integer(1..=9223372036854775807)","s.default":"100000000","s.scope":"request"}
+{"s.name":"plan_budget_limit","s.kind":"integer(1..=9223372036854775807)","s.default":"65536","s.scope":"request"}
 {"s.name":"write_max_bytes","s.kind":"integer(1..)","s.default":"33554432","s.scope":"request"}
 {"s.name":"load_source_max_bytes","s.kind":"integer(1..)","s.default":"33554432","s.scope":"request"}
 {"s.name":"query_memory_bytes","s.kind":"integer(1..)","s.default":"157286400","s.scope":"request"}

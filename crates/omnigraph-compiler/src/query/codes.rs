@@ -112,6 +112,9 @@ codes! {
     // bind by position, so a defaulted parameter is followed only by
     // defaulted ones.
     T88 = "a parameter with a default is followed by one without; the fix moves it after them";
+    // The GQ 3 RFC, section 2, Recursion: a declared plan budget above the
+    // server's ceiling is refused, never clamped (invariant 11).
+    T89 = "a declared `@budget(plan = n)` is above the ceiling `plan_budget_limit` sets";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
     // the binding it ranks, and `rrf` arms that rank two bindings are T75.

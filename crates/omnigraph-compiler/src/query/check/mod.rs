@@ -126,6 +126,62 @@ pub fn check_query_decl(
     check_syntax_decl(catalog, &decl.syntax).map_err(CompilerError::query)
 }
 
+/// The plan budget `decl` declares with `@budget(plan = n)` and the
+/// annotation declaring it; `None` when it declares none, or declares one
+/// the type checker refuses as malformed.
+fn declared_plan_budget(decl: &Decl) -> Option<(u64, &Annotation)> {
+    decl.annotations.iter().find_map(|a| {
+        if a.name != "budget" {
+            return None;
+        }
+        a.args.as_deref()?.iter().find_map(|arg| match arg {
+            AnnotationArg::Named(key, AnnotationValue::Literal(Literal::Integer(n)))
+                if key == "plan" && *n > 0 =>
+            {
+                Some((u64::try_from(*n).unwrap_or(u64::MAX), a))
+            }
+            _ => None,
+        })
+    })
+}
+
+/// The plan budget a query declaration declares, `@budget(plan = n)`.
+pub fn declared_plan(decl: &crate::query::file::QueryDecl) -> Option<u64> {
+    declared_plan_budget(decl.syntax.decl()).map(|(n, _)| n)
+}
+
+/// Refuse (`T89`) a declaration whose `@budget(plan = n)` is above
+/// `ceiling`, the session's `plan_budget_limit`, before it is typed: a
+/// client never sets the server's resource bounds (invariant 11), so the
+/// budget is refused rather than clamped, and the refused declaration costs
+/// no expansion. A declaration declaring no plan budget compiles under the
+/// compile-time default.
+pub fn admit_plan_budget(
+    decl: &crate::query::file::QueryDecl,
+    ceiling: u64,
+) -> Result<(), QueryDiagnostic> {
+    match declared_plan_budget(decl.syntax.decl()) {
+        Some((declared, a)) if declared > ceiling => {
+            let mut d = QueryDiagnostic::typecheck(
+                T89,
+                format!(
+                    "`{}` declares `@budget(plan = {declared})`, above this session's ceiling `plan_budget_limit` = {ceiling}; a declared budget is refused, never clamped",
+                    decl.name
+                ),
+            )
+            .with_fix(format!(
+                "declare `@budget(plan = {ceiling})` or less, or have the operator raise `plan_budget_limit` (`OMNIGRAPH_PLAN_BUDGET_LIMIT`)"
+            ));
+            if a.at.end > a.at.start {
+                d.position = Some(a.at.position);
+                d.end = Some(a.at.end_position);
+            }
+            Err(d)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Each declaration's name and its checked form or refusal.
 pub type CheckedDecls = Vec<(String, Result<CheckedDecl, QueryDiagnostic>)>;
 

@@ -26,6 +26,7 @@ show all;
 {"name": "stage_write_concurrency", "value": "8", "default": "8", "source": "default", "scope": "process"}
 {"name": "traversal_work_limit", "value": "1000000", "default": "1000000", "source": "default", "scope": "request"}
 {"name": "read_work_limit", "value": "100000000", "default": "100000000", "source": "default", "scope": "request"}
+{"name": "plan_budget_limit", "value": "65536", "default": "65536", "source": "default", "scope": "request"}
 {"name": "write_max_bytes", "value": "33554432", "default": "33554432", "source": "default", "scope": "request"}
 {"name": "load_source_max_bytes", "value": "33554432", "default": "33554432", "source": "default", "scope": "request"}
 {"name": "query_memory_bytes", "value": "157286400", "default": "157286400", "source": "default", "scope": "request"}

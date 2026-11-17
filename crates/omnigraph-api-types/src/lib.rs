@@ -195,6 +195,13 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = read_work_limit_schema)]
     pub read_work_limit: Option<i64>,
+    /// `plan_budget_limit`: the largest plan budget a declaration may
+    /// declare with `@budget(plan = n)`, at least `1`; an `i64` like
+    /// `traversal_work_limit`. A served request may lower it, never raise
+    /// it past the server's ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = plan_budget_limit_schema)]
+    pub plan_budget_limit: Option<i64>,
     /// `write_max_bytes`: independent row-data and Blob-payload allowances, at
     /// least `1`; a value raised above the default is held in memory as one
     /// typed batch at commit.
@@ -245,6 +252,9 @@ impl SettingsRequest {
         }
         if let Some(limit) = self.read_work_limit {
             assignments.push((SettingId::ReadWorkLimit, SettingValue::Integer(limit)));
+        }
+        if let Some(limit) = self.plan_budget_limit {
+            assignments.push((SettingId::PlanBudgetLimit, SettingValue::Integer(limit)));
         }
         if let Some(bytes) = self.write_max_bytes {
             assignments.push((SettingId::WriteMaxBytes, SettingValue::Integer(bytes)));
@@ -299,6 +309,10 @@ fn traversal_work_limit_schema() -> utoipa::openapi::schema::Object {
 
 fn read_work_limit_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::ReadWorkLimit)
+}
+
+fn plan_budget_limit_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::PlanBudgetLimit)
 }
 
 fn write_max_bytes_schema() -> utoipa::openapi::schema::Object {
@@ -4199,13 +4213,14 @@ mod tests {
             ann_nprobes: Some(7),
             traversal_work_limit: Some(123),
             read_work_limit: Some(456),
+            plan_budget_limit: Some(789),
             write_max_bytes: Some(4093),
             load_source_max_bytes: Some(8186),
             query_memory_bytes: Some(524288),
             history_release_bytes: Some(2048),
         };
         let expected = format!(
-            "{{\"{}\":\"off\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":456,\"{}\":4093,\"{}\":8186,\"{}\":524288,\"{}\":2048}}",
+            "{{\"{}\":\"off\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":456,\"{}\":789,\"{}\":4093,\"{}\":8186,\"{}\":524288,\"{}\":2048}}",
             request_rows[0],
             request_rows[1],
             request_rows[2],
@@ -4214,9 +4229,10 @@ mod tests {
             request_rows[5],
             request_rows[6],
             request_rows[7],
-            request_rows[8]
+            request_rows[8],
+            request_rows[9]
         );
-        assert_eq!(request_rows.len(), 9);
+        assert_eq!(request_rows.len(), 10);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated
