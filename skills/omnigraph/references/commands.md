@@ -548,9 +548,15 @@ For params:
 - `jsonl` — NDJSON, one per line, with metadata line first
 - `json` — pretty `ReadOutput` envelope (metadata, columns, and rows); the `rows` array is printed compact and verbatim
 
-`--format arrow` appears in `--help` but the CLI has no Arrow output: it always
-fails with "has no text rendering". Do not use it, or set it as
-`defaults.output`.
+`query --format arrow` writes the result's columns and rows to stdout as one
+Arrow IPC stream (pyarrow `ipc.open_stream`, Polars `read_ipc_stream`), with
+each column's declared type and real nulls. The stream carries no
+`graph_commit_id`, target or `ranking`; take those from `--json`. Only a query
+run on a direct target (an `explain` statement included) has batches to write.
+It refuses before the read runs, exit 1: on a served or managed target (its server
+answers JSON), for a control statement (`branch list`, `show`), and when stdout
+is a terminal, so redirect it (`> result.arrow`). `alias` and `defaults.output`
+do not offer `arrow`; for a whole branch use `export` (JSONL).
 
 Mutations do not take `--format`; use `--json`. Successful `mutate --json` and
 `load --json` include the exact published `commit` (`null` for a no-op
