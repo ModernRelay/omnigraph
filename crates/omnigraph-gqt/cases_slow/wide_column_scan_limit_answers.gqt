@@ -14,7 +14,7 @@
 # notes: In both, the scan streams the narrow columns and the kept row's body is fetched
 # notes: by row address above the limit (pass late_materialization).
 # notes: Cheap tier: `a_wide_column_read_under_a_limit_follows_its_result` in
-# notes: crates/omnigraph/tests/engine_v2_memory.rs (the same shapes, 16 MiB pool).
+# notes: crates/omnigraph/tests/integration/execution_memory.rs (the same shapes, 16 MiB pool).
 # notes: Rename to issue_<N>_wide_column_scan_limit_answers.gqt once the issue exists.
 
 --- runner

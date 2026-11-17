@@ -201,7 +201,7 @@ fn plan_expectations_hold_under_every_engine_selection() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("plan_engine.gqt");
     let fixture =
-        include_str!("../../cases/v2/planner/anti_join_correlated_filter_keeps_the_plan.gqt")
+        include_str!("../../cases/planner/anti_join_correlated_filter_keeps_the_plan.gqt")
             .replace("set engine = v2;\n", "");
     let selections = [
         (None, "", "", true),

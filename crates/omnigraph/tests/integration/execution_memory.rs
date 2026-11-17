@@ -1266,7 +1266,7 @@ fn join_counter(probes: &QueryMemoryProbes, name: &str) -> Vec<usize> {
 /// cuts the tie rule's order (a top-k by `$p`'s id), and a top-k `limit 1`
 /// each read the narrow columns of every row and fetch one payload by row
 /// address.
-/// GQT cannot set the pool; scale twin `cases_slow/v2/wide_column_scan_limit_answers.gqt`.
+/// GQT cannot set the pool; scale twin `cases_slow/wide_column_scan_limit_answers.gqt`.
 #[tokio::test]
 #[serial]
 async fn a_wide_column_read_under_a_limit_follows_its_result() {

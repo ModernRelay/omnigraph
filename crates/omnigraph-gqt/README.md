@@ -4,9 +4,9 @@ GQ describes operations; GQT describes the scenario and expectations; DST
 controls execution. This private test package is not shipped in release builds.
 Every `.gqt` file under `cases/`, including subdirectories, is one test
 in the complete corpus. Test names retain the path relative to `cases/`.
-Shared cases live directly under `cases/`; v2-specific cases live under
-`cases/v2/`, with plan assertions under `cases/v2/planner/`.
-These directories organize the corpus. Every case runs on engine v2, the one
+Shared cases live directly under `cases/`, plan assertions under
+`cases/planner/`, catalogue reads under `cases/catalogue/` and compiler
+refusals under `cases/diagnostics/`. These directories organize the corpus. Every case runs on engine v2, the one
 engine; a case's `set engine = v2;` line changes nothing, and discovery never
 selects an engine.
 The format contract and future extensions live in
@@ -896,7 +896,7 @@ Tokio from any directory; the commands below use crate-relative paths):
 cd crates/omnigraph-gqt
 cargo test -p omnigraph-gqt --locked
 cargo test -p omnigraph-gqt --test gq_logic_tests -- --list
-cargo test -p omnigraph-gqt --test gq_logic_tests v2/planner/
+cargo test -p omnigraph-gqt --test gq_logic_tests planner/
 cargo test -p omnigraph-gqt --test gq_logic_tests -- --test-threads=2
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --target omnigraph-engine-dst --storage in-memory-object-store --seed 42

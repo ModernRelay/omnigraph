@@ -1,6 +1,6 @@
 //! Scale acceptance for bound-edge grouped aggregation. The always-on pool
-//! owner is engine_v2_memory.rs; rows and nulls are covered by
-//! omnigraph-gqt/cases/v2/planner/issue_723_grouped_transfer_aggregation.gqt.
+//! owner is execution_memory.rs; rows and nulls are covered by
+//! omnigraph-gqt/cases/planner/issue_723_grouped_transfer_aggregation.gqt.
 
 use crate::helpers;
 

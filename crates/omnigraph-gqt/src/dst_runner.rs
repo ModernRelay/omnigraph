@@ -985,7 +985,7 @@ fn measure_rows(summary: &Summary) -> Vec<MeasureRow> {
 }
 
 /// The case's name in the baseline: its path under the corpus, whichever
-/// spelling named it (`cases/v2/x.gqt` and its absolute form are one case);
+/// spelling named it (`cases/x.gqt` and its absolute form are one case);
 /// a case outside the corpus is its absolute path.
 fn baseline_case_key(path: &Path) -> String {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -3121,7 +3121,7 @@ mod action_tests {
 
     #[test]
     fn a_case_has_one_baseline_name_whichever_way_it_was_spelled() {
-        let nested = "v2/planner/input_ann_nprobes.gqt";
+        let nested = "planner/input_ann_nprobes.gqt";
         let relative = std::path::Path::new("cases").join(nested);
         assert!(relative.is_file(), "cargo test runs in the crate root");
         let absolute = crate::corpus_root().join(nested);
