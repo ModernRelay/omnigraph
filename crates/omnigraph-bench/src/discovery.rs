@@ -282,7 +282,7 @@ pub struct ScenarioEntry {
     pub id: String,
     pub fixture: FixtureInput,
     pub workload: PathBuf,
-    pub groups: Vec<String>,
+    pub suites: Vec<String>,
     pub repetitions: u32,
     pub source: SourceState,
     pub diagnostics: Vec<Diagnostic>,
@@ -290,7 +290,7 @@ pub struct ScenarioEntry {
 #[derive(Debug, Serialize)]
 pub struct ScenarioInventory {
     pub config: PathBuf,
-    pub groups: BTreeMap<String, Vec<String>>,
+    pub suites: BTreeMap<String, Vec<String>>,
     pub run: Vec<String>,
     pub entries: Vec<ScenarioEntry>,
 }
@@ -328,9 +328,9 @@ pub fn scenario(catalog: &Catalog, scenario: &Scenario) -> ScenarioEntry {
         id: scenario.id.clone(),
         fixture: scenario.fixture.clone(),
         workload: scenario.workload.clone(),
-        groups: catalog
+        suites: catalog
             .definition
-            .groups
+            .suites
             .iter()
             .filter(|(_, members)| members.contains(&scenario.id))
             .map(|(id, _)| id.clone())
@@ -350,7 +350,7 @@ pub fn scenarios(catalog: &Catalog) -> ScenarioInventory {
     entries.sort_by(|a, b| a.id.cmp(&b.id));
     ScenarioInventory {
         config: catalog.path.clone(),
-        groups: catalog.definition.groups.clone(),
+        suites: catalog.definition.suites.clone(),
         run: catalog.definition.run.clone(),
         entries,
     }

@@ -26,6 +26,11 @@ ignore = [
   { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; a proc-macro pulled by lance-bitpacking 13.0.0, cleared when Lance replaces it" },
   { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.0 is unmaintained; pulled by aws-smithy-http 0.63.6 through aws-config (lance-io 13.0.0); RustSec lists no replacement; cleared when aws-smithy-http drops it" },
   { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side channel via reqsign (lance-io, opendal); RustSec lists no patched version" },
+  # chrono and its two dependents were marked unmaintained on 2026-11-17 (chronotope/chrono#1768);
+  # arrow 58 and lance 13 pin all three. Each row clears when those two move.
+  { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 is unmaintained; pinned by arrow-arith 58.4.1 under arrow, datafusion 54 and lance 13, and named by omnigraph-core, omnigraph-engine and omnigraph-reference-engine; RustSec names jiff and time; cleared when arrow moves off chrono and the three crates follow" },
+  { id = "RUSTSEC-2026-0555", reason = "chrono-tz 0.10.4 is unmaintained with chrono; pinned by arrow-array 58.4.1; no workspace crate names it; cleared when arrow moves off chrono" },
+  { id = "RUSTSEC-2026-0542", reason = "humantime 2.4.0 is unmaintained with chrono; pinned by lance 13.0.0; no workspace crate names it; cleared when Lance replaces it" },
   # zstd 0.13 and its zstd-safe 7 are pinned by arrow-ipc 58.3.0 (`zstd = "0.13.0"`)
   # and lance-encoding 13.0.0 (`zstd = "0.13"`); the patched line is zstd 0.14.3 with
   # zstd-safe 8.2.0, taken when arrow and Lance move. Those two crates reach only the
