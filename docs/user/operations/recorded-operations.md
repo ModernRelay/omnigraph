@@ -33,18 +33,22 @@ branch, for the actor the bearer token resolves to.
 
 ### Table ceilings and the byte budget
 
-A per-table ceiling is measured from a table's compaction plan before anything
-is written. A table over one is `deferred` with reason `resource_limit`, and
-the run goes on to the next table. This does not move the resume position
-(`resume_at`), so every later run defers that table again until it fits. The
-run byte budget defers, with reason `byte_budget`, the first table that would
+A per-table ceiling is measured from a table's compaction plan before any of
+that table's work starts. A table over one is `deferred` with reason
+`resource_limit`: the run does not compact it, rebuild its lagging indexes or
+rewrite its dropped properties, and goes on to the next table. This does not
+move the resume position (`resume_at`), so every later run defers that table
+again until a ceiling is raised or a direct run compacts it. The run byte
+budget defers, with reason `byte_budget`, the first table that would
 take the run past it and every table after it, and the run resumes there.
 
 The budget is also the table byte ceiling when
 `OMNIGRAPH_OPTIMIZE_MAX_SOURCE_BYTES` is unset. A table whose compaction reads
-more bytes than the budget is therefore never compacted by a served run. To
-compact it, raise the budget, or stop the server and run `omnigraph optimize`
-on the cluster root directly, which applies neither. A direct run keeps the
+more bytes than the budget is therefore never optimized by a served run. To
+optimize it, raise the budget, or stop the server and run `omnigraph optimize`
+on the cluster root directly, which applies neither. Give that run
+`--tables <type key>` (for example `--tables node:Document`) to optimize only
+the oversized table, so the server restarts sooner. A direct run keeps the
 root's admission lock: release it with `cluster force-unlock`, as after a
 [direct apply](../clusters/index.md#bootstrap-a-cluster), before the server
 starts again.
@@ -124,9 +128,7 @@ when its server stopped is `interrupted` at the next submission or lookup.
 A full-catalog run that a gate hold or the byte budget stopped records the
 table to start at; the next full-catalog submission for that graph starts
 there, so successive bounded runs reach every table that fits the server's
-per-table ceilings. A table over a ceiling, including a table larger than the
-byte budget when no table byte ceiling is set, does not move that position: it
-is deferred with `resource_limit` on every run until the ceiling is raised
+per-table ceilings; a table over one never moves that position
 ([table ceilings](#table-ceilings-and-the-byte-budget)).
 
 Cancellation stops the run at its next safe boundary. A run that already

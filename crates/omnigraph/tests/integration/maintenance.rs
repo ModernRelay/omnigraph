@@ -774,6 +774,7 @@ async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
             )
             .await
             .unwrap();
+        let mut checked = 0;
         for stat in &report.tables {
             if !["node:Company", "node:Person"].contains(&stat.type_key.as_str()) {
                 continue;
@@ -784,7 +785,9 @@ async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
             };
             assert_eq!(exceeded.measure, ResourceMeasure::SourceBytes);
             assert_eq!(exceeded.ceiling, below, "the budget is the ceiling");
+            checked += 1;
         }
+        assert_eq!(checked, 2, "{report:?}");
         assert_eq!(report.resume_at, None, "{report:?}");
         assert_eq!(report.graph_commit_id, None, "{report:?}");
         assert_eq!(
