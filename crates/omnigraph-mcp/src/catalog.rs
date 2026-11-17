@@ -664,6 +664,7 @@ pub(super) fn queries_output_schema() -> Value {
                         "item_kind": kind,
                         "vector_dim": {"type": "integer"},
                         "nullable": {"type": "boolean"},
+                        "default": {"description": "The declared default, which an omitted parameter binds; present as `null` when the default is `null`, absent when none is declared."},
                     },
                     "required": ["name", "kind", "nullable"],
                 }},

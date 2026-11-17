@@ -1882,10 +1882,26 @@ pub struct ParamDescriptor {
     /// Whether the parameter admits null.
     pub nullable: bool,
     /// The declared default, the value an omitted parameter binds. A
-    /// parameter with neither `nullable` nor a `default` is required.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// parameter with neither `nullable` nor a `default` is required. The
+    /// key is absent when no default is declared and `null` when the
+    /// declared default is `null`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value"
+    )]
     #[schema(value_type = Option<Value>)]
     pub default: Option<Value>,
+}
+
+/// A field whose presence carries meaning: present, whatever its value
+/// (`null` included), is `Some`; with `#[serde(default)]`, absent is
+/// `None`. Plain `Option<Value>` reads a present `null` as absent.
+pub fn present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// One entry in the stored-query catalog (`GET /queries`).
@@ -3842,6 +3858,40 @@ pub struct GraphDiscoveryOutput {
 
 #[cfg(test)]
 mod tests {
+    /// A declared `null` default and no default are different parameters:
+    /// the first may be omitted and binds null, the second (when not
+    /// nullable) is required. The catalog keeps them apart on the wire.
+    #[test]
+    fn a_null_default_survives_the_wire_apart_from_no_default() {
+        use super::{ParamDescriptor, ParamKind};
+        let param = |default| ParamDescriptor {
+            name: "x".into(),
+            kind: ParamKind::Int,
+            item_kind: None,
+            vector_dim: None,
+            nullable: true,
+            default,
+        };
+        for (default, wire) in [
+            (
+                Some(serde_json::Value::Null),
+                r#"{"name":"x","kind":"int","nullable":true,"default":null}"#,
+            ),
+            (
+                Some(serde_json::json!(3)),
+                r#"{"name":"x","kind":"int","nullable":true,"default":3}"#,
+            ),
+            (None, r#"{"name":"x","kind":"int","nullable":true}"#),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&param(default.clone())).unwrap(),
+                wire
+            );
+            let read: ParamDescriptor = serde_json::from_str(wire).unwrap();
+            assert_eq!(read.default, default, "{wire}");
+        }
+    }
+
     /// Every code says what it means and whether a server sends it, under
     /// which status; one that no HTTP response carries names the surface that
     /// sends it. The published enum lists every code once, in its wire

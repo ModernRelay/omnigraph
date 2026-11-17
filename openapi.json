@@ -16406,7 +16406,7 @@
         ],
         "properties": {
           "default": {
-            "description": "The declared default, the value an omitted parameter binds. A\nparameter with neither `nullable` nor a `default` is required."
+            "description": "The declared default, the value an omitted parameter binds. A\nparameter with neither `nullable` nor a `default` is required. The\nkey is absent when no default is declared and `null` when the\ndeclared default is `null`."
           },
           "item_kind": {
             "oneOf": [

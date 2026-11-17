@@ -51,8 +51,9 @@ omnigraph queries list --target prod --graph dev --json # a server's GET /graphs
   prints the route's body: its parameters carry `kind` (`string`, `int`, `list`
   with `item_kind`, `vector` with `vector_dim`, ...) rather than the root
   form's GQ `type`. Both forms list a declared `default` (the human form as
-  `$k: I32 = 10`); a parameter with neither `nullable` nor a `default` is
-  required.
+  `$k: I32 = 10`, JSON as `"default": 10`, and a declared `= null` as
+  `"default": null`; with no declared default the key is absent); a
+  parameter with neither `nullable` nor a `default` is required.
 - `queries` is distinct from `lint` — `lint` validates a single `.gq` file you point it at; `queries validate` validates the registry the server will actually serve.
 
 ## HTTP surface
