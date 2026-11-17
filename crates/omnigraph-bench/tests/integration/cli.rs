@@ -812,10 +812,15 @@ fn commit_of(reference: &str) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
-/// A catalog beside the public one: `tiny-read` and `tiny-mutate` copied from
-/// it under the suite `pair`, so one `run pair` measures two scenarios.
+/// `tiny-read` and `tiny-mutate` as the public catalog declares them, under
+/// the suite `pair`.
 #[cfg(not(debug_assertions))]
-fn pair_catalog(directory: &Path) -> PathBuf {
+const PAIR_YAML: &str = "version: 2\nscenarios:\n- id: tiny-read\n  fixture: fixtures/tiny_graph.gqt\n  workload: workloads/tiny_read.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- query branch: main\n      query items() {\n          match { $i: Item }\n          return { $i.key as key, $i.val as val }\n      }\n- id: tiny-mutate\n  fixture: fixtures/tiny_graph.gqt\n  workload: workloads/tiny_mutate.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- mutate\n      query add() { insert Item { key: \"c\", val: 3 } }\nsuites:\n  pair: [tiny-read, tiny-mutate]\nrun: [pair]\n";
+
+/// A catalog beside the public one: its fixture and the two tiny workloads
+/// copied from it, with `yaml` as its `benchmarks.yaml`.
+#[cfg(not(debug_assertions))]
+fn catalog_with(directory: &Path, yaml: &str) -> PathBuf {
     let root = directory.join("catalog");
     for file in [
         "fixtures/tiny_graph.gqt",
@@ -825,12 +830,156 @@ fn pair_catalog(directory: &Path) -> PathBuf {
         fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
         fs::copy(benchmark_path(file), root.join(file)).unwrap();
     }
-    fs::write(
-        root.join("benchmarks.yaml"),
-        "version: 2\nscenarios:\n- id: tiny-read\n  fixture: fixtures/tiny_graph.gqt\n  workload: workloads/tiny_read.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- query branch: main\n      query items() {\n          match { $i: Item }\n          return { $i.key as key, $i.val as val }\n      }\n- id: tiny-mutate\n  fixture: fixtures/tiny_graph.gqt\n  workload: workloads/tiny_mutate.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- mutate\n      query add() { insert Item { key: \"c\", val: 3 } }\nsuites:\n  pair: [tiny-read, tiny-mutate]\nrun: [pair]\n",
-    )
-    .unwrap();
+    fs::write(root.join("benchmarks.yaml"), yaml).unwrap();
     root
+}
+
+/// The two-scenario catalog, so one `run pair` measures two scenarios.
+#[cfg(not(debug_assertions))]
+fn pair_catalog(directory: &Path) -> PathBuf {
+    catalog_with(directory, PAIR_YAML)
+}
+
+/// The records a store holds, counted through `report`.
+#[cfg(not(debug_assertions))]
+fn report_rows(catalog: &Path, store: &Path, selector: &str) -> usize {
+    let report = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(repository_root())
+        .env_remove("OMNIGRAPH_BENCH_PRODUCT")
+        .args(["report", selector, "--catalog"])
+        .arg(catalog)
+        .arg("--store")
+        .arg(store)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let series: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert!(report.status.success(), "{series}");
+    series["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["rows"].as_array().unwrap().len())
+        .sum()
+}
+
+/// A selection with one point that resets another way is refused before any
+/// run: every scenario's options are checked for every ref first, so no ref
+/// measures the scenarios before it and no record is put.
+#[test]
+#[cfg(not(debug_assertions))]
+fn clone_route_at_refuses_a_selection_whole_before_any_run() {
+    let Some(product) = std::env::var_os("OMNIGRAPH_BENCH_PRODUCT") else {
+        eprintln!("skipping run --at: OMNIGRAPH_BENCH_PRODUCT names no product binary");
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("store");
+    let catalog = catalog_with(
+        directory.path(),
+        &PAIR_YAML.replace(
+            "  workload: workloads/tiny_mutate.gqt\n",
+            "  workload: workloads/tiny_mutate.gqt\n  protocol:\n    reset: local-clonefile\n",
+        ),
+    );
+    let product = repository_root().join(&product).display().to_string();
+    let head = product_claiming(directory.path(), &product, &commit_of("HEAD"));
+    let output = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(repository_root())
+        .env_remove("OMNIGRAPH_BENCH_PRODUCT")
+        .args(["run", "pair", "--catalog"])
+        .arg(&catalog)
+        .arg("--dataset-cache")
+        .arg(directory.path().join("cache"))
+        .arg("--store")
+        .arg(&store)
+        .arg("--at")
+        .arg(format!("HEAD={head}"))
+        .args(["--repetitions", "1", "--json"])
+        .output()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!output.status.success(), "{result}");
+    assert_eq!(
+        result["diagnostics"][0]["code"], "invalid_run_input",
+        "{result}"
+    );
+    assert!(
+        !store.join("records").exists()
+            || fs::read_dir(store.join("records")).unwrap().count() == 0,
+        "a record was put before the refusal"
+    );
+}
+
+/// A ref that fails at a later scenario: the failure document on stdout
+/// carries that ref's completed runs, the refs' records put before it are
+/// named on stderr, and every record put stays in the store.
+#[test]
+#[cfg(not(debug_assertions))]
+fn clone_route_at_failure_document_keeps_the_refs_completed_runs() {
+    let Some(product) = std::env::var_os("OMNIGRAPH_BENCH_PRODUCT") else {
+        eprintln!("skipping run --at: OMNIGRAPH_BENCH_PRODUCT names no product binary");
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("store");
+    let catalog = catalog_with(
+        directory.path(),
+        &PAIR_YAML
+            .replace(
+                "suites:\n  pair: [tiny-read, tiny-mutate]\n",
+                "- id: tiny-wrong\n  fixture: fixtures/tiny_graph.gqt\n  workload: workloads/tiny_wrong.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- query branch: main\n      query items() {\n          match { $i: Item }\n          return { $i.key as key, $i.val as val }\n      }\nsuites:\n  trio: [tiny-read, tiny-mutate, tiny-wrong]\n",
+            )
+            .replace("run: [pair]\n", "run: [trio]\n"),
+    );
+    let wrong = fs::read_to_string(catalog.join("workloads/tiny_read.gqt"))
+        .unwrap()
+        .replace("{\"key\":\"a\",\"val\":1}", "{\"key\":\"a\",\"val\":9}");
+    fs::write(catalog.join("workloads/tiny_wrong.gqt"), wrong).unwrap();
+    let product = repository_root().join(&product).display().to_string();
+    let head = product_claiming(directory.path(), &product, &commit_of("HEAD"));
+    let previous = product_claiming(directory.path(), &product, &commit_of("HEAD~1"));
+    let output = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(repository_root())
+        .env_remove("OMNIGRAPH_BENCH_PRODUCT")
+        .args(["run", "trio", "--catalog"])
+        .arg(&catalog)
+        .arg("--dataset-cache")
+        .arg(directory.path().join("cache"))
+        .arg("--store")
+        .arg(&store)
+        .arg("--at")
+        .arg(format!("HEAD={head}"))
+        .arg("--at")
+        .arg(format!("HEAD~1={previous}"))
+        .args(["--repetitions", "1", "--json"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!output.status.success(), "{result}\n{stderr}");
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(result["completed_run_count"], 2, "{result}\n{stderr}");
+    assert_eq!(
+        result["completed_runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|run| run["case_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["tiny-read", "tiny-mutate"],
+        "{result}"
+    );
+    assert!(
+        stderr.contains("completed before `HEAD` failed at `tiny-wrong`: HEAD ")
+            && stderr.contains("completed before `HEAD` failed at `tiny-wrong`: HEAD~1 ")
+            && stderr.matches("(2 record(s) put)").count() == 2,
+        "{stderr}"
+    );
+    assert_eq!(report_rows(&catalog, &store, "trio"), 4);
 }
 
 /// `run pair --catalog <dir> --at HEAD=<product> --at HEAD~1=<product>`

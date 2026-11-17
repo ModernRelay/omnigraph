@@ -1816,7 +1816,7 @@ async fn run_resolved_suite(
     archive: Option<PathBuf>,
     json: bool,
 ) -> ExitCode {
-    match execute_resolved_suite(suite, selector, options, archive, None, json).await {
+    match execute_resolved_suite(suite, selector, options, archive, None, None, json).await {
         Ok(output) if json => print_json_success(&output),
         Ok(output) => print_execution(&output),
         Err(code) => code,
@@ -1826,21 +1826,16 @@ async fn run_resolved_suite(
 /// Runs the selection and returns its output, or the exit code of a failure
 /// already printed; a `--store` run without `--archive` puts every completed
 /// record into the store under `session` (minted here when absent).
-async fn execute_resolved_suite(
-    suite: ResolvedSuite,
-    selector: Option<&str>,
-    options: RunOptions,
-    archive: Option<PathBuf>,
-    session: Option<Ulid>,
+/// Every selected run's options checked before any run, so a selection with
+/// one point that cannot run this way is refused whole and nothing is measured.
+fn validate_selected(
+    selected: &[&ResolvedRun],
+    options: &RunOptions,
     json: bool,
-) -> Result<SuiteRunOutput, ExitCode> {
-    let selected = match select_runs(&suite, selector) {
-        Ok(selected) => selected,
-        Err(diagnostic) => return Err(print_cli_failure(diagnostic, json)),
-    };
-    for run in &selected {
+) -> Result<(), ExitCode> {
+    for run in selected {
         let validation = run.case.gqt().map_err(|e| e.to_string()).and_then(|plan| {
-            omnigraph_bench::gqt_runner::validate_run_options(plan, &options)
+            omnigraph_bench::gqt_runner::validate_run_options(plan, options)
                 .map_err(|e| e.to_string())
         });
         if let Err(message) = validation {
@@ -1850,6 +1845,25 @@ async fn execute_resolved_suite(
             ));
         }
     }
+    Ok(())
+}
+
+/// `prior`, the session's output so far (a `--at` ref's earlier scenarios), is
+/// carried, so the result and a failure document cover every completed run.
+async fn execute_resolved_suite(
+    suite: ResolvedSuite,
+    selector: Option<&str>,
+    options: RunOptions,
+    archive: Option<PathBuf>,
+    session: Option<Ulid>,
+    prior: Option<&SuiteRunOutput>,
+    json: bool,
+) -> Result<SuiteRunOutput, ExitCode> {
+    let selected = match select_runs(&suite, selector) {
+        Ok(selected) => selected,
+        Err(diagnostic) => return Err(print_cli_failure(diagnostic, json)),
+    };
+    validate_selected(&selected, &options, json)?;
     let recording = match archive {
         Some(root) => match RecordingContext::new(root.clone()) {
             Ok(context) => Some(context),
@@ -1886,16 +1900,25 @@ async fn execute_resolved_suite(
         },
         _ => None,
     };
-    let mut store_receipts = Vec::new();
+    let mut store_receipts = prior
+        .and_then(|prior| prior.store_records.as_ref())
+        .map(|records| records.records.clone())
+        .unwrap_or_default();
     // Raw samples already become durable authority one record at a time. In
     // archive mode, retaining them all again in the CLI result would make
     // memory grow with the complete suite and defeat streaming publication.
-    let mut diagnostic_runs = recording
-        .is_none()
-        .then(|| Vec::with_capacity(selected.len()));
+    let mut diagnostic_runs = recording.is_none().then(|| {
+        prior
+            .and_then(|prior| prior.runs.clone())
+            .unwrap_or_else(|| Vec::with_capacity(selected.len()))
+    });
     let mut receipts = Vec::with_capacity(selected.len());
-    let mut completed_run_count = 0usize;
-    let mut bound_points = std::collections::BTreeSet::new();
+    let mut completed_run_count = prior.map_or(0usize, |prior| prior.completed_run_count);
+    let mut bound_points: std::collections::BTreeSet<_> = diagnostic_runs
+        .iter()
+        .flatten()
+        .map(|execution| execution.point_id.clone())
+        .collect();
     for run in selected {
         let invocation = recording.as_ref().map(RecordingContext::begin_invocation);
         let execution = match execute_run(run, &options).await {
@@ -2103,8 +2126,8 @@ impl Drop for ProductStaging {
     }
 }
 
-/// `run --at a --at b`: every ref's product resolved and inspected before
-/// any run, then every scenario of the selection run once per ref, in `--at`
+/// `run --at a --at b`: every product inspected and every scenario's options
+/// checked before any run, then every scenario run once per ref, in `--at`
 /// order, before the next scenario, so the refs see the same machine state.
 #[allow(clippy::too_many_arguments)]
 async fn run_at(
@@ -2220,31 +2243,42 @@ async fn run_at(
             )
         })
         .collect();
+    let options_for = |target: &AtOutput| RunOptions {
+        dataset_cache: Some(dataset_cache.clone()),
+        no_build,
+        fixture_bindings: fixtures.clone(),
+        worker_executable: std::env::current_exe().ok(),
+        store: Some(store.clone()),
+        backend: backend.clone(),
+        product: Some(target.product.path.clone()),
+        product_commit: Some(target.commit.clone()),
+        ..Default::default()
+    };
+    let selected = match select_runs(&suite, None) {
+        Ok(selected) => selected,
+        Err(diagnostic) => return print_cli_failure(diagnostic, json),
+    };
+    for (_, target) in &outputs {
+        if let Err(code) = validate_selected(&selected, &options_for(target), json) {
+            return code;
+        }
+    }
+    drop(selected);
     for scenario in &scenarios {
         for index in 0..outputs.len() {
             let (session, target) = &mut outputs[index];
-            let options = RunOptions {
-                dataset_cache: Some(dataset_cache.clone()),
-                no_build,
-                fixture_bindings: fixtures.clone(),
-                worker_executable: std::env::current_exe().ok(),
-                store: Some(store.clone()),
-                backend: backend.clone(),
-                product: Some(target.product.path.clone()),
-                product_commit: Some(target.commit.clone()),
-                ..Default::default()
-            };
             let run = execute_resolved_suite(
                 suite.clone(),
                 Some(scenario),
-                options,
+                options_for(target),
                 None,
                 Some(*session),
+                Some(&target.output),
                 json,
             )
             .await;
             match run {
-                Ok(part) => absorb_at_output(&mut target.output, part),
+                Ok(cumulative) => target.output = cumulative,
                 Err(code) => {
                     let reference = target.reference.clone();
                     let completed = AtRunOutput {
@@ -2294,20 +2328,6 @@ async fn run_at(
     }
     print_at_table(&output);
     ExitCode::SUCCESS
-}
-
-/// One scenario's measurement of a ref folded into that ref's `--at` output:
-/// the runs, the records put and the count accumulate.
-fn absorb_at_output(output: &mut SuiteRunOutput, part: SuiteRunOutput) {
-    output.completed_run_count = output
-        .completed_run_count
-        .saturating_add(part.completed_run_count);
-    if let (Some(runs), Some(more)) = (&mut output.runs, part.runs) {
-        runs.extend(more);
-    }
-    if let (Some(records), Some(more)) = (&mut output.store_records, part.store_records) {
-        records.records.extend(more.records);
-    }
 }
 
 fn print_at_table(output: &AtRunOutput) {

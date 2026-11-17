@@ -659,16 +659,19 @@ binary is inspected, before any run: a product writing another storage format
 refuses the whole command as `not_comparable`, and a binary whose `version
 --json` names another commit than its ref is refused as
 `product_commit_mismatch` (a development build names no commit and is admitted
-under any ref); then every scenario of the selection runs once per ref, in
+under any ref), and every scenario's run options are checked for every ref, so
+a selection with one point that resets another way is refused whole and
+nothing is measured; then every scenario of the selection runs once per ref, in
 `--at` order, before the next scenario (the first ref is the baseline a later
 one is read against, and the refs' runs of one scenario are neighbours in time,
 so a drifting machine or store moves both alike), the records of one ref
 sharing one session id, each record carrying `requested_commit` beside the
 binary's own `source_commit`, and the table prints one row per ref and
 scenario (commit, version, repetitions, min, p50, max, the measured step's
-Lance calls at p50, records put). When a run fails, the records put before it
-are printed first, per ref (the table, or one line per ref under `--json`),
-since they are already in the store. `--at` runs catalog scenarios only, never
+Lance calls at p50, records put). When a run fails, the failure document
+carries the failing ref's completed runs, and the records put before it are
+printed first, per ref (the table, or one line per ref under `--json`), since
+they are already in the store. `--at` runs catalog scenarios only, never
 a legacy case file, and conflicts with `--archive` and `--product`.
 
 `--catalog <dir | file>`, repeatable on `run`, `report`, `show`, `list` and
