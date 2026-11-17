@@ -37,12 +37,12 @@ edge Holds: Root -> Item
 
 --- query
 query membership_of_a_node() {
-    match { $r: Root }
+    match { $r: Root, $i: Item }
     where $r in $i
     return { $r.rid }
 }
 
---- expect error: T6: variable `$i` is not bound
+--- expect error: T7: `$i` is a node, so `$r in $i` is a triple over the edge named `in`
 
 --- query
 query indexed_identity($ids: [String]) {
