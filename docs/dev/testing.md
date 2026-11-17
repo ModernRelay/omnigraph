@@ -659,6 +659,7 @@ forms. Each law lives with the owner of its boundary:
 | 3. Typed expressions and the charged term grow by a constant per unit of every construct family | compiler `check::tests::compile_cost` | 200 reads | 5,000 |
 | 4. Every single edit of a generated plan's replay envelope is refused or replays the run | engine `integration/plan_replay.rs` | 24 plans, 40 edits each | 300 plans, 100 edits |
 | 6b. Every direct-engine case keeps its rows under each physical layout | `omnigraph-gqt` `tests/gq_layout_tests.rs` ([GQT README](../../crates/omnigraph-gqt/README.md#physical-layouts)) | layouts `a`, `b` | `a` to `d` |
+| One plan for one meaning: every canonical form section 6 lists (lint's `L203`, `L206` to `L211`) has its canonical spelling's typed IR, logical and physical plan, `logical_hash` and rows, over fixed pairs and over generated reads rewritten at random positions; the five listed spellings the grammar refuses suggest a fix with the canonical IR; lint's printed fix on every flagged corpus read keeps the typed IR and `logical_hash` | `omnigraph-gqt` `integration/law_canonical_forms.rs` | 200 reads | 5,000 |
 
 The nightly twins are `#[ignore = "nightly: …"]` tests enrolled by exact
 name: the compiler's and the engine's in `tests-slow-nightly.yml`, the

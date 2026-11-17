@@ -5616,6 +5616,7 @@ dependencies = [
  "omnigraph-reference",
  "omnigraph-storage",
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",

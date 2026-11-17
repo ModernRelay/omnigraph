@@ -40,6 +40,7 @@ datatest-stable = "0.3"
 # shared generators.
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1", features = ["test-util"] }
 proptest = "1"
+regex = { workspace = true }
 # tests/runner_dispatch.rs lists an `s3://` base's objects through the storage crate's test helper.
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.15.1", features = ["test-util"] }
 
