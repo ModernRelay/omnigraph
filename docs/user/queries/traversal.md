@@ -286,8 +286,10 @@ lowered (`T86`).
 
 `from union(a, b, …)` joins the bag union of its arms, each an inline read:
 every row of every arm, duplicates kept (`return distinct` removes them). The
-arms return the same number of columns, matched by position and named by the
-first arm, so a later arm renames its column with `as`:
+arms match by column name: each returns the same set of names, a column's base
+type agrees in every arm, and the columns come in the first arm's order. A
+later arm names its column with `as`, and an arm missing a name or holding
+another is `T73`, whose fix aliases it:
 
 ```gq
 query older_or_known() {
@@ -300,8 +302,8 @@ query older_or_known() {
 }
 ```
 
-An arm may return values, `return { $p, 1 as d }`, which match by position
-and are nullable where any arm's is, and may group, order and cut its own
+An arm may return values, `return { $p, 1 as d }`, which match by name and
+are nullable where any arm's is, and may group, order and cut its own
 rows (`order { $p.age } limit 3` belongs to the arm). An arm may read a name
 bound before the union, `$p worksAt $c`: the union then runs for each outer
 row. In this release a node column is one type in every arm, no arm returns

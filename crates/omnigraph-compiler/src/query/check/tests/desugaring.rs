@@ -17,7 +17,7 @@ use crate::ir::expr::IRExpr;
 use crate::query::check::{SExpr, SKind, type_source};
 use crate::query::value::{AggFunc, CompOp, Literal};
 use crate::schema::parser::parse_schema;
-use crate::types::{Direction, PropType, ScalarType};
+use crate::types::{Direction, ExprType, PropType, ScalarType};
 
 /// The checker tests' schema plus a second Person → Person edge, so that an
 /// alternation has two members of one orientation, and a node whose
@@ -299,7 +299,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             ),
         ),
         (
-            "optional { p }: Correlate(R, Union(p, Project(Filter(Env, ¬ exists p), nulls)))",
+            "optional { p }: Correlate(R, Union(p, Project(Filter(Env, ¬ exists p), nulls))), the arms matching by name",
             "query f() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p, $c } }",
             {
                 // An `optional` is an inner scope: `$c` is bound inside it,
@@ -345,6 +345,18 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
                                         },
                                     )
                                     .to_ir(),
+                                ),
+                                // The arms of a `Union` match by name: the
+                                // padding row is null in the fresh column
+                                // `p`'s triple adds too.
+                                (
+                                    "__temp_t1".into(),
+                                    IRExpr::Literal(
+                                        Literal::Null,
+                                        ExprType::Node {
+                                            type_name: "Company".into(),
+                                        },
+                                    ),
                                 ),
                             ],
                             keep: false,
@@ -896,7 +908,7 @@ fn the_closure_table() {
         refuse(
             &format!("query q() {{ match {{ from union({{ match {{ from {GROUPED} }} return {{ $c, $n }} }}, {{ match {{ $x: Company }} return {{ $x as c, $x.name as n }} }}) }} return {{ $c }} }}"),
             "T73",
-            "arm 2 column 2",
+            "union arm 2's column `n`",
         ),
     );
     rows.insert(

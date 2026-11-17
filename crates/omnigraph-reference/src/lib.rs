@@ -773,16 +773,23 @@ impl<'a> Interpreter<'a> {
                 }
             }
             Term::Union { left, right } => {
-                // Columns agree by position and take the left arm's names.
+                // The arms match by column name, in the left arm's column
+                // order.
                 let names = columns(left);
                 let mut l = self.term(left, env)?;
                 let r = self.term(right, env)?;
-                l.rows.extend(r.rows.into_iter().map(|row| {
-                    row.into_iter()
-                        .zip(&names)
-                        .map(|((_, v), name)| (name.clone(), v))
-                        .collect()
-                }));
+                for row in r.rows {
+                    let aligned = names
+                        .iter()
+                        .map(|name| match get(&row, name) {
+                            Some(v) => Ok((name.clone(), v.clone())),
+                            None => Err(Refusal::Unsupported(format!(
+                                "a union arm has no column `{name}`"
+                            ))),
+                        })
+                        .collect::<R<Row>>()?;
+                    l.rows.push(aligned);
+                }
                 l.ordered = false;
                 l
             }

@@ -109,8 +109,9 @@ aggregate, `distinct`, `order` and `limit` run per outer row when it reads
 an outer name (once otherwise), so an outer `where` or `limit` never widens
 or replaces its cut, and `count` with no key is 0 where nothing matches; a
 ranking inside such a read is `T86`. `from union({ … }, { … })`
-joins the bag of its arms' rows, columns by position and named by the first
-arm (`return { $q as p }` in a later one); an arm may return values and
+joins the bag of its arms' rows, columns matched by name in the first arm's
+order (`return { $q as p }` in a later one; a missing or extra name is
+`T73`); an arm may return values and
 group, order or cut its own rows, and may read an outer name (the union then
 runs per outer row); one returning an edge, or a value while reading an outer
 name, is `T86`. `from name(args)` runs a read

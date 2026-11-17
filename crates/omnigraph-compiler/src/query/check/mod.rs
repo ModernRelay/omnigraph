@@ -34,7 +34,7 @@ use crate::query::syntax::*;
 use crate::query::syntax::{EdgeSelector, Traversal};
 use crate::query::value::{AggFunc, CompOp, Literal, NOW_PARAM_NAME};
 use crate::traversal::EdgeSelection;
-use crate::types::{Direction, PropType, ScalarType};
+use crate::types::{Direction, ExprType, PropType, ScalarType};
 use literal::{assignment_compatible, check_literal_type, literal_type, types_compatible};
 use traversal::{BoundVariable, resolve_traversal};
 
@@ -3695,31 +3695,81 @@ impl Ctx<'_> {
         if arms.is_empty() {
             return Err(E::Pending(pending.unwrap()));
         }
+        // The arms match by column name (the GQ 3 RFC, section 3): the
+        // same set of names, base types agreeing per name, a column
+        // nullable when any arm's is, column order from the first arm.
         let mut acc = arms.remove(0);
         for (i, arm) in arms.into_iter().enumerate() {
-            if arm.ty.cols.len() != acc.ty.cols.len() {
-                return Err(err(
-                    T73,
+            let has = |rel: &Rel, name: &str| rel.ty.cols.iter().any(|c| c.name == name);
+            let missing: Vec<&str> = acc
+                .ty
+                .cols
+                .iter()
+                .map(|c| c.name.as_str())
+                .filter(|n| !has(&arm, n))
+                .collect();
+            let extra: Vec<&str> = arm
+                .ty
+                .cols
+                .iter()
+                .map(|c| c.name.as_str())
+                .filter(|n| !has(&acc, n))
+                .collect();
+            if !missing.is_empty() || !extra.is_empty() {
+                let list = |names: &[&str]| {
+                    names
+                        .iter()
+                        .map(|n| format!("`{n}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let mut message = format!("union arm {}", i + 2);
+                if !missing.is_empty() {
+                    message.push_str(&format!(" has no column {}", list(&missing)));
+                }
+                if !extra.is_empty() {
+                    message.push_str(&format!(
+                        "{} a column {} the first arm does not have",
+                        if missing.is_empty() { " has" } else { " and" },
+                        list(&extra)
+                    ));
+                }
+                message.push_str("; the arms of a `union` match by column name");
+                // One unmatched column each way pairs up: alias it.
+                let fix = if missing.len() == extra.len() {
+                    missing
+                        .iter()
+                        .zip(&extra)
+                        .map(|(want, have)| format!("return `{have}` as `{want}`: `… as {want}`"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                } else {
                     format!(
-                        "union arm {} has {} columns, the first has {}",
-                        i + 2,
-                        arm.ty.cols.len(),
-                        acc.ty.cols.len()
-                    ),
-                ));
+                        "return the columns {} from every arm, aliasing with `as`",
+                        list(
+                            &acc.ty
+                                .cols
+                                .iter()
+                                .map(|c| c.name.as_str())
+                                .collect::<Vec<_>>()
+                        )
+                    )
+                };
+                return Err(err_fix(T73, message, fix));
             }
             let mut cols = Vec::new();
-            for (j, (a, b)) in acc.ty.cols.iter().zip(&arm.ty.cols).enumerate() {
+            for a in &acc.ty.cols {
+                let Some(b) = arm.ty.cols.iter().find(|c| c.name == a.name) else {
+                    unreachable!("both arms hold every name (checked above)")
+                };
                 if !a.ty.same_base(&b.ty) {
                     return Err(err(
                         T73,
                         format!(
-                            "union arm {} column {} (`{}`) is {}, the first arm's `{}` is {}",
+                            "union arm {}'s column `{}` is {}, the first arm's is {}",
                             i + 2,
-                            j + 1,
-                            b.name,
-                            b.ty.display(),
                             a.name,
+                            b.ty.display(),
                             a.ty.display()
                         ),
                     ));
@@ -5963,21 +6013,23 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
                 .boxed(),
                 pred: not_exists(&col).to_ir(),
             };
-            let items = env
-                .iter()
-                .map(|c| {
-                    (
-                        c.name.clone(),
-                        SExpr::new(SKind::Col(c.name.clone()), c.ty.clone()),
-                    )
+            // The arms of a `Union` match by name, so the unmatched row
+            // holds every column `p` holds, in `p`'s order: the outer
+            // columns it reads, and null in each column it adds, the names
+            // it binds and the ones its lowering made up alike.
+            let items = output_columns(&inner)
+                .into_iter()
+                .filter_map(|name| {
+                    if let Some(c) = env.iter().find(|c| c.name == name) {
+                        let read = SExpr::new(SKind::Col(c.name.clone()), c.ty.clone());
+                        return Some((name, read.to_ir()));
+                    }
+                    let ty = match new_cols.iter().find(|c| c.name == name) {
+                        Some(c) => c.ty.with_nullable(true).expr_type(),
+                        None => nullable_type(column_type(&inner, &name)?),
+                    };
+                    Some((name, IRExpr::Literal(Literal::Null, ty)))
                 })
-                .chain(new_cols.iter().map(|c| {
-                    (
-                        c.name.clone(),
-                        SExpr::new(SKind::Null, c.ty.with_nullable(true)),
-                    )
-                }))
-                .map(|(n, e)| (n, e.to_ir()))
                 .collect();
             correlate(
                 Some(acc.unwrap_or(Term::Unit)),
@@ -6171,6 +6223,126 @@ fn reaches_recursion(t: &Term) -> bool {
 }
 
 /// The column names a term produces (types are not needed by the fold).
+/// The type of the column `name` that `t` outputs, from the node that
+/// adds it.
+fn column_type(t: &Term, name: &str) -> Option<ExprType> {
+    match t {
+        Term::Unit => None,
+        Term::Env(cols) => cols
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.ty.expr_type()),
+        Term::Scan { var, ty } => (var == name).then(|| ty.expr_type()),
+        Term::Expand {
+            input,
+            dst,
+            dst_type,
+            edges,
+            edge_var,
+            ..
+        } => {
+            if dst == name {
+                Some(ExprType::Node {
+                    type_name: dst_type.clone(),
+                })
+            } else if edge_var.as_deref() == Some(name) {
+                Some(ExprType::Edge {
+                    type_name: edges
+                        .members()
+                        .iter()
+                        .map(|m| m.edge_type.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                })
+            } else {
+                column_type(input, name)
+            }
+        }
+        Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
+            column_type(input, name)
+        }
+        Term::Project { input, items, keep } => match items.iter().find(|(n, _)| n == name) {
+            Some((_, e)) => Some(e.ty().clone()),
+            None if *keep => column_type(input, name),
+            None => None,
+        },
+        Term::Group { keys, aggs, .. } => keys
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, e)| e.ty().clone())
+            .or_else(|| {
+                aggs.iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, a)| a.ty.expr_type())
+            }),
+        Term::Correlate { outer, inner } => {
+            column_type(outer, name).or_else(|| column_type(inner, name))
+        }
+        Term::Union { left, .. } => column_type(left, name),
+        Term::Score {
+            input, kind, out, ..
+        } => {
+            if out == name {
+                Some(ExprType::Value {
+                    scalar: match kind {
+                        ScoreKind::Distance => ScalarType::F32,
+                        ScoreKind::Bm25 => ScalarType::F64,
+                    },
+                    list: false,
+                    nullable: false,
+                })
+            } else {
+                column_type(input, name)
+            }
+        }
+        Term::ApproxTopK { input, out, .. } => {
+            if out == name {
+                Some(ExprType::Value {
+                    scalar: ScalarType::F32,
+                    list: false,
+                    nullable: false,
+                })
+            } else {
+                column_type(input, name)
+            }
+        }
+        Term::Fuse {
+            arms, target, out, ..
+        } => {
+            if out == name {
+                Some(ExprType::Value {
+                    scalar: ScalarType::F64,
+                    list: false,
+                    nullable: false,
+                })
+            } else if target == name {
+                arms.iter().find_map(|a| column_type(a, name))
+            } else {
+                None
+            }
+        }
+        Term::Fix { body, .. } | Term::Call { body, .. } => column_type(body, name),
+        Term::RecRef { ty, .. } => ty.get(name).map(|c| c.ty.expr_type()),
+    }
+}
+
+/// `ty`, admitting null: a value type's nullable form; a reference column
+/// is nullable as it is.
+fn nullable_type(ty: ExprType) -> ExprType {
+    match ty {
+        ExprType::Value { scalar, list, .. } => ExprType::Value {
+            scalar,
+            list,
+            nullable: true,
+        },
+        ExprType::ExactInteger { list, .. } => ExprType::ExactInteger {
+            list,
+            nullable: true,
+        },
+        other => other,
+    }
+}
+
 fn output_columns(t: &Term) -> Vec<String> {
     match t {
         Term::Unit => Vec::new(),
@@ -6486,15 +6658,12 @@ impl Walk<'_> {
             Term::Union { left, right } => {
                 let mut c = self.term(left)?;
                 let r = self.term(right)?;
-                // Positional: the right arm's computed columns are the left
-                // arm's names.
+                // The arms match by name: a column the right arm computes is
+                // the union's column of that name.
                 let ln = output_columns(left);
-                let rn = output_columns(right);
-                for (i, n) in rn.iter().enumerate() {
-                    if r.contains(n)
-                        && let Some(l) = ln.get(i)
-                    {
-                        c.insert(l.clone());
+                for n in output_columns(right) {
+                    if r.contains(&n) && ln.contains(&n) {
+                        c.insert(n);
                     }
                 }
                 c

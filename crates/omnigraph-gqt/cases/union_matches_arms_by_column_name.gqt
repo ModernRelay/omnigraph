@@ -1,0 +1,130 @@
+# issue: none
+# notes: `union` matches its arms by column name (section 3 of the GQ 3 RFC): the same set of names, base types agreeing per
+# notes: name, a column nullable when any arm's is, column order from the first arm. Two String columns returned in another
+# notes: order keep their values under their names, which a positional match would swap; node columns likewise. An arm
+# notes: missing a name or holding an extra one is `T73`, whose fix aliases with `as`.
+
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+node Doc {
+    id: String @key
+    title: String
+    body: String @index
+    year: I32
+    tags: [String]
+    embedding: Vector(3)?
+    payload: Blob?
+}
+node Collection {
+    slug: String @key
+    min_docs: I32
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+edge In: Doc -> Collection
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36,"city":"Berlin"}}
+{"type":"Person","data":{"handle":"bob","name":"Bob","age":2}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"Knows","from":"ada","to":"bob"}
+
+--- query
+query swapped_strings() {
+    match {
+        from union(
+            { match { $p: Person } return { $p.name as n, $p.handle as h } },
+            { match { $c: Company } return { $c.slug as h, $c.name as n } })
+    }
+    return { $n, $h }
+}
+
+--- expect unordered
+{"n":"Ada","h":"ada"}
+{"n":"Bob","h":"bob"}
+{"n":"Acme","h":"acme"}
+
+--- expect shape
+n: String
+h: String
+
+--- query
+query swapped_nodes() {
+    match {
+        from union(
+            { match { $a: Person, $b: Person, $a knows $b } return { $a as src, $b as dst } },
+            { match { $x: Person, $y: Person, $y knows $x } return { $x as dst, $y as src } })
+    }
+    return { $src.handle, $dst.handle }
+}
+
+--- expect unordered
+{"src.handle":"ada","dst.handle":"bob"}
+{"src.handle":"ada","dst.handle":"bob"}
+
+--- expect shape
+src.handle: String
+dst.handle: String
+
+--- query
+query nullable_by_name() {
+    match {
+        from union(
+            { match { $p: Person } return { $p.city as town, $p.handle as key } },
+            { match { $c: Company } return { $c.slug as key, $c.name as town } })
+    }
+    return { $key, $town }
+}
+
+--- expect unordered
+{"key":"ada","town":"Berlin"}
+{"key":"bob"}
+{"key":"acme","town":"Acme"}
+
+--- expect shape
+key: String
+town: String?
+
+--- query
+query missing_name() {
+    match {
+        from union(
+            { match { $p: Person } return { $p.name as n, $p.handle as h } },
+            { match { $c: Company } return { $c.name as n, $c.slug as s } })
+    }
+    return { $n }
+}
+
+--- expect error: type error: T73: union arm 2 has no column `h` and a column `s` the first arm does not have
+
+--- query
+query types_disagree() {
+    match {
+        from union(
+            { match { $p: Person } return { $p.age as v, $p.name as n } },
+            { match { $c: Company } return { $c.name as n, $c.name as v } })
+    }
+    return { $v }
+}
+
+--- expect error: type error: T73: union arm 2's column `v` is String, the first arm's is I32?

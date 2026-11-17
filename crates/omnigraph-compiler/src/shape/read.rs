@@ -2181,8 +2181,9 @@ impl<'a> Shaper<'a> {
     }
 
     /// `from union(a, b, …)`: the arms, folded from the left, each an inline
-    /// read of its own, its returned references renamed to the first arm's
-    /// column names by position and every other name it binds renamed apart.
+    /// read of its own, its returned references bound to the union's column
+    /// of the same name (the arms match by name, columns in the first arm's
+    /// order) and every other name it binds renamed apart.
     fn union(&self, term: &Term, facts: &mut Facts) -> Result<(), ShapeError> {
         let at = || Construct::Element(FROM, None);
         let mut arms = Vec::new();
@@ -2238,7 +2239,7 @@ impl<'a> Shaper<'a> {
             inner.substitute(&inner_lets);
             let mut renames: HashMap<String, String> = HashMap::new();
             let mut exposed = HashSet::new();
-            for (position, (column, expr)) in items.iter().enumerate() {
+            for (column, expr) in items.iter() {
                 let mut expr = expr.clone();
                 substitute(&mut expr, &inner_lets);
                 let IRExpr::Variable(variable, ExprType::Node { type_name }) = &expr else {
@@ -2250,10 +2251,11 @@ impl<'a> Shaper<'a> {
                 if index == 0 {
                     columns.push((column.clone(), type_name.clone()));
                 }
-                let Some((name, declared)) = columns.get(position) else {
-                    return Err(ShapeError::Internal(
-                        "a union arm has more columns than the first".to_string(),
-                    ));
+                let Some((name, declared)) = columns.iter().find(|(name, _)| name == column) else {
+                    return Err(ShapeError::Internal(format!(
+                        "union arm {} has a column `{column}` the first does not, which the type checker refuses (T73)",
+                        index + 1
+                    )));
                 };
                 if declared != type_name {
                     return Err(ShapeError::Internal(format!(
@@ -2343,7 +2345,8 @@ impl<'a> Shaper<'a> {
 
     /// `from union(a, b, …)` whose arms return a value, or group, order or
     /// cut their own rows: each arm an uncorrelated read of its own
-    /// (`correlate_read`) returning its columns under the first arm's names,
+    /// (`correlate_read`) returning its columns by name in the first arm's
+    /// order,
     /// its values as columns of one `values` binding all arms share, which
     /// the union carries beside the references. A column is nullable when
     /// any arm's is.
@@ -2377,9 +2380,18 @@ impl<'a> Shaper<'a> {
             }
             let renamed: Vec<(String, IRExpr)> = names
                 .iter()
-                .zip(items.iter())
-                .map(|(name, (_, e))| (name.clone(), e.clone()))
-                .collect();
+                .map(|name| {
+                    items
+                        .iter()
+                        .find(|(column, _)| column == name)
+                        .map(|(_, e)| (name.clone(), e.clone()))
+                        .ok_or_else(|| {
+                            ShapeError::Internal(format!(
+                                "a union arm has no column `{name}`, which the type checker refuses (T73)"
+                            ))
+                        })
+                })
+                .collect::<Result<_, _>>()?;
             let mut inner = Facts {
                 inlined: facts.inlined,
                 ..Facts::default()

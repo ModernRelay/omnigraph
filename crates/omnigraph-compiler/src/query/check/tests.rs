@@ -1385,7 +1385,7 @@ fn rrf_refusals() {
 }
 
 #[test]
-fn union_agrees_by_position_and_widens_nullability() {
+fn union_matches_by_name_and_widens_nullability() {
     let c = ok(
         "query q() { match { from union({ match { $p: Person } return { $p.city as c } }, { match { $x: Company } return { $x.name as c } }) } return { $c } }",
     );
@@ -1394,7 +1394,7 @@ fn union_agrees_by_position_and_widens_nullability() {
         "query q() { match { from union({ match { $p: Person } return { $p.age as c } }, { match { $x: Company } return { $x.name as c } }) } return { $c } }",
         "T73",
     );
-    assert!(m.contains("arm 2 column 1"), "{m}");
+    assert!(m.contains("union arm 2's column `c` is String"), "{m}");
     refused(
         "query q() { match { from union({ match { $p: Person } return { $p } }, { match { $x: Company } return { $x as p } }) } return { $p } }",
         "T73",
@@ -1403,6 +1403,33 @@ fn union_agrees_by_position_and_widens_nullability() {
         "query q() { match { from union({ match { $p: Person } return { $p, $p.age as a } }, { match { $x: Person } return { $x as p } }) } return { $p } }",
         "T73",
     );
+    // Columns in another order match by name, in the first arm's order:
+    // two Strings a positional match would swap, and two nodes.
+    let c = ok(
+        "query q() { match { from union({ match { $p: Person } return { $p.name as n, $p.city as t } }, { match { $x: Company } return { $x.slug as t, $x.name as n } }) } return { $n, $t } }",
+    );
+    assert_eq!(
+        cols(&c),
+        vec![
+            ("n".into(), "String".into()),
+            ("t".into(), "String?".into())
+        ]
+    );
+    ok(
+        "query q() { match { from union({ match { $a: Person, $b: Company, $a worksAt $b } return { $a, $b } }, { match { $c: Company, $d: Person, $d worksAt $c } return { $c as b, $d as a } }) } return { $a.name, $b.name } }",
+    );
+    // An arm missing a name or holding another is refused, the fix
+    // aliasing it.
+    let d = refused_with(
+        "query q() { match { from union({ match { $p: Person } return { $p.name as n, $p.handle as h } }, { match { $c: Company } return { $c.name as n, $c.slug as s } }) } return { $n } }",
+        "T73",
+    );
+    assert!(
+        d.message
+            .contains("has no column `h` and a column `s` the first arm does not have"),
+        "{d}"
+    );
+    assert_eq!(d.fix.as_deref(), Some("return `s` as `h`: `… as h`"), "{d}");
     // A flat union and a nested one are one term (the formatter flattens).
     let flat = ok(
         "query q() { match { from union({ match { $p: Person } return { $p } }, { match { $q: Person } return { $q as p } }, { match { $r: Person } return { $r as p } }) } return { $p } }",

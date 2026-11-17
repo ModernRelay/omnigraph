@@ -1,12 +1,12 @@
 # issue: none
 # notes: `from union(a, b, …)` is the bag union of its arms (`Union`, folded
 # notes: from the left): every row of each arm, duplicates kept, its columns
-# notes: named by the first arm and matched by position. Each arm is its own
+# notes: matched by name in the first arm's column order. Each arm is its own
 # notes: inline read whose other names stay inside it, a `where` after the
 # notes: union filters the union's rows, and the elements after it join on
 # notes: the names it binds. An arm may return a value, or group, order and
 # notes: cut its own rows: each arm is then drawn as a read of its own, its
-# notes: values one column each under the first arm's names.
+# notes: values one column each under their names.
 # notes: An inline read holding a union keeps it.
 
 --- runner
@@ -61,12 +61,12 @@ query older_or_known() {
 p.handle: String
 
 --- query
-query names_from_the_first_arm() {
+query arms_named_alike() {
     match {
         from union(
             { match { $p: Person } where $p.handle = "ada" return { $p } },
-            { match { $q: Person } where $q.handle = "cy" return { $q } },
-            { match { $r: Person } where $r.handle = "ada" return { $r } }),
+            { match { $q: Person } where $q.handle = "cy" return { $q as p } },
+            { match { $r: Person } where $r.handle = "ada" return { $r as p } }),
     }
     where $p.age > 30
     return { $p.handle, $p.age }

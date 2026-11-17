@@ -564,13 +564,18 @@ fn the_tie_rule_reads_an_expand_target_before_its_edge() {
     assert_eq!(out, vec![json!({"q.name": "a", "id": "z"})]);
 }
 
+/// `Union` matches its arms by column name, in the first arm's column
+/// order: columns returned in another order keep their values.
 #[test]
-fn union_names_its_columns_by_position_from_the_first_arm() {
+fn union_matches_its_arms_by_column_name() {
     assert_eq!(
         sorted(rows(
-            "query q() { match { from union({ match { $p: Person } where $p.name = \"ann\" return { $p.name as who } }, { match { $d: Doc } where $d.slug = \"d1\" return { $d.slug as what } }) } return { $who } }"
+            "query q() { match { from union({ match { $p: Person } where $p.name = \"ann\" return { $p.name as who, $p.city as at } }, { match { $d: Doc } where $d.slug = \"d1\" return { $d.slug as at, concat($d.slug, \"!\") as who } }) } return { $who, $at } }"
         )),
-        vec![json!({"who": "ann"}), json!({"who": "d1"})]
+        vec![
+            json!({"at": "Oslo", "who": "ann"}),
+            json!({"at": "d1", "who": "d1!"})
+        ]
     );
 }
 
