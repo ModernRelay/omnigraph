@@ -2220,7 +2220,7 @@ impl Omnigraph {
             self,
             &ds,
             txn.catalog.system_columns.id,
-            scan_predicate,
+            DeletedRowsRead::filtered(scan_predicate),
             recorded_row_addrs(&staging.deleted_row_addrs, &table_key, ds.version())?,
             &mut staging.deleted_id_budget,
             &mut deleted_ids,
@@ -2293,32 +2293,60 @@ impl Omnigraph {
             // `affected_edges` counts the committed edges the cascade removes;
             // the staged delete removes them at end-of-query. Exact under D₂
             // (no staged inserts can add matches mid-query). The removed node
-            // ids are probed one bounded chunk per scan, never as one filter
-            // over every id (#1442). An edge whose endpoints fall in two
-            // chunks, or that an earlier delete statement on this table (a
-            // prior cascade or an explicit `delete <Edge>`) already
-            // scheduled, is skipped by its row address, so it is counted once. Scan (not count) the removed edge ids so
-            // validation recounts the OTHER endpoint's @card after the
-            // cascade; `len()` is the affected count.
+            // ids are read through `RemovalEdgeReads`: pushed in bounded
+            // chunks where an index answers them, matched in memory on the
+            // fragments it leaves uncovered, never one filter over every id
+            // copied per fragment (#1442). An edge that two reads find, or
+            // that an earlier delete statement on this table (a prior cascade
+            // or an explicit `delete <Edge>`) already scheduled, is skipped by
+            // its row address, so it is counted once. Scan (not count) the
+            // removed edge ids so validation recounts the OTHER endpoint's
+            // @card after the cascade; `len()` is the affected count.
             let mut matched_ids = Vec::new();
             let mut matched_addrs = RowAddrTreeMap::new();
             let (src, dst) = (
                 txn.catalog.system_columns.src,
                 txn.catalog.system_columns.dst,
             );
-            for filter in
-                crate::validate::endpoint_probe_filters((src, probed(src)), (dst, probed(dst)))
-            {
+            let reads = crate::validate::RemovalEdgeReads::plan(
+                edge_ds.dataset(),
+                (src, probed(src)),
+                (dst, probed(dst)),
+            )
+            .await?;
+            let scheduled = recorded_row_addrs(
+                &staging.deleted_row_addrs,
+                &edge_table_key,
+                edge_ds.version(),
+            )?;
+            for filter in reads.probe_filters() {
                 scan_deleted_ids(
                     self,
                     &edge_ds,
                     txn.catalog.system_columns.id,
-                    filter,
-                    recorded_row_addrs(
-                        &staging.deleted_row_addrs,
-                        &edge_table_key,
-                        edge_ds.version(),
-                    )?,
+                    DeletedRowsRead {
+                        filter: Some(filter),
+                        fragments: reads.probe_fragments(),
+                        matcher: None,
+                    },
+                    scheduled,
+                    &mut staging.deleted_id_budget,
+                    &mut matched_ids,
+                    &mut matched_addrs,
+                )
+                .await?;
+            }
+            if let Some((fragments, matcher)) = reads.matched() {
+                scan_deleted_ids(
+                    self,
+                    &edge_ds,
+                    txn.catalog.system_columns.id,
+                    DeletedRowsRead {
+                        filter: None,
+                        fragments: Some(fragments),
+                        matcher: Some(&matcher),
+                    },
+                    scheduled,
                     &mut staging.deleted_id_budget,
                     &mut matched_ids,
                     &mut matched_addrs,
@@ -2405,7 +2433,7 @@ impl Omnigraph {
             self,
             &ds,
             txn.catalog.system_columns.id,
-            pred_expr.clone(),
+            DeletedRowsRead::filtered(pred_expr.clone()),
             recorded_row_addrs(&staging.deleted_row_addrs, &table_key, ds.version())?,
             &mut staging.deleted_id_budget,
             &mut deleted_ids,
@@ -2498,29 +2526,56 @@ async fn key_id_conjunct(
     ))
 }
 
-/// Walk the exact typed predicate a batch at a time, admitting each id against
+/// The rows one scan of [`scan_deleted_ids`] reads: those `filter` selects on
+/// `fragments` (`None`: the whole table), or, with `matcher`, every row of
+/// `fragments` that it keeps (`crate::validate::RemovalEdgeReads`).
+struct DeletedRowsRead<'r, 'm> {
+    filter: Option<Expr>,
+    fragments: Option<Vec<lance_table::format::Fragment>>,
+    matcher: Option<&'r crate::validate::EndpointMatch<'m>>,
+}
+
+impl DeletedRowsRead<'_, '_> {
+    fn filtered(filter: Expr) -> Self {
+        Self {
+            filter: Some(filter),
+            fragments: None,
+            matcher: None,
+        }
+    }
+}
+
+/// Walk the rows `read` selects a batch at a time, admitting each id against
 /// `budget` before copying it, and keep each matched row's address so the
 /// staged delete removes exactly these rows without scanning again. The ids
 /// and addresses accumulate into `removed` and `addrs` across a statement's
-/// probes; a row already in `addrs` (an earlier probe of this statement) or in
+/// reads; a row already in `addrs` (an earlier read of this statement) or in
 /// `scheduled` (an earlier statement's rows) is skipped before it is charged.
 async fn scan_deleted_ids(
     db: &Omnigraph,
     snapshot: &SnapshotHandle,
     id_column: &str,
-    filter: Expr,
+    read: DeletedRowsRead<'_, '_>,
     scheduled: Option<&RowAddrTreeMap>,
     budget: &mut DeletedIdBudget,
     removed: &mut Vec<String>,
     addrs: &mut RowAddrTreeMap,
 ) -> Result<()> {
+    // The id column first: the walk reads it as column 0.
+    let projection: Vec<&str> = std::iter::once(id_column)
+        .chain(read.matcher.iter().flat_map(|matcher| matcher.columns()))
+        .collect();
     let mut stream = db
         .storage()
-        .scan_filtered_row_addrs(snapshot, &[id_column], filter)
+        .scan_filtered_row_addrs(snapshot, &projection, read.filter, read.fragments)
         .await?;
     let mut scanned = RowAddrTreeMap::new();
     let mut found = Vec::new();
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        let batch = match read.matcher {
+            Some(matcher) => matcher.keep(&batch)?,
+            None => batch,
+        };
         let ids = batch
             .column(0)
             .as_any()

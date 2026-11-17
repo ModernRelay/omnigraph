@@ -1,1 +1,1 @@
-- Removing nodes an edge type references (by overwrite load, delete or merge) now probes edges in bounded id chunks, so memory no longer grows with removed ids times edge fragments.
+- Removing nodes an edge type references (overwrite load, `load csv`, delete or merge) no longer needs memory that grows with removed ids times edge fragments.

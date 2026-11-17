@@ -788,13 +788,15 @@ async fn overwrite_node_removal_rejects_retained_orphan_edge() {
     );
 }
 
-/// The retained-edge check of a node overwrite probes the removed ids one
-/// bounded chunk per scan (`validate::PROBE_CHUNK_KEYS`, 8,192), never one
-/// filter over every removed id, whose memory grew with removed ids times edge
-/// fragments (#1442). Across those chunks it still finds a retained edge whose
-/// endpoint was removed in the last chunk, and passes when every retained edge
-/// keeps both endpoints. The scale symptom is `--stats` peak RSS, which the
-/// engine suite cannot observe in one process; the issue holds the script.
+/// The retained-edge check of a node overwrite reads the edge table through
+/// `validate::RemovalEdgeReads`, never with one filter over every removed id,
+/// whose memory grew with removed ids times edge fragments (#1442): the
+/// removal holds more ids than one filter and no index covers the edges, so
+/// the fragments are read whole once and matched in memory. It still finds
+/// a retained edge whose endpoint is the last removed id, and passes when
+/// every retained edge keeps both endpoints.
+/// The scale symptom, peak RSS, is guarded by the `heavy-repro:` tests in
+/// `integration/repro_issue_1442.rs`.
 #[tokio::test]
 async fn overwrite_finds_a_retained_orphan_past_the_first_removed_id_chunk_issue_1442() {
     let removed = 2 * 8_192 + 5;
