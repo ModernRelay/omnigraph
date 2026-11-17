@@ -1,0 +1,36 @@
+# issue: none
+# notes: Unary minus is `0 - x` in its operand's type: negating the type's minimum
+# notes: overflows (`E1`) in the engine and in the reference interpreter alike. Found by
+# notes: the generated scalar-evaluator law (law_scalar_evaluators.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node X {
+    k: String @key
+    a: I64?
+    b: I32?
+}
+
+--- seed
+{"type":"X","data":{"k":"min","a":-9223372036854775808,"b":-2147483648}}
+
+--- query
+query q() {
+  match { $x: X }
+  return { (-$x.a) as v }
+}
+
+--- expect error: E1
+
+--- query
+query q() {
+  match { $x: X }
+  return { (-$x.b) as v }
+}
+
+--- expect error: E1

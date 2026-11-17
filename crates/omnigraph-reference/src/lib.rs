@@ -1322,8 +1322,10 @@ impl<'a> Interpreter<'a> {
                 Value::Bool((self.expr(expr, row, env)? == Value::Null) != *negated)
             }
             IRExpr::Cast { expr, ty } => cast(self.expr(expr, row, env)?, ty)?,
-            IRExpr::Neg { expr, .. } => match self.expr(expr, row, env)? {
-                Value::Int(i) => Value::Int(-i),
+            // Negation is `0 - x` in the operand's type: it overflows where
+            // the negated value leaves the type (`-i64::MIN`), `E1`.
+            IRExpr::Neg { expr, ty } => match self.expr(expr, row, env)? {
+                Value::Int(i) => arith(ArithOp::Sub, Value::Int(0), Value::Int(i), ty)?,
                 Value::Float(f) => Value::Float(-f),
                 _ => Value::Null,
             },
