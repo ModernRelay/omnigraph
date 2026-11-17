@@ -119,8 +119,10 @@ Read output supports `table`, `json`, `jsonl`, `csv`, `kv`, `toon`, and, for
 `--format`, no `--json`, and no `defaults.output`, a read prints a table. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
 cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
-`table` and `kv` print strings unquoted. CSV writes an empty string as `""`
-and quotes fields containing a comma, double quote, or line break. `--format json` prints the
+`table` and `kv` print strings unquoted. CSV writes a null as an empty field
+and an empty string as `""`, and quotes fields containing a comma, double
+quote, or line break, so [`load csv`](../mutations/index.md#csv-loading)
+reads a null back as null and the string `null` as that string. `--format json` prints the
 envelope pretty and the `rows` array compact. `--format toon` encodes that same
 document as [TOON](https://github.com/toon-format/spec) (specification 4.4,
 comma delimiter, two-space indent). `rows` declares its fields once when every

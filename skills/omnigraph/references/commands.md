@@ -547,7 +547,7 @@ For params:
 - `table` (default) — human-readable
 - `toon` — the same document as `json`, in TOON (specification 4.4). Uniform rows declare their fields once. Numbers are canonical (`1`, not `1.0`). A refusal is that document on stdout. The HTTP API still returns JSON
 - `kv` — `key: value` per line; good for single rows
-- `csv` — comma-separated
+- `csv` — comma-separated; a null is an empty field and an empty string is `""`
 - `jsonl` — NDJSON, one per line, with metadata line first
 - `json` — pretty `ReadOutput` envelope (metadata, columns, and rows); the `rows` array is printed compact and verbatim
 
