@@ -527,7 +527,7 @@ fn rrf_options(s: &str, pick: usize) -> Option<String> {
         let w_at = i + ", k: 60, ".len();
         let w_end = w_at + s[w_at..].find(']')? + 1;
         let weights = &s[w_at..w_end];
-        return Some(if pick % 2 == 0 {
+        return Some(if pick.is_multiple_of(2) {
             format!("{}, {weights}{}", &s[..i], &s[w_end..])
         } else {
             format!("{}, {weights}, k: 60{}", &s[..i], &s[w_end..])
