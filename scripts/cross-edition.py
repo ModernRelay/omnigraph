@@ -50,7 +50,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CASES_DIR = "crates/omnigraph-gqt/cases"
 TABLE = ROOT / "crates/omnigraph-gqt/cross-edition.tsv"
-ASPECTS = ("columns", "types", "rows", "affected", "error", "steps")
+ASPECTS = ("columns", "types", "rows", "affected", "error", "steps", "requests")
 
 # The bullets of the RFC's "Compatibility and reversibility" section a table
 # row may cite, each with the sentence that sanctions a difference. A row
@@ -77,6 +77,14 @@ BULLETS = {
     "results.distance-rename": "Language (respelling map): an unaliased `nearest` column `d._distance` becomes `_distance`, the one rename the fixed map carries.",
 }
 
+# Why a step's store requests may rise (aspect `requests`, under
+# `--measure`): a rise is a difference like any other and passes only when a
+# row names one of these.
+COSTS = {
+    "cost.exact-lexical-scan": "RFC section 4: the exact lexical scan answers every `match_terms` and `bm25`, and no query reads a full-text index, so a lexical read reads its text column's data files.",
+    "cost.accepted-refusal": "Compatibility, Language: a text edition 2 refused is accepted, so the step runs a read where edition 2 refused before reading.",
+}
+
 # Differences this branch makes that no Compatibility bullet names. A row may
 # cite one of these keys so that the job stays a check of everything else,
 # but it is not a sanction: the job prints every such row as a warning, and
@@ -88,6 +96,8 @@ OPEN = {
     "open:engine-setting-removed": "The session setting `engine` (released in 0.12) is removed; no RFC section names it.",
     "open:bm25-score-rename": "An unaliased `bm25` column `d._score` becomes `_score`; the Language bullet's respelling map names `_distance` as the one rename.",
     "open:mutation-where-lexical": "A lexical predicate in a write's `where`, which edition 2 refused (`T44`), is accepted; the Language bullet's list of nine accepted refusals does not include it.",
+    "open:index-pages-read-twice": "A filter's scalar index pages (`page_data`, `page_lookup`) are read by scan-access planning and again by execution, where edition 2 read them once.",
+    "open:block-reads-table-again": "A correlated block reads its table's data file once more than the edition-2 read did.",
     "open:catalogue-operators": "The `@Operator` and logical-kind catalogue rows follow the new core operators (`RankFuse` and `TextSearch` leave, `Correlate`, `Fuse`, `Let`, `OptionalJoin`, `Score`, `TargetCut` and `Union` arrive); no Compatibility bullet names the catalogue.",
 }
 
@@ -344,7 +354,10 @@ def read_table(path: Path) -> list[Sanction]:
             )
         if aspect not in ASPECTS:
             errors.append(f"{path.name}:{number}: aspect `{aspect}` is not one of {', '.join(ASPECTS)}")
-        if bullet not in BULLETS and bullet not in OPEN:
+        if aspect == "requests":
+            if bullet not in COSTS and bullet not in OPEN:
+                errors.append(f"{path.name}:{number}: `{bullet}` names no cost reason")
+        elif bullet not in BULLETS and bullet not in OPEN:
             errors.append(f"{path.name}:{number}: bullet `{bullet}` names no Compatibility bullet")
         if len(why) < 20:
             errors.append(f"{path.name}:{number}: the reason is missing or too short to review")
@@ -409,10 +422,17 @@ class SideResult:
     order: list
     message: str = ""
     failure: tuple | None = None
+    costs: dict = field(default_factory=dict)
 
 
 def run_side(
-    runner: Path, text: str, work: Path, relative: str, timeout_s: int, reuse: bool = False
+    runner: Path,
+    text: str,
+    work: Path,
+    relative: str,
+    timeout_s: int,
+    reuse: bool = False,
+    measure: bool = False,
 ) -> SideResult:
     case_path = work / "cases" / relative
     artifacts = work / "artifacts" / relative
@@ -430,7 +450,8 @@ def run_side(
     env.pop("OMNIGRAPH_GQ_BLESS", None)
     try:
         proc = subprocess.run(
-            [str(runner), str(case_path), "--trace", "--artifacts", str(artifacts)],
+            [str(runner), str(case_path), "--trace", "--artifacts", str(artifacts)]
+            + (["--measure"] if measure else []),
             capture_output=True,
             text=True,
             timeout=timeout_s,
@@ -456,7 +477,41 @@ def read_side(artifacts: Path, status: str, message: str) -> SideResult:
             first = trace
             break
     steps, order = observations(first) if first else ({}, [])
-    return SideResult(status, steps, order, message, failed_assertion(first) if first else None)
+    return SideResult(
+        status,
+        steps,
+        order,
+        message,
+        failed_assertion(first) if first else None,
+        step_costs(artifacts),
+    )
+
+
+def step_costs(artifacts: Path) -> dict[int, dict[str, int]]:
+    """Each step's store metrics under `--measure` (seed 0): `requests` and
+    one count per `<realm>_<kind>.<verb>` class."""
+    costs: dict[int, dict[str, int]] = {}
+    cost_dir = artifacts / "cost"
+    if not cost_dir.exists():
+        return costs
+    for tsv in sorted(cost_dir.glob("*.tsv")):
+        with tsv.open() as handle:
+            header = handle.readline().rstrip("\n").split("\t")
+            for line in handle:
+                row = dict(zip(header, line.rstrip("\n").split("\t")))
+                if row.get("slot") != "step" or row.get("seed") != "0":
+                    continue
+                metric = row.get("metric", "")
+                if metric in ("makespan", "span", "simulated_us", "usd_micro", "bytes_read", "bytes_written"):
+                    continue
+                try:
+                    value = int(float(row.get("value", "0")))
+                except ValueError:
+                    continue
+                step = int(row.get("step", "0"))
+                costs.setdefault(step, {})[metric] = value
+        break
+    return costs
 
 
 def failed_assertion(trace: Path) -> tuple | None:
@@ -503,6 +558,7 @@ def run(args: argparse.Namespace) -> int:
             relative,
             args.timeout,
             args.reuse,
+            args.measure,
         )
         new = run_side(
             current_runner,
@@ -511,6 +567,7 @@ def run(args: argparse.Namespace) -> int:
             relative,
             args.timeout,
             args.reuse,
+            args.measure,
         )
         return relative, old, new
 
@@ -518,6 +575,7 @@ def run(args: argparse.Namespace) -> int:
     used: set[int] = set()
     unrunnable: list[str] = []
     shared_failures: list[str] = []
+    costs: list[dict] = []
     compared_steps = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         for relative, old, new in pool.map(compare_case, cases):
@@ -550,6 +608,39 @@ def run(args: argparse.Namespace) -> int:
                 if op not in pairs:
                     continue
                 old_key = pairs[op] + key[2:]
+                if (
+                    args.measure
+                    and key[2] == ""
+                    and key[1] == ""
+                    and old_key[0] in old.costs
+                    and key[0] in new.costs
+                ):
+                    before, after = old.costs[old_key[0]], new.costs[key[0]]
+                    if after.get("requests", 0) > before.get("requests", 0):
+                        findings.append(
+                            {
+                                "case": case,
+                                "step": str(key[0]),
+                                "aspect": "requests",
+                                "detail": f"{before.get('requests', 0)} store requests became {after.get('requests', 0)}",
+                            }
+                        )
+                    if before.get("requests") != after.get("requests"):
+                        classes = sorted(set(before) | set(after))
+                        costs.append(
+                            {
+                                "case": case,
+                                "step": key[0],
+                                "signature": names.get(op, ""),
+                                "edition_2": before.get("requests", 0),
+                                "current": after.get("requests", 0),
+                                "classes": {
+                                    c: after.get(c, 0) - before.get(c, 0)
+                                    for c in classes
+                                    if c != "requests" and after.get(c, 0) != before.get(c, 0)
+                                },
+                            }
+                        )
                 if old_key not in old.steps:
                     continue
                 compared_steps += 1
@@ -576,7 +667,13 @@ def run(args: argparse.Namespace) -> int:
             used.add(row.line)
             finding["bullet"] = row.bullet
     compared = {current.removeprefix(CASES_DIR + "/") for _, current in cases}
-    stale = [row for row in table if row.line not in used and row.case in compared]
+    stale = [
+        row
+        for row in table
+        if row.line not in used
+        and row.case in compared
+        and (args.measure or row.aspect != "requests")
+    ]
 
     report = {
         "base_ref": args.base_ref,
@@ -588,6 +685,7 @@ def run(args: argparse.Namespace) -> int:
         "stale_rows": [row.__dict__ for row in stale],
         "unrunnable": unrunnable,
         "findings": findings,
+        "costs": costs,
     }
     (work / "report.json").write_text(json.dumps(report, indent=1, sort_keys=True))
     by_bullet = Counter(f.get("bullet") for f in findings if f.get("bullet"))
@@ -757,6 +855,11 @@ def main() -> int:
     r.add_argument("--table", default=str(TABLE))
     r.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     r.add_argument("--timeout", type=int, default=600)
+    r.add_argument(
+        "--measure",
+        action="store_true",
+        help="also compare each aligned step's store requests under the simulation; a rise is a difference",
+    )
     r.add_argument(
         "--reuse",
         action="store_true",

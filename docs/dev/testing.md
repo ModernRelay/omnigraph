@@ -724,6 +724,12 @@ python3 scripts/cross-edition.py run --edition-2-runner /tmp/e2-target/debug/omn
   --current-runner target/debug/omnigraph-gqt --base-ref <EDITION_2_SOURCE_COMMIT> --work /tmp/cross-edition
 ```
 
+With `--measure`, each side also runs under `--measure`, and an aligned
+step whose store requests (seed 0, deterministic under the simulation) rose
+is a difference of aspect `requests`, which a row passes by naming the
+reason (`COSTS` in the script, or an `open:` key); CI runs it as its own
+pass, since the measure ledger moves a concurrent block's park points. The
+report lists every changed step's requests and class deltas under `costs`.
 `--case <path>` (repeatable) selects cases; `--reuse` compares the traces an
 earlier run left under `--work`. The report (`report.json` under `--work`)
 holds every difference with both observations.

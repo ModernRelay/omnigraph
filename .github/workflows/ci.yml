@@ -1225,6 +1225,21 @@ jobs:
             --work "$RUNNER_TEMP/cross-edition" \
             --jobs "$(nproc)"
 
+      # A second pass under `--measure`: store requests are deterministic
+      # under the simulation, so a step whose requests rose is a difference
+      # the table must name. Its own pass, since the measure ledger moves a
+      # concurrent block's park points.
+      - name: Compare every paired step's store requests
+        run: |
+          set -euo pipefail
+          python3 scripts/cross-edition.py run \
+            --edition-2-runner "$OMNIGRAPH_EDITION_2_GQT_BIN" \
+            --current-runner target/debug/omnigraph-gqt \
+            --base-ref "$EDITION_2_SOURCE_COMMIT" \
+            --work "$RUNNER_TEMP/cross-edition-measure" \
+            --jobs "$(nproc)" \
+            --measure
+
       # The generated reads both editions express, run through the edition-2
       # CLI and this tree's engine (docs/dev/testing.md, Generated laws).
       - name: Run the two-edition law
@@ -1241,7 +1256,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cross-edition-report
-          path: ${{ runner.temp }}/cross-edition/report.json
+          path: |
+            ${{ runner.temp }}/cross-edition/report.json
+            ${{ runner.temp }}/cross-edition-measure/report.json
           if-no-files-found: warn
           retention-days: 14
           overwrite: true

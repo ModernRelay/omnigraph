@@ -167,7 +167,8 @@ was measured against, in a detached worktree into the job's target directory
 (inside that checkout, so its `tokio_unstable` cfg applies), copies the binary
 and the commit's `omnigraph` CLI out, cleans the path-package artifacts
 through both manifests as the storage job does, builds the current runner,
-runs `scripts/cross-edition.py run` over every case both commits hold, then
+runs `scripts/cross-edition.py run` over every case both commits hold, once
+for rows and once under `--measure` for store requests, then
 runs the two-edition generated law (`law_two_editions`) with the edition-2
 CLI and `OMNIGRAPH_REQUIRE_EDITION_2=1`. A missing runner or CLI fails the
 job; nothing skips. `GQT slow nightly` builds the same commit's CLI for the
