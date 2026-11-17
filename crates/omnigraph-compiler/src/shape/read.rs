@@ -1163,6 +1163,9 @@ impl<'a> Shaper<'a> {
         let mut lets = std::mem::take(&mut facts.lets);
         lets.extend(std::mem::take(&mut after_facts.lets));
         facts.substitute(&lets);
+        // The elements and `where` after a ranking read its `let`s, and its
+        // blocks' values, in place too.
+        after_facts.substitute(&lets);
         for e in items.values_mut() {
             substitute(e, &lets);
         }
