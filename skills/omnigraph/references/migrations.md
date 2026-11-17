@@ -126,3 +126,16 @@ The [upgrade guide](../../../docs/user/operations/upgrade.md#storage-upgrade)
 owns the findings table, the limits and the recovery actions. Upgrade the CLI,
 server and HTTP integrations together: every protected request needs the
 `Omnigraph-Http-Api: 0.14` header described at the top of this page.
+
+## Roll back to an earlier binary
+
+Once the current binary has built or rebuilt an index (`index build`,
+`index rebuild`, `optimize`, a schema apply, or a write that declares a
+column's first full-text index), rolling back in place is not supported. An
+earlier binary refuses full-text search on such an index, because its
+certificate records the field's analyzer profile (`english_v1` where none is
+declared), and returns no rows. It reads the BITMAP, LABEL_LIST and NGRAM
+indexes `@index` now builds, but rebuilds a lagging one as a BTREE or fails.
+To roll back, restore the whole-root backup taken before the upgrade, or
+rebuild the indexes with the earlier binary on each live branch. Do not edit
+certificates or index metadata to make the earlier binary accept them.

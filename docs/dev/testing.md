@@ -376,10 +376,18 @@ nullable outer vectors, an uncovered search tail, branches and history. Cold
 candidate reads must leave its whole root unchanged, including index UUIDs and
 analyzer certificates. Candidate writes, an explicit full-text rebuild, optimize and cleanup are followed by
 predecessor reads of the new state and retained snapshots, including an old
-untrained analyzer declaration and newly built candidate postings. Finally the test
-restores its offline whole-root byte-copy backup at the original path and reads
-it with both binaries. This qualifies those exercised shapes, not arbitrary
-external Lance datasets or every possible downgrade.
+untrained analyzer declaration. Rollback in place after the candidate built or
+rebuilt an index is not supported
+([upgrade guide](../user/operations/upgrade.md#lance-substrate-upgrades-v010-v014)), so
+the predecessor must refuse or answer as the candidate does: its full-text query
+on main, whose postings the candidate rebuilt with fingerprint (format 2)
+certificates, must fail with its certificate refusal and return no rows, while
+its key lookup and its `contains` filters, planned through the NGRAM index the
+candidate's optimize built, must equal the candidate's answers. Finally the test
+restores its offline whole-root byte-copy backup at the original path, the
+supported rollback, and reads it with both binaries. This qualifies those
+exercised shapes, not arbitrary external Lance datasets or every possible
+downgrade.
 
 The stamp-13 journey needs the stamp-13 CLI: the job builds it from the commit
 `ci.yml` pins as `STAMP_13_SOURCE_COMMIT` and exports `OMNIGRAPH_V13_BIN`. It

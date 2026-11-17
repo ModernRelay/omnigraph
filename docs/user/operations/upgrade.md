@@ -145,11 +145,17 @@ migration, but the full-text upgrade below. v0.14 moves to Lance 13 with graph
 format 16 and V2_2 data files unchanged: no `omnigraph upgrade` for a format-16
 graph, and full-text indexes stay searchable, the analyzer being unchanged.
 
-Neither transition is rolling-compatible. Update the CLI, server, and client
-integrations together with application traffic stopped, never run an old and new
-fleet against the same graph, and keep the old executables and a verified whole-root
-backup until the upgrade is proven: a graph the new fleet has written is not qualified
-for the old reader ([Lance contract](../../dev/versioning.md#lance-contract), [v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility)).
+Neither transition is rolling-compatible. Update the CLI, server, and client integrations together
+with traffic stopped, never run an old and new fleet against the same graph, and keep the old
+executables and a verified whole-root backup until the upgrade is proven ([Lance contract](../../dev/versioning.md#lance-contract), [v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility)).
+
+Once this release has built or rebuilt an index (`index build`, `index rebuild`, `optimize`, a
+schema apply, or a write declaring a column's first full-text index), rollback in place is not
+supported. An earlier binary refuses full-text search on that index, whose certificate records
+the field's [analyzer profile](../search/analyzers.md), and returns no rows. It reads the BITMAP,
+LABEL_LIST and NGRAM indexes [`@index` builds](../schema/index.md#what-index-builds), but rebuilds
+a lagging one as a BTREE or fails. To roll back, restore the backup taken before the upgrade, or
+rebuild the indexes with the earlier binary on each live branch.
 
 ## Full-text index upgrade
 

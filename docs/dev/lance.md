@@ -155,6 +155,17 @@ searchable until an explicit rebuild. Planning and execution share the same
 foldable-index predicate; pending full-text coverage alone is not recovery work.
 Other index maintenance is unchanged.
 
+Every certificate this build writes is format 2, which records the field's
+analyzer fingerprint. A binary that reads only format 1, such as the Lance 11
+predecessor, refuses such an index as malformed proof (`FullTextIndexRebuildRequired`)
+and returns no rows, never the rows of a different analysis. Rollback in place
+after this build has built or rebuilt an index is therefore not supported; the
+supported rollback restores the whole-root backup taken before the upgrade, or
+rebuilds the indexes with the older binary
+([upgrade guide](../user/operations/upgrade.md#lance-substrate-upgrades-v010-v014)).
+The CLI's `genuine_lance11_storage_upgrade_round_trip` journey pins the refusal
+and the backup restore.
+
 The audited analyzer dependency set has exact pins and a resolved-lockfile guard.
 Any change needs a compatibility audit before keeping or changing the certificate
 generation. See
