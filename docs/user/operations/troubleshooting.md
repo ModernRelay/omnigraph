@@ -134,7 +134,7 @@ exit follows from the disposition:
 | 64 | The argument parser refused the command line before anything ran (`EX_USAGE`); an addressing refusal inside a command, such as two scope flags, exits 1. |
 
 Maintenance commands (`init`, `upgrade`, `optimize`, `index build`, `index rebuild`,
-`repair`, `cleanup`, `schema upgrade-system-columns`), `cluster`, `policy`,
+`cleanup`, `schema upgrade-system-columns`), `cluster`, `policy`,
 `target`, `credentials`, `mcp`, `studio` and the managed commands keep their own exits for now:
 their exit 1 does not by itself say that nothing changed, so read their report;
 `mcp` answers each relayed request with its own disposition.
@@ -290,7 +290,7 @@ See [Operating a cluster](../clusters/index.md).
 
 ## Maintenance failures
 
-If `optimize`, `index build`, `index rebuild`, `repair`, `cleanup` or `upgrade` cannot
+If `optimize`, `index build`, `index rebuild`, `cleanup` or `upgrade` cannot
 write or flush its output, the CLI returns a failure without repeating the
 operation. An output failure does not undo completed work. Inspect the graph's
 state before another attempt; for an interrupted upgrade, follow the
@@ -299,8 +299,8 @@ state before another attempt; for an interrupted upgrade, follow the
 - Recovery required: reopen the graph read-write or restart its server. A
   graph carrying a sidecar from a release before 0.12 must first be opened
   read-write with that release (`omnigraph snapshot <graph>` is such an open).
-- Foreign drift: `repair` reports Lance commits above a table's last linear
-  version as `foreign_drift`; no read or write uses them and no command
+- Foreign versions: `cleanup` lists Lance commits above a table's last linear
+  version under `foreign_versions`; no read or write uses them and no command
   adopts them (below).
 - Cleanup row with `error`: the collector's trace of that table did not
   finish, so nothing of that table was deleted; fix the named cause and
@@ -308,21 +308,24 @@ state before another attempt; for an interrupted upgrade, follow the
 - Azure admission failure: inspect the lease owner before using the admission
   tool's break-glass flow.
 
-### Foreign drift
+### Foreign versions
 
-`omnigraph repair` classifies a graph table as `foreign_drift` when its
-Lance linear history carries commits above the table's recorded last linear
-version (`omnigraph.last_linear_version` on the registration). Every
-OmniGraph write is a detached commit that a graph commit pins, so such a
-commit came from something else writing the table directory directly. The
-condition is per table.
+A table has foreign versions when its Lance linear history carries commits
+above the table's recorded last linear version
+(`omnigraph.last_linear_version` on the registration). Every Omnigraph write
+is a detached commit that a graph commit pins, so such a commit came from
+something else writing the table directory directly. The condition is per
+table.
 
 - Queries, mutations, loads, merges, index builds, schema apply, optimize
-  and cleanup are unaffected: none of them resolves the linear HEAD.
-- `repair` prints the last linear version, the HEAD and the count of foreign
-  versions, takes no action and exits 0. The removed confirmation flags are rejected; repair never adopts the foreign commit.
-- `cleanup` never deletes a foreign version or its files; the table's result
-  row lists them under `foreign_versions`.
+  and cleanup are unaffected: none of them resolves the linear HEAD, and no
+  command adopts a foreign commit.
+- A confirmed `cleanup --keep N --confirm` run lists them per table, under
+  `foreign_versions` with `--json` and by name in the human report, and never
+  deletes a foreign version or its files. The preview without `--confirm`
+  lists nothing.
+- The `repair` command that reported them as `foreign_drift` was removed; read
+  `foreign_versions` from cleanup instead.
 
 There is no command to run before writing: the write path has no
 precondition on a table's linear history. To discard the foreign commits,
@@ -337,7 +340,6 @@ omnigraph version
 omnigraph snapshot --target ./graph.omni --json
 omnigraph commit list --target ./graph.omni --json
 omnigraph cluster status --target ./company-brain --json
-omnigraph repair --target ./graph.omni --json
 ```
 
 For server requests, retain the HTTP status, response body, request path,

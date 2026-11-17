@@ -46,7 +46,6 @@ prints the exact flags of the installed binary.
 | `upgrade` | — | Convert a standalone graph's storage offline |
 | `optimize` | — | Compact data and reconcile declared indexes on `main` |
 | `index` | `build` `rebuild` | Build a branch's missing or lagging indexes; replace its full-text indexes |
-| `repair` | — | Report foreign Lance history without adopting it |
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
@@ -323,7 +322,12 @@ traversal startup; it does not collect unused forks (that is `cleanup`). It
 works on `main`; use `index build` for another branch. Writes running beside
 it are not refused by its publication: a write it overtook commits over the
 compaction, or prepares again once, holding writes off, when it changes a row
-the run moved. None returns `read_set_conflict` for it. Against a server
+the run moved. None returns `read_set_conflict` for it. Writes to `main` wait
+while it holds main's writer gates: `--max-gate-hold 30s` starts no table after
+that long except the first, so a write waits about the bound plus one table,
+and `--tables node:Person,edge:Knows` runs only those tables, in that order.
+Each table reports `optimized`, `unchanged`, `deferred` or `failed`; one
+table's failure does not stop the others, so read the report. Against a server
 target it runs as a recorded operation: it prints an operation id, waits for
 the operation's record (`--no-wait`, `--timeout`), and `--operation <id>`
 observes one; after a lost response it looks the id up and never resubmits.
@@ -358,8 +362,9 @@ for that dependency change. Do not mix fleets across an incompatible analyzer
 transition. Rebuilds use default English analysis, replacing custom tokenizer
 settings; JSON `warnings` reports this for actual work. Check the selected
 `branch`, `graph_commit_id`, and `rebuilt_indexes`; an empty list/null commit is
-a no-op, not a migration of other branches or historical snapshots. `--as` is
-actor attribution and does not install server policy on direct access.
+a no-op, not a migration of other branches or historical snapshots. On a
+cluster graph the cluster's applied graph policy judges `--as` (`maintain` on
+the branch); a standalone graph has no policy.
 
 ### `cleanup` — destructive version GC
 
@@ -382,7 +387,9 @@ drops does not stop it; `--older-than` reads every other commit's time and
 stops on one it cannot read. Without `--confirm`, cleanup only echoes the
 policy and exits 0; it lists no candidates. Cleanup also reclaims table forks
 and deleted branches' refs once nothing needs them. Branch
-deletion and `optimize` leave this reclamation to `cleanup`.
+deletion and `optimize` leave this reclamation to `cleanup`. On a cluster
+graph the applied policy judges the `--as` actor: `reclaim` for `cleanup`,
+`maintain` for `optimize` and `index`.
 
 ## Stored Queries
 
@@ -502,9 +509,17 @@ identities use different targets. There is no `--auth` selector or last-used ide
 
 Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
-`optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph`, with region
+`optimize`/`index build`/`index rebuild`/`cleanup --graph`, with region
 and endpoint captured from the environment
-([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
+([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)),
+and a graph shallow clone: `--base URI` opens a direct graph target over the
+graph at `URI` (reads fall through to the base, writes land in the target, the
+base is never written) for `query`, `mutate`, `load`, `branch`, `commit`,
+`changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`; an inline
+`s3://` clone root with an `s3://` base is admitted there. Nothing in the target
+records its base, so every reopen passes the same `--base`; a clone root opened
+without it is refused. `--stats PATH` writes one JSON document per invocation
+with the logical object-store calls, the exit code and the peak resident set.
 Each direct writer keeps its admission lock; `cluster force-unlock` it before
 starting the server. Inline local paths and `file://`
 URIs are accepted; remote endpoints must be registered. Server targets own auth;
@@ -536,9 +551,15 @@ For params:
 - `jsonl` — NDJSON, one per line, with metadata line first
 - `json` — pretty `ReadOutput` envelope (metadata, columns, and rows); the `rows` array is printed compact and verbatim
 
-`--format arrow` appears in `--help` but the CLI has no Arrow output: it always
-fails with "has no text rendering". Do not use it, or set it as
-`defaults.output`.
+`query --format arrow` writes the result's columns and rows to stdout as one
+Arrow IPC stream (pyarrow `ipc.open_stream`, Polars `read_ipc_stream`), with
+each column's declared type and real nulls. The stream carries no
+`graph_commit_id`, target or `ranking`; take those from `--json`. Only a query
+run on a direct target (an `explain` statement included) has batches to write.
+It refuses before the read runs, exit 1: on a served or managed target (its server
+answers JSON), for a control statement (`branch list`, `show`), and when stdout
+is a terminal, so redirect it (`> result.arrow`). `alias` and `defaults.output`
+do not offer `arrow`; for a whole branch use `export` (JSONL).
 
 Mutations do not take `--format`; use `--json`. Successful `mutate --json` and
 `load --json` include the exact published `commit` (`null` for a no-op

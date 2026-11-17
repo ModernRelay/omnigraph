@@ -659,7 +659,6 @@ pub const CLI_ONLY_OPERATIONS: &[CliOnlyOperation] = &[
     cli_only("upgrade", STORAGE),
     cli_only("index build", STORAGE),
     cli_only("index rebuild", STORAGE),
-    cli_only("repair", STORAGE),
     cli_only("cleanup", STORAGE),
     cli_only("lint", LOCAL),
     cli_only("queries validate", APPLIED),

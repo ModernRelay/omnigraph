@@ -1,0 +1,25 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+--- seed generate: v1 seed: 7
+tables:
+  - kind: node
+    name: Person
+    rows: 0
+    commits: 1
+    columns:
+      name: {kind: key, prefix: person-, width: 3}
+      age: {kind: literal, value: 1}
+--- query
+query all() { match { $p: Person } return { $p.name } }
+--- expect unordered
+--- expect shape
+p.name: String

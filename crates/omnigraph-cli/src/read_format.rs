@@ -1,8 +1,16 @@
+use std::io::{BufWriter, Write};
+
 use clap::ValueEnum;
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use color_eyre::eyre::Result;
+use omnigraph_api_types::ErrorCode;
+use omnigraph_compiler::error::CompilerError;
+use omnigraph_compiler::result::QueryResult;
 use omnigraph_server::api::ReadOutput;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+use crate::helpers::CodedRefusal;
 
 /// Output rendering format for read-shaped commands (`read`/`query`/`alias`).
 /// A CLI presentation concern — lives here, not in the server.
@@ -17,8 +25,51 @@ pub enum ReadOutputFormat {
     Json,
     /// Same document as json, in TOON (specification 4.4).
     Toon,
-    /// The result as an Arrow IPC stream on stdout.
+    /// The result's columns and rows as an Arrow IPC stream on stdout. Direct
+    /// targets only; refused when stdout is a terminal.
     Arrow,
+}
+
+/// `--format` for a read whose answer is always a server's JSON (an alias
+/// invokes a stored query by name): every format but `arrow`.
+pub(crate) fn rendered_format_parser() -> impl TypedValueParser<Value = ReadOutputFormat> {
+    PossibleValuesParser::new(
+        ReadOutputFormat::value_variants()
+            .iter()
+            .filter(|format| **format != ReadOutputFormat::Arrow)
+            .filter_map(ValueEnum::to_possible_value),
+    )
+    .try_map(|name| ReadOutputFormat::from_str(&name, false))
+}
+
+/// The refusal of `--format arrow` for an answer that is rendered JSON and
+/// has no result batches: a control statement's (`branch list`, `show`), or
+/// one a server sent. `answer` names it.
+pub(crate) fn arrow_has_no_batches(answer: &str) -> color_eyre::Report {
+    CodedRefusal::report(
+        ErrorCode::BadRequest,
+        format!(
+            "`--format arrow` writes a query's result batches, and {answer} has none; use `--format json` or `--format jsonl`"
+        ),
+    )
+}
+
+/// Write the engine's result batches to `writer` as one Arrow IPC stream:
+/// the result's schema, its rows, and the end-of-stream marker. Nothing else
+/// travels with them: the read's target, graph commit and ranking stay in
+/// the JSON document. Every refusal precedes this call, so stdout never holds
+/// part of a stream a refusal cut short; a failed write fails delivery, as
+/// any format's does.
+pub(crate) fn write_arrow_stream(result: &QueryResult, writer: &mut dyn Write) -> Result<()> {
+    let mut writer = BufWriter::new(writer);
+    result
+        .write_arrow_ipc(&mut writer)
+        .map_err(|error| match error {
+            CompilerError::Io(error) => color_eyre::Report::from(error),
+            error => error.into(),
+        })?;
+    writer.flush()?;
+    Ok(())
 }
 
 /// How an over-wide table cell is laid out when rendering `--format table`.
@@ -50,9 +101,9 @@ pub fn render_read(
         ReadOutputFormat::Csv => render_csv(output),
         ReadOutputFormat::Kv => Ok(render_kv(output)? + &page_footer(output)),
         ReadOutputFormat::Table => Ok(render_table(output, options)? + &page_footer(output)),
-        ReadOutputFormat::Arrow => color_eyre::eyre::bail!(
-            "`--format arrow` writes an Arrow IPC byte stream to stdout and has no text rendering"
-        ),
+        // Arrow output writes the engine's batches (`write_arrow_stream`);
+        // a rendered answer reaches here only without any.
+        ReadOutputFormat::Arrow => Err(arrow_has_no_batches("this answer")),
     }
 }
 
@@ -106,16 +157,17 @@ fn render_kv(output: &ReadOutput) -> Result<String> {
         return Ok(lines.join("\n"));
     }
 
+    let columns = columns(output, &rows);
     for (idx, row) in rows.iter().enumerate() {
         if idx > 0 {
             lines.push(String::new());
         }
         lines.push(format!("row {}", idx + 1));
-        for column in columns(output, &rows) {
+        for column in &columns {
             lines.push(format!(
                 "{}: {}",
                 column,
-                stringify_value(row.get(&column).unwrap_or(&Value::Null))
+                stringify_value(row.get(column).unwrap_or(&Value::Null))
             ));
         }
     }
@@ -325,7 +377,7 @@ fn pad_to_width(value: &str, width: usize) -> String {
 }
 
 fn csv_escape(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+    if value.is_empty() || value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_string()

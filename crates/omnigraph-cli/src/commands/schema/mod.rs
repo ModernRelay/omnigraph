@@ -68,7 +68,7 @@ pub(crate) async fn plan_schema(
 ) -> Result<()> {
     let schema_source = fs::read_to_string(schema)?;
     let uri = binding.uri();
-    let db = crate::admission::open_read_only_with_binding(binding, None).await?;
+    let db = crate::admission::open_read_only_with_binding(binding, None, None).await?;
     let plan = db.plan_schema(&schema_source).await?;
     let output = SchemaPlanOutput {
         uri,

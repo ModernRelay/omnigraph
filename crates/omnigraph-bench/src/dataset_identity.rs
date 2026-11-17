@@ -34,7 +34,12 @@ pub struct DatasetLogicalV1 {
     pub limitations: Vec<String>,
 }
 pub async fn observe(root: &Path) -> Result<DatasetLogicalV1, String> {
-    let db = Omnigraph::open_read_only(root.to_str().ok_or("non-UTF8 dataset path")?)
+    observe_uri(root.to_str().ok_or("non-UTF8 dataset path")?).await
+}
+/// [`observe`] over a graph root URI: a local directory or an `s3://` prefix,
+/// the frozen base of a store among them; opened read-only, nothing written.
+pub async fn observe_uri(uri: &str) -> Result<DatasetLogicalV1, String> {
+    let db = Omnigraph::open_read_only(uri)
         .await
         .map_err(|e| e.to_string())?;
     let mut names = db.branch_list().await.map_err(|e| e.to_string())?;

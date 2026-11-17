@@ -3,19 +3,17 @@
 use std::io::Write;
 
 use color_eyre::eyre::{Result, bail};
-use omnigraph::db::{CleanupPolicyOptions, Omnigraph, RepairAction};
+use omnigraph::db::CleanupPolicyOptions;
 
 use crate::app::Completion;
 use crate::helpers::{confirm_destructive, parse_duration_arg, resolve_actor};
-use crate::output::{
-    write_cleanup, write_full_text_rebuild, write_index_build, write_optimize, write_repair,
-};
+use crate::output::{write_cleanup, write_full_text_rebuild, write_index_build, write_optimize};
 
 pub(crate) mod args;
 mod served;
 pub(crate) use args::{
     CleanupArgs, IndexBuildArgs, IndexCommand, IndexRebuildArgs, IndexRebuildKind, OptimizeArgs,
-    RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
+    RebuildFullTextIndexesArgs, UpgradeArgs,
 };
 
 /// Only the existing global arguments consumed by this command family.
@@ -63,7 +61,7 @@ pub(crate) async fn run_optimize(
             scope.operator,
             scope.target,
             scope.graph,
-            None,
+            scope.actor,
             stderr,
         )
         .await?;
@@ -97,10 +95,10 @@ pub(crate) async fn run_optimize(
     let uri = crate::scope::direct_graph_uri(scope.target, scope.graph).await?;
     let binding = crate::scope::capture_storage_binding(scope.target)?.for_uri(&uri)?;
     let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
-    crate::admission::ensure_graph_with_binding(&binding, stderr).await?;
-    let db = Omnigraph::open_with_storage(
-        binding.uri(),
-        omnigraph::storage::storage_for_binding(&binding)?,
+    let db = crate::admission::open_writable(
+        &binding,
+        async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
+        stderr,
     )
     .await?;
     let report = db.optimize_as(actor.as_deref(), request).await?;
@@ -119,10 +117,10 @@ pub(crate) async fn run_index(
             let uri = crate::scope::direct_graph_uri(scope.target, scope.graph).await?;
             let binding = crate::scope::capture_storage_binding(scope.target)?.for_uri(&uri)?;
             let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
-            crate::admission::ensure_graph_with_binding(&binding, stderr).await?;
-            let db = Omnigraph::open_with_storage(
-                binding.uri(),
-                omnigraph::storage::storage_for_binding(&binding)?,
+            let db = crate::admission::open_writable(
+                &binding,
+                async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
+                stderr,
             )
             .await?;
             let result = db.ensure_indices_on_as(&branch, actor.as_deref()).await?;
@@ -177,44 +175,14 @@ pub(crate) async fn rebuild_full_text_indexes(
     stderr: &mut dyn Write,
 ) -> Result<()> {
     let uri = binding.uri();
-    crate::admission::ensure_graph_with_binding(binding, stderr).await?;
-    let db = Omnigraph::open_with_storage(uri, omnigraph::storage::storage_for_binding(binding)?)
-        .await?;
-    let result = db.rebuild_full_text_indices_on_as(branch, actor).await?;
-    write_full_text_rebuild(uri, &result, json, stdout, stderr)
-}
-
-pub(crate) async fn run_repair(
-    args: RepairArgs,
-    scope: MaintenanceScope<'_>,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<Completion> {
-    let RepairArgs { json } = args;
-    let uri = crate::scope::direct_graph_uri(scope.target, scope.graph).await?;
-    let binding = crate::scope::capture_storage_binding(scope.target)?.for_uri(&uri)?;
-    let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
-    crate::admission::ensure_graph_with_binding(&binding, stderr).await?;
-    let db = Omnigraph::open_with_storage(
-        binding.uri(),
-        omnigraph::storage::storage_for_binding(&binding)?,
+    let db = crate::admission::open_writable(
+        binding,
+        async { Ok(omnigraph::storage::storage_for_binding(binding)?) },
+        stderr,
     )
     .await?;
-    let stats = db.repair_report_as(actor.as_deref()).await?;
-    let refused_count = stats
-        .datasets
-        .iter()
-        .filter(|s| matches!(s.action, RepairAction::Refused))
-        .count();
-    write_repair(&uri, &stats, json, stdout)?;
-    if refused_count > 0 {
-        stdout.flush()?;
-        bail!(
-            "repair could not diagnose {} dataset(s); inspect the reported errors",
-            refused_count
-        );
-    }
-    Ok(Completion::success())
+    let result = db.rebuild_full_text_indices_on_as(branch, actor).await?;
+    write_full_text_rebuild(uri, &result, json, stdout, stderr)
 }
 
 pub(crate) async fn run_cleanup(
@@ -261,10 +229,10 @@ pub(crate) async fn run_cleanup(
         older_than: older_than_dur,
     };
     let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
-    crate::admission::ensure_graph_with_binding(&binding, stderr).await?;
-    let db = Omnigraph::open_with_storage(
-        binding.uri(),
-        omnigraph::storage::storage_for_binding(&binding)?,
+    let db = crate::admission::open_writable(
+        &binding,
+        async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
+        stderr,
     )
     .await?;
     let stats = db.cleanup_as(options.clone(), actor.as_deref()).await?;

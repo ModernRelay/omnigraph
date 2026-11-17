@@ -2505,33 +2505,6 @@ async fn _compile_compact_files_signature() -> lance::Result<()> {
     Ok(())
 }
 
-// --- Guard 7b: transaction history exposes repair's classification surface -
-//
-// `db/omnigraph/repair.rs` reads Lance transactions between manifest and HEAD
-// and treats only `ReserveFragments` + `Rewrite` as safe maintenance drift.
-// Compile-only.
-
-#[allow(
-    dead_code,
-    unreachable_code,
-    unused_variables,
-    unused_mut,
-    clippy::diverging_sub_expression
-)]
-async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()> {
-    let ds: Dataset = unimplemented!();
-    let tx = ds.read_transaction_by_version(1u64).await?;
-    if let Some(tx) = tx {
-        let operation = tx.operation;
-        let _name: &str = operation.name();
-        match operation {
-            Operation::Rewrite { .. } | Operation::ReserveFragments { .. } => {}
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 // --- Guard 8: DeleteBuilder::execute_uncommitted returns
 //     UncommittedDelete { transaction, affected_rows, num_deleted_rows } ---
 //

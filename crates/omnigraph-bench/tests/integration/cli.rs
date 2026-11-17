@@ -32,7 +32,10 @@ fn legacy_catalog() -> &'static Path {
             )
             .unwrap();
             for scenario in &catalog.definition.scenarios {
-                let (mut definition, _) = scenario.expand(&catalog.definition.defaults);
+                let (mut definition, _) = scenario.expand(
+                    &catalog.definition.defaults,
+                    &omnigraph_bench::catalog::local_environment(),
+                );
                 for path in omnigraph_bench::catalog::fixture_paths(&definition.fixture)
                     .into_iter()
                     .chain([definition.workload.queries.as_path()])
@@ -71,8 +74,7 @@ fn legacy_catalog() -> &'static Path {
                             repetitions: catalog
                                 .scenario(id)
                                 .unwrap()
-                                .expand(&catalog.definition.defaults)
-                                .1,
+                                .repetitions(&catalog.definition.defaults),
                         })
                         .collect(),
                 };
@@ -696,6 +698,258 @@ fn the_read_through_route_runs_the_production_loop() {
     for sample in samples {
         assert_eq!(sample["outcome"], "expectations-passed", "{sample}");
     }
+}
+
+/// The clone route end to end over a local store: `OMNIGRAPH_BENCH_PRODUCT`
+/// names the product's `omnigraph`; without it the test says why it skipped.
+#[test]
+#[cfg(not(debug_assertions))]
+fn the_clone_route_runs_the_product_binary_over_a_local_store() {
+    let Some(product) = std::env::var_os("OMNIGRAPH_BENCH_PRODUCT") else {
+        eprintln!("skipping clone route: OMNIGRAPH_BENCH_PRODUCT names no product binary");
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("store");
+    let output = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(repository_root())
+        .env_remove("OMNIGRAPH_BENCH_PRODUCT")
+        .args(["run", "e2e-query-scan", "--config"])
+        .arg(repository_root().join("benchmarks/benchmarks.yaml"))
+        .arg("--dataset-cache")
+        .arg(directory.path().join("cache"))
+        .arg("--store")
+        .arg(&store)
+        .arg("--product")
+        .arg(&product)
+        .args(["--repetitions", "2", "--json"])
+        .output()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "{result}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let runs = result["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "{result}");
+    let run = &runs[0];
+    assert_eq!(
+        run["bound"]["plan"]["definition"]["protocol"]["reset"], "clone",
+        "{run}"
+    );
+    assert_eq!(
+        run["bound"]["identity"]["cache_condition"]["process"], "fresh-per-step",
+        "{run}"
+    );
+    assert!(
+        run["base"]["objects"]
+            .as_array()
+            .is_some_and(|o| !o.is_empty()),
+        "{run}"
+    );
+    assert_eq!(
+        run["product"]["executable_sha256"].as_str().map(str::len),
+        Some(64),
+        "{run}"
+    );
+    assert!(
+        run["fixture"].is_null() && run["server_receipt"].is_null(),
+        "{run}"
+    );
+    let samples = run["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 2, "{run}");
+    for sample in samples {
+        assert_eq!(sample["outcome"], "expectations-passed", "{sample}");
+        assert_eq!(
+            sample["base_manifest_sha256"].as_str().map(str::len),
+            Some(64),
+            "{sample}"
+        );
+        assert!(
+            sample["peak_rss_bytes"].as_u64().is_some_and(|n| n > 0),
+            "{sample}"
+        );
+        assert!(sample["logical_store_calls"].is_object(), "{sample}");
+        assert!(sample["control_store_calls"].is_null(), "{sample}");
+    }
+    let clones: Vec<_> = std::fs::read_dir(store.join("clones"))
+        .map(|entries| entries.map(|e| e.unwrap().path()).collect())
+        .unwrap_or_default();
+    assert!(clones.is_empty(), "clones left after the run: {clones:?}");
+}
+
+/// The product wrapped so that `version --json` names `commit`, every other
+/// invocation passed through: the one binary stands for two commits.
+#[cfg(not(debug_assertions))]
+fn product_claiming(directory: &Path, product: &str, commit: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let wrapper = directory.join(format!("omnigraph-{}", &commit[..12]));
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \"$1 $2\" in \"version --json\") \"{product}\" version --json | sed -e 's/\"commit\": *\"[0-9a-f]*\"/\"commit\": \"{commit}\"/'; exit ;; esac\nexec \"{product}\" \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wrapper.display().to_string()
+}
+
+#[cfg(not(debug_assertions))]
+fn commit_of(reference: &str) -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", &format!("{reference}^{{commit}}")])
+        .current_dir(repository_root())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{reference}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// `run --at HEAD=<product> --at HEAD~1=<product>` measures one binary under
+/// two commits (each ref's product is the binary wrapped to name that commit)
+/// against one store, puts one record per ref, and `report` reads them back.
+#[test]
+#[cfg(not(debug_assertions))]
+fn clone_route_at_two_refs_puts_records_the_report_reads_back() {
+    let Some(product) = std::env::var_os("OMNIGRAPH_BENCH_PRODUCT") else {
+        eprintln!("skipping run --at: OMNIGRAPH_BENCH_PRODUCT names no product binary");
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("store");
+    let product = repository_root().join(&product).display().to_string();
+    let head = product_claiming(directory.path(), &product, &commit_of("HEAD"));
+    let previous = product_claiming(directory.path(), &product, &commit_of("HEAD~1"));
+    let output = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(repository_root())
+        .env_remove("OMNIGRAPH_BENCH_PRODUCT")
+        .args(["run", "e2e-query-scan", "--config"])
+        .arg(repository_root().join("benchmarks/benchmarks.yaml"))
+        .arg("--dataset-cache")
+        .arg(directory.path().join("cache"))
+        .arg("--store")
+        .arg(&store)
+        .arg("--at")
+        .arg(format!("HEAD={head}"))
+        .arg("--at")
+        .arg(format!("HEAD~1={previous}"))
+        .args(["--repetitions", "1", "--json"])
+        .output()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "{result}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let at = result["at"].as_array().unwrap();
+    assert_eq!(at.len(), 2, "{result}");
+    assert_eq!(at[0]["reference"], "HEAD", "{result}");
+    assert_eq!(at[1]["reference"], "HEAD~1", "{result}");
+    assert_ne!(at[0]["commit"], at[1]["commit"], "{result}");
+    for target in at {
+        assert_eq!(
+            target["commit"].as_str().map(str::len),
+            Some(40),
+            "{target}"
+        );
+        let records = target["output"]["store_records"]["records"]
+            .as_array()
+            .unwrap();
+        assert_eq!(records.len(), 1, "{target}");
+        let run = &target["output"]["runs"][0];
+        assert_eq!(
+            run["product"]["requested_commit"], target["commit"],
+            "{run}"
+        );
+    }
+    let report = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(repository_root())
+        .env_remove("OMNIGRAPH_BENCH_PRODUCT")
+        .args(["report", "e2e-query-scan", "--config"])
+        .arg(repository_root().join("benchmarks/benchmarks.yaml"))
+        .arg("--store")
+        .arg(&store)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let series: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert!(
+        report.status.success(),
+        "{series}\n{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let groups = series["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{series}");
+    let rows = groups[0]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{series}");
+    let commits: std::collections::BTreeSet<_> = rows
+        .iter()
+        .map(|row| row["commit"].as_str().unwrap())
+        .collect();
+    assert_eq!(commits.len(), 2, "{series}");
+    for row in rows {
+        assert_eq!(row["sut"], "product-binary", "{row}");
+        assert_eq!(row["status"], "complete", "{row}");
+        assert_eq!(row["observed_repetitions"], 1, "{row}");
+    }
+}
+
+/// A product whose `version --json` writes another storage format is
+/// refused before any run: nothing is measured, no record is put.
+#[test]
+#[cfg(not(debug_assertions))]
+fn clone_route_at_refuses_a_product_writing_another_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("store");
+    let fake = directory.path().join("omnigraph-other-schema");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nprintf '%s' '{\"version\":\"0.0.0\",\"commit\":null,\"http_contract\":\"none\",\"internal_schema\":{\"writes\":1,\"reads\":[1]}}'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(repository_root())
+        .env_remove("OMNIGRAPH_BENCH_PRODUCT")
+        .args(["run", "e2e-query-scan", "--config"])
+        .arg(repository_root().join("benchmarks/benchmarks.yaml"))
+        .arg("--dataset-cache")
+        .arg(directory.path().join("cache"))
+        .arg("--store")
+        .arg(&store)
+        .arg("--at")
+        .arg(format!("HEAD={}", fake.display()))
+        .args(["--repetitions", "1", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let text = result.to_string();
+    assert!(text.contains("not_comparable"), "{text}");
+    assert!(text.contains("writes internal schema v1"), "{text}");
+    assert!(
+        !store.join("records").exists(),
+        "records written by a refused run"
+    );
 }
 
 #[test]

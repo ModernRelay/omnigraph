@@ -201,11 +201,12 @@ backend. `--config DIR` is source input only.
 - Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
 - Server: `--target production --graph knowledge`; the registered target owns endpoint and one auth provider.
 - Managed: `--profile work` for account operations; a managed target references that profile and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
-- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph` while the server is stopped. Each direct writer on the root takes the admission lock and keeps it; once that writer has stopped and its I/O has settled, release its exact `lock_id` (from `cluster status --json`) with `cluster force-unlock` before the next writer or the server starts. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
+- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup --graph` while the server is stopped. Each direct writer on the root takes the admission lock and keeps it; once that writer has stopped and its I/O has settled, release its exact `lock_id` (from `cluster status --json`) with `cluster force-unlock` before the next writer or the server starts. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
-address convenience. `--as ACTOR` attributes supported direct operations and
+address convenience. `--as ACTOR` attributes supported direct operations, is
+the actor a cluster graph's applied policy judges them by, and
 names the actor `access` reports for direct storage;
 served targets derive their actor from credentials and send `--as` as the
 `Omnigraph-If-Actor` assertion, refusing a mismatch with `actor_mismatch` and
@@ -219,7 +220,7 @@ destination line.
 | Data | `query`, `mutate`, `load --mode overwrite\|append\|merge`, `branch`, `commit`, `snapshot`, `export`, `blob`, `diff`, `changes`; direct or served targets |
 | Managed data | `graphs list` and common served graph commands, subject to endpoint capabilities and policy; no direct maintenance fallback |
 | Direct schema | `schema plan`; `schema apply` and `schema upgrade-system-columns` require standalone graph targets |
-| Direct maintenance | `optimize`, `index build`, `index rebuild --kind full-text`, `repair`, `cleanup`; `upgrade --target ADDRESS` is standalone and offline |
+| Maintenance | `optimize` on a direct target, or on a cluster server as a recorded operation; `index build`, `index rebuild --kind full-text`, `cleanup` direct only; `upgrade --target ADDRESS` is standalone and offline |
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
 | Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
@@ -235,6 +236,8 @@ destination line.
 `--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate
 values into query source. Reads support `--format table|json|jsonl|csv|kv|toon`;
 `--format toon` encodes the same document as `--format json` in TOON;
+`query --format arrow` writes an Arrow IPC stream from a direct target to a
+redirected stdout ([`commands.md`](references/commands.md#output-formats-and-positions));
 `--json` preserves exact receipt/error structure. Inspect `commit` and
 `graph_commit_id` after uncertain writes; do not infer safe retry from a timeout.
 
@@ -263,10 +266,11 @@ two agents given the same input should write the same graph and read the same
 meaning back. Decide conservatively what to model; once modeled, constrain
 precisely, because changing a commitment later is a rebuild (adding
 `@key`/`@range`/`@check`, an edge `@unique` or a required edge to an existing
-type, changing cardinality, removing a constraint from a property that stays,
-and `T` → `T?` are refused; `@index` additions, nullable additions, enum
-widening, renames, drops, `T?` → `T` and a node `@unique` apply in place, the
-last two only when the stored rows already satisfy them).
+type, raising an edge's `@card` minimum or lowering its maximum, removing a
+constraint from a property that stays, and `T` → `T?` are refused; `@index`
+additions, nullable additions, enum widening, widening a `@card` range,
+renames, drops, `T?` → `T` and a node `@unique` apply in place, the last two
+only when the stored rows already satisfy them).
 
 In short: Gruber's five criteria (clarity · coherence · extendibility · minimal
 encoding bias · minimal commitment) · neither too loose (one meaning, many
@@ -416,7 +420,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Expecting `@embed` to populate vectors during load | missing/stale vectors | `@embed` is metadata; run the offline `omnigraph embed ... --reembed-all` file pipeline, then load its output |
 | `schema apply` with feature branches open | `schema apply requires a graph with only main` | Delete them (`merge --delete-branch` or `branch delete`); a merge alone leaves the branch live |
 | `nearest(...)` / `rrf(...)` without `limit` | compile error | Add `limit N`; a BM25-only query may omit it, though bounded output is recommended |
-| Adding non-nullable property without backfill | unsupported migration | Make optional → backfill; keep it optional (tightening `T?` → `T` is refused, OG-MF-106) |
+| Adding non-nullable property without backfill | unsupported migration | Add it optional → backfill → promote `T?` → `T`; the promotion is refused, changing nothing, while a stored row holds a null (OG-MF-104) |
 | `omnigraph init --json` | `unexpected argument '--json' found` | `init` doesn't support `--json`; drop the flag |
 | `omnigraph init` on an already-initialized URI | `graph already initialized or initialization metadata exists at '<uri>'` | Never overwrite it. `--force` only replaces orphan schema artifacts after proving there is no graph manifest |
 | `schema apply` dropping a property/type | nothing is reclaimed at apply; older commits still read the dropped data, and a dropped property's values stay in the current data files | a type: `cleanup` with a retention that excludes the pre-drop commits. A property: `optimize` first, delete branches and tags from before it, then that `cleanup`; the data is then unrecoverable |
@@ -443,7 +447,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Using `data.id` for identity on a new graph | `unknown input field 'id': move data.id to the top-level 'id' field` | Put identity in top-level JSONL `id`; `data` contains user properties |
 | Re-running a `--mode merge` load with unkeyed edges | duplicate edges | Supply stable top-level edge `id`s, or declare `@key(@src, @dst)` when creating the edge type |
 | Assuming every JSON result cell has a key | absent keys for null values | Query/export JSON omits null cells; change images retain explicit nulls |
-| `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv`, `kv`, or `toon` |
+| `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv`, `kv`, or `toon`; pass `query --format arrow` per invocation on a direct target |
 | `..` or a symlink in a `cluster.yaml` relative path | `config_path_escape` / `config_path_symlink` | Keep referenced files inside the config directory with plain relative paths |
 | A 0.13 operator file | configuration refusal | Rewrite it as `version: 1` (see [migrations](references/migrations.md#operator-configuration-rewrite)); keep the old operator home until unresolved work is reconciled |
 

@@ -31,7 +31,7 @@ use helpers::collector::{
 };
 use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
 use helpers::{
-    MUTATION_QUERIES, Session, TEST_QUERIES, collect_column_strings, count_rows,
+    MUTATION_QUERIES, Session, TEST_QUERIES, collect_column_strings, count_rows, count_rows_branch,
     forge_linear_head_from_pin, init_and_load, is_detached_version, mixed_params, mutate_main,
     node_blob_cell, params, pinned_version, read_managed_blob_bytes, read_table, version_main,
 };
@@ -3066,6 +3066,124 @@ async fn conditional_update_and_delete_races_return_precondition_failed_before_e
     );
 }
 
+const CARD_RACE_SCHEMA: &str = r#"
+node Task { name: String @key }
+node Agent { name: String @key }
+edge HeldBy: Task -> Agent @card(0..1)
+"#;
+
+const CARD_RACE_SEED: &str = r#"{"type":"Task","data":{"name":"task-0"}}
+{"type":"Agent","data":{"name":"a"}}
+{"type":"Agent","data":{"name":"b"}}"#;
+
+const CARD_RACE_MUTATIONS: &str = r#"
+query hold($task: String, $agent: String) {
+    insert HeldBy { from: $task, to: $agent }
+}
+"#;
+
+/// Issue #1424: two conditional writers read the same head and each insert
+/// the one edge a `@card(0..1)` allows. The loser passed its precondition
+/// before the winner published, so its live `@card` count sees the winner's
+/// edge; that read is past the caller's head, and the loser must report its
+/// failed precondition (412 on the server), not a `@card` violation.
+///
+/// One row on `main` and one on a named branch forked from it and never
+/// written: there the gate and the live read both take the head the fork
+/// inherits, and the winner (itself a conditional `@card` insert) is the
+/// fork's first write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn conditional_edge_insert_that_loses_the_race_fails_its_precondition_issue_1424() {
+    for branch in ["main", "review"] {
+        conditional_edge_insert_loses_the_race(branch).await;
+    }
+}
+
+async fn conditional_edge_insert_loses_the_race(branch: &str) {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), CARD_RACE_SCHEMA)
+            .await
+            .unwrap(),
+    ));
+    db.load_jsonl(CARD_RACE_SEED, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let main_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    if branch != "main" {
+        db.branch_create(branch).await.unwrap();
+    }
+    let read_head = branch_head_commit_id(dir.path(), branch).await.unwrap();
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_EXECUTE_PRE_VALIDATE);
+    let loser = {
+        let db = Arc::clone(&db);
+        let read_head = read_head.clone();
+        let branch = branch.to_string();
+        tokio::spawn(async move {
+            db.mutate_as_with_expected_head(
+                &branch,
+                CARD_RACE_MUTATIONS,
+                "hold",
+                &params(&[("$task", "task-0"), ("$agent", "a")]),
+                None,
+                Some(&read_head),
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    db.mutate_as_with_expected_head(
+        branch,
+        CARD_RACE_MUTATIONS,
+        "hold",
+        &params(&[("$task", "task-0"), ("$agent", "b")]),
+        None,
+        Some(&read_head),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{branch}: the winner's precondition holds: {err}"));
+    let winner_head = branch_head_commit_id(dir.path(), branch).await.unwrap();
+    rendezvous.release();
+
+    let err = loser
+        .await
+        .unwrap()
+        .expect_err("the loser's precondition must fail");
+    assert!(!rendezvous.timed_out(), "{branch}: the loser stayed parked");
+    match err {
+        OmniError::PreconditionFailed {
+            branch: refused,
+            expected,
+            actual,
+        } => {
+            assert_eq!(refused, branch);
+            assert_eq!(expected, read_head);
+            assert_eq!(actual.as_deref(), Some(winner_head.as_str()));
+        }
+        other => panic!(
+            "{branch}: the losing conditional write must be PreconditionFailed, got: {other}"
+        ),
+    }
+    assert_eq!(
+        branch_head_commit_id(dir.path(), branch).await.unwrap(),
+        winner_head,
+        "{branch}: the loser must not commit"
+    );
+    assert_eq!(count_rows_branch(&db, branch, "edge:HeldBy").await, 1);
+    if branch != "main" {
+        assert_eq!(
+            branch_head_commit_id(dir.path(), "main").await.unwrap(),
+            main_head,
+            "neither write reaches main"
+        );
+        assert_eq!(count_rows(&db, "edge:HeldBy").await, 0);
+    }
+}
+
 /// A fresh named branch needs its inherited lineage fallback because it has no
 /// exact branch-head row. If that second read fails after opening the
 /// replacement manifest, the warm handle must keep its previous manifest and
@@ -5026,7 +5144,13 @@ async fn schema_apply_retry_preserves_the_original_empty_create() {
         assert_eq!(entry.published_dataset_version, if changed { 2 } else { 1 });
         assert_eq!(entry.version_metadata.staged_version().is_some(), changed);
         assert_eq!(entry.version_metadata.last_linear_version(), Some(1));
-        recovered.repair_report_as(None).await.unwrap();
+        let plan = recovered.cleanup_plan(keep_one()).await.unwrap();
+        let company_plan = main_plan(&plan, "node:Company");
+        assert!(company_plan.errors.is_empty(), "{company_plan:?}");
+        assert!(
+            company_plan.foreign_versions.is_empty(),
+            "the qualified original version is no foreign commit: {company_plan:?}"
+        );
         recovered.ensure_indices_as(None).await.unwrap();
         let cleaned = recovered.cleanup_as(keep_one(), None).await.unwrap();
         assert!(cleaned.iter().all(|row| row.error.is_none()), "{cleaned:?}");
@@ -6137,7 +6261,7 @@ async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrit
 ///
 /// The token carried in `admission_txn` is the authority proof and the source
 /// of the recovery sidecar's `RecoveryAuthorityToken`. Removing it would
-/// silently downgrade optimize/cleanup/repair from
+/// silently downgrade optimize and cleanup from
 /// reject-on-authority-drift to read-whatever-is-fresh.
 async fn seed_optimize_race_graph(dir: &tempfile::TempDir) {
     let seed = helpers::init_and_load(dir).await;
@@ -9934,7 +10058,7 @@ async fn branch_merge_pointer_adoption_carries_the_source_pin() {
 
 /// RFC 0067: a handle whose snapshot predates another handle's write holds
 /// a stale read set: its write reprepares from the current manifest instead
-/// of being refused with a repair conflict.
+/// of being refused as a conflict.
 #[tokio::test]
 #[serial]
 async fn rfc_0067_stale_handle_write_after_another_write_reprepares() {

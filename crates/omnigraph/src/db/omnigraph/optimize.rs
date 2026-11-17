@@ -62,41 +62,6 @@ pub struct CleanupPolicyOptions {
     pub older_than: Option<Duration>,
 }
 
-/// Why `optimize` did not compact a dataset. Typed so callers branch on the
-/// reason rather than sniffing a string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SkipReason {
-    /// The Lance dataset HEAD is ahead of the version recorded in
-    /// `__manifest`, and no pending pin explains that movement. `optimize`
-    /// cannot infer whether the drift is benign maintenance or an external
-    /// semantic write, so it leaves the dataset untouched and points operators at
-    /// explicit `repair`.
-    DriftNeedsRepair,
-}
-
-impl SkipReason {
-    /// Stable machine-readable token for serialized output (e.g. CLI `--json`).
-    /// Once emitted this is part of the output contract — keep it stable.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SkipReason::DriftNeedsRepair => "drift_needs_repair",
-        }
-    }
-}
-
-impl std::fmt::Display for SkipReason {
-    /// Human-readable reason for CLI and log output.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let msg = match self {
-            SkipReason::DriftNeedsRepair => {
-                "published dataset/Lance HEAD drift — run omnigraph repair"
-            }
-        };
-        f.write_str(msg)
-    }
-}
-
 /// What one optimize run did to one table. A run reports exactly one outcome
 /// for every table it considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,8 +73,6 @@ pub enum TableOptimizeOutcome {
     Unchanged,
     /// Not started: nothing was written for the table.
     Deferred(DeferReason),
-    /// Deliberately left alone.
-    Skipped(SkipReason),
     /// A failure of this table's own planning or staging, with definite
     /// evidence: its staging is unreachable and the other tables still
     /// publish. [`DatasetOptimizeStats::failure`] holds the error.
@@ -124,7 +87,6 @@ impl TableOptimizeOutcome {
             TableOptimizeOutcome::Optimized => "optimized",
             TableOptimizeOutcome::Unchanged => "unchanged",
             TableOptimizeOutcome::Deferred(_) => "deferred",
-            TableOptimizeOutcome::Skipped(_) => "skipped",
             TableOptimizeOutcome::Failed => "failed",
         }
     }
@@ -309,14 +271,6 @@ impl DatasetOptimizeStats {
     /// materialization.
     pub fn committed(&self) -> bool {
         self.outcome == TableOptimizeOutcome::Optimized
-    }
-
-    /// `Some(reason)` if this table was deliberately not compacted.
-    pub fn skipped(&self) -> Option<SkipReason> {
-        match self.outcome {
-            TableOptimizeOutcome::Skipped(reason) => Some(reason),
-            _ => None,
-        }
     }
 }
 
