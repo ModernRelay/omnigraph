@@ -428,6 +428,27 @@ impl ClusterAdmission {
         self.admitted_graph_id(graph_uri).map(|_| ())
     }
 
+    /// The policy the applied revision binds to the admitted graph at
+    /// `graph_uri`, or `None` when it binds none. A storage owner's handle
+    /// installs it as a server's does, so a direct writer is refused what a
+    /// served one is. It is read from the state under this admission's lock,
+    /// which a deployment needs to change it, so it holds for the admission's
+    /// life. Only the bundles bound to the graph are read; one that does not
+    /// load refuses.
+    pub async fn graph_policy(
+        &self,
+        graph_uri: &str,
+    ) -> Result<Option<Arc<omnigraph_policy::PolicyEngine>>, Diagnostic> {
+        let graph = self.admitted_graph_id(graph_uri)?;
+        let store = self.store();
+        let state = store
+            .read_state(&mut store.observations())
+            .await?
+            .state
+            .ok_or_else(missing_state)?;
+        crate::authorization::AppliedPolicies::load_graph(&store, &state, &graph).await
+    }
+
     fn admitted_graph_id(&self, graph_uri: &str) -> Result<String, Diagnostic> {
         admitted_graph_id(
             self.canonical_root(),

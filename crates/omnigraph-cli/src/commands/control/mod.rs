@@ -73,8 +73,8 @@ pub(crate) async fn run_policy(
         Some(id) => graph_resource_id_for_selection(Some(id), ""),
         None => graph_resource_id_for_selection(None, "default"),
     };
-    let policies = read_cluster_policies(&binding).await?;
-    let bundles = PolicyBundles::select(cluster, &policies, graph)?;
+    let snapshot = read_serving_snapshot_or_report(&binding).await?;
+    let bundles = PolicyBundles::select(cluster, &snapshot, graph)?;
     match command {
         PolicyCommand::Validate {} => {
             if bundles.graph.is_none() && bundles.cluster.is_none() {
@@ -205,17 +205,6 @@ pub(crate) fn not_servable(
     )
 }
 
-/// Resolve the Cedar policy bundle(s) for a direct-root policy target
-/// (RFC-011). Sources the applied policies from the cluster's serving snapshot;
-/// each `ServingPolicy` carries its `source` (digest-verified content) and the
-/// scopes it `applies_to` (`cluster` | `graph.<id>`). The optional `graph`
-/// selects a graph's bundle when several apply.
-async fn read_cluster_policies(
-    binding: &omnigraph::storage::CapturedStorageBinding,
-) -> Result<Vec<omnigraph_cluster::ServingPolicy>> {
-    Ok(read_serving_snapshot_or_report(binding).await?.policies)
-}
-
 /// The scope whose bundle answers an action: the graph's bundle for a graph
 /// action, the `cluster` bundle for `graph_list` and `config_manage`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,10 +221,9 @@ fn scope_of(action: omnigraph_policy::PolicyAction) -> PolicyScope {
     }
 }
 
-/// The applied bundles a policy command can consult, routed by binding the
-/// way serving routes them (`omnigraph-server` `settings.rs`): at most one
-/// bundle per graph and one bound to `cluster`. There is no fallback between
-/// the two scopes.
+/// The applied bundles a policy command can consult, selected through the
+/// serving snapshot as serving selects them: at most one bundle per graph and
+/// one bound to `cluster`. There is no fallback between the two scopes.
 struct PolicyBundles<'p> {
     cluster_uri: &'p str,
     graph_id: Option<&'p str>,
@@ -244,67 +232,42 @@ struct PolicyBundles<'p> {
 }
 
 impl<'p> PolicyBundles<'p> {
-    /// With `--graph`, the graph's bundle is the one bound to `graph.<id>`;
-    /// without it, the sole graph-bound bundle when exactly one exists.
-    /// Two bundles for one scope are a loud error, as serving refuses them.
+    /// With `--graph`, the graph's bundle is the one the cluster's binding
+    /// rule selects for it, as serving and a direct write select it; without
+    /// it, the sole graph-bound bundle when exactly one exists. The rule
+    /// already refused a ledger binding one scope twice.
     fn select(
         cluster_uri: &'p str,
-        policies: &'p [omnigraph_cluster::ServingPolicy],
+        snapshot: &'p omnigraph_cluster::ServingSnapshot,
         graph_id: Option<&'p str>,
     ) -> Result<Self> {
-        let names = |many: &[&omnigraph_cluster::ServingPolicy]| {
-            many.iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let graph_bound: Vec<&omnigraph_cluster::ServingPolicy> = match graph_id {
-            Some(id) => {
-                let binding = format!("graph.{id}");
-                policies
+        let graph = match graph_id {
+            Some(id) => snapshot.graph_policy(id),
+            None => {
+                let graph_bound: Vec<&omnigraph_cluster::ServingPolicy> = snapshot
+                    .policies
                     .iter()
-                    .filter(|p| p.applies_to.iter().any(|s| s == &binding))
-                    .collect()
+                    .filter(|p| p.applies_to.iter().any(|s| s.starts_with("graph.")))
+                    .collect();
+                match graph_bound.as_slice() {
+                    [] => None,
+                    [only] => Some(*only),
+                    many => bail!(
+                        "cluster `{cluster_uri}` has {} graph policy bundles ([{}]); pass --graph <id> to select one",
+                        many.len(),
+                        many.iter()
+                            .map(|p| p.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
             }
-            None => policies
-                .iter()
-                .filter(|p| p.applies_to.iter().any(|s| s.starts_with("graph.")))
-                .collect(),
-        };
-        let graph = match (graph_bound.as_slice(), graph_id) {
-            ([], _) => None,
-            ([only], _) => Some(*only),
-            (many, Some(id)) => bail!(
-                "graph `{id}` in cluster `{cluster_uri}` matches {} policy bundles ([{}]); \
-                 the cluster model expects one bundle per graph scope",
-                many.len(),
-                names(many)
-            ),
-            (many, None) => bail!(
-                "cluster `{cluster_uri}` has {} graph policy bundles ([{}]); pass --graph <id> to select one",
-                many.len(),
-                names(many)
-            ),
-        };
-        let cluster_bound: Vec<&omnigraph_cluster::ServingPolicy> = policies
-            .iter()
-            .filter(|p| p.applies_to.iter().any(|s| s == "cluster"))
-            .collect();
-        let cluster = match cluster_bound.as_slice() {
-            [] => None,
-            [only] => Some(*only),
-            many => bail!(
-                "cluster `{cluster_uri}` binds {} policy bundles to the cluster scope ([{}]); \
-                 the cluster model expects one bundle per scope",
-                many.len(),
-                names(many)
-            ),
         };
         Ok(Self {
             cluster_uri,
             graph_id,
             graph,
-            cluster,
+            cluster: snapshot.cluster_policy(),
         })
     }
 

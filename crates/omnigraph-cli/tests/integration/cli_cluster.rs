@@ -3259,7 +3259,8 @@ fn applied_knowledge_cluster() -> tempfile::TempDir {
 #[test]
 fn optimize_resolves_a_cluster_graph_by_id() {
     let temp = applied_knowledge_cluster();
-    // No hand-typed storage path: address the graph by cluster dir + id.
+    // No hand-typed storage path: address the graph by cluster dir + id. The
+    // applied policy grants `act-operator` `maintain`.
     let out = output_success(
         cli()
             .arg("optimize")
@@ -3267,7 +3268,7 @@ fn optimize_resolves_a_cluster_graph_by_id() {
             .arg(temp.path())
             .arg("--graph")
             .arg("knowledge")
-            .arg("--json"),
+            .args(["--as", "act-operator", "--json"]),
     );
     let payload = parse_stdout_json(&out);
     assert!(
@@ -3289,10 +3290,25 @@ async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
     .unwrap();
     let graph = temp.path().join("graphs/knowledge.omni");
     let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    // A write under `--base` builds a read-through adapter, which writes the
+    // clone marker, so it must be refused before that adapter is built.
+    let clone_base = tempdir().unwrap();
+    let base_graph = clone_base.path().join("base.omni");
+    init_graph(&base_graph);
+    let data = clone_base.path().join("row.jsonl");
+    fs::write(
+        &data,
+        "{\"type\": \"Person\", \"data\": {\"name\": \"Eve\"}}\n",
+    )
+    .unwrap();
+    let (data, base_graph) = (data.to_str().unwrap(), base_graph.to_str().unwrap());
     for args in [
         vec!["optimize", "--json"],
         vec!["cleanup", "--keep", "1", "--confirm", "--json"],
         vec!["branch", "create", "must-not-exist"],
+        vec![
+            "load", "--data", data, "--mode", "append", "--base", base_graph,
+        ],
     ] {
         let output = output_failure(cli().args(&args).arg("--target").arg(&graph).arg("--yes"));
         assert!(
@@ -3300,6 +3316,7 @@ async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
             "{args:?}: {output:?}"
         );
     }
+    assert!(!graph.join("__clone").exists());
     assert_eq!(
         fs::read(temp.path().join("__cluster/state.json")).unwrap(),
         before
@@ -3441,7 +3458,14 @@ async fn successful_v2_cli_reads_preserve_admission_and_applied_state() {
     // Reads leave the writer door usable; writers still retain their own lock.
     output_success(
         cli()
-            .args(["branch", "create", "after-reads", "--target"])
+            .args([
+                "branch",
+                "create",
+                "after-reads",
+                "--as",
+                "act-operator",
+                "--target",
+            ])
             .arg(&graph),
     );
     assert!(lock_path.exists());
@@ -3532,11 +3556,14 @@ fn optimize_uses_only_an_explicit_or_configured_graph() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("graph"));
     let home = tempdir().unwrap();
     fs::write(home.path().join("config.yaml"), format!("version: 1\ntargets:\n  root:\n    kind: direct\n    scope: root\n    uri: file://{}\n    default_graph: knowledge\n", temp.path().display())).unwrap();
-    let out = output_success(
-        cli()
-            .env("OMNIGRAPH_HOME", home.path())
-            .args(["optimize", "--target", "root", "--json"]),
-    );
+    let out = output_success(cli().env("OMNIGRAPH_HOME", home.path()).args([
+        "optimize",
+        "--target",
+        "root",
+        "--as",
+        "act-operator",
+        "--json",
+    ]));
     assert!(parse_stdout_json(&out)["datasets"].is_array());
 }
 
@@ -3701,25 +3728,37 @@ fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
     // pending recovery sweep) does NOT block it — unlike the full serving-snapshot
     // read. This is what keeps `optimize --target ROOT --graph GRAPH` usable on a degraded cluster.
     let temp = applied_knowledge_cluster();
-    // Remove the verified catalog payloads (queries/policies) — a serving read
-    // would refuse with a catalog-payload diagnostic; the ledger-only resolve
-    // must not care.
-    let resources = temp.path().join("__cluster").join("resources");
-    if resources.exists() {
-        fs::remove_dir_all(&resources).unwrap();
-    }
-    let out = output_success(
-        cli()
+    let optimize = || {
+        let output = cli()
             .arg("optimize")
             .arg("--target")
             .arg(temp.path())
             .arg("--graph")
             .arg("knowledge")
-            .arg("--json"),
-    );
+            .args(["--as", "act-operator", "--json"])
+            .output()
+            .unwrap();
+        unlock_cluster_fixture(temp.path());
+        output
+    };
+    // Remove the stored-query payloads — a serving read would refuse with a
+    // catalog-payload diagnostic; the ledger-only resolve must not care.
+    let resources = temp.path().join("__cluster").join("resources");
+    fs::remove_dir_all(resources.join("query")).unwrap();
+    let out = optimize();
+    assert!(out.status.success(), "{out:?}");
     assert!(
         parse_stdout_json(&out)["datasets"].as_array().is_some(),
         "optimize should resolve via the ledger despite degraded catalog payloads"
+    );
+    // The graph's own policy is no unrelated payload: without it the
+    // maintenance cannot be judged, so it refuses rather than run unpoliced.
+    fs::remove_dir_all(resources.join("policy")).unwrap();
+    let refused = optimize();
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("catalog_payload_missing"),
+        "{refused:?}"
     );
 }
 

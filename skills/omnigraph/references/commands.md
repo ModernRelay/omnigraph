@@ -364,8 +364,9 @@ built or rebuilt, so roll back by restoring the backup
 ([roll back](migrations.md#roll-back-to-an-earlier-binary)). Rebuilds use each property's analyzer profile (`english_v1` where
 none is declared), replacing custom tokenizer settings; JSON `warnings` reports this for actual work. Check the selected
 `branch`, `graph_commit_id`, and `rebuilt_indexes`; an empty list/null commit is
-a no-op, not a migration of other branches or historical snapshots. `--as` is
-actor attribution and does not install server policy on direct access.
+a no-op, not a migration of other branches or historical snapshots. On a
+cluster graph the cluster's applied graph policy judges `--as` (`maintain` on
+the branch); a standalone graph has no policy.
 
 ### `cleanup` — destructive version GC
 
@@ -388,7 +389,9 @@ drops does not stop it; `--older-than` reads every other commit's time and
 stops on one it cannot read. Without `--confirm`, cleanup only echoes the
 policy and exits 0; it lists no candidates. Cleanup also reclaims table forks
 and deleted branches' refs once nothing needs them. Branch
-deletion and `optimize` leave this reclamation to `cleanup`.
+deletion and `optimize` leave this reclamation to `cleanup`. On a cluster
+graph the applied policy judges the `--as` actor: `reclaim` for `cleanup`,
+`maintain` for `optimize` and `index`.
 
 ## Stored Queries
 
@@ -550,9 +553,15 @@ For params:
 - `jsonl` — NDJSON, one per line, with metadata line first
 - `json` — pretty `ReadOutput` envelope (metadata, columns, and rows); the `rows` array is printed compact and verbatim
 
-`--format arrow` appears in `--help` but the CLI has no Arrow output: it always
-fails with "has no text rendering". Do not use it, or set it as
-`defaults.output`.
+`query --format arrow` writes the result's columns and rows to stdout as one
+Arrow IPC stream (pyarrow `ipc.open_stream`, Polars `read_ipc_stream`), with
+each column's declared type and real nulls. The stream carries no
+`graph_commit_id`, target or `ranking`; take those from `--json`. Only a query
+run on a direct target (an `explain` statement included) has batches to write.
+It refuses before the read runs, exit 1: on a served or managed target (its server
+answers JSON), for a control statement (`branch list`, `show`), and when stdout
+is a terminal, so redirect it (`> result.arrow`). `alias` and `defaults.output`
+do not offer `arrow`; for a whole branch use `export` (JSONL).
 
 Mutations do not take `--format`; use `--json`. Successful `mutate --json` and
 `load --json` include the exact published `commit` (`null` for a no-op

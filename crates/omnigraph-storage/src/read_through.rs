@@ -378,16 +378,20 @@ impl ReadThroughMount {
     /// own objects: the harness leaves it out of a clone root's shape proof.
     pub const RESERVED_DIRECTORY: &'static str = RESERVED;
 
-    /// Mask the deletes an earlier mount recorded in `layer`, and give a
-    /// layer that has no reserved directory yet its `__clone/created` object,
-    /// so every clone root carries the directory from its first build.
+    /// Mask the deletes an earlier mount recorded in `layer`, and give an
+    /// empty layer its `__clone/created` object, so every clone root carries
+    /// the directory from its first build.
     ///
     /// # Errors
     /// When the layer's listing or that first write fails, or when `frozen`
     /// holds the reserved directory itself: it is then a clone root, and
     /// reading through a clone root would lose its base and its whiteouts.
     /// Also when `frozen` holds an object at the directory's name, which no
-    /// read or listing of a clone could show.
+    /// read or listing of a clone could show. Also, before any write, when
+    /// the layer holds objects under `prefix` but no `__clone/created`: it is
+    /// then not a clone root (an ordinary graph, say), and marking it would
+    /// turn it into one, so a command refused after the open would leave it
+    /// unopenable without the base.
     pub async fn open(
         layer: &dyn ObjectStore,
         frozen: FrozenDirectory,
@@ -413,6 +417,28 @@ impl ReadThroughMount {
             });
         }
         let reserved = prefix.clone().join(RESERVED);
+        let created = reserved.clone().join(CREATED);
+        let first_build = match layer.head(&created).await {
+            Ok(_) => false,
+            Err(Error::NotFound { .. }) => true,
+            Err(error) => return Err(error),
+        };
+        if first_build {
+            match layer.list(Some(&prefix)).try_next().await {
+                Ok(None) | Err(Error::NotFound { .. }) => {}
+                Ok(Some(found)) => {
+                    return Err(Error::Generic {
+                        store: "ReadThroughStore",
+                        source: format!(
+                            "the clone root already holds {} but no {RESERVED}/{CREATED}: it is not a clone root, and reading a base through it is not supported",
+                            found.location
+                        )
+                        .into(),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let deleted = reserved.clone().join(DELETED);
         let mut markers = layer.list(Some(&deleted));
         while let Some(marker) = markers.try_next().await? {
@@ -420,13 +446,8 @@ impl ReadThroughMount {
                 frozen.mark_deleted(key.collect());
             }
         }
-        let created = reserved.clone().join(CREATED);
-        match layer.head(&created).await {
-            Ok(_) => {}
-            Err(Error::NotFound { .. }) => {
-                layer.put(&created, PutPayload::new()).await?;
-            }
-            Err(error) => return Err(error),
+        if first_build {
+            layer.put(&created, PutPayload::new()).await?;
         }
         Ok(Self {
             frozen: Arc::new(frozen),
@@ -1354,6 +1375,7 @@ mod tests {
         a_durable_store_keeps_its_whiteouts_out_of_sight,
         durable_refuses_a_base_that_is_itself_a_clone_root,
         durable_refuses_a_base_that_holds_an_object_at_the_reserved_name,
+        durable_refuses_a_layer_that_is_not_a_clone_root,
         a_clone_root_carries_the_reserved_directory_from_its_first_build,
         a_stop_between_the_whiteout_and_the_delete_leaves_the_key_deleted_or_untouched,
         an_update_and_a_delete_of_one_base_object_take_turns,

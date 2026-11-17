@@ -5392,6 +5392,9 @@ dependencies = [
 name = "omnigraph-cli"
 version = "0.15.1"
 dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
  "assert_cmd",
  "async-trait",
  "base64 0.22.1",

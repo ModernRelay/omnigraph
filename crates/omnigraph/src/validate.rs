@@ -135,10 +135,19 @@ pub(crate) struct CommittedState<'a> {
     /// snapshot for `@card` (the #298 stale-handle fix). This is the live
     /// committed graph view, not a raw Lance HEAD that may be unpublished or
     /// belong to an inherited source ref. `None` on merge/load.
-    live: Option<(&'a Omnigraph, Option<&'a str>)>,
+    live: Option<LiveCardinality<'a>>,
     /// The committed datasets this validation has opened, one open per
     /// table: the access choice and the lookups share the handle.
     opened: std::sync::Mutex<HashMap<String, Dataset>>,
+}
+
+/// Where a write counts `@card`: the live branch of `db`, and the graph head
+/// the caller's precondition names, when the write carries one (#1424).
+#[derive(Clone, Copy)]
+pub(crate) struct LiveCardinality<'a> {
+    pub(crate) db: &'a Omnigraph,
+    pub(crate) branch: Option<&'a str>,
+    pub(crate) caller_head: Option<&'a str>,
 }
 
 impl<'a> CommittedState<'a> {
@@ -172,6 +181,11 @@ impl<'a> CommittedState<'a> {
     /// through the fresh graph snapshot is load-bearing for first-touch named
     /// branches: their table still inherits another Lance ref until this write
     /// forks it, so opening the target ref directly would be invalid.
+    ///
+    /// The live read is the one read of a write that reaches past the head
+    /// it pinned. A write carrying a caller precondition promises that its
+    /// outcome is decided at the caller's head, so a live head that differs
+    /// is the caller's precondition failing, before any effect (#1424).
     async fn open_cardinality(&self, table_key: &str) -> Result<Option<Dataset>> {
         if self.overwritten.contains(table_key) {
             return Ok(None);
@@ -183,8 +197,21 @@ impl<'a> CommittedState<'a> {
             return Ok(None);
         };
         match self.live {
-            Some((db, branch)) => {
-                let live = db.fresh_snapshot_for_branch_unchecked(branch).await?;
+            Some(LiveCardinality {
+                db,
+                branch,
+                caller_head,
+            }) => {
+                let (live, live_head) = db.fresh_snapshot_for_branch_unchecked(branch).await?;
+                if let Some(expected) = caller_head
+                    && live_head != expected
+                {
+                    return Err(OmniError::precondition_failed(
+                        branch.unwrap_or("main"),
+                        expected,
+                        Some(live_head),
+                    ));
+                }
                 match live.dataset(table_key) {
                     Some(_) => Ok(Some(live.open_lance_dataset(table_key).await?)),
                     None => Ok(None),

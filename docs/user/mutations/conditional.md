@@ -19,7 +19,9 @@ against a server and with code 1 on an embedded graph such as this `--target`
 run, and JSON output contains `precondition_failure` with `expected` and
 optional `actual` commit ids. Re-read the branch and decide again; do not blindly retry
 the old mutation. The precondition is still checked when the mutation would
-match no entities.
+match no entities. A mutation that loses a race to another commit reports this
+precondition failure, even when that commit would also make it break a
+constraint such as an edge `@card` maximum.
 
 Use the `graph_commit_id` returned with the original query rows. Fetching a
 head id afterward creates a race between the read and the precondition. For the

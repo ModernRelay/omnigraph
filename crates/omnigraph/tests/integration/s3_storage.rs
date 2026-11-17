@@ -486,6 +486,7 @@ s3_contract_rows!(
     a_durable_store_keeps_its_whiteouts_out_of_sight,
     durable_refuses_a_base_that_is_itself_a_clone_root,
     durable_refuses_a_base_that_holds_an_object_at_the_reserved_name,
+    durable_refuses_a_layer_that_is_not_a_clone_root,
     a_clone_root_carries_the_reserved_directory_from_its_first_build,
     a_stop_between_the_whiteout_and_the_delete_leaves_the_key_deleted_or_untouched,
     an_update_and_a_delete_of_one_base_object_take_turns,

@@ -25,8 +25,8 @@ use super::kernels::{
 };
 use super::key_set::{IntKeySet, IntKeySetLayout, canonical_i64, key_bytes};
 use super::{
-    AccessPath, CommittedState, Violation, integer_capacity_error, overwrite_removed_ids,
-    scan_int_ids, string_col, value_violation,
+    AccessPath, CommittedState, LiveCardinality, Violation, integer_capacity_error,
+    overwrite_removed_ids, scan_int_ids, string_col, value_violation,
 };
 use crate::db::{Omnigraph, Snapshot};
 use crate::error::{OmniError, Result};
@@ -98,6 +98,9 @@ pub(crate) enum JudgedSide {
     Live {
         base: Snapshot,
         branch: Option<String>,
+        /// The graph head a caller's precondition names; the live `@card`
+        /// read refuses with that precondition when the branch moved past it.
+        caller_head: Option<String>,
     },
 }
 
@@ -109,9 +112,17 @@ impl JudgedSide {
         }
     }
 
-    fn live<'a>(&'a self, db: &'a Omnigraph) -> Option<(&'a Omnigraph, Option<&'a str>)> {
+    fn live<'a>(&'a self, db: &'a Omnigraph) -> Option<LiveCardinality<'a>> {
         match self {
-            Self::Live { branch, .. } => Some((db, branch.as_deref())),
+            Self::Live {
+                branch,
+                caller_head,
+                ..
+            } => Some(LiveCardinality {
+                db,
+                branch: branch.as_deref(),
+                caller_head: caller_head.as_deref(),
+            }),
             Self::Base(_) | Self::MergeTarget(_) => None,
         }
     }

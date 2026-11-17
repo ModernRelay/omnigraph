@@ -52,8 +52,8 @@ operation maintains (`main` for optimize) and takes
 `branch_scope`; `reclaim` covers every branch's history and takes no branch
 scope. `change` admits no maintenance: index builds and the full-text rebuild
 need `maintain` on their branch. The engine checks these actions whenever a policy is installed on the
-graph handle; the direct maintenance commands load no policy (see
-[maintenance](maintenance.md)).
+graph handle, which a direct command on a cluster graph does (see
+[direct writes](#actor-identity)).
 
 ## Bind a policy
 
@@ -69,7 +69,10 @@ policies:
 ```
 
 A bundle may target graph IDs or the `cluster` scope, but not both. Only one
-bundle may bind a given scope. The target `og_catalog` binds the
+bundle may bind a given scope. `cluster validate` refuses a configuration that
+breaks either rule, and the server, direct writes, `access` and the `policy`
+commands refuse an applied state that breaks one, so they always select the
+same bundle for a graph. The target `og_catalog` binds the
 [engine catalogue](../queries/catalogue.md), which every server serves and no
 `graphs:` entry declares: its `read` rule decides catalogue reads with the
 resource `og_catalog` and no branch, and the bundle is applied and activated
@@ -234,6 +237,9 @@ decide; a server without
 authentication allows every graph action and reports `actor_id: null`. The MCP
 `access` tool returns the same body, and `omnigraph access` prints it for a
 server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
+For a direct cluster target it evaluates the policy the cluster applied to the
+graph, which also judges the CLI's direct writes and maintenance there. Direct
+reads are not judged: storage access is their trust boundary.
 
 It reports policy actions, not actor views, so a view can still refuse a
 `change` the policy allows. It does not report `reclaim`, since no server
@@ -254,9 +260,17 @@ For direct CLI writes, actor resolution is:
 
 The version-1 operator document has no actor field.
 
-When a policy is installed, a missing actor is denied. Only the server
-resolves a served write's actor; there `--as` is an assertion the server checks
-against the token ([Assert the actor](server.md#assert-the-actor)).
+A direct write to a cluster graph, through its root target with `--graph`
+or through its own store, installs the policy the cluster applied to that
+graph, the policy `omnigraph access` reports for that target. Every write and
+maintenance command is then judged by it before any effect, and a missing actor is
+denied. A standalone graph has no policy. A direct actor is self-declared, so
+this keeps a storage owner within the policy rather than authenticating them:
+storage permissions remain the trust boundary. A refused direct write, like
+every direct writer, keeps the cluster's admission lock
+([S3 cluster roots](s3-cluster-roots.md)). Only the server resolves a
+served write's actor; there `--as` is an assertion the server checks against
+the token ([Assert the actor](server.md#assert-the-actor)).
 
 Successful graph commits record the actor for the whole atomic change. Inspect
 the audit trail with:
