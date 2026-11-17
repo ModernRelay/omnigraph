@@ -922,7 +922,7 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
             ),
             (
                 "people_named",
-                "query people_named($name: String = \"Alice\", $note: String?) { match { $p: Person } where $p.name = $name return { $p.name } }",
+                "query people_named($note: String?, $name: String = \"Alice\") { match { $p: Person } where $p.name = $name return { $p.name } }",
                 true,
             ),
             (
@@ -968,8 +968,8 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
     assert_eq!(
         named["params"],
         json!([
-            {"name":"name","kind":"string","nullable":false,"default":"Alice"},
-            {"name":"note","kind":"string","nullable":true}
+            {"name":"note","kind":"string","nullable":true},
+            {"name":"name","kind":"string","nullable":false,"default":"Alice"}
         ])
     );
 }
