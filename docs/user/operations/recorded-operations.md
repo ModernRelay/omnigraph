@@ -33,14 +33,16 @@ branch, for the actor the bearer token resolves to.
 
 ### Table ceilings and the byte budget
 
-A per-table ceiling is measured from a table's compaction plan before any of
-that table's work starts. A table over one is `deferred` with reason
-`resource_limit`: the run does not compact it, rebuild its lagging indexes or
-rewrite its dropped properties, and goes on to the next table. This does not
-move the resume position (`resume_at`), so every later run defers that table
-again until a ceiling is raised or a direct run compacts it. The run byte
-budget defers, with reason `byte_budget`, the first table that would
-take the run past it and every table after it, and the run resumes there.
+A per-table ceiling is checked before any of that table's work starts. The
+fragment, row, byte and blob ceilings are measured from the table's compaction
+plan; `_MAX_INDEX_ROWS` counts all of the table's rows, and only when the table
+has index work. A table over one is `deferred` with reason `resource_limit`:
+the run does not compact it, rebuild its lagging indexes or rewrite its dropped
+properties, and goes on to the next table. This does not move the resume
+position (`resume_at`), so every later run defers that table again until a
+ceiling is raised or a direct run optimizes it. The run byte budget defers,
+with reason `byte_budget`, the first table that would take the run past it and
+every table after it, and the run resumes there.
 
 The budget is also the table byte ceiling when
 `OMNIGRAPH_OPTIMIZE_MAX_SOURCE_BYTES` is unset. A table whose compaction reads
