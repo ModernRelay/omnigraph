@@ -3214,6 +3214,8 @@ impl<'a> Shaper<'a> {
     /// The scope's traversals as expansions from the names already bound,
     /// each introducing its other end with that binding's filters; a
     /// traversal with neither end bound scans its source.
+    /// `optional_names` are the names an `optional` introduced, null on a
+    /// row it kept without a match.
     fn expand_traversals(
         &self,
         traversals: &[&TraversalFact],
@@ -3221,6 +3223,7 @@ impl<'a> Shaper<'a> {
         bound_vars: &mut HashSet<String>,
         deferred_filters: &mut HashMap<String, Vec<IRExpr>>,
         fresh: &mut FreshNames,
+        optional_names: &HashSet<String>,
     ) -> Result<(), ShapeError> {
         let mut remaining: Vec<&TraversalFact> = traversals.to_vec();
         while !remaining.is_empty() {
@@ -3248,18 +3251,28 @@ impl<'a> Shaper<'a> {
                     });
                     let id = self.catalog.system_columns.id.to_string();
                     let string = scalar(ScalarType::String);
+                    // An optional's node is null on a row it kept without a
+                    // match; the equality is null there and drops the row.
+                    let end = match optional_names.contains(&traversal.dst) {
+                        true => ExprType::Value {
+                            scalar: ScalarType::String,
+                            list: false,
+                            nullable: true,
+                        },
+                        false => string.clone(),
+                    };
                     pipeline.push(PatternStep::Filter(
                         crate::ir::coerce::binary(
                             IRExpr::PropAccess {
                                 variable: temp_var,
                                 property: id.clone(),
-                                ty: string.clone(),
+                                ty: string,
                             },
                             BinaryOp::Compare(CompOp::Eq),
                             IRExpr::PropAccess {
                                 variable: traversal.dst.clone(),
                                 property: id,
-                                ty: string,
+                                ty: end,
                             },
                         )
                         .map_err(|e| ShapeError::Internal(e.to_string()))?,
@@ -3627,6 +3640,7 @@ impl<'a> Shaper<'a> {
             bound_vars,
             &mut deferred_filters,
             fresh,
+            &facts.optional_names,
         )?;
         pipeline.extend(rebind_filters.into_iter().map(PatternStep::Filter));
         let mut correlates = facts.correlates.iter().peekable();
@@ -3683,6 +3697,7 @@ impl<'a> Shaper<'a> {
             bound_vars,
             &mut deferred_filters,
             fresh,
+            &facts.optional_names,
         )?;
         for correlate in deferred {
             self.place_correlate(correlate, pipeline, bound_vars, outer_physical_names, fresh)?;

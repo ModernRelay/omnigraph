@@ -1,0 +1,71 @@
+# issue: none
+# notes: A triple whose two ends are bound, one of them a node an `optional` left null:
+# notes: the equality of the expansion with the bound end is null there and drops the row.
+# notes: Found by the generated engine-equals-reference law (law_engine_reference.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+    p0: F64?
+    p1: F32
+    p2: Bool?
+    v: Vector(3, distance = "l2")?
+    t: String? @index(fulltext, analyzer = "english_v1")
+}
+edge Rel0: A -> A
+
+
+--- seed
+{"type":"A","data":{"k":"b","p0":100.0,"p1":-2.25,"p2":false,"v":[1.0,-1.0,2.0],"t":"search"}}
+{"type":"A","data":{"k":"c","p1":100.0}}
+{"type":"A","data":{"k":"f","p1":1.5e3,"p2":true,"t":""}}
+{"type":"A","data":{"k":"e","p0":1.5,"p1":3.0,"p2":false,"t":"data"}}
+{"type":"A","data":{"k":"d","p0":0.0,"p1":3.0,"v":[0.5,0.5,2.0],"t":"data"}}
+{"edge":"Rel0","from":"f","to":"b","data":{}}
+{"edge":"Rel0","from":"d","to":"b","data":{}}
+{"edge":"Rel0","from":"c","to":"b","data":{}}
+{"edge":"Rel0","from":"b","to":"e","data":{}}
+{"edge":"Rel0","from":"e","to":"f","data":{}}
+{"edge":"Rel0","from":"f","to":"d","data":{}}
+{"edge":"Rel0","from":"e","to":"f","data":{}}
+{"edge":"Rel0","from":"d","to":"e","data":{}}
+
+
+--- query
+query q() { match { $n4: A, optional { $n5: A, $n5 rel0 $n4 }, $n6: A, $n6 rel0 $n5 } where ($n5.p1 is null) return { (avg($n6.p0) { $n7: A, $n7 rel0 $n4 }) as c0 } }
+
+--- expect unordered
+
+--- expect shape
+c0: F64?
+
+--- query
+query q() { match { $n4: A, optional { $n5: A, $n5 rel0 $n4 }, $n6: A, $n6 rel0 $n5 } where ($n5.p1 is null) return { $n4.k as c0 } }
+
+--- expect unordered
+
+--- expect shape
+c0: String
+
+--- query
+query q() { match { $n4: A, optional { $n5: A, $n5 rel0 $n4 }, $n6: A, $n6 rel0 $n5 } return { (avg($n6.p0) { $n7: A, $n7 rel0 $n4 }) as c0 } }
+
+--- expect unordered
+{"c0":0}
+{"c0":0}
+{"c0":1.5}
+{"c0":1.5}
+{"c0":100}
+{}
+{}
+{}
+{}
+
+--- expect shape
+c0: F64?
