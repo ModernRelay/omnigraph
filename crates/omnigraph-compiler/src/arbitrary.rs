@@ -425,7 +425,7 @@ fn prop_json(c: &mut Choices, p: &Prop) -> Option<String> {
         PropTy::Enum => json_string(ENUM_MEMBERS[c.below(3)]),
         PropTy::ListStr => {
             let n = c.below(3);
-            let items: Vec<String> = (0..n).map(|_| json_string(*c.pick(&STRS))).collect();
+            let items: Vec<String> = (0..n).map(|_| json_string(c.pick(&STRS))).collect();
             format!("[{}]", items.join(","))
         }
         PropTy::Vector(_) => {
@@ -1274,10 +1274,9 @@ impl ReadGen<'_, '_, '_> {
             Class::Int => int_literal(INTS[self.c.below(INTS.len() - 1)]),
             Class::Float => {
                 let f = FLOATS[self.c.below(FLOATS.len())];
-                if f.starts_with('-') {
-                    format!("(-{})", &f[1..])
-                } else {
-                    f.to_string()
+                match f.strip_prefix('-') {
+                    Some(magnitude) => format!("(-{magnitude})"),
+                    None => f.to_string(),
                 }
             }
             Class::Bool => ["false", "true"][self.c.below(2)].to_string(),
@@ -1586,7 +1585,7 @@ impl ScalarExpr {
                     _ => ScalarExpr::Input(*c.pick(&[Sc::I32, Sc::I64, Sc::U32])),
                 },
                 Class::Float => match c.below(3) {
-                    0 => ScalarExpr::Float(*c.pick(&["0.0", "0.5", "1.5", "3.0", "1.5e3"])),
+                    0 => ScalarExpr::Float(c.pick(&["0.0", "0.5", "1.5", "3.0", "1.5e3"])),
                     _ => ScalarExpr::Input(*c.pick(&[Sc::F32, Sc::F64])),
                 },
                 Class::Bool => match c.below(3) {
@@ -1594,7 +1593,7 @@ impl ScalarExpr {
                     _ => ScalarExpr::Input(Sc::Bool),
                 },
                 _ => match c.below(3) {
-                    0 => ScalarExpr::Str(*c.pick(&["", "a", "ab", "b"])),
+                    0 => ScalarExpr::Str(c.pick(&["", "a", "ab", "b"])),
                     _ => ScalarExpr::Input(Sc::Str),
                 },
             }
