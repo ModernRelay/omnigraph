@@ -40,14 +40,17 @@ and its cluster deployment state.
   from the key properties, so the same key is the same entity on every
   branch; without a key the id is supplied or generated, and two unkeyed
   edges between one pair of nodes are two entities. An id deleted and
-  inserted again is the same id, not a tracked lifetime.
+  inserted again is the same id, not a tracked lifetime, and a key cannot be
+  updated: changing it is a delete of one entity and an insert of another.
 - Types, properties and tables have **stable identity** that survives a
   supported rename and ends at a drop; a re-added name is a new identity.
   Names and paths are aliases, never identity.
 - A **graph commit** is an immutable, id-addressed version of the whole graph
   with its parent or parents, branch, actor when known, and a writer-clock
-  timestamp. Commits form a directed acyclic history per graph; merge commits
-  have two parents. Time is transaction time only: there is no valid time.
+  timestamp. Commits form a version graph, a directed acyclic graph per
+  graph; a merge commit has exactly two parents. Time is transaction time
+  only: there is no valid time. There is no checkout or working copy: a read
+  names a branch head or a commit, and every write is a commit.
 - A **branch** is a named history: a head commit and the commits reachable
   from it. `main` always exists. A deleted name and a recreated one are
   different branches.
@@ -99,41 +102,53 @@ Owners: [writes](writes.md), [recovery](recovery.md); `failpoints.rs`,
 
 ### 2. Isolation
 
-- **Reads.** A read names one branch head or one commit, resolves it once,
-  and sees exactly that commit, every type together, for its whole life.
-  Within one mutation a later insert or update sees the earlier statements'
-  pending rows; its delete statements read the same commit and remove the
-  union of what they match.
-- **Writes on one branch.** A branch's commits form a total order, and every
-  history over one branch is equivalent to its commits running one at a time
-  in that order, consistent with real time (strict serializability). A write
-  takes effect against the head at its publication: either that is the head
-  it read, or it was prepared again on the newer head, or it is refused. A
-  read at a branch head observes every commit acknowledged before it began.
+- **One branch is one linearizable object.** Every read and every write on a
+  branch is one atomic operation on the branch head, and takes effect at its
+  publication [1]. A read names one branch head or one commit, resolves it
+  once, and sees exactly that commit, every type together, for its whole
+  life; at a head it returns the latest commit published before it answers,
+  which includes every commit acknowledged before it began. A write takes
+  effect against the head at its publication: that is the head it read, or
+  it was prepared again on the newer head, or it is refused. The reads and
+  commits of one branch are therefore strictly serializable in commit order
+  [2]. A write whose outcome is unknown counts as still pending: it is
+  concurrent with everything after it until history shows whether it landed.
+- **Branches compose.** Each such operation touches one branch, so by
+  locality [1] operations on different branches are linearizable together.
+  A merge, a two-sided diff and a branch create read two branches and are
+  not covered: two branches have no joint view.
+- **Within a mutation** a later insert or update sees the earlier
+  statements' pending rows; its delete statements read the same commit and
+  remove the union of what they match.
 - **Conditional writes.** A write that names the commit its caller read
-  (`--if-commit`) applies only if that commit is still the head, whatever
-  changed in between, and is otherwise refused with `expected` and `actual`.
-  This is how a client extends the serial order across its own read and a
-  later write; without it, a write is serialized where it lands, not where
-  its caller last looked. An unpublished commit publishes under the same
-  rule.
+  (`--if-commit`) is a compare-and-set on the branch head: it applies only
+  if that commit is still the head, whatever changed in between, so the
+  caller's read and write take effect as one transaction in the serial
+  order, or not at all. Without it, a write is serialized where it lands,
+  not where its caller last looked. An unpublished commit publishes under
+  the same rule.
 - **Readers scale out.** A read learns the head from storage, never from
   another process. Any number of reader processes may serve one root; none
   coordinates with the writer or with another reader, and each is always
-  fresh: it observes every commit acknowledged before the read began. Not
-  promised: a stale read mode that trades freshness for latency.
-- **Sessions.** On one branch a client gets read-your-writes and monotonic
-  reads from the rules above, on whichever reader process serves it. A client that needs a fixed view across
-  requests pins a commit id. Not promised: a read "at least as new as commit
-  X" on another branch, or any joint view of two branches.
-- **Across branches.** Branches are isolated until merged, and a merge
-  detects conflicts by entity and by declared constraint
-  ([clause 3](#3-merge)). That is snapshot isolation between branches, not
-  serializability: a merge tracks no read set. Two branches that each read a
-  fact and wrote different entities merge cleanly even when each decision
-  depended on what the other changed (write skew), unless the schema declares
-  the invariant. An invariant that must hold across branches is declared as a
-  constraint or checked on the target after the merge.
+  fresh. Not promised: a stale read mode that trades freshness for latency.
+- **Sessions.** On one branch a client's sequential requests get all four
+  session guarantees [4]: read-your-writes, monotonic reads, monotonic
+  writes and writes-follow-reads, on whichever process serves them, with no
+  session token. They cover acknowledged writes. Across branches none holds
+  until a merge. A client that needs a fixed view pins a commit id. Not
+  promised: a read "at least as new as commit X" on another branch.
+- **Across branches.** A merge resembles snapshot isolation [3]: each branch
+  reads from its fork point and its own commits, and a merge certifies what
+  was written, entity by entity, with no read set. It is weaker in two ways.
+  An identical change made on both branches converges, so a lost update
+  across branches is admitted: two branches that each read a counter at 3
+  and write 4 merge to 4. And a branch's unmerged commits are readable by
+  others, who may act on a state that is never merged. Write skew, write
+  skew through a predicate read (both branches see no matching entity and
+  each inserts one) and the read-only anomaly [5] are admitted unless a
+  declared constraint catches them. An invariant that must hold across
+  branches is declared as a constraint; checking it on the target after the
+  merge detects a violation but does not prevent it.
 
 Owners: [writes](writes.md), [execution](execution.md),
 [architecture](architecture.md#concurrency-and-support-boundary);
@@ -142,22 +157,44 @@ the DST suite.
 
 ### 3. Merge
 
-- A merge compares source and target against one merge base, a lowest
-  common ancestor chosen by a fixed rule (nearest both heads, then highest
-  generation, then smallest commit id), and publishes the result as one
-  commit on the target, or nothing. The source is unchanged.
-- The unit of comparison is the entity. An entity changed on one side takes
-  that side's state, a delete included. The same change on both sides
-  converges. Different changes to one entity are a conflict, even when they
-  touch different properties: there is no property-level merge. The kinds are
-  `divergent_insert`, `divergent_update`, `delete_vs_update`. A result that
-  breaks a constraint is a conflict too: `orphan_edge`, `unique_violation`,
-  `cardinality_violation`, `value_constraint_violation`.
-- Conflicts are reported per entity, typed, and resolved by writing to a
-  branch and merging again. Without conflicts the merged entities do not
-  depend on which branch merges first; commit ids, history shape and feed
-  order do. Not promised: automatic resolution, or a policy such as
-  last-writer-wins.
+- A merge is a state-based, keyed three-way merge [8]: it compares source
+  and target against one merge base and publishes the result as one commit
+  on the target, or nothing. The source is unchanged, and only the target
+  head moves.
+- Conflict detection is entity-level, not property-level as in systems that
+  merge by field or cell [9]. An entity changed on one side takes that
+  side's state. The same change on both sides converges, deletes on both
+  sides included. Different changes to one entity are an entity conflict,
+  even when they touch different properties: `divergent_insert`,
+  `divergent_update`, and `delete_vs_update` for a delete on one side and an
+  update on the other.
+- Each entity's result depends only on its base, source and target states,
+  so a merge is repeatable and changes to disjoint entities never conflict,
+  except through a declared constraint that spans entities. A merged result
+  that breaks one is refused as a constraint violation: `orphan_edge`,
+  `unique_violation`, `cardinality_violation`,
+  `value_constraint_violation`.
+- Which constraints a merge of two valid branches can break follows from
+  invariant confluence [6]. Under one schema it cannot break a per-entity
+  value constraint, because each merged entity is one valid side's whole
+  state, which is what entity-level merge buys;
+  `value_constraint_violation` is a guard, not an expected outcome. It can break uniqueness of chosen values, edge
+  endpoints when a node is deleted, and cardinality bounds, so those are the
+  checks a merge must run, and refusing the merge is the coordination they
+  require.
+- The merge base is a lowest common ancestor of the two heads, picked by a
+  fixed rule (nearest both heads, then highest generation, then smallest
+  commit id). After criss-cross merges there can be several; the rule makes
+  the result repeatable, not independent of the choice.
+- For two branches forked from one commit that have merged nothing since and
+  conflict neither by entity nor by constraint, the merged entities are the
+  same whichever merges first; commit ids, history shape and feed order
+  differ. This is a property of this merge, not a convergence result:
+  conflicting changes are refused, not resolved.
+- Conflicts and violations are reported per entity, typed, and resolved by
+  writing to a branch and merging again. Not promised: automatic resolution,
+  a precedence rule (ours, theirs or last-writer-wins), or a merge of more
+  than two heads.
 
 Owners: [merge](../user/branching/merge.md), [merge internals](merge.md);
 `integration/merge_truth_table.rs`, `integration/merge_fast_forward.rs`.
@@ -178,10 +215,11 @@ Owners: [execution](execution.md#validation), [invariants](invariants.md);
 
 ### 5. Durability and outcomes
 
-- A success answer is returned only after the commit is durable and visible
-  at the storage root, and it names the commit, or says that nothing was
-  published. What survives is what the root survives: any crash of the
-  process or the machine, never the loss of the root.
+- A success answer is returned only after the commit is visible at the
+  storage root and durable, and it names the commit, or says that nothing
+  was published. Durable means it survives every failure named under
+  [assumptions](#a-assumptions), a stop of the process or the machine at any
+  point, short of the loss of the root.
 - Every operation ends in success or in a typed refusal that states its
   effects: none, partial (an earlier step of the same operation published),
   or unknown. An unknown outcome is resolved by reading history, never by
@@ -223,10 +261,12 @@ Owners: [branching](../user/branching/index.md),
 
 ### 7. Data independence, identity and policy
 
-- **Data independence.** A read answers from committed data: a missing or
-  partial index changes cost, never rows or their order, and where an index
-  is required for meaning the read is refused rather than answered
-  differently. A read that is approximate by request says so in its answer:
+- **Data independence**, in Codd's sense of indexing and ordering
+  independence [7]. A read answers from committed data, so building,
+  dropping or partly covering an index changes cost, never rows, and rows
+  have no order but the one `order` or a ranking states. One declared
+  exception: a read that needs an index for its meaning is refused without
+  it, rather than answered differently. A read that is approximate by request says so in its answer:
   `nearest` under a probe cap reports whether the run was `exhaustive`. Not
   promised: a recall figure for a non-exhaustive run.
 - **Identity.** A served actor comes from the bearer token; a client cannot
@@ -259,7 +299,7 @@ is a deliberate limit says so.
 | 2 | Branch create and delete, schema apply, dropping a proposal and `cleanup` are safe only from one writer process per graph; schema apply's only-`main` check can miss another process's branch create, and schema apply needs `main` to be the only branch | Every write decided by the same compare-and-swap, across processes; schema apply with live branches |
 | 2, 5 | A process that claimed a branch's writer epoch (embedded engine only) reads its bound branch without checking the head: it is stale once another process replaces it or deletes the branch, and can answer some reads with no storage request while the store is unreachable | Deliberate: the owner trades the check for latency. Wanted is a bounded staleness the owner can state |
 | 2 | Read replicas are not a supported topology: a served process takes the cluster's writer admission, so one server serves a cluster, and only read-only CLI commands read beside it | A read-only serving mode that takes no writer admission, so read capacity grows with processes |
-| 2 | An aggregate read with an `order` breaks ties between groups by nothing, so groups equal on the order keys come back in unspecified order | One total order for every sorted read |
+| O | An aggregate read with an `order` breaks ties between groups by nothing, so groups equal on the order keys come back in unspecified order | One total order for every sorted read |
 | 5 | On a local filesystem root nothing is fsynced: an acknowledged commit survives a process crash, not necessarily power loss or an operating-system crash. On an object store it is durable at acknowledgement | Durable at acknowledgement on every supported root, or local roots declared development-only |
 | 5 | A stream (export, Blob GET) that fails after its headers ends in an aborted body, not a typed refusal; a merge that also deletes its source can succeed while the deletion fails; retries a write took are not reported in its answer | Every failure typed at the door; retries visible in the answer |
 | 5 | The server answers the schema route from memory while the store is unreachable | Deliberate: the schema it serves is the one it accepted |
@@ -367,26 +407,29 @@ and write only the second, or propose changes to the first.
 
 ### Against the usual categories
 
-OLTP, OLAP, HTAP and LTAP are names for bundles that were useful together
-once: each fixes a contract, a mechanism and a workload at the same time
-([systems](systems.md#appendix-a-terminology-expansion)). Omnigraph is
-defined by its three parts above, not by a bundle, and matches each bundle
-in some claims and not in others.
+OLTP, OLAP, HTAP and LTAP each name a workload and usually imply a contract
+and a mechanism ([systems](systems.md#appendix-a-terminology-expansion)).
+Omnigraph is defined by its three parts above, not by a bundle, and matches
+each bundle in some claims and not in others. The first three are categories
+of the literature; LTAP is one vendor's architecture.
 
 | Category | What it bundles | Where Omnigraph matches | Where it does not |
 |---|---|---|---|
-| OLTP | Work: many short, selective reads and writes, highly concurrent on the same data. Contract: interactive multi-statement transactions, serializable or weaker. Mechanism: row storage, a write-ahead log, updates in place, locks or multi-version rows | The read and write footprint: small selective lookups and small commits on a critical path | The transaction is one commit, not a session; writes on one branch are serial, so write concurrency comes from branches, not from row-level concurrency; no log and no update in place, so a commit costs object-store round trips |
-| OLAP | Work: few large scans and aggregates over much history, loaded in batches. Contract: a consistent snapshot of what was loaded, with a freshness lag accepted. Mechanism: columnar files, vectorized scans, compute apart from storage | The mechanism: columnar immutable files, batch loads, compute apart from storage; analytical reads are part of the work | The scale and the lag: analytical reads cover one graph of up to 10^7 entities, not billions of rows, and they read the same fresh commit as a lookup |
-| HTAP | Both of the above on one system, usually as two representations (row and column) with replication between them, promising analytics on fresh data without slowing transactions | The mixed read work on one system and one fresh snapshot | There is one representation, so no replication and no freshness gap to manage, and also no isolation of the two kinds of work from each other; the transactional half is weaker than OLTP as above |
-| LTAP | Transactional and analytical work over one copy of the data in an open format on object storage, with one write path and readers that scale out | The shape: one copy in open Lance on object storage, one writer and many readers, no export to a second system | The unit: a typed graph commit with branches and three-way merge, not a table transaction; retrieval over structure, vectors and text is a first-class read, which the category does not name |
+| OLTP [10] [11] | Work: many short transactions that read or update a few records by key, on current data; transaction throughput is the measure. Contract: atomic, isolated transactions, serializable or weaker; often interactive sessions, though some engines run stored procedures one at a time. Mechanism: row storage, B-tree indexes, a write-ahead log, updates in place under locks or multi-version rows | The footprint: small reads by key and small commits on a critical path, each seeing current data; serial execution per branch, as in the engines that run transactions one at a time [12] | The transaction is one request, not an interactive session. A branch's commits are serialized by a compare-and-swap on object storage, so a commit costs object-store round trips and one branch sustains a few commits a second, the rate Delta Lake reports for the same mechanism [15], not thousands. Write concurrency comes from branches |
+| OLAP [10] [16] | Work: few complex ad hoc queries that scan, join and aggregate much historical data consolidated from many sources, loaded in batches; response time is the measure. Contract: read-mostly; a consistent snapshot of the last load, refreshed periodically; often a multidimensional model. Mechanism: star schemas, bitmap indexes, materialized views, parallel scans; later columnar storage and vectorized execution; in the cloud, compute apart from storage | The mechanism: columnar immutable files, batch loads, compute apart from storage; analytical reads are part of the work | The scale, the model and the lag: analytical reads cover one graph of up to 10^7 entities, not a warehouse consolidating many sources; there is no multidimensional model and no pre-aggregated summary; an analytical read sees the latest commit, the one a lookup sees, not the last load |
+| HTAP [12] [13] [14] | Work: transactions and analytical queries on the same data at once, analytics on the latest committed data. Contract: transactions plus analytical reads of a fresh, consistent snapshot; the named requirements are freshness and performance isolation. Mechanism, two families: one copy with snapshots, or a row store plus a columnar replica kept consistent by replication | The mixed read work on one system over one copy, every read at a fresh snapshot: the single-copy family, not the replicated one | With no replica there is no replication lag. Isolation of lookups from analytical reads would come from separate stateless reader processes over the same files, not from separate representations, and it is unmeasured. The transactional half is weaker than OLTP as above, so HTAP's hard case, analytics beside a high write rate, is not this work |
+| LTAP [17] | Databricks' term (June 2026), Lake Transactional/Analytical Processing: separate transactional and analytical engines over one durable copy in open table formats on object storage. Postgres writes with full transactions through a replicated log and a page server that transcodes pages to columns; analytical engines read the same files, scaled independently, at a log position plus the tail not yet written out; row pages are a cache. It unifies at the storage layer, not in one engine | The shape: one copy in an open format on object storage, one write path, readers that scale out, no export to a second system | The unit and the engines: one engine and a typed graph commit published by compare-and-swap, with no log and no row tier, against multi-statement Postgres transactions over a replicated log. Its branches are copies for experiments; Omnigraph's merge three-way. Retrieval over structure, vectors and text is a first-class read, which the term does not name |
 
 What none of the four names, and what this work is mostly made of: isolation
 by branch and merge instead of by lock or session; history read as often as
-the present; ranked retrieval as the common read; attribution of every
-change to an actor; and readers and writers that are programs acting on what
-they just read. Use a category word only as shorthand for the row it points
-at; a design argues from the clauses and the work, never from "it is an
-HTAP system".
+the present, where those systems keep it for rollback and reproduction;
+ranked retrieval as the common read; and readers and writers that are
+programs acting on what they just read. Two existing labels sit closer than
+the four and are still only shorthand: data versioning systems, which share
+the branch, commit and merge contract [9], and hybrid serving and analytical
+processing, which names selective latency-bound reads beside analytics. Use
+a category word only as shorthand for the row it points at; a design argues
+from the clauses and the work, never from "it is an HTAP system".
 
 ### What we optimize for
 
@@ -427,3 +470,49 @@ the benchmark harness, not clauses.
   with the measurement that moved it.
 - A user-facing document states a clause in the user's words and links here
   for the precise form; it never states a stronger or weaker one.
+
+## Sources
+
+Read in full on 2026-11-16 to ground the terms above; the number is the
+citation used in the text. The method's own sources are in
+[systems](systems.md#references-and-source-scope).
+
+1. Herlihy and Wing, "Linearizability: A Correctness Condition for
+   Concurrent Objects", TOPLAS 1990: linearizability and locality.
+2. Papadimitriou, "The Serializability of Concurrent Database Updates",
+   JACM 1979: strict serializability.
+3. Berenson et al., "A Critique of ANSI SQL Isolation Levels", SIGMOD 1995:
+   snapshot isolation, lost update, write skew. Also Adya, Liskov and
+   O'Neil, "Generalized Isolation Level Definitions", ICDE 2000.
+4. Terry et al., "Session Guarantees for Weakly Consistent Replicated
+   Data", PDIS 1994.
+5. Fekete et al., "Making Snapshot Isolation Serializable", TODS 2005:
+   predicate write skew and the read-only anomaly.
+6. Bailis et al., "Coordination Avoidance in Database Systems", PVLDB 2015:
+   invariant confluence and its table of constraints.
+7. Codd, "A Relational Model of Data for Large Shared Data Banks", CACM
+   1970: ordering and indexing dependence.
+8. Khanna, Kunal and Pierce, "A Formal Investigation of Diff3", FSTTCS
+   2007: state-based three-way merge and its properties.
+9. Maddox et al., "Decibel: The Relational Dataset Branching System", PVLDB
+   2016; Huang et al., "OrpheusDB", PVLDB 2017; Bhardwaj et al., "DataHub",
+   CIDR 2015; and the Dolt and lakeFS merge documentation: version graphs
+   and field-level or cell-level merge.
+10. Chaudhuri and Dayal, "An Overview of Data Warehousing and OLAP
+    Technology", SIGMOD Record 1997.
+11. Stonebraker and Cetintemel, "One Size Fits All: An Idea Whose Time Has
+    Come and Gone", ICDE 2005.
+12. Kemper and Neumann, "HyPer: A Hybrid OLTP&OLAP Main Memory Database
+    System Based on Virtual Memory Snapshots", ICDE 2011.
+13. Ozcan, Tian and Tozun, "Hybrid Transactional/Analytical Processing: A
+    Survey", SIGMOD 2017.
+14. Huang et al., "TiDB: A Raft-based HTAP Database", PVLDB 2020.
+15. Armbrust et al., "Delta Lake: High-Performance ACID Table Storage over
+    Cloud Object Stores", PVLDB 2020; and "Lakehouse", CIDR 2021.
+16. Codd, Codd and Salley, "Providing OLAP to User-Analysts: An IT
+    Mandate", 1993.
+17. Databricks, "Databricks Launches LTAP" (press release, 16 June 2026),
+    and R. Xin, "From monolith to Lakebase to LTAP" (30 June 2026).
+
+Not grounded in a source read here: the definition of durability, and the
+latency and rate figures in the work, which are hypotheses.
