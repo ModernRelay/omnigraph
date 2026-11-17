@@ -23,7 +23,9 @@
 //! is built. Writes are not generated: the reference evaluates reads only.
 //!
 //! The metamorphic layer reruns each read rewritten to an equal one: a
-//! tautology conjoined to its `where`, its top-level conjuncts reversed.
+//! tautology conjoined to its `where`, its top-level conjuncts reversed
+//! when none can fail, and an `rrf`'s arms swapped with their weights (the
+//! fusion is invariant under permuting its arms).
 //!
 //! A failure prints the shrunk read, the schema, the graph and both
 //! answers. Seeds are deterministic; a failing case's seed is written to
@@ -201,6 +203,30 @@ fn rewritten(source: &str, extra: &str, reverse: bool) -> Option<String> {
     Some(out.join("\n"))
 }
 
+/// The read with its `rrf`'s two arms swapped, their weights with them.
+fn rrf_arms_swapped(source: &str) -> Option<String> {
+    let start = source.find("from rrf(")? + "from rrf(".len();
+    let end = start + source[start..].find(") as $s")?;
+    let inner = &source[start..end];
+    let split = inner.find(", bm25(")?;
+    let (first, rest) = (&inner[..split], &inner[split + 2..]);
+    let tail_at = rest.find(", k: ")?;
+    let (second, tail) = (&rest[..tail_at], &rest[tail_at..]);
+    let tail = match tail.split_once(", weights: [") {
+        Some((k, weights)) => {
+            let weights = weights.strip_suffix(']')?;
+            let (a, b) = weights.split_once(", ")?;
+            format!("{k}, weights: [{b}, {a}]")
+        }
+        None => tail.to_string(),
+    };
+    Some(format!(
+        "{}{second}, {first}{tail}{}",
+        &source[..start],
+        &source[end..]
+    ))
+}
+
 /// Whether a conjunct may hold a term that can fail: arithmetic or an
 /// aggregate that can overflow.
 fn can_fail(conjunct: &str) -> bool {
@@ -295,6 +321,10 @@ async fn check(sample: &Sample) -> Result<(), String> {
     }
     if let Some(reversed) = rewritten(source, "", true) {
         judge(&session, sample, &reversed, "conjuncts reversed").await?;
+    }
+    // `rrf` is invariant under permuting its arms with their weights.
+    if let Some(permuted) = rrf_arms_swapped(source) {
+        judge(&session, sample, &permuted, "rrf arms swapped").await?;
     }
     // Every declared index built.
     session

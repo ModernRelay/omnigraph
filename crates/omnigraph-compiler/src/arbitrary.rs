@@ -1770,7 +1770,7 @@ impl ScalarExpr {
                 let (rt, rn) = r.rfc_type();
                 (join(lt, rt), ln || rn)
             }
-            ScalarExpr::If(c, a, b) => {
+            ScalarExpr::If(_, a, b) => {
                 let (at, an) = a.rfc_type();
                 let (bt, bn) = b.rfc_type();
                 (join(at, bt), an || bn)
