@@ -781,7 +781,7 @@ impl<'a> Interpreter<'a> {
                             let Some(d) = self.field_distance(&row, column, property, &q)? else {
                                 continue;
                             };
-                            row.push((out.clone(), Value::Float(d)));
+                            row.push((out.clone(), Value::Float(finite_distance(d)?)));
                             rows.push(row);
                         }
                     }
@@ -835,6 +835,11 @@ impl<'a> Interpreter<'a> {
                         .then(cmp_values(&a.1, &b.1))
                 });
                 best.truncate(k);
+                // A kept target's distance must be finite; an overflowing
+                // one past the window was never selected.
+                for (d, _) in &best {
+                    finite_distance(*d)?;
+                }
                 let mut rows = Vec::new();
                 for mut row in input.rows {
                     let target = get(&row, column).cloned();
@@ -1045,7 +1050,9 @@ impl<'a> Interpreter<'a> {
     /// The distance of the row's vector `property` to `q` under the
     /// field's declared distance, rounded to `F32` as the engine reports it:
     /// `None` for a null vector and, under `cosine`, a zero vector, which
-    /// drops the row; a zero `q` on a `cosine` field is refused.
+    /// drops the row; a zero `q` on a `cosine` field is refused. A distance
+    /// from finite components can overflow `F32`: the caller refuses it
+    /// ([`finite_distance`]) where it scores or selects the row.
     fn field_distance(&self, row: &Row, column: &str, property: &str, q: &[f64]) -> R<Option<f64>> {
         let distance = match get(row, column) {
             Some(Value::Ref {
@@ -1352,6 +1359,17 @@ impl<'a> Interpreter<'a> {
             }
             IRExpr::Aggregate { .. } => return unsupported("an aggregate outside a group"),
         })
+    }
+}
+
+/// A distance as a score reports it: a non-finite one, which finite
+/// components can reach by overflowing `F32`, is `E3` (section 2, `Score`:
+/// a non-finite input is a typed error).
+fn finite_distance(d: f64) -> R<f64> {
+    if d.is_finite() {
+        Ok(d)
+    } else {
+        Err(Refusal::Runtime("E3", "a distance is not finite".into()))
     }
 }
 

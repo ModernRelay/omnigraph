@@ -876,6 +876,24 @@ fn f32_arithmetic_overflows_in_f32() {
     );
 }
 
+/// A distance from finite components that overflows `F32` is `E3` under
+/// `distance` and `nearest` alike, never a row with an infinite score.
+#[test]
+fn an_overflowing_distance_is_the_e3_refusal() {
+    for call in [
+        "distance($docs, $d.embedding, [3.0e38, 3.0e38])",
+        "nearest($docs, $d.embedding, [3.0e38, 3.0e38], k: 1)",
+    ] {
+        let refused = run_refused(&format!(
+            "query q() {{ match {{ let $docs = {{ match {{ $d: Doc }} return {{ $d }} }}, from {call} as $dist }} return {{ $d.slug }} }}"
+        ));
+        assert!(
+            matches!(refused, Refusal::Runtime("E3", _)),
+            "{call}: {refused:?}"
+        );
+    }
+}
+
 /// A cast of a float to an integer is a form this interpreter does not
 /// evaluate, never a float passed through as the integer.
 #[test]
