@@ -235,6 +235,8 @@ destination line.
 `--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate
 values into query source. Reads support `--format table|json|jsonl|csv|kv|toon`;
 `--format toon` encodes the same document as `--format json` in TOON;
+`query --format arrow` writes an Arrow IPC stream from a direct target to a
+redirected stdout ([`commands.md`](references/commands.md#output-formats-and-positions));
 `--json` preserves exact receipt/error structure. Inspect `commit` and
 `graph_commit_id` after uncertain writes; do not infer safe retry from a timeout.
 
@@ -444,7 +446,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Using `data.id` for identity on a new graph | `unknown input field 'id': move data.id to the top-level 'id' field` | Put identity in top-level JSONL `id`; `data` contains user properties |
 | Re-running a `--mode merge` load with unkeyed edges | duplicate edges | Supply stable top-level edge `id`s, or declare `@key(@src, @dst)` when creating the edge type |
 | Assuming every JSON result cell has a key | absent keys for null values | Query/export JSON omits null cells; change images retain explicit nulls |
-| `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv`, `kv`, or `toon` |
+| `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv`, `kv`, or `toon`; pass `query --format arrow` per invocation on a direct target |
 | `..` or a symlink in a `cluster.yaml` relative path | `config_path_escape` / `config_path_symlink` | Keep referenced files inside the config directory with plain relative paths |
 | A 0.13 operator file | configuration refusal | Rewrite it as `version: 1` (see [migrations](references/migrations.md#operator-configuration-rewrite)); keep the old operator home until unresolved work is reconciled |
 

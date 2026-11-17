@@ -25,6 +25,7 @@ use omnigraph_api_types::{
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
 use omnigraph_compiler::query::parser::parse_query;
+use omnigraph_compiler::result::QueryResult;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
@@ -226,6 +227,42 @@ pub(crate) enum GraphClient {
     /// read as `@` types, with no store opened. Serves read queries and
     /// `schema show`; every other verb is refused.
     Catalogue,
+}
+
+/// An ad-hoc read the engine in this process answered, on a direct target's
+/// store or on the catalogue scope, before any rendering.
+pub(crate) struct EngineRead {
+    query_name: String,
+    /// The target the read used; `None` on the catalogue scope, which has
+    /// no branches or snapshots.
+    target: Option<ReadTarget>,
+    pub(crate) result: QueryResult,
+    graph_commit_id: Option<String>,
+}
+
+impl EngineRead {
+    /// The `ReadOutput` a server renders for the same answer.
+    fn into_read_output(self) -> Result<ReadOutput> {
+        let Some(target) = self.target else {
+            let mut output = read_output(
+                self.query_name,
+                &ReadTarget::branch("main"),
+                self.result,
+                None,
+            )?;
+            output.target = omnigraph_api_types::ReadTargetOutput {
+                branch: None,
+                snapshot: None,
+            };
+            return Ok(output);
+        };
+        Ok(read_output(
+            self.query_name,
+            &target,
+            self.result,
+            self.graph_commit_id,
+        )?)
+    }
 }
 
 /// The refusal every verb outside the catalogue scope's reads answers.
@@ -2035,6 +2072,27 @@ impl GraphClient {
                 )
                 .await
             }
+            GraphClient::Embedded { .. } | GraphClient::Catalogue => self
+                .engine_query(target, query_source, query_name, params_json, settings)
+                .await?
+                .into_read_output(),
+        }
+    }
+
+    /// Run an ad-hoc read on the engine in this process, a direct target's or
+    /// the catalogue scope's, and keep its answer as the engine gave it: the
+    /// batches every format renders, under the session's read limits.
+    /// `--format arrow` writes them unrendered. A served target runs the read
+    /// on its server, which answers JSON, so it has no engine answer.
+    pub(crate) async fn engine_query(
+        &self,
+        target: Option<ReadTarget>,
+        query_source: &str,
+        query_name: Option<&str>,
+        params_json: Option<&Value>,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<EngineRead> {
+        match self {
             GraphClient::Embedded {
                 uri, binding, base, ..
             } => {
@@ -2047,12 +2105,12 @@ impl GraphClient {
                 let (result, graph_commit_id) = session
                     .query_with_head(target.clone(), query_source, &selected_name, &params)
                     .await?;
-                Ok(read_output(
-                    selected_name,
-                    &target,
+                Ok(EngineRead {
+                    query_name: selected_name,
+                    target: Some(target),
                     result,
                     graph_commit_id,
-                )?)
+                })
             }
             GraphClient::Catalogue => {
                 if target.is_some() {
@@ -2066,13 +2124,15 @@ impl GraphClient {
                 let params = query_params_from_json(&query_params, params_json)?;
                 let scope = Self::catalogue_scope(settings)?;
                 let result = scope.query(query_source, &selected_name, &params).await?;
-                let mut output =
-                    read_output(selected_name, &ReadTarget::branch("main"), result, None)?;
-                output.target = omnigraph_api_types::ReadTargetOutput {
-                    branch: None,
-                    snapshot: None,
-                };
-                Ok(output)
+                Ok(EngineRead {
+                    query_name: selected_name,
+                    target: None,
+                    result,
+                    graph_commit_id: None,
+                })
+            }
+            GraphClient::Remote { .. } => {
+                Err(crate::read_format::arrow_has_no_batches("a served answer"))
             }
         }
     }
@@ -2093,6 +2153,24 @@ impl GraphClient {
                 self.query(Some(target), query_source, None, None, settings)
                     .await
             }
+            GraphClient::Embedded { .. } | GraphClient::Catalogue => self
+                .engine_explain_load(target, query_source, stmt, external_blob_policy, settings)
+                .await?
+                .into_read_output(),
+        }
+    }
+
+    /// `explain load csv …` on a direct target's engine, its plan rows kept
+    /// as the engine gave them; see [`Self::engine_query`].
+    pub(crate) async fn engine_explain_load(
+        &self,
+        target: ReadTarget,
+        query_source: &str,
+        stmt: omnigraph_compiler::query::ast::LoadStmt,
+        external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<EngineRead> {
+        match self {
             GraphClient::Embedded {
                 uri, binding, base, ..
             } => {
@@ -2106,14 +2184,17 @@ impl GraphClient {
                 .await?;
                 Self::apply_prefix(&mut session, query_source)?;
                 let (result, graph_commit_id) = session.explain_load(target.clone(), &stmt).await?;
-                Ok(read_output(
-                    stmt.statement_name().to_string(),
-                    &target,
+                Ok(EngineRead {
+                    query_name: stmt.statement_name().to_string(),
+                    target: Some(target),
                     result,
                     graph_commit_id,
-                )?)
+                })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("explain load")),
+            GraphClient::Remote { .. } => {
+                Err(crate::read_format::arrow_has_no_batches("a served answer"))
+            }
         }
     }
 
