@@ -2503,6 +2503,192 @@ fn read_resolves_uri_from_default_store_scope() {
     assert_eq!(payload["row_count"], 1);
 }
 
+/// `--format arrow` writes the query's result as one Arrow IPC stream when
+/// stdout is a pipe or a file, with each column's declared type and nulls
+/// kept, and refuses a terminal before any work, writing nothing to it. A
+/// statement has no result batches and refuses too. All of these used to
+/// refuse alike.
+#[test]
+fn query_format_arrow_writes_a_query_s_batches_unless_stdout_is_a_terminal_issue_1428() {
+    const PEOPLE: &str =
+        "query people() { match { $p: Person } return { $p.name, $p.age } order { $p.name asc } }";
+    let graph = SystemGraph::loaded();
+    output_success(
+        cli()
+            .args(["mutate", "--target"])
+            .arg(graph.path())
+            .args(["-e", "query add() { insert Person { name: \"Eve\" } }"]),
+    );
+    let arrow_query = |source: &str| {
+        let mut command = cli_process();
+        command
+            .args(["query", "--target"])
+            .arg(graph.path())
+            .args(["-e", source, "--format", "arrow"])
+            .stdin(std::process::Stdio::null());
+        command
+    };
+
+    // A pipe.
+    let piped = arrow_query(PEOPLE).output().unwrap();
+    assert!(
+        piped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&piped.stderr)
+    );
+    assert_people_stream(&piped.stdout);
+
+    // A file.
+    let path = graph.path().with_extension("arrow");
+    let file = arrow_query(PEOPLE)
+        .stdout(fs::File::create(&path).unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        file.status.success(),
+        "{}",
+        String::from_utf8_lossy(&file.stderr)
+    );
+    assert_people_stream(&fs::read(&path).unwrap());
+
+    // A terminal.
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        let (mut terminal, stdout) = open_terminal();
+        let refused = arrow_query(PEOPLE).stdout(stdout).output().unwrap();
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains(
+                "`--format arrow` writes a binary Arrow IPC stream, and stdout is a terminal; \
+                 redirect stdout to a file or a pipe, for example `> result.arrow`\n\
+                 disposition: {\"effects\":\"none\",\"action\":\"fix\"}\n"
+            ),
+            "{stderr}"
+        );
+        // Every descriptor of the terminal's other end is closed now, so a
+        // read returns what the command wrote to it, then ends.
+        let mut written = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match terminal.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => written.extend_from_slice(&buffer[..count]),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(libc::EIO) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("read the terminal: {error}"),
+            }
+        }
+        assert!(written.is_empty(), "wrote to the terminal: {written:?}");
+    }
+
+    // A statement's answer is rendered JSON with no batches.
+    let statement = arrow_query("branch list").output().unwrap();
+    let stderr = String::from_utf8_lossy(&statement.stderr);
+    assert_eq!(statement.status.code(), Some(1), "{stderr}");
+    assert!(statement.stdout.is_empty());
+    assert!(
+        stderr.contains(
+            "`--format arrow` writes a query's result batches, and `branch list` has none; \
+             use `--format json` or `--format jsonl`\n\
+             disposition: {\"effects\":\"none\",\"action\":\"fix\"}\n"
+        ),
+        "{stderr}"
+    );
+}
+
+/// The `people` result read back from an Arrow IPC stream: complete, with
+/// the declared column types and Eve's absent age a null.
+fn assert_people_stream(stream: &[u8]) {
+    use arrow_array::{Array, Int32Array, StringArray};
+    use arrow_schema::DataType;
+
+    assert!(
+        stream.ends_with(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]),
+        "the stream ends with its end-of-stream marker"
+    );
+    let reader =
+        arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(stream), None).unwrap();
+    let columns = reader
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            (
+                field.name().clone(),
+                field.data_type().clone(),
+                field.is_nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        columns,
+        [
+            ("p.name".to_owned(), DataType::Utf8, false),
+            ("p.age".to_owned(), DataType::Int32, true),
+        ]
+    );
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let names = batch.column(0).as_any().downcast_ref::<StringArray>();
+        let ages = batch.column(1).as_any().downcast_ref::<Int32Array>();
+        let (names, ages) = (names.unwrap(), ages.unwrap());
+        for row in 0..batch.num_rows() {
+            rows.push((
+                names.value(row).to_owned(),
+                ages.is_valid(row).then(|| ages.value(row)),
+            ));
+        }
+    }
+    assert_eq!(
+        rows,
+        [
+            ("Alice".to_owned(), Some(30)),
+            ("Bob".to_owned(), Some(25)),
+            ("Charlie".to_owned(), Some(35)),
+            ("Diana".to_owned(), Some(28)),
+            ("Eve".to_owned(), None),
+        ]
+    );
+}
+
+/// A pseudo-terminal: its reading end, nonblocking, and the terminal a
+/// child takes as stdout.
+#[cfg(unix)]
+fn open_terminal() -> (fs::File, fs::File) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // SAFETY: each call takes a descriptor this function owns, and
+    // `ptsname`'s buffer is copied before any other call can reuse it.
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(master >= 0, "{}", std::io::Error::last_os_error());
+        let master = fs::File::from_raw_fd(master);
+        let fd = master.as_raw_fd();
+        assert_eq!(libc::grantpt(fd), 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(libc::unlockpt(fd), 0, "{}", std::io::Error::last_os_error());
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+        let name = libc::ptsname(fd);
+        assert!(!name.is_null(), "{}", std::io::Error::last_os_error());
+        let name = std::ffi::CStr::from_ptr(name).to_str().unwrap().to_owned();
+        let terminal = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(name)
+            .unwrap();
+        (master, terminal)
+    }
+}
+
 #[test]
 fn read_csv_format_outputs_header_and_row_values() {
     let temp = tempdir().unwrap();

@@ -110,7 +110,8 @@ params; see [Work with branches](index.md#work-with-branches)), or one
 `explain` statement, `query -e 'explain query q() { … }'`, answering the plan
 as rows under the query's own target and params; see [Explain](../queries/explain.md).
 
-Read output supports `table`, `json`, `jsonl`, `csv`, `kv`, and `toon`. With no
+Read output supports `table`, `json`, `jsonl`, `csv`, `kv`, `toon`, and, for
+`query`, `arrow`. With no
 `--format`, no `--json`, and no `defaults.output`, a read prints a table. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
 cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
@@ -124,6 +125,21 @@ non-uniform and TOON repeats every key. Numbers use TOON's canonical spelling,
 so an integral value is `1` where the JSON writer may spell `1.0`. The CLI ends
 the TOON document with a newline. The HTTP API returns JSON. A refusal follows
 [Diagnostics](../queries/diagnostics.md).
+
+`query --format arrow` writes the result's columns and rows to stdout as one
+[Arrow IPC stream](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format),
+which Arrow readers such as pyarrow and Polars read. Each column keeps its
+declared Arrow type, and a null stays a null. The stream holds the result
+alone: the `graph_commit_id`, target and `ranking` of the JSON document are not
+in it. Only a query that this process runs on a direct target, including an
+`explain` statement, has result batches to write. Three cases refuse `arrow`
+before the read runs, and exit 1: a served target, whose server answers JSON
+(refused before its credential is read); a control statement such as
+`branch list` or `show`; and a stdout that is a terminal, so redirect it, for
+example `> result.arrow`. Stdout therefore holds the whole stream, or, when a
+write to it fails, part of one and a nonzero exit. `alias` and
+`defaults.output` do not offer `arrow`. To stream a whole branch, use
+[`export`](#commands), which writes JSONL.
 
 ### Invocation statistics
 

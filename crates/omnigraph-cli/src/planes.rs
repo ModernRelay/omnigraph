@@ -495,6 +495,22 @@ pub(crate) fn validate_target(
             _ => {}
         }
     }
+    // `--format arrow` writes the result batches of a query the engine in
+    // this process runs; a server runs the query itself and answers JSON.
+    if let Command::Query(args) = &cli.command
+        && args.format == Some(crate::read_format::ReadOutputFormat::Arrow)
+        && matches!(target.binding, Server { .. } | Managed(_))
+    {
+        return Err(crate::targets::refusal(
+            "target_kind_unsupported",
+            format!(
+                "`--format arrow` writes the result batches of a query run on direct storage; \
+                 target '{}' is served, and its server answers JSON: use `--format json` or \
+                 `--format jsonl`",
+                target.label()
+            ),
+        ));
+    }
     let invocation = match &cli.command {
         Command::Query(args) => Some((
             args.name.as_deref(),
