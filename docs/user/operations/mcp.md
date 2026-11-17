@@ -219,10 +219,9 @@ The server's `initialize` instructions tell a model to call `graphs`, then
 `schema`, then `query` with a stored read's `name` or its own GQ source.
 
 - `queries` lists every stored query with its typed parameters (`name`,
-  `kind`, `nullable`, `default` when one is declared, plus `item_kind` for
-  lists and `vector_dim` for vectors); a declared `= null` default is listed
-  as `"default": null`, and a parameter with neither `nullable` nor a
-  `default` is required. An entry with `mutation: true` is a stored
+  `kind`, `nullable`, `default` when one is declared, `null` included, plus
+  `item_kind` for lists and `vector_dim` for vectors); a parameter with
+  neither `nullable` nor a `default` is required. An entry with `mutation: true` is a stored
   mutation, which `mutate` runs.
 - `query` refuses stored mutations; `mutate` runs them.
 - `commits_list` takes `listing`: `history` (the default), `unpublished` for
