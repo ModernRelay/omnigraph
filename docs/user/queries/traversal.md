@@ -131,7 +131,8 @@ already bound there) constrains the same rows; it never introduces a second
 `$p`. Inside a block, an `optional` or an inline read, binding a name the
 enclosing scope holds is `T68` ([inner scopes](#inner-scopes)): `not exists {
 $p: Person where $p.name = "bob" }` is refused with the fix `not ($p.name =
-"bob")`. Variable names beginning with `__` are reserved.
+"bob")`, or `not coalesce(…, false)` when the test can be null. Variable names
+beginning with `__` are reserved.
 
 Bare traversal names begin with a lowercase letter (`worksAt` for the declared
 edge `WorksAt`); edge lookup itself is case-insensitive. Any word is an edge

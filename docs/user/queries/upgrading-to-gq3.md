@@ -7,36 +7,20 @@ older form that GQ 3 refuses prints its fix, as text and as byte-range edits
 ([Diagnostics](diagnostics.md)). Rewrite each source from the map below and
 the fixes the compiler prints.
 
-## Find what to rewrite
-
-Run the checks before upgrading the server:
-
-```bash
-omnigraph lint --query queries.gq --schema schema.pg --json
-omnigraph queries validate --target . --json    # the applied stored queries
-omnigraph cluster plan --config . --json         # desired stored queries
-```
-
-Each refusal carries its code, position, fix and `suggestion` edits. Apply
-every `machine_applicable` edit of one pass at once, compile again, and repeat
-until no refusal is left ([every refusal in one pass](diagnostics.md#every-refusal-in-one-pass)).
-
 ## Stored queries at upgrade
 
-A stored query that no longer compiles is refused, as an invalid source
-always was: in `cluster plan` with its diagnostic, and at server boot, where
-its graph does not serve (the graph is quarantined while healthy graphs
-serve, and startup fails under `--require-all-graphs`). Nothing converts the
-source. For a source that no longer parses, the boot log names the query and
-gives the code, position, message, fix and edits:
+The procedure for upgrading a deployment's stored queries together with the
+binary is pending and is not described yet. A stored query that does not
+compile is refused, as an invalid source always was: in `cluster plan` with
+its diagnostic, and at server boot, where the boot log names the query and
+gives the code, the position, the message, the fix and its edits, for a
+source that does not parse and for one that fails the type check alike:
 
 ```text
 stored query 'NAME': error[CODE] at line L, column C: MESSAGE; fix: FIX; edits: bytes S..E -> "TEXT"
 ```
 
-A source that parses but fails the type check is reported as
-`query 'NAME': type error: CODE: MESSAGE`; `queries validate --json` gives its
-fix and edits. Byte offsets count into the stored query's own source.
+Byte offsets count into the stored query's own source.
 
 ## The respelling map
 
@@ -178,7 +162,8 @@ refuses a `sum`, `avg`, `min` or `max` block without its argument.
   Before, it declared an index on the property `fulltext`.
 - A schema whose full-text index names an analyzer or a scorer
   (`@index(fulltext, analyzer = …)`), or whose vector declares a distance
-  (`Vector(n, distance = …)`), is refused by earlier binaries ("schema
+  other than `l2` (`Vector(n, distance = "cosine")`; an explicit `l2` is
+  stored as an omitted one), is refused by earlier binaries ("schema
   feature … is unknown to this build"). Upgrade every binary that opens the
   graph before applying such a schema
   ([analyzers](../search/analyzers.md)).

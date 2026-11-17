@@ -172,7 +172,8 @@ scan. A format-1 certificate, edition 2's analysis, never qualifies for a
 profile. A raw `contains_tokens` scan filter names no field analysis, so it
 refuses over any column holding a segment. Every refusal is
 `FullTextIndexRebuildRequired` with a reason naming the check, raised before
-execution. Successful immutable proof uses Lance's bounded session metadata
+execution; since no query reads a segment, a `match_terms` or `bm25` is never
+refused for its index's state. Successful immutable proof uses Lance's bounded session metadata
 cache, keyed by the expected and measured fingerprints; failures are not cached.
 
 The full builder writes proof before the existing CreateIndex publication.

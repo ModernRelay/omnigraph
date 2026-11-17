@@ -11,12 +11,11 @@ CLI configuration, HTTP/MCP, and client compatibility changes.
 
 ## Query language (GQ 3)
 
-This release parses GQ 3 only. A stored query or `.gq` file written for an
-earlier release fails to compile, and a stored query that fails keeps its
-graph from serving. Before upgrading, run `omnigraph queries validate --json`
-and `omnigraph cluster plan --json`, then rewrite each refused source from
-[Upgrading queries to GQ 3](../queries/upgrading-to-gq3.md) and the fix each
-refusal prints. Nothing converts a source automatically.
+This release parses GQ 3 only: a stored query or `.gq` file written for an
+earlier release fails to compile, and [Upgrading queries to GQ
+3](../queries/upgrading-to-gq3.md) maps each older form to its GQ 3 form. The
+procedure for upgrading a deployment's stored queries together with the
+binary is pending and is not described yet.
 
 ## Storage upgrade
 
@@ -176,9 +175,9 @@ omnigraph index rebuild --kind full-text --target ./graph.omni --branch main --a
 
 Follow the [full-text maintenance procedure](maintenance.md#rebuild-full-text-indexes)
 for authorization, tokenizer changes and result checks. Rebuilding a live branch
-publishes its indexes in one graph commit; it leaves earlier snapshots unchanged,
-so those snapshots may still refuse full-text search. `optimize` is not a
-replacement for an analyzer rebuild.
+publishes its indexes in one graph commit and leaves earlier snapshots
+unchanged; a search reads no index, so it answers alike on either. `optimize`
+is not a replacement for an analyzer rebuild.
 
 A retained published commit under the current schema can start a branch with
 `branch create --from-commit <id>`; pre-upgrade commits are refused. See the

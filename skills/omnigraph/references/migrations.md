@@ -117,10 +117,10 @@ source brings these with it:
   run interrupted before it publishes changes nothing and is rerun.
 - A cluster-managed graph is not converted: export with the build that wrote
   it, then `init` and `load --mode overwrite` with the current binary.
-- The conversion does not rebuild full-text indexes. A search refused with
-  `FullTextIndexRebuildRequired` needs `omnigraph index rebuild --kind
-  full-text --target ./graph.omni --branch <branch>` on each live branch that
-  searches text.
+- The conversion does not rebuild full-text indexes, and no search needs it:
+  every `match_terms` and `bm25` is answered by the exact scan, which reads no
+  index. `omnigraph index rebuild --kind full-text --target ./graph.omni
+  --branch <branch>` keeps a branch's built indexes current.
 
 The [upgrade guide](../../../docs/user/operations/upgrade.md#storage-upgrade)
 owns the findings table, the limits and the recovery actions. Upgrade the CLI,
