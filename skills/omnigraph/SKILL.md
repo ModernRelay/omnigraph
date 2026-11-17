@@ -458,7 +458,7 @@ For anything beyond the basics, load the relevant reference file. Each is self-c
 
 | Reference | When to load |
 |-----------|--------------|
-| [`references/onboarding.md`](references/onboarding.md) | Setting Omnigraph up for a new user: install, version-matched skill, a first schema, local graph, load, query and branch, then next steps |
+| [`references/onboarding.md`](references/onboarding.md) | Setting Omnigraph up for a new user: install, version-matched skill, finding the use case (or trying a cookbook), a first schema, local graph, load, query and branch, a completion check, then next steps |
 | [`references/schema.md`](references/schema.md) | Editing `.pg` files, running `schema plan`/`apply`, renaming types, backfilling required fields |
 | [`references/schema-design.md`](references/schema-design.md) | Designing or reviewing a schema: Gruber's criteria, design flow, identity, provenance, `GraphPolicy` rules, composition, and measuring convergence across agents |
 | [`references/queries.md`](references/queries.md) | Writing or linting `.gq` files, search functions, aggregations, multi-hop patterns |
