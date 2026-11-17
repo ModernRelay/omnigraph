@@ -47,24 +47,26 @@ evidence.
 ### What an agent does
 
 An agent is a policy that acts over a shared model of some domain, in many
-steps, toward goals it does not finish in one session. It holds no state of
-its own worth keeping, so everything it must remember goes through the graph.
+steps, toward goals it does not finish in one session. Its working state is
+private and short-lived; it holds no durable state of its own, so every
+result it or another agent must rely on later goes through the graph.
 Its activities range over the following, each with its footprint; the
 distribution is their sum.
 
 | Activity | What the agent does | Footprint on the graph |
 |---|---|---|
-| Orient | Learns what exists and what the words mean: the schema, the types and their counts, what changed since it last looked, what others are doing now | Schema and catalogue reads; change feed from a cursor; branch and commit listings; cheap, at every session start and after every pause |
-| Retrieve | Assembles the context for the next step, in two modes. Lookup: the entity by key, its neighborhood, the things like it, the passages that mention it, under filters on type, time and status. Analytical: how many, which most, grouped by what, over a type or a filtered slice, to size a problem, rank candidates or summarize before deciding | Lookup: selective reads combining key lookup, one to three hops, vector, lexical and fused ranking; tens to a few hundred rows; several per step; the most common read. Analytical: aggregates, group-bys, top-N and filtered scans over whole types, small results from wide reads; fewer than lookups but on the same critical path of a step |
+| Orient | Learns what exists and what the words mean, throughout a task and not only at its start: the schema, the types and their counts, which type or property holds what it is looking for, what changed since it last looked, what others are working on now | Schema and catalogue reads, search over type and property names and descriptions, change feed from a cursor, branch and commit listings. In measured data-agent traces about half of all queries are this kind of exploration [18], so it is frequent and must be cheap |
+| Speculate | Probes before it commits to an approach: partial, exploratory and repeated reads to test an idea, and what-if writes on a throwaway branch to see their effect, most of which are discarded | Many small reads, largely overlapping with each other and with other agents' reads (most sub-plans across parallel attempts are duplicates [18]); many short-lived branches created, written a little and dropped, far more than a person would make [18] [24] |
+| Retrieve | Assembles the context for the next step, in two modes. Lookup: the entity by key, its neighborhood, the things like it, the passages that mention it, under filters on type, time and status, ranked by relevance, recency and importance. Analytical: how many, which most, grouped by what, over a type or a filtered slice, to size a problem, rank candidates or summarize before deciding | Lookup: selective reads combining key lookup, one to three hops or a ranking that spreads over the graph, vector, lexical and fused ranking, often cut by a time range; tens to a few hundred rows; several per step; the most common read. Analytical: aggregates, group-bys, top-N and filtered scans over whole types, small results from wide reads, on the same critical path of a step |
 | Acquire | Brings outside information in: fetches pages, documents, API results and files; imports a dataset it was handed or found, structured (tables, exports, API dumps) or unstructured (PDFs, documents, transcripts, mail); extracts entities, relations and passages from the unstructured content; embeds text | Keyed loads from 10^2 records to 10^7 for a whole source, unplanned and bursty, on the task's branch, as many bounded batches; Blob writes of thousands of source documents; extracted entities and passages linked to the Blob they came from; embedding columns; the usual way a new source enters before a sync exists |
 | Sync | Keeps part of the model in step with a system that stays the record of its own data (CRM, ticketing, mail and calendar, documents, code hosting, a warehouse), as a pipeline it runs or supervises: backfill, then incremental pulls or pushed events, then reconciliation; and feeds other systems from the graph | Idempotent keyed upserts under the source's external identity, every few minutes or per event, mostly rows that did not change; the source's deletes propagated; whole-source reruns; outbound, an ordered read of everything that changed since a cursor |
-| Author | Records what it learned, decided and did: observations, claims with evidence, decisions with reasons, tasks, plans, status, and links between things that already exist | Small attributed commits of one to tens of entities, many per task, on the task's branch, append-mostly; the most common write and the densest edges |
-| Derive | Computes over what is there: classifies, scores, resolves duplicates, summarizes, infers edges, consolidates old memory into new | Reads wide across a type, writes many small updates or a batch per run; periodic, often as a pipeline |
-| Coordinate | Shares work with other agents and people: claims a task, hands one off, checks whether something was already done, avoids writing over a concurrent change | Concurrent reads of shared state; conditional writes from the commit it read; one branch per task, so one writer per branch by construction of the work, not by a lock; merges into shared state; a conflict re-decided from a fresh read, not retried blind |
-| React | Wakes on a change instead of on a schedule: a new document to extract, a task assigned, a claim contradicted, a branch ready for review, a sync that landed. Reads what changed, decides, and writes, which may wake others | A standing wait on the change feed of a branch, filtered by type and operation; delivery in commit order, each change at least once, soon after its commit; a read of the changed entities at that commit; a write conditional on it. Chains of reactions make write load follow write load |
-| Verify and correct | Checks what it holds against sources and constraints, finds drift and duplicates, fixes errors | Targeted reads by key and by external identity; corrections as updates or new facts; deletes rarely; constraint refusals as signal |
+| Author | Records what it learned, decided and did: observations, claims with their evidence, confidence and competing alternatives, decisions with reasons, tasks, plans and checkpoints it can resume from, status, and links between things that already exist | Small attributed commits of one to tens of entities, many per task, on the task's branch, append-mostly, each tied to the sources it came from; the most common write and the densest edges |
+| Derive | Computes over what is there: classifies, scores, resolves duplicates, summarizes groups of related entities, infers edges, and consolidates what it observed into new, cited insights (what the agent-memory literature calls reflection [27]) | Reads wide across a type, writes many small updates or a batch per run; periodic, often as a pipeline; later reads depend on how fresh its output is |
+| Coordinate | Shares work with other agents and people: sees who is working on what, claims a task so that no one else takes it, hands one off, checks whether something was already done, avoids writing over a concurrent change | Reads of others' activity; an exclusive claim that exactly one of several claimants wins; conditional writes from the commit it read; one branch per task, so one writer per branch by construction of the work, not by a lock; merges into shared state; a conflict re-decided from a fresh read, not retried blind |
+| React | Wakes on a change instead of on a schedule: a new document to extract, a task assigned, a claim contradicted, a branch ready for review, a sync that landed. Reads what changed, decides, and writes, which may wake others | A standing wait on the change feed of a branch, selective enough that an agent wakes only for what concerns it: filtered by type and operation and by a condition over the changed state; delivery in commit order, each change at least once, soon after its commit; a read of the changed entities at that commit; a write conditional on it. Chains of reactions make write load follow write load |
+| Verify and correct | Checks work before others rely on it, its own and other agents': against sources, against constraints, by an independent checker before a branch is integrated; finds drift and duplicates, fixes errors. Unchecked work by parallel agents compounds errors, which makes this larger than it looks [21] [22] | Targeted reads by key and by external identity; a check that runs over a branch and gates its merge; corrections as updates or new facts; deletes rarely; constraint refusals as signal |
 | Propose and review | Puts a change up for a person or another agent to accept; reads what a branch would change; approves, merges, or discards | Branch diffs and merge previews; a merge or a branch delete; unpublished commits that wait |
-| Reflect and evaluate | Looks back: what was known at a time, what was decided and why, what happened after; compares a past state with now; evaluates its own earlier actions | Reads at a past commit; diffs across history; commit changes with actors; with orient, the second most common read |
+| Look back | Asks what was known at a time, what was decided and why, what happened after; compares a past state with now; evaluates its own earlier actions and those of others | Reads at a past commit; diffs across history; commit changes with actors; questions about when a fact held true, not only when it was recorded; with orient, the second most common read |
 | Maintain | Adjusts the model as the domain is understood better: adds a type or property, widens an enum, re-embeds, rebuilds coverage, prunes | Additive schema applies; index and layout maintenance; rare, reviewed destructive changes and cleanup |
 | Report | Answers a person's question or produces a report or dashboard: the analytical mode of retrieve, with larger results and no step waiting on it | Aggregation over whole types; larger results; scheduled or occasional |
 
@@ -78,18 +80,47 @@ sync and owned by its source, authored knowledge is owned by the graph, and
 the two provenances stay distinguishable, because agents read both together
 and write only the second, or propose changes to the first.
 
+### What the evidence says
+
+The hypothesis was checked against the literature on 2026-11-16 ([sources](#sources)).
+No source measures several agents sharing one persistent model, so the
+premise is untested, not confirmed.
+
+- **Supported.** Agents explore schema and metadata heavily, issue many
+  redundant and partial reads, and create and discard branches at many times
+  the human rate [18] [24]. Shared structured state coordinates better than
+  messages passed between agents [20] [23]. Verification is a leading cause
+  of multi-agent failure, and independent checking contains errors that
+  unchecked agents amplify [21] [22]. Long-term memory needs time-aware
+  retrieval and facts that are superseded, not erased [28]. Coordination
+  through a shared medium needs change-triggered activation with a
+  condition, an atomic claim, and hypotheses held side by side with
+  confidence, as blackboard systems and tuple spaces established [25] [26].
+- **Against.** Production multi-agent systems are mostly several readers and
+  one writing lead per task, and strong practitioners argue against agents
+  writing in parallel at all [23]; measured gains from adding agents are
+  small on average and negative for sequential work [22]. The read-to-write
+  ratio is unmeasured, and memory pipelines that write on every turn would
+  bring it near one to one. Most agent-memory systems are schemaless: that
+  the shared model is **typed** is this page's bet, argued from
+  standardization as the way to make one party's output usable by another
+  [29], not an observation.
+- **Outside the store.** Scheduling and control (which agent runs next, and
+  on what) is a separate component in every coordination architecture
+  [25]. The contract owes it the facts it decides from, visible in the
+  state: pending work, claims and who is working on what.
+
 ### Quantities
 
 | Quantity | Hypothesis | Revise when |
 |---|---|---|
-| Actors | A few to tens of agents per graph at once, a few people, a handful of programs; many graphs per deployment rather than one | Hundreds of concurrent agents on one graph |
+| Actors | A few to tens of agents per graph at once, most of them reading for one task while one lead writes it (three to five sub-agents is common, more than ten for a hard task [23]); a few people; a handful of programs; many graphs per deployment rather than one | Hundreds of concurrent agents on one graph; many agents writing one task's branch |
 | Read capacity | Tens of agents at several retrieve reads a step is more read load than one process should carry, and it grows with agents while write load grows with tasks; reads are served by several processes | One process serves a graph's reads with headroom at the hypothesized actors |
-| Mix | Reads outnumber writes by one to two orders of magnitude; most reads are lookups, and a real minority, perhaps one in ten, are analytical reads over whole types; authored commits dominate writes by count, acquisition and sync by rows; deletes are rare everywhere | Analytical reads become the majority; updates or deletes become common; result sets pass 10^4 rows |
+| Mix | Reads outnumber writes by one to two orders of magnitude; most reads are lookups and exploration, largely overlapping across agents, and a real minority, one in ten or more, are analytical reads over whole types; authored commits dominate writes by count, acquisition and sync by rows; deletes are rare everywhere | Analytical reads become the majority; a write on every agent turn brings reads and writes near one to one; updates or deletes become common; result sets pass 10^4 rows |
 | Volume | 10^4 to 10^7 entities per graph, set by the sources; 10 to 100 types; small scalar properties, text bodies, embeddings on a few types, Blobs for documents; agent batches of 10^2 to 10^5 records, whole-source imports and backfills to 10^7 records and 10^4 documents | 10^8 entities or 10^3 types; batches past 10^6; sync as streaming at thousands of events a second |
-| Rate | 10^2 to 10^4 commits a day; tens of live branches with hundreds of commits each and one writer; incremental sync every few minutes; an additive schema change about weekly; history retained long and read as often as the present | Commit rate or branch count up an order; several writers on one branch; conflict retries common; destructive schema changes frequent; history read rarely |
-
+| Rate | 10^2 to 10^4 commits a day; two kinds of branch: tens of task branches with hundreds of commits each and one writer, and many more short speculative branches of a few commits, most of them discarded, about ten live per task and nested deep [24]; incremental sync every few minutes; an additive schema change about weekly; history retained long and read as often as the present | Commit rate or branch count up an order; several writers on one branch; conflict retries common; destructive schema changes frequent; history read rarely; branches rarely abandoned |
 | Reaction | Tens of standing consumers per graph (agents, pipelines, downstream systems), each filtered to a few types; a change reaches its consumers within seconds of its commit; reaction chains a few steps deep | Hundreds of consumers; sub-second delivery needed; reaction storms |
-| Targets | No latency is measured yet. As a starting hypothesis for a warm handle in the store's region: a retrieve read answers in about 100 ms at the median and under 1 s at the tail; a small commit publishes in under 1 s; one branch publishes its commits serially, a few a second at most, which the hypothesized rate needs on average at one every several seconds, with bursts on shared state from merges and syncs | Measured figures replace these; shared state needs sustained tens of commits a second |
+| Targets | No latency is measured yet. As a starting hypothesis for a warm handle in the store's region: a retrieve read answers in about 100 ms at the median and under 1 s at the tail; (agent-memory systems report 0.15 to 0.5 s for a search, embedding and network included [30]); a small commit publishes in under 1 s; creating and discarding a branch costs about what a small commit costs; one branch publishes its commits serially, a few a second at most, which the hypothesized rate needs on average at one every several seconds, with bursts on shared state from merges and syncs | Measured figures replace these; shared state needs sustained tens of commits a second |
 
 ### Against the usual categories
 
@@ -124,12 +155,13 @@ In this order, and a later item never buys an earlier one: the clauses above
 cost on this work. On cost the direction is: retrieve reads first, lookups
 and then analytical reads, because both sit on the critical path of an agent
 step; then the cost of a small
-commit and of a branch, because authoring and coordination are the common
-writes; then history, change discovery and delivery of changes to those waiting on
+commit and of creating, writing and discarding a branch, because authoring,
+speculation and coordination are the common writes; then history, change discovery and delivery of changes to those waiting on
 them; then bulk acquisition and sync, whose cost should follow what changed,
 not what was sent.
 Read capacity scales out by adding reader processes; write capacity on one
-branch does not, and need not at the hypothesized rate. An analytical read
+branch does not, and need not at the hypothesized rate. Reads that overlap, across agents or across one agent's attempts, should
+share work. An analytical read
 may cost more than a lookup but not in proportion to history, and a lookup
 is never slowed to serve one. Warehouse-scale scans and single-branch write
 throughput beyond the hypothesized rate are not optimized for, and a design
@@ -158,11 +190,12 @@ belong in the contract.
 |---|---|---|
 | **Multiple agents**, in parallel, restarting at any time | Let many act at once without corrupting each other: each step's writes land whole or not at all, a retried request is not applied twice, and every change names who made it | 1, 5, 7 |
 | **Sharing** one model | Be one authoritative state that every agent reads and writes through the same rules, with access scoped to what each agent may see and change | 2, 7 |
-| A **typed world model** | Enforce the model on every write, by every writer; let the model change as understanding grows, as reviewably as the data does | 4 |
+| A **typed world model** | Let agents find what the model holds by searching its types, properties and descriptions; enforce the model on every write, by every writer; let the model change as understanding grows, as reviewably as the data does | 4 |
 | **Continuously**, over a long horizon | Stay available while it is written, maintained and evolved; keep what was known and when, so an agent can resume, reflect, audit and undo; never grow slower with age | 5, 6 |
 | **Retrieve** context | Answer selective, combined-mode and analytical reads from one coherent, current view, at a latency a step can afford, from as many readers as the agents need | 2, 7 |
 | **Update** context | Accept small frequent writes, whole-source imports of structured and unstructured data, and sync pipelines that mostly rewrite what did not change, each at a cost that follows what changed; let an agent protect a decision against the state it was based on | 1, 2, 5 |
-| **Coordinate work** | Give agents long isolated workspaces that integrate without losing or silently overriding each other's work; let an agent or a pipeline react to a change soon after it commits, in order, without polling and without missing one; make a claim on a task exclusive | 2, 3, 6 |
+| **Coordinate work**, with awareness | See what others are working on, so that work is not duplicated: active branches with their owner, task and what they touch, and live claims | 6 |
+| **Coordinate work** | Give agents long isolated workspaces that integrate without losing or silently overriding each other's work; let an agent or a pipeline react to a change soon after it commits, in order, without polling and without missing one; make a claim on a task exclusive, with exactly one winner; integrate a workspace only after an independent check passes; make trying an idea and discarding it nearly free | 2, 3, 6 |
 
 ## B: the boundary
 
@@ -191,8 +224,10 @@ and its cluster deployment state.
 - A **graph commit** is an immutable, id-addressed version of the whole graph
   with its parent or parents, branch, actor when known, and a writer-clock
   timestamp. Commits form a version graph, a directed acyclic graph per
-  graph; a merge commit has exactly two parents. Time is transaction time
-  only: there is no valid time. There is no checkout or working copy: a read
+  graph; a merge commit has exactly two parents. Commit time is transaction time: when a fact was recorded. When a fact held true in the
+  world (valid time) is modeled by the schema, as properties, and a fact
+  that stopped being true is superseded, not erased, so the work can ask
+  both what was believed and what was the case. There is no checkout or working copy: a read
   names a branch head or a commit, and every write is a commit.
 - A **branch** is a named history: a head commit and the commits reachable
   from it. `main` always exists. A deleted name and a recreated one are
@@ -284,6 +319,9 @@ workspace others do not see until it is ready.*
   the same rule. The condition is as narrow as the decision: an agent names
   the commit, the entities or the query its decision depended on, so that an
   unrelated commit by another agent does not refuse it.
+- **Claims.** When several agents claim one thing at once, a task or an
+  entity, exactly one succeeds and the others learn who holds it; an
+  unrelated commit never makes a claim fail.
 - **Readers and writers scale out.** A read learns the head from storage,
   never from another process. Any number of reader processes may serve one
   root; none coordinates with the writer or with another reader, and each is
@@ -358,6 +396,9 @@ stop for a decision where they did, never pick silently.*
   same whichever merges first; commit ids, history shape and feed order
   differ. This is a property of this merge, not a convergence result:
   conflicting changes are refused, not resolved.
+- A merge can be gated: the target names a check that the branch must pass,
+  run by a party other than its author, and a branch that fails it does not
+  merge.
 - Conflicts and violations are reported per entity, typed, and resolved by
   writing to a branch and merging again. Not promised: automatic resolution,
   a precedence rule (ours, theirs or last-writer-wins), or a merge of more
@@ -435,8 +476,12 @@ time, and a mistake by one agent must be undoable without losing the rest.*
   idempotently. Reclaimed history, a schema boundary and a cursor from
   another branch lifetime are typed refusals, never silent gaps. A consumer
   can wait for the next matching change instead of polling for it, filtered
-  by type and operation, and learns of a commit soon after it is
-  acknowledged, so agents and pipelines can react to events.
+  by type and operation and by a condition over the changed state, so that
+  it wakes only for what concerns it, and learns of a commit soon after it
+  is acknowledged.
+- Work in progress is visible: which branches are live, who owns each, for
+  what task, and which entities it has touched, recorded as the work happens
+  and not by a separate report from the agent.
 - A commit records who made it and, when the caller says so, why: the task
   and the reason, readable wherever the commit is.
 - A commit or a merge can be reverted by one operation that publishes its
@@ -495,12 +540,17 @@ is a deliberate limit says so.
 | 2, 5 | A process that claimed a branch's writer epoch (embedded engine only) reads its bound branch without checking the head: it is stale once another process replaces it or deletes the branch, and can answer some reads with no storage request while the store is unreachable | Deliberate: the owner trades the check for latency. Wanted is a bounded staleness the owner can state |
 | 2 | Read replicas are not a supported topology: a served process takes the cluster's writer admission, so one server serves a cluster, and only read-only CLI commands read beside it | A read-only serving mode that takes no writer admission, so read capacity grows with processes |
 | 2 | A conditional write names one commit and is refused by any intervening commit on the branch, related or not | *Derived.* A condition scoped to the entities or query the decision read |
+| S | Valid time and supersession have no construct: a schema models them as ordinary properties, and nothing ranks or filters by them specially | *Derived.* Decide whether valid time stays a schema convention or becomes a construct |
+| 2 | A claim is a conditional write on the whole branch head, so claimants on a busy branch refuse each other and unrelated writers refuse them | *Derived.* An exclusive claim with one winner, unaffected by unrelated commits |
 | 2 | A merge records and checks no read dependency, so a conclusion can merge on evidence that changed on the target | *Derived.* Declared dependencies, reported at merge when stale |
 | 3 | Conflict detection is by whole entity: two agents changing different properties of one entity conflict (`divergent_update`) | *Derived.* Property-level merge with the merged entity rechecked |
+| 3 | A merge is gated by policy on who may merge, not by a check on what is merged | *Derived.* A named check as a precondition of a merge |
+| 4 | Types and properties carry descriptions, but nothing searches the schema by meaning | *Derived.* Search over the schema's names and descriptions |
 | 4 | Schema apply runs against `main` only, with no other branch live, outside review by branch | A schema change proposed on a branch and merged, with branches live |
 | 5 | Graph writes carry no request identity: a lost answer is resolved by reading history, and only a conditional write is safe to repeat. Recorded operations do carry one | *Derived.* An idempotency identity on every write |
 | 5 | Replacing a serving process is stop, then start; `optimize` and schema apply hold writer gates while they run | Continuous service through replacement and maintenance |
-| 6 | A commit records an actor only; a change feed is polled; there is no revert, and undoing is a hand-written inverse commit | *Derived.* Task and reason on the commit, a waiting feed, revert as an operation |
+| 6 | A commit records an actor only; a change feed is polled and filters by kind, type and operation, with no condition over state; there is no revert, and undoing is a hand-written inverse commit | *Derived.* Task and reason on the commit, a waiting feed with a condition, revert as an operation |
+| 6 | A branch listing shows head, origin and times, not owner, task or touched entities | *Derived.* Work in progress visible in the state |
 | 7 | Policy scope stops at a branch class (any, protected, unprotected): no type-level or property-level scope | Type and property scope, as the access-authority work proposes |
 | O | An aggregate read with an `order` breaks ties between groups by nothing, so groups equal on the order keys come back in unspecified order | One total order for every sorted read |
 | 5 | On a local filesystem root nothing is fsynced: an acknowledged commit survives a process crash, not necessarily power loss or an operating-system crash. On an object store it is durable at acknowledgement | Durable at acknowledgement on every supported root, or local roots declared development-only |
@@ -544,6 +594,9 @@ wire compatibility are owned by [versioning](versioning.md).
   writes listed under [today and the target](#today-and-the-target) do not.
 - **Trust.** The server boundary is trusted to resolve actors. An embedded or
   direct caller is trusted as the operator who gave it the root.
+- **Control.** Deciding which agent runs next, and on what, is a client
+  component outside the contract. The contract owes it the facts it decides
+  from, readable in the state.
 - **Delegated.** Three things a commit depends on sit outside it. Stored
   vectors are computed outside the write path, by the offline `embed` step or
   the client: no load or mutation calls a provider, and nothing detects a
@@ -612,5 +665,42 @@ citation used in the text. The method's own sources are in
 17. Databricks, "Databricks Launches LTAP" (press release, 16 June 2026),
     and R. Xin, "From monolith to Lakebase to LTAP" (30 June 2026).
 
-Not grounded in a source read here: the definition of durability, and the
-latency and rate figures in the work, which are hypotheses.
+On the work itself, read on 2026-11-16:
+
+18. Liu et al. (UC Berkeley), "Supporting Our AI Overlords: Redesigning Data
+    Systems to be Agent-First", CIDR 2026; and Parameswaran et al.,
+    "Intelligence is Free, Now What? Data Systems for, of, and by Agents",
+    BAIR blog, 2026.
+19. Lei et al., "Spider 2.0", ICLR 2025: agent query behavior on large
+    schemas.
+20. Hong et al., "MetaGPT", ICLR 2024; Wu et al., "AutoGen", 2023: shared
+    structured pools and message-driven activation.
+21. Cemri et al., "Why Do Multi-Agent LLM Systems Fail?", NeurIPS 2025.
+22. Kim et al., "Towards a Science of Scaling Agent Systems", 2025.
+23. Anthropic, "How we built our multi-agent research system" and
+    "Effective context engineering for AI agents"; Cognition, "Don't Build
+    Multi-Agents", the opposing view.
+24. Pandis, Shamgunov and Xin, "How agentic software development will change
+    databases", Databricks, 2026 (vendor telemetry); Tagliabue and Greco,
+    "Safe, Untrusted, 'Proof-Carrying' AI Agents", 2025; Chang and Geng,
+    "SagaLLM", PVLDB 2025; Rezazadeh et al., "Collaborative Memory", 2025.
+25. Erman et al., "The Hearsay-II Speech-Understanding System", Computing
+    Surveys 1980; Han and Zhang, and Salemi et al., blackboard systems for
+    LLM agents, 2025.
+26. Gelernter, "Generative Communication in Linda", TOPLAS 1985.
+27. Park et al., "Generative Agents", UIST 2023; Packer et al., "MemGPT",
+    2023; Sumers et al., "Cognitive Architectures for Language Agents",
+    TMLR 2024; Edge et al., "From Local to Global: A GraphRAG Approach",
+    2024; Gutierrez et al., "HippoRAG", NeurIPS 2024.
+28. Rasmussen et al., "Zep: A Temporal Knowledge Graph Architecture for
+    Agent Memory", 2025; Wu et al., "LongMemEval", ICLR 2025; Maharana et
+    al., "LoCoMo", ACL 2024.
+29. Malone and Crowston, "The Interdisciplinary Study of Coordination",
+    Computing Surveys 1994; Dourish and Bellotti, "Awareness and
+    Coordination in Shared Workspaces", CSCW 1992; Ellis and Gibbs,
+    "Concurrency Control in Groupware Systems", SIGMOD 1989.
+30. Chhikara et al., "Mem0", 2025: measured memory search latency.
+
+Not grounded in a source read here: the definition of durability; the
+read-to-write ratio, the latency targets and the rate figures in the work,
+which no source measures for a shared model and which remain hypotheses.
