@@ -2468,10 +2468,13 @@ impl Omnigraph {
     /// The re-read goes through this handle's control session, so it observes
     /// the destination the handle is bound to rather than one the ambient
     /// provider configuration selects.
+    ///
+    /// Returns the snapshot with the branch's effective graph head at that
+    /// same `__manifest` version (an unpublished fork's inherited head).
     pub(crate) async fn fresh_snapshot_for_branch_unchecked(
         &self,
         branch: Option<&str>,
-    ) -> Result<Snapshot> {
+    ) -> Result<(Snapshot, String)> {
         let session = self.control_session();
         let manifest = match branch {
             Some(branch) => {
@@ -2487,7 +2490,8 @@ impl Omnigraph {
                     .await?
             }
         };
-        Ok(Snapshot::wrap(manifest.snapshot()))
+        let head = manifest.head().graph_commit_id.clone();
+        Ok((Snapshot::wrap(manifest.snapshot()), head))
     }
 
     #[cfg(test)]

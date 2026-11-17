@@ -923,6 +923,14 @@ decide_seam! {
 }
 
 decide_seam! {
+    /// After a mutation has executed and staged its rows in memory, before
+    /// validation judges them. Tests park a conditional writer here so another
+    /// writer publishes between its precondition check and its live `@card`
+    /// count (#1424).
+    pub static MUTATION_POST_EXECUTE_PRE_VALIDATE = ("mutation.post_execute_pre_validate", Mutation, [Fail]);
+}
+
+decide_seam! {
     /// After a conditional mutation has executed to a zero-effect result, but
     /// before it acquires the branch gate and revalidates the caller's graph
     /// head. This pins the linearization point for successful no-op CAS calls.
@@ -1255,6 +1263,7 @@ impl Omnigraph {
             committed: JudgedSide::Live {
                 base,
                 branch: txn.branch.clone(),
+                caller_head: txn.caller_expected_graph_head.clone(),
             },
             write_budget,
             catalog: Arc::clone(&txn.catalog),
@@ -1457,6 +1466,7 @@ impl Omnigraph {
                 })
             }
             Ok(total) => {
+                fail(&MUTATION_POST_EXECUTE_PRE_VALIDATE)?;
                 let mut committed = self
                     .commit_staged_mutation(
                         staging,
