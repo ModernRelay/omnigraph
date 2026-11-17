@@ -2285,6 +2285,21 @@ query nullable_vectors() {
     return { $v.name, $v.embedding }
     order { $v.name }
 }
+query slug_lookup() {
+    match { $d: Doc } where $d.slug = "ml-intro"
+    return { $d.slug, $d.title }
+    order { $d.slug }
+}
+query title_contains() {
+    match { $d: Doc } where contains($d.title, "organism")
+    return { $d.slug }
+    order { $d.slug }
+}
+query title_contains_case() {
+    match { $d: Doc } where contains($d.title, "ORGANISM")
+    return { $d.slug }
+    order { $d.slug }
+}
 "#;
     let predecessor_added_queries = r#"
 query terms($term: String) {
@@ -2296,6 +2311,21 @@ query nullable_vectors() {
     match { $v: NullableVector }
     return { $v.name, $v.embedding }
     order { $v.name }
+}
+query slug_lookup() {
+    match { $d: Doc $d.slug = "ml-intro" }
+    return { $d.slug, $d.title }
+    order { $d.slug }
+}
+query title_contains() {
+    match { $d: Doc $d.title contains "organism" }
+    return { $d.slug }
+    order { $d.slug }
+}
+query title_contains_case() {
+    match { $d: Doc $d.title contains "ORGANISM" }
+    return { $d.slug }
+    order { $d.slug }
 }
 "#;
     fs::write(
@@ -2482,7 +2512,20 @@ query nullable_vectors() {
         assert!(docs.has_unindexed_fragments().await.unwrap());
     });
     const BRANCHES: [&str; 2] = ["main", "review"];
-    const QUERIES: [&str; 5] = ["docs", "edges", "vectors", "terms", "nullable_vectors"];
+    // The last three filter the String columns on which the candidate's
+    // `optimize` builds BTREE and NGRAM indexes the predecessor never builds;
+    // `title_contains_case` matches no row unless a reader skips the NGRAM
+    // index's case-sensitive recheck.
+    const QUERIES: [&str; 8] = [
+        "docs",
+        "edges",
+        "vectors",
+        "terms",
+        "nullable_vectors",
+        "slug_lookup",
+        "title_contains",
+        "title_contains_case",
+    ];
     let exports = BRANCHES.map(|branch| export(&old, branch));
     let histories = BRANCHES.map(|branch| history(&old, branch));
     let heads: [String; 2] = std::array::from_fn(|index| {
@@ -2503,6 +2546,21 @@ query nullable_vectors() {
         json!([{"d.slug":"ml-intro"}, {"d.slug":"old-tail"}])
     );
     assert_eq!(answers[1][3], json!([{"d.slug":"ml-intro"}]));
+    assert_eq!(
+        answers.each_ref().map(|answer| answer[5..].to_vec()),
+        [
+            vec![
+                json!([{"d.slug":"ml-intro", "d.title":"organism indexed"}]),
+                json!([{"d.slug":"ml-intro"}, {"d.slug":"old-tail"}]),
+                json!([]),
+            ],
+            vec![
+                json!([{"d.slug":"ml-intro", "d.title":"organism review"}]),
+                json!([{"d.slug":"ml-intro"}]),
+                json!([]),
+            ],
+        ]
+    );
     let certificates: Vec<_> = before
         .iter()
         .filter(|(path, _)| {
@@ -2597,12 +2655,15 @@ query nullable_vectors() {
         !new_certificates.is_empty(),
         "the candidate must build new posting artifacts"
     );
+    // Format 2 records the field's analyzer fingerprint; the predecessor
+    // reads only format 1, so it refuses these postings below.
     for (_, bytes) in new_certificates {
         let certificate: Value = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
             certificate["analyzer_generation"],
             "lance11.0.0-frostem1.20260821.3-v1"
         );
+        assert_eq!(certificate["format_version"], 2);
     }
     run(&current, &["optimize", "--target", uri]);
     run(
@@ -2622,6 +2683,27 @@ query nullable_vectors() {
             manifest.manifest().writer_version.as_ref().unwrap().version,
             "13.0.0"
         );
+        // The candidate's `optimize` builds BTREE and NGRAM indexes on the
+        // String columns of main, the branch it optimized; the predecessor
+        // never builds these.
+        let db = Omnigraph::open(uri).await.unwrap();
+        for (branch, built) in [("main", true), ("review", false)] {
+            let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await.unwrap();
+            let names = snapshot
+                .open_dataset("node:Doc")
+                .await
+                .unwrap()
+                .built_index_names()
+                .await
+                .unwrap();
+            for name in ["slug_btree", "title_btree", "title_ngram"] {
+                assert_eq!(
+                    names.iter().any(|index| index == name),
+                    built,
+                    "{branch} {name}: {names:?}"
+                );
+            }
+        }
     });
     assert_eq!(
         rows(&current, "--branch", "main", "terms"),
@@ -2640,15 +2722,74 @@ query nullable_vectors() {
             format!("base64:{payload}")
         );
     }
-    // Qualified rollback reads actual candidate data and index writes, including
-    // all-null nullable outer vectors, rather than only reopening old files.
+    // Rollback in place after the candidate built or rebuilt an index is not
+    // supported: the predecessor reads the candidate's data writes, including
+    // all-null nullable outer vectors, and answers as the candidate does, or it
+    // refuses; it never answers differently. The candidate rebuilt main's
+    // full-text indexes with fingerprint certificates, which the predecessor
+    // refuses without returning rows. The supported rollback is the backup
+    // restore below.
+    //
+    // The predecessor plans `title_contains` on main through the candidate's
+    // NGRAM index, so its equal answer below covers that index kind.
+    let explain = support::parse_stdout_json(&run(
+        &old,
+        &[
+            "query",
+            "-e",
+            r#"explain query title_contains() { match { $d: Doc $d.title contains "organism" } return { $d.slug } }"#,
+            "--store",
+            uri,
+            "--branch",
+            "main",
+            "--json",
+        ],
+    ));
+    let scan = explain["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["tree"] == "physical" && row["node"] == "Scan")
+        .unwrap();
+    let scan: Value = serde_json::from_str(scan["detail"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        (&scan["access"], &scan["index"]),
+        (&json!("index_probe"), &json!(["title_ngram"]))
+    );
     for (index, branch) in BRANCHES.into_iter().enumerate() {
         assert_eq!(export(&old, branch), export(&current, branch));
         for (query_index, name) in QUERIES.into_iter().enumerate() {
-            assert_eq!(
-                rows(&old, "--branch", branch, name),
-                rows(&current, "--branch", branch, name)
-            );
+            if (branch, name) == ("main", "terms") {
+                let output = run_old(
+                    &old,
+                    &[
+                        "query",
+                        "terms",
+                        "--query",
+                        predecessor_query_path,
+                        "--store",
+                        uri,
+                        "--branch",
+                        branch,
+                        "--params",
+                        r#"{"term":"ORGANISM"}"#,
+                        "--json",
+                    ],
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    !output.status.success()
+                        && output.stdout.is_empty()
+                        && stderr.contains("requires rebuild")
+                        && stderr.contains("analyzer certificate payload is malformed"),
+                    "the predecessor must refuse the candidate's full-text postings: {output:?}"
+                );
+            } else {
+                assert_eq!(
+                    rows(&old, "--branch", branch, name),
+                    rows(&current, "--branch", branch, name)
+                );
+            }
             for binary in [&old, &current] {
                 assert_eq!(
                     rows(binary, "--snapshot", &heads[index], name),
@@ -2666,8 +2807,10 @@ query nullable_vectors() {
             untrained_terms
         );
     }
-    // No backup command exists: reuse the owner's offline whole-root byte-copy
-    // restore at the original path, including native refs and index artifacts.
+    // The supported rollback restores the backup taken before the candidate
+    // wrote. No backup command exists: reuse the owner's offline whole-root
+    // byte-copy restore at the original path, including native refs and index
+    // artifacts.
     fs::remove_dir_all(&graph).unwrap();
     for (path, bytes) in &before {
         let destination = graph.join(path);
