@@ -198,7 +198,7 @@ async fn open_case_store(case: &Case) -> Result<(Session, String, tempfile::Temp
         .map_err(|e| format!("init failed: {e}"))?;
     let db = with_case_external_blob_policy(db, case)?;
     let session = case_session(db, case)?;
-    seed_case(&session, &fixture.seed, case.needs_indices).await?;
+    seed_case(&session, fixture, case.needs_indices).await?;
     Ok((session, uri, dir))
 }
 
@@ -307,7 +307,7 @@ async fn execute_case_with_storage(
     let db = with_case_external_blob_policy(db, case)?;
     let session = case_session(db, case)?;
     if let (None, Some(fixture)) = (prepared, case.fixture.as_ref()) {
-        seed_case(&session, &fixture.seed, case.needs_indices).await?;
+        seed_case(&session, fixture, case.needs_indices).await?;
     }
     omnigraph_gqt_core::execute_steps(case, path, false, session, uri, Some(storage), &PLAIN_HOST)
         .await
@@ -656,7 +656,9 @@ pub async fn execute_with_layout(case: &Case, path: &Path, layout: Layout) -> Re
         .map_err(|e| format!("init failed: {e}"))?;
     let db = with_case_external_blob_policy(db, case)?;
     let session = case_session(db, case)?;
-    fixture.seed.load(&session).await?;
+    // The fixture as the corpus seeds it (its rows and declared branches),
+    // without index preparation: the layout decides the indexes.
+    seed_case(&session, fixture, false).await?;
     let index = |session: &Session| {
         let session = session.clone();
         async move {
