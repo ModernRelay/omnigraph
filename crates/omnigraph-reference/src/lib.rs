@@ -1260,19 +1260,27 @@ impl<'a> Interpreter<'a> {
                 ty,
             } => {
                 let l = self.expr(left, row, env)?;
+                // `and` and `or` are guards, left to right (section 2,
+                // scalar expressions): `a and b` evaluates `b` only where `a`
+                // is not false, `a or b` only where `a` is not true, so a
+                // right side that can fail never runs on a decided row.
                 match op {
                     BinaryOp::And => {
-                        let r = self.expr(right, row, env)?;
-                        match (l, r) {
-                            (Value::Bool(false), _) | (_, Value::Bool(false)) => Value::Bool(false),
+                        if l == Value::Bool(false) {
+                            return Ok(Value::Bool(false));
+                        }
+                        match (l, self.expr(right, row, env)?) {
+                            (_, Value::Bool(false)) => Value::Bool(false),
                             (Value::Bool(true), Value::Bool(true)) => Value::Bool(true),
                             _ => Value::Null,
                         }
                     }
                     BinaryOp::Or => {
-                        let r = self.expr(right, row, env)?;
-                        match (l, r) {
-                            (Value::Bool(true), _) | (_, Value::Bool(true)) => Value::Bool(true),
+                        if l == Value::Bool(true) {
+                            return Ok(Value::Bool(true));
+                        }
+                        match (l, self.expr(right, row, env)?) {
+                            (_, Value::Bool(true)) => Value::Bool(true),
                             (Value::Bool(false), Value::Bool(false)) => Value::Bool(false),
                             _ => Value::Null,
                         }

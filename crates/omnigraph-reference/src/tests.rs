@@ -310,6 +310,32 @@ fn integer_overflow_is_the_e1_refusal() {
     assert!(matches!(refused, Refusal::Runtime("E1", _)), "{refused:?}");
 }
 
+/// `and` and `or` are guards, left to right: the right side runs only
+/// where the left does not decide, so its overflow never fires on a row the
+/// left decides, and fires on a row it does not.
+#[test]
+fn and_and_or_evaluate_their_right_side_only_where_the_left_does_not_decide() {
+    let big = "($p.age * 2147483647) > 0";
+    assert_eq!(
+        rows(&format!(
+            "query q() {{ match {{ $p: Person }} where $p.name = \"ann\" return {{ $p.name, $p.name = \"ann\" or {big} as x }} }}"
+        )),
+        vec![json!({"p.name": "ann", "x": true})]
+    );
+    assert_eq!(
+        rows(&format!(
+            "query q() {{ match {{ $p: Person }} where $p.name = \"ann\" return {{ $p.name, $p.name != \"ann\" and {big} as x }} }}"
+        )),
+        vec![json!({"p.name": "ann", "x": false})]
+    );
+    for guard in ["$p.name = \"bob\" or", "$p.name = \"ann\" and"] {
+        let refused = run_refused(&format!(
+            "query q() {{ match {{ $p: Person }} where $p.name = \"ann\" return {{ {guard} {big} as x }} }}"
+        ));
+        assert!(matches!(refused, Refusal::Runtime("E1", _)), "{refused:?}");
+    }
+}
+
 #[test]
 fn a_bare_node_renders_as_its_object() {
     let out = rows("query q() { match { $p: Person } where $p.name = \"bob\" return { $p } }");
