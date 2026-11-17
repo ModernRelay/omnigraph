@@ -9,6 +9,41 @@ Work through the steps in order. Ask the user only where a step says so; take
 the default otherwise and tell them what you chose. Run each command yourself
 and check its output before moving on.
 
+## In short
+
+<!-- omnigraph.dev's /llms.txt prints this section as its setup steps. Keep it
+in step with the steps below, and keep the heading: the site's build fails
+without it. -->
+
+1. Install the CLI and check that `omnigraph version` runs (step 1).
+2. Export the skill that matches the installed CLI with
+   `omnigraph skill export ~/.claude/skills/omnigraph --force --json` (use
+   your agent's skills directory if it is not Claude Code), then read its
+   `SKILL.md`. `omnigraph skill show` prints it without installing anything
+   (step 2).
+3. Find the use case. If the user has none in mind yet, show them what people
+   build: each use case has a cookbook you can load into a local graph for them
+   to try (step 3).
+4. Write the user's questions as `.gq` queries first, then the schema they
+   need, and lint both before you create the graph, load it and query it
+   (steps 4 to 7).
+5. Register the graph as a named target with `omnigraph target add`, so
+   `omnigraph target list` shows it from any directory (step 8).
+6. Ask to add a section on all the user's graphs to their global agent file
+   (`~/.claude/CLAUDE.md` or `~/.codex/AGENTS.md`): every session runs
+   `omnigraph target list` at least, reads a graph's schema before using it,
+   pulls context from the graphs, and offers to record what should outlast the
+   session on a branch the user approves before it merges into main (step 8).
+7. Make the graph the canonical store for its use case in the project's
+   `AGENTS.md`, with the same rules and the target's name (step 8).
+
+Setup is complete only when `omnigraph version` runs in a new shell, the
+exported skill is in a directory your agent loads skills from, `omnigraph lint`
+passes, the queries return rows, `omnigraph target list` shows the graph, the
+global agent file lists it (or the user declined), and the project's
+`AGENTS.md` names the use case and the target and carries those rules. If your
+agent must restart to load the skill, tell the user the exact step to resume.
+
 ## 1. Install the CLI
 
 Check first whether it is already installed:
