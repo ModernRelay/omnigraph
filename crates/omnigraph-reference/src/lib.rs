@@ -21,14 +21,15 @@ use std::collections::{BTreeMap, HashMap};
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::IRExpr;
 use omnigraph_compiler::ir::core::{
-    Agg, Col, CoreRead, Count, LexicalQuery, RelTy, ScoreKind, ScoreQuery, Term, Ty,
+    Agg, Col, CoreRead, Count, LexicalQuery, RRF_MAX_K, RelTy, ScoreKind, ScoreQuery, Term, Ty,
 };
 use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
 use omnigraph_compiler::query::syntax::ArithOp;
 use omnigraph_compiler::query::value::{AggFunc, BinaryOp, CompOp, Literal, NOW_PARAM_NAME};
 use omnigraph_compiler::schema::vector::{VectorDistance, is_zero_vector};
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
-use omnigraph_compiler::types::{Direction, ExprType, ScalarType};
+use omnigraph_compiler::types::{Direction, ExprType, PropType, ScalarType};
+use omnigraph_compiler::{check_datetime_literal, date_literal_days, datetime_literal_millis};
 use serde_json::{Map, Value as Json};
 
 /// Why the interpreter returned no rows.
@@ -99,7 +100,8 @@ impl Value {
     fn from_literal(l: &Literal) -> Self {
         match l {
             Literal::Null => Self::Null,
-            Literal::String(s) | Literal::Date(s) | Literal::DateTime(s) => Self::Str(s.clone()),
+            Literal::String(s) | Literal::Date(s) => Self::Str(s.clone()),
+            Literal::DateTime(s) => Self::Str(canonical_datetime(s).unwrap_or_else(|| s.clone())),
             Literal::Integer(i) => Self::Int(*i),
             Literal::Float(f) => Self::Float(*f),
             Literal::Bool(b) => Self::Bool(*b),
@@ -291,6 +293,8 @@ pub struct Interpreter<'a> {
     catalog: &'a Catalog,
     graph: &'a Graph,
     params: HashMap<String, Value>,
+    /// The caller bound `now()`'s reserved name, which binding refuses.
+    binds_now: bool,
     /// The current value of each recursive read inside its `Fix`.
     rec: HashMap<String, Vec<Row>>,
 }
@@ -300,6 +304,7 @@ impl<'a> Interpreter<'a> {
         Self {
             catalog,
             graph,
+            binds_now: params.contains_key(NOW_PARAM_NAME),
             params: {
                 let mut values: HashMap<String, Value> = params
                     .iter()
@@ -318,11 +323,29 @@ impl<'a> Interpreter<'a> {
     /// Run `read` and render its rows as the engine renders them: one JSON
     /// object per row, keyed by result column, a reference as its object.
     pub fn run(&mut self, read: &CoreRead) -> R<(Vec<Json>, bool)> {
-        // A parameter binds at its declared type.
+        // `now()` reads the clock of the read, never a caller's value.
+        if self.binds_now {
+            return Err(Refusal::Input(format!(
+                "param '{NOW_PARAM_NAME}': reserved for now() and cannot be bound"
+            )));
+        }
+        // A parameter binds at its declared type: an omitted one to its
+        // declared default, a nullable one without a default to null, and a
+        // required one without a default is refused, as is a value its
+        // declared type does not hold.
         for (name, ty) in &read.params {
-            if let Some(v) = self.params.remove(name) {
-                self.params.insert(name.clone(), typed(v, Some(ty.scalar)));
-            }
+            let value = match self.params.remove(name) {
+                Some(value) => value,
+                None => match read.defaults.iter().find(|(n, _)| n == name) {
+                    Some((_, default)) => Value::from_literal(default),
+                    None if ty.nullable => Value::Null,
+                    None => {
+                        return Err(Refusal::Input(format!("parameter '{name}' not provided")));
+                    }
+                },
+            };
+            let value = bind_param(name, value, ty)?;
+            self.params.insert(name.clone(), value);
         }
         let rel = self.term(&read.term, &Vec::new())?;
         let rows = rel
@@ -421,12 +444,25 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// A `limit`'s row count: a non-negative integer.
     fn count(&self, k: &Count) -> R<usize> {
+        self.count_within(k, 0, u64::MAX)
+    }
+
+    /// `k` bound within `min..=max`; a parameter outside it, or not an
+    /// integer, is refused, as a literal outside it is a type error: a
+    /// `limit` from zero, a `nearest` window from one, `rrf`'s constant
+    /// within `1..=RRF_MAX_K` (section 4, Errors: an option out of range).
+    fn count_within(&self, k: &Count, min: u64, max: u64) -> R<usize> {
         match k {
             Count::Literal(n) => Ok(*n as usize),
             Count::Param(p) => match self.params.get(p) {
-                Some(Value::Int(n)) if *n >= 0 => Ok(*n as usize),
-                other => Err(Refusal::Input(format!("`${p}` is no count: {other:?}"))),
+                Some(Value::Int(n)) if (i128::from(min)..=i128::from(max)).contains(n) => {
+                    Ok(*n as usize)
+                }
+                other => Err(Refusal::Input(format!(
+                    "`${p}` is no count in {min}..={max}: {other:?}"
+                ))),
             },
         }
     }
@@ -816,7 +852,7 @@ impl<'a> Interpreter<'a> {
                 // Exact: every target's distance, the `k` nearest kept.
                 let input = self.term(input, env)?;
                 let q = self.vector(query, env)?;
-                let k = self.count(k)?;
+                let k = self.count_within(k, 1, u64::MAX)?;
                 let mut best: Vec<(f64, Value)> = Vec::new();
                 for row in &input.rows {
                     let Some(target) = get(row, column).cloned() else {
@@ -860,7 +896,7 @@ impl<'a> Interpreter<'a> {
                 weights,
                 out,
             } => {
-                let k = self.count(k)? as f64;
+                let k = self.count_within(k, 1, RRF_MAX_K)? as f64;
                 let mut fused: Vec<(Value, f64)> = Vec::new();
                 for (i, arm) in arms.iter().enumerate() {
                     let best = self.ranked_targets(arm, target, env)?;
@@ -1165,6 +1201,8 @@ impl<'a> Interpreter<'a> {
     /// `match_terms(field, terms(q, mode, max_edits))`: every (`all`) or some
     /// (`any`) analyzed query term has a document term within the budget. A
     /// null or token-empty document does not match: the predicate is false.
+    /// `q` is a non-null String (section 4, The lexical query): a parameter
+    /// bound to null is refused.
     #[allow(clippy::too_many_arguments)]
     fn lexical(
         &self,
@@ -1178,7 +1216,7 @@ impl<'a> Interpreter<'a> {
         let analysis = self.field_analysis(field, row, env)?;
         let q = match self.expr(query, row, env)? {
             Value::Str(q) => analysis.tokens(&q)?,
-            _ => return Ok(Value::Null),
+            other => return Err(Refusal::Input(format!("a lexical query is {other:?}"))),
         };
         let doc = match self.expr(field, row, env)? {
             Value::Str(f) => analysis.tokens(&f)?,
@@ -1373,6 +1411,87 @@ fn finite_distance(d: f64) -> R<f64> {
     }
 }
 
+/// A `DateTime` as the engine renders it: the instant the string names
+/// (the compiler's one parse, `datetime_literal_millis`) in UTC, as
+/// `YYYY-MM-DDTHH:MM:SS` with `.mmm` where the milliseconds are not zero, so
+/// two spellings of one instant are one value and compare as one. `None`
+/// for a string that names no instant, or a year outside `0..=9999`.
+fn canonical_datetime(s: &str) -> Option<String> {
+    let millis = datetime_literal_millis(s).ok()?;
+    let (days, of_day) = (millis.div_euclid(86_400_000), millis.rem_euclid(86_400_000));
+    // Days since 1970-01-01 to the civil date (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    if !(0..=9999).contains(&year) {
+        return None;
+    }
+    let (hour, minute, second, ms) = (
+        of_day / 3_600_000,
+        of_day / 60_000 % 60,
+        of_day / 1000 % 60,
+        of_day % 1000,
+    );
+    let mut out = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}");
+    if ms != 0 {
+        out.push_str(&format!(".{ms:03}"));
+    }
+    Some(out)
+}
+
+/// A parameter's value at its declared type: a null for a non-nullable
+/// declaration, or a number its declared numeric type does not hold (an
+/// integer out of range, a float that is not finite or rounds to an
+/// infinite `F32`), is refused; a list is judged item by item.
+fn bind_param(name: &str, value: Value, ty: &PropType) -> R<Value> {
+    fn holds(value: &Value, scalar: ScalarType) -> bool {
+        match (value, scalar) {
+            (Value::Int(i), ScalarType::I32) => i32::try_from(*i).is_ok(),
+            (Value::Int(i), ScalarType::I64) => i64::try_from(*i).is_ok(),
+            (Value::Int(i), ScalarType::U32) => u32::try_from(*i).is_ok(),
+            (Value::Int(i), ScalarType::U64) => u64::try_from(*i).is_ok(),
+            (Value::Float(f), ScalarType::F32 | ScalarType::Vector(_)) => (*f as f32).is_finite(),
+            (Value::Float(f), ScalarType::F64) => f.is_finite(),
+            (Value::List(items), scalar) => items.iter().all(|item| holds(item, scalar)),
+            _ => true,
+        }
+    }
+    if value == Value::Null && !ty.nullable {
+        return Err(Refusal::Input(format!(
+            "param '{name}': null for a non-nullable parameter"
+        )));
+    }
+    let spelled = |value: &Value| match (value, ty.scalar) {
+        (Value::Str(s), ScalarType::DateTime) => check_datetime_literal(s)
+            .and_then(|()| datetime_literal_millis(s).map(drop))
+            .is_ok(),
+        (Value::Str(s), ScalarType::Date) => date_literal_days(s).is_ok(),
+        _ => true,
+    };
+    let spelled_items = match &value {
+        Value::List(items) => items.iter().all(spelled),
+        other => spelled(other),
+    };
+    if !spelled_items {
+        return Err(Refusal::Input(format!(
+            "param '{name}': {value:?} is not a {}",
+            ty.scalar
+        )));
+    }
+    if !holds(&value, ty.scalar) {
+        return Err(Refusal::Input(format!(
+            "param '{name}': {value:?} is outside its declared type"
+        )));
+    }
+    Ok(typed(value, Some(ty.scalar)))
+}
+
 /// An exported value at its declared type: an integer the export spells as
 /// a string (beyond JSON's exact range) reads back as the integer.
 fn typed(v: Value, scalar: Option<ScalarType>) -> Value {
@@ -1383,6 +1502,9 @@ fn typed(v: Value, scalar: Option<ScalarType>) -> Value {
     let single = matches!(scalar, Some(ScalarType::F32 | ScalarType::Vector(_)));
     match v {
         Value::Str(s) if integer => s.parse::<i128>().map_or(Value::Str(s), Value::Int),
+        Value::Str(s) if scalar == Some(ScalarType::DateTime) => {
+            Value::Str(canonical_datetime(&s).unwrap_or(s))
+        }
         // An `F32` or vector element is stored at single precision.
         Value::Int(i) if single => Value::Float(f64::from(i as f32)),
         Value::Float(f) if single => Value::Float(f64::from(f as f32)),

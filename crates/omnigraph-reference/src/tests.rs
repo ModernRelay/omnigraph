@@ -631,6 +631,150 @@ fn limit_reads_its_count_from_a_parameter() {
     );
 }
 
+/// The outcome of the one read in `src` under `params`.
+#[track_caller]
+fn outcome(src: &str, params: &[(&str, Literal)]) -> R<Vec<Json>> {
+    let catalog = catalog();
+    let graph = Graph::from_export(&catalog, DATA).unwrap();
+    let (_, checked) = check_source(&catalog, src)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let CoreDecl::Read(read) = checked.unwrap().core else {
+        panic!("a read")
+    };
+    let params: HashMap<String, Literal> = params
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    Interpreter::new(&catalog, &graph, &params)
+        .run(&read)
+        .map(|(rows, _)| rows)
+}
+
+/// Binding: an omitted parameter takes its declared default, an omitted
+/// nullable one without a default is null, and an omitted required one, a
+/// null for a non-nullable one and a value outside the declared type are
+/// refused.
+#[test]
+fn a_parameter_binds_at_its_declaration() {
+    let count = |decl: &str, params: &[(&str, Literal)]| {
+        outcome(
+            &format!(
+                "query q({decl}) {{ match {{ $p: Person }} where $p.age > $x return {{ count($p) as n }} }}"
+            ),
+            params,
+        )
+    };
+    assert_eq!(count("$x: I32 = 30", &[]).unwrap(), vec![json!({"n": 1})]);
+    assert_eq!(count("$x: I32? = 30", &[]).unwrap(), vec![json!({"n": 1})]);
+    assert_eq!(count("$x: I32?", &[]).unwrap(), vec![json!({"n": 0})]);
+    for (decl, params) in [
+        ("$x: I32", vec![]),
+        ("$x: I32", vec![("x", Literal::Null)]),
+        (
+            "$x: I32",
+            vec![("x", Literal::Integer(i128::from(i32::MAX) + 1))],
+        ),
+    ] {
+        assert!(
+            matches!(count(decl, &params), Err(Refusal::Input(_))),
+            "{decl} {params:?}"
+        );
+    }
+    let f32_param = outcome(
+        "query q($y: F32) { match { $r: Reading } where $r.y > $y return { $r.slug } }",
+        &[("y", Literal::Float(1e39))],
+    );
+    assert!(matches!(f32_param, Err(Refusal::Input(_))), "{f32_param:?}");
+}
+
+/// A window or constant read from a parameter is refused outside its
+/// range: a `limit` below zero, a `nearest` window below one, an `rrf`
+/// constant outside `1..=RRF_MAX_K`; a null lexical query, and a value
+/// bound to `now()`'s reserved name, are refused too.
+#[test]
+fn a_count_parameter_outside_its_range_is_refused() {
+    let docs = "let $docs = { match { $d: Doc } return { $d } }";
+    for (src, k) in [
+        (
+            "query q($k: I64) { match { $p: Person } return { $p.name } limit $k }".to_string(),
+            -1,
+        ),
+        (
+            format!(
+                "query q($k: I64) {{ match {{ {docs}, from nearest($docs, $d.embedding, [0.0, 1.0], k: $k) as $s }} return {{ $d.slug }} }}"
+            ),
+            0,
+        ),
+        (
+            format!(
+                "query q($k: I64) {{ match {{ {docs}, from rrf(nearest($docs, $d.embedding, [0.0, 1.0], k: 2), bm25($docs, $d.text, \"needle\"), k: $k) as $s }} return {{ $d.slug }} }}"
+            ),
+            0,
+        ),
+        (
+            format!(
+                "query q($k: I64) {{ match {{ {docs}, from rrf(nearest($docs, $d.embedding, [0.0, 1.0], k: 2), bm25($docs, $d.text, \"needle\"), k: $k) as $s }} return {{ $d.slug }} }}"
+            ),
+            i128::from(RRF_MAX_K) + 1,
+        ),
+    ] {
+        let refused = outcome(&src, &[("k", Literal::Integer(k))]);
+        assert!(
+            matches!(refused, Err(Refusal::Input(_))),
+            "{src} k={k}: {refused:?}"
+        );
+    }
+    let now = outcome(
+        "query q() { match { $p: Person } return { $p.name } }",
+        &[(
+            NOW_PARAM_NAME,
+            Literal::DateTime("2024-01-01T00:00:00Z".into()),
+        )],
+    );
+    assert!(matches!(now, Err(Refusal::Input(_))), "{now:?}");
+    let null_query = outcome(
+        "query q($q: String?) { match { $d: Doc } where match_terms($d.text, terms($q, mode: any)) return { $d.slug } }",
+        &[("q", Literal::Null)],
+    );
+    assert!(
+        matches!(null_query, Err(Refusal::Input(_))),
+        "{null_query:?}"
+    );
+}
+
+/// A `DateTime` is its instant: spellings of one instant (zero padding,
+/// another offset) are one value, rendered as the engine renders it; a
+/// parameter with a non-zero digit past the millisecond is refused.
+#[test]
+fn a_datetime_is_its_instant() {
+    for spelling in [
+        "2024-01-01T00:00:00.123Z",
+        "2024-01-01T00:00:00.123000Z",
+        "2024-01-01T05:00:00.123000000+05:00",
+    ] {
+        assert_eq!(
+            canonical_datetime(spelling).as_deref(),
+            Some("2024-01-01T00:00:00.123")
+        );
+    }
+    assert_eq!(
+        canonical_datetime("1969-12-31T23:59:59Z").as_deref(),
+        Some("1969-12-31T23:59:59")
+    );
+    let ty = PropType::scalar(ScalarType::DateTime, false);
+    assert!(matches!(
+        bind_param("t", Value::Str("2024-01-01T00:00:00.123456Z".into()), &ty),
+        Err(Refusal::Input(_))
+    ));
+    assert_eq!(
+        bind_param("t", Value::Str("2024-01-01T01:00:00+01:00".into()), &ty),
+        Ok(Value::Str("2024-01-01T00:00:00".into()))
+    );
+}
+
 #[test]
 fn if_and_coalesce_evaluate_only_what_they_select() {
     // bob's age is 40: the division is the branch not taken.
