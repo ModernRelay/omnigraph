@@ -22,11 +22,6 @@ const MERGE_STAGE_DIR_ENV: &str = "OMNIGRAPH_MERGE_STAGING_DIR";
 const DELETE_FILTER_IN: &str = " IN (";
 const DELETE_FILTER_SEPARATOR: &str = ", ";
 const DELETE_FILTER_SUFFIX: &str = ")";
-/// The unified validator currently consumes one cross-table `ChangeSet`, so
-/// projected scalar deltas must remain resident until evaluation completes.
-/// Keep that operation-wide retained input bounded independently of the
-/// per-transaction keyed-write chunks.
-const MERGE_VALIDATION_MAX_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 const MERGE_VALIDATION_RESOURCE: &str = "branch-merge retained validation delta bytes";
 /// Maximum detached chunk commits one table may chain in a single merge. The
 /// writer rejects a larger plan before its first effect, which bounds the
@@ -3379,25 +3374,26 @@ fn classify_merge_conflict(
 /// Operation-wide budget for the scalar delta retained by merge validation.
 ///
 /// Physical merge staging is chunked, but the unified validator evaluates one
-/// cross-table `ChangeSet`. Without a second aggregate ceiling, many valid
-/// chunks (or many candidate tables) could be collected back into an unbounded
-/// resident delta before the first effect.
+/// cross-table `ChangeSet`, so projected scalar deltas stay resident until
+/// evaluation completes. Without a second aggregate ceiling, many valid chunks
+/// (or many candidate tables) could be collected back into an unbounded
+/// resident delta before the first effect. The ceiling is the merge's captured
+/// `write_max_bytes` allowance, independent of the per-transaction chunks, so
+/// a caller can raise it the way it raises the merge's other write accounts.
 #[derive(Debug)]
 struct MergeValidationBudget {
     retained_bytes: u64,
     limit: u64,
 }
 
-impl Default for MergeValidationBudget {
-    fn default() -> Self {
+impl MergeValidationBudget {
+    fn new(write_budget: WriteBudget) -> Self {
         Self {
             retained_bytes: 0,
-            limit: MERGE_VALIDATION_MAX_BYTES,
+            limit: write_budget.bytes(),
         }
     }
-}
 
-impl MergeValidationBudget {
     fn reserve(&mut self, bytes: u64) -> Result<()> {
         let actual = self.retained_bytes.checked_add(bytes).ok_or_else(|| {
             OmniError::manifest_internal("branch merge validation byte count overflow")
@@ -3473,9 +3469,10 @@ async fn build_merge_changeset(
     db: &Omnigraph,
     catalog: &Catalog,
     candidates: &HashMap<String, CandidateTableState>,
+    write_budget: WriteBudget,
 ) -> Result<crate::validate::ChangeSet> {
     let mut changeset = crate::validate::ChangeSet::new();
-    let mut validation_budget = MergeValidationBudget::default();
+    let mut validation_budget = MergeValidationBudget::new(write_budget);
     // The shared-budget failure and the validator's observable traversal must
     // not depend on HashMap iteration order.
     let mut ordered_table_keys = candidates.keys().collect::<Vec<_>>();
@@ -5964,7 +5961,7 @@ impl Omnigraph {
             let validation_timing = crate::instrumentation::start_merge_timing(
                 crate::instrumentation::MergeTimingPhase::CandidateValidation,
             );
-            let changeset = build_merge_changeset(self, catalog, &candidates).await?;
+            let changeset = build_merge_changeset(self, catalog, &candidates, write_budget).await?;
             plans = self
                 .validate_merge_candidates(target_txn, &changeset, write_budget)
                 .await?;

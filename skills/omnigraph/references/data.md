@@ -47,6 +47,11 @@ edits.
 > `write_max_bytes` setting (default 32 MiB). Raise it for a direct load with
 > `--set write_max_bytes=<bytes>` or `OMNIGRAPH_WRITE_MAX_BYTES`; a served JSONL
 > load uses the server's value and refuses `--set`.
+> A `branch merge` that is not a fast forward also holds the scalar columns of
+> every changed row for validation, bounded by one `write_max_bytes` allowance
+> for the whole merge: chunking the branch's loads does not split it, so a
+> refusal naming `branch-merge retained validation delta bytes` needs
+> `--set write_max_bytes=<bytes>` on the merge itself.
 > Against a non-local
 > target, `--mode overwrite` (like `cleanup` and `branch delete`) requires
 > explicit `--yes` consent in non-interactive runs.
