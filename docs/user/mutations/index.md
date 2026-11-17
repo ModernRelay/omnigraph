@@ -169,10 +169,10 @@ load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" head
 - `columns (a, b, …)` names the property each column feeds, by position. It
   is required without `header` and overrides a header's names. `from` and
   `to` name an edge file's endpoint columns and are refused on a node file.
-- An empty field is null; a null for a non-nullable property, a column the
-  type does not declare, a count of `columns` that differs from the source, a
-  malformed number, a repeated name, and an edge file without `from` or `to`
-  are refused before anything is staged.
+- An empty field and `""` are null (there is no empty-string spelling); an empty line is not a
+  record, so a one-column file skips its null rows. A null for a non-nullable property, a column
+  the type does not declare, a count of `columns` that differs from the source, a malformed
+  number, a repeated name, and an edge file without `from` or `to` are refused before anything is staged.
 
 Numbers are typed by the reader. `Bool` takes exactly `true` or `false`.
 `Date` and `DateTime` cells are read as text and pass the checks above

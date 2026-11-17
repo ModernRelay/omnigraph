@@ -141,7 +141,7 @@ fn render_csv(output: &ReadOutput) -> Result<String> {
         lines.push(
             columns
                 .iter()
-                .map(|column| csv_escape(&stringify_value(row.get(column).unwrap_or(&Value::Null))))
+                .map(|column| csv_cell(row.get(column)))
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -376,6 +376,16 @@ fn pad_to_width(value: &str, width: usize) -> String {
     }
 }
 
+/// One CSV field. A null (a JSON row omits its key) is an empty unquoted
+/// field, the spelling `load csv` reads as null, while an empty string is
+/// `""`; so the string `null` stays a string.
+fn csv_cell(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => String::new(),
+        Some(value) => csv_escape(&stringify_value(value)),
+    }
+}
+
 fn csv_escape(value: &str) -> String {
     if value.is_empty() || value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
@@ -575,6 +585,44 @@ rows[2]:
         .unwrap();
 
         assert!(rendered.lines().next().unwrap().contains("age,name"));
+    }
+
+    /// A null cell (its key omitted from the JSON row) and the stored string
+    /// "null" must not be written as the same CSV field, or a reader cannot
+    /// tell them apart.
+    #[test]
+    fn csv_keeps_a_null_cell_distinct_from_the_string_null() {
+        let mut output = sample_output();
+        output.columns = vec!["slug".to_string(), "s".to_string()];
+        output.row_count = 3;
+        output.rows = serde_json::value::RawValue::from_string(
+            r#"[{"slug":"empty","s":""},{"slug":"nul"},{"slug":"word","s":"null"}]"#.to_string(),
+        )
+        .unwrap();
+
+        let rendered = render_read(
+            &output,
+            ReadOutputFormat::Csv,
+            &ReadRenderOptions {
+                max_column_width: 80,
+                cell_layout: TableCellLayout::Truncate,
+            },
+        )
+        .unwrap();
+        let cells: Vec<&str> = rendered
+            .lines()
+            .skip(1)
+            .map(|line| line.split_once(',').unwrap().1)
+            .collect();
+
+        assert_eq!(cells.len(), 3, "{rendered}");
+        assert_ne!(cells[0], cells[1], "empty string and null: {rendered}");
+        assert_ne!(
+            cells[1], cells[2],
+            "null and the string \"null\": {rendered}"
+        );
+        // The spelling `load csv` reads back: an empty field is null.
+        assert_eq!(rendered, "slug,s\nempty,\"\"\nnul,\nword,null");
     }
 
     #[test]
