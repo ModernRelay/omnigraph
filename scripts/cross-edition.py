@@ -734,6 +734,14 @@ class SelfTest(unittest.TestCase):
     def test_checked_in_table_reads(self):
         read_table(TABLE)
 
+    def test_every_workflow_pins_one_edition_2_commit(self):
+        pins = {}
+        for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            for found in re.findall(r"EDITION_2_SOURCE_COMMIT: ([0-9a-f]{40})", workflow.read_text()):
+                pins.setdefault(found, []).append(workflow.name)
+        self.assertEqual(len(pins), 1, pins)
+        self.assertIn("ci.yml", next(iter(pins.values())))
+
 
 def main() -> int:
     if "--self-test" in sys.argv[1:]:

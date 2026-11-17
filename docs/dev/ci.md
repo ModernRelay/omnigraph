@@ -165,10 +165,13 @@ reused.
 of `EDITION_2_SOURCE_COMMIT`, the merge base with `main` that the GQ 3 break
 was measured against, in a detached worktree into the job's target directory
 (inside that checkout, so its `tokio_unstable` cfg applies), copies the binary
-out, cleans the path-package artifacts through both manifests as the storage
-job does, builds the current runner, and runs `scripts/cross-edition.py run`
-over every case both commits hold. A missing runner fails the job; nothing
-skips. The comparison, the table it reads and what passes are in
+and the commit's `omnigraph` CLI out, cleans the path-package artifacts
+through both manifests as the storage job does, builds the current runner,
+runs `scripts/cross-edition.py run` over every case both commits hold, then
+runs the two-edition generated law (`law_two_editions`) with the edition-2
+CLI and `OMNIGRAPH_REQUIRE_EDITION_2=1`. A missing runner or CLI fails the
+job; nothing skips. `GQT slow nightly` builds the same commit's CLI for the
+law's nightly breadth; the self-test holds the two pins equal. The comparison, the table it reads and what passes are in
 [testing](testing.md#cross-edition-comparison); the report is kept as the
 `cross-edition-report` artifact. The pin moves only with the edition-2
 reference: until the break merges, to a later merge base when `main` is merged

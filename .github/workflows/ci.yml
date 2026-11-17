@@ -1178,13 +1178,14 @@ jobs:
       # engine is what every case is compared with, and a moving reference
       # would compare edition 3 with itself (docs/dev/testing.md, Cross-edition
       # comparison).
-      - name: Build the edition-2 GQT runner
+      - name: Build the edition-2 GQT runner and CLI
         env:
           EDITION_2_SOURCE_COMMIT: 42013036b50ecfff3d63f071f32db951be9cbd54
         run: |
           set -euo pipefail
           e2_source="$RUNNER_TEMP/omnigraph-edition-2"
           e2_bin="$RUNNER_TEMP/omnigraph-gqt-edition-2"
+          e2_cli="$RUNNER_TEMP/omnigraph-edition-2-cli"
           git fetch --no-tags --depth=1 origin "$EDITION_2_SOURCE_COMMIT"
           git worktree add --detach "$e2_source" "$EDITION_2_SOURCE_COMMIT"
           test "$(git -C "$e2_source" rev-parse HEAD)" = "$EDITION_2_SOURCE_COMMIT"
@@ -1192,10 +1193,14 @@ jobs:
           # (the `tokio_unstable` cfg the simulation needs) applies.
           (cd "$e2_source" && cargo build --locked \
             --package omnigraph-gqt \
+            --package omnigraph-cli \
             --bin omnigraph-gqt \
+            --bin omnigraph \
             --target-dir "$GITHUB_WORKSPACE/target")
           cp "$GITHUB_WORKSPACE/target/debug/omnigraph-gqt" "$e2_bin"
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$e2_cli"
           test -x "$e2_bin"
+          test -x "$e2_cli"
           # The two commits' path packages share names and versions; remove
           # both identities before the current runner links.
           cargo clean --workspace --locked \
@@ -1205,6 +1210,7 @@ jobs:
             --target-dir "$GITHUB_WORKSPACE/target"
           echo "EDITION_2_SOURCE_COMMIT=$EDITION_2_SOURCE_COMMIT" >> "$GITHUB_ENV"
           echo "OMNIGRAPH_EDITION_2_GQT_BIN=$e2_bin" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_EDITION_2_BIN=$e2_cli" >> "$GITHUB_ENV"
 
       - name: Build the current GQT runner
         run: cargo build --locked --package omnigraph-gqt --bin omnigraph-gqt
@@ -1218,6 +1224,17 @@ jobs:
             --base-ref "$EDITION_2_SOURCE_COMMIT" \
             --work "$RUNNER_TEMP/cross-edition" \
             --jobs "$(nproc)"
+
+      # The generated reads both editions express, run through the edition-2
+      # CLI and this tree's engine (docs/dev/testing.md, Generated laws).
+      - name: Run the two-edition law
+        env:
+          OMNIGRAPH_REQUIRE_EDITION_2: '1'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p omnigraph-gqt --test integration \
+            law_two_editions:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/two-editions.log"
+          grep -F "test law_two_editions::edition_2_and_edition_3_answer_generated_reads_alike ... ok" "$RUNNER_TEMP/two-editions.log"
 
       - name: Retain the cross-edition report
         if: always()
