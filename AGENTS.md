@@ -213,9 +213,10 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   with `--run-ignored only` and refuses a run in which an enrolled name did
   not pass.
 - `crates/omnigraph-reference` evaluates the core IR as the RFC's operator
-  table states it; GQT's `--- expect same as reference` compares a query
-  step's rows with it. A change to core semantics updates it in the same pull
-  request, and a disagreement is a bug in one of the two.
+  table states it; GQT compares every read step on the direct engine with
+  it, rows and refusals, unless the step states why it opts out
+  (`--- reference skipped:`). A change to core semantics updates it in the
+  same pull request, and a disagreement is a bug in one of the two.
 - A change to what an operation reads or writes in storage adds or updates
   its row in the DST storage-cost golden,
   `crates/omnigraph-dst/cost_table.txt`, and the pull request explains every

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use omnigraph::Session;
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::storage::StorageAdapter;
 use omnigraph_compiler::ir::core::CoreRead;
@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::concurrent::ConcurrentStep;
 use crate::runner_config::SeamDirective;
-use crate::{Case, Item, Step, StepFail};
+use crate::{Case, ReferenceRefusal, Step, StepFail};
 
 /// Runner-owned observation and execution facilities around ordinary GQT steps.
 pub trait ExecutionHost: Sync {
@@ -23,20 +23,6 @@ pub trait ExecutionHost: Sync {
         if case.needs_dst() {
             return Err(
                 "unsupported_environment: this executor cannot run seams or concurrent blocks"
-                    .into(),
-            );
-        }
-        if case.items.iter().any(|item| {
-            let steps = match item {
-                Item::Step(step) => std::slice::from_ref(step),
-                Item::Loop { steps, .. } => steps,
-            };
-            steps
-                .iter()
-                .any(|step| matches!(step, Step::Query(query) if query.same_as_reference))
-        }) {
-            return Err(
-                "unsupported_environment: this executor cannot compare the reference interpreter"
                     .into(),
             );
         }
@@ -85,15 +71,23 @@ pub trait ExecutionHost: Sync {
         .boxed()
     }
 
-    /// The rows the core reference interpreter returns for `read` over
-    /// `branch` of the case session, for `--- expect same as reference`.
+    /// Whether this host compares every read step with the core reference
+    /// interpreter: the GQT runner on the direct engine does; DST, served
+    /// and measuring executors run the case without it.
+    fn compares_reference(&self) -> bool {
+        false
+    }
+
+    /// The core reference interpreter's outcome for `read` over `target`
+    /// of the case session: its rows, or its refusal. `Err` is a failure to
+    /// reach the interpreter at all (the export, the host).
     fn reference_rows<'a>(
         &'a self,
         _session: &'a Session,
         _read: &'a CoreRead,
-        _branch: &'a str,
+        _target: &'a ReadTarget,
         _params: &'a ParamMap,
-    ) -> BoxFuture<'a, Result<Vec<Value>, String>> {
+    ) -> BoxFuture<'a, Result<Result<Vec<Value>, ReferenceRefusal>, String>> {
         futures::future::ready(Err(
             "unsupported_environment: reference comparison requires the GQT runner".into(),
         ))

@@ -10,8 +10,8 @@ use omnigraph_gqt_core::concurrent::ConcurrentStep;
 pub use omnigraph_gqt_core::runner_config;
 use omnigraph_gqt_core::runner_config::{Execution, SeamDirective};
 use omnigraph_gqt_core::{
-    Case, ControlStep, ControlWrite, ExecutionHost, Item, Step, StepFail, canonical_json,
-    case_session, parse_case, run_session, seed_case,
+    Case, ControlStep, ControlWrite, ExecutionHost, Item, ReferenceRefusal, Step, StepFail,
+    canonical_json, case_session, parse_case, run_session, seed_case,
 };
 pub use omnigraph_gqt_core::{ServerTarget, admit_served};
 use serde_json::Value;
@@ -104,29 +104,48 @@ impl ExecutionHost for GqtHost {
     fn measure_step_end(&self, ordinal: u64) {
         dst_runner::measure_step_end(ordinal);
     }
+    fn compares_reference(&self) -> bool {
+        !dst_runner::active()
+    }
     fn reference_rows<'a>(
         &'a self,
         session: &'a Session,
         read: &'a omnigraph_compiler::ir::core::CoreRead,
-        branch: &'a str,
+        target: &'a omnigraph::db::ReadTarget,
         params: &'a omnigraph_compiler::ParamMap,
-    ) -> futures::future::BoxFuture<'a, Result<Vec<Value>, String>> {
+    ) -> futures::future::BoxFuture<'a, Result<Result<Vec<Value>, ReferenceRefusal>, String>> {
         async move {
-            // The reference reads the branch's rows through the engine's
-            // export, the narrowest public read of a whole branch.
-            let export = session
-                .db()
-                .export_jsonl(branch, &[])
-                .await
-                .map_err(|e| format!("export failed: {e}"))?;
+            // The reference reads the target's rows through the engine's
+            // export, the narrowest public read of a whole branch or
+            // snapshot.
+            // A target the export cannot read is input the reference
+            // cannot read.
+            let export = match session.db().export_jsonl_at(target.clone(), &[]).await {
+                Ok(export) => export,
+                Err(e) => return Ok(Err(ReferenceRefusal::Input(format!("export failed: {e}")))),
+            };
             let catalog = session.catalog();
-            let graph = omnigraph_reference::Graph::from_export(&catalog, &export)
-                .map_err(|e| e.to_string())?;
             let params = params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            omnigraph_reference::Interpreter::new(&catalog, &graph, &params)
-                .run(read)
-                .map(|(rows, _)| rows)
-                .map_err(|e| e.to_string())
+            Ok(omnigraph_reference::Graph::from_export(&catalog, &export)
+                .and_then(|graph| {
+                    omnigraph_reference::Interpreter::new(&catalog, &graph, &params)
+                        .run(read)
+                        .map(|(rows, _)| rows)
+                })
+                .map_err(|refusal| match refusal {
+                    omnigraph_reference::Refusal::Runtime(code, message) => {
+                        ReferenceRefusal::Runtime {
+                            code: code.to_string(),
+                            message,
+                        }
+                    }
+                    omnigraph_reference::Refusal::Input(message) => {
+                        ReferenceRefusal::Input(message)
+                    }
+                    omnigraph_reference::Refusal::Unsupported(what) => {
+                        ReferenceRefusal::Unsupported(what)
+                    }
+                }))
         }
         .boxed()
     }
@@ -145,6 +164,9 @@ pub struct CaseOutcome {
     pub stem: String,
     pub elapsed: Duration,
     pub result: Result<(), String>,
+    /// The `--- reference skipped:` reasons of a run on the direct engine,
+    /// one line per step, printed under the case's result line.
+    pub notes: Vec<String>,
 }
 
 pub fn measure_model_names() -> Vec<&'static str> {
@@ -477,6 +499,7 @@ where
         stem: stem.to_string(),
         elapsed: started.elapsed(),
         result,
+        notes: Vec::new(),
     }
 }
 

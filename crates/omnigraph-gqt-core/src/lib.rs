@@ -68,7 +68,7 @@ pub use runner_config::{
 
 /// The case format's version: one number, bumped whenever `grammar_text()`
 /// changes, pinned by the grammar golden under `tests/grammar/`.
-pub const GQT_FORMAT_VERSION: u32 = 1;
+pub const GQT_FORMAT_VERSION: u32 = 2;
 pub use served::{
     ServerTarget, admit_served, admit_served_workload, execute_measured_served,
     execute_steps_served,
@@ -163,6 +163,29 @@ impl Case {
                 .iter()
                 .any(|i| matches!(i, Item::Step(Step::Concurrent(_))))
     }
+
+    /// One line per read step that opts out of the reference comparison,
+    /// `step <ordinal> (line <n>): reference skipped: <reason>`, for the
+    /// runner to print when it runs the case on the direct engine.
+    pub fn reference_skips(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .flat_map(|item| match item {
+                Item::Step(step) => std::slice::from_ref(step),
+                Item::Loop { steps, .. } => steps.as_slice(),
+            })
+            .filter_map(|step| match step {
+                Step::Query(query) => query.reference_skipped.as_ref().map(|reason| {
+                    let line = self
+                        .source_lines
+                        .get(&query.ordinal)
+                        .map_or_else(String::new, |line| format!(" (line {line})"));
+                    format!("step {}{line}: reference skipped: {reason}", query.ordinal)
+                }),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// The step's kind as the measure report names it.
@@ -193,7 +216,8 @@ pub enum Item {
 
 #[derive(Debug)]
 pub enum Step {
-    Query(QueryStep),
+    /// Boxed: a query step carries its expectations and is the largest kind.
+    Query(Box<QueryStep>),
     Mutate(MutateStep),
     Load(LoadStep),
     Control(ControlStep),
@@ -201,7 +225,9 @@ pub enum Step {
     Settings(SettingsStep),
     Show(ShowStep),
     BranchRead(BranchReadStep),
-    Restart { ordinal: usize },
+    Restart {
+        ordinal: usize,
+    },
     Concurrent(ConcurrentStep),
 }
 
@@ -288,10 +314,10 @@ pub struct QueryStep {
     /// The `--- expect plan` section, checked against the engine's explain
     /// document before the rows.
     plan: Option<PlanExpect>,
-    /// `--- expect same as reference`: the rows must also equal the core
-    /// reference interpreter's rows for the same query, compared as the
-    /// step's `expect` compares.
-    same_as_reference: bool,
+    /// `--- reference skipped: <reason>`: the step opts out of the
+    /// comparison with the core reference interpreter, which every read step
+    /// on the direct engine otherwise makes; the runner prints the reason.
+    reference_skipped: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1178,7 +1204,7 @@ fn record_binding(
 }
 
 /// The words an `--- expect` header may start with, for a near miss.
-const EXPECT_MODE_WORDS: [&str; 9] = [
+const EXPECT_MODE_WORDS: [&str; 8] = [
     "ok",
     "unordered",
     "ordered",
@@ -1187,7 +1213,6 @@ const EXPECT_MODE_WORDS: [&str; 9] = [
     "outcome:",
     "shape",
     "plan",
-    "same as reference",
 ];
 
 fn parse_expect_header(rest: &str) -> Result<ExpectHeader, CaseError> {
@@ -2031,13 +2056,42 @@ fn complete_control_step(
     })
 }
 
-/// The expect word that adds the reference comparison to a query step's
-/// rows expect.
-const SAME_AS_REFERENCE: &str = "same as reference";
+/// The `--- reference` section's one form, `skipped: <reason>`.
+const REFERENCE_SKIPPED: &str = "skipped:";
 
-/// Why a `--- expect same as reference` section has no step to attach to; a
+/// The fix every misplaced or malformed `--- reference` section names.
+const REFERENCE_SKIPPED_FIX: &str = "write `--- reference skipped: <reason>` directly under the read step's last expect section (`--- expect shape`, `--- expect plan` or `--- expect error:`), naming why the reference interpreter's answer is not compared";
+
+/// The reason of a `--- reference skipped: <reason>` header; the reason is
+/// required, since the runner prints it whenever it skips the comparison.
+fn parse_reference_skipped(rest: &str) -> Result<String, CaseError> {
+    let reason = rest
+        .trim()
+        .strip_prefix(REFERENCE_SKIPPED)
+        .map(str::trim)
+        .ok_or_else(|| {
+            CaseError::new(
+                CaseErrorCode::ReferenceSkip,
+                format!(
+                    "`--- reference {}` is refused; the section's one form is `--- reference skipped: <reason>`",
+                    rest.trim()
+                ),
+            )
+            .fix(REFERENCE_SKIPPED_FIX)
+        })?;
+    if reason.is_empty() {
+        return Err(CaseError::new(
+            CaseErrorCode::ReferenceSkip,
+            "`--- reference skipped:` names no reason; a step opts out of the reference comparison only with a stated reason",
+        )
+        .fix(REFERENCE_SKIPPED_FIX));
+    }
+    Ok(reason.to_string())
+}
+
+/// Why a `--- reference skipped:` section has no step to attach to; a
 /// mutate step, pending or just completed, gets its own refusal.
-fn same_as_reference_misplaced(
+fn reference_skipped_misplaced(
     pending: Option<&Pending>,
     items: &[Item],
     open_loop: Option<&(String, Vec<String>, Vec<Step>)>,
@@ -2051,16 +2105,12 @@ fn same_as_reference_misplaced(
     };
     let on_mutate = matches!(pending, Some(Pending::Decl(step)) if step.is_mutation)
         || (pending.is_none() && matches!(last, Some(Step::Mutate(_))));
-    if on_mutate {
-        return mode_for_step(
-            "`--- expect same as reference` is refused on a mutate step; the reference interpreter only reads, and a mutation returns no rows to compare",
-        );
-    }
-    CaseError::new(
-        CaseErrorCode::ExpectWithoutStep,
-        "`--- expect same as reference` must directly follow a query step's `--- expect shape` or `--- expect plan`; it adds the reference comparison to the step's own rows expect",
-    )
-    .fix("move `--- expect same as reference` directly under the query step's `--- expect shape` or `--- expect plan`")
+    let message = if on_mutate {
+        "`--- reference skipped:` is refused on a mutate step; the reference interpreter evaluates reads, and a write is not compared"
+    } else {
+        "`--- reference skipped:` must directly follow a read step's last expect section; it opts that step out of the reference comparison"
+    };
+    CaseError::new(CaseErrorCode::ReferenceSkip, message).fix(REFERENCE_SKIPPED_FIX)
 }
 
 /// The declaration of a step whose source the compiler refused at parse: no
@@ -2100,7 +2150,7 @@ fn complete_decl_step(
             if ordered && let Some(reason) = step.ordered_refusal {
                 return Err(mode_for_step(reason));
             }
-            Ok(Step::Query(QueryStep {
+            Ok(Step::Query(Box::new(QueryStep {
                 ordinal: step.ordinal,
                 source: step.source,
                 name: step.name,
@@ -2109,10 +2159,10 @@ fn complete_decl_step(
                 decl: step.decl,
                 params_raw: step.params_raw,
                 expects_expand: step.expects_expand,
-                same_as_reference: false,
+                reference_skipped: None,
                 expect: rows_expect(ordered, section, loop_var)?,
                 plan: None,
-            }))
+            })))
         }
         (ExpectHeader::Error(needle), is_mutation) => {
             refuse_nonempty_body(&section.body, "an `expect error:` section")?;
@@ -2133,7 +2183,7 @@ fn complete_decl_step(
                     plan: None,
                 })
             } else {
-                Step::Query(QueryStep {
+                Step::Query(Box::new(QueryStep {
                     ordinal: step.ordinal,
                     source: step.source,
                     name: step.name,
@@ -2142,10 +2192,10 @@ fn complete_decl_step(
                     decl: step.decl,
                     params_raw: step.params_raw,
                     expects_expand: step.expects_expand,
-                    same_as_reference: false,
+                    reference_skipped: None,
                     expect: QueryExpect::Error { needle },
                     plan: None,
-                })
+                }))
             })
         }
         (ExpectHeader::Ok, true) => {
@@ -2189,7 +2239,7 @@ fn complete_decl_step(
 }
 
 /// The section kinds a header may name, for a near miss.
-const SECTION_KINDS: [&str; 16] = [
+const SECTION_KINDS: [&str; 17] = [
     "runner",
     "schema",
     "seed",
@@ -2206,6 +2256,7 @@ const SECTION_KINDS: [&str; 16] = [
     "foreach",
     "endloop",
     "seam",
+    "reference",
 ];
 
 /// The optional `--- schema` + `--- seed` pair at the head of the step
@@ -2335,7 +2386,9 @@ struct StepCursor {
     pending: Option<Pending>,
     awaiting_shape: Option<Step>,
     awaiting_plan: Option<Step>,
-    awaiting_same_as_reference: Option<Step>,
+    /// A query step whose last expect section is parsed, waiting for an
+    /// optional `--- reference skipped:` section.
+    awaiting_reference: Option<Step>,
     awaiting_load_plan: bool,
     awaiting_seam_step: bool,
     skip_continuations: bool,
@@ -2351,7 +2404,7 @@ impl StepCursor {
 
     /// Whether `kind` continues the step a refusal abandoned.
     fn skips(&mut self, kind: &str) -> bool {
-        if self.skip_continuations && matches!(kind, "expect" | "params") {
+        if self.skip_continuations && matches!(kind, "expect" | "params" | "reference") {
             return true;
         }
         self.skip_continuations = false;
@@ -2635,14 +2688,11 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             }
             if let Some(step) = cursor
                 .awaiting_plan
-                .take_if(|_| !matches!(expect_word, "plan" | SAME_AS_REFERENCE))
+                .take_if(|_| expect_word != "plan" && kind != "reference")
             {
                 push_step(&mut items, &mut loops, step);
             }
-            if let Some(step) = cursor
-                .awaiting_same_as_reference
-                .take_if(|_| expect_word != SAME_AS_REFERENCE)
-            {
+            if let Some(step) = cursor.awaiting_reference.take_if(|_| kind != "reference") {
                 push_step(&mut items, &mut loops, step);
             }
             if cursor.awaiting_seam_step && !matches!(kind, "mutate" | "load" | "seam") {
@@ -3393,32 +3443,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                             ));
                         };
                         query.plan = Some(PlanExpect { lines });
-                        cursor.awaiting_same_as_reference = Some(step);
-                        return Ok(());
-                    }
-                    if rest.trim() == SAME_AS_REFERENCE {
-                        refuse_nonempty_body(
-                            &section.body,
-                            "an `expect same as reference` section",
-                        )?;
-                        let Some(mut step) = cursor
-                            .awaiting_plan
-                            .take()
-                            .or_else(|| cursor.awaiting_same_as_reference.take())
-                        else {
-                            return Err(same_as_reference_misplaced(
-                                cursor.pending.as_ref(),
-                                &items,
-                                loops.open.as_ref(),
-                            ));
-                        };
-                        let Step::Query(query) = &mut step else {
-                            return Err(mode_for_step(
-                                "`--- expect same as reference` is supported only on a query declaration step",
-                            ));
-                        };
-                        query.same_as_reference = true;
-                        push_step(&mut items, &mut loops, step);
+                        cursor.awaiting_reference = Some(step);
                         return Ok(());
                     }
                     let mode = parse_expect_header(rest)?;
@@ -3508,9 +3533,35 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                     if matches!(completed.read_expect(), Some(QueryExpect::Rows { .. })) {
                         substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
                         cursor.awaiting_shape = Some(completed);
+                    } else if matches!(completed, Step::Query(_)) {
+                        cursor.awaiting_reference = Some(completed);
                     } else {
                         push_step(&mut items, &mut loops, completed);
                     }
+                }
+                "reference" => {
+                    let reason = parse_reference_skipped(rest)?;
+                    refuse_nonempty_body(&section.body, "a `--- reference skipped:` section")?;
+                    let Some(mut step) = cursor
+                        .awaiting_plan
+                        .take()
+                        .or_else(|| cursor.awaiting_reference.take())
+                    else {
+                        return Err(reference_skipped_misplaced(
+                            cursor.pending.as_ref(),
+                            &items,
+                            loops.open.as_ref(),
+                        ));
+                    };
+                    let Step::Query(query) = &mut step else {
+                        return Err(CaseError::new(
+                            CaseErrorCode::ReferenceSkip,
+                            "`--- reference skipped:` follows a query declaration step only; the reference interpreter compares no other step",
+                        )
+                        .fix("drop the `--- reference skipped:` section"));
+                    };
+                    query.reference_skipped = Some(reason);
+                    push_step(&mut items, &mut loops, step);
                 }
                 "bind" => {
                     if cursor.pending.is_some() {
@@ -3665,7 +3716,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
     if let Some(step) = cursor
         .awaiting_plan
         .take()
-        .or_else(|| cursor.awaiting_same_as_reference.take())
+        .or_else(|| cursor.awaiting_reference.take())
     {
         push_step(&mut items, &mut loops, step);
     }
@@ -4283,6 +4334,11 @@ async fn run_query_step(
             return match &step.expect {
                 QueryExpect::Error { needle } if e.contains(needle) => {
                     host.record("parameter_error", || serde_json::json!({"message": e}));
+                    if host.compares_reference() && step.reference_skipped.is_some() {
+                        return Err(fail(stale_reference_skip(
+                            "the runner refused its parameters before the query ran",
+                        )));
+                    }
                     Ok(())
                 }
                 QueryExpect::Error { needle } => {
@@ -4395,78 +4451,221 @@ async fn run_query_step(
                 return Err(fail(drift));
             }
             check_rows(host, &label, &result, *ordered, body_raw, *span, binding)?;
-            if step.same_as_reference && !host.active() {
-                check_same_as_reference(host, session, step, &target, &params, &result, *ordered)
+            if host.compares_reference() && step.reference_skipped.is_none() {
+                let engine = EngineOutcome::Rows {
+                    result: &result,
+                    ordered: *ordered,
+                };
+                compare_with_reference(host, session, step, &target, &params, engine)
                     .await
                     .map_err(&fail)?;
             }
             Ok(())
         }
         QueryExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, "the query succeeded").map_err(fail)
+            let refusal = outcome.as_ref().err().map(EngineRefusal::of);
+            check_error_expect(host, needle, outcome, "the query succeeded").map_err(&fail)?;
+            let Some(refusal) = refusal.filter(|_| host.compares_reference()) else {
+                return Ok(());
+            };
+            if matches!(refusal, EngineRefusal::Static) {
+                return match step.reference_skipped {
+                    Some(_) => Err(fail(stale_reference_skip(
+                        "the engine refused the query before it ran, so it has no core term to evaluate",
+                    ))),
+                    None => Ok(()),
+                };
+            }
+            if step.reference_skipped.is_none() {
+                compare_with_reference(
+                    host,
+                    session,
+                    step,
+                    &target,
+                    &params,
+                    EngineOutcome::Refused(refusal),
+                )
+                .await
+                .map_err(&fail)?;
+            }
+            Ok(())
         }
     }
 }
 
-/// `--- expect same as reference`: the step's query evaluated by the core
-/// reference interpreter over the same branch; a refusal of either kind or a
-/// row difference fails the step.
-async fn check_same_as_reference(
+/// A `--- reference skipped:` section on a step the comparison never
+/// reaches: the opt-out says nothing, and the case drops it.
+fn stale_reference_skip(why: &str) -> String {
+    format!(
+        "`--- reference skipped:` on a step the reference comparison does not reach ({why}); drop the section"
+    )
+}
+
+/// How the engine refused a read step, as the reference comparison reads
+/// it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum EngineRefusal {
+    /// A parse, type or plan diagnostic: the query never ran, and there is
+    /// no core term to evaluate.
+    Static,
+    /// A row the query refused while it ran, under its `E` code (the GQ 3
+    /// RFC, section 2): the reference must refuse with the same code.
+    Coded(&'static str),
+    /// A resource bound the engine enforces (memory, traversal or read
+    /// work): an execution error of the engine, not of the language, whose
+    /// reference has no bound; the reference must answer rows.
+    Bound(String),
+    /// Any other refusal while the query ran: a parameter value the query
+    /// cannot bind, or a read target that does not resolve. The reference
+    /// must refuse its input too.
+    Input(String),
+}
+
+impl EngineRefusal {
+    fn of(error: &omnigraph::error::OmniError) -> Self {
+        use omnigraph::error::OmniError;
+        use omnigraph_compiler::error::CompilerError;
+        use omnigraph_compiler::query::diagnostic::QueryDiagnosticKind;
+        match error {
+            OmniError::Compiler(CompilerError::Query(diagnostic)) => match diagnostic.kind {
+                QueryDiagnosticKind::Execution => Self::Coded(diagnostic.code.as_str()),
+                QueryDiagnosticKind::Parse
+                | QueryDiagnosticKind::Type
+                | QueryDiagnosticKind::Plan => Self::Static,
+            },
+            OmniError::ResourceLimitExceeded { .. } => Self::Bound(error_text(error)),
+            other => Self::Input(error_text(other)),
+        }
+    }
+}
+
+/// The core reference interpreter's refusal, as a host reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReferenceRefusal {
+    /// A run-time refusal of the RFC's `E` namespace, with its code.
+    Runtime { code: String, message: String },
+    /// The export or a parameter could not be read.
+    Input(String),
+    /// A form the interpreter does not evaluate.
+    Unsupported(String),
+}
+
+impl std::fmt::Display for ReferenceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime { code, message } => write!(f, "{code}: {message}"),
+            Self::Input(message) => f.write_str(message),
+            Self::Unsupported(what) => {
+                write!(f, "the reference interpreter does not evaluate {what}")
+            }
+        }
+    }
+}
+
+/// What the engine answered for a compared step.
+pub(crate) enum EngineOutcome<'a> {
+    Rows {
+        result: &'a QueryResult,
+        ordered: bool,
+    },
+    Refused(EngineRefusal),
+}
+
+/// The reference comparison every read step on the direct engine makes:
+/// the step's query evaluated by the core reference interpreter over the
+/// step's read target, against the engine's rows or refusal
+/// ([`judge_reference`]).
+async fn compare_with_reference(
     host: &impl ExecutionHost,
     session: &Session,
     step: &QueryStep,
     target: &ReadTarget,
     params: &omnigraph_compiler::ParamMap,
-    engine: &QueryResult,
-    ordered: bool,
+    engine: EngineOutcome<'_>,
 ) -> Result<(), String> {
-    let ReadTarget::Branch(branch) = target else {
-        return Err(
-            "expect same as reference: the reference reads a branch, not a snapshot".into(),
-        );
-    };
     let catalog = session.catalog();
-    let CoreDecl::Read(read) = check_query_decl(&catalog, &step.decl)
-        .map_err(|e| format!("expect same as reference: {e}"))?
-    else {
-        return Err("expect same as reference: the step is a write".into());
-    };
-    let reference = host
-        .reference_rows(session, &read, branch, params)
-        .await
-        .map_err(|e| {
-            format!(
-                "expect same as reference: the engine returned rows, the reference refused: {e}"
-            )
-        })?;
-    let actual = match engine.to_rust_json() {
-        Ok(Value::Array(rows)) => rows,
-        Ok(_) => {
-            return Err("expect same as reference: the engine returned a non-array row set".into());
+    let read = match check_query_decl(&catalog, &step.decl) {
+        Ok(CoreDecl::Read(read)) => read,
+        Ok(CoreDecl::Write(_)) => {
+            return Err("reference comparison: the step is a write".into());
         }
         Err(e) => {
             return Err(format!(
-                "expect same as reference: rows failed to render as JSON: {e}"
+                "reference comparison: the engine ran the query, the checker refuses it: {e}"
             ));
         }
     };
-    compare_with_reference(&reference, &actual, ordered)
+    let reference = host
+        .reference_rows(session, &read, target, params)
+        .await
+        .map_err(|e| format!("reference comparison: the reference was not reached: {e}"))?;
+    let engine = match engine {
+        EngineOutcome::Rows { result, ordered } => match result.to_rust_json() {
+            Ok(Value::Array(rows)) => Ok((rows, ordered)),
+            Ok(_) => {
+                return Err("reference comparison: the engine returned a non-array row set".into());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "reference comparison: rows failed to render as JSON: {e}"
+                ));
+            }
+        },
+        EngineOutcome::Refused(refusal) => Err(refusal),
+    };
+    judge_reference(&reference, &engine)
 }
 
-/// The reference's rows against the engine's, ordered or as bags; a
-/// difference names both row sets.
-fn compare_with_reference(
-    reference: &[Value],
-    engine: &[Value],
-    ordered: bool,
+/// The rule of the comparison. Rows against rows compare ordered or as
+/// bags, as the step's expect does. An `E`-coded engine refusal needs the
+/// reference to refuse with the same code; a refusal of input the query
+/// cannot read (a parameter value, a read target) needs the reference to
+/// refuse its input; a resource bound, which the reference does not have,
+/// needs the reference to answer rows. Any other pairing disagrees, and so
+/// does a reference that does not evaluate the query.
+pub(crate) fn judge_reference(
+    reference: &Result<Vec<Value>, ReferenceRefusal>,
+    engine: &Result<(Vec<Value>, bool), EngineRefusal>,
 ) -> Result<(), String> {
-    compare_rows(reference, engine, ordered).map_err(|(message, _)| {
-        format!(
-            "expect same as reference: the engine and the reference disagree (expected = reference, actual = engine): {message}\nreference: {}\nengine: {}",
-            Value::Array(reference.to_vec()),
-            Value::Array(engine.to_vec())
-        )
-    })
+    const PREFIX: &str = "reference comparison: the engine and the reference disagree";
+    match (reference, engine) {
+        (Ok(reference), Ok((engine, ordered))) => compare_rows(reference, engine, *ordered)
+            .map_err(|(message, _)| {
+                format!(
+                    "{PREFIX} (expected = reference, actual = engine): {message}\nreference: {}\nengine: {}",
+                    Value::Array(reference.to_vec()),
+                    Value::Array(engine.to_vec())
+                )
+            }),
+        (Err(refusal), Ok(_)) => Err(format!(
+            "{PREFIX}: the engine returned rows, the reference refused: {refusal}"
+        )),
+        (Ok(_), Err(EngineRefusal::Bound(_))) => Ok(()),
+        (Ok(rows), Err(refusal)) => Err(format!(
+            "{PREFIX}: the engine refused ({}), the reference returned rows: {}",
+            engine_refusal_text(refusal),
+            Value::Array(rows.to_vec())
+        )),
+        (Err(ReferenceRefusal::Runtime { code, .. }), Err(EngineRefusal::Coded(engine)))
+            if code == engine =>
+        {
+            Ok(())
+        }
+        (Err(ReferenceRefusal::Input(_)), Err(EngineRefusal::Input(_))) => Ok(()),
+        (Err(reference), Err(engine)) => Err(format!(
+            "{PREFIX}: the engine refused ({}), the reference refused otherwise: {reference}",
+            engine_refusal_text(engine)
+        )),
+    }
+}
+
+fn engine_refusal_text(refusal: &EngineRefusal) -> String {
+    match refusal {
+        EngineRefusal::Static => "at compile time".into(),
+        EngineRefusal::Coded(code) => format!("with {code}"),
+        EngineRefusal::Bound(message) => format!("at a resource bound: {message}"),
+        EngineRefusal::Input(message) => format!("on its input: {message}"),
+    }
 }
 
 /// Compares the executed rows with the expect body; a mismatch carries the

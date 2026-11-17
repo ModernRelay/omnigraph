@@ -102,7 +102,7 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, multi-graph serving and live deployment activation. |
 | `omnigraph-azure-admission` | Azure deployment wrapper that admits one mutation-capable server process through the root-derived Blob lease. It is not a storage backend. |
 | `omnigraph-gqt-core` | GQT format, embedded and served execution, and expectation checks shared by the GQT runner and benchmark harness. It has no build script or test-only engine dependency. |
-| `omnigraph-reference` | The typed core IR's reference interpreter: it evaluates a checked read directly from the operator table (whole-table reads, nested loops; no index, planner or cost model) over a branch's JSONL export, depending on the compiler alone. GQT's `--- expect same as reference` compares a query step's rows with it, the GQT runner is its one dependent, and a change to core semantics updates it in the same change ([testing](testing.md)). |
+| `omnigraph-reference` | The typed core IR's reference interpreter: it evaluates a checked read directly from the operator table (whole-table reads, nested loops; no index, planner or cost model) over a branch's JSONL export, depending on the compiler alone. GQT compares every read step on the direct engine with it, the GQT runner is its one dependent, and a change to core semantics updates it in the same change ([testing](testing.md)). |
 
 The server mounts `omnigraph-mcp` at `/mcp` on its existing listener. Its adapter
 dispatches to the same handlers as HTTP and retains authentication, OAuth

@@ -820,7 +820,16 @@ fn run_with_selection(
 ) -> CaseOutcome {
     let started = Instant::now();
     let mut summary = new_summary(Some(path.to_path_buf()));
-    summary.result = run_invocation(path, executable, bless, &selection, started, &mut summary);
+    let mut notes = Vec::new();
+    summary.result = run_invocation(
+        path,
+        executable,
+        bless,
+        &selection,
+        started,
+        &mut summary,
+        &mut notes,
+    );
     (summary.scope, summary.not_run) = coverage(&summary);
     if let Some(options) = &selection.measure {
         if let Err(error) = report_measurements(&summary, options, selection.artifacts.as_deref()) {
@@ -839,6 +848,7 @@ fn run_with_selection(
         stem: stem_of(path),
         elapsed: started.elapsed(),
         result,
+        notes,
     }
 }
 
@@ -1564,6 +1574,7 @@ fn run_invocation(
     selection: &Selection<'_>,
     started: Instant,
     summary: &mut Summary,
+    notes: &mut Vec<String>,
 ) -> Result<(), String> {
     refuse_ambient()?;
     let selected = selection.target;
@@ -1721,6 +1732,14 @@ fn run_invocation(
             || !matches!(selected_envs[0].execution, Execution::Engine { .. }))
     {
         return Err("invalid_case: bless requires exactly one direct engine environment".into());
+    }
+    // The reference comparison is a property of the direct engine: a run
+    // there names every step that opts out of it, and why.
+    if selected_envs
+        .iter()
+        .any(|env| matches!(env.execution, Execution::Engine { .. }))
+    {
+        notes.extend(case.reference_skips());
     }
     let build = executable_digest(executable)?;
     summary.executable_digest = Some(build.clone());

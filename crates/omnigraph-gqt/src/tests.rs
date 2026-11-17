@@ -8,7 +8,8 @@ const TRAVERSAL_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":
                               {\"edge\":\"Knows\",\"id\":\"k-1\",\"from\":\"alice\",\"to\":\"bob\",\"data\":{\"since\":2020}}\n";
 
 /// Every read position of an edge's `@type`, which the engine and the
-/// reference both answer, passes the comparison end to end.
+/// reference both answer, passes the comparison every read step on the
+/// direct engine makes, end to end.
 #[tokio::test]
 async fn reference_comparison_answers_named_type_access_in_every_read_position() {
     for (pattern, returns, order, rows, shape) in [
@@ -49,7 +50,7 @@ async fn reference_comparison_answers_named_type_access_in_every_read_position()
         ),
     ] {
         let text = format!(
-            "{HDR}{TRAVERSAL_SCHEMA}{TRAVERSAL_SEED}--- query\nquery q() {{ {pattern} return {{ {returns} }} {order} }}\n--- expect unordered\n{rows}\n--- expect shape\n{shape}\n--- expect same as reference\n"
+            "{HDR}{TRAVERSAL_SCHEMA}{TRAVERSAL_SEED}--- query\nquery q() {{ {pattern} return {{ {returns} }} {order} }}\n--- expect unordered\n{rows}\n--- expect shape\n{shape}\n"
         );
         let case = parse_case("reference_type_access", &text).unwrap();
         execute_case(&case, Path::new("unused.gqt"), false)

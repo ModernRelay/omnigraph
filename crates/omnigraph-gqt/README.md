@@ -111,12 +111,13 @@ the served and skipped cases and refuses an empty served set. A declared
 runner implements it. The declared `storage` is recorded, not checked: no
 route reports the server's backend. Refused before any request, by name: `--- restart`,
 `--- concurrent`, seam directives, settings steps and settings prefixes on a
-control or `show` step, `--- expect plan`, `--- expect same as reference`, the
+control or `show` step, `--- expect plan`, the
 `# traversal:` pin, the `# writer:` pin, and queries that need indices (`search`, `fuzzy`,
 `nearest`, `rrf`). The `--- expect shape` section is not judged under a
 server target: it holds the executor's Arrow schema against the compiler's,
-which no wire answer carries. `--server` is exclusive with `--store`, and a
-served run never blesses. `--server` selects exactly one `omnigraph-server`
+which no wire answer carries, and no step is compared with the reference
+interpreter, a property of the direct target. `--server` is exclusive with
+`--store`, and a served run never blesses. `--server` selects exactly one `omnigraph-server`
 environment (`--storage` picks when several are declared), since every pass
 would share the one graph. Parameters travel as the case spells them, or as
 its recipe generates them, and the server judges them, so a parameter error is
@@ -851,40 +852,62 @@ load executed: partitions 1 rows 2
 
 ## Reference comparison
 
-A query step may end with `--- expect same as reference`, directly after its
-`--- expect shape` or `--- expect plan`; the section has no body. The runner
-checks the step's query to its core IR again, evaluates it with the core
-reference interpreter (`omnigraph_reference::Interpreter`, the crate
-`omnigraph-reference`) over the same branch's rows, read through the engine's
-export, and compares those rows with the engine's, ordered or unordered as the
-step's `--- expect` says. The step's own rows expect still applies; the
-comparison is added to it.
+Every read step on the direct engine (`target: omnigraph-engine`) is also
+evaluated by the core reference interpreter
+(`omnigraph_reference::Interpreter`, the crate `omnigraph-reference`): the
+runner checks the step's query to its core IR again and evaluates it over the
+rows of the step's read target, a branch or a `snapshot:` commit, read
+through the engine's export. The step's own expect still applies; the
+comparison is added to it, and the rule depends on what the engine answered:
+
+| The engine | The reference must |
+|---|---|
+| returns rows | return the same rows, ordered or as bags as the step's `--- expect` compares them |
+| refuses a row with an `E` code (`E1` overflow, `E2` a zero divisor, `E3` a non-finite float) | refuse with the same code |
+| refuses input the query cannot read: a parameter value (an omitted required parameter, a null or out-of-range value, a window or constant outside its range), or a read target that does not resolve | refuse its input |
+| stops at one of its resource bounds (`query_memory_bytes`, `traversal_work_limit`, `read_work_limit`) | return rows, since it has no such bound |
+
+Any other pairing fails the step, and the failure prints both answers. A
+step the engine refuses at compile time (a `Q`, `T` or `P` diagnostic) has no
+core term and is not compared. Writes, `show` and the branch statements are
+not read steps, and the DST runner, the served runner and the benchmark
+executors do not compare: the comparison is a property of the direct target,
+not of the case.
+
+A step opts out only with a stated reason, in a `--- reference skipped:`
+section directly after its last expect section (`--- expect shape`,
+`--- expect plan` or `--- expect error:`):
 
 ```text
+--- query
+query operators() {
+    match { $o: @Operator }
+    return { $o.name }
+}
 --- expect unordered
+{"o.name": "Scan"}
 --- expect shape
-p.name: String
---- expect same as reference
+o.name: String
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows
 ```
 
-The interpreter evaluates each core operator of the RFC's operator table
-directly: nested loops, whole-table reads, no index, planner or cost model. A
-reference refusal or a row difference fails the step, and the failure prints
-both row sets. The section is refused on a mutate step, an error expect,
-`show` and `branch list`, and at run time on a `snapshot:` target, since the
-reference reads a branch. The DST runner skips the comparison, and an
-executor other than the GQT runner refuses the case.
+The reason is required and printed, with the step and its line, under the
+case's result line whenever the case runs on the direct engine. The section is
+refused (`reference_skip`) without a reason, with a body, after a mutate or
+statement step and anywhere but directly after a query step's last expect,
+and at run time on a step the comparison does not reach (a compile-time
+refusal, a parameter the runner refuses), where it would say nothing.
 
-The interpreter evaluates a field's analyzer profile as far as the RFC fixes
-it (the simple tokenizer, lowercasing, edition 2's 40-byte filter, ASCII
-folding of Latin letters, refusing any other non-ASCII letter in a folded
-field) and `bm25_v1` in `F64`, at the type the checker gives the score. The
-RFC names no stemmer or stop-word list, so it applies neither (`english_v1`, a
-field with no profile), nor NFC. A step depending on them, on `fuzzy` over a
-field with no profile, on a projected `bm25` score's last digits, on a
-catalogue type the export does not carry, or on `DateTime` spellings with
-different offsets has no `expect same as reference`. When the RFC's semantics
-change, the interpreter changes in the same pull request.
+The interpreter evaluates each core operator of the RFC's operator table
+directly: nested loops, whole-table reads, no index, planner or cost model.
+It evaluates a field's analyzer profile as the RFC fixes it (NFC, the simple
+tokenizer, lowercasing, the English Snowball stemmer and `english_v1`'s stop
+list of each word and its stem, ASCII folding of Latin letters, refusing any
+other non-ASCII letter in a folded field) and `bm25_v1` in `F64`, at the type
+the checker gives the score. A step that scans a catalogue type, which the
+export does not carry, or whose data is beyond nested loops in the case's
+budget, opts out with that reason. When the RFC's semantics change, the
+interpreter changes in the same pull request.
 
 ## Run and reproduce
 

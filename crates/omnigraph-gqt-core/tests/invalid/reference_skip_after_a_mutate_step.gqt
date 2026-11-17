@@ -1,0 +1,18 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+--- schema
+node Person {
+    name: String @key
+}
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+--- mutate
+query add($n: String) { insert Person { name: $n } }
+--- params
+{"n":"bob"}
+--- expect affected: nodes=1 edges=0
+--- reference skipped: the write is compared elsewhere

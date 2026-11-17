@@ -1203,36 +1203,55 @@ fn refuses_ok_expect_on_a_query_step() {
     assert!(refusal("x", &text).contains("a query step takes"));
 }
 
-const SAME: &str = "--- expect same as reference\n";
+const SKIP: &str = "--- reference skipped: a stated reason\n";
 
-#[test]
-fn same_as_reference_follows_a_query_steps_shape_or_plan() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{QUERY}{EXPECT}");
-    let case = parse_case("x", &text).unwrap();
-    let flags: Vec<bool> = case
-        .items
+/// The reason of each query step's `--- reference skipped:`, in order.
+fn skips(case: &Case) -> Vec<Option<String>> {
+    case.items
         .iter()
         .map(|item| match item {
-            Item::Step(Step::Query(step)) => step.same_as_reference,
+            Item::Step(Step::Query(step)) => step.reference_skipped.clone(),
             other => panic!("expected query steps, got {other:?}"),
         })
-        .collect();
-    assert_eq!(flags, [true, false]);
+        .collect()
+}
+
+#[test]
+fn reference_skipped_follows_a_read_steps_last_expect() {
+    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SKIP}{QUERY}{EXPECT}");
+    let case = parse_case("x", &text).unwrap();
+    assert_eq!(skips(&case), [Some("a stated reason".to_string()), None]);
     let after_plan = format!(
-        "{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect plan\nscan Person as $p: no filter\n{SAME}"
+        "{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect plan\nscan Person as $p: no filter\n{SKIP}"
     );
     let case = parse_case("x", &after_plan).unwrap();
     let Some(Item::Step(Step::Query(step))) = case.items.first() else {
         panic!("first item is the query step");
     };
-    assert!(step.same_as_reference && step.plan.is_some());
+    assert!(step.reference_skipped.is_some() && step.plan.is_some());
+    let after_error = format!(
+        "{HDR}{SCHEMA}{SEED}{QUERY}--- expect error: boom\n{SKIP}{QUERY}--- expect error: boom\n"
+    );
+    let case = parse_case("x", &after_error).unwrap();
+    assert_eq!(skips(&case), [Some("a stated reason".to_string()), None]);
+    let in_a_loop =
+        format!("{HDR}{SCHEMA}{SEED}--- loop $i 0 2\n{QUERY}{EXPECT}{SKIP}--- endloop\n");
+    let case = parse_case("x", &in_a_loop).unwrap();
+    let Some(Item::Loop { steps, .. }) = case.items.first() else {
+        panic!("first item is the loop");
+    };
+    assert!(matches!(&steps[0], Step::Query(step) if step.reference_skipped.is_some()));
+    assert_eq!(
+        case.reference_skips(),
+        ["step 1 (line 15): reference skipped: a stated reason"]
+    );
 }
 
 #[test]
-fn same_as_reference_is_refused_off_a_query_rows_expect() {
+fn reference_skipped_is_refused_off_a_read_step_or_without_a_reason() {
     for text in [
-        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{SAME}"),
-        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{SAME}"),
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{SKIP}"),
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{SKIP}"),
     ] {
         let refused = refusal("x", &text);
         assert!(refused.contains("refused on a mutate step"), "{refused}");
@@ -1240,53 +1259,120 @@ fn same_as_reference_is_refused_off_a_query_rows_expect() {
     let rows = "--- expect unordered\n{\"p.name\": \"alice\"}\n";
     for (text, needle) in [
         (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{SAME}{SHAPE}"),
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{SKIP}{SHAPE}"),
             "must directly follow",
         ),
         (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{rows}{SAME}{SHAPE}"),
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{rows}{SKIP}{SHAPE}"),
             "needs an `--- expect shape`",
         ),
         (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect error: boom\n{SAME}"),
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SKIP}{SKIP}"),
             "must directly follow",
         ),
         (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{SAME}"),
-            "must directly follow",
-        ),
-        (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{{\"p.name\": \"alice\"}}\n"),
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SKIP}{{\"p.name\": \"alice\"}}\n"),
             "carries no body",
         ),
         (
-            format!("{HDR}{SCHEMA}{SEED}{CREATE}{LIST}{SAME}"),
-            "only on a query declaration step",
+            format!("{HDR}{SCHEMA}{SEED}{CREATE}{LIST}{SKIP}"),
+            "query declaration step only",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- reference skipped:\n"),
+            "names no reason",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- reference skipped:   \n"),
+            "names no reason",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- reference compared\n"),
+            "one form is `--- reference skipped: <reason>`",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect same as reference\n"),
+            "unknown expect mode",
         ),
     ] {
-        let refused = refusal("x", &text);
-        assert!(refused.contains(needle), "{needle}: {refused}");
+        let errors = parse_case("x", &text).expect_err("expected the case to be refused");
+        let first = errors.first();
+        assert!(
+            first.message.contains(needle),
+            "{needle}: {}",
+            first.message
+        );
+        assert!(first.fix.is_some(), "{needle}: no fix");
     }
 }
 
 #[test]
-fn same_as_reference_compares_as_the_rows_expect_compares() {
+fn the_reference_comparison_judges_rows_and_refusals() {
     let a = serde_json::json!({"p.name": "alice"});
     let b = serde_json::json!({"p.name": "bob"});
-    compare_with_reference(&[a.clone(), b.clone()], &[b.clone(), a.clone()], false).unwrap();
-    let moved =
-        compare_with_reference(&[a.clone(), b.clone()], &[b.clone(), a.clone()], true).unwrap_err();
+    let rows = |rows: &[Value], ordered| Ok((rows.to_vec(), ordered));
+    let runtime = |code: &str| {
+        Err(ReferenceRefusal::Runtime {
+            code: code.into(),
+            message: "refused".into(),
+        })
+    };
+    let input = || Err(ReferenceRefusal::Input("a parameter".into()));
+    // Rows compare as the step's expect does: as bags, or in order.
+    judge_reference(
+        &Ok(vec![a.clone(), b.clone()]),
+        &rows(&[b.clone(), a.clone()], false),
+    )
+    .unwrap();
+    let moved = judge_reference(
+        &Ok(vec![a.clone(), b.clone()]),
+        &rows(&[b.clone(), a.clone()], true),
+    )
+    .unwrap_err();
     assert!(
         moved.contains(
             "the engine and the reference disagree (expected = reference, actual = engine)"
         ),
         "{moved}"
     );
-    let missing = compare_with_reference(&[a.clone(), b], &[a], false).unwrap_err();
+    let missing = judge_reference(
+        &Ok(vec![a.clone(), b.clone()]),
+        &rows(std::slice::from_ref(&a), false),
+    )
+    .unwrap_err();
     assert!(
         missing.contains("reference: [") && missing.contains("engine: [{\"p.name\":\"alice\"}]"),
         "{missing}"
     );
+    // An `E` refusal needs the same code; an input refusal an input
+    // refusal; a resource bound the reference's rows.
+    let coded = Err(EngineRefusal::Coded("E2"));
+    judge_reference(&runtime("E2"), &coded).unwrap();
+    for reference in [runtime("E1"), input(), Ok(vec![a.clone()])] {
+        let refused = judge_reference(&reference, &coded).unwrap_err();
+        assert!(
+            refused.contains("the engine refused (with E2)"),
+            "{refused}"
+        );
+    }
+    let bad_input = Err(EngineRefusal::Input("parameter 'id' not provided".into()));
+    judge_reference(&input(), &bad_input).unwrap();
+    for reference in [runtime("E2"), Ok(Vec::new())] {
+        let refused = judge_reference(&reference, &bad_input).unwrap_err();
+        assert!(refused.contains("on its input"), "{refused}");
+    }
+    let bound = Err(EngineRefusal::Bound("query_memory_bytes".into()));
+    judge_reference(&Ok(vec![a.clone()]), &bound).unwrap();
+    for reference in [runtime("E1"), input()] {
+        let refused = judge_reference(&reference, &bound).unwrap_err();
+        assert!(refused.contains("at a resource bound"), "{refused}");
+    }
+    // A reference that does not evaluate the query disagrees with any
+    // engine answer.
+    let unsupported = Err(ReferenceRefusal::Unsupported("a form".into()));
+    for engine in [rows(&[a], false), coded, bad_input, bound] {
+        assert!(judge_reference(&unsupported, &engine).is_err());
+    }
 }
 
 #[test]
@@ -3563,6 +3649,8 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
             &[(QueryParse, 7), (BodyShape, 13)],
         ),
         ("query_parse_unclosed_brace", &[(QueryParse, 14)]),
+        ("reference_skip_after_a_mutate_step", &[(ReferenceSkip, 18)]),
+        ("reference_skip_without_a_reason", &[(ReferenceSkip, 19)]),
         ("runner_config_timeout_as_a_word", &[(RunnerConfig, 2)]),
         (
             "section_order_schema_after_a_step",
@@ -3684,7 +3772,7 @@ fn every_near_miss_word_is_a_dispatched_spelling() {
 
 /// A host whose reference interpreter answers with fixed rows, or refuses.
 struct FixedReferenceHost {
-    reference: Result<Vec<Value>, String>,
+    reference: Result<Vec<Value>, ReferenceRefusal>,
 }
 
 impl ExecutionHost for FixedReferenceHost {
@@ -3702,56 +3790,89 @@ impl ExecutionHost for FixedReferenceHost {
         PlainHost.finish_seams(guard)
     }
 
+    fn compares_reference(&self) -> bool {
+        true
+    }
+
     fn reference_rows<'a>(
         &'a self,
         _session: &'a Session,
         _read: &'a omnigraph_compiler::ir::core::CoreRead,
-        _branch: &'a str,
+        _target: &'a ReadTarget,
         _params: &'a omnigraph_compiler::ParamMap,
-    ) -> futures::future::BoxFuture<'a, Result<Vec<Value>, String>> {
-        futures::future::ready(self.reference.clone()).boxed()
+    ) -> futures::future::BoxFuture<'a, Result<Result<Vec<Value>, ReferenceRefusal>, String>> {
+        futures::future::ready(Ok(self.reference.clone())).boxed()
     }
 }
 
-/// `--- expect same as reference` fails its step when the reference's rows
-/// differ from the engine's, and when the reference refuses a query the
-/// engine answered; it passes when they agree.
+/// The step's outcome under a host whose reference answers `reference`.
+async fn with_reference(
+    text: &str,
+    reference: Result<Vec<Value>, ReferenceRefusal>,
+) -> Result<(), String> {
+    let case = parse_case("reference_comparison", text).unwrap();
+    let (session, uri, _dir) = open_case_store(&case).await.unwrap();
+    let host = FixedReferenceHost { reference };
+    execute_steps(
+        &case,
+        Path::new("unused.gqt"),
+        false,
+        session,
+        &uri,
+        None,
+        &host,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("{error:?}"))
+}
+
+/// Every read step is compared by default: a rows step fails when the
+/// reference's rows differ or it refuses, and passes when they agree; an
+/// error step that ran fails unless the reference refuses with the same
+/// code; a step refused at compile time is not compared; a skipped step is
+/// not compared, and a skip on a step the comparison never reaches fails.
 #[tokio::test]
-async fn a_reference_disagreement_or_refusal_fails_the_step() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect same as reference\n");
-    let case = parse_case("reference_comparison", &text).unwrap();
-    for (reference, failure) in [
-        (Ok(vec![serde_json::json!({"p.name": "alice"})]), None),
+async fn every_read_step_is_compared_with_the_reference() {
+    let rows_step = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let e2 = || {
+        Err(ReferenceRefusal::Runtime {
+            code: "E2".into(),
+            message: "a divisor is zero".into(),
+        })
+    };
+    let alice = || Ok(vec![serde_json::json!({"p.name": "alice"})]);
+    let bob = || Ok(vec![serde_json::json!({"p.name": "bob"})]);
+    with_reference(&rows_step, alice()).await.unwrap();
+    for (reference, needle) in [
+        (bob(), "the engine and the reference disagree"),
+        (e2(), "the reference refused: E2: a divisor is zero"),
+    ] {
+        let error = with_reference(&rows_step, reference).await.unwrap_err();
+        assert!(error.contains(needle), "{needle} not in {error}");
+    }
+    let skipped = format!("{rows_step}--- reference skipped: the host answers bob\n");
+    with_reference(&skipped, bob()).await.unwrap();
+
+    let divide = "--- query\nquery q($d: I64) {\n    match { $p: Person }\n    return { 1 / $d as x }\n}\n--- params\n{\"d\": 0}\n--- expect error: E2\n";
+    let error_step = format!("{HDR}{SCHEMA}{SEED}{divide}");
+    with_reference(&error_step, e2()).await.unwrap();
+    for (reference, needle) in [
+        (alice(), "the reference returned rows"),
         (
-            Ok(vec![serde_json::json!({"p.name": "bob"})]),
-            Some("the engine and the reference disagree"),
-        ),
-        (
-            Err("E2: a divisor is zero".to_string()),
-            Some("the reference refused: E2: a divisor is zero"),
+            Err(ReferenceRefusal::Input("a parameter".into())),
+            "the reference refused otherwise",
         ),
     ] {
-        let (session, uri, _dir) = open_case_store(&case).await.unwrap();
-        let host = FixedReferenceHost { reference };
-        let result = execute_steps(
-            &case,
-            Path::new("unused.gqt"),
-            false,
-            session,
-            &uri,
-            None,
-            &host,
-        )
-        .await;
-        match failure {
-            None => assert!(result.is_ok(), "agreeing rows failed the step"),
-            Some(needle) => {
-                let error = match result {
-                    Ok(_) => panic!("the step passed although {needle}"),
-                    Err(error) => format!("{error:?}"),
-                };
-                assert!(error.contains(needle), "{needle} not in {error}");
-            }
-        }
+        let error = with_reference(&error_step, reference).await.unwrap_err();
+        assert!(error.contains(needle), "{needle} not in {error}");
     }
+
+    let unparsed = format!(
+        "{HDR}{SCHEMA}{SEED}--- query\nquery q() {{ match {{ $p: Person }}\n--- expect error: Q001\n"
+    );
+    with_reference(&unparsed, alice()).await.unwrap();
+    let stale = format!("{unparsed}--- reference skipped: a stale reason\n");
+    let error = with_reference(&stale, alice()).await.unwrap_err();
+    assert!(error.contains("does not reach"), "{error}");
 }
