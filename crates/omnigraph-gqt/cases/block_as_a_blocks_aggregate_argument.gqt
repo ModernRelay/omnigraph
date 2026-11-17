@@ -1,0 +1,68 @@
+# issue: none
+# notes: A block read as the aggregate argument of another block, in a return item
+# notes: and in a `where`: the inner block correlates on the outer block's rows. Found by
+# notes: the generated engine-equals-reference law (law_engine_reference.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+    p0: F64?
+}
+edge Rel0: A -> A
+
+--- seed
+{"type":"A","data":{"k":"a","p0":1.5}}
+{"type":"A","data":{"k":"b","p0":2.5}}
+{"type":"A","data":{"k":"c"}}
+{"edge":"Rel0","from":"a","to":"a"}
+{"edge":"Rel0","from":"b","to":"a"}
+{"edge":"Rel0","from":"c","to":"b"}
+
+--- query
+query q() {
+  match { $n1: A }
+  return { $n1.k as k, (avg((avg($n4.p0) { $n4: A, $n4 rel0 $n3 })) { $n3: A, $n3 rel0 $n1 }) as c1 }
+}
+
+--- expect unordered
+{"c1":2,"k":"a"}
+{"k":"b"}
+{"k":"c"}
+
+--- expect shape
+k: String
+c1: F64?
+
+--- query
+query q() {
+  match { $n1: A }
+  return { $n1.k as k, (sum((count { $n4: A, $n4 rel0 $n3 })) { $n3: A, $n3 rel0 $n1 }) as c1 }
+}
+
+--- expect unordered
+{"c1":0,"k":"b"}
+{"c1":3,"k":"a"}
+{"k":"c"}
+
+--- expect shape
+k: String
+c1: F64?
+
+--- query
+query q() {
+  match { $n1: A }
+  where (sum((count { $n4: A, $n4 rel0 $n3 })) { $n3: A, $n3 rel0 $n1 }) > 1
+  return { $n1.k as k }
+}
+
+--- expect unordered
+{"k":"a"}
+
+--- expect shape
+k: String

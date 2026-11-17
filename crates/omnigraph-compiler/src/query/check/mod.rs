@@ -3571,6 +3571,23 @@ impl Ctx<'_> {
         if self.refusals.len() > mark || inner.refused || (block.arg.is_some() && arg.is_none()) {
             return Err(E::Recorded);
         }
+        // A block in the argument correlates on the block's own rows: it
+        // is placed in the block's term, as a return item's block is in its
+        // read's, before the aggregate reads its column.
+        let blocks = std::mem::take(&mut inner.block_buf);
+        if !blocks.is_empty() {
+            let at = inner.binders;
+            inner.push_filter(
+                at,
+                Step::Filter {
+                    blocks,
+                    pred: SExpr::new(
+                        SKind::Lit(Literal::Bool(true)),
+                        Ty::scalar(ScalarType::Bool, false),
+                    ),
+                },
+            );
+        }
         let free = inner.free.clone();
         let term = self.finish(&mut inner)?.unwrap_or(Term::Unit);
         for f in &free {
