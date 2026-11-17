@@ -259,6 +259,36 @@ enum Typed {
 }
 
 fn typed_decl(catalog: &Catalog, unit: &HashMap<String, &Decl>, decl: &Decl) -> Typed {
+    typed_decl_measured(catalog, unit, decl, &mut 0)
+}
+
+/// How many expressions typing each declaration of `source` typed
+/// ([`Ctx::typed_exprs`]), with whether it was accepted.
+#[cfg(test)]
+pub(crate) fn typing_work(catalog: &Catalog, source: &str) -> Vec<(String, usize, bool)> {
+    let file = crate::query::syntax::parse::parse_source(source).expect("parses");
+    let decls: Vec<&Decl> = match &file.body {
+        Body::Decls(d) => d.iter().collect(),
+        Body::Explain { before, decl } => before.iter().chain([decl.as_ref()]).collect(),
+        Body::Statement(_) => Vec::new(),
+    };
+    let unit = source_unit(&decls);
+    decls
+        .iter()
+        .map(|d| {
+            let mut work = 0;
+            let typed = typed_decl_measured(catalog, &unit, d, &mut work);
+            (d.name.clone(), work, matches!(typed, Typed::Checked(_)))
+        })
+        .collect()
+}
+
+fn typed_decl_measured(
+    catalog: &Catalog,
+    unit: &HashMap<String, &Decl>,
+    decl: &Decl,
+    work: &mut usize,
+) -> Typed {
     let refused = |d: QueryDiagnostic| Typed::Refused {
         refusals: vec![d],
         partial: None,
@@ -276,6 +306,7 @@ fn typed_decl(catalog: &Catalog, unit: &HashMap<String, &Decl>, decl: &Decl) -> 
         refusals: Vec::new(),
         plan_limit: DEFAULT_PLAN_BUDGET,
         typed_calls: HashMap::new(),
+        typed_exprs: 0,
     };
     let params = match param_types(&decl.params) {
         Ok(p) => p,
@@ -304,6 +335,7 @@ fn typed_decl(catalog: &Catalog, unit: &HashMap<String, &Decl>, decl: &Decl) -> 
         }),
         DeclBody::Write(w) => ctx.write_decl(decl, w).map(CoreDecl::Write),
     };
+    *work = ctx.typed_exprs;
     // Every refusal recorded by a recovery point, then the one that ended
     // the pass, each at its span or at the declaration's name.
     let mut refusals = std::mem::take(&mut ctx.refusals);
@@ -1086,6 +1118,10 @@ struct Ctx<'a> {
     /// term, type and column shapes. A body that reached a recursive
     /// reference depends on the call frames and is typed at each call.
     typed_calls: HashMap<String, (Term, RelTy, Vec<Option<String>>)>,
+    /// How many expressions the pass typed, each written expression once
+    /// per time it is typed: the deterministic measure of a declaration's
+    /// typing work that the tests hold to the source's size.
+    typed_exprs: usize,
 }
 
 struct Frame {
@@ -1150,13 +1186,10 @@ enum Step {
     },
     /// Correlated block aggregates (each the inner `Group`, and the column
     /// that receives it), then the filter that reads them.
-    Filter {
-        blocks: Vec<(Term, String, Agg)>,
-        pred: SExpr,
-    },
+    Filter { blocks: Vec<BlockAgg>, pred: SExpr },
     /// `let $v = expr`.
     Let {
-        blocks: Vec<(Term, String, Agg)>,
+        blocks: Vec<BlockAgg>,
         name: String,
         value: SExpr,
     },
@@ -1193,14 +1226,15 @@ struct Scope {
     /// correlation).
     future: HashSet<String>,
     /// Block aggregates produced while typing the current expression.
-    block_buf: Vec<(Term, String, Agg)>,
+    block_buf: Vec<BlockAgg>,
     /// A conjunct of the scope's `where` that can fail was placed: it and
     /// every conjunct after it run after the scope's elements (A3).
     failing_where: bool,
-    /// The guards around the expression being typed: an operand of `and`,
-    /// `or`, `if` or `coalesce` is evaluated only where these hold (A3), so
-    /// a block under them that can fail is evaluated only there too.
-    guards: Vec<Expr>,
+    /// The guards around the expression being typed, each typed once where
+    /// it is written: an operand of `and`, `or`, `if` or `coalesce` is
+    /// evaluated only where these hold (A3), so a block under them that can
+    /// fail is evaluated only there too ([`BlockAgg::guard`]).
+    guards: Vec<SExpr>,
     pending: Vec<Pending>,
     /// True inside an inline read or a called body: a binding reusing an
     /// outer name is `T68`, since it would silently become a filter.
@@ -2774,8 +2808,7 @@ impl Ctx<'_> {
                         // fail may be placed below later elements; that one
                         // and every one after it run after the scope's
                         // elements, in written order.
-                        let fails =
-                            pred.can_fail || blocks.iter().any(|(inner, _, _)| inner.can_fail());
+                        let fails = pred.can_fail || blocks.iter().any(|b| b.inner.can_fail());
                         if fails {
                             sc.failing_where = true;
                         }
@@ -4972,6 +5005,7 @@ impl Ctx<'_> {
     }
 
     fn expr(&mut self, sc: &mut Scope, e: &Expr, at: At) -> R<SExpr> {
+        self.typed_exprs += 1;
         let sub = at;
         let boolean = Ty::scalar(ScalarType::Bool, false);
         Ok(match e {
@@ -5106,24 +5140,7 @@ impl Ctx<'_> {
                 ));
             }
             Expr::Block(b) => {
-                let (mut term, mut free, mut arg) = self.block_scope_arg(sc, b)?;
-                // A block that can fail, written under a guard, holds the
-                // guard as its first conjunct: it evaluates nothing on an
-                // outer row the guard does not select (A3).
-                if term.can_fail()
-                    && let Some(guard) = sc
-                        .guards
-                        .iter()
-                        .cloned()
-                        .reduce(|a, b| Expr::And(Box::new(a), Box::new(b)))
-                {
-                    let mut guarded = (**b).clone();
-                    guarded.pattern.predicate = Some(match guarded.pattern.predicate.take() {
-                        Some(own) => Expr::And(Box::new(guard), Box::new(own)),
-                        None => guard,
-                    });
-                    (term, free, arg) = self.block_scope_arg(sc, &guarded)?;
-                }
+                let (term, free, arg) = self.block_scope_arg(sc, b)?;
                 if free.is_empty() {
                     return Err(err(
                         T39,
@@ -5131,6 +5148,9 @@ impl Ctx<'_> {
                     ));
                 }
                 let col = self.fresh("b");
+                // The block evaluates its inner term and, over its rows, its
+                // aggregate's argument; either can fail.
+                let can_fail = term.can_fail() || arg.as_ref().is_some_and(|a| a.can_fail);
                 let (agg, value) = match b.func {
                     BlockFunc::Exists => (count_rows(), exists_col(&col)),
                     BlockFunc::Agg(func) => {
@@ -5157,7 +5177,31 @@ impl Ctx<'_> {
                         (agg, SExpr::new(SKind::Col(col.clone()), ty))
                     }
                 };
-                sc.block_buf.push((term, col.clone(), agg));
+                // A block that can fail, written under a guard, runs only on
+                // the outer rows the guard selects (A3): the guard, typed
+                // once where it was written, is computed as a column of the
+                // outer row and the block's input keeps the rows where it
+                // holds.
+                let guard = if can_fail {
+                    sc.guards
+                        .iter()
+                        .cloned()
+                        .reduce(|a, b| {
+                            SExpr::new(
+                                SKind::And(a.boxed(), b.boxed()),
+                                Ty::scalar(ScalarType::Bool, false),
+                            )
+                        })
+                        .map(|g| (self.fresh("g"), g))
+                } else {
+                    None
+                };
+                sc.block_buf.push(BlockAgg {
+                    inner: term,
+                    col: col.clone(),
+                    agg,
+                    guard,
+                });
                 // The block's column is visible to the expression that reads it.
                 value
             }
@@ -5330,13 +5374,16 @@ impl Ctx<'_> {
                 let a = self.expr(sc, l, sub);
                 // `a and b` evaluates `b` only where `a` is not false, `a or
                 // b` only where `a` is not true.
-                sc.guards.push(if matches!(e, Expr::And(..)) {
-                    lazy_coalesce(l, true)
-                } else {
-                    Expr::Not(Box::new(lazy_coalesce(l, false)))
-                });
+                let guard = a
+                    .as_ref()
+                    .ok()
+                    .map(|a| lazy_guard(a, matches!(e, Expr::And(..)), true));
+                let guarded = guard.is_some();
+                sc.guards.extend(guard);
                 let b = self.expr(sc, r, sub);
-                sc.guards.pop();
+                if guarded {
+                    sc.guards.pop();
+                }
                 let (a, b) = self.both(sc, a, b)?;
                 let what = if matches!(e, Expr::And(..)) {
                     "`and`"
@@ -5379,6 +5426,9 @@ impl Ctx<'_> {
             ));
         }
         let mut args = Vec::new();
+        // Each argument as typed, by position, for the guards of the ones
+        // after it.
+        let mut typed_at: Vec<Option<SExpr>> = Vec::new();
         // Every argument is typed, so a refusal in one does not hide an
         // independent refusal in another.
         let mut failed: Option<E> = None;
@@ -5393,23 +5443,34 @@ impl Ctx<'_> {
                     // The lazy rows evaluate an argument only where the ones
                     // before it select it: `if`'s branches under their
                     // condition, `coalesce`'s later arguments where every
-                    // earlier one is null.
-                    let earlier = |i: usize| match c.args.get(i) {
-                        Some(Arg::Expr(e)) => Some(e.clone()),
-                        _ => None,
-                    };
+                    // earlier one is null. Each guard reads the arguments as
+                    // they were typed; nothing is typed again.
+                    let earlier = |i: usize| typed_at.get(i).cloned().flatten();
                     let guard = match (name, position) {
-                        ("if", 1) => earlier(0).map(|cnd| lazy_coalesce(&cnd, false)),
-                        ("if", 2) => {
-                            earlier(0).map(|cnd| Expr::Not(Box::new(lazy_coalesce(&cnd, false))))
-                        }
+                        ("if", 1) => earlier(0).map(|cnd| lazy_guard(&cnd, true, false)),
+                        ("if", 2) => earlier(0).map(|cnd| lazy_guard(&cnd, false, true)),
                         ("coalesce", p) if p > 0 => (0..p)
-                            .filter_map(earlier)
-                            .map(|before| Expr::IsNull {
-                                expr: Box::new(before),
-                                negated: false,
-                            })
-                            .reduce(|a, b| Expr::And(Box::new(a), Box::new(b))),
+                            .map(earlier)
+                            .collect::<Option<Vec<_>>>()
+                            .and_then(|before| {
+                                before
+                                    .into_iter()
+                                    .map(|b| {
+                                        SExpr::new(
+                                            SKind::IsNull {
+                                                expr: b.boxed(),
+                                                negated: false,
+                                            },
+                                            Ty::scalar(ScalarType::Bool, false),
+                                        )
+                                    })
+                                    .reduce(|a, b| {
+                                        SExpr::new(
+                                            SKind::And(a.boxed(), b.boxed()),
+                                            Ty::scalar(ScalarType::Bool, false),
+                                        )
+                                    })
+                            }),
                         _ => None,
                     };
                     let guarded = guard.is_some();
@@ -5418,6 +5479,7 @@ impl Ctx<'_> {
                     if guarded {
                         sc.guards.pop();
                     }
+                    typed_at.push(typed.as_ref().ok().cloned());
                     match typed {
                         Ok(v) => args.push(v),
                         Err(e) => {
@@ -5738,18 +5800,7 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
             }
         }
         Step::Filter { blocks, pred } => {
-            let mut t = acc.unwrap_or(Term::Unit);
-            for (inner, col, agg) in blocks {
-                t = Term::Correlate {
-                    outer: t.boxed(),
-                    inner: Term::Group {
-                        input: inner.boxed(),
-                        keys: Vec::new(),
-                        aggs: vec![(col, agg)],
-                    }
-                    .boxed(),
-                };
-            }
+            let t = with_blocks(acc.unwrap_or(Term::Unit), blocks);
             if matches!(pred.kind, SKind::Lit(Literal::Bool(true))) {
                 return t;
             }
@@ -5763,18 +5814,7 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
             name,
             value,
         } => {
-            let mut t = acc.unwrap_or(Term::Unit);
-            for (inner, col, agg) in blocks {
-                t = Term::Correlate {
-                    outer: t.boxed(),
-                    inner: Term::Group {
-                        input: inner.boxed(),
-                        keys: Vec::new(),
-                        aggs: vec![(col, agg)],
-                    }
-                    .boxed(),
-                };
-            }
+            let t = with_blocks(acc.unwrap_or(Term::Unit), blocks);
             Term::Project {
                 input: t.boxed(),
                 items: vec![(name, value.to_ir())],
@@ -5842,13 +5882,136 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
     }
 }
 
+/// A block typed in an expression: its inner term, the column its aggregate
+/// fills, the aggregate, and, for a block that can fail written under a
+/// guard, the guard's column and the guard as typed where it was written.
+#[derive(Debug, Clone)]
+struct BlockAgg {
+    inner: Term,
+    col: String,
+    agg: Agg,
+    guard: Option<(String, SExpr)>,
+}
+
+impl BlockAgg {
+    /// The nodes [`with_blocks`] adds for the block: `Correlate` and
+    /// `Group` over its inner term, and for a guarded block the guard's
+    /// `Project` and the inner `Filter` on it.
+    fn added(&self) -> usize {
+        2 + self.inner.size() + if self.guard.is_some() { 2 } else { 0 }
+    }
+}
+
+/// Each block over `t`: `Correlate(t, Group(inner, [], [agg]))`, one row per
+/// outer row. A guarded block's guard is computed once as a column of the
+/// outer row (`Project`) and its inner term's `Env` row is kept only where
+/// that column holds, so on an outer row the guard rejects the block reads
+/// nothing and evaluates nothing: `count` 0, every other aggregate null.
+fn with_blocks(mut t: Term, blocks: Vec<BlockAgg>) -> Term {
+    for BlockAgg {
+        inner,
+        col,
+        agg,
+        guard,
+    } in blocks
+    {
+        let inner = match guard {
+            None => inner,
+            Some((name, guard)) => {
+                t = Term::Project {
+                    input: t.boxed(),
+                    items: vec![(name.clone(), guard.to_ir())],
+                    keep: true,
+                };
+                condition_env(inner, &name)
+            }
+        };
+        t = Term::Correlate {
+            outer: t.boxed(),
+            inner: Term::Group {
+                input: inner.boxed(),
+                keys: Vec::new(),
+                aggs: vec![(col, agg)],
+            }
+            .boxed(),
+        };
+    }
+    t
+}
+
+/// `t` with its `Env` row (the leaf its own steps were built on) kept only
+/// where the outer Boolean column `guard` holds; the `Env` exposes `guard`
+/// beside the columns it already read.
+fn condition_env(t: Term, guard: &str) -> Term {
+    let boolean = Ty::scalar(ScalarType::Bool, false);
+    let step = |input: Box<Term>| Box::new(condition_env(*input, guard));
+    match t {
+        Term::Env(mut cols) => {
+            cols.push(Col {
+                name: guard.to_string(),
+                ty: boolean.clone(),
+            });
+            Term::Filter {
+                input: Term::Env(cols).boxed(),
+                pred: SExpr::new(SKind::Col(guard.to_string()), boolean).to_ir(),
+            }
+        }
+        Term::Expand {
+            input,
+            src,
+            dst,
+            src_type,
+            dst_type,
+            edges,
+            min_hops,
+            max_hops,
+            edge_var,
+        } => Term::Expand {
+            input: step(input),
+            src,
+            dst,
+            src_type,
+            dst_type,
+            edges,
+            min_hops,
+            max_hops,
+            edge_var,
+        },
+        Term::Filter { input, pred } => Term::Filter {
+            input: step(input),
+            pred,
+        },
+        Term::Project { input, items, keep } => Term::Project {
+            input: step(input),
+            items,
+            keep,
+        },
+        Term::Group { input, keys, aggs } => Term::Group {
+            input: step(input),
+            keys,
+            aggs,
+        },
+        Term::Correlate { outer, inner } => Term::Correlate {
+            outer: step(outer),
+            inner,
+        },
+        Term::Order { input, keys } => Term::Order {
+            input: step(input),
+            keys,
+        },
+        Term::Cut { input, k } => Term::Cut {
+            input: step(input),
+            k,
+        },
+        other => other,
+    }
+}
+
 impl Step {
     /// How many nodes [`apply`] adds above a present `acc`, read from the
     /// step without building them.
     fn added(&self) -> usize {
-        let blocks = |blocks: &[(Term, String, Agg)]| {
-            blocks.iter().map(|(t, ..)| 2 + t.size()).sum::<usize>()
-        };
+        let blocks = |blocks: &[BlockAgg]| blocks.iter().map(BlockAgg::added).sum::<usize>();
         match self {
             Step::Leaf(t) => 1 + t.size(),
             Step::Expand { semi, .. } => 1 + usize::from(semi.is_some()),
@@ -5863,18 +6026,28 @@ impl Step {
     }
 }
 
-/// `coalesce(e, fallback)`: `e`, or the Boolean `fallback` where `e` is
-/// null, the guard an operand of a lazy row is evaluated under.
-fn lazy_coalesce(e: &Expr, fallback: bool) -> Expr {
-    Expr::Call(Call {
-        name: "coalesce".into(),
-        args: vec![
-            Arg::Expr(e.clone()),
-            Arg::Expr(Expr::Literal(Literal::Bool(fallback))),
-        ],
-        options: Vec::new(),
-        at: SourceSpan::default(),
-    })
+/// The guard a lazy row's later operand is evaluated under, over the
+/// earlier operand `e` as it was typed: the rows where `e` is `when`, a null
+/// `e` selected when `on_null`. `b` in `a and b` runs where `a` is true or
+/// null, in `a or b` where it is false or null; `if`'s branch where its
+/// condition is true, its else branch where it is false or null.
+fn lazy_guard(e: &SExpr, when: bool, on_null: bool) -> SExpr {
+    let boolean = Ty::scalar(ScalarType::Bool, false);
+    let lit = |b: bool| SExpr::new(SKind::Lit(Literal::Bool(b)), boolean.clone());
+    let fallback = if when { on_null } else { !on_null };
+    let coalesced = SExpr::new(
+        SKind::Call {
+            func: "coalesce".into(),
+            args: vec![e.clone(), lit(fallback)],
+            options: Vec::new(),
+        },
+        boolean.clone(),
+    );
+    if when {
+        coalesced
+    } else {
+        SExpr::new(SKind::Not(coalesced.boxed()), boolean)
+    }
 }
 
 /// Whether `t` holds a recursive reference or a fixpoint, whose typing

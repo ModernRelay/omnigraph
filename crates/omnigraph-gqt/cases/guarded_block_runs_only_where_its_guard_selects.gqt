@@ -1,0 +1,106 @@
+# issue: none
+# notes: A block that can fail, written under a guard (the later operand of
+# notes: `and` or `or`, an `if` branch, a later `coalesce` argument), runs only
+# notes: on the outer rows its guard selects: its inner pattern, its own
+# notes: `where`, a `let` inside it and its aggregate's argument are evaluated
+# notes: nowhere else, so ada (age 0) fails none of them. The guard is the
+# notes: earlier operand as it was typed, read as a column of the outer row;
+# notes: nothing the guard binds is bound again in the block.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32
+}
+node Company {
+    slug: String @key
+    size: I32
+}
+edge WorksAt: Person -> Company
+
+--- seed
+{"type":"Person","data":{"handle":"ada","age":0}}
+{"type":"Person","data":{"handle":"bob","age":5}}
+{"type":"Person","data":{"handle":"cy","age":50}}
+{"type":"Company","data":{"slug":"acme","size":0}}
+{"type":"Company","data":{"slug":"bolt","size":7}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"WorksAt","from":"bob","to":"acme"}
+{"edge":"WorksAt","from":"cy","to":"bolt"}
+
+--- query
+query or_guards_a_block_whose_where_can_fail() {
+    match { $p: Person }
+    where $p.age = 0 or count { $c: Company, $p worksAt $c where 10 / $p.age > 1 } > 0
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+--- expect shape
+p.handle: String
+--- expect same as reference
+
+--- query
+query if_guards_an_aggregate_argument() {
+    match { $p: Person }
+    return { $p.handle, if($p.age != 0, sum(100 / $p.age) { $c: Company, $p worksAt $c }, 0) as s }
+}
+
+--- expect unordered
+{"p.handle":"ada","s":0}
+{"p.handle":"bob","s":20}
+{"p.handle":"cy","s":2}
+--- expect shape
+p.handle: String
+s: F64
+--- expect same as reference
+
+--- query
+query coalesce_guards_a_later_argument() {
+    match { $p: Person }
+    return { $p.handle, coalesce(max($c.size) { $c: Company, $p worksAt $c where $p.age = 0 }, count { $c: Company, $p worksAt $c where 10 / $p.age > 0 }) as n }
+}
+
+--- expect unordered
+{"n":0,"p.handle":"ada"}
+{"n":0,"p.handle":"cy"}
+{"n":1,"p.handle":"bob"}
+--- expect shape
+p.handle: String
+n: I64
+--- expect same as reference
+
+--- query
+query and_guards_a_let_inside_the_block() {
+    match { $p: Person }
+    where $p.handle != "nobody" and ($p.age = 0 or sum($x) { $c: Company, $p worksAt $c, let $x = 100 / $p.age } > 2)
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+--- expect shape
+p.handle: String
+--- expect same as reference
+
+--- query
+query a_guard_holding_a_block_binds_nothing_in_the_guarded_one() {
+    match { $p: Person }
+    where if($p.age != 0 and exists { $c: Company, $p worksAt $c }, count { $c: Company, $p worksAt $c where 10 / $p.age > 0 } > 0, false)
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"bob"}
+--- expect shape
+p.handle: String
+--- expect same as reference

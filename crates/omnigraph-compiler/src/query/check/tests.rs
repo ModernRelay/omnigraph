@@ -2,7 +2,9 @@
 //! 10, "Type-check tests"), the RFC's examples type-checked, and one repair
 //! per type-level refusal shape.
 
-use super::{CheckedDecl, SExpr, SKind, Step, apply, check_source, count_rows, type_source};
+use super::{
+    BlockAgg, CheckedDecl, SExpr, SKind, Step, apply, check_source, count_rows, type_source,
+};
 use crate::catalog::{Catalog, build_catalog};
 use crate::ir::core::*;
 use crate::query::syntax::parse::parse_source;
@@ -839,12 +841,25 @@ fn a_called_read_is_typed_once_however_often_it_is_called() {
         ));
     }
     reads.reverse();
-    let started = std::time::Instant::now();
-    let _ = check(&reads.join("\n"));
+    let source = reads.join("\n");
+    let checked = check(&source);
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(20),
-        "typing took {:?}",
-        started.elapsed()
+        checked.iter().all(|(_, c)| c.is_ok()),
+        "every read in the chain is accepted"
+    );
+    // Typing `u{i}` types its own expressions and, once each, those of the
+    // reads it reaches: one more read reached adds the same work.
+    let work: Vec<usize> = super::typing_work(&catalog(), &source)
+        .into_iter()
+        .map(|(_, work, accepted)| {
+            assert!(accepted);
+            work
+        })
+        .collect();
+    let steps: Vec<usize> = work.windows(2).map(|w| w[0] - w[1]).collect();
+    assert!(
+        steps.iter().all(|step| *step == steps[0] && *step > 0),
+        "typing work is linear in the reads reached: {work:?}"
     );
     // A bound relation over the budget is refused although nothing draws it.
     let mut nested = String::from("$q12: Person, $q11 knows $q12");
@@ -863,6 +878,57 @@ fn a_called_read_is_typed_once_however_often_it_is_called() {
     assert!(m.contains("plan budget"), "{m}");
 }
 
+/// A block that can fail under a guard (`or`, `and`, `if`, `coalesce`) is
+/// typed once where it is written: the guard is the earlier operand as it
+/// was typed, read by the block's plan as a column, never a copy of the
+/// guard typed again inside the block. A guard holding blocks of its own
+/// therefore adds the same typing work per guarded block, and nothing the
+/// guard names is bound inside the block.
+#[test]
+fn guarded_blocks_are_typed_once_each_and_capture_no_name() {
+    let block = "count { $c: Company, $p worksAt $c where 10 / $p.age > 0 } > 0";
+    for (form, wrap) in [
+        (
+            "or",
+            (|b: &str, rest: &str| format!("({b} or {rest})")) as fn(&str, &str) -> String,
+        ),
+        ("and", |b, rest| format!("({b} and {rest})")),
+        ("if", |b, rest| format!("if({b}, {rest}, false)")),
+        ("coalesce", |b, rest| format!("coalesce({b}, {rest})")),
+    ] {
+        let work: Vec<usize> = (1..=18)
+            .map(|n| {
+                let mut predicate = block.to_string();
+                for _ in 1..n {
+                    predicate = wrap(block, &predicate);
+                }
+                let source = format!(
+                    "query q() {{ match {{ $p: Person }} where {predicate} return {{ $p.handle }} }}"
+                );
+                let [(_, work, accepted)] = super::typing_work(&catalog(), &source)[..] else {
+                    panic!("one declaration");
+                };
+                assert!(accepted, "{form}: {source}");
+                work
+            })
+            .collect();
+        let steps: Vec<usize> = work.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            steps.iter().all(|step| *step == steps[0]),
+            "{form}: typing work is linear in the guarded blocks: {work:?}"
+        );
+    }
+    // The guard reads `$c` in its own block; the guarded block binds its own.
+    ok(
+        "query q() { match { $p: Person } where if(exists { $c: Company, $p worksAt $c }, count { $c: Company, $p worksAt $c where 10 / $p.age > 0 } > 0, false) return { $p.handle } }",
+    );
+    // A block that reads no outer name is refused under a guard too.
+    refused(
+        "query q() { match { $p: Person } where $p.age > 3 or count { $d: Doc where 10 / $d.year > 0 } > 0 return { $p.handle } }",
+        "T39",
+    );
+}
+
 /// [`Step::added`] counts exactly the nodes [`apply`] adds above a present
 /// term, for every kind of step.
 #[test]
@@ -875,7 +941,23 @@ fn a_step_counts_the_nodes_it_adds() {
         SKind::Lit(Literal::Bool(false)),
         Ty::scalar(ScalarType::Bool, false),
     );
-    let block = || vec![(Term::Env(Vec::new()), "c".to_string(), count_rows())];
+    let block = || {
+        vec![
+            BlockAgg {
+                inner: Term::Env(Vec::new()),
+                col: "c".to_string(),
+                agg: count_rows(),
+                guard: None,
+            },
+            // A guarded block: the guard's column, then the inner filter on it.
+            BlockAgg {
+                inner: Term::Env(Vec::new()),
+                col: "d".to_string(),
+                agg: count_rows(),
+                guard: Some(("g".to_string(), truth.clone())),
+            },
+        ]
+    };
     let leaf = Term::Correlate {
         outer: Term::Unit.boxed(),
         inner: Term::Env(Vec::new()).boxed(),
