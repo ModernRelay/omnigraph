@@ -94,14 +94,17 @@ enum Command {
         #[command(subcommand)]
         command: DatasetCommand,
     },
-    /// Run a named scenario/group, custom config selection, or a legacy case file.
+    /// Run a named scenario/suite, custom config selection, or a legacy case file.
     Run(Box<RunArgs>),
-    /// Print a store's run records of a scenario or group as a series.
+    /// Print a store's run records of a scenario or suite as a series.
     Report {
-        /// Scenario/group name; the catalog's run list when absent.
+        /// Scenario/suite name; the catalog's run list when absent.
         scenario: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "catalog")]
         config: Option<PathBuf>,
+        /// A catalog, repeatable: a benchmarks.yaml or the directory holding one; the name resolves in the first that declares it.
+        #[arg(long, value_name = "DIR|FILE")]
+        catalog: Vec<PathBuf>,
         /// The fixture store whose `records/` are read.
         #[arg(long)]
         store: String,
@@ -120,11 +123,14 @@ enum Command {
 /// the size of its smallest variants.
 #[derive(Debug, clap::Args)]
 struct RunArgs {
-    /// Scenario/group name; a legacy case YAML path is also accepted.
+    /// Scenario/suite name; a legacy case YAML path is also accepted.
     case: Option<PathBuf>,
     /// Explicit config; paths in it resolve beside the YAML file.
-    #[arg(long, conflicts_with_all = ["dataset", "queries"])]
+    #[arg(long, conflicts_with_all = ["dataset", "queries", "catalog"])]
     config: Option<PathBuf>,
+    /// A catalog, repeatable: a benchmarks.yaml or the directory holding one; the name resolves in the first that declares it.
+    #[arg(long, value_name = "DIR|FILE", conflicts_with_all = ["dataset", "queries"])]
+    catalog: Vec<PathBuf>,
     #[arg(long)]
     dataset: Option<PathBuf>,
     #[arg(long)]
@@ -663,9 +669,10 @@ async fn main() -> ExitCode {
         Command::Report {
             scenario,
             config,
+            catalog,
             store,
             json,
-        } => run_report(scenario, config, store, json).await,
+        } => run_report(scenario, config, catalog, store, json).await,
         Command::Projection { command } => run_projection(command).await,
         Command::WorkerV2 => omnigraph_bench::gqt_worker::run_worker_stdio_v2().await,
         Command::FixtureWorkerV1 { request, result } => {
@@ -676,6 +683,7 @@ async fn main() -> ExitCode {
             let RunArgs {
                 case,
                 config,
+                catalog,
                 dataset,
                 queries,
                 repetitions,
@@ -728,7 +736,7 @@ async fn main() -> ExitCode {
             let run_reset = store
                 .is_some()
                 .then_some(omnigraph_bench::case::ResetMode::Clone);
-            let legacy = if config.is_none() {
+            let legacy = if config.is_none() && catalog.is_empty() {
                 match case.as_deref().map(bench_cli::legacy_input).transpose() {
                     Ok(legacy) => legacy.unwrap_or(false),
                     Err(e) => return bench_cli::failure(e, json),
@@ -747,10 +755,6 @@ async fn main() -> ExitCode {
                         json,
                     );
                 }
-                let catalog = match bench_cli::load(&bench_cli::CatalogArgs { config, json }) {
-                    Ok(c) => c,
-                    Err(e) => return bench_cli::failure(e, json),
-                };
                 let selector = match case.as_deref() {
                     Some(path) => match path.to_str() {
                         Some(name) => Some(name),
@@ -766,6 +770,17 @@ async fn main() -> ExitCode {
                         }
                     },
                     None => None,
+                };
+                let catalog = match bench_cli::load_for(
+                    &bench_cli::CatalogArgs {
+                        config,
+                        catalog,
+                        json,
+                    },
+                    selector,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => return bench_cli::failure(e, json),
                 };
                 let environment = match (&served, store_environment) {
                     (Some((input, position)), _) => omnigraph_bench::catalog::served_environment(
@@ -819,7 +834,7 @@ async fn main() -> ExitCode {
                     vec![Diagnostic::error(
                         "invalid_run_input",
                         "at",
-                        "--at runs a catalog scenario or group, never a legacy case file",
+                        "--at runs a catalog scenario or suite, never a legacy case file",
                     )],
                     json,
                 );
@@ -1801,7 +1816,7 @@ async fn run_resolved_suite(
     archive: Option<PathBuf>,
     json: bool,
 ) -> ExitCode {
-    match execute_resolved_suite(suite, selector, options, archive, json).await {
+    match execute_resolved_suite(suite, selector, options, archive, None, json).await {
         Ok(output) if json => print_json_success(&output),
         Ok(output) => print_execution(&output),
         Err(code) => code,
@@ -1809,13 +1824,14 @@ async fn run_resolved_suite(
 }
 
 /// Runs the selection and returns its output, or the exit code of a failure
-/// already printed. A `--store` run without `--archive` puts every completed
-/// record into the store.
+/// already printed; a `--store` run without `--archive` puts every completed
+/// record into the store under `session` (minted here when absent).
 async fn execute_resolved_suite(
     suite: ResolvedSuite,
     selector: Option<&str>,
     options: RunOptions,
     archive: Option<PathBuf>,
+    session: Option<Ulid>,
     json: bool,
 ) -> Result<SuiteRunOutput, ExitCode> {
     let selected = match select_runs(&suite, selector) {
@@ -1854,7 +1870,13 @@ async fn execute_resolved_suite(
     };
     let store = match (&options.store, &recording) {
         (Some(uri), None) => match omnigraph_bench::store::FixtureStore::open(uri) {
-            Ok(store) => Some((store, Ulid::new())),
+            Ok(store) => {
+                let session = match session {
+                    Some(session) => session,
+                    None => Ulid::new(),
+                };
+                Some((store, session))
+            }
             Err(error) => {
                 return Err(print_cli_failure(
                     Diagnostic::error(&error.code, "store", error.message),
@@ -2082,8 +2104,8 @@ impl Drop for ProductStaging {
 }
 
 /// `run --at a --at b`: every ref's product resolved and inspected before
-/// any run, then the selection run once per ref against the same store, the
-/// results side by side.
+/// any run, then every scenario of the selection run once per ref, in `--at`
+/// order, before the next scenario, so the refs see the same machine state.
 #[allow(clippy::too_many_arguments)]
 async fn run_at(
     suite: ResolvedSuite,
@@ -2164,37 +2186,83 @@ async fn run_at(
         };
         targets.push((reference.to_string(), commit, product));
     }
-    let mut outputs = Vec::new();
-    for (reference, commit, product) in targets {
-        let options = RunOptions {
-            dataset_cache: Some(dataset_cache.clone()),
-            no_build,
-            fixture_bindings: fixtures.clone(),
-            worker_executable: std::env::current_exe().ok(),
-            store: Some(store.clone()),
-            backend: backend.clone(),
-            product: Some(product.path.clone()),
-            product_commit: Some(commit.clone()),
-            ..Default::default()
-        };
-        match execute_resolved_suite(suite.clone(), None, options, None, json).await {
-            Ok(output) => outputs.push(AtOutput {
-                reference,
-                commit,
-                product,
-                output,
-            }),
-            Err(code) => {
-                if !outputs.is_empty() {
+    let scenarios: Vec<String> = suite
+        .runs
+        .iter()
+        .map(|run| run.case.id().to_owned())
+        .collect();
+    let mut outputs: Vec<(Ulid, AtOutput)> = targets
+        .into_iter()
+        .map(|(reference, commit, product)| {
+            let session = Ulid::new();
+            let output = SuiteRunOutput {
+                runner_output_version: RUNNER_OUTPUT_VERSION,
+                suite: suite.definition.name.clone(),
+                suite_path: suite.suite_path.clone(),
+                local_route: None,
+                completed_run_count: 0,
+                runs: Some(Vec::new()),
+                durable_archive: None,
+                store_records: Some(StoreRecordsOutput {
+                    store: fixture_store.uri(),
+                    session_id: session.to_string(),
+                    records: Vec::new(),
+                }),
+            };
+            (
+                session,
+                AtOutput {
+                    reference,
+                    commit,
+                    product,
+                    output,
+                },
+            )
+        })
+        .collect();
+    for scenario in &scenarios {
+        for index in 0..outputs.len() {
+            let (session, target) = &mut outputs[index];
+            let options = RunOptions {
+                dataset_cache: Some(dataset_cache.clone()),
+                no_build,
+                fixture_bindings: fixtures.clone(),
+                worker_executable: std::env::current_exe().ok(),
+                store: Some(store.clone()),
+                backend: backend.clone(),
+                product: Some(target.product.path.clone()),
+                product_commit: Some(target.commit.clone()),
+                ..Default::default()
+            };
+            let run = execute_resolved_suite(
+                suite.clone(),
+                Some(scenario),
+                options,
+                None,
+                Some(*session),
+                json,
+            )
+            .await;
+            match run {
+                Ok(part) => absorb_at_output(&mut target.output, part),
+                Err(code) => {
+                    let reference = target.reference.clone();
                     let completed = AtRunOutput {
                         runner_output_version: RUNNER_OUTPUT_VERSION,
                         store,
-                        at: outputs,
+                        at: outputs
+                            .into_iter()
+                            .map(|(_, target)| target)
+                            .filter(|target| target.output.completed_run_count > 0)
+                            .collect(),
                     };
+                    if completed.at.is_empty() {
+                        return code;
+                    }
                     if json {
                         for target in &completed.at {
                             eprintln!(
-                                "completed before `{reference}` failed: {} {} ({} record(s) put)",
+                                "completed before `{reference}` failed at `{scenario}`: {} {} ({} record(s) put)",
                                 target.reference,
                                 &target.commit[..12],
                                 target
@@ -2206,24 +2274,40 @@ async fn run_at(
                             );
                         }
                     } else {
-                        eprintln!("`{reference}` failed; the refs completed before it:");
+                        eprintln!(
+                            "`{reference}` failed at `{scenario}`; the records put before it:"
+                        );
                         print_at_table(&completed);
                     }
+                    return code;
                 }
-                return code;
             }
         }
     }
     let output = AtRunOutput {
         runner_output_version: RUNNER_OUTPUT_VERSION,
         store,
-        at: outputs,
+        at: outputs.into_iter().map(|(_, target)| target).collect(),
     };
     if json {
         return print_json_success(&output);
     }
     print_at_table(&output);
     ExitCode::SUCCESS
+}
+
+/// One scenario's measurement of a ref folded into that ref's `--at` output:
+/// the runs, the records put and the count accumulate.
+fn absorb_at_output(output: &mut SuiteRunOutput, part: SuiteRunOutput) {
+    output.completed_run_count = output
+        .completed_run_count
+        .saturating_add(part.completed_run_count);
+    if let (Some(runs), Some(more)) = (&mut output.runs, part.runs) {
+        runs.extend(more);
+    }
+    if let (Some(records), Some(more)) = (&mut output.store_records, part.store_records) {
+        records.records.extend(more.records);
+    }
 }
 
 fn print_at_table(output: &AtRunOutput) {
@@ -2435,16 +2519,24 @@ struct ReportOutput {
     groups: Vec<ReportGroup>,
 }
 
-/// `report <scenario|group> --store <uri>`: the store's records of the
+/// `report <scenario|suite> --store <uri>`: the store's records of the
 /// selection, one row per record, grouped by point and machine; never a
 /// factor across groups.
 async fn run_report(
     selector: Option<String>,
     config: Option<PathBuf>,
+    catalog: Vec<PathBuf>,
     store: String,
     json: bool,
 ) -> ExitCode {
-    let catalog = match bench_cli::load(&bench_cli::CatalogArgs { config, json }) {
+    let catalog = match bench_cli::load_for(
+        &bench_cli::CatalogArgs {
+            config,
+            catalog,
+            json,
+        },
+        selector.as_deref(),
+    ) {
         Ok(catalog) => catalog,
         Err(diagnostics) => return bench_cli::failure(diagnostics, json),
     };

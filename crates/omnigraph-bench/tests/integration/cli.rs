@@ -63,7 +63,7 @@ fn legacy_catalog() -> &'static Path {
                 )
                 .unwrap();
             }
-            for (name, ids) in &catalog.definition.groups {
+            for (name, ids) in &catalog.definition.suites {
                 let suite = omnigraph_bench::SuiteV1 {
                     version: 1,
                     name: name.clone(),
@@ -812,9 +812,30 @@ fn commit_of(reference: &str) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
-/// `run --at HEAD=<product> --at HEAD~1=<product>` measures one binary under
-/// two commits (each ref's product is the binary wrapped to name that commit)
-/// against one store, puts one record per ref, and `report` reads them back.
+/// A catalog beside the public one: `tiny-read` and `tiny-mutate` copied from
+/// it under the suite `pair`, so one `run pair` measures two scenarios.
+#[cfg(not(debug_assertions))]
+fn pair_catalog(directory: &Path) -> PathBuf {
+    let root = directory.join("catalog");
+    for file in [
+        "fixtures/tiny_graph.gqt",
+        "workloads/tiny_read.gqt",
+        "workloads/tiny_mutate.gqt",
+    ] {
+        fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+        fs::copy(benchmark_path(file), root.join(file)).unwrap();
+    }
+    fs::write(
+        root.join("benchmarks.yaml"),
+        "version: 2\nscenarios:\n- id: tiny-read\n  fixture: fixtures/tiny_graph.gqt\n  workload: workloads/tiny_read.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- query branch: main\n      query items() {\n          match { $i: Item }\n          return { $i.key as key, $i.val as val }\n      }\n- id: tiny-mutate\n  fixture: fixtures/tiny_graph.gqt\n  workload: workloads/tiny_mutate.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- mutate\n      query add() { insert Item { key: \"c\", val: 3 } }\nsuites:\n  pair: [tiny-read, tiny-mutate]\nrun: [pair]\n",
+    )
+    .unwrap();
+    root
+}
+
+/// `run pair --catalog <dir> --at HEAD=<product> --at HEAD~1=<product>`
+/// measures one binary under two commits, scenario by scenario with the refs
+/// interleaved, puts two records per ref, and `report` reads them back in order.
 #[test]
 #[cfg(not(debug_assertions))]
 fn clone_route_at_two_refs_puts_records_the_report_reads_back() {
@@ -824,6 +845,7 @@ fn clone_route_at_two_refs_puts_records_the_report_reads_back() {
     };
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("store");
+    let catalog = pair_catalog(directory.path());
     let product = repository_root().join(&product).display().to_string();
     let head = product_claiming(directory.path(), &product, &commit_of("HEAD"));
     let previous = product_claiming(directory.path(), &product, &commit_of("HEAD~1"));
@@ -831,8 +853,8 @@ fn clone_route_at_two_refs_puts_records_the_report_reads_back() {
         .unwrap()
         .current_dir(repository_root())
         .env_remove("OMNIGRAPH_BENCH_PRODUCT")
-        .args(["run", "e2e-query-scan", "--config"])
-        .arg(repository_root().join("benchmarks/benchmarks.yaml"))
+        .args(["run", "pair", "--catalog"])
+        .arg(&catalog)
         .arg("--dataset-cache")
         .arg(directory.path().join("cache"))
         .arg("--store")
@@ -855,6 +877,11 @@ fn clone_route_at_two_refs_puts_records_the_report_reads_back() {
     assert_eq!(at[0]["reference"], "HEAD", "{result}");
     assert_eq!(at[1]["reference"], "HEAD~1", "{result}");
     assert_ne!(at[0]["commit"], at[1]["commit"], "{result}");
+    assert_ne!(
+        at[0]["output"]["store_records"]["session_id"],
+        at[1]["output"]["store_records"]["session_id"],
+        "{result}"
+    );
     for target in at {
         assert_eq!(
             target["commit"].as_str().map(str::len),
@@ -864,19 +891,29 @@ fn clone_route_at_two_refs_puts_records_the_report_reads_back() {
         let records = target["output"]["store_records"]["records"]
             .as_array()
             .unwrap();
-        assert_eq!(records.len(), 1, "{target}");
-        let run = &target["output"]["runs"][0];
+        assert_eq!(records.len(), 2, "{target}");
+        assert_eq!(target["output"]["completed_run_count"], 2, "{target}");
+        let runs = target["output"]["runs"].as_array().unwrap();
         assert_eq!(
-            run["product"]["requested_commit"], target["commit"],
-            "{run}"
+            runs.iter()
+                .map(|run| run["case_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["tiny-read", "tiny-mutate"],
+            "{target}"
         );
+        for run in runs {
+            assert_eq!(
+                run["product"]["requested_commit"], target["commit"],
+                "{run}"
+            );
+        }
     }
     let report = Command::cargo_bin("omnigraph-bench")
         .unwrap()
         .current_dir(repository_root())
         .env_remove("OMNIGRAPH_BENCH_PRODUCT")
-        .args(["report", "e2e-query-scan", "--config"])
-        .arg(repository_root().join("benchmarks/benchmarks.yaml"))
+        .args(["report", "pair", "--catalog"])
+        .arg(&catalog)
         .arg("--store")
         .arg(&store)
         .arg("--json")
@@ -889,19 +926,38 @@ fn clone_route_at_two_refs_puts_records_the_report_reads_back() {
         String::from_utf8_lossy(&report.stderr)
     );
     let groups = series["groups"].as_array().unwrap();
-    assert_eq!(groups.len(), 1, "{series}");
-    let rows = groups[0]["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 2, "{series}");
-    let commits: std::collections::BTreeSet<_> = rows
-        .iter()
-        .map(|row| row["commit"].as_str().unwrap())
-        .collect();
-    assert_eq!(commits.len(), 2, "{series}");
-    for row in rows {
-        assert_eq!(row["sut"], "product-binary", "{row}");
-        assert_eq!(row["status"], "complete", "{row}");
-        assert_eq!(row["observed_repetitions"], 1, "{row}");
+    assert_eq!(groups.len(), 2, "{series}");
+    let mut order = Vec::new();
+    for group in groups {
+        let rows = group["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{series}");
+        for row in rows {
+            assert_eq!(row["sut"], "product-binary", "{row}");
+            assert_eq!(row["status"], "complete", "{row}");
+            assert_eq!(row["observed_repetitions"], 1, "{row}");
+            order.push((
+                row["invoked_at_unix_ms"].as_u64().unwrap(),
+                row["case_id"].as_str().unwrap(),
+                row["commit"].as_str().unwrap(),
+            ));
+        }
     }
+    order.sort();
+    let head_commit = at[0]["commit"].as_str().unwrap();
+    let previous_commit = at[1]["commit"].as_str().unwrap();
+    assert_eq!(
+        order
+            .iter()
+            .map(|(_, case, commit)| (*case, *commit))
+            .collect::<Vec<_>>(),
+        [
+            ("tiny-read", head_commit),
+            ("tiny-read", previous_commit),
+            ("tiny-mutate", head_commit),
+            ("tiny-mutate", previous_commit),
+        ],
+        "the refs run interleaved per scenario: {series}"
+    );
 }
 
 /// A product whose `version --json` writes another storage format is
