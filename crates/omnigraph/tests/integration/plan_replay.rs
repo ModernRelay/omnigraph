@@ -3245,6 +3245,8 @@ async fn saved_return_leaf_types_refuse_drift_when_limit_skips_input() {
 // position the mutator picks, by one of the single edits below, and the
 // edited envelope goes through the replay door. The law: every edit is
 // refused, or replays to the run's rows (a no-op edit, an equivalent plan).
+// The envelope's value table, the run's parameter values, is input, not
+// plan, and is not edited.
 // The unedited envelope reads back to the run's plan, which covers the
 // serialization round trip of every node kind the generator reaches.
 
@@ -3338,8 +3340,8 @@ fn edited(plan: &Value, path: &str, in_array: bool, edit: PlanEdit, pick: usize)
             *slot = match slot {
                 Value::Bool(b) => Value::Bool(!*b),
                 Value::Number(n) => match (n.as_u64(), n.as_i64(), n.as_f64()) {
-                    (Some(u), _, _) => Value::from(u + 1),
-                    (_, Some(i), _) => Value::from(i + 1),
+                    (Some(u), _, _) => Value::from(u.checked_add(1).unwrap_or(0)),
+                    (_, Some(i), _) => Value::from(i.checked_add(1).unwrap_or(i64::MIN)),
                     (_, _, Some(f)) => Value::from(f + 1.0),
                     _ => return None,
                 },
@@ -3440,6 +3442,10 @@ async fn plan_acceptance_sample(
     }
     let mut positions = Vec::new();
     edit_positions(&plan, String::new(), &mut positions);
+    // The value table is the replay's input, the run's bound parameter
+    // values, which the door holds to their declared types and ranges; a
+    // changed value is another run of the plan, not an edit of it.
+    positions.retain(|(path, _)| !path.starts_with("/body/values"));
     let mut c = Choices::new(e);
     for _ in 0..edits {
         // An edit, then a position it applies at.
