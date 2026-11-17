@@ -2049,10 +2049,14 @@ node Person @description("new") {
             )]
         );
 
+        let defaults = FullTextAnalysis {
+            analyzer: None,
+            scorer: FullTextScorer::Bm25V1,
+        };
         let removed = evolve(&declared, &source("@index(fulltext)"));
         let plan = plan_schema_migration(&declared, &removed).unwrap();
         assert!(plan.supported, "{plan:?}");
-        assert_eq!(plan.steps, vec![step(Some(english), None)]);
+        assert_eq!(plan.steps, vec![step(Some(english), Some(defaults))]);
 
         let renamed = evolve(
             &declared,
@@ -2068,7 +2072,18 @@ node Person @description("new") {
             "{plan:?}"
         );
 
-        let same = evolve(&accepted, &source("@index(fulltext)"));
+        // `@index(fulltext)` over a plain `@index` declares the full-text
+        // index, and a plain `@index` over it withdraws the declaration; the
+        // resolved analysis is `english_v1` either way.
+        let full_text = evolve(&accepted, &source("@index(fulltext)"));
+        let plan = plan_schema_migration(&accepted, &full_text).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert_eq!(plan.steps, vec![step(None, Some(defaults))]);
+        let plain = evolve(&full_text, &source("@index"));
+        let plan = plan_schema_migration(&full_text, &plain).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert_eq!(plan.steps, vec![step(Some(defaults), None)]);
+        let same = evolve(&accepted, &source("@index"));
         assert!(
             plan_schema_migration(&accepted, &same)
                 .unwrap()

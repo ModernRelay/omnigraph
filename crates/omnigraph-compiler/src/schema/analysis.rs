@@ -8,7 +8,10 @@
 //! A property whose full-text index declares no analyzer takes
 //! [`AnalyzerProfile::DEFAULT`], `english_v1`, as an omitted distance takes
 //! `l2`, so every full-text field has exactly one profile. The declaration
-//! as written is kept: an omitted analyzer carries no [`FullTextAnalysis`].
+//! as written is kept: every `@index(fulltext, ...)` carries a
+//! [`FullTextAnalysis`], an omitted analyzer recorded as `None`, and a plain
+//! `@index` carries none, so the engine builds a full-text index only where
+//! one is declared.
 
 use std::fmt;
 
@@ -31,9 +34,9 @@ pub fn is_property_index_annotation(annotation: &Annotation) -> bool {
 }
 
 /// The analysis a property's annotations declare: the options of its
-/// `@index(fulltext, ...)`, `None` when they are the defaults (no analyzer,
-/// the default scorer). Names the parser has validated; an unknown one reads
-/// as absent.
+/// `@index(fulltext, ...)`, the defaults included, `None` when it declares no
+/// full-text index (a plain `@index` or none). Names the parser has
+/// validated; an unknown one reads as absent.
 pub fn declared_analysis(annotations: &[Annotation]) -> Option<FullTextAnalysis> {
     let index = annotations.iter().find(|annotation| {
         annotation.name == "index" && annotation.value.as_deref() == Some(FULL_TEXT_INDEX_KIND)
@@ -47,7 +50,7 @@ pub fn declared_analysis(annotations: &[Annotation]) -> Option<FullTextAnalysis>
         .get("scorer")
         .and_then(|name| FullTextScorer::parse(name))
         .unwrap_or_default();
-    FullTextAnalysis::declared(analyzer, scorer)
+    Some(FullTextAnalysis { analyzer, scorer })
 }
 
 /// The analyzer profiles a schema can declare.
@@ -434,10 +437,11 @@ impl fmt::Display for FullTextScorer {
     }
 }
 
-/// The full-text analysis a property's index declares beyond the defaults: a
-/// profile, a scorer other than the default, or both. Absent (`None` on the
-/// property) when the index declares neither; [`FullTextAnalysis::resolved`]
-/// gives the analysis that holds either way.
+/// The full-text analysis a property's `@index(fulltext, ...)` declares, as
+/// written: its profile, `None` when it names none, and its scorer. Absent
+/// (`None` on the property) when the property declares no full-text index;
+/// [`FullTextAnalysis::resolved`] gives the analysis a lexical read applies
+/// either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FullTextAnalysis {
     /// `None` is [`AnalyzerProfile::DEFAULT`].
@@ -448,13 +452,6 @@ pub struct FullTextAnalysis {
 }
 
 impl FullTextAnalysis {
-    /// The declaration as written, `None` when it is the defaults: no
-    /// profile and the default scorer.
-    pub fn declared(analyzer: Option<AnalyzerProfile>, scorer: FullTextScorer) -> Option<Self> {
-        (analyzer.is_some() || scorer != FullTextScorer::default())
-            .then_some(Self { analyzer, scorer })
-    }
-
     /// The analysis a full-text field declaring `declared` has: its profile,
     /// [`AnalyzerProfile::DEFAULT`] when it names none, and its scorer.
     pub fn resolved(declared: Option<&Self>) -> Self {
@@ -762,18 +759,5 @@ mod tests {
             })
         ));
         assert!(!changes_index_analysis(Some(&english), Some(&english)));
-    }
-
-    #[test]
-    fn a_default_declaration_is_absent() {
-        assert_eq!(
-            FullTextAnalysis::declared(None, FullTextScorer::Bm25V1),
-            None
-        );
-        assert!(FullTextAnalysis::declared(None, FullTextScorer::None).is_some());
-        assert!(
-            FullTextAnalysis::declared(Some(AnalyzerProfile::StandardV1), FullTextScorer::Bm25V1)
-                .is_some()
-        );
     }
 }

@@ -206,7 +206,11 @@ fn underfill_seed_data() -> String {
 
 async fn init_search_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = session(Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap());
+    let db = session(
+        Omnigraph::init(uri, &with_full_text(SEARCH_SCHEMA))
+            .await
+            .unwrap(),
+    );
     db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
@@ -2469,9 +2473,9 @@ async fn rrf_fuses_two_vector_queries() {
 async fn mutation_with_deferred_index_coverage_remains_searchable() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_search_db(&dir).await;
-    // `id`'s BTREE plus a full-text, NGRAM and BTREE index on each of the
-    // key property, title and body.
-    assert_eq!(doc_user_index_count(&db).await, 10);
+    // `id`'s BTREE, the key property's BTREE, and a full-text, NGRAM and
+    // BTREE index on each of title and body.
+    assert_eq!(doc_user_index_count(&db).await, 8);
 
     let mut mutation_params = vector_param("$embedding", &[0.9, 0.1, 0.1, 0.1]);
     mutation_params.insert(
@@ -2493,7 +2497,7 @@ async fn mutation_with_deferred_index_coverage_remains_searchable() {
 
     assert_eq!(
         doc_user_index_count(&db).await,
-        10,
+        8,
         "mutation must leave physical index materialization to the reconciler"
     );
 
@@ -2749,8 +2753,9 @@ node Doc {
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(
         user_indices.len(),
-        5,
-        "expected id BTree index, the key property's full-text, NGRAM and BTREE indexes, and the vector index"
+        3,
+        "expected id BTree index, the key property's BTREE (a `@key` alone builds no full-text \
+         or NGRAM index), and the vector index"
     );
 }
 
@@ -2770,8 +2775,9 @@ async fn load_commit_creates_inverted_indices_for_string_annotations() {
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(
         user_indices.len(),
-        10,
-        "expected id BTree index plus the full-text, NGRAM and BTREE indexes of the key property, title and body"
+        8,
+        "expected id BTree index, the key property's BTREE, and the full-text, NGRAM and BTREE \
+         indexes of title and body"
     );
 }
 

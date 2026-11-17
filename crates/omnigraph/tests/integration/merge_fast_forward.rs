@@ -1056,9 +1056,9 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
     );
     assert_eq!(
         probes.proven_insert_history_read_calls(),
-        4,
-        "each table's chain, its first rows and the full-text declaration chained on them, \
-         is proven by one history read per link"
+        2,
+        "each table's chain, its first rows (a `@key` String declares no full-text index, so \
+         no declaration is chained on them), is proven by one history read per link"
     );
     assert_eq!(
         probes.ordered_cursor_scan_calls(),

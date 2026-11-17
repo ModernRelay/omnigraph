@@ -1465,9 +1465,12 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
                 .join("graph.omni")
                 .to_string_lossy()
                 .into_owned();
-            omnigraph::db::Omnigraph::init(&uri, "node Person { slug: String @key }\n")
-                .await
-                .unwrap();
+            omnigraph::db::Omnigraph::init(
+                &uri,
+                "node Person { slug: String @key @index(fulltext) }\n",
+            )
+            .await
+            .unwrap();
             let client = GraphClient::embedded_test(uri.clone(), None);
             client
                 .mutate(

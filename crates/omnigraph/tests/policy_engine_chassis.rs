@@ -884,7 +884,7 @@ async fn non_canonical_branch_names_cannot_reach_a_protected_branch() {
 #[tokio::test]
 async fn full_text_rebuild_enforces_maintain_on_the_selected_branch_and_records_actor() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let db = init_and_load_with_schema(&dir, &full_text_test_schema()).await;
     db.branch_create("feature").await.unwrap();
     drop(db);
     // `act-allowed` can change unprotected feature but not maintain it, and

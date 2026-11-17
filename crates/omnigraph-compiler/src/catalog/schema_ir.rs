@@ -2190,16 +2190,34 @@ mod tests {
         let readded_fingerprint = property(&readded, "text").full_text_fingerprint();
         assert_ne!(readded_fingerprint, fingerprint);
 
-        // Without a declaration the feature and the field are absent, so the
-        // schema keeps its bytes, and the field takes `english_v1`: the
-        // fingerprint is the declared profile's.
+        // `@index(fulltext)` without options records the declaration, the
+        // defaults written out, so the engine builds its full-text index; the
+        // field takes `english_v1`, so the fingerprint is the declared
+        // profile's.
         let omitted = evolve(r#"node Doc { slug: String @key body: String @index(fulltext) }"#);
-        assert!(!omitted.features.contains(FEATURE_FULL_TEXT_ANALYSIS));
-        assert!(!schema_ir_json(&omitted).unwrap().contains("full_text"));
+        assert!(omitted.features.contains(FEATURE_FULL_TEXT_ANALYSIS));
+        assert!(
+            schema_ir_json(&omitted)
+                .unwrap()
+                .contains(r#""full_text":{"scorer":"bm25_v1"}"#)
+        );
         assert_eq!(
             property(&omitted, "body").full_text_fingerprint(),
             fingerprint
         );
+        // A plain `@index` declares no full-text index: the feature and the
+        // field are absent, so an edition 2 schema keeps its bytes. It is
+        // still a lexical field, with the default profile's fingerprint.
+        let plain = evolve(r#"node Doc { slug: String @key body: String @index }"#);
+        assert!(!plain.features.contains(FEATURE_FULL_TEXT_ANALYSIS));
+        assert!(!schema_ir_json(&plain).unwrap().contains("full_text"));
+        assert_eq!(
+            property(&plain, "body").full_text_fingerprint(),
+            fingerprint
+        );
+        let catalog = build_catalog_from_ir(&plain).unwrap();
+        let doc = &catalog.node_types["Doc"];
+        assert!(doc.is_lexical_field("body") && !doc.builds_full_text_index("body"));
 
         // The feature set is derived: a hand-authored IR whose set disagrees
         // with its declarations is refused, and so is an unknown feature.

@@ -5678,7 +5678,7 @@ node Work {
 }
 
 node Embedding {
-    name: String @key
+    name: String @key @index(fulltext)
     vector: Vector(2)? @index
 }
 "#;
@@ -8947,7 +8947,11 @@ async fn full_text_rebuild_on_a_branch_stages_on_the_inherited_table() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let db = helpers::session(Omnigraph::init(&uri, SEARCH_SCHEMA).await.unwrap());
+    let db = helpers::session(
+        Omnigraph::init(&uri, &helpers::with_full_text(SEARCH_SCHEMA))
+            .await
+            .unwrap(),
+    );
     db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
@@ -11391,9 +11395,9 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
         .unwrap();
     assert!(row.error.is_none(), "{row:?}");
     assert_eq!(
-        row.manifests_removed, 3,
-        "the retry sweeps what the first pass left of the two links, main's pruned base pin and the \
-         base load's effect beneath its full-text declaration: {row:?}"
+        row.manifests_removed, 2,
+        "the retry sweeps what the first pass left of the two links and main's pruned base pin: \
+         {row:?}"
     );
     let remaining = detached_versions(&person_uri).await;
     for link in &chain[..2] {
@@ -11426,7 +11430,9 @@ async fn table_path_exists(db: &Omnigraph, table_uri: &str, path: &str) -> bool 
 async fn assert_collector_retry_treats_an_index_directory_an_interrupted_pass_removed_as_swept(
     uri: &str,
 ) {
-    let db = helpers::init_and_load_at(uri, helpers::TEST_SCHEMA).await;
+    // Every write declares `Person.name`'s full-text index with an untrained
+    // segment, so each pruned pin names an index directory of its own.
+    let db = helpers::init_and_load_at(uri, &helpers::full_text_test_schema()).await;
     let person_uri = node_table_uri(&db, "Person").await;
     let before = detached_versions(&person_uri).await;
     insert_person(&db, "main", "swept-first").await;
@@ -11553,7 +11559,9 @@ async fn assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_
     uri: &str,
     scoped: bool,
 ) {
-    let db = helpers::init_and_load_at(uri, helpers::TEST_SCHEMA).await;
+    // Every write declares `Person.name`'s full-text index with an untrained
+    // segment, so each pruned pin names an index directory of its own.
+    let db = helpers::init_and_load_at(uri, &helpers::full_text_test_schema()).await;
     // Serving scopes file I/O through Lance's file-object-store provider,
     // whose list/delete path also removes the directory and can return NotFound.
     let db = if scoped {

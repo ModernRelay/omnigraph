@@ -4,8 +4,10 @@
 //!
 //! Orderable scalars get a BTREE, so `SnapshotDataset::index_coverage` (the
 //! helper the traversal chooser uses) reports `Indexed`. An enum or `Bool`
-//! gets a BITMAP, a list a LABEL_LIST, and a free-text String its full-text
-//! index, an NGRAM and a BTREE; each is checked by its index family.
+//! gets a BITMAP, a list a LABEL_LIST, and a free-text String a BTREE for a
+//! `@key` alone, an NGRAM and a BTREE for an `@index`, and a full-text index
+//! beside them only for `@index(fulltext)`; each is checked by its index
+//! family.
 
 use omnigraph::IndexCoverage;
 use omnigraph::db::Omnigraph;
@@ -20,15 +22,21 @@ node Item {
     published: DateTime @index
     rank: I32 @index
     title: String @index
+    body: String? @index(fulltext)
     active: Bool @index
     tags: [String] @index
     note: String?
 }
+
+node Code {
+    code: String @key @index
+}
 "#;
 
-const DATA: &str = r#"{"type":"Item","data":{"slug":"a","status":"active","published":"2024-06-01T00:00:00Z","rank":1,"title":"alpha","active":true,"tags":["x"],"note":"n1"}}
-{"type":"Item","data":{"slug":"b","status":"archived","published":"2023-01-01T00:00:00Z","rank":2,"title":"beta","active":false,"tags":[],"note":"n2"}}
-{"type":"Item","data":{"slug":"c","status":"active","published":"2025-02-02T00:00:00Z","rank":3,"title":"gamma","active":true,"tags":["x","y"],"note":"n3"}}"#;
+const DATA: &str = r#"{"type":"Item","data":{"slug":"a","status":"active","published":"2024-06-01T00:00:00Z","rank":1,"title":"alpha","body":"alpha text","active":true,"tags":["x"],"note":"n1"}}
+{"type":"Item","data":{"slug":"b","status":"archived","published":"2023-01-01T00:00:00Z","rank":2,"title":"beta","body":"beta text","active":false,"tags":[],"note":"n2"}}
+{"type":"Item","data":{"slug":"c","status":"active","published":"2025-02-02T00:00:00Z","rank":3,"title":"gamma","body":"gamma text","active":true,"tags":["x","y"],"note":"n3"}}
+{"type":"Code","data":{"code":"c-1"}}"#;
 
 /// The index families on `column`, by the message name of each index's
 /// details (`BTree`, `Bitmap`, `LabelList`, `NGram`, `Inverted`), sorted.
@@ -51,7 +59,9 @@ async fn families(ds: &omnigraph::db::SnapshotDataset, column: &str) -> Vec<Stri
 // Orderable scalars (DateTime, numeric) get a BTREE from the index
 // reconciler, so a `=`/range filter on them uses the index. An enum and a
 // `Bool` get a BITMAP and no BTREE, a list a LABEL_LIST, and a free-text
-// String its full-text index, an NGRAM and a BTREE. An un-annotated column
+// String a BTREE (`@key` alone), an NGRAM and a BTREE (`@index`, also beside a
+// `@key`), and a full-text index beside them only for `@index(fulltext)`, so a
+// plain `@index` or a `@key` builds no full-text index. An un-annotated column
 // has no scalar index and reports `Degraded`, the negative control that keeps
 // this test from being vacuously green. A second `ensure_indices` run must be
 // a no-op.
@@ -80,12 +90,26 @@ async fn node_index_columns_get_the_index_kinds_their_type_serves() {
         ("status", &["Bitmap"][..]),
         ("active", &["Bitmap"][..]),
         ("tags", &["LabelList"][..]),
-        ("title", &["BTree", "Inverted", "NGram"][..]),
+        ("slug", &["BTree"][..]),
+        ("title", &["BTree", "NGram"][..]),
+        ("body", &["BTree", "Inverted", "NGram"][..]),
         ("note", &[][..]),
     ] {
         assert_eq!(families(&ds, col).await, expected, "the indexes of `{col}`");
     }
-    assert!(ds.has_fts_index("title").await.unwrap());
+    assert!(ds.has_fts_index("body").await.unwrap());
+    for col in ["slug", "title"] {
+        assert!(
+            !ds.has_fts_index(col).await.unwrap(),
+            "`{col}` builds no full text"
+        );
+    }
+    let code = snap.open_dataset("node:Code").await.unwrap();
+    assert_eq!(
+        families(&code, "code").await,
+        ["BTree", "NGram"],
+        "a `@key` with an explicit `@index` follows the `@index` rule"
+    );
 
     // No @index annotation -> no scalar index at all -> Degraded.
     let note_cov = ds.index_coverage("note").await.unwrap();
@@ -140,7 +164,8 @@ async fn a_lagging_bitmap_label_list_or_ngram_is_rebuilt_in_its_own_family() {
                 ("status", &["Bitmap"][..]),
                 ("active", &["Bitmap"][..]),
                 ("tags", &["LabelList"][..]),
-                ("title", &["BTree", "Inverted", "NGram"][..]),
+                ("title", &["BTree", "NGram"][..]),
+                ("body", &["BTree", "Inverted", "NGram"][..]),
             ] {
                 assert_eq!(families(&ds, col).await, expected, "{step}: `{col}`");
             }

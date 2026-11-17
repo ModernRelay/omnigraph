@@ -381,6 +381,14 @@ async fn optimize_calls_before_publish_once_with_the_nonce_its_commit_answers() 
     };
     assert_eq!(outcomes(&publication.tables), outcomes(&report.tables));
 
+    // The first run compacts the four inserted fragments apart from the base
+    // fragment, whose index set differs until the run's fold covers them
+    // alike (Lance plans one bin per index set); a second run merges the two.
+    let converged = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(converged.graph_commit_id.is_some(), "{converged:?}");
     // A run that stages no table publishes nothing and never calls the hook.
     let (hook, seen) = recording_hook();
     let idle = db
@@ -801,7 +809,11 @@ async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
         ),
         "{next:?}"
     );
-    assert_eq!(next.resume_at, None);
+    // The resumed run wraps to Company, whose base fragment now merges with
+    // the tail the first run compacted (Lance plans one bin per index set,
+    // and the first run's fold made them alike), so the budget may defer it
+    // in turn; it never defers Person again.
+    assert_ne!(next.resume_at.as_deref(), Some("node:Person"), "{next:?}");
 }
 
 /// The artifact limit holds before the scan (a lower bound) and during it
@@ -1229,7 +1241,7 @@ async fn optimize_preserves_versions_under_stale_auto_cleanup_config_on_data_tab
 async fn optimize_reindexes_fragments_appended_after_index_build() {
     const SCHEMA: &str = r#"
 node Doc {
-    slug: String @key
+    slug: String @key @index(fulltext)
     rank: I32 @index
 }
 "#;
@@ -2624,7 +2636,10 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
     let db = init_and_load(&dir).await;
     db.apply_schema(
         &TEST_SCHEMA
-            .replace("age: I32?", "age: I32?\n    biography: String? @index")
+            .replace(
+                "age: I32?",
+                "age: I32?\n    biography: String? @index(fulltext)",
+            )
             .replace("since: Date?", "since: Date?\n    note: String? @index")
             .replace(
                 "edge WorksAt: Person -> Company",
@@ -2686,13 +2701,11 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
             property: "note".to_string(),
         },
         RebuiltFullTextIndex {
-            type_key: "node:Company".to_string(),
-            property: "name".to_string(),
-        },
-        RebuiltFullTextIndex {
             type_key: "node:Person".to_string(),
             property: "biography".to_string(),
         },
+        // `Person.name` is a `@key`, which declares no full-text index; the
+        // physical one forged above is still replaced, never removed.
         RebuiltFullTextIndex {
             type_key: "node:Person".to_string(),
             property: "name".to_string(),
@@ -2721,7 +2734,7 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
         before.graph_manifest_version() + 1
     );
 
-    for (table_key, expected_fts) in [("edge:Knows", 1), ("node:Company", 1), ("node:Person", 2)] {
+    for (table_key, expected_fts) in [("edge:Knows", 1), ("node:Person", 2)] {
         let old = before.open_dataset(table_key).await.unwrap();
         let new = after.open_dataset(table_key).await.unwrap();
         assert_eq!(
@@ -2773,10 +2786,13 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
     }
     // Edge declarations alone do not create FTS: normal ensure only builds
     // edge id/src/dst BTREEs. An existing physical edge FTS is still replaced.
-    assert_same_dataset_entry(
-        before.dataset("edge:WorksAt").unwrap(),
-        after.dataset("edge:WorksAt").unwrap(),
-    );
+    // A `@key` String (`Company.name`) has none to replace.
+    for table_key in ["edge:WorksAt", "node:Company"] {
+        assert_same_dataset_entry(
+            before.dataset(table_key).unwrap(),
+            after.dataset(table_key).unwrap(),
+        );
+    }
     assert_eq!(recovery_sidecar_count(&dir), 0);
 
     // A force rebuild remains a real operation after coverage is complete.
@@ -2803,16 +2819,21 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
     use omnigraph::db::{BuiltIndex, BuiltIndexAction, BuiltIndexKind};
 
     let dir = tempfile::tempdir().unwrap();
-    let schema =
-        format!("{TEST_SCHEMA}\nnode Tag {{\n    slug: String @key\n    rank: I64 @index\n}}\n");
+    // `Tag` carries each String declaration: a `@key` alone builds a BTREE, a
+    // plain `@index` an NGRAM and a BTREE, and `@index(fulltext)` its full
+    // text beside them.
+    let schema = format!(
+        "{}\nnode Tag {{\n    slug: String @key\n    rank: I64 @index\n    label: String? @index\n    body: String? @index(fulltext)\n}}\n",
+        helpers::full_text_test_schema()
+    );
     let db = helpers::init_and_load_with_schema(&dir, &schema).await;
     db.branch_create("feature").await.unwrap();
     db.load(
         "feature",
         concat!(
-            r#"{"type":"Tag","data":{"slug":"graphs","rank":1}}"#,
+            r#"{"type":"Tag","data":{"slug":"graphs","rank":1,"label":"g","body":"graph text"}}"#,
             "\n",
-            r#"{"type":"Tag","data":{"slug":"search","rank":2}}"#,
+            r#"{"type":"Tag","data":{"slug":"search","rank":2,"label":"s","body":"search text"}}"#,
             "\n",
             r#"{"type":"Person","data":{"name":"Eve","age":41}}"#,
         ),
@@ -2877,6 +2898,36 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
             ),
             built(
                 "node:Tag",
+                "body",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "body",
+                BuiltIndexKind::NGram,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "body",
+                BuiltIndexKind::FullText,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "label",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "label",
+                BuiltIndexKind::NGram,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
                 "rank",
                 BuiltIndexKind::Btree,
                 BuiltIndexAction::Built
@@ -2885,18 +2936,6 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
                 "node:Tag",
                 "slug",
                 BuiltIndexKind::Btree,
-                BuiltIndexAction::Built
-            ),
-            built(
-                "node:Tag",
-                "slug",
-                BuiltIndexKind::NGram,
-                BuiltIndexAction::Built
-            ),
-            built(
-                "node:Tag",
-                "slug",
-                BuiltIndexKind::FullText,
                 BuiltIndexAction::Built
             ),
         ]
@@ -2973,7 +3012,7 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
 #[tokio::test]
 async fn full_text_rebuild_on_a_branch_stages_on_the_inherited_location_without_changing_main() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let db = helpers::init_and_load_with_schema(&dir, &helpers::full_text_test_schema()).await;
     db.branch_create("feature").await.unwrap();
     let inherited = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
     db.ensure_indices_on_as("feature", None).await.unwrap();
@@ -3093,9 +3132,12 @@ async fn full_text_rebuild_reports_empty_builds_but_not_no_work() {
     assert_eq!(recovery_sidecar_count(&no_fts), 0);
 
     let empty = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(empty.path().to_str().unwrap(), TEST_SCHEMA)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(
+        empty.path().to_str().unwrap(),
+        &helpers::full_text_test_schema(),
+    )
+    .await
+    .unwrap();
     let before = snapshot_main(&db).await.unwrap();
     let result = db
         .rebuild_full_text_indices_on_as("main", None)
@@ -4632,7 +4674,9 @@ async fn index_build_tolerates_null_vector_rows() {
     );
     let ds = after.open_dataset("node:Doc").await.unwrap();
     assert!(ds.has_btree_index("__id").await.unwrap());
-    assert!(ds.has_fts_index("slug").await.unwrap());
+    // A `@key` String builds a BTREE and no full-text index.
+    assert!(ds.has_btree_index("slug").await.unwrap());
+    assert!(!ds.has_fts_index("slug").await.unwrap());
     assert!(ds.has_btree_index("n").await.unwrap());
     assert!(!ds.has_vector_index("embedding").await.unwrap());
 }
@@ -4683,7 +4727,11 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open_dataset("node:Doc").await.unwrap();
     assert!(ds.has_btree_index("__id").await.unwrap());
-    assert!(ds.has_fts_index("slug").await.unwrap());
+    assert!(ds.has_btree_index("slug").await.unwrap());
+    assert!(
+        !ds.has_fts_index("slug").await.unwrap(),
+        "a `@key` builds no full text"
+    );
     assert!(ds.has_btree_index("rank").await.unwrap());
     assert_eq!(
         ds.index_coverage("rank").await.unwrap(),

@@ -5610,6 +5610,7 @@ node Doc {
             key: None,
             unique_constraints: vec![],
             indices: vec![],
+            index_declarations: Default::default(),
             range_constraints: vec![RangeConstraint {
                 property: "score".to_string(),
                 min: Some(LiteralValue::Float(0.0)),

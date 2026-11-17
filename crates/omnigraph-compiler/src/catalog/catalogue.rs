@@ -139,6 +139,7 @@ impl CatalogueType {
             key: Some(vec![self.key().to_string()]),
             unique_constraints: Vec::new(),
             indices: Vec::new(),
+            index_declarations: HashMap::new(),
             range_constraints: Vec::new(),
             check_constraints: Vec::new(),
             embed_sources: HashMap::new(),

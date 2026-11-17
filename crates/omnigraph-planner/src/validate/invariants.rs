@@ -282,7 +282,7 @@ fn check_exact_bm25(score: &ExactScore, input: &AcceptInput<'_>) -> Result<(), V
         .node_types
         .get(&score.type_name)
         .is_some_and(|node| {
-            node.has_full_text_index(&score.property)
+            node.is_lexical_field(&score.property)
                 && node.full_text_scorer(&score.property) == FullTextScorer::Bm25V1
         });
     if !corpus {

@@ -6955,7 +6955,8 @@ edge WorksAt: Person -> Company
         // rebuilding indexes inline (deferred); ensure_indices restores them.
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let initial_schema = TEST_SCHEMA.replace("name: String @key", "name: String @key @index");
+        let initial_schema =
+            TEST_SCHEMA.replace("name: String @key", "name: String @key @index(fulltext)");
         let mut db = Omnigraph::init(uri, &initial_schema).await.unwrap();
         seed_person_row(&mut db, "Alice", Some(30)).await;
 

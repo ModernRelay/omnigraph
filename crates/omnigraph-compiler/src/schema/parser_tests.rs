@@ -1871,7 +1871,15 @@ node Doc {
             scorer: FullTextScorer::None,
         })
     );
-    assert_eq!(analysis("plain"), None);
+    // `@index(fulltext)` with no options declares the full-text index with
+    // the defaults; plain `@index` declares none.
+    assert_eq!(
+        analysis("plain"),
+        Some(FullTextAnalysis {
+            analyzer: None,
+            scorer: FullTextScorer::Bm25V1,
+        })
+    );
     assert_eq!(analysis("legacy"), None);
     for property in ["title", "body", "note", "tag", "plain", "legacy"] {
         assert!(

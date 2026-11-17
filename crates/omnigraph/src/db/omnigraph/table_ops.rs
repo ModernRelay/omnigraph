@@ -380,10 +380,14 @@ async fn maintain_indices_for_branch(
             }
             IndexMaintenanceMode::RebuildFullText => {
                 let node = &catalog.node_types[type_name];
+                let declared: Vec<String> = declared_full_text_columns(&catalog, &table_key)?
+                    .into_iter()
+                    .map(|column| column.column)
+                    .collect();
                 plan_full_text_rebuild(
                     &table_key,
                     &node.properties,
-                    &node.indices,
+                    &declared,
                     &|column| full_text_build(node, column),
                     &ds,
                 )
@@ -811,8 +815,9 @@ pub(super) async fn append_deferred_full_text_indexes(
 }
 
 /// The columns of `table_key` that carry a declared full-text index: every
-/// one-column `@index`/`@key` node property [`PropType::index_kinds`] gives
-/// full text, the same rule the index builder follows. Edges declare none.
+/// node property declaring `@index(fulltext, ...)`, the one declaration
+/// [`PropType::index_kinds`] gives full text, the same rule the index builder
+/// follows. Edges declare none.
 /// Every detached commit a writer publishes declares them
 /// (`TableStore::commit_staged_detached`).
 pub(crate) fn declared_full_text_columns(
@@ -829,7 +834,7 @@ pub(crate) fn declared_full_text_columns(
         .indices
         .iter()
         .filter_map(|index_cols| match index_cols.as_slice() {
-            [property] if node_type.has_full_text_index(property) => Some(property),
+            [property] if node_type.builds_full_text_index(property) => Some(property),
             _ => None,
         })
         .collect();
@@ -929,11 +934,13 @@ pub(super) struct IndexWorkStatus {
 ///
 /// Per `build_indices_on_dataset_for_catalog`, nodes get BTree (id) plus, for
 /// each one-column `@index`/`@key` property, the indexes
-/// `PropType::index_kinds` assigns: a BITMAP for enums and `Bool`, a
-/// LABEL_LIST for lists, FTS, NGRAM and BTREE for free-text Strings, a BTREE
-/// for the other orderable scalars (DateTime/Date/numeric), or a Vector
-/// index. Edges get BTree only (id, src, dst). This helper and the builder
-/// share `PropType::index_kinds` so they cannot drift — see its doc comment.
+/// `PropType::index_kinds` assigns its declaration: a BITMAP for enums and
+/// `Bool`, a LABEL_LIST for lists, for free-text Strings a BTREE (a `@key`
+/// alone), NGRAM and BTREE (`@index`) or FTS, NGRAM and BTREE
+/// (`@index(fulltext, ...)`), a BTREE for the other orderable scalars
+/// (DateTime/Date/numeric), or a Vector index. Edges get BTree only (id, src,
+/// dst). This helper and the builder share `PropType::index_kinds` so they
+/// cannot drift — see its doc comment.
 #[derive(Default)]
 pub(super) struct PlannedIndexWork {
     pub(super) specs: Vec<crate::storage_layer::IndexBuildSpec>,
@@ -962,24 +969,19 @@ impl PlannedIndexWork {
 
 /// Full rebuilds use schema declarations plus the actual physical inventory.
 /// An externally named FTS index on a supported property is still replaced;
-/// names and the table writer version are not compatibility evidence.
+/// names and the table writer version are not compatibility evidence. So is
+/// a full-text index the schema no longer declares on a free-text String (a
+/// plain `@index` whose earlier build gave it full text): the rebuild replaces
+/// what exists, never removes it, and builds full text anew only for
+/// `declared` columns.
 async fn plan_full_text_rebuild(
     table_key: &str,
     properties: &HashMap<String, PropType>,
-    declarations: &[Vec<String>],
+    declared: &[String],
     build: &(dyn Fn(&str) -> Result<crate::storage_layer::FullTextBuild> + Sync),
     ds: &SnapshotHandle,
 ) -> Result<PlannedIndexWork> {
-    let mut columns = BTreeSet::new();
-    for declaration in declarations {
-        if let [column] = declaration.as_slice()
-            && properties
-                .get(column)
-                .is_some_and(PropType::has_full_text_index_kind)
-        {
-            columns.insert(column.clone());
-        }
-    }
+    let mut columns: BTreeSet<String> = declared.iter().cloned().collect();
 
     let dataset = ds.dataset();
     let store = dataset
@@ -1033,7 +1035,7 @@ async fn plan_full_text_rebuild(
         let Some(field) = field.filter(|field| {
             properties
                 .get(&field.name)
-                .is_some_and(PropType::has_full_text_index_kind)
+                .is_some_and(PropType::is_free_text_string)
         }) else {
             return Err(OmniError::manifest(format!(
                 "cannot rebuild full-text index '{}' on {}: only single, non-list, \
@@ -1098,10 +1100,7 @@ async fn plan_index_work_node(
             continue;
         }
         let prop_name = &index_cols[0];
-        let Some(prop_type) = node_type.properties.get(prop_name) else {
-            continue;
-        };
-        let kinds = prop_type.index_kinds();
+        let kinds = node_type.property_index_kinds(prop_name);
         for kind in kinds {
             match kind {
                 // An untrained segment only declares the analyzer
@@ -1141,11 +1140,18 @@ async fn plan_index_work_node(
                         }
                     }
                 }
-                // A BTREE beside a full-text index is named explicitly: the
-                // full-text index in the same batch takes the default name.
+                // A free-text String's BTREE is named explicitly: a full-text
+                // index takes the default name, whether built in the same
+                // batch or before (a plain `@index` built full text before
+                // only `@index(fulltext, ...)` did), and a replacing build
+                // under that name would remove it.
                 PropIndexKind::Btree => {
                     if !db.storage().has_btree_index(ds, prop_name).await? {
-                        let name = kinds.contains(&PropIndexKind::FullText).then(|| {
+                        let free_text = node_type
+                            .properties
+                            .get(prop_name)
+                            .is_some_and(PropType::is_free_text_string);
+                        let name = free_text.then(|| {
                             crate::table_store::scalar_index_name(
                                 prop_name,
                                 ScalarIndexFamily::BTree,

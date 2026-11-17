@@ -287,7 +287,7 @@ async fn linear_head(uri: &str) -> u64 {
 }
 
 /// The Person properties the ensure-indices cell declares beside `age`.
-const ENSURE_INDICES_PROPERTIES: &str = "age: I32? @index\n    status: enum(active, retired)? @index\n    nick: String? @index\n    labels: [String]? @index";
+const ENSURE_INDICES_PROPERTIES: &str = "age: I32? @index\n    status: enum(active, retired)? @index\n    nick: String? @index\n    bio: String? @index(fulltext)\n    labels: [String]? @index";
 
 /// After recovery and an index pass, every scalar kind the cell declared is
 /// built on Person in its own family: the crashed attempt left none half
@@ -300,7 +300,8 @@ async fn assert_scalar_index_kinds_built(cell: &str, db: &Omnigraph) {
     for (column, expected) in [
         ("age", &["BTree"][..]),
         ("status", &["Bitmap"][..]),
-        ("nick", &["BTree", "Inverted", "NGram"][..]),
+        ("nick", &["BTree", "NGram"][..]),
+        ("bio", &["BTree", "Inverted", "NGram"][..]),
         ("labels", &["LabelList"][..]),
     ] {
         let field = ds.schema().field(column).unwrap().id;
@@ -755,8 +756,9 @@ async fn run_cell(
 
     // An index cell needs index work: declared indexes the schema apply
     // records and leaves unbuilt, one of every scalar kind (a BTREE, an
-    // enum's BITMAP, a String's NGRAM and BTREE beside its full text, and a
-    // list's LABEL_LIST), so a crashed reconciliation stages them together.
+    // enum's BITMAP, a plain `@index` String's NGRAM and BTREE, an
+    // `@index(fulltext)` String's full text beside them, and a list's
+    // LABEL_LIST), so a crashed reconciliation stages them together.
     if writer == Writer::EnsureIndices {
         db.apply_schema(&helpers::TEST_SCHEMA.replace("age: I32?", ENSURE_INDICES_PROPERTIES))
             .await
@@ -783,11 +785,12 @@ async fn run_cell(
         }
     }
     // A full-text rebuild cell needs a built full-text index with rows
-    // behind it: a `String @index` Person property, one row carrying text,
+    // behind it: a `String @index(fulltext)` Person property, one row carrying text,
     // and the initial build.
     if writer == Writer::FtsRebuild {
         db.apply_schema(
-            &helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    city: String? @index"),
+            &helpers::TEST_SCHEMA
+                .replace("age: I32?", "age: I32?\n    city: String? @index(fulltext)"),
         )
         .await
         .unwrap();

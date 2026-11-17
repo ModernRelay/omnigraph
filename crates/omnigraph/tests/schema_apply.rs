@@ -3450,7 +3450,7 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
     };
 
     // Declaring the full-text index publishes its analyzer with the contract.
-    let declared = "node Doc {\n    slug: String @key\n    body: String @index\n}\n";
+    let declared = "node Doc {\n    slug: String @key\n    body: String @index(fulltext)\n}\n";
     let before = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -3476,7 +3476,7 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
 
     // Renaming the column keeps its segment (no second declaration), and an
     // added full-text property gets its own.
-    let evolved = "node Doc {\n    slug: String @key\n    text: String @rename_from(\"body\") @index\n    summary: String? @index\n}\n";
+    let evolved = "node Doc {\n    slug: String @key\n    text: String @rename_from(\"body\") @index(fulltext)\n    summary: String? @index(fulltext)\n}\n";
     assert!(db.apply_schema(evolved).await.unwrap().applied);
     assert_eq!(segments("text").await, [Some(0)]);
     assert_eq!(segments("summary").await, [Some(0)]);
@@ -3514,7 +3514,7 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
         format!("node Doc {{\n    slug: String @key\n    {column}: String {rename}{index}\n}}\n")
     };
     let db = helpers::session(
-        Omnigraph::init(uri, &schema("body", "@index", ""))
+        Omnigraph::init(uri, &schema("body", "@index(fulltext)", ""))
             .await
             .unwrap(),
     );
@@ -3701,6 +3701,31 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
     .await
     .unwrap();
     assert_eq!(search("text", "run").await, ["d1"]);
+
+    // A plain `@index` declares no full-text index: the apply withdraws the
+    // declaration, the built index stays as it is, writes declare no new
+    // segment, an index pass neither rebuilds nor removes it, and no answer
+    // changes, since the exact scan answers `match_terms` either way.
+    db.apply_schema(&schema("text", "@index", ""))
+        .await
+        .unwrap();
+    let doc = &db.catalog().node_types["Doc"];
+    assert!(doc.is_lexical_field("text") && !doc.builds_full_text_index("text"));
+    assert_eq!(fingerprint("text"), Some(english_fingerprint.clone()));
+    let left = |segments: Vec<lance_table::format::IndexMetadata>| {
+        segments.iter().map(|index| index.uuid).collect::<Vec<_>>()
+    };
+    assert_eq!(left(segments("text").await.1), [changed_segments[0].uuid]);
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d3","text":"runs"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+    assert_eq!(left(segments("text").await.1), [changed_segments[0].uuid]);
+    assert_eq!(search("text", "run").await, ["d1", "d3"]);
+    assert_eq!(search("text", "cafe").await, ["d2"]);
 }
 
 // Enum widening (iss-enum-widening-migration): adding variants to an enum is

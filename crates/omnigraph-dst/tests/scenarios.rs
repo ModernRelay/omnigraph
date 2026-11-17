@@ -2902,11 +2902,11 @@ query widen($title: String) {
 /// the update's `<key> = v` match adds the derived id conjunct, and an upsert
 /// whose rows are all new or all present skips Lance's full-table merge
 /// join. Their calls do not follow the fragment count. The rows of the two
-/// sizes differ only in three GETs of `KeyedInsert`, the first write after the
-/// reopen: one the forced join paid as well (it read 10 and 25), and two
-/// because at 16 fragments the table's manifest outgrows the 4 KiB tail Lance
-/// reads first (its index section lists the key's full-text, NGRAM and BTREE
-/// indexes), so Lance reads the index section with its own HEAD and GET. At 2
+/// sizes differ only in one GET of `KeyedInsert`, the first write after the
+/// reopen, which the forced join paid as well (it read 10 and 25); the
+/// table's manifest at 16 fragments still fits the 4 KiB tail Lance reads
+/// first, since a `@key` alone adds only its BTREE to the index section. The
+/// update's `<key> = v` reads the key's BTREE beside the id BTREE. At 2
 /// fragments the two writes before `MergeLoadPresent` leave as many fragments
 /// uncovered as covered, so it keeps the join; each write after the first
 /// finds the dataset the previous one committed in the handle cache, so that
@@ -3028,8 +3028,9 @@ query update_one() {
 
 /// The scalar index kinds `@index` builds beside BTREE
 /// (the GQ 3 RFC, section 4): one reconciliation that builds
-/// an enum's and a `Bool`'s BITMAP, a list's LABEL_LIST and a String's
-/// NGRAM, BTREE and full-text index together (`ScalarKindsBuild`), then on a
+/// an enum's and a `Bool`'s BITMAP, a list's LABEL_LIST, a plain `@index`
+/// String's NGRAM and BTREE and the key's BTREE together, and no full-text
+/// index, which only `@index(fulltext)` declares (`ScalarKindsBuild`), then on a
 /// reopened handle one read probing each kind: an enum equality through the
 /// BITMAP, a list membership through the LABEL_LIST and a `contains` through
 /// the NGRAM, whose candidates Lance rechecks.

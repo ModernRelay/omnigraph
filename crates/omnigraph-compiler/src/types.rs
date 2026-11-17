@@ -233,6 +233,20 @@ impl std::fmt::Display for ScalarType {
     }
 }
 
+/// The one-column index declaration a node property carries, the strongest
+/// of its annotations: a `@key` alone, an explicit `@index` (property-level
+/// or body-level, with or without a `@key`), or `@index(fulltext, ...)`.
+/// [`PropType::index_kinds`] reads it beside the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IndexDeclaration {
+    /// `@key` and no explicit `@index`.
+    Key,
+    /// An explicit `@index`.
+    Index,
+    /// `@index(fulltext, ...)`.
+    FullText,
+}
+
 /// One index a one-column `@index` or `@key` declaration builds on a node
 /// property (the GQ 3 RFC, section 4, "Scalar indexes"): a
 /// BTREE for equality, ranges and order, a BITMAP for an enum or `Bool`, a
@@ -303,24 +317,29 @@ impl PropType {
         self.enum_values.is_some()
     }
 
-    /// The indexes a one-column `@index`/`@key` declaration on a node
-    /// property of this type builds, empty when the type is not indexable (a
-    /// `Blob`, or a list of vectors or Blobs). Each is derived acceleration
-    /// (invariant 7); the kinds follow the predicates Lance 13 answers per
-    /// index (docs/dev/lance.md, the scalar index rows):
+    /// The indexes a one-column `declaration` on a node property of this type
+    /// builds, empty when the type is not indexable (a `Blob`, or a list of
+    /// vectors or Blobs). Each is derived acceleration (invariant 7); the
+    /// kinds follow the predicates Lance 13 answers per index
+    /// (docs/dev/lance.md, the scalar index rows):
     ///
     /// - an enum or `Bool` takes a BITMAP, which answers equality, `!=`,
     ///   `in`, ranges and `is null` exactly, as a BTREE would, and no BTREE
     ///   beside it, since nothing orders through an index;
     /// - a list takes a LABEL_LIST, which answers `value in $x.list` exactly;
-    /// - a free-text String takes its full-text index, an NGRAM for
-    ///   `contains` (a candidate superset Lance rechecks) and a BTREE for
-    ///   equality, `in`, ranges and `starts_with`, which an NGRAM answers none
-    ///   of;
-    /// - every other scalar takes a BTREE, and a vector its vector index.
+    /// - a free-text String takes a BTREE for equality, `in`, ranges and
+    ///   `starts_with`; an explicit `@index` adds an NGRAM for `contains` (a
+    ///   candidate superset Lance rechecks), which a `@key` alone does without,
+    ///   since an identifier is matched by equality and its `contains` is
+    ///   answered by the scan; and only `@index(fulltext, ...)` adds the
+    ///   full-text index, since `match_terms` and `bm25` answer from the exact
+    ///   scan whatever is built;
+    /// - every other scalar takes a BTREE, and a vector its vector index,
+    ///   whatever the declaration.
     ///
-    /// The one rule the type checker and index maintenance share.
-    pub fn index_kinds(&self) -> &'static [PropIndexKind] {
+    /// The one rule index maintenance and the declared full-text columns
+    /// share.
+    pub fn index_kinds(&self, declaration: IndexDeclaration) -> &'static [PropIndexKind] {
         if self.list {
             return match self.scalar {
                 ScalarType::Vector(_) | ScalarType::Blob => &[],
@@ -329,11 +348,15 @@ impl PropType {
         }
         match self.scalar {
             ScalarType::String if self.is_enum() => &[PropIndexKind::Bitmap],
-            ScalarType::String => &[
-                PropIndexKind::FullText,
-                PropIndexKind::NGram,
-                PropIndexKind::Btree,
-            ],
+            ScalarType::String => match declaration {
+                IndexDeclaration::Key => &[PropIndexKind::Btree],
+                IndexDeclaration::Index => &[PropIndexKind::NGram, PropIndexKind::Btree],
+                IndexDeclaration::FullText => &[
+                    PropIndexKind::FullText,
+                    PropIndexKind::NGram,
+                    PropIndexKind::Btree,
+                ],
+            },
             ScalarType::Bool => &[PropIndexKind::Bitmap],
             ScalarType::Vector(_) => &[PropIndexKind::Vector],
             ScalarType::DateTime
@@ -348,10 +371,11 @@ impl PropType {
         }
     }
 
-    /// Whether a one-column index on a property of this type builds the
-    /// full-text index `match_terms` and `bm25` read: a free-text String.
-    pub fn has_full_text_index_kind(&self) -> bool {
-        self.index_kinds().contains(&PropIndexKind::FullText)
+    /// Whether this is a free-text String: a String that is neither an enum
+    /// nor a list, the only type lexical search reads and a full-text index
+    /// covers.
+    pub fn is_free_text_string(&self) -> bool {
+        matches!(self.scalar, ScalarType::String) && !self.list && !self.is_enum()
     }
 
     pub fn to_arrow(&self) -> DataType {

@@ -979,7 +979,9 @@ fn optimize_json_succeeds_on_local_graph() {
         &schema,
         fs::read_to_string(fixture("test.pg"))
             .unwrap()
-            .replace("age: I32?", "age: I32?\n    embedding: Vector(4)? @index"),
+            .replace("age: I32?", "age: I32?\n    embedding: Vector(4)? @index")
+            // The keys declare full text, which the rebuild below replaces.
+            .replace("name: String @key", "name: String @key @index(fulltext)"),
     )
     .unwrap();
     output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
@@ -1128,11 +1130,17 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     let schema = temp.path().join("schema.pg");
+    // `Tag` carries each String declaration: a `@key` alone builds a BTREE, a
+    // plain `@index` an NGRAM and a BTREE, and `@index(fulltext)` its full
+    // text beside them. `Person.name` declares full text, whose coverage the
+    // feature row leaves lagging.
     fs::write(
         &schema,
         format!(
-            "{}\nnode Tag {{\n    slug: String @key\n    rank: I64 @index\n}}\n",
-            fs::read_to_string(fixture("test.pg")).unwrap()
+            "{}\nnode Tag {{\n    slug: String @key\n    rank: I64 @index\n    label: String? @index\n    body: String? @index(fulltext)\n}}\n",
+            fs::read_to_string(fixture("test.pg"))
+                .unwrap()
+                .replace("name: String @key", "name: String @key @index(fulltext)")
         ),
     )
     .unwrap();
@@ -1163,8 +1171,8 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
     fs::write(
         &rows,
         concat!(
-            "{\"type\":\"Tag\",\"data\":{\"slug\":\"graphs\",\"rank\":1}}\n",
-            "{\"type\":\"Tag\",\"data\":{\"slug\":\"search\",\"rank\":2}}\n",
+            "{\"type\":\"Tag\",\"data\":{\"slug\":\"graphs\",\"rank\":1,\"label\":\"g\",\"body\":\"graph text\"}}\n",
+            "{\"type\":\"Tag\",\"data\":{\"slug\":\"search\",\"rank\":2,\"label\":\"s\",\"body\":\"search text\"}}\n",
             "{\"type\":\"Person\",\"data\":{\"name\":\"Eve\",\"age\":41}}\n",
         ),
     )
@@ -1202,10 +1210,13 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
             {"type_key": "node:Person", "property": "name", "kind": "btree", "action": "refreshed"},
             {"type_key": "node:Person", "property": "name", "kind": "ngram", "action": "refreshed"},
             {"type_key": "node:Tag", "property": "__id", "kind": "btree", "action": "built"},
+            {"type_key": "node:Tag", "property": "body", "kind": "btree", "action": "built"},
+            {"type_key": "node:Tag", "property": "body", "kind": "ngram", "action": "built"},
+            {"type_key": "node:Tag", "property": "body", "kind": "full_text", "action": "built"},
+            {"type_key": "node:Tag", "property": "label", "kind": "btree", "action": "built"},
+            {"type_key": "node:Tag", "property": "label", "kind": "ngram", "action": "built"},
             {"type_key": "node:Tag", "property": "rank", "kind": "btree", "action": "built"},
             {"type_key": "node:Tag", "property": "slug", "kind": "btree", "action": "built"},
-            {"type_key": "node:Tag", "property": "slug", "kind": "ngram", "action": "built"},
-            {"type_key": "node:Tag", "property": "slug", "kind": "full_text", "action": "built"},
         ])
     );
     let pending = built["pending_indexes"].as_array().unwrap();

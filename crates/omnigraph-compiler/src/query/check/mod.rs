@@ -3873,7 +3873,7 @@ impl Ctx<'_> {
             if !self
                 .catalog
                 .query_node_type(&type_name)
-                .is_some_and(|n| n.has_full_text_index(&property))
+                .is_some_and(|n| n.is_lexical_field(&property))
             {
                 return Err(err_fix(
                     T27,
@@ -5471,7 +5471,7 @@ impl Ctx<'_> {
                     if !this
                         .catalog
                         .query_node_type(&type_name)
-                        .is_some_and(|n| n.has_full_text_index(prop))
+                        .is_some_and(|n| n.is_lexical_field(prop))
                     {
                         return Err(err(
                             T27,

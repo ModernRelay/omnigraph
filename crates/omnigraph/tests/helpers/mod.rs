@@ -30,6 +30,20 @@ pub const TEST_SCHEMA: &str = include_str!("../fixtures/test.pg");
 pub const TEST_DATA: &str = include_str!("../fixtures/test.jsonl");
 pub const TEST_QUERIES: &str = include_str!("../fixtures/test.gq");
 
+/// `schema` with every plain `String @index` declaring `@index(fulltext)`, for
+/// tests of full-text index machinery over a fixture that older binaries also
+/// read (`search.pg`), which therefore keeps the spelling they parse.
+pub fn with_full_text(schema: &str) -> String {
+    schema.replace("String @index\n", "String @index(fulltext)\n")
+}
+
+/// [`TEST_SCHEMA`] with `Person.name` and `Company.name` declaring
+/// `@index(fulltext)` beside their `@key`, for tests of full-text index
+/// machinery: a `@key` alone builds no full-text index.
+pub fn full_text_test_schema() -> String {
+    TEST_SCHEMA.replace("name: String @key", "name: String @key @index(fulltext)")
+}
+
 pub const MUTATION_QUERIES: &str = r#"
 query insert_person($name: String, $age: I32) {
     insert Person { name: $name, age: $age }

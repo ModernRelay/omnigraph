@@ -152,7 +152,11 @@ fn write_sized_external_blob(path: &std::path::Path, bytes: u64) {
 
 async fn init_search_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = helpers::session(Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap());
+    let db = helpers::session(
+        Omnigraph::init(uri, &helpers::with_full_text(SEARCH_SCHEMA))
+            .await
+            .unwrap(),
+    );
     db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
@@ -3379,8 +3383,8 @@ async fn merged_rewritten_indexed_table_is_searchable_immediately() {
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(
         user_indices.len(),
-        10,
-        "expected rebuilt id BTree plus the full-text, NGRAM and BTREE indexes of the key property, title and body after rewritten merge"
+        8,
+        "expected rebuilt id BTree, the key property's BTREE, and the full-text, NGRAM and BTREE indexes of title and body after rewritten merge"
     );
 }
 
