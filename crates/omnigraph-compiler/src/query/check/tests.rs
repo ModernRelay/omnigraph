@@ -2462,6 +2462,7 @@ fn a_type_error_carries_the_position_of_its_clause() {
     assert_eq!(d.position.map(|p| p.column), Some(61));
 }
 
+mod compile_cost;
 mod components;
 mod desugaring;
 mod diagnostics;
