@@ -321,8 +321,22 @@ impl<S: TrustSet> TrustHolder<S> {
                 let Some(holder) = weak.upgrade() else {
                     break;
                 };
+                let source_name = holder.source_name;
                 // A panic is contained to its tick; the next tick reads again.
-                let _ = tokio::task::spawn_blocking(move || holder.refresh()).await;
+                // The panic payload is not logged, so no source text can reach
+                // the log through it.
+                if tokio::task::spawn_blocking(move || holder.refresh())
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        source = source_name,
+                        class = "panicked",
+                        "{} refresh tick panicked; the installed set stays in force and the \
+                         next tick reads the source again",
+                        S::LABEL
+                    );
+                }
             }
         });
     }
