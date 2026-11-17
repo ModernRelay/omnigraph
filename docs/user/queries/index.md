@@ -39,7 +39,8 @@ a default must be supplied; omission fails before execution. A trailing `?`
 accepts `null` or an omitted value, which is null. `= value` declares a
 default, a literal of the type (`T3` otherwise), that an omitted parameter
 takes; a supplied value or an explicit `null` replaces it. `@description` and
-`@instruction` attach metadata for tool clients. An integer parameter carries
+`@instruction` attach metadata for tool clients; an annotation without
+arguments takes no parentheses (`@name`, never `@name()`, which is `Q012`). An integer parameter carries
 its type's whole range: a `U64` takes `0` to `18446744073709551615`. A source
 declares each name once, compared case-sensitively as a call resolves it; a
 second declaration is `T83`, naming both: rename or delete the later one.
@@ -90,9 +91,13 @@ GQ has no `null` literal, so `$p.x = null` is a parse error. A parameter bound
 to `null` makes every comparison on it null, and `is null` refuses a `Blob`.
 `not ($p.age > 30) or $p.age is null` selects every row the comparison did not.
 
-`and`, `or`, `not`, `is`, `null` and `in` are reserved words: none is a bare operand
-or a return alias. `$p.and` after a dot and `and: 1` in an assignment stay
-legal; `nothing` and `android` are ordinary identifiers.
+`and`, `or`, `not`, `is`, `null` and `in` are reserved words: none is a bare operand,
+a return alias or a call name. A keyword is never a call name either:
+`where(…)`, `match(…)` and `and(a, b)` are `Q019`, whose fix prints the form
+the word is used in (`a and b`). `$p.and` after a dot and `and: 1` in an
+assignment stay legal; `nothing` and `android` are ordinary identifiers.
+Whitespace may follow a minus sign: `- $p.age`, `[- 1, 2]` and a default
+`= - 3` read as `-$p.age`, `[-1, 2]` and `= -3`.
 A bare name is never a value in a read (`Q018`): a property is `$x.name`, a
 parameter `$name` and a string `"name"`; the one bare name is an `order` alias.
 Inside `match` any word is an edge name, reserved words included: `$i in $b`

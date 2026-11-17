@@ -186,14 +186,14 @@ expected format instead, without an edit.
 | `Q009` | `mutation` is not a declaration keyword; the fix is `query`. |
 | `Q010` | A binding carries a property map or braces; the fix is the binding and the conjunct in `where`, `match { $p: Person } where $p.handle = $h`. |
 | `Q011` | A read body carries `as commit` or `as unattached branch`. |
-| `Q012` | A respelling the language refuses (`not { … }`, `\|\|`, `CASE`, a chained comparison, a one-name edge group `(knows)`); the fix prints the legal form. |
+| `Q012` | A respelling the language refuses (`not { … }`, `\|\|`, `CASE`, a chained comparison, a one-name edge group `(knows)`, an annotation's empty parentheses `@name()`); the fix prints the legal form. |
 | `Q013` | A write's elements are written without `match { }`, or after a statement; the fix is the group's `match`. |
 | `Q014` | A spelling from another language (`==`, `&&`, `WHERE`, `count(*)`, …); the fix prints the GQ form. |
 | `Q015` | A form the language does not have yet; the message names it. |
 | `Q016` | Two elements, return items, order keys, call arguments or assignments are separated by whitespace alone; the fix is the comma. |
 | `Q017` | A filter, a `where` or a comparison inside the `match` braces; the fix moves it to the `where` after them, joined with `and`. |
 | `Q018` | A bare name where a value is read; a bare name is a return alias in `order` only. |
-| `Q019` | A call named by an element keyword (`exists(x)`), or `from` over a parenthesized relation. |
+| `Q019` | A call named by a keyword or a reserved word (`exists(x)`, `where(…)`, `and(a, b)`), or `from` over a parenthesized relation. |
 | `Q020` | A read body's parts are missing, misplaced or unbraced. |
 | `Q021` | An annotation's named argument is written `name: value`; the fix is `name = value`. |
 

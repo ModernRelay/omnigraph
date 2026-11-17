@@ -257,6 +257,10 @@ const INTENDED: &[(&str, &str)] = &[
         r#"query q() { match { $p: Person } return { concat($p.name, $p.handle) as n } }"#,
     ),
     (
+        "diagnostics/q012_annotation_with_empty_parentheses.gqt step 3",
+        r#"query q() @deprecated { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
         "diagnostics/q013_element_after_the_last_statement.gqt step 3",
         r#"query w($h: String) { match { $p: Person, $q: Person } where $p.handle = $h delete $p }"#,
     ),
@@ -275,6 +279,10 @@ const INTENDED: &[(&str, &str)] = &[
     (
         "diagnostics/q019_element_keyword_call.gqt step 3",
         r#"query q() { match { $p: Person } where $p.city is not null return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/q019_element_keyword_call.gqt step 7",
+        r#"query q() { match { $p: Person } where $p.age > 30 and $p.city is null return { $p.name } }"#,
     ),
     (
         "diagnostics/q020_match_without_braces.gqt step 3",

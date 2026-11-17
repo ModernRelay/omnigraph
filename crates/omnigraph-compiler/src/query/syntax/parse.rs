@@ -1139,6 +1139,17 @@ fn annotation(pair: Pair<Rule>) -> R<Annotation> {
     let text = pair.as_str();
     let mut args = Vec::new();
     for arg in inner {
+        if arg.as_rule() == Rule::empty_args_rec {
+            let (start, end) = span_of(&arg);
+            return Err(refusal(
+                input,
+                Q012,
+                format!("`@{name}()`: an annotation without arguments takes no parentheses"),
+                whole,
+                vec![edit(start, end, "")],
+                MACHINE,
+            ));
+        }
         let a = arg.into_inner().next().unwrap();
         args.push(match a.as_rule() {
             Rule::annotation_kwarg => {
@@ -4239,12 +4250,33 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
                     MACHINE,
                 ));
             }
+            let positional: Vec<&str> = args
+                .iter()
+                .filter(|a| a.as_rule() == Rule::positional)
+                .map(|a| a.as_str().trim())
+                .collect();
+            // An infix operator written as a call: the fix writes it infix.
+            if matches!(word, "and" | "or" | "in")
+                && let [left, right] = positional.as_slice()
+                && args.len() == 2
+            {
+                return Err(refusal(
+                    input,
+                    Q019,
+                    format!(
+                        "`{word}` is a reserved word, and a call is never named one; `{word}` is written between its operands"
+                    ),
+                    span,
+                    vec![edit(span.0, span.1, format!("{left} {word} {right}"))],
+                    MACHINE,
+                ));
+            }
             Err(refusal_note(
                 input,
                 Q019,
-                format!("`{word}` is an element keyword, and a registry row is never named one"),
+                format!("`{word}` is a keyword, and a call is never named one"),
                 span,
-                format!("{word} {{ … }}"),
+                keyword_form(word),
             ))
         }
         Rule::prop_method_rec => {
@@ -4342,6 +4374,28 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
             }
         }
         other => unreachable!("grammar: operand holds no {other:?}"),
+    }
+}
+
+/// The form a keyword written as a call's name is used in, the fix a
+/// `Q019` prints.
+fn keyword_form(word: &str) -> String {
+    match word {
+        "let" => "let $x = <value>".to_string(),
+        "from" => "from { match { … } return { … } }".to_string(),
+        "optional" | "exists" | "match" => format!("{word} {{ … }}"),
+        "where" => "match { … } where <predicate>".to_string(),
+        "return" | "order" => format!("{word} {{ … }}"),
+        "limit" => "limit <n>".to_string(),
+        "distinct" => "return distinct { … }, or count(distinct <value>)".to_string(),
+        "as" => "<value> as <name>".to_string(),
+        "query" => "query <name>(…) { … }".to_string(),
+        "insert" => "insert <Type> { … }".to_string(),
+        "update" | "set" => "update $x set { … }".to_string(),
+        "delete" => "delete $x".to_string(),
+        "not" => "not <value>".to_string(),
+        "is" | "null" => "<value> is null".to_string(),
+        other => format!("<value> {other} <value>"),
     }
 }
 

@@ -11,7 +11,7 @@
 //! - the header: a name (keywords included), parameters of every base,
 //!   list and vector type with or without `?` and with or without a default
 //!   (any literal, a list among them, under an optional `-`), annotations
-//!   with no parentheses, empty ones, positional and `name = value`
+//!   with no parentheses or one argument at least, positional and `name = value`
 //!   arguments over literals, `$params`, `@meta` fields and bare words
 //!   (`@budget(plan = 3)` among them), and a write's `as commit` and
 //!   `as unattached branch` with no base, a quoted base or a `$param` base;
@@ -45,7 +45,9 @@
 //! Each tree is printed ([`print_file`]) and the text parsed back; the parse
 //! must be the tree, and printing the parse must give the same text (a
 //! fixed point). The text is then respelled and parsed again: comments,
-//! line and block, replace some of the spaces between tokens, and a string's
+//! line and block, replace some of the spaces between tokens, a space
+//! follows some minus signs (a sign, a unary minus or a negative number in
+//! a list), and a string's
 //! `\n`, `\t` and `\r` escapes become the raw characters, which the grammar
 //! reads too (a string may span lines). The respelled text must parse to
 //! the same tree.
@@ -139,8 +141,9 @@ const IDENTS: &[&str] = &[
 const CALLS: &[&str] = &[
     // Not `date`/`datetime`: with one string argument the call is the date
     // literal production.
-    // Not `let`, `from`, `optional`, `exists`: a registry row is never named an
-    // element keyword (section 5).
+    // Not a reserved word or a keyword (`let`, `from`, `where`, `match`,
+    // `and`, …): a call is never named one (section 7), which
+    // `a_keyword_is_never_a_call_name` holds.
     "f",
     "coalesce",
     "contains",
@@ -152,15 +155,7 @@ const CALLS: &[&str] = &[
     "rrf",
     "count",
     "distance",
-    // Clause and statement words are names in operand position.
-    "match",
-    "return",
-    "order",
-    "limit",
-    "where",
-    "insert",
-    "set",
-    "as",
+    // A foreign word is a name in operand position.
     "with",
 ];
 const OPTIONS: &[&str] = &["k", "recall", "max_edits", "weights", "mode", "from"];
@@ -532,7 +527,9 @@ fn annotation() -> impl Strategy<Value = Annotation> {
     });
     prop_oneof![
         1 => budget,
-        3 => (pick(ANNOTATIONS), proptest::option::of(proptest::collection::vec(arg, 0..3)))
+        // An annotation without arguments takes no parentheses: `args` is
+        // `None` or holds one argument at least.
+        3 => (pick(ANNOTATIONS), proptest::option::of(proptest::collection::vec(arg, 1..3)))
             .prop_map(|(name, args)| Annotation { name, args, at: SourceSpan::default() }),
     ]
 }
@@ -708,6 +705,10 @@ fn respell(text: &str, seed: u64) -> String {
                 in_string = true;
                 out.push(c);
             }
+            // Whitespace may follow a minus sign, a unary minus and a
+            // negative number's alike (section 7); not inside a float's
+            // exponent, which is one token.
+            '-' if !out.ends_with(['e', 'E']) && next() % 4 == 0 => out.push_str("- "),
             ' ' => match next() % 8 {
                 0 => out.push_str(" /* a \"comment\" { // */ "),
                 1 => out.push_str(" // a \"comment\" */ /* {\n"),
@@ -809,6 +810,7 @@ const NOT_GENERATED: &[(&str, &[&str])] = &[
             "edge_name",
             "call_arg",
             "write_element",
+            "call_keyword",
         ],
     ),
     (
@@ -851,6 +853,8 @@ const NOT_GENERATED: &[(&str, &[&str])] = &[
             "star_mark",
             // `$x.out(…)`, a method call on a variable.
             "prop_method_head",
+            // A keyword or reserved word written as a call's name.
+            "call_keyword_word",
             // Edition 2's statement `where`, refused with the group form.
             "where_stmt",
             "binding_brace_filter",
@@ -1013,6 +1017,119 @@ fn every_grammar_rule_the_generator_is_meant_to_cover_is_produced() {
         "grammar rules the generator never produced over its fixed seed; generate them or \
          list them in `NOT_GENERATED` with the reason: {missing:?}"
     );
+}
+
+/// The words `call_keyword` names in `grammar.pest`: every reserved word
+/// and declaration keyword a call is never named.
+fn call_keywords() -> Vec<String> {
+    let grammar = include_str!("../grammar.pest");
+    let line = grammar
+        .lines()
+        .find(|l| l.starts_with("call_keyword "))
+        .expect("the grammar defines `call_keyword`");
+    let mut words = Vec::new();
+    for kw in line.split('|').map(str::trim) {
+        let kw = kw
+            .trim_start_matches("call_keyword = _{")
+            .trim()
+            .trim_end_matches('}')
+            .trim();
+        if kw == "reserved" {
+            words.extend(["and", "or", "not", "is", "null", "in"].map(String::from));
+        } else if let Some(word) = kw.strip_prefix("kw_") {
+            words.push(word.to_string());
+        }
+    }
+    assert!(words.len() > 10, "{words:?}");
+    words
+}
+
+/// Section 7: a reserved word or keyword is never a call name. Written as
+/// one, in a `return` item, a `where` and an `order` key, it is `Q019`
+/// with a printed fix; a word of the generator's call pool beside it
+/// parses as a call.
+#[test]
+fn a_keyword_is_never_a_call_name() {
+    for word in call_keywords() {
+        for text in [
+            format!("query q() {{ match {{ $p: Person }} return {{ {word}($p.a, $p.b) as x }} }}"),
+            format!("query q() {{ match {{ $p: Person }} where {word}($p.a) return {{ $p }} }}"),
+            format!(
+                "query q() {{ match {{ $p: Person }} return {{ $p }} order {{ {word}($p.a) }} }}"
+            ),
+        ]
+        .into_iter()
+        // `not(x)` is the negation of a parenthesized operand; only a
+        // second argument makes it a call.
+        .filter(|text| word != "not" || text.contains(", "))
+        {
+            let d = parse_source(&text).expect_err(&text);
+            assert_eq!(d.code.as_str(), "Q019", "{text}: {d}");
+            assert!(d.fix.is_some(), "{text}: no fix printed: {d}");
+            assert!(
+                d.message.contains(&format!("`{word}`")),
+                "{text}: the message does not name the word: {d}"
+            );
+        }
+    }
+    for word in CALLS {
+        let text = format!("query q() {{ match {{ $p: Person }} return {{ {word}($p.a) as x }} }}");
+        parse_source(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+    }
+    // `where` after the pattern is the clause, parenthesized or not.
+    parse_source("query q() { match { $p: Person } where($p.a > 1) return { $p } }")
+        .expect("`where (…)` is the clause");
+    // An infix reserved word written as a call: the fix writes it infix.
+    let d = parse_source("query q() { match { $p: Person } where and($p.a, $p.b) return { $p } }")
+        .expect_err("refused");
+    let edits = &d.suggestion.as_ref().expect("a machine fix").edits;
+    assert_eq!(edits[0].replacement, "$p.a and $p.b", "{d}");
+}
+
+/// Section 7: an annotation without arguments takes no parentheses. The
+/// generator writes `@name` and `@name(args)`; `@name()` is `Q012`, whose
+/// machine fix removes the parentheses and gives the generator's form.
+#[test]
+fn an_annotation_without_arguments_takes_no_parentheses() {
+    for name in ANNOTATIONS {
+        let text = format!("query q() @{name}() {{ match {{ $p: Person }} return {{ $p }} }}");
+        let d = parse_source(&text).expect_err(&text);
+        assert_eq!(d.code.as_str(), "Q012", "{text}: {d}");
+        let edits = &d.suggestion.as_ref().expect("a machine fix").edits;
+        let mut fixed = text.clone();
+        for e in edits.iter().rev() {
+            fixed.replace_range(e.start..e.end, &e.replacement);
+        }
+        assert_eq!(
+            fixed,
+            format!("query q() @{name} {{ match {{ $p: Person }} return {{ $p }} }}"),
+            "{d}"
+        );
+        parse_source(&fixed).unwrap_or_else(|e| panic!("{fixed}: {e}"));
+    }
+}
+
+/// Section 7: whitespace may follow a unary minus, a parameter default's
+/// sign and a list's negative number; each spelling is the tree without
+/// it.
+#[test]
+fn whitespace_may_follow_a_minus_sign() {
+    for (spaced, tight) in [
+        (
+            "query q($n: I64 = - 1) { match { $p: Person } where $p.a in [- 1, - 2.5] and - $p.b > - 3 return { $p } }",
+            "query q($n: I64 = -1) { match { $p: Person } where $p.a in [-1, -2.5] and -$p.b > -3 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where $p.a in [-\n 1] return { $p } }",
+            "query q() { match { $p: Person } where $p.a in [-1] return { $p } }",
+        ),
+    ] {
+        assert_eq!(
+            parse_source(&spaced).unwrap_or_else(|e| panic!("{spaced}: {e}")),
+            parse_source(tight).unwrap_or_else(|e| panic!("{tight}: {e}")),
+            "{spaced}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

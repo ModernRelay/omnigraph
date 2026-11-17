@@ -38,7 +38,7 @@ codes! {
     Q016 = "two items of a list are separated by whitespace alone; the fix is the comma";
     Q017 = "a filter, a where or a comparison inside the match braces; the fix moves it to the where after them";
     Q018 = "a bare name where a value is read; a bare name is a return alias in order only";
-    Q019 = "a call named by an element keyword, or `from` over a parenthesized relation";
+    Q019 = "a call named by a keyword or a reserved word, or `from` over a parenthesized relation";
     Q020 = "a read body's parts are missing, misplaced or unbraced";
     Q021 = "an annotation's named argument is written `name: value`; the fix is `name = value`";
 

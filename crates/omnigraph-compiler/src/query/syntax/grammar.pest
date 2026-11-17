@@ -187,7 +187,10 @@ param = { variable ~ ":" ~ type_ref ~ ("=" ~ param_default)? }
 param_default = { neg_sign? ~ literal }
 neg_sign = { "-" }
 param_untyped_rec = { variable ~ &("," | ")") }
-annotation = { annotation_name ~ ("(" ~ (annotation_arg ~ ("," ~ annotation_arg)*)? ~ ")")? }
+// An annotation without arguments takes no parentheses (section 7);
+// `@name()` is recognized to print `@name`.
+annotation = { annotation_name ~ (empty_args_rec | "(" ~ annotation_arg ~ ("," ~ annotation_arg)* ~ ")")? }
+empty_args_rec = { "(" ~ ")" }
 annotation_name = @{ "@" ~ ident }
 annotation_arg = { annotation_kwarg | annotation_colon_rec | annotation_value }
 annotation_kwarg = { ident ~ "=" ~ annotation_value }
@@ -401,17 +404,20 @@ unary_minus = { "-" }
 // and the builder refuses it there with the foreign-word table's fix; it is
 // admitted only as a whole `order` key and inside the `where_stmt` predicate,
 // so the accepted texts are section 7's.
-operand    = { "(" ~ expr ~ ")" | block_value | agg_distinct | count_star_rec | case_rec | literal | type_prop_rec | call | keyword_call_rec | prop_method_rec | prop_chain_rec | prop_star_rec | prop_access | meta_field | variable | reserved_property | bare_name_rec }
+operand    = { "(" ~ expr ~ ")" | block_value | agg_distinct | count_star_rec | case_rec | keyword_call_rec | literal | type_prop_rec | call | prop_method_rec | prop_chain_rec | prop_star_rec | prop_access | meta_field | variable | reserved_property | bare_name_rec }
 // A block is an operand and nothing else: its elements and its own `where`
 // inside its braces.
 block_value = { (agg_name ~ ("(" ~ expr ~ ")")? | kw_exists) ~ "{" ~ block_body ~ "}" }
 agg_name    = @{ ("count" | "sum" | "avg" | "min" | "max") ~ !(ASCII_ALPHANUMERIC | "_") }
 agg_distinct = { agg_name ~ "(" ~ kw_distinct ~ expr ~ ")" }
 count_star_rec = { agg_name ~ "(" ~ "*" ~ ")" }
-// A call's name is never an element keyword (section 5: a registry row is
-// never named `let`, `from`, `optional` or `exists`).
+// A call's name is never a reserved word or a keyword of a declaration
+// (section 7): a registry row is never named `let`, `from`, `where`,
+// `and`, …, so `where(…)` is refused with its fix rather than read as an
+// unknown call.
 call        = { call_name ~ "(" ~ call_args? ~ ")" }
-call_name   = @{ !(reserved | kw_let | kw_from | kw_optional | kw_exists) ~ ident }
+call_name   = @{ !call_keyword ~ ident }
+call_keyword = _{ reserved | kw_let | kw_from | kw_optional | kw_exists | kw_where | kw_match | kw_return | kw_order | kw_limit | kw_distinct | kw_as | kw_query | kw_insert | kw_update | kw_delete | kw_set }
 // Section 7's `call_args` (positionals, then options), written as one
 // comma-separated list the builder checks, so an option before a positional
 // and a missing comma are refused with a fix.
@@ -419,7 +425,8 @@ call_args   = { call_arg ~ (("," | missing_comma_rec) ~ call_arg)* }
 call_arg    = _{ call_option | positional }
 positional  = { !(ident ~ ":") ~ (inline_read | expr) }
 call_option = { ident ~ ":" ~ expr }
-keyword_call_rec = { (kw_let | kw_from | kw_optional | kw_exists) ~ "(" ~ call_args? ~ ")" }
+keyword_call_rec = { call_keyword_word ~ "(" ~ call_args? ~ ")" }
+call_keyword_word = { call_keyword }
 case_rec = { fw_case ~ (fw_when ~ expr ~ fw_then ~ expr)+ ~ (fw_else ~ expr)? ~ fw_end }
 type_prop_rec = { type_name ~ "." ~ ident }
 prop_method_rec = { prop_method_head ~ call_args? ~ ")" }
@@ -436,9 +443,10 @@ kw_date      = @{ "date" ~ !(ASCII_ALPHANUMERIC | "_") }
 datetime_lit = { kw_datetime ~ "(" ~ string_lit ~ ")" }
 kw_datetime  = @{ "datetime" ~ !(ASCII_ALPHANUMERIC | "_") }
 list_lit  = { "[" ~ (list_elem ~ ("," ~ list_elem)*)? ~ "]" }
-// A list holds literals, and a negative number is one there.
+// A list holds literals, and a negative number is one there; whitespace may
+// follow its sign, as it may follow a unary minus (section 7).
 list_elem = { neg_number | literal }
-neg_number = ${ "-" ~ (exp_float_rec | float_lit | integer) }
+neg_number = { "-" ~ (exp_float_rec | float_lit | integer) }
 float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ (("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+)? ~ !(ASCII_ALPHANUMERIC | "_") }
 integer   = @{ ASCII_DIGIT+ ~ !(ASCII_ALPHANUMERIC | "_" | ".") }
 // `1e3`: an exponent needs a fraction.

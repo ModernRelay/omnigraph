@@ -147,7 +147,9 @@ the ends to `$s formsPattern $p`. `<e>` reads either direction. A selection,
 is `T82` only when no member points along the written order.
 
 Inside `match` any word is an edge name, keywords included (`$d in $c` follows
-an edge `In`); a quoted name is accepted too.
+an edge `In`); a quoted name is accepted too. Outside it a keyword or reserved
+word is never a call name: `where(…)` and `and(a, b)` are `Q019`, with the
+form printed as the fix.
 
 ### Multi-hop
 
