@@ -274,6 +274,11 @@ omnigraph --target file:///srv/company-brain \
   cluster apply --deployment-id '<DEPLOYMENT_ID>' --writers-stopped --json
 ```
 
+Settling a started schema change or a graph deletion on a graph with an
+applied policy runs as an actor, so add `--as <ACTOR>` with an actor that
+policy permits `schema_apply`. Without one, reconciliation refuses with
+`policy_denied` before it takes the lock and changes nothing.
+
 An S3 root works the same way inline, for example
 `--target s3://bucket/company-brain`; see
 [S3 cluster roots](../operations/s3-cluster-roots.md).

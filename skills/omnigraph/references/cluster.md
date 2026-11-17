@@ -130,6 +130,9 @@ evidence. It observes completed results and needs explicit `--target` plus
 requires `--config DIR`; it cannot also carry the recovery attestation. Reusing
 an existing ID with identical captured source only observes; it never executes
 again. Different input refuses. Server ID-only apply refuses: use status.
+When a started schema change or a deletion touches a graph with an applied
+policy, add `--as <ACTOR>` (an actor with `schema_apply`); without it recovery
+refuses `policy_denied` before taking the lock.
 
 Reconciliation never replays uncertain schema execution or graph creation.
 Unknown results stay outstanding. Accepted deletion can continue removing only

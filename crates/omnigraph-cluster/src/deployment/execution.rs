@@ -2333,6 +2333,35 @@ fn authorize_graph_deletion(
     Ok(())
 }
 
+/// Recovery that settles a started schema change or deletes a graph acts as
+/// the caller under that graph's applied policy, and the engine refuses a
+/// policy-bound write that names no actor. Refuse it before admission, so the
+/// refusal takes no lock and changes nothing; the policy still judges a named
+/// actor when recovery runs.
+fn require_recovery_actor(
+    policy: &AppliedPolicies,
+    caller: &DeploymentCaller,
+    pending: &OutstandingDeployment,
+) -> Result<(), Diagnostic> {
+    if caller.actor().is_some() {
+        return Ok(());
+    }
+    for (graph, entry) in &pending.graphs {
+        let acts_as_caller = entry.delete.is_some()
+            || (matches!(entry.state, GraphDeploymentState::Started) && entry.create.is_none());
+        if acts_as_caller && policy.graph(graph).is_some() {
+            return Err(refusal(
+                "policy_denied",
+                format!(
+                    "recovering graph '{graph}' runs under its applied policy and needs an \
+                     actor; pass --as with an actor that policy permits schema_apply"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The caller owns the cluster writer and has drained all affected work. The
 /// durable Started record is the completion authority if prefix deletion stops
 /// after removing only part of the root.
@@ -2892,7 +2921,7 @@ async fn reconcile_deployment_in_store(
 ) -> Result<DeploymentLookup, Diagnostic> {
     let (before, _) = read_existing(&store).await?;
     require_v2(&before)?;
-    lookup_policies(&store, &before, caller, Some(id)).await?;
+    let preflight_policy = lookup_policies(&store, &before, caller, Some(id)).await?;
     let existing = lookup(&before, id)?;
     if !matches!(existing, DeploymentLookup::Outstanding { .. }) {
         return Ok(existing);
@@ -2902,6 +2931,9 @@ async fn reconcile_deployment_in_store(
             "writers_stopped_required",
             "recovery requires --writers-stopped and settled prior graph/control I/O",
         ));
+    }
+    if let Some(pending) = before.outstanding.as_ref() {
+        require_recovery_actor(&preflight_policy, caller, pending)?;
     }
     let admission = admission::acquire_with_store(
         &store,
