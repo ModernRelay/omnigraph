@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{ReadTarget, SnapshotId};
 use omnigraph_api_types::{ChangeOutput, ReadOutput};
-use omnigraph_compiler::query::ast::{BranchWrite, CommitWrite, LoadStmtMode};
+use omnigraph_compiler::query::ast::{BranchWrite, CommitWrite, LoadStmt, LoadStmtMode};
 use serde_json::Value;
 
 use crate::client::{GraphClient, parse_set_flags};
@@ -23,6 +23,7 @@ use crate::invocation::MachineErrors;
 use crate::operator::{InvocationConfig, OperatorAlias};
 use crate::output::{write_change_human, write_json};
 use crate::presentation::ReadPresentation;
+use crate::read_format::{ReadOutputFormat, arrow_has_no_batches, write_arrow_stream};
 
 use args::ParamsArgs;
 pub(crate) use args::{AliasArgs, CatalogueArgs, MutateArgs, QueryArgs};
@@ -63,6 +64,8 @@ pub(crate) async fn run_catalogue(
             actor: None,
             yes: false,
         },
+        // `catalogue` offers no `--format`, so no output here is Arrow.
+        false,
         machine,
         stdout,
         stderr,
@@ -79,10 +82,12 @@ pub(crate) struct GraphScope<'a> {
     pub yes: bool,
 }
 
+/// `stdout_is_terminal` is the process's stdout, captured where the process
+/// starts; Arrow output refuses a terminal.
 pub(crate) async fn run_query(
     args: QueryArgs,
     scope: GraphScope<'_>,
-
+    stdout_is_terminal: bool,
     machine: &mut Option<MachineErrors>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -110,6 +115,7 @@ pub(crate) async fn run_query(
     };
     let presentation = ReadPresentation::capture(operator, format, json, None);
     *machine = presentation.machine_errors();
+    presentation.refuse_terminal(stdout_is_terminal)?;
     let client =
         GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr).await?;
     let params_json = load_params_json(&params)?;
@@ -136,6 +142,43 @@ pub(crate) async fn run_query(
         envelope,
         client.is_remote(),
     )?;
+    if presentation.format == ReadOutputFormat::Arrow {
+        // Only a query the engine in this process runs has result batches
+        // to write; a statement's answer is rendered JSON, so it refuses
+        // before it runs. A served target was refused before credentials
+        // (`planes::validate_target`).
+        let read = match operation {
+            ReadOperation::AdHoc(source) => {
+                client
+                    .engine_query(
+                        has_target.then_some(target),
+                        source,
+                        name.as_deref(),
+                        params_json.as_ref(),
+                        &settings,
+                    )
+                    .await?
+            }
+            ReadOperation::ExplainLoad(source, statement) => {
+                let policy = admit_explain_load(&client, &envelope, &target, &statement)?;
+                client
+                    .engine_explain_load(target, source, statement, policy, &settings)
+                    .await?
+            }
+            ReadOperation::Stored(_) => {
+                return Err(arrow_has_no_batches("a stored query's answer"));
+            }
+            ReadOperation::BranchList(_) => return Err(arrow_has_no_batches("`branch list`")),
+            ReadOperation::BranchRead(_, read) => {
+                return Err(arrow_has_no_batches(&format!(
+                    "`{}`",
+                    read.statement_name()
+                )));
+            }
+            ReadOperation::Show(..) => return Err(arrow_has_no_batches("`show`")),
+        };
+        return write_arrow_stream(&read.result, stdout);
+    }
     let output: ReadOutput = match operation {
         ReadOperation::AdHoc(source) => {
             client
@@ -166,18 +209,7 @@ pub(crate) async fn run_query(
                 .await?
         }
         ReadOperation::ExplainLoad(source, statement) => {
-            if client.is_catalogue() {
-                return Err(crate::client::catalogue_scope_refusal("explain load"));
-            }
-            prepare::refuse_statement_envelope(
-                &envelope,
-                matches!(target, ReadTarget::Snapshot(_)),
-            )?;
-            let policy = if client.is_remote() {
-                None
-            } else {
-                embedded_file_source_policy(&statement.source)?
-            };
+            let policy = admit_explain_load(&client, &envelope, &target, &statement)?;
             client
                 .explain_load(target, source, statement, policy, &settings)
                 .await?
@@ -407,6 +439,26 @@ async fn execute_operator_alias(
             None,
         )
         .await
+}
+
+/// What an `explain load` needs before it runs, in either output lane: the
+/// catalogue scope refuses it, it takes no snapshot or other envelope beside
+/// it, and on a direct target the policy that lets it probe its source.
+fn admit_explain_load(
+    client: &GraphClient,
+    envelope: &Envelope<'_>,
+    target: &ReadTarget,
+    statement: &LoadStmt,
+) -> Result<Option<omnigraph::ExternalBlobPolicy>> {
+    if client.is_catalogue() {
+        return Err(crate::client::catalogue_scope_refusal("explain load"));
+    }
+    prepare::refuse_statement_envelope(envelope, matches!(target, ReadTarget::Snapshot(_)))?;
+    if client.is_remote() {
+        Ok(None)
+    } else {
+        embedded_file_source_policy(&statement.source)
+    }
 }
 
 /// Authorize an embedded file source's directory, without opening the source.
