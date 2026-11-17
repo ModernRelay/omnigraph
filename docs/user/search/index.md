@@ -236,7 +236,11 @@ ordering contract lives on the [queries page](../queries/index.md).
 
 A ranking may rank any node binding of its population, whichever binding the
 population's `match` declares first, and whether or not the ranked binding is
-declared at all; its `return` lists every binding the rest of the query reads:
+declared at all; its `return` lists every binding the rest of the query reads.
+A population holding an `optional` or a `union` yields its ranked node as a
+column of its rows rather than a binding the vector search scans, so a
+`nearest` over it ranks those rows by their exact distance, as `distance`
+does, and keeps the rows of its `k` nearest targets:
 
 ```gq
 query passages($matter: String, $q: String) {

@@ -86,10 +86,12 @@ pub enum PatternStep {
     /// A ranking drawn over the rows of the steps before it, its
     /// population, when it is not the read's leading `order` key cut by the
     /// read's `limit` (that ranking is `order_by`'s first key): `key` is the
-    /// `nearest` ranking as a leading key holds it, `binding` the ranked node
-    /// column, and `window` the `nearest` window `k` in targets (an `rrf`'s
-    /// `nearest` arm's). The steps after it run over the selected rows,
-    /// which nothing refills.
+    /// `nearest` ranking as a leading key holds it, or, over a population
+    /// that yields the ranked node as a column of its rows rather than a
+    /// binding of its own, the exact distance a `Score` step before it
+    /// appended; `binding` the ranked node column, and `window` the `nearest`
+    /// window `k` in targets (an `rrf`'s `nearest` arm's). The steps after
+    /// it run over the selected rows, which nothing refills.
     Rank {
         key: IRExpr,
         binding: String,
@@ -1752,20 +1754,56 @@ impl<'a> Shaper<'a> {
         *inlined = facts.inlined;
         let lets = std::mem::take(&mut facts.lets);
         facts.substitute(&lets);
+        // A `nearest` window searches its binding's scan where the
+        // population binds the ranked node as a binding of its own. A
+        // population drawn as a read of its own (one holding an `optional`
+        // or a `union`) yields the node as a column of its rows: the window
+        // ranks those rows by their exact distance, whatever the shape.
+        let over_rows = match (&ranking.exact, &ranking.key) {
+            (None, IRExpr::Nearest { .. }) => {
+                !facts.bindings.iter().any(|b| b.variable == ranking.column)
+            }
+            _ => false,
+        };
         let ranked: Vec<String> = match ranking.exact {
-            None => vec![ranking.column.clone()],
-            Some(_) => Vec::new(),
+            None if !over_rows => vec![ranking.column.clone()],
+            _ => Vec::new(),
         };
         self.place(&facts, &ranked, pipeline, bound, &HashSet::new(), fresh)?;
+        let type_name = |facts: &Facts| {
+            facts.types.get(&ranking.column).cloned().ok_or_else(|| {
+                ShapeError::Internal(format!(
+                    "an exact score ranks `{}`, which its population binds as no node",
+                    ranking.column
+                ))
+            })
+        };
+        let key = match &ranking.key {
+            IRExpr::Nearest {
+                variable,
+                property,
+                query,
+                ..
+            } if over_rows => {
+                pipeline.push(PatternStep::Score {
+                    binding: variable.clone(),
+                    type_name: type_name(&facts)?,
+                    property: property.clone(),
+                    kind: ScoreKind::Distance,
+                    query: query.as_ref().clone(),
+                });
+                IRExpr::PropAccess {
+                    variable: variable.clone(),
+                    property: DISTANCE_COLUMN.to_string(),
+                    ty: scalar(ScalarType::F32),
+                }
+            }
+            key => key.clone(),
+        };
         pipeline.push(match &ranking.exact {
             Some((property, kind, query)) => PatternStep::Score {
                 binding: ranking.column.clone(),
-                type_name: facts.types.get(&ranking.column).cloned().ok_or_else(|| {
-                    ShapeError::Internal(format!(
-                        "an exact score ranks `{}`, which its population binds as no node",
-                        ranking.column
-                    ))
-                })?,
+                type_name: type_name(&facts)?,
                 property: property.clone(),
                 kind: *kind,
                 query: query.clone(),
@@ -1784,7 +1822,7 @@ impl<'a> Shaper<'a> {
                     }
                 };
                 PatternStep::Rank {
-                    key: ranking.key.clone(),
+                    key,
                     binding: ranking.column.clone(),
                     window,
                     window_param,

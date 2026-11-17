@@ -173,16 +173,11 @@ pub(crate) fn conjunct_regions(
     out: &mut Vec<(IRExpr, Vec<Region>)>,
 ) {
     // The steps before a `nearest` ranking step are its population, which
-    // the plan tests below the window's cut.
-    let window = steps.iter().rposition(|step| {
-        matches!(
-            step,
-            PatternStep::Rank {
-                key: IRExpr::Nearest { .. },
-                ..
-            }
-        )
-    });
+    // the plan tests below the window's cut, whether the window searches a
+    // scan or ranks rows by their exact distance.
+    let window = steps
+        .iter()
+        .rposition(|step| matches!(step, PatternStep::Rank { .. }));
     for (index, step) in steps.iter().enumerate() {
         let mut here = path.to_vec();
         if window.is_some_and(|window| index < window) {

@@ -588,48 +588,48 @@ fn resolve_pipeline(
             } => {
                 let input = bound(current, "ranking")?;
                 let schema = schema_of(plan, input)?;
-                let node = search_node(input, key, *window, false, *recall).ok_or_else(|| {
-                    PlanError::Internal(format!("the ranking step `{key}` is not a search"))
+                // A search over the ranked binding's scan, or rows that
+                // already carry their exact distance, which the key reads.
+                let (ranked, score) = match search_node(input, key, *window, false, *recall) {
+                    Some(node) => (
+                        plan.add(node, schema.clone()),
+                        rank_score(binding, RankKind::Nearest),
+                    ),
+                    None => (input, key.clone()),
+                };
+                // The window: the rows of the `k` nearest targets, in
+                // distance order with ties to the smaller identity.
+                let targets = window.ok_or_else(|| {
+                    PlanError::Internal("a `nearest` ranking step has no window".to_string())
                 })?;
-                let ranked = plan.add(node, schema.clone());
-                if let IRExpr::Nearest { .. } = key {
-                    // The window: the rows of the `k` nearest targets, in
-                    // distance order with ties to the smaller identity.
-                    let targets = window.ok_or_else(|| {
-                        PlanError::Internal("a `nearest` ranking step has no window".to_string())
-                    })?;
-                    let score = rank_score(binding, RankKind::Nearest);
-                    let mut keys = Vec::new();
-                    order_keys(&score, &mut keys);
-                    let tiebreak = scope_tiebreaks(plan, ranked, source)?
-                        .into_iter()
-                        .map(|(column, _)| column)
-                        .filter(|column| column.binding == *binding)
-                        .collect();
-                    let sorted = plan.add(
-                        LogicalNode::Sort {
-                            input: ranked,
-                            keys,
-                            order_by: vec![IROrdering {
-                                expr: score,
-                                descending: false,
-                            }],
-                            fetch: None,
-                            tiebreak,
-                        },
-                        schema.clone(),
-                    );
-                    plan.add(
-                        LogicalNode::TargetCut {
-                            input: sorted,
-                            binding: binding.clone(),
-                            targets,
-                        },
-                        schema,
-                    )
-                } else {
-                    ranked
-                }
+                let mut keys = Vec::new();
+                order_keys(&score, &mut keys);
+                let tiebreak = scope_tiebreaks(plan, ranked, source)?
+                    .into_iter()
+                    .map(|(column, _)| column)
+                    .filter(|column| column.binding == *binding)
+                    .collect();
+                let sorted = plan.add(
+                    LogicalNode::Sort {
+                        input: ranked,
+                        keys,
+                        order_by: vec![IROrdering {
+                            expr: score,
+                            descending: false,
+                        }],
+                        fetch: None,
+                        tiebreak,
+                    },
+                    schema.clone(),
+                );
+                plan.add(
+                    LogicalNode::TargetCut {
+                        input: sorted,
+                        binding: binding.clone(),
+                        targets,
+                    },
+                    schema,
+                )
             }
             PatternStep::Score {
                 binding,

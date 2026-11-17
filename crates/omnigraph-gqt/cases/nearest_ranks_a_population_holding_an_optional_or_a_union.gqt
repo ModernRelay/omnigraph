@@ -1,0 +1,75 @@
+# issue: none
+# notes: `nearest` ranks its population whatever the population's shape. A
+# notes: population holding an `optional` or a `union` is drawn as a read of its
+# notes: own, which yields the ranked node as a column of its rows rather than
+# notes: a binding the vector search scans: the window then ranks those rows by
+# notes: their exact distance, ties to the smaller identity, and keeps the rows
+# notes: of its `k` nearest targets. Both steps agree with the reference.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    n: I64 @index
+    embedding: Vector(4) @index
+}
+node Tag {
+    name: String @key
+}
+edge Tagged: Doc -> Tag
+
+--- seed
+{"type":"Doc","data":{"slug":"d0","n":0,"embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","n":1,"embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d2","n":2,"embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d3","n":3,"embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Tag","data":{"name":"t"}}
+{"edge":"Tagged","from":"d1","to":"t"}
+
+--- query
+query over_an_optional($q: Vector(4)) {
+    match {
+      let $pop = { match { $d: Doc, optional { $t: Tag, $d tagged $t } } return { $d, $t } },
+      from nearest($pop, $d.embedding, $q, k: 2) as $distance,
+    }
+    return { $d.slug, $t.name, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [0.9, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d1","distance":0.010000004,"t.name":"t"}
+{"d.slug":"d0","distance":0.80999994}
+--- expect shape
+d.slug: String
+t.name: String?
+distance: F32
+--- expect same as reference
+
+--- query
+query over_a_union($q: Vector(4)) {
+    match {
+      let $pop = { match { from union({ match { $d: Doc } where $d.n < 1 return { $d } }, { match { $d: Doc } where $d.n > 2 return { $d } }) } return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 2) as $distance,
+    }
+    return { $d.slug, $distance }
+    order { $distance }
+}
+
+--- params
+{"q": [0.9, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d0","distance":0.80999994}
+{"d.slug":"d3","distance":4.4099994}
+--- expect shape
+d.slug: String
+distance: F32
+--- expect same as reference
