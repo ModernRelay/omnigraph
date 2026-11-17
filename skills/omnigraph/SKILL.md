@@ -205,7 +205,8 @@ backend. `--config DIR` is source input only.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
-address convenience. `--as ACTOR` attributes supported direct operations and
+address convenience. `--as ACTOR` attributes supported direct operations, is
+the actor a cluster graph's applied policy judges them by, and
 names the actor `access` reports for direct storage;
 served targets derive their actor from credentials and send `--as` as the
 `Omnigraph-If-Actor` assertion, refusing a mismatch with `actor_mismatch` and

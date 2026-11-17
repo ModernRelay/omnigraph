@@ -809,20 +809,27 @@ pub fn converged_loaded_cluster(graph_id: &str, policy_yaml: Option<&str>) -> Cl
 
     apply_cluster_fixture(&dir);
 
+    // `POLICY_YAML` lets no actor change the protected `main`.
     let served_root = dir.join("graphs").join(format!("{graph_id}.omni"));
-    output_success(
-        cli()
-            .arg("load")
-            .arg("--data")
-            .arg(fixture("test.jsonl"))
-            .arg("--mode")
-            .arg("overwrite")
-            .arg("--target")
-            .arg(&served_root),
+    seed_as_storage_owner(
+        &served_root,
+        &fs::read_to_string(fixture("test.jsonl")).unwrap(),
     );
 
-    unlock_cluster_fixture(&dir);
     ClusterFixture { _temp: temp, dir }
+}
+
+/// Overwrite `graph`'s `main` with the JSONL `data` as a storage owner's
+/// embedded host that installs no policy. A direct CLI load of a cluster graph
+/// is judged by the graph's applied policy, which may admit no actor to `main`.
+pub fn seed_as_storage_owner(graph: &Path, data: &str) {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = Omnigraph::open(&graph.to_string_lossy()).await.unwrap();
+        session_over(db)
+            .load_jsonl(data, omnigraph::loader::LoadMode::Overwrite)
+            .await
+            .unwrap();
+    });
 }
 
 /// Build a converged cluster with one graph `graph_id` and the policy layout
@@ -1023,7 +1030,16 @@ rules:
   - id: cluster-operators-change
     allow:
       actors: { group: cluster_operators }
-      actions: [change, schema_apply]
+      actions: [change, schema_apply, maintain]
+  - id: cluster-operators-branch
+    allow:
+      actors: { group: cluster_operators }
+      actions: [branch_create]
+      target_branch_scope: any
+  - id: cluster-operators-reclaim
+    allow:
+      actors: { group: cluster_operators }
+      actions: [reclaim]
 "#,
     )
     .unwrap();
@@ -1657,9 +1673,12 @@ policies:
     let served_root = cluster_dir
         .join("graphs")
         .join(format!("{PARITY_GRAPH_ID}.omni"));
+    // A direct write to the cluster graph is judged by its applied policy,
+    // which admits `act-parity`.
     output_success(
         fixture_cli()
             .arg("load")
+            .args(["--as", "act-parity"])
             .arg("--data")
             .arg(fixture("test.jsonl"))
             .arg("--mode")

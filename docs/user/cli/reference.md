@@ -41,8 +41,12 @@ directory or prefix is a new clone; the same target again shows the clone's own
 state. Nothing in the target records its base, so pass the same `--base` on
 every open of that target; a clone root opened without `--base` is refused,
 since its marker says it is a clone and not which base it was cloned from.
+A target that already holds objects but no clone marker, an ordinary graph
+for example, is refused under `--base` before anything is written.
 
-`--as ACTOR` attributes supported direct operations. A served target derives its
+`--as ACTOR` attributes supported direct operations; on a cluster graph the
+applied graph policy judges them by it ([direct writes](../operations/policy.md#actor-identity)).
+A served target derives its
 actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
 exiting 4 on a mismatch ([Assert the actor](../operations/server.md#assert-the-actor));
 a managed target refuses it. `--yes` supplies noninteractive consent for destructive
