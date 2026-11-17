@@ -152,9 +152,8 @@ unsupported. Pattern:
 1. Add as optional: `new_prop: String?`
 2. Apply
 3. Backfill via a `mutate` or `load --mode merge`
-4. Keep it optional: tightening `T?` -> `T` is currently refused by the planner
-   (a property-type change, OG-MF-106). Enforce presence at write time by
-   convention until required-tightening ships as a migration step.
+4. Promote it: change `new_prop: String?` to `new_prop: String` and apply. The
+   constraints section below says when that apply is refused.
 
 ### Enum widening is a supported apply
 
