@@ -147,10 +147,11 @@ relevance. Use the
 query language's exact `contains(...)` and `starts_with(...)` functions for
 literal, case-sensitive substring and prefix matching.
 
-A full-text function needs a full-text index on its property: a one-column
-`@index` or `@key` on a free-text String property of a node. A call on any
-other String property is refused at type checking (`T27`); for an enum,
-compare its values with `=` instead. The check reads only the schema.
+A full-text function reads a free-text String property of a node that carries
+a one-column `@index`, `@key` or `@index(fulltext, ...)`. A call on any other
+String property is refused at type checking (`T27`); for an enum, compare its
+values with `=` instead. The check reads only the schema, and no read needs a
+built index: only `@index(fulltext, ...)` builds a full-text index.
 
 The index's analysis comes from the schema: `@index(fulltext, analyzer =
 "english_v1")` declares one of three profiles, an index without `analyzer`
@@ -301,11 +302,13 @@ declaration, Omnigraph currently creates:
 | Property | Index use |
 |---|---|
 | Enum, number, Boolean, Date, or DateTime | Equality, range, membership, and null filters |
-| Free-text String | A full-text index built with the field's [analyzer](analyzers.md), which no query reads |
+| List | Membership (`value in $x.list`) |
+| Free-text String | `contains` through an NGRAM, and a BTREE; a `@key` alone builds the BTREE only, and `@index(fulltext, ...)` adds a full-text index built with the field's [analyzer](analyzers.md), which no query reads |
 | Vector | `nearest` |
 
-Node ids and edge ids/endpoints are indexed automatically. Lists and Blobs do
-not receive property indexes. Composite declarations and edge-property
+Node ids and edge ids/endpoints are indexed automatically. Blobs do not
+receive property indexes. See
+[What `@index` builds](../schema/index.md#what-index-builds). Composite declarations and edge-property
 declarations do not currently create property indexes.
 
 Indexes are derived performance data. A new declaration may still be pending,

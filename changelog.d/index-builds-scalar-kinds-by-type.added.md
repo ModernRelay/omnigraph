@@ -1,3 +1,3 @@
-- `@index` builds the indexes a property's type serves: a BITMAP for an enum or `Bool`, a LABEL_LIST for a list's `in`, an NGRAM and a BTREE beside a String's full text. See [what `@index` builds][scalar-index-kinds-guide].
+- `@index` builds what a type serves: BITMAP (enum, `Bool`), LABEL_LIST (list), NGRAM and BTREE (String); a String `@key` builds a BTREE, and only `@index(fulltext)` full text. See [what `@index` builds][scalar-index-kinds-guide].
 
 [scalar-index-kinds-guide]: ../docs/user/schema/index.md#what-index-builds

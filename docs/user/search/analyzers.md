@@ -13,10 +13,10 @@ node Doc {
 }
 ```
 
-`analyzer` names one of three profiles. An index without `analyzer`, and a
-bare `@index` on a free-text String, takes `english_v1`, so every full-text
-field has exactly one profile. A profile never changes once released; a
-different pipeline is a new profile. Every setting is stated:
+`analyzer` names one of three profiles. An index without `analyzer` takes
+`english_v1`, so every full-text field has exactly one profile. A profile never
+changes once released; a different pipeline is a new profile. Every setting is
+stated:
 
 | Setting | `standard_v1` | `standard_folded_v1` | `english_v1` |
 |---|---|---|---|
@@ -59,6 +59,18 @@ covers the profile, its stop list and stemmer, and the scorer; an index
 stores no term positions, which its certificate records and the fingerprint
 does not. An index built before its field had a profile is rebuilt with the
 profile by `omnigraph index rebuild`.
+
+Only `@index(fulltext, ...)` builds a full-text index. A plain `@index` on a
+free-text String builds an NGRAM and a BTREE, and a `@key` alone a BTREE
+([What `@index` builds](../schema/index.md#what-index-builds)); `match_terms`
+and `bm25` still read either field, with `english_v1`, since they never read an
+index. Replacing `@index(fulltext)` by a plain `@index` is a schema change
+applied in place that leaves the built index as it is. So does opening a graph
+whose earlier release built a full-text index for a plain `@index` or a `@key`.
+Such an index is left in place: no read uses it, no write declares a segment for
+it, an index pass neither removes nor refreshes it and reports it pending once
+rows outpace it, and `omnigraph index rebuild --kind full-text` replaces it.
+Declare `@index(fulltext)` to keep one built and current.
 
 ## Exact matching and scoring
 

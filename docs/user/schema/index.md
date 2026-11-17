@@ -101,15 +101,23 @@ One property can carry more than one:
 |---|---|---|
 | enum, `Bool` | BITMAP | `=`, `!=`, `in [...]`, ranges, `is null` |
 | list | LABEL_LIST | `value in $x.list`, `not (value in $x.list)` |
-| free-text `String` | full text, NGRAM, BTREE | `match_terms` and `bm25`; `contains`; `=`, `in [...]`, ranges, `starts_with` |
+| free-text `String`, `@index` | NGRAM, BTREE | `contains`; `=`, `in [...]`, ranges, `starts_with` |
+| free-text `String`, `@key` alone | BTREE | `=`, `in [...]`, ranges |
+| free-text `String`, `@index(fulltext, ...)` | full text, NGRAM, BTREE | as `@index`; the full-text index carries the field's [analyzer](../search/analyzers.md), and no query reads it yet |
 | number, `Date`, `DateTime` | BTREE | `=`, `in [...]`, ranges |
 | vector | vector index | `nearest` |
 
 An index changes cost, never rows: a row an index does not cover yet, after a
 write, is read directly, and an NGRAM's candidates are checked exactly. An
 existing graph gains the kinds it lacks at its next index pass. The index
-`@key` implies follows the same table, and an edge builds only its identity and
-endpoint indexes.
+`@key` implies follows the same table: a String key builds a BTREE only, and
+`contains` on it reads the rows. `@key` with an explicit `@index` follows the
+`@index` row. Only `@index(fulltext, ...)` builds a full-text index; see
+[Full-text analyzers](../search/analyzers.md) for one an earlier release built.
+The table covers single-property node declarations: a composite or
+edge-property declaration is accepted as intent but builds no property index,
+and an edge builds only its identity and endpoint indexes, which traversal uses
+([Search](../search/index.md#indexes)).
 
 `@range(p, ..10)` supplies only a maximum, and `@range(p, 10..)` supplies
 only a minimum; both endpoints are inclusive. Integer bounds must fit `I64`
@@ -139,13 +147,6 @@ one schema change, then add the properties back without it; dropping a
 property discards its stored values. A constraint that also names another
 property or `@src`/`@dst` cannot be removed in place: rebuild the graph
 without it.
-
-Current automatic property indexes are created for single-property node declarations:
-orderable scalars and enums receive a scalar index, free-text Strings receive a
-full-text index, and vectors receive a vector index. Composite declarations and
-edge-property declarations are accepted as schema intent but do not currently
-create a property index. Edge endpoints are indexed independently for traversal.
-See [Search](../search/index.md#indexes).
 
 ### Edge cardinality
 

@@ -71,8 +71,8 @@ charges nothing. Retained-edge access describes the filtered
 lookup in the incident edge table. Append and merge keep the consulted table,
 so their `edge_ri` and non-key `@unique` checks use `probe` only when every
 looked-up column carries a BTREE covering every fragment of that table (the
-`@key` column's own index, or an `@index` on an orderable scalar; an `@index`
-on a String is a full-text index and does not count) and `scan` otherwise, a
+`@key` column's own index, or an `@index` on an orderable scalar or a String,
+whose BTREE counts; a full-text index does not) and `scan` otherwise, a
 partly covered index included: an unindexed probe hands the store one filter
 of every key, copied per fragment for the whole read.
 

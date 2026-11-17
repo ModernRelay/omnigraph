@@ -27,9 +27,9 @@ node Chunk {
 - `@embed("source_prop", model="model-id")` — associates the vector with its
   String source and, optionally, the exact model space
 - `@index` — declares derived index intent and can accelerate vector search
-  (on a String it also builds the full-text index, an NGRAM for `contains`
-  and a BTREE); correctness falls back to an exact scan when coverage is
-  missing
+  (on a String it builds an NGRAM for `contains` and a BTREE, and
+  `@index(fulltext, ...)` adds the full-text index); correctness falls back
+  to an exact scan when coverage is missing
 
 The schema says **where** embeddings live and **what** they come from. It does
 not populate vectors during mutation or load. Supply required vectors in input
@@ -239,9 +239,10 @@ where match_terms($d.title, terms($q, mode: any))                 // any analyze
 `match_terms` is the one lexical predicate. `search`, `match_text` and `fuzzy`
 are refused (`T6`) with their fix: `match_terms(f, terms(q, mode: any))`, and
 `max_edits: 2` for a `fuzzy` without a budget. A full-text call (`match_terms`,
-`bm25`) needs a full-text index on its property: a one-column `@index` or
-`@key` on a free-text String node property. A call on any other property, an
-enum included, is refused at type checking (`T27`); compare enums with `=`.
+`bm25`) reads a free-text String node property with a one-column `@index`,
+`@key` or `@index(fulltext, ...)`; only the last builds a full-text index, and
+no call needs one built. A call on any other property, an enum included, is
+refused at type checking (`T27`); compare enums with `=`.
 The field's analyzer decides what matches (next section). `match_terms` is a
 Boolean operand like any other in a `where`: true where the row is among the
 call's matches, false elsewhere, never null. Write `not match_terms(...)`,

@@ -165,6 +165,13 @@ refuses a `sum`, `avg`, `min` or `max` block without its argument.
 
 ## Schemas
 
+- A plain `@index` on a free-text String builds an NGRAM and a BTREE, a `@key`
+  String a BTREE, and only `@index(fulltext, ...)` a full-text index
+  ([What `@index` builds](../schema/index.md#what-index-builds)). No row
+  changes: `match_terms` and `bm25` read the rows either way. A full-text index
+  an earlier release built for a plain `@index` or a `@key` stays in place and
+  no read uses it ([Full-text analyzers](../search/analyzers.md)); declare
+  `@index(fulltext)` to keep one built.
 - In `.pg`, `@index(fulltext)` after a property declares a full-text index on
   that property. In a type that also declares a property named `fulltext` it
   is refused as ambiguous; write `@index` on the property the index is for.

@@ -551,7 +551,7 @@ indexed branch still applies; the planner's index facts
 (`plan_source/indexes.rs`) classify each index by the same family. A BTREE
 answers `=`, `in`, ranges and `starts_with`, a BITMAP (an enum or `Bool`) `=`,
 `!=`, `in`, ranges and `is null`, and a LABEL_LIST (a list) `value in
-$x.list`, all exactly. An NGRAM (a String) answers `contains` with candidates
+$x.list`, all exactly. An NGRAM (a String `@index`) answers `contains` with candidates
 that Lance rechecks with the whole pushed filter. A needle of fewer than three
 characters never reaches it; one of three or more with no alphanumeric trigram
 makes Lance 13 drop every match of an indexed fragment, so

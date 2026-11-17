@@ -431,7 +431,7 @@ Both String predicates are functions, exact and case-sensitive:
 `contains($p.name, "Al")` matches a substring and `starts_with($p.name, "A")`
 a prefix. The infix forms (`$p.name contains "Al"`) and `contains` over a list
 are refused (`T7`) with the call or `in` printed as the fix. They remain correct without an
-index, and an index never changes their rows: a String `@index` builds an NGRAM that narrows
+index, and an index never changes their rows: a String `@index` (not a `@key` alone) builds an NGRAM that narrows
 `contains` to candidates checked exactly (a needle under three characters, or with no run of
 three letters or digits, reads every row) and a BTREE for `starts_with`; a list `@index` builds a
 LABEL_LIST for `"x" in $p.tags`.
