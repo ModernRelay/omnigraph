@@ -5,6 +5,7 @@ mod effective_settings;
 mod fix_convergence;
 mod law_canonical_forms;
 mod law_engine_reference;
+mod law_refusal_soundness;
 mod law_scalar_evaluators;
 mod layout_hunts;
 mod query_corpus;

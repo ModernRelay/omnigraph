@@ -188,6 +188,8 @@ pub(crate) fn resolve_traversal(
     if let Some(max_hops) = traversal.max_hops
         && max_hops > 1
         && src_type != dst_type
+        && (traversal.min_hops <= 1
+            || super::soundness::refuses(super::soundness::Claim::HopPastDistinctEndpoints))
     {
         let (EdgeSelector::Named(name), Some(member)) = (&traversal.selector, edges.named()) else {
             return Err(CompilerError::typed(

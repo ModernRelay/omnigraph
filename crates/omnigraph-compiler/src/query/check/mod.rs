@@ -3123,10 +3123,16 @@ impl Ctx<'_> {
             ));
         }
         let resolved = resolve_traversal(self.catalog, &t, &bindings, &sc.declared)?;
+        let mut resolved = resolved;
         if let Some(d) =
             reversed_triple(self.catalog, written, &resolved, self.element_span.as_ref())
         {
-            return Err(E::D(d));
+            if soundness::refuses(soundness::Claim::ReversedTriple) {
+                return Err(E::D(d));
+            }
+            // Let through (a test-only switch): the written order is the
+            // direction, so every member traverses from the written source.
+            resolved.edges = resolved.edges.reversed();
         }
         if let Some(k) = &resolved.edge_binding {
             if *k == t.src || *k == t.dst {
@@ -5386,8 +5392,35 @@ impl Ctx<'_> {
                 left,
                 right,
                 at: written,
-            } if is_null_literal(left) || is_null_literal(right) => {
+            } if (is_null_literal(left) || is_null_literal(right))
+                && soundness::refuses(soundness::Claim::NullComparison) =>
+            {
                 return Err(null_comparison(*op, left, right, written));
+            }
+            Expr::Compare {
+                op, left, right, ..
+            } if is_null_literal(left) || is_null_literal(right) => {
+                // The refusal let through (a test-only switch): the `null`
+                // takes the other operand's type, as the refusal's claim
+                // reads it.
+                let other_is_left = !is_null_literal(left);
+                let other = if other_is_left { left } else { right };
+                let other = self.expr(sc, other, sub)?;
+                let Ty::Value(t) = &other.ty else {
+                    return Err(err(T7, "a comparison with `null` over a reference"));
+                };
+                let null = SExpr::new(
+                    SKind::Null,
+                    Ty::Value(PropType {
+                        nullable: true,
+                        ..t.clone()
+                    }),
+                );
+                if other_is_left {
+                    compare(*op, other, null)?
+                } else {
+                    compare(*op, null, other)?
+                }
             }
             Expr::Compare {
                 op,
@@ -7119,7 +7152,7 @@ fn compare(op: CompOp, l: SExpr, r: SExpr) -> R<SExpr> {
             if ordering || !matches!(op, CompOp::Eq | CompOp::Ne) {
                 return Err(err(T7, "references compare with `=` and `!=` only"));
             }
-            if a != b {
+            if a != b && soundness::refuses(soundness::Claim::ReferencesOfTwoTypes) {
                 return Err(err(
                     T7,
                     format!("`{a}` and `{b}` references are never equal"),
@@ -7215,6 +7248,9 @@ fn literal_against_property(
     written: &SourceSpan,
     index: usize,
 ) -> R<()> {
+    if !soundness::refuses(soundness::Claim::LiteralOutsideDomain) {
+        return Ok(());
+    }
     let (SKind::Prop { prop: name, .. }, Ty::Value(expected)) = (&prop.kind, &prop.ty) else {
         return Ok(());
     };
@@ -7235,6 +7271,9 @@ fn literal_against_property(
 /// element type, and each element of a written list against a property
 /// needle.
 fn literal_in_against_property(needle: &SExpr, list: &SExpr, written: &SourceSpan) -> R<()> {
+    if !soundness::refuses(soundness::Claim::LiteralOutsideDomain) {
+        return Ok(());
+    }
     if let Ty::Value(t) = &list.ty
         && t.list
         && matches!(list.kind, SKind::Prop { .. })
@@ -8338,6 +8377,7 @@ pub(crate) mod nearest;
 mod result;
 pub use result::{projection_field, result_schema};
 mod scalar;
+pub mod soundness;
 mod traversal;
 pub use scalar::{SExpr, SKind, Terms};
 

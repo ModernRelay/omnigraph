@@ -55,6 +55,7 @@ jobs:
           names=(
             law_canonical_forms::generated_reads_keep_one_plan_under_the_listed_rewrites_at_nightly_breadth
             law_engine_reference::engine_equals_reference_on_generated_reads_at_nightly_breadth
+            law_refusal_soundness::every_refusal_resting_on_a_claim_about_every_graph_holds_it_at_nightly_breadth
             law_scalar_evaluators::scalar_evaluators_agree_on_generated_expressions_at_nightly_breadth
           )
           cargo test -p omnigraph-gqt --locked --test integration -- --ignored --exact "${names[@]}" 2>&1 | tee target/gqt-laws.log
