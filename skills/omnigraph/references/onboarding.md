@@ -39,10 +39,11 @@ without it. -->
 
 Setup is complete only when `omnigraph version` runs in a new shell, the
 exported skill is in a directory your agent loads skills from, `omnigraph lint`
-passes, the queries return rows, `omnigraph target list` shows the graph, the
-global agent file lists it (or the user declined), and the project's
-`AGENTS.md` names the use case and the target and carries those rules. If your
-agent must restart to load the skill, tell the user the exact step to resume.
+passes, the queries run against the graph, `omnigraph target list` shows the
+graph, the global agent file lists it (or the user declined), and the
+project's `AGENTS.md` names the use case and the target and carries those
+rules. If your agent must restart to load the skill, tell the user the exact
+step to resume.
 
 ## 1. Install the CLI
 
@@ -137,19 +138,23 @@ have seen the options (then continue with 3a):
 When they pick one, offer to load it so they can see a real graph before
 designing their own. Every [cookbook](https://github.com/ModernRelay/omnigraph-cookbooks)
 folder has `schema.pg`, `queries/` and `seed.jsonl`, with `seed.md` describing
-the seed. Copy the chosen one into a new project directory:
+the seed. Copy the chosen one into a trial directory of its own, apart from the
+project, setting `COOKBOOK` to the folder named in the table:
 
 ```bash
-mkdir my-graph && cd my-graph
-git clone --depth 1 https://github.com/ModernRelay/omnigraph-cookbooks /tmp/omnigraph-cookbooks
-cp -R /tmp/omnigraph-cookbooks/second-brain/{schema.pg,queries,seed.jsonl,seed.md} .
+COOKBOOK=second-brain   # the cookbook the user picked
+SRC=$(mktemp -d)
+git clone --depth 1 https://github.com/ModernRelay/omnigraph-cookbooks "$SRC"
+mkdir omnigraph-trial && cd omnigraph-trial
+cp -R "$SRC/$COOKBOOK"/{schema.pg,queries,seed.jsonl,seed.md} .
 ```
 
 Then lint, create and load it as in steps 4 and 5, with the cookbook's files in
 place of new ones, and run two or three of its read queries that answer
 questions like the one in the table. Afterwards ask whether to keep it as the
 starting point, trimmed to what they need, or to start fresh in step 4 with
-what they have learned. Either way, ask the 3a questions before step 4.
+what they have learned. Either way, ask the 3a questions before step 4, and
+build the user's graph in the project directory, not in `omnigraph-trial`.
 
 ### Cookbook versions
 
@@ -168,8 +173,12 @@ writes them into the project's agent file.
 
 ## 4. Design a first schema
 
-In a new project directory, write two files. If the user kept a cookbook in
-step 3b, edit its files instead: drop the types their questions don't need.
+In the project directory, write two files. If the user kept a cookbook in
+step 3b, copy its `schema.pg`, `queries/` and `seed.jsonl` from
+`omnigraph-trial` instead and trim them: drop the types their questions don't
+need, and the seed records of those types. Step 5 then creates the project's
+own graph from the trimmed schema; the trial graph keeps the full cookbook and
+can be deleted.
 
 First the questions, as `.gq` queries in `queries.gq`: the user's questions
 from step 3, three to five reads they will actually run. Then the schema in `schema.pg` with the node and edge
@@ -245,7 +254,9 @@ omnigraph query sources_for_claim --query queries.gq \
   --params '{"claim":"lower-latency"}' --format table --target ./graph.omni
 ```
 
-Run each query from step 4 and show the user the results.
+Run each query from step 4 and show the user the results. A query that runs
+but returns no rows is fine when the data holds no answer yet; say so, and
+check with the user that it is expected.
 
 ## 7. Show a branch
 
@@ -352,7 +363,8 @@ which one fails if one does:
 - The exported skill is in a directory your agent loads skills from.
 - `omnigraph lint --schema schema.pg --query <file>` passes for every query
   file (`queries.gq`, or each file in a cookbook's `queries/`).
-- Each query from step 4 returns rows from the graph.
+- Each query from step 4 runs against the graph without error, and any empty
+  result is one the user agreed is expected.
 - `omnigraph target list` shows the graph under its name.
 - The global agent file lists the graph and carries the rules above, or the
   user declined.
