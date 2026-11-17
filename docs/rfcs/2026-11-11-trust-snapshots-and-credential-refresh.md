@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-11-11
-updated: 2026-11-13
+updated: 2026-11-16
 discussion: https://github.com/ModernRelay/omnigraph/issues/434
 supersedes: []
 superseded_by: []
@@ -156,7 +156,13 @@ Every applied change is logged once at `info`: the new generation, the first
 eight hexadecimal digits of the snapshot digest, the actor count, and the
 actor ids added and removed. Actor ids are not secrets; tokens never appear.
 This is a log line, not an audit record: the server has no audit sink, and
-the log is the operator's own.
+the log is the operator's own. It is also the only machine-readable reload
+status this RFC adds. The server exports OpenTelemetry traces and no metrics
+(`telemetry.rs`), and the standard shape for reload status is a metric (a
+last-reload-succeeded gauge and a generation or timestamp), so that belongs in
+a metrics facility when one exists, for every holder at once. A one-off field
+on `/readyz` is not added: it would be a second status surface for one
+feature, and `/readyz` is unauthenticated.
 
 Confirmation needs no new API. An operator's hook calls `GET /graphs/{graph_id}/access` with
 the newly added token and expects 200, or with the removed token and expects
@@ -311,8 +317,12 @@ Every refresh, on every surface, runs the same steps in `TrustHolder::refresh`:
    `validate_bearer_tokens` for every source, as #1323 already does for the
    Secrets Manager payload (which also reserves the `principal:` actor
    prefix).
-4. **Hash and digest.** Hash each token; discard the plaintext. The canonical
-   digest is the SHA-256 of the sorted `(actor, token_hash)` pairs.
+4. **Hash and digest.** Hash each token and zeroize the plaintext buffers
+   before they are dropped (`zeroize`); dropping a `Vec<u8>` does not scrub
+   it. The token hash stays SHA-256 with a constant-time compare, which is
+   sound for the high-entropy random tokens the documentation requires and
+   would not be for an operator-chosen passphrase. The canonical digest is
+   the SHA-256 of the sorted `(actor, token_hash)` pairs.
 5. **Policy gate.** The surface's freshness policy may refuse the candidate:
    OIDC refuses a changed binding, a lower or replayed revision. Static
    tokens have no gate beyond validation.
@@ -479,7 +489,9 @@ Extend existing owners; add no fixture. The `Fix Regression Gate` keys on
    function, the boot-fixed mode, `FileSource` with `Polled`, the variable,
    the change log line, the tests above, and the documentation: per-source reload
    behaviour in `docs/user/operations/server.md` (which also stops saying
-   "Choose one static token source", since `_TOKEN` and `_FILE` combine),
+   "Choose one static token source", since `_TOKEN` and `_FILE` combine, and
+   says that a static token must be a random high-entropy value, because the
+   server keeps only its SHA-256),
    the Kubernetes notes in `docs/user/deployment.md`, the sentence in
    `docs/user/clusters/index.md` that credential configuration stays fixed,
    and one line in `skills/omnigraph/references/server-policy.md`, and `defaultMode: 0400` in
@@ -524,3 +536,9 @@ available today.
   presenting the shared validator as new. O3: per-request validity is a method
   of the set. O4: `/graphs/{graph_id}/access`. O5: "logged", not "audited".
   O6: content-less failures warn once per error class.
+- 2026-11-16: after the best-practice pass. Reload status: the log line is the
+  only machine-readable status; a metric is the standard shape and belongs in
+  a metrics facility when one exists, not in a one-off `/readyz` field.
+  Plaintext token buffers are zeroized after hashing. The documentation must
+  require random high-entropy tokens, since the server keeps only a SHA-256.
+  The AWS 60 s interval is a floor; the documented default is minutes.
