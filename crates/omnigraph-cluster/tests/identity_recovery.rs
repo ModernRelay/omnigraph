@@ -307,24 +307,19 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
     assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before_denial);
     assert_eq!(file_bytes(&graph), graph_bytes);
 
-    // A storage-owning recovery without an actor still fails the installed
-    // engine policy. Preserve that bounded cause without losing original work.
+    // A storage-owning recovery without an actor cannot author the settlement
+    // the installed graph policy judges. Nothing ran, so it is a policy
+    // refusal before admission, not an unknown outcome: no lock, no ledger or
+    // graph change, and the original work stays outstanding.
     let missing_actor = DeploymentCaller::storage_owner(None);
     let error = Box::pin(reconcile_deployment(root, &id, true, &missing_actor))
         .await
         .unwrap_err();
-    assert_eq!(error.code, "deployment_outcome_unknown");
-    assert!(error.message.contains("no actor"), "{error:?}");
-    assert!(error.message.len() <= 4096);
+    assert_eq!(error.code, "policy_denied", "{error:?}");
+    assert!(error.message.contains("--as"), "{error:?}");
+    assert!(!dir.path().join("__cluster/lock.json").exists());
     assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before_denial);
     assert_eq!(file_bytes(&graph), graph_bytes);
-    let lock = deployment_status(root, Some(&id), &original)
-        .await
-        .unwrap()
-        .lock_id
-        .unwrap();
-    assert!(error.message.contains(&lock));
-    force_unlock_storage_root(root, &lock).await.unwrap();
 
     {
         let _fail = cluster_seams::DEPLOYMENT_AFTER_SETTLEMENT_INTENT.fire_always();
@@ -356,14 +351,14 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
         .lock_id
         .unwrap();
     force_unlock_storage_root(root, &lock).await.unwrap();
-    // Once a fence is persisted, invocation refusal must preserve its exact
-    // identity and expose the same policy cause rather than generic uncertainty.
+    // Once a fence is persisted, the refusal must preserve its exact identity
+    // and expose the same policy cause rather than generic uncertainty.
     let error = Box::pin(reconcile_deployment(root, &id, true, &missing_actor))
         .await
         .unwrap_err();
-    assert_eq!(error.code, "deployment_outcome_unknown");
-    assert!(error.message.contains("no actor"), "{error:?}");
-    assert!(error.message.len() <= 4096);
+    assert_eq!(error.code, "policy_denied", "{error:?}");
+    assert!(error.message.contains("--as"), "{error:?}");
+    assert!(!dir.path().join("__cluster/lock.json").exists());
     let retained: serde_json::Value =
         serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
     assert_eq!(
@@ -371,13 +366,6 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
         fence
     );
     assert_eq!(file_bytes(&graph), graph_bytes);
-    let lock = deployment_status(root, Some(&id), &original)
-        .await
-        .unwrap()
-        .lock_id
-        .unwrap();
-    assert!(error.message.contains(&lock));
-    force_unlock_storage_root(root, &lock).await.unwrap();
     fs::remove_file(dir.path().join("people.pg")).unwrap();
     fs::remove_file(dir.path().join("cluster.yaml")).unwrap();
 
