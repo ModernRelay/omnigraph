@@ -390,8 +390,7 @@ async fn scan_field(
         |scanner| {
             scanner.batch_size(rows);
             scanner.batch_size_bytes(bytes as u64);
-            scanner.batch_readahead(super::scan::PIPELINED_READAHEAD);
-            scanner.io_buffer_size(super::scan::PIPELINED_IO_BUFFER_BYTES);
+            scanner.pipelined();
             Ok(())
         },
     )

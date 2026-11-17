@@ -6,7 +6,8 @@
 //! how each committed lookup reads ([`plan::plan_write`], the `load csv`
 //! plan), and the one judge in [`load`] executes them: the `load csv`
 //! operator over its partitions, the staged routes (a JSONL load, a
-//! mutation, a blob cell, a branch merge) over their batches in memory.
+//! mutation, a blob cell) over their batches in memory, and a branch merge
+//! over its delta streamed from storage ([`load::Sweep`]).
 //!
 //! This module holds what the judge reads: [`CommittedState`], the committed
 //! view behind the lookups, with one open per table shared between them,
@@ -62,30 +63,6 @@ impl Violation {
         OmniError::manifest(self.message)
     }
 }
-
-/// Per-table change a branch merge computes for its target: the rows added
-/// or changed (as batches, projected to what the checks read) plus the ids
-/// removed. The merge's delta container, planned table by table.
-#[derive(Debug, Default)]
-pub(crate) struct TableChange {
-    /// Rows new in the result (absent from base).
-    pub added: Vec<RecordBatch>,
-    /// Rows present before but with changed values.
-    pub changed: Vec<RecordBatch>,
-    /// Ids removed in the result.
-    pub deleted_ids: Vec<String>,
-}
-
-impl TableChange {
-    /// Batches carrying field values a row-local constraint must check
-    /// (`added ∪ changed`). Unchanged rows were validated at write time.
-    pub fn value_batches(&self) -> impl Iterator<Item = &RecordBatch> {
-        self.added.iter().chain(self.changed.iter())
-    }
-}
-
-/// Per-table changes keyed by `table_key` (`node:Type` / `edge:Type`).
-pub(crate) type ChangeSet = HashMap<String, TableChange>;
 
 /// Wrap a leaf-check error as a value-constraint [`Violation`]; the message
 /// is the leaf's own text, which every route's refusal carries verbatim.

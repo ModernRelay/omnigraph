@@ -31,15 +31,6 @@ pub(crate) fn id_in_list_expr(ids: &[String], id_col: &str) -> datafusion::prelu
     col(id_col).in_list(id_list, false)
 }
 
-/// Lance batches a pipelined read decodes ahead, which the pool does not see.
-pub(super) const PIPELINED_READAHEAD: usize = 2;
-
-/// Bytes Lance may hold fetched and not yet decoded for one pipelined read,
-/// which the pool does not see either. Lance's default is 32 MiB per I/O
-/// thread (2 GiB on a cloud store), read ahead of a consumer that may stop
-/// after its first batch; two 32 MiB pages keep its throughput.
-pub(super) const PIPELINED_IO_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
-
 /// One node scan resolved before any Lance read: the dataset, the pushed
 /// filter (the literal filters and a gate's eligible set) and the columns it
 /// reads.
@@ -193,8 +184,7 @@ impl<'n> NodeRead<'n> {
         if let Some((rows, bytes)) = pipelined_batch {
             scanner.batch_size(rows);
             scanner.batch_size_bytes(bytes as u64);
-            scanner.batch_readahead(PIPELINED_READAHEAD);
-            scanner.io_buffer_size(PIPELINED_IO_BUFFER_BYTES);
+            scanner.pipelined();
         }
         Ok(())
     }

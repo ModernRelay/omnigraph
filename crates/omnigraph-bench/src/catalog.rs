@@ -27,7 +27,7 @@ pub struct ConfigV2 {
     pub defaults: Defaults,
     pub scenarios: Vec<Scenario>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub groups: BTreeMap<String, Vec<String>>,
+    pub suites: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub run: Vec<String>,
 }
@@ -230,8 +230,12 @@ pub struct Catalog {
 }
 impl Catalog {
     pub fn load(path: &Path) -> Result<Self, Vec<Diagnostic>> {
-        let metadata =
-            std::fs::metadata(path).map_err(|e| vec![error("config_read_error", e.to_string())])?;
+        let metadata = std::fs::metadata(path).map_err(|e| {
+            vec![error(
+                "config_read_error",
+                format!("{}: {e}", path.display()),
+            )]
+        })?;
         if !metadata.is_file() {
             return Err(vec![error(
                 "invalid_config_file",
@@ -293,7 +297,7 @@ impl Catalog {
         })
     }
 
-    /// The scenario ids a selector names: one scenario, one group, or the
+    /// The scenario ids a selector names: one scenario, one suite, or the
     /// catalog's run list.
     pub fn selection(&self, selector: Option<&str>) -> Result<Vec<String>, Vec<Diagnostic>> {
         select(&self.definition, selector)
@@ -451,13 +455,13 @@ fn check_repetitions(value: u32) -> Result<(), Vec<Diagnostic>> {
 fn validate(config: &ConfigV2) -> Result<(), Vec<Diagnostic>> {
     if config.scenarios.is_empty()
         || config.scenarios.len() > MAX_SUITE_RUNS
-        || config.groups.len() > MAX_SUITE_RUNS
+        || config.suites.len() > MAX_SUITE_RUNS
         || config.run.len() > MAX_SUITE_RUNS
     {
         return Err(vec![error(
             "invalid_catalog_size",
             format!(
-                "config requires 1..={MAX_SUITE_RUNS} scenarios and at most {MAX_SUITE_RUNS} groups"
+                "config requires 1..={MAX_SUITE_RUNS} scenarios and at most {MAX_SUITE_RUNS} suites"
             ),
         )]);
     }
@@ -497,25 +501,25 @@ fn validate(config: &ConfigV2) -> Result<(), Vec<Diagnostic>> {
             }
         }
     }
-    for (name, members) in &config.groups {
+    for (name, members) in &config.suites {
         if !valid_kebab_id(name) || name.len() > 128 || names.contains(name.as_str()) {
             return Err(vec![error(
-                "invalid_group_id",
-                format!("group '{name}' must be unique kebab-case, distinct from scenario IDs"),
+                "invalid_suite_id",
+                format!("suite '{name}' must be unique kebab-case, distinct from scenario IDs"),
             )]);
         }
         if members.is_empty() || members.len() > MAX_SUITE_RUNS {
             return Err(vec![error(
-                "invalid_group_size",
-                format!("group '{name}' is empty or too large"),
+                "invalid_suite_size",
+                format!("suite '{name}' is empty or too large"),
             )]);
         }
         let mut seen = BTreeSet::new();
         for id in members {
             if !names.contains(id.as_str()) || !seen.insert(id) {
                 return Err(vec![error(
-                    "invalid_group_member",
-                    format!("group '{name}' has duplicate or unknown scenario '{id}'"),
+                    "invalid_suite_member",
+                    format!("suite '{name}' has duplicate or unknown scenario '{id}'"),
                 )]);
             }
         }
@@ -533,21 +537,21 @@ fn select(config: &ConfigV2, selector: Option<&str>) -> Result<Vec<String>, Vec<
     if selectors.is_empty() {
         return Err(vec![error(
             "empty_selection",
-            "supply a scenario/group name or an explicit run list in the config",
+            "supply a suite or scenario name or an explicit run list in the config",
         )]);
     }
     let names: BTreeSet<_> = config.scenarios.iter().map(|s| s.id.as_str()).collect();
     let mut seen = BTreeSet::new();
     let mut result = Vec::new();
     for selector in selectors {
-        let members = if let Some(members) = config.groups.get(selector) {
+        let members = if let Some(members) = config.suites.get(selector) {
             members.clone()
         } else if names.contains(selector) {
             vec![selector.to_owned()]
         } else {
             return Err(vec![error(
                 "unknown_selection",
-                format!("unknown scenario or group '{selector}'"),
+                format!("unknown suite or scenario '{selector}'"),
             )]);
         };
         for id in members {

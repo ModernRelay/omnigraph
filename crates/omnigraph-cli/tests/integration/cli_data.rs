@@ -2749,6 +2749,99 @@ fn read_csv_format_outputs_header_and_row_values() {
     assert!(stdout.contains("Alice"));
 }
 
+/// `query --format csv` output loads back through `load csv` with the same
+/// values: a null stays null, the stored string "null" stays a string, and a
+/// null in a number column loads. The writer (`csv_cell`) and the reader
+/// (`utf8_without_empty`) spell null in two crates; this test keeps them in
+/// agreement. An empty string reads back as null, because `load csv` has no
+/// spelling for an empty string.
+#[test]
+fn csv_query_output_round_trips_through_load_csv() {
+    let temp = tempdir().unwrap();
+    let schema = temp.path().join("schema.pg");
+    fs::write(
+        &schema,
+        "node X {\n    slug: String @key\n    s: String?\n    n: I32?\n}\n",
+    )
+    .unwrap();
+    let source = temp.path().join("source.omni");
+    let copy = temp.path().join("copy.omni");
+    for graph in [&source, &copy] {
+        output_success(cli().arg("init").arg("--schema").arg(&schema).arg(graph));
+    }
+    let rows = temp.path().join("rows.jsonl");
+    fs::write(
+        &rows,
+        concat!(
+            r#"{"type":"X","data":{"slug":"empty","s":"","n":1}}"#,
+            "\n",
+            r#"{"type":"X","data":{"slug":"nul","n":2}}"#,
+            "\n",
+            r#"{"type":"X","data":{"slug":"word","s":"null"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&rows)
+            .arg("--mode")
+            .arg("merge")
+            .arg("--target")
+            .arg(&source),
+    );
+
+    let read = "query q() { match { $x: X } \
+                return { $x.slug as slug, $x.s as s, $x.n as n } order { $x.slug } }";
+    let csv = stdout_string(&output_success(
+        cli()
+            .arg("query")
+            .arg("--target")
+            .arg(&source)
+            .arg("-e")
+            .arg(read)
+            .arg("--format")
+            .arg("csv"),
+    ));
+    let sources = temp.path().join("sources");
+    fs::create_dir(&sources).unwrap();
+    let csv_path = sources.join("x.csv");
+    fs::write(&csv_path, &csv).unwrap();
+    output_success(
+        cli()
+            .arg("mutate")
+            .arg("--target")
+            .arg(&copy)
+            .arg("--yes")
+            .arg("-e")
+            .arg(format!(
+                "load csv \"file://{}\" into node:X mode overwrite header",
+                csv_path.display()
+            )),
+    );
+
+    let loaded = parse_stdout_json(&output_success(
+        cli()
+            .arg("query")
+            .arg("--target")
+            .arg(&copy)
+            .arg("-e")
+            .arg(read)
+            .arg("--json"),
+    ));
+    assert_eq!(
+        loaded["rows"],
+        json!([
+            {"slug": "empty", "n": 1},
+            {"slug": "nul", "n": 2},
+            {"slug": "word", "s": "null"},
+        ]),
+        "csv written by query:\n{csv}"
+    );
+}
+
 /// RFC-007 PR 1: the format cascade's operator hop — `defaults.output` in
 /// ~/.omnigraph/config.yaml applies when nothing more specific is given,
 /// and `--format` still wins over it.
