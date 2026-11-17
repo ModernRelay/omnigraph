@@ -23,6 +23,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 ulid = { workspace = true }
+# The shared generators of the generated laws (`src/arbitrary.rs`).
+proptest = { version = "1", optional = true }
+
+[features]
+# Exposes `omnigraph_compiler::arbitrary` to dependents' test builds;
+# enabled only through dev-dependencies (forbidden_apis.rs pins this).
+test-util = ["dep:proptest"]
 
 [dev-dependencies]
 # The parse, print and parse property (src/query/syntax/tests/round_trip.rs).

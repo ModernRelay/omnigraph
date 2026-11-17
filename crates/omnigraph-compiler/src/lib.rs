@@ -1,3 +1,5 @@
+#[cfg(any(test, feature = "test-util"))]
+pub mod arbitrary;
 pub mod catalog;
 pub mod error;
 pub mod ir;
