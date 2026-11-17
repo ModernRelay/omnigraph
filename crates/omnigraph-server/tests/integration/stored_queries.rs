@@ -3,9 +3,9 @@
 
 use axum::body::Body;
 use axum::http::StatusCode;
+use omnigraph_server::AppState;
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
-use omnigraph_server::AppState;
 use serde_json::{Value, json};
 use serial_test::serial;
 
@@ -1182,12 +1182,8 @@ const OLDER_OR_NAMED_GQ: &str = "query older_or_named($name: String) { match { $
 #[tokio::test(flavor = "multi_thread")]
 async fn stored_read_with_a_compound_predicate_answers_both_arms() {
     let specs: &[(&str, &str, bool)] = &[("older_or_named", OLDER_OR_NAMED_GQ, false)];
-    let (_temp, app) = app_with_stored_queries(
-        specs,
-        &[("act-invoke", "t-invoke")],
-        INVOKE_POLICY_YAML,
-    )
-    .await;
+    let (_temp, app) =
+        app_with_stored_queries(specs, &[("act-invoke", "t-invoke")], INVOKE_POLICY_YAML).await;
     let (status, body) = json_response(
         &app,
         invoke_request(

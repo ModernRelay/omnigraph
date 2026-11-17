@@ -443,7 +443,8 @@ async fn profile_rows_carry_the_report_in_the_explain_row_schema() {
     .await
     .unwrap();
     let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
-    let run = db.clone()
+    let run = db
+        .clone()
         .query_inspected(ReadTarget::branch("main"), NEAREST, "by_vector", &params)
         .await
         .unwrap();

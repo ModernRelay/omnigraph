@@ -609,10 +609,7 @@ edge Knows: Doc -> Doc
         .await
         .unwrap();
     db.ensure_indices_as(None).await.unwrap();
-    let v2 = with_setting(&db,
-        "rrf_plan",
-        "force_postfilter",
-    );
+    let v2 = with_setting(&db, "rrf_plan", "force_postfilter");
     let query = r#"query friends($q: Vector(4)) {
         match { let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, from nearest($pop, $d.embedding, $q, k: 10) as $distance }
         return { $d.slug }
