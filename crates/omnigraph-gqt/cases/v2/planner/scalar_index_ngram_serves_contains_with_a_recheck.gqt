@@ -1,7 +1,7 @@
 # issue: none
 # traversal: auto
-# notes: `@index` on a String builds an NGRAM beside its BTREE and full-text index (the GQ 3 RFC
-# notes: section 4, "Scalar indexes"). `contains` probes it for candidates (lowercased, ASCII-folded trigrams)
+# notes: `@index` on a String builds an NGRAM beside its BTREE, and no full-text index (the GQ 3
+# notes: RFC section 4, "Scalar indexes"). `contains` probes it for candidates (lowercased, ASCII-folded trigrams)
 # notes: and Lance rechecks each with the case-sensitive substring test, so a case-mismatched or accent-folded
 # notes: needle returns the scan's rows. A needle shorter than three characters, a needle with no alphanumeric
 # notes: trigram (which Lance 13 would answer with no row, so the engine pushes it in a form no index answers)
