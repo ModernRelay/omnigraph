@@ -14,7 +14,7 @@
 //! which is admitted only when the validator derives the same id from the
 //! written value.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::requirements::{BoundVariable, Region, TieColumn};
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
@@ -812,10 +812,13 @@ impl Requirements {
             .copied()
             .filter(|id| !inside.contains(id))
             .collect();
-        let tested_outside: HashSet<IRExpr> = conjuncts(plan, &outside)
-            .into_iter()
-            .map(|(_, conjunct)| conjunct)
-            .collect();
+        // Each conjunct tested outside every optional, with how many times:
+        // a correlated read writing the same conjunct tests its own copy
+        // there, which is not the optional's.
+        let mut tested_outside: HashMap<IRExpr, usize> = HashMap::new();
+        for (_, conjunct) in conjuncts(plan, &outside) {
+            *tested_outside.entry(conjunct).or_default() += 1;
+        }
         let top_level: HashSet<&IRExpr> = self.eligibility.iter().collect();
         // Each query optional takes the plan optional on its binding that
         // tests its conjuncts and the fewest others, the optionals writing
@@ -860,7 +863,15 @@ impl Requirements {
             planned.remove(index);
             tested.remove(index);
             if let Some(leaked) = optional.eligibility.iter().find(|conjunct| {
-                tested_outside.contains(*conjunct) && !self.top_level_conjunct(conjunct, &top_level)
+                let correlated = self
+                    .correlates
+                    .iter()
+                    .filter(|correlate| correlate.eligibility.contains(*conjunct))
+                    .count();
+                tested_outside
+                    .get(*conjunct)
+                    .is_some_and(|tested| *tested > correlated)
+                    && !self.top_level_conjunct(conjunct, &top_level)
             }) {
                 return Err(ValidationError::violated(
                     "predicate origin",
@@ -923,10 +934,13 @@ impl Requirements {
             .copied()
             .filter(|id| !inside.contains(id))
             .collect();
-        let tested_outside: HashSet<IRExpr> = conjuncts(plan, &outside)
-            .into_iter()
-            .map(|(_, conjunct)| conjunct)
-            .collect();
+        // Each conjunct tested outside every correlated read, with how many
+        // times: an optional writing the same conjunct tests its own copy
+        // there, which is not the read's.
+        let mut tested_outside: HashMap<IRExpr, usize> = HashMap::new();
+        for (_, conjunct) in conjuncts(plan, &outside) {
+            *tested_outside.entry(conjunct).or_default() += 1;
+        }
         let top_level: HashSet<&IRExpr> = self.eligibility.iter().collect();
         for correlate in &self.correlates {
             let found = planned.iter().position(|(outer_var, read, nodes)| {
@@ -958,7 +972,17 @@ impl Requirements {
             };
             planned.remove(index);
             if let Some(leaked) = correlate.eligibility.iter().find(|conjunct| {
-                tested_outside.contains(*conjunct) && !self.top_level_conjunct(conjunct, &top_level)
+                // An optional writing the same conjunct tests its own copy
+                // outside every correlated read.
+                let others = self
+                    .optionals
+                    .iter()
+                    .filter(|optional| optional.eligibility.contains(*conjunct))
+                    .count();
+                tested_outside
+                    .get(*conjunct)
+                    .is_some_and(|tested| *tested > others)
+                    && !self.top_level_conjunct(conjunct, &top_level)
             }) {
                 return Err(ValidationError::violated(
                     "predicate origin",
