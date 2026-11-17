@@ -1,0 +1,79 @@
+# issue: none
+# notes: The tie rule orders reference columns in written column order, which the
+# notes: plan's steps need not keep: a `union` and an `optional` run after the scope's
+# notes: traversals, yet their columns come where they are written. A `limit` without
+# notes: `order` and a constant `order` key both cut by it. Found by the generated
+# notes: engine-equals-reference law (law_engine_reference.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+}
+node C {
+    k: String @key
+    p1: Bool?
+}
+edge Rel0: A -> A
+edge Rel1: A -> A
+edge RelC: C -> A
+
+--- seed
+{"type":"A","data":{"k":"a"}}
+{"type":"A","data":{"k":"b"}}
+{"type":"A","data":{"k":"c"}}
+{"type":"C","data":{"k":"x","p1":true}}
+{"type":"C","data":{"k":"y","p1":true}}
+{"edge":"Rel0","from":"a","to":"a"}
+{"edge":"Rel1","from":"a","to":"a"}
+{"edge":"Rel1","from":"b","to":"a"}
+{"edge":"Rel1","from":"c","to":"a"}
+{"edge":"RelC","from":"x","to":"a"}
+{"edge":"RelC","from":"y","to":"a"}
+
+--- query
+query q() {
+  match {
+    $d1: A,
+    from union({ match { $n7: A, $n7 rel0 $d1 } return { $n7 as u8 } }, { match { $n10: A } return { $n10 as u8 } }),
+    $n11: A, $n11 rel1 $d1
+  }
+  return { $u8.k as c0, $d1.k as c1, $n11.k as c2 }
+  limit 4
+}
+
+--- expect unordered
+{"c0":"a","c1":"a","c2":"a"}
+{"c0":"a","c1":"a","c2":"a"}
+{"c0":"a","c1":"a","c2":"b"}
+{"c0":"a","c1":"a","c2":"b"}
+
+--- expect shape
+c0: String
+c1: String
+c2: String
+
+--- query
+query q() {
+  match { $d1: A, optional { $o: C, $o relC $d1 }, $n11: A, $n11 rel1 $d1 }
+  return { $o.k as c0, $n11.k as c1, true as c2 }
+  order { c2 }
+}
+
+--- expect ordered
+{"c0":"x","c1":"a","c2":true}
+{"c0":"x","c1":"b","c2":true}
+{"c0":"x","c1":"c","c2":true}
+{"c0":"y","c1":"a","c2":true}
+{"c0":"y","c1":"b","c2":true}
+{"c0":"y","c1":"c","c2":true}
+
+--- expect shape
+c0: String?
+c1: String
+c2: Bool

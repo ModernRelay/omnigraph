@@ -340,6 +340,7 @@ fn resolve_query(
         order_by,
         limit,
         limit_param,
+        written_columns,
     } = ir;
     if let (Some(param), None) = (limit_param, limit) {
         return Err(PlanError::Internal(format!(
@@ -424,7 +425,7 @@ fn resolve_query(
             order_keys(&ordering.expr, &mut keys);
         }
         let tiebreak = sort_tiebreak(
-            &tie_rule(plan, current, source, false)?,
+            &tie_rule(plan, current, source, false, written_columns)?,
             order_by,
             return_exprs,
             grouped,
@@ -938,7 +939,7 @@ fn correlate_tiebreak(
     read: &crate::read_shape::InnerRead,
     source: &dyn PlanSource,
 ) -> Result<Vec<ColumnRef>, PlanError> {
-    let candidates = tie_rule(plan, inner, source, true)?;
+    let candidates = tie_rule(plan, inner, source, true, &[])?;
     let Some(group) = &read.group else {
         return Ok(candidates.into_iter().map(|(column, _)| column).collect());
     };
@@ -1320,13 +1321,16 @@ fn scope_tiebreaks(
 /// unreturned bindings, which stand for the values the read computes from
 /// them. With `own`, the rows are an inline read's own, which hold its
 /// unreturned bindings as columns until its projection, so every name
-/// counts where it is bound. Each entry carries the physical column that
-/// recognizes a user key over it.
+/// counts where it is bound. `written` is the read's written column order
+/// ([`ReadShape::written_columns`]), empty for an inline read's own rows.
+/// Each entry carries the physical column that recognizes a user key over
+/// it.
 fn tie_rule(
     plan: &LogicalPlan,
     id: LogicalId,
     source: &dyn PlanSource,
     own: bool,
+    written: &[String],
 ) -> Result<Vec<(ColumnRef, String)>, PlanError> {
     let mut columns = TieColumns::default();
     columns.walk(plan, id, source)?;
@@ -1334,6 +1338,15 @@ fn tie_rule(
         .entries
         .into_iter()
         .partition(|entry| own || entry.is_named());
+    // The named references come in written column order, which the plan's
+    // steps need not keep: an `optional` or a `union` runs after the
+    // scope's traversals.
+    named.sort_by_key(|entry| {
+        written
+            .iter()
+            .position(|name| name == entry.binding())
+            .unwrap_or(usize::MAX)
+    });
     named.extend(rest);
     let mut out = Vec::new();
     for entry in named {

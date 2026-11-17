@@ -56,6 +56,72 @@ pub struct ReadShape {
     /// planning, so the plan's cut is that value and a replay folds the
     /// value its own value table holds.
     pub limit_param: Option<String>,
+    /// The match's columns in written column order (the GQ 3 RFC, section
+    /// 2, `Order`'s tie rule): the order the core term adds them, which the
+    /// steps' run order need not keep (an `optional` and a `union` run after
+    /// the scope's traversals). The tie rule orders reference columns by it.
+    pub written_columns: Vec<String>,
+}
+
+/// The columns `term` adds to its rows, in the order the core term adds
+/// them, each once (the reference interpreter's row order).
+pub fn written_columns(term: &Term, out: &mut Vec<String>) {
+    fn push(out: &mut Vec<String>, name: &str) {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    match term {
+        Term::Unit => {}
+        Term::Env(cols) => cols.iter().for_each(|c| push(out, &c.name)),
+        Term::Scan { var, .. } => push(out, var),
+        Term::Expand {
+            input,
+            dst,
+            edge_var,
+            ..
+        } => {
+            written_columns(input, out);
+            push(out, dst);
+            if let Some(edge) = edge_var {
+                push(out, edge);
+            }
+        }
+        Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
+            written_columns(input, out)
+        }
+        Term::Project { input, items, keep } => {
+            if *keep {
+                written_columns(input, out);
+            } else {
+                out.clear();
+            }
+            items.iter().for_each(|(name, _)| push(out, name));
+        }
+        Term::Group { keys, aggs, .. } => {
+            out.clear();
+            keys.iter().for_each(|(name, _)| push(out, name));
+            aggs.iter().for_each(|(name, _)| push(out, name));
+        }
+        Term::Correlate { outer, inner } => {
+            written_columns(outer, out);
+            let mut own = Vec::new();
+            written_columns(inner, &mut own);
+            own.iter().for_each(|name| push(out, name));
+        }
+        Term::Union { left, .. } => written_columns(left, out),
+        Term::Score { input, out: score, .. } | Term::ApproxTopK { input, out: score, .. } => {
+            written_columns(input, out);
+            push(out, score);
+        }
+        Term::Fuse { target, out: score, .. } => {
+            out.clear();
+            push(out, target);
+            push(out, score);
+        }
+        Term::Fix { body, .. } | Term::Call { body, .. } => written_columns(body, out),
+        Term::RecRef { ty, .. } => ty.cols.iter().for_each(|c| push(out, &c.name)),
+    }
 }
 
 /// One step of a pattern.
@@ -1098,6 +1164,8 @@ impl<'a> Shaper<'a> {
             order_keys = keys;
             term = input;
         }
+        let mut written = Vec::new();
+        written_columns(term, &mut written);
         // The items, by their hidden names, and the body under them.
         let mut items: HashMap<String, IRExpr> = HashMap::new();
         let mut aggs: HashMap<String, Agg> = HashMap::new();
@@ -1454,6 +1522,7 @@ impl<'a> Shaper<'a> {
             order_by,
             limit,
             limit_param,
+            written_columns: written,
         })
     }
 

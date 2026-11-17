@@ -244,6 +244,7 @@ mod tests {
             }],
             limit: Some(2),
             limit_param: None,
+            written_columns: Vec::new(),
         };
         let plan = futures::executor::block_on(crate::plan_query(&query, &source, &BOUNDS))
             .expect("the query plans");

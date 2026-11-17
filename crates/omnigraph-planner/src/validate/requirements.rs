@@ -519,14 +519,25 @@ impl Requirements {
         budget: &mut Budget,
     ) -> Result<Self, ValidationError> {
         let ir = input.ir;
-        Self::scope(
+        let mut required = Self::scope(
             &ir.pipeline,
             &ir.return_exprs,
             &ir.order_by,
             ir.distinct,
             ir.limit,
             budget,
-        )
+        )?;
+        // The tie rule takes the named references in written column order,
+        // which the steps' run order need not keep.
+        required.tie_columns.sort_by_key(|column| match column {
+            TieColumn::Identity { binding, .. } if column.is_named() => ir
+                .written_columns
+                .iter()
+                .position(|name| name == binding)
+                .unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        });
+        Ok(required)
     }
 
     /// The requirements of one scope: the read's top-level pattern with its

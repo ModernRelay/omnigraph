@@ -1011,6 +1011,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             limit_param: None,
+            written_columns: Vec::new(),
         };
         let source = source.with_explain_dump_dir(dir.path().to_path_buf());
         EXPLAIN_RENDERS.with(|count| count.set(0));
