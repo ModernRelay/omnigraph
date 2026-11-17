@@ -577,6 +577,39 @@ rows[2]:
         assert!(rendered.lines().next().unwrap().contains("age,name"));
     }
 
+    /// A null cell (its key omitted from the JSON row) and the stored string
+    /// "null" must not be written as the same CSV field, or a reader cannot
+    /// tell them apart.
+    #[test]
+    fn csv_keeps_a_null_cell_distinct_from_the_string_null() {
+        let mut output = sample_output();
+        output.columns = vec!["slug".to_string(), "s".to_string()];
+        output.row_count = 3;
+        output.rows = serde_json::value::RawValue::from_string(
+            r#"[{"slug":"empty","s":""},{"slug":"nul"},{"slug":"word","s":"null"}]"#.to_string(),
+        )
+        .unwrap();
+
+        let rendered = render_read(
+            &output,
+            ReadOutputFormat::Csv,
+            &ReadRenderOptions {
+                max_column_width: 80,
+                cell_layout: TableCellLayout::Truncate,
+            },
+        )
+        .unwrap();
+        let cells: Vec<&str> = rendered
+            .lines()
+            .skip(1)
+            .map(|line| line.split_once(',').unwrap().1)
+            .collect();
+
+        assert_eq!(cells.len(), 3, "{rendered}");
+        assert_ne!(cells[0], cells[1], "empty string and null: {rendered}");
+        assert_ne!(cells[1], cells[2], "null and the string \"null\": {rendered}");
+    }
+
     #[test]
     fn csv_quotes_carriage_returns() {
         assert_eq!(csv_escape("hello\rworld"), "\"hello\rworld\"");
