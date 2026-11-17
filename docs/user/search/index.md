@@ -166,7 +166,8 @@ whose property is null is false. `not match_terms(...)`, `match_terms(...) or
 all run, inside blocks too, and keep exactly the rows the call's matches
 decide. The exact lexical scan answers every call from the field's rows and
 reads no index, so a row an index has not covered yet answers as an indexed
-one does. A full-text call read as a value, in `return`, `order` or a block's
+one does; its time is linear in the field's text
+([cost](analyzers.md#the-exact-scans-cost)). A full-text call read as a value, in `return`, `order` or a block's
 aggregate, is not lowered (`T86`). `search`, `match_text` and `fuzzy` are not
 functions: each is refused (`T6`) with its `match_terms` fix,
 `match_terms($d.body, terms($q, mode: any))`, and `max_edits: 2` for a `fuzzy`

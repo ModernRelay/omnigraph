@@ -86,6 +86,19 @@ the state of an index. A raw `contains_tokens` scan filter, outside GQ, names
 no field analysis, so it refuses over any field that holds a full-text index
 (`full_text_index_rebuild_required`).
 
+### The exact scan's cost
+
+Until a later release shares one analyzer between the index and the scan,
+every `match_terms` and `bm25` call reads and analyzes the field's whole text
+at the query's snapshot, whatever filters or `limit` the query carries, so its
+time is linear in the bytes of that field across the node type. Measured on
+two CPUs, the scan takes about 50 ms per MiB of text: about 9.7 s over a
+171,000-document corpus, which a native full-text index answered in about
+113 ms before this release. Its memory does not grow with the field: `bm25`
+keeps the corpus's statistics and scores each row from its own text, so a
+corpus larger than the query's memory pool scores within it. Keep such calls
+to node types whose text fits the latency you need.
+
 `match_terms($d.f, terms($q, mode: all | any, max_edits: n))` is true where
 every (`all`, the default) or some (`any`) distinct analyzed term of `$q` has
 a term in the value within `n` edits, `n` from 0 to 2, default 0. An edit
