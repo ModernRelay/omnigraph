@@ -168,6 +168,10 @@ struct IdChunk<R> {
     /// writer and always appends both.
     row_ids: Vec<R>,
     filter_bytes: u64,
+    /// The filter byte bound the chunk was planned under: the merge's
+    /// `write_max_bytes` for a delete chunk, the keyed-write default for a
+    /// lineage candidate chunk.
+    max_filter_bytes: u64,
 }
 
 type DeleteIdChunk = IdChunk<u64>;
@@ -264,6 +268,7 @@ impl<R> IdChunks<R> {
                 ids: Vec::new(),
                 row_ids: Vec::new(),
                 filter_bytes: empty_filter_bytes,
+                max_filter_bytes,
             });
         }
 
@@ -360,7 +365,7 @@ impl<R> IdChunk<R> {
                 self.ids.len()
             )));
         }
-        if self.filter_bytes > KEYED_WRITE_MAX_BYTES {
+        if self.filter_bytes > self.max_filter_bytes {
             return Err(OmniError::manifest_internal(format!(
                 "branch merge delete chunk exceeds its planned byte bound: {} bytes",
                 self.filter_bytes
@@ -2194,7 +2199,8 @@ const LINEAGE_FILTER_MAX_IDS: usize = 512;
 /// matching what `CandidateIdChunks` re-applies at chunking time. Crossing it
 /// falls back to the walk: a candidate set approaching the whole table is the
 /// walk's own regime, and the gate's fail-closed contract must hold for
-/// budgets as well as preconditions.
+/// budgets as well as preconditions. It stays fixed under `write_max_bytes`
+/// because crossing it never refuses a merge; it only chooses the walk.
 const LINEAGE_CANDIDATE_MAX_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 
 /// A gated lineage-merge plan: the three pinned datasets plus the candidate
@@ -2746,6 +2752,7 @@ async fn plan_lineage_merge(
         "lineage merge: candidate discovery complete"
     );
 
+    // Fixed bounds, like LINEAGE_CANDIDATE_MAX_BYTES: a miss falls back to the walk.
     let mut candidate_chunks =
         CandidateIdChunks::new(catalog.system_columns.id, WriteBudget::default());
     for id in candidate_ids {
@@ -3412,14 +3419,16 @@ impl MergeValidationBudget {
         Ok(())
     }
 
-    /// Charge the exact projected Arrow allocation before the batch is pushed
-    /// into the retained `ChangeSet`.
-    fn reserve_projected_batch(&mut self, batch: &RecordBatch) -> Result<u64> {
-        let bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("branch merge validation batch bytes exceed u64")
-        })?;
+    /// Charge a projected batch before it is pushed into the retained
+    /// `ChangeSet`, and return the batch to retain. A scan can emit slices
+    /// that share one buffer; such a batch is copied to its own rows first,
+    /// so the charge is what the validator keeps and does not depend on the
+    /// staged layout (which `write_max_bytes` also changes).
+    fn reserve_projected_batch(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+        let (batch, bytes) = crate::table_store::compact_retained_batch(batch)?;
+        crate::instrumentation::record_merge_validation_batch(bytes);
         self.reserve(bytes)?;
-        Ok(bytes)
+        Ok(batch)
     }
 
     /// Deleted IDs are cloned from the already-bounded physical delete plan
@@ -3628,6 +3637,7 @@ async fn scan_staged_for_validation(
             None,
             None,
             false,
+            // Batch size targets, not limits; MergeValidationBudget bounds the hold.
             KEYED_WRITE_MAX_ROWS,
             KEYED_WRITE_MAX_BYTES,
         )
@@ -3636,14 +3646,9 @@ async fn scan_staged_for_validation(
         if batch.num_rows() == 0 {
             continue;
         }
-        let projected_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("branch merge validation batch bytes exceed u64")
-        })?;
-        crate::instrumentation::record_merge_validation_batch(projected_bytes);
         // Charge before `output.push`: rejection never retains the batch that
         // crosses the shared operation-wide ceiling.
-        budget.reserve_projected_batch(&batch)?;
-        output.push(batch);
+        output.push(budget.reserve_projected_batch(batch)?);
     }
     Ok(())
 }
@@ -3683,9 +3688,6 @@ async fn scan_proven_pure_inserts_for_validation(
         if batch.num_rows() == 0 {
             continue;
         }
-        let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("branch merge validation batch bytes exceed u64")
-        })?;
         if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::resource_limit(
                 format!("branch-merge pure-insert validation batch entities for {table_key}"),
@@ -3693,13 +3695,9 @@ async fn scan_proven_pure_inserts_for_validation(
                 batch.num_rows() as u64,
             ));
         }
-        if batch_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                format!("branch-merge pure-insert validation batch bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                batch_bytes,
-            ));
-        }
+        // No byte bound per batch: the scanner's byte size is only a target
+        // and cannot split a row, and `MergeValidationBudget` owns the one
+        // byte bound on everything validation retains.
         observed_rows = observed_rows
             .checked_add(batch.num_rows() as u64)
             .ok_or_else(|| {
@@ -3707,9 +3705,7 @@ async fn scan_proven_pure_inserts_for_validation(
                     "branch merge pure-insert validation row count overflow",
                 )
             })?;
-        crate::instrumentation::record_merge_validation_batch(batch_bytes);
-        budget.reserve_projected_batch(&batch)?;
-        output.push(batch);
+        output.push(budget.reserve_projected_batch(batch)?);
     }
     if observed_rows != proven.inserted_rows {
         return Err(OmniError::manifest_internal(format!(
@@ -4293,6 +4289,7 @@ mod chain_limit_tests {
                         ids: vec!["id".to_string()],
                         row_ids: vec![0],
                         filter_bytes,
+                        max_filter_bytes: KEYED_WRITE_MAX_BYTES,
                     })
                     .collect(),
                 retained_bytes: 0,
@@ -4357,6 +4354,25 @@ mod chain_limit_tests {
             crate::table_store::write_batch_bytes(&chunk).unwrap().rows,
             bytes
         );
+    }
+
+    #[test]
+    fn branch_merge_delete_chunk_planned_under_raised_write_max_bytes_passes_its_own_bound() {
+        let settings = omnigraph_compiler::settings::SessionSettings::default()
+            .with("write_max_bytes", &(64 * 1024 * 1024).to_string())
+            .unwrap();
+        let mut chunks = DeleteIdChunks::new(
+            SYSTEM_COLUMNS_LEGACY.id,
+            WriteBudget::from_settings(&settings),
+        );
+        for (row, fill) in ['a', 'b', 'c'].into_iter().enumerate() {
+            chunks
+                .push(fill.to_string().repeat(12 * 1024 * 1024), row as u64)
+                .unwrap();
+        }
+        assert_eq!(chunks.chunk_count(), 1);
+        assert!(chunks.chunks[0].filter_bytes > KEYED_WRITE_MAX_BYTES);
+        chunks.chunks[0].delete_expr().unwrap();
     }
 
     #[test]
@@ -4777,12 +4793,11 @@ async fn next_exact_staged_chunk(
         let slice = slices.pop().expect("one slice");
         let usage = crate::table_store::write_batch_bytes(&slice)?;
         let retained = slice.get_array_memory_size() as u64;
-        let logical = crate::table_store::batch_slice_memory_size(&slice, 0, slice.num_rows())?;
         if !partial_batch
             && usage.rows <= write_budget.bytes()
             && usage.payload <= write_budget.bytes()
             && retained <= write_budget.bytes().saturating_mul(2)
-            && retained <= logical.saturating_add(64 * 1024)
+            && crate::table_store::batch_holds_only_its_rows(&slice)?
         {
             slice
         } else {

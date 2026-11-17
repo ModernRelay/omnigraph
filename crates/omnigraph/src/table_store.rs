@@ -8802,9 +8802,8 @@ fn next_proven_insert_batch(
         // ArrayData's logical slice measure excludes the backing capacity held
         // by an Arrow slice. Preserve an already-compact whole scanner batch,
         // but copy any selected prefix or obvious retained-parent emission.
-        let retained_parent_slop = 64_u64 * 1024;
         let keeps_only_logical_slice =
-            retained_bytes <= logical_bytes.saturating_add(retained_parent_slop);
+            retained_bytes <= logical_bytes.saturating_add(RETAINED_PARENT_SLOP_BYTES);
         let retained_usage = write_batch_bytes(batch)?;
         let candidate = if is_whole_batch
             && retained_usage.rows <= write_budget.bytes()
@@ -8924,6 +8923,35 @@ fn finish_proven_insert_batch(
     };
     validate_proven_insert_source_batch(&batch, table_key, write_budget)?;
     Ok(batch)
+}
+
+/// Backing bytes a batch may hold beyond its own rows' buffers and still be
+/// kept as it is rather than copied.
+pub(crate) const RETAINED_PARENT_SLOP_BYTES: u64 = 64 * 1024;
+
+/// Whether `batch` holds little more than its own rows' buffers. An Arrow
+/// slice keeps every buffer of its parent alive, and `get_array_memory_size`
+/// counts them all; the logical measure counts only the slice's rows.
+pub(crate) fn batch_holds_only_its_rows(batch: &RecordBatch) -> Result<bool> {
+    let retained = u64::try_from(batch.get_array_memory_size())
+        .map_err(|_| OmniError::manifest_internal("retained batch bytes exceed u64"))?;
+    let logical = batch_slice_memory_size(batch, 0, batch.num_rows())?;
+    Ok(retained <= logical.saturating_add(RETAINED_PARENT_SLOP_BYTES))
+}
+
+/// `batch` as it will be kept, and the Arrow bytes it then holds: the batch
+/// itself when it holds only its rows, otherwise a copy of them. A caller
+/// that retains batches charges this size, so the charge is what the batch
+/// keeps alive and does not depend on how a scan happened to share buffers.
+pub(crate) fn compact_retained_batch(batch: RecordBatch) -> Result<(RecordBatch, u64)> {
+    let batch = if batch_holds_only_its_rows(&batch)? {
+        batch
+    } else {
+        copy_batch_range(&batch, 0, batch.num_rows())?
+    };
+    let bytes = u64::try_from(batch.get_array_memory_size())
+        .map_err(|_| OmniError::manifest_internal("retained batch bytes exceed u64"))?;
+    Ok((batch, bytes))
 }
 
 /// `rows` rows of `batch` from `offset`, copied into buffers of their own: an

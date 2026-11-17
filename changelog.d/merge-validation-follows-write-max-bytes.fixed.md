@@ -1,1 +1,1 @@
-- A three-way `branch merge` whose retained validation delta passes 32 MiB can now run: a `write_max_bytes` above 32 MiB raises that allowance too.
+- A three-way `branch merge` past 32 MiB of validation delta can now run under a higher `write_max_bytes`, on every merge path, charged for the rows it keeps.
