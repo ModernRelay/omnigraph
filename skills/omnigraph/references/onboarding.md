@@ -230,26 +230,66 @@ Check each command's `--help` if the installed CLI differs. See
 
 ## 8. Leave the project ready for the next session
 
-The graph is only useful if every later session uses it: an agent that does
-not know about it answers from memory and keeps facts in chat or notes, and the
-graph falls out of date. Write an agent file that makes it the canonical store
-for what it holds.
+An agent that does not know a graph exists answers from memory and keeps facts
+in chat or notes, and the graph falls behind. Make every later session find the
+graph, read it first and write back to it.
 
-- Write `AGENTS.md` in the project, which most coding agents read, and for
-  Claude Code a `CLAUDE.md` whose only line is `@AGENTS.md`. Adapt this
-  section, filling in the use case, the user's questions from step 3, the
-  cookbook it started from if any, and the real paths and `--target`:
+- **Name the graph**, so `omnigraph target list` shows it in every session and
+  directory. Pick a short name for what it holds (`brain` below). Tell the user
+  first: `target add` rewrites `~/.omnigraph/config.yaml` and drops its
+  comments.
+
+  ```bash
+  echo "{\"kind\":\"direct\",\"scope\":\"graph\",\"uri\":\"file://$PWD/graph.omni\"}" \
+    | omnigraph target add brain
+  omnigraph target list
+  ```
+
+- **The user's global agent file.** Ask to add this section to
+  `~/.claude/CLAUDE.md` (Claude Code) or `~/.codex/AGENTS.md` (Codex). It
+  covers all their graphs, not only this one, and changes every session they
+  run. If the section is already there, add the new graph to its list.
+
+  ```markdown
+  ## Omnigraph: my graphs are context and durable memory
+
+  My Omnigraph graphs hold knowledge and state that outlast a session. They
+  are the targets in `~/.omnigraph/config.yaml`:
+
+  - `brain`: <what it holds>
+
+  Rules:
+
+  - At the start of every session, run `omnigraph target list` to see which
+    graphs exist. Do at least this, even when the task looks unrelated.
+  - Read a graph's schema before querying or writing it:
+    `omnigraph schema show --target <name>`. A server target can hold several
+    graphs; `omnigraph graphs list --target <name>` lists them for `--graph`.
+  - Pull context first: when a request touches anything a graph holds, query
+    it and answer from what it returns. If it returns nothing, say so.
+  - Write back what should last: offer to record facts, decisions and state
+    worth keeping beyond this session in the graph, not in chat, notes or
+    memory files. Look the entity up by its key first, write on a branch, and
+    merge into main only after I approve.
+  - Load the omnigraph skill (`omnigraph skill show`) before changing a
+    schema, bulk loading, or retrying a write whose outcome is unknown.
+  ```
+
+- **The project's agent file.** Write `AGENTS.md`, which most coding agents
+  read, and for Claude Code a `CLAUDE.md` whose only line is `@AGENTS.md`.
+  Fill in the use case, the user's questions from step 3, the cookbook it
+  started from if any, and the target's name:
 
   ```markdown
   ## Omnigraph: the canonical store for <what it holds>
 
   <One sentence on what the graph is for.> It answers questions such as:
   <the user's questions>. Facts about <people, projects, decisions…> live in
-  the graph at `--target ./graph.omni`, not in chat, notes or this file.
+  the graph at `--target brain`, not in chat, notes or this file.
 
   - Read the schema before any query or write:
-    `omnigraph schema show --target ./graph.omni`. Use only the types,
-    properties and edges it declares. Queries are in `queries.gq`.
+    `omnigraph schema show --target brain`. Use only the types, properties
+    and edges it declares. Queries are in `queries.gq`.
   - Pull context first: when a request touches anything the graph holds,
     query it and answer from what it returns. If it returns nothing, say so
     instead of guessing.
@@ -257,20 +297,15 @@ for what it holds.
     should hold, or you find one it lacks or contradicts, offer to add it.
     Look the entity up by its key before creating another.
   - Write on a branch, never straight to main: `omnigraph branch create
-    agent/<topic> --target ./graph.omni`, then `mutate` or `load` with
+    agent/<topic> --target brain`, then `mutate` or `load` with
     `--branch agent/<topic>`. Show the user `omnigraph branch diff
-    agent/<topic> --target ./graph.omni`, and merge with `omnigraph branch
-    merge agent/<topic> --into main --delete-branch --target ./graph.omni`
-    only after they approve.
+    agent/<topic> --target brain`, and merge with `omnigraph branch merge
+    agent/<topic> --into main --delete-branch --target brain` only after
+    they approve.
   - Load the omnigraph skill (`omnigraph skill show`) before changing the
     schema, bulk loading, or retrying a write whose outcome is unknown.
   ```
 
-- If the graph should be the canonical store outside this project too, as a
-  second brain or a company brain usually is, offer to add the same section to
-  the user's global agent file (`~/.claude/CLAUDE.md` for Claude Code,
-  `~/.codex/AGENTS.md` for Codex), with the graph's absolute path as the
-  `--target`. Ask first: it changes every session they run.
 - Add `.env.omni`, `.claude/` and `*.omni/` to `.gitignore`; commit
   `schema.pg`, `queries.gq`, `seed.jsonl` and the agent files (see
   [what to commit](../SKILL.md#what-to-commit)).
@@ -283,7 +318,10 @@ which one fails if one does:
 - `omnigraph lint --schema schema.pg --query <file>` passes for every query
   file (`queries.gq`, or each file in a cookbook's `queries/`).
 - Each query from step 4 returns rows from the graph.
-- `AGENTS.md` names the use case and the `--target`, and carries the
+- `omnigraph target list` shows the graph under its name.
+- The global agent file lists the graph and carries the rules above, or the
+  user declined.
+- The project's `AGENTS.md` names the use case and the target, and carries the
   canonical-store rules: read the schema, pull context first, suggest writes,
   write on a branch.
 
@@ -357,8 +395,9 @@ omnigraph studio --target local --graph knowledge
 `--graph` is required: a server without a cluster policy refuses to list its
 graphs. Without Studio installed, `omnigraph studio` prints the link and fails
 with `studio_unavailable`. `./served` is a second graph, so writes through
-`--target local` land there, not in `./graph.omni`; if the user keeps it, point
-the agent file's `--target` at it and add `served/` to `.gitignore`. See
+`--target local` land there, not in `./graph.omni`; if the user keeps it, use
+`local` instead of `brain` in both agent files and add `served/` to
+`.gitignore`. See
 [Open Studio](../../../docs/user/cli/studio.md) and [cluster](cluster.md).
 
 ### Show the user things in Studio
