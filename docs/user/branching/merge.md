@@ -215,8 +215,14 @@ removed ids.
 
 Those keys are limited to 32 MiB per merge, counted as the bytes of their
 values (a string's length, plus 4 bytes; a null counts nothing), whatever
-buffers storage returned them in. The limit is fixed: `write_max_bytes` and
-`query_memory_bytes` do not change it.
+buffers storage returned them in. The checks hold each key in lookup tables of
+their own, so their memory is several times this count, not bounded by it.
+The limit is fixed: `write_max_bytes` and `query_memory_bytes` do not change
+it. The check sets no bound of its own on a row's width. A merge that writes
+rows (for a table both branches changed) keeps its own `write_max_bytes`
+allowance, as any write does, so a row wider than 32 MiB, written under a
+raised value, needs that value again; a merge that adopts the source's table
+by pointer writes no row.
 It applies to the whole delta since the merge base, however the source's
 commits were chunked, so a branch whose every load fit its own bounds can
 still reach it. A merge past the limit publishes nothing and fails with

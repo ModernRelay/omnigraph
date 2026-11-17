@@ -248,11 +248,12 @@ impl WriteJudge {
 /// One sweep of a staged write's deltas, a batch at a time: each table's
 /// batches are observed once in source order, every check's facts are
 /// extracted while the batch is hot, and the batch is then let go. What stays
-/// is the facts and the few columns the judgment reads again after the sweep
-/// ([`Sweep::fact_columns`]), so a row's other values are never held past
-/// their batch. The routes that hold their batches in memory
-/// ([`WriteJudge::judge_batches`]) and a branch merge, which streams its
-/// delta from storage, share it.
+/// is the facts and the few columns the judgment reads again after the sweep,
+/// all derived from the key columns ([`Sweep::fact_columns`]), so a row's
+/// other values are never held past their batch. The routes that hold their
+/// batches in memory ([`WriteJudge::judge_batches`], [`Sweep::new`]) and a
+/// branch merge, which streams its delta from storage ([`Sweep::streamed`]),
+/// share it.
 ///
 /// Tables are swept in the judge's order and a table's batches in its source
 /// order, so every fact keeps the position one pass over the whole delta
@@ -271,10 +272,29 @@ pub(crate) struct Sweep<'j> {
     /// read ([`retained_columns`]); empty when the judgment reads none.
     retained_columns: Vec<Vec<&'static str>>,
     retained: Vec<Vec<RecordBatch>>,
+    /// Whether a kept column is copied out of its batch: a streamed batch is
+    /// freed after the sweep, and a column of it kept as a zero-copy slice
+    /// would pin the scan's whole decode buffer, which a Lance scan can share
+    /// between batches; an in-memory route's caller holds every batch
+    /// anyway.
+    copy_kept: bool,
 }
 
 impl<'j> Sweep<'j> {
+    /// A sweep of batches the caller holds until the judgment ends: a kept
+    /// column is a zero-copy projection of its batch.
     pub(crate) fn new(judge: &'j WriteJudge) -> Self {
+        Self::with_copy_kept(judge, false)
+    }
+
+    /// A sweep of batches read from storage and freed as it goes: a kept
+    /// column is copied into buffers of its own ([`copy_batch_range`]), so
+    /// what stays is its rows' bytes alone.
+    pub(crate) fn streamed(judge: &'j WriteJudge) -> Self {
+        Self::with_copy_kept(judge, true)
+    }
+
+    fn with_copy_kept(judge: &'j WriteJudge, copy_kept: bool) -> Self {
         let plans: Vec<SweepPlan> = (0..judge.tables.len())
             .map(|index| judge.sweep_plan(index, 1))
             .collect();
@@ -288,6 +308,7 @@ impl<'j> Sweep<'j> {
             retained: plans.iter().map(|_| Vec::new()).collect(),
             retained_columns,
             plans,
+            copy_kept,
         }
     }
 
@@ -296,7 +317,9 @@ impl<'j> Sweep<'j> {
     /// fact is), each uniqueness group's columns, an edge's source under
     /// `@card`, and the columns retained for the judgment's second read. A
     /// column that only a value check reads is judged within its batch and
-    /// outlives none, so the facts of a delta grow with these columns alone.
+    /// outlives none, so the facts of a delta grow with these columns alone:
+    /// in proportion to their bytes, not within them, since each fact copies
+    /// its key into owned strings and hash entries of its own.
     pub(crate) fn fact_columns(&self, index: usize) -> Vec<&str> {
         fn keep<'c>(columns: &mut Vec<&'c str>, column: &'c str) {
             if !columns.contains(&column) {
@@ -324,9 +347,13 @@ impl<'j> Sweep<'j> {
         columns
     }
 
-    /// The bytes of `batch`'s [`Self::fact_columns`] the sweep keeps past it:
-    /// each column's non-null values ([`value_bytes`]). A route that streams
-    /// its delta charges this before it observes the batch.
+    /// The bytes of `batch`'s [`Self::fact_columns`], the keys its facts are
+    /// derived from: each column's non-null values
+    /// ([`crate::table_store::column_logical_bytes`]). The memory the facts
+    /// take is proportional to this count, not bounded by it: a short id
+    /// costs a `String` header and hash slots in each fact that keeps it,
+    /// several times its own bytes. A route that streams its delta charges
+    /// this before it observes the batch.
     pub(crate) fn fact_bytes(&self, index: usize, batch: &RecordBatch) -> Result<u64> {
         let mut bytes = 0_u64;
         for name in self.fact_columns(index) {
@@ -337,14 +364,18 @@ impl<'j> Sweep<'j> {
                 ))
             })?;
             bytes = bytes
-                .checked_add(u64::try_from(value_bytes(column.as_ref())).unwrap_or(u64::MAX))
+                .checked_add(
+                    u64::try_from(crate::table_store::column_logical_bytes(column.as_ref()))
+                        .unwrap_or(u64::MAX),
+                )
                 .ok_or_else(|| OmniError::manifest_internal("validation byte count overflow"))?;
         }
         Ok(bytes)
     }
 
     /// Sweep one batch of table `index`; the table's batches arrive in source
-    /// order. Of the batch only its [`retained_columns`] stay.
+    /// order. Of the batch only its [`retained_columns`] stay, copied out of
+    /// it on a [`Sweep::streamed`] sweep.
     pub(crate) fn observe(&mut self, index: usize, batch: &RecordBatch) -> Result<()> {
         if index >= self.plans.len() {
             return Err(OmniError::manifest_internal(format!(
@@ -374,7 +405,13 @@ impl<'j> Sweep<'j> {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            self.retained[index].push(batch.project(&indices).map_err(OmniError::arrow_internal)?);
+            let kept = batch.project(&indices).map_err(OmniError::arrow_internal)?;
+            let kept = if self.copy_kept {
+                crate::table_store::copy_batch_range(&kept, 0, kept.num_rows())?
+            } else {
+                kept
+            };
+            self.retained[index].push(kept);
         }
         Ok(())
     }
@@ -444,67 +481,6 @@ impl<'j> Sweep<'j> {
             .collect();
         judge_write_swept(judge, db, deltas, admission).await
     }
-}
-
-/// The bytes of `batch`'s rows, column by column as [`value_bytes`] counts
-/// them: what a batch holds of its values, whatever buffers a scan decoded
-/// them into.
-pub(crate) fn batch_value_bytes(batch: &RecordBatch) -> u64 {
-    batch.columns().iter().fold(0_u64, |total, column| {
-        total.saturating_add(u64::try_from(value_bytes(column.as_ref())).unwrap_or(u64::MAX))
-    })
-}
-
-/// The bytes of `column`'s rows a fact can copy: every non-null value's bytes
-/// plus the column's offsets or views and its validity, so a null counts no
-/// value bytes whatever range its offsets span. A scan may return a null
-/// whose offsets cover a neighbouring row's bytes in a shared decode buffer,
-/// which the slice size and the allocation both count; no fact copies a
-/// null. A fixed-width or nested column counts its slice
-/// (`get_slice_memory_size`), or its whole allocation where that is
-/// unavailable.
-fn value_bytes(column: &dyn Array) -> usize {
-    use arrow_array::cast::AsArray;
-    use arrow_schema::DataType;
-
-    fn sum(lengths: impl Iterator<Item = usize>) -> usize {
-        lengths.fold(0, usize::saturating_add)
-    }
-    let rows = column.len();
-    let validity = column.nulls().map_or(0, |_| rows.div_ceil(8));
-    let (values, framing) = match column.data_type() {
-        DataType::Utf8 => (
-            sum(column.as_string::<i32>().iter().flatten().map(str::len)),
-            rows.saturating_add(1).saturating_mul(4),
-        ),
-        DataType::LargeUtf8 => (
-            sum(column.as_string::<i64>().iter().flatten().map(str::len)),
-            rows.saturating_add(1).saturating_mul(8),
-        ),
-        DataType::Utf8View => (
-            sum(column.as_string_view().iter().flatten().map(str::len)),
-            rows.saturating_mul(16),
-        ),
-        DataType::Binary => (
-            sum(column.as_binary::<i32>().iter().flatten().map(<[u8]>::len)),
-            rows.saturating_add(1).saturating_mul(4),
-        ),
-        DataType::LargeBinary => (
-            sum(column.as_binary::<i64>().iter().flatten().map(<[u8]>::len)),
-            rows.saturating_add(1).saturating_mul(8),
-        ),
-        DataType::BinaryView => (
-            sum(column.as_binary_view().iter().flatten().map(<[u8]>::len)),
-            rows.saturating_mul(16),
-        ),
-        _ => {
-            return column
-                .to_data()
-                .get_slice_memory_size()
-                .unwrap_or_else(|_| column.get_array_memory_size());
-        }
-    };
-    values.saturating_add(framing).saturating_add(validity)
 }
 
 /// The columns of table `index` the judgment reads after the sweep, which
@@ -1820,32 +1796,6 @@ mod tests {
     /// The slice key the source tags its batches with (`csv_source.rs`).
     fn slice_key(partition: usize, index: usize) -> usize {
         (partition << 32) | index
-    }
-
-    /// A fact column counts its non-null values: a null whose offsets span a
-    /// neighbour's bytes in a shared buffer counts none of them, as no fact
-    /// copies it (#1427), and a fixed-width column counts its slice.
-    #[test]
-    fn value_bytes_count_non_null_values_not_their_buffers_issue_1427() {
-        use arrow_array::Int64Array;
-        use datafusion::arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
-
-        let spanning_null = StringArray::new(
-            OffsetBuffer::new(vec![0_i32, 5, 10].into()),
-            Buffer::from("aaaaabbbbb".as_bytes()),
-            Some(NullBuffer::from(vec![true, false])),
-        );
-        assert_eq!(
-            spanning_null.to_data().get_slice_memory_size().unwrap(),
-            10 + 2 * 4 + 1,
-            "the slice size counts the null's bytes"
-        );
-        assert_eq!(value_bytes(&spanning_null), 5 + 3 * 4 + 1);
-        assert_eq!(
-            value_bytes(&StringArray::from(vec!["abc", "de"])),
-            5 + 3 * 4
-        );
-        assert_eq!(value_bytes(&Int64Array::from(vec![1, 2, 3])), 3 * 8);
     }
 
     #[test]

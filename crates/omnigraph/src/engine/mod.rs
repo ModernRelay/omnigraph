@@ -83,8 +83,7 @@ use run::{pass_rows, run_plan};
 #[cfg(test)]
 pub(crate) use scan::lance_filter_support;
 pub(crate) use scan::{
-    MAX_NULL_SPLIT_COLUMNS, PIPELINED_IO_BUFFER_BYTES, PIPELINED_READAHEAD,
-    exceeds_null_split_columns, id_in_list_expr, ir_expr_to_df_expr,
+    MAX_NULL_SPLIT_COLUMNS, exceeds_null_split_columns, id_in_list_expr, ir_expr_to_df_expr,
 };
 pub(crate) use search::referenced_edge_types;
 

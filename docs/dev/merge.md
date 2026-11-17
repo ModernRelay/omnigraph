@@ -186,40 +186,54 @@ the target plus the complete selected delta.
 the target's pinned version (`plan_write`, `WriteKind::BranchMerge`), with the
 exact row counts the staged delta datasets and the proven-insert intervals
 already hold, then streams each table's delta through the judge's one sweep
-(`validate::load::Sweep`): in judgment order, added rows before changed ones,
-projected to the scalar columns (vectors and Blobs are never read), in
-8,192-row and 32 MiB batches with Lance's read-ahead capped as an engine read
-caps it (`PIPELINED_READAHEAD`, `PIPELINED_IO_BUFFER_BYTES`). A batch is let go
-once the sweep has extracted its facts, so a value that only a row-local
-check reads (value, enum, `@range`, `@check`) is never retained, whatever its
-width. A source that yields other than its declared rows fails the merge.
+(`validate::load::Sweep::streamed`): in judgment order, added rows before
+changed ones, projected to the scalar columns (vectors and Blobs are never
+read), in 8,192-row and 32 MiB batches with Lance's read-ahead capped as an
+engine read caps it (`ScanTuning::pipelined`: `PIPELINED_READAHEAD`,
+`PIPELINED_IO_BUFFER_BYTES`; `fragment_readahead` keeps Lance's default). A
+batch is let go once the sweep has extracted its facts, so a value that only
+a row-local check reads (value, enum, `@range`, `@check`) is never retained,
+whatever its width. No batch has a byte bound of its own on either route: a
+row wider than 32 MiB was written under a raised `write_max_bytes`; a merge
+that writes it again (a staged chunk, or a proven-insert replay) bounds it by
+the merge's own captured allowance, and a pointer adoption writes no row. The
+proven-insert route keeps its 8,192-row bound per batch, and a source that
+yields other than its declared rows fails the merge.
 
 What the sweep keeps is what the cross-row checks judge across the whole
 delta at once: the facts keyed by the ids, each uniqueness group's values,
 an edge's source under `@card`, the id and endpoint columns of an edge table
 whose endpoint checks probe after the sweep, and the removed ids
-(`Sweep::fact_columns`). `MergeValidationBudget` charges those columns'
-value bytes as each batch is swept (`Sweep::fact_bytes`: every non-null
-value's bytes plus offsets and validity), and every removed id as it is
+(`Sweep::fact_columns`). A streamed sweep copies each kept column out of its
+batch (`copy_batch_range`), so a kept column never pins a decode buffer
+another batch shares. `MergeValidationBudget` charges those columns' bytes as
+each batch is swept (`Sweep::fact_bytes`), and every removed id as it is
 copied out of the delete plan, against `MERGE_VALIDATION_MAX_BYTES` (32 MiB);
 crossing it refuses the merge as `branch-merge retained validation key bytes`
-before the first effect. The charge measures the keys; the facts derived from
-them (hash entries, owned strings) are proportional to the keys and are not
-separately accounted, as for the other staged routes.
+before the first effect. The charge limits the keys validation takes in; the
+memory of the facts built from them is proportional to that count, not bounded
+by it. Each fact copies its key into an owned string and hash entries of its
+own, so a short id costs about ten times its bytes; the other staged routes
+leave the same facts unaccounted.
 
 The charge counts values, not buffers, because Arrow lets a null string own
 bytes and a Lance 13 scan returns such nulls: two rows of one fragment, a
 wide value and a null, can come back as two one-row batches over one decode
 buffer, the null's offsets spanning the wide value, so its slice size and
-its allocation both count the wide value again. The proven-insert scan's
-per-batch bound reads the same value bytes. Publication rebuilds a planned
-chunk the scan returned as several batches by copying each with `take`,
-which copies valid values only, before concatenating them, since `concat`
-copies every slot's offset range and would carry the null's span past the
-bound the chunk's rows were planned under
-(`next_exact_staged_chunk`).
+its allocation both count the wide value again. `table_store` owns the two
+answers: `column_logical_bytes` (with `batch_logical_bytes`) counts what a
+batch's rows hold, every non-null value plus offsets or views and validity,
+and `copy_batch_range` copies rows with `take`, which copies valid values
+alone. `batch_slice_memory_size` counts every slot's offset range, which is
+what a `concat` copies. Publication rebuilds a planned chunk the scan returned
+as several batches by copying each with `copy_batch_range` before
+concatenating them (`next_exact_staged_chunk`), and copies a single slice
+whose buffers hold more than its logical bytes. The proven-insert
+publication still plans its prefixes by `batch_slice_memory_size`, which
+subtracts each Blob payload's offset range: a null's span there can only
+shrink a chunk, never refuse one.
 
-The budget is fixed. It bounds validation's resident state, not a write, so
+The budget is fixed. It limits what validation keeps, not a write, so
 `write_max_bytes`, which a pointer adoption that writes no row never meets,
 does not move it. It applies to the whole delta since the merge base. The
 supported route past it is a merge in stages: a branch created at an
@@ -230,7 +244,8 @@ uniqueness and `@card` partition cleanly by their key and source, while the
 exemptions that consult the delta's ids (a committed holder or edge the delta
 itself changes or removes) and endpoint settlement need either the whole id
 set or a probe of the staged delta datasets by id. The sweep reads every
-source from storage, so such passes can read it again.
+source from storage, so such passes can read it again, and exact accounting
+of each pass's facts against the query memory pool fits there.
 
 ## Cost model
 
@@ -433,14 +448,16 @@ structured error; it cannot replace the successful merge receipt. See
   while keys past 32 MiB refuse before arm
   (`branch_merge_validation_delta_is_aggregate_bounded_pre_arm`).
 - `crates/omnigraph/src/validate/load.rs` — the judge's sweep (`Sweep`) the merge
-  streams its delta through, and the value bytes it charges
-  (`value_bytes_count_non_null_values_not_their_buffers_issue_1427`); in
+  streams its delta through; `table_store.rs` owns the bytes it charges and
+  the copies it keeps
+  (`column_logical_bytes_count_values_not_their_buffers_issue_1427`); in
   `exec/merge.rs`, `staged_publication_copies_no_bytes_a_null_spans_issue_1427`
   owns the publication rebuild. The `.gqt` cases
   `issue_1427_three_way_merge_past_validation_budget.gqt`,
+  `issue_1427_wide_row_merges_on_the_proven_insert_route.gqt`,
   `issue_1427_merge_rows_sharing_a_fragment_with_nulls.gqt` and
   `issue_1427_merge_in_stages_past_validation_key_limit.gqt` own the merge's
-  observable validation limit and the staged recovery.
+  observable validation limit on both routes and the staged recovery.
 - `crates/omnigraph/tests/integration/branching.rs` — branch identity and Blob behavior.
 - `crates/omnigraph/tests/integration/merge_cost.rs` — delta scope and manifest-history
   cost contracts, not semantics.

@@ -23,10 +23,10 @@ const DELETE_FILTER_IN: &str = " IN (";
 const DELETE_FILTER_SEPARATOR: &str = ", ";
 const DELETE_FILTER_SUFFIX: &str = ")";
 /// The merge validator streams the delta and keeps only what its cross-row
-/// checks judge across the whole delta at once: the key columns of the rows
-/// and the removed ids ([`MergeValidationBudget`]). Those stay resident until
-/// judgment ends, so their operation-wide total is bounded independently of
-/// the per-transaction keyed-write chunks.
+/// checks judge across the whole delta at once, derived from the key columns
+/// of the rows and the removed ids ([`MergeValidationBudget`]). Those stay
+/// resident until judgment ends, so the keys' operation-wide total is limited
+/// independently of the per-transaction keyed-write chunks.
 const MERGE_VALIDATION_MAX_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 const MERGE_VALIDATION_RESOURCE: &str = "branch-merge retained validation key bytes";
 /// Maximum detached chunk commits one table may chain in a single merge. The
@@ -3390,10 +3390,13 @@ fn classify_merge_conflict(
 /// value bytes as each batch is swept
 /// ([`crate::validate::load::Sweep::fact_bytes`]), and each removed id as it
 /// is copied, so a delta whose keys exceed it is refused before the first
-/// effect.
+/// effect. It limits the keys validation takes in, not the memory it uses:
+/// the facts built from the keys (owned strings, hash entries, a copy per
+/// check that reads them) take a multiple of the keys' bytes, proportional to
+/// them but not bounded by this count.
 ///
-/// The ceiling is fixed: it bounds validation's resident state, not a write,
-/// so `write_max_bytes` (which a pointer adoption that writes no row does not
+/// The ceiling is fixed: it limits what validation keeps, not a write, so
+/// `write_max_bytes` (which a pointer adoption that writes no row does not
 /// meet) does not move it. It applies to the whole delta since the merge
 /// base, however the source's commits were chunked; a larger delta merges in
 /// stages, through a branch at an intermediate source commit merged first.
@@ -3624,7 +3627,8 @@ async fn sweep_validation_rows(
 ) -> Result<()> {
     // Lance decodes and fetches ahead of the consumer outside any budget,
     // by default up to 32 MiB per I/O thread; cap both as an engine read
-    // does, so the sweep holds about one batch in flight, not the delta.
+    // does (`ScanTuning::pipelined`), so the sweep holds about one batch in
+    // flight, not the delta.
     let (dataset, fragments) = match rows {
         ValidationRows::Staged(table) => (&table.dataset, None),
         ValidationRows::ProvenInserts(proven) => match &proven.interval {
@@ -3645,8 +3649,7 @@ async fn sweep_validation_rows(
             }
             scanner.batch_size(KEYED_WRITE_MAX_ROWS);
             scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
-            scanner.batch_readahead(crate::engine::PIPELINED_READAHEAD);
-            scanner.io_buffer_size(crate::engine::PIPELINED_IO_BUFFER_BYTES);
+            scanner.pipelined();
             Ok(())
         },
     )
@@ -3667,16 +3670,13 @@ async fn sweep_validation_rows(
                 batch.num_rows() as u64,
             ));
         }
-        // The batch's values, not its decode buffers: a scan can hand back a
-        // null whose offsets span a neighbour's bytes in a shared buffer.
-        let value_bytes = crate::validate::load::batch_value_bytes(&batch);
-        if proven && value_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                format!("branch-merge pure-insert validation batch bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                value_bytes,
-            ));
-        }
+        // No byte bound per batch, on either route: the sweep frees the batch
+        // once its facts are extracted, `MergeValidationBudget` limits the
+        // keys it keeps, and the scanner's byte size is a target that cannot
+        // split a row. A row wider than 32 MiB was written under a raised
+        // `write_max_bytes`; a merge that writes it again bounds it by its own
+        // captured allowance, and one that adopts the table by pointer writes
+        // no row.
         observed_rows = observed_rows
             .checked_add(batch.num_rows() as u64)
             .ok_or_else(|| {
@@ -4812,11 +4812,15 @@ async fn next_exact_staged_chunk(
             *carry = Some(batch.slice(take, batch.num_rows() - take));
         }
     }
+    // A scan can return a null whose offsets span a neighbour's bytes in a
+    // shared decode buffer. `concat` copies every slot's offset range and
+    // would carry those bytes into the chunk, past the bound its rows were
+    // planned under; a copy (`copy_batch_range`) holds valid values alone.
     let chunk = if slices.len() == 1 {
         let slice = slices.pop().expect("one slice");
         let usage = crate::table_store::write_batch_bytes(&slice)?;
         let retained = slice.get_array_memory_size() as u64;
-        let logical = crate::table_store::batch_slice_memory_size(&slice, 0, slice.num_rows())?;
+        let logical = crate::table_store::batch_logical_bytes(&slice);
         if !partial_batch
             && usage.rows <= write_budget.bytes()
             && usage.payload <= write_budget.bytes()
@@ -4825,22 +4829,12 @@ async fn next_exact_staged_chunk(
         {
             slice
         } else {
-            let indices = UInt64Array::from_iter_values(0..slice.num_rows() as u64);
-            arrow_select::take::take_record_batch(&slice, &indices)
-                .map_err(OmniError::arrow_internal)?
+            crate::table_store::copy_batch_range(&slice, 0, slice.num_rows())?
         }
     } else {
-        // `concat` copies each slice's whole offset range, so a null that a
-        // scan decoded spanning a neighbour's bytes in a shared buffer would
-        // carry them into the chunk, past the bound its rows were planned
-        // under. `take` copies valid values only; copy each slice first.
         let compact = slices
             .iter()
-            .map(|slice| {
-                let indices = UInt64Array::from_iter_values(0..slice.num_rows() as u64);
-                arrow_select::take::take_record_batch(slice, &indices)
-                    .map_err(OmniError::arrow_internal)
-            })
+            .map(|slice| crate::table_store::copy_batch_range(slice, 0, slice.num_rows()))
             .collect::<Result<Vec<_>>>()?;
         drop(slices);
         arrow_select::concat::concat_batches(schema, &compact).map_err(OmniError::arrow_internal)?
@@ -6460,7 +6454,7 @@ impl Omnigraph {
             report: Report::Every,
             repeat: RepeatRule::for_write(WriteKind::BranchMerge),
         };
-        let mut sweep = Sweep::new(&judge);
+        let mut sweep = Sweep::streamed(&judge);
         for (index, delta) in deltas.iter().enumerate() {
             if judge.tables[index].table != delta.table_key {
                 return Err(OmniError::manifest_internal(format!(
