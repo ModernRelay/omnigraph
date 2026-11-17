@@ -723,13 +723,9 @@ where
         })?;
     u32::try_from(src_ids.len())
         .map_err(|_| OmniError::manifest_internal("expand source ordinal exceeds UInt32"))?;
-    // A bound source is a node the frontier holds, and a node's id is never
-    // null: a null here is an integrity fault, refused rather than dropped.
-    if src_ids.null_count() > 0 {
-        return Err(OmniError::manifest_internal(format!(
-            "bound expand frontier has a null '{src_name}'"
-        )));
-    }
+    // A null source is a node an `optional` left null on a row with no
+    // match: it reaches nothing, so its row takes no group and expands to
+    // no pair (`Expand` over a null reference, the GQ 3 RFC, section 2).
     // The source groups, each group's wide rows (`group_starts` into
     // `group_rows`, in row order) and one owned key per group.
     super::operators::KeyGroups::charge(&source_memory, src_ids.len())

@@ -1,0 +1,68 @@
+# issue: none
+# notes: A traversal from, or to, a node an `optional` introduces: a row whose
+# notes: optional matched nothing holds a null node, which reaches nothing, so the row is
+# notes: dropped. Found by the generated engine-equals-reference
+# notes: law (law_engine_reference.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+    p0: I64?
+}
+edge Rel0: A -> A
+
+--- seed
+{"type":"A","data":{"k":"a","p0":0}}
+{"type":"A","data":{"k":"b","p0":1}}
+{"type":"A","data":{"k":"c"}}
+{"edge":"Rel0","from":"a","to":"c","data":{}}
+{"edge":"Rel0","from":"c","to":"b","data":{}}
+{"edge":"Rel0","from":"b","to":"b","data":{}}
+
+--- query
+query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2 where $n2.p0 is null }, $n2 $k4:rel0 $n5 }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}
+
+--- expect unordered
+{"a":"a","b":"c","c":"b"}
+
+--- expect shape
+a: String
+b: String?
+c: String?
+
+--- query
+query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2 where $n2.p0 is null }, $n2 rel0{1,2} $n5 }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}
+
+--- expect unordered
+{"a":"a","b":"c","c":"b"}
+
+--- expect shape
+a: String
+b: String?
+c: String?
+
+--- query
+query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2 where $n2.p0 is null }, $n5 rel0 $n2 }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}
+
+--- expect unordered
+{"a":"a","b":"c","c":"a"}
+
+--- expect shape
+a: String
+b: String?
+c: String?
