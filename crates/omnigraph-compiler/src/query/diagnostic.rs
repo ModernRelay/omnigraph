@@ -66,6 +66,63 @@ pub enum QueryDiagnosticKind {
     Execution,
 }
 
+thread_local! {
+    /// The line indexes of the sources whose scopes are open on this thread,
+    /// innermost last (a parse can reparse inside itself).
+    static LINE_INDEXES: std::cell::RefCell<Vec<LineIndex>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many positions this thread computed by reading the source's
+    /// prefix, outside any [`LineIndex::scope`].
+    pub(crate) static PREFIX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The byte offset where each line of a source starts, computed once.
+pub(crate) struct LineIndex {
+    /// The source's address and length: while its scope is open the source
+    /// is borrowed, so these name that text and no other.
+    source: (usize, usize),
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    fn serves(&self, source: &str) -> bool {
+        self.source == (source.as_ptr() as usize, source.len())
+    }
+
+    /// The 1-based line holding `byte` and the offset where it starts.
+    fn line_of(&self, byte: usize) -> (usize, usize) {
+        let line = self.starts.partition_point(|start| *start <= byte);
+        (line, self.starts[line - 1])
+    }
+
+    /// Run `f` with `source`'s line index installed: every
+    /// [`Position::at`] over `source` inside `f` reads it.
+    pub(crate) fn scope<T>(source: &str, f: impl FnOnce() -> T) -> T {
+        let starts = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(n, _)| n + 1))
+            .collect();
+        LINE_INDEXES.with(|indexes| {
+            indexes.borrow_mut().push(LineIndex {
+                source: (source.as_ptr() as usize, source.len()),
+                starts,
+            })
+        });
+        // Removed on unwind too, so no index outlives its borrow.
+        struct Pop;
+        impl Drop for Pop {
+            fn drop(&mut self) {
+                LINE_INDEXES.with(|indexes| indexes.borrow_mut().pop());
+            }
+        }
+        let _pop = Pop;
+        f()
+    }
+}
+
 /// A source position: 1-based line and column (in characters) plus the byte
 /// offset the parser reported (saturated; a query source is never that long).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -80,18 +137,35 @@ impl Position {
     /// the end positions at the end.
     /// An offset inside a multi-byte character positions at that
     /// character.
+    ///
+    /// Inside a [`LineIndex::scope`] for `source` the line is found by a
+    /// binary search over the line starts computed once for the scope, so a
+    /// parse that positions many refusals reads the source once, not once
+    /// per refusal; elsewhere the prefix is read.
     pub fn at(source: &str, byte: usize) -> Self {
         let mut byte = byte.min(source.len());
         while !source.is_char_boundary(byte) {
             byte -= 1;
         }
-        let prefix = &source[..byte];
-        let line = prefix.matches('\n').count() + 1;
-        let column = prefix
-            .rsplit('\n')
-            .next()
-            .map_or(0, |last| last.chars().count())
-            + 1;
+        let (line, line_start) = LINE_INDEXES
+            .with(|indexes| {
+                indexes
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|index| index.serves(source))
+                    .map(|index| index.line_of(byte))
+            })
+            .unwrap_or_else(|| {
+                #[cfg(test)]
+                PREFIX_READS.with(|n| n.set(n.get() + 1));
+                let prefix = &source[..byte];
+                (
+                    prefix.matches('\n').count() + 1,
+                    prefix.rfind('\n').map_or(0, |n| n + 1),
+                )
+            });
+        let column = source[line_start..byte].chars().count() + 1;
         Self {
             line: u32::try_from(line).unwrap_or(u32::MAX),
             column: u32::try_from(column).unwrap_or(u32::MAX),

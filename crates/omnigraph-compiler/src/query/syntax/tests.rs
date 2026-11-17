@@ -2412,6 +2412,48 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query q() { match { $p: Person } where contains($p.name, "a") return { $p.name } }"#,
     ),
     (
+        r#"a missing comma after a string whose later line holds `//`"#,
+        "Q016",
+        r#"query q() {
+  match { $p: Person }
+  return {
+    $p.name
+    "a
+// b" as note
+  }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name, "a
+// b" as note } }"#,
+    ),
+    (
+        r#"a missing comma after an element ending in a string whose later line holds `//`"#,
+        "Q016",
+        r#"query q() {
+  match {
+    $p: Person
+    let $s = "x
+// y"
+    $p knows $q
+  }
+  return { $q.name, $s }
+}"#,
+        r#"query q() { match { $p: Person, let $s = "x
+// y", $p knows $q } return { $q.name, $s } }"#,
+    ),
+    (
+        r#"a missing comma after an element followed by a comment"#,
+        "Q016",
+        r#"query q() {
+  match {
+    $p: Person // the person
+    $p knows $q /* their friend */
+    $q knows $r
+  }
+  return { $r.name }
+}"#,
+        r#"query q() { match { $p: Person, $p knows $q, $q knows $r } return { $r.name } }"#,
+    ),
+    (
         r#"a missing comma between assignments"#,
         "Q016",
         r#"query w() {
@@ -2554,9 +2596,22 @@ fn a_parse_reports_a_bounded_number_of_refusals() {
         "query q() {{ match {{ $p: Person }} return {{ {} }} }}",
         items.join(", ")
     );
+    let before = crate::query::diagnostic::PREFIX_READS.with(|n| n.get());
     let refusals = super::parse::parse_source_all(&source).1;
-    assert!(!refusals.is_empty());
-    assert!(refusals.len() <= 256, "{}", refusals.len());
+    assert_eq!(refusals.len(), 256);
+    // Each refusal is positioned from the source's line index, never by
+    // reading the source up to it.
+    assert_eq!(
+        crate::query::diagnostic::PREFIX_READS.with(|n| n.get()),
+        before
+    );
+    let lines: Vec<_> = refusals.iter().map(|d| d.position.unwrap()).collect();
+    for p in &lines {
+        assert_eq!(
+            *p,
+            crate::query::diagnostic::Position::at(&source, p.byte as usize)
+        );
+    }
 }
 
 /// `text` as a source.

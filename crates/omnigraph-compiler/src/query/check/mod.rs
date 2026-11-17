@@ -154,6 +154,10 @@ fn source_unit<'d>(decls: &[&'d Decl]) -> HashMap<String, &'d Decl> {
 /// (`T81`) and the lowering admission (`T86`) are typing rules of the same
 /// pass.
 pub fn check_source_all(catalog: &Catalog, source: &str) -> Vec<QueryDiagnostic> {
+    crate::query::diagnostic::LineIndex::scope(source, || check_source_all_scoped(catalog, source))
+}
+
+fn check_source_all_scoped(catalog: &Catalog, source: &str) -> Vec<QueryDiagnostic> {
     if let Err(refused) = crate::query::depth::check_query_nesting(source) {
         return vec![refused];
     }

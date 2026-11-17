@@ -34,7 +34,7 @@ use crate::query::codes::{
     Q019, Q020, Q021, T83,
 };
 use crate::query::diagnostic::{
-    Applicability, Position, QueryCode, QueryDiagnostic, Suggestion, TextEdit,
+    Applicability, LineIndex, Position, QueryCode, QueryDiagnostic, Suggestion, TextEdit,
 };
 use crate::query::file::{FileBody, MutationWriteMode, QueryDecl, QueryFile, SyntaxDecl};
 use crate::query::syntax::{EdgeSelector, Traversal};
@@ -189,31 +189,85 @@ pub(super) fn edit(start: usize, end: usize, replacement: impl Into<String>) -> 
     }
 }
 
+/// A pair's byte range, from its first token to the end of its last
+/// ([`token_end`]).
 fn span_of(p: &Pair<Rule>) -> (usize, usize) {
-    (p.as_span().start(), p.as_span().end())
+    (p.as_span().start(), token_end(p))
 }
 
-/// A pair's [`SourceSpan`], its trailing whitespace left out.
+/// A pair's [`SourceSpan`], from its first token to its last.
 fn source_span(p: &Pair<Rule>) -> SourceSpan {
-    let input = input_of(p);
     let (start, end) = span_of(p);
-    SourceSpan::of(input, start, start + input[start..end].trim_end().len())
+    SourceSpan::of(input_of(p), start, end)
 }
 
-/// A pair's byte range, its trailing whitespace left out.
+/// A pair's byte range, from its first token to its last.
 fn written_range(p: &Pair<Rule>) -> (usize, usize) {
-    let start = p.as_span().start();
-    (start, start + p.as_str().trim_end().len())
+    span_of(p)
 }
 
-/// The end of a pair's last token: a pest span can end after the implicit
-/// whitespace a trailing repetition skipped.
-fn tend(input: &str, p: &Pair<Rule>) -> usize {
-    input[..p.as_span().end()].trim_end().len()
+/// The end of a pair's last token ([`token_end`]).
+fn tend(_input: &str, p: &Pair<Rule>) -> usize {
+    token_end(p)
 }
 
 fn input_of<'i>(p: &Pair<'i, Rule>) -> &'i str {
     p.as_span().get_input()
+}
+
+/// Where the last token of a parsed construct ends. A pair's span can run
+/// on over the whitespace and comments the grammar skipped before a
+/// lookahead that ends its rule; its tokens cannot. The construct's last
+/// inner pair's last token is found the same way (a string literal is a
+/// pair of its own), and what follows it inside the span holds only the
+/// punctuation and keywords the rule wrote, whitespace and comments, so the
+/// last of those that is not trivia ends the construct.
+fn token_end(p: &Pair<Rule>) -> usize {
+    let span = p.as_span();
+    // A pair with no inner pair is one token (a string literal, a keyword, a
+    // name): its text, whatever it holds, is not trivia.
+    if p.clone().into_inner().next().is_none() {
+        return span.start() + p.as_str().trim_end().len();
+    }
+    // An inner pair's span can run on over trivia too: its own last token
+    // is found the same way.
+    let after = p
+        .clone()
+        .into_inner()
+        .map(|inner| token_end(&inner))
+        .max()
+        .unwrap_or(span.start());
+    let tail = &input_of(p).as_bytes()[after..span.end()];
+    let mut end = 0;
+    let mut i = 0;
+    while i < tail.len() {
+        match (tail[i], tail.get(i + 1)) {
+            (b' ' | b'\t' | b'\r' | b'\n', _) => i += 1,
+            (b'/', Some(b'/')) => {
+                i = tail[i..]
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map_or(tail.len(), |n| i + n);
+            }
+            (b'/', Some(b'*')) => {
+                i = tail[i + 2..]
+                    .windows(2)
+                    .position(|w| w == b"*/")
+                    .map_or(tail.len(), |n| i + 2 + n + 2);
+            }
+            _ => {
+                i += 1;
+                end = i;
+            }
+        }
+    }
+    after + end
+}
+
+/// A parsed construct's text, from its first token to its last
+/// ([`token_end`]).
+fn token_text<'i>(p: &Pair<'i, Rule>) -> &'i str {
+    &input_of(p)[p.as_span().start()..token_end(p)]
 }
 
 /// `[start, end)` widened over the whitespace that follows it.
@@ -400,17 +454,19 @@ pub fn parse_source_all(input: &str) -> (Option<SourceFile>, Vec<QueryDiagnostic
             }
             Err(Refused::Builder(refusals)) => {
                 let room = MAX_PARSE_REFUSALS.saturating_sub(out.len());
-                for refused in refusals.into_iter().take(room) {
-                    let at = refused.span.map_or_else(
-                        || refused.diagnostic.position.map_or(0, |p| p.byte as usize),
-                        |(start, _)| start,
-                    );
-                    let region = super::recover::region_at(&text, at);
-                    out.push(spanned(
-                        &text,
-                        foreign::with_habits(&text, refused, structural_refusals, region),
-                    ));
-                }
+                LineIndex::scope(&text, || {
+                    for refused in refusals.into_iter().take(room) {
+                        let at = refused.span.map_or_else(
+                            || refused.diagnostic.position.map_or(0, |p| p.byte as usize),
+                            |(start, _)| start,
+                        );
+                        let region = super::recover::region_at(&text, at);
+                        out.push(spanned(
+                            &text,
+                            foreign::with_habits(&text, refused, structural_refusals, region),
+                        ));
+                    }
+                });
                 break;
             }
             Err(Refused::Grammar(first)) => {
@@ -450,9 +506,11 @@ pub fn parse_source_all(input: &str) -> (Option<SourceFile>, Vec<QueryDiagnostic
     // character into one space per byte, so a column counted in the
     // neutralized text can overcount: each line and column is counted again
     // in the source as written.
-    for d in &mut out {
-        reposition(input, d);
-    }
+    LineIndex::scope(input, || {
+        for d in &mut out {
+            reposition(input, d);
+        }
+    });
     (None, out)
 }
 
@@ -561,6 +619,10 @@ fn duplicate_declarations(input: &str, names: &[DeclName]) -> Vec<Refusal> {
 
 /// The file and each declaration's name span, in source order.
 fn structural(input: &str) -> std::result::Result<(SourceFile, Vec<DeclName>), Refused> {
+    LineIndex::scope(input, || structural_scoped(input))
+}
+
+fn structural_scoped(input: &str) -> std::result::Result<(SourceFile, Vec<DeclName>), Refused> {
     let pairs = QueryParser::parse(Rule::query_file, input)
         .map_err(|error| Refused::Grammar(grammar_error(input, error)))?;
     let file = pairs.into_iter().next().expect("grammar: one query_file");
@@ -2397,7 +2459,7 @@ fn top_level_or(e: &Pair<Rule>) -> bool {
 /// An expression's text as one conjunct of a `where`: parenthesized when
 /// its top level is an `or`.
 fn pred_text(e: &Pair<Rule>) -> String {
-    let text = e.as_str().trim().to_string();
+    let text = token_text(e).to_string();
     if top_level_or(e) {
         format!("({text})")
     } else {
@@ -2448,13 +2510,15 @@ impl Pieces {
     /// problem; returns the first element refused on its own (a foreign
     /// form, say).
     fn collect<'i>(&mut self, list: &Pair<'i, Rule>) -> Option<Pair<'i, Rule>> {
-        let input = input_of(list);
         let mut own = None;
         let mut gap: Option<usize> = None;
+        // Where the last element's last token ends: a missing comma goes
+        // there, before any comment or line break after it.
+        let mut last_end: Option<usize> = None;
         for c in list.clone().into_inner() {
             match c.as_rule() {
                 Rule::missing_comma_rec => {
-                    gap = Some(without_trailing_comments(&input[..c.as_span().start()]).len());
+                    gap = Some(last_end.unwrap_or(c.as_span().start()));
                 }
                 Rule::element => {
                     // A predicate written without a comma before it moves to
@@ -2474,6 +2538,7 @@ impl Pieces {
                             at,
                         );
                     }
+                    last_end = Some(token_end(&c));
                     if self.item(&c) && own.is_none() {
                         own = Some(c);
                     }
@@ -2611,8 +2676,7 @@ impl Pieces {
                     self.preds
                         .push(pred_text(&ik.clone().into_inner().next().unwrap()));
                 } else {
-                    self.elements
-                        .push(without_trailing_comments(inner.as_str().trim()).to_string());
+                    self.elements.push(token_text(&inner).to_string());
                 }
                 note_problem(
                     &mut self.problem,
@@ -2625,12 +2689,9 @@ impl Pieces {
             | Rule::from_clause
             | Rule::optional_block
             | Rule::binding
-            | Rule::traversal => self
-                .elements
-                .push(without_trailing_comments(e.as_str().trim()).to_string()),
+            | Rule::traversal => self.elements.push(token_text(e).to_string()),
             _ => {
-                self.elements
-                    .push(without_trailing_comments(e.as_str().trim()).to_string());
+                self.elements.push(token_text(e).to_string());
                 return true;
             }
         }
@@ -2653,41 +2714,6 @@ impl Pieces {
             out.push_str(&format!(" where {}", self.preds.join(" and ")));
         }
         out
-    }
-}
-
-/// `text` without the whitespace and comments that end it: a construct's
-/// span can hold the comment written after it, which a fix that writes the
-/// construct elsewhere, or a comma after it, must leave behind.
-fn without_trailing_comments(text: &str) -> &str {
-    let mut text = text.trim_end();
-    loop {
-        if let Some(open) = text.strip_suffix("*/").and_then(|t| t.rfind("/*")) {
-            text = text[..open].trim_end();
-            continue;
-        }
-        let line_start = text.rfind('\n').map_or(0, |n| n + 1);
-        let line = &text[line_start..];
-        // A `//` outside a string literal opens a comment to the line's end.
-        let mut quoted = false;
-        let mut escaped = false;
-        let mut comment = None;
-        for (i, c) in line.char_indices() {
-            match c {
-                _ if escaped => escaped = false,
-                '\\' if quoted => escaped = true,
-                '"' => quoted = !quoted,
-                '/' if !quoted && line[i..].starts_with("//") => {
-                    comment = Some(i);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        match comment {
-            Some(i) => text = text[..line_start + i].trim_end(),
-            None => return text,
-        }
     }
 }
 
@@ -2847,11 +2873,11 @@ fn missing_commas(list: &Pair<Rule>, what: &str) -> R<()> {
         .enumerate()
         .filter(|(_, c)| c.as_rule() == Rule::missing_comma_rec)
         .map(|(i, c)| {
+            // A parsed item's span ends at its last token, before any
+            // comment or line break after it.
             let at = match i.checked_sub(1).map(|before| &items[before]) {
-                Some(before) => {
-                    before.as_span().start() + without_trailing_comments(before.as_str()).len()
-                }
-                None => without_trailing_comments(&input[..c.as_span().start()]).len(),
+                Some(before) => token_end(before),
+                None => c.as_span().start(),
             };
             edit(at, at, ",")
         })
