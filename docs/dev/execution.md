@@ -414,7 +414,8 @@ flag; version 8 types each node's ordering and declares ranked scans'
 eligibility and policy; version 9 records every `AntiJoin`'s `strategy`;
 version 11 carries an integer outside the `i64` range as its decimal text;
 version 14 drops the ranked `bm25` scan, its eligibility and the recorded
-full-text coverage. Plans saved with earlier binaries must be regenerated before replay.
+full-text coverage; version 15 drops a ranked scan's `kind`, since every
+ranked scan is a `nearest` one. Plans saved with earlier binaries must be regenerated before replay.
 
 ### Expand path selection
 

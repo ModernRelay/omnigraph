@@ -632,7 +632,7 @@ pub(super) fn validate_plan_values(
                     if let Some(ranked) = ranked {
                         let valid = matches!(&ranked.score,
                         IRExpr::PropAccess { variable, property, ty: ExprType::Value { scalar: ScalarType::F32, list: false, nullable: false } }
-                        if Some(variable) == spec.binding.as_ref() && property == ranked.kind.score().0);
+                        if Some(variable) == spec.binding.as_ref() && property == omnigraph_compiler::query::value::DISTANCE_COLUMN);
                         if !valid {
                             return Err(OmniError::manifest_internal(
                                 "ranked score leaf disagrees with its scan producer",
@@ -640,7 +640,10 @@ pub(super) fn validate_plan_values(
                         }
                         if let Some(binding) = &spec.binding {
                             owners.scores.insert(
-                                (binding.as_str(), ranked.kind.score().0),
+                                (
+                                    binding.as_str(),
+                                    omnigraph_compiler::query::value::DISTANCE_COLUMN,
+                                ),
                                 (DataType::Float32, false),
                             );
                         }

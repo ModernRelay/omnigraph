@@ -26,23 +26,6 @@ use omnigraph_compiler::query::codes::{P002, P003};
 /// The index of a node in a [`PhysicalPlan`].
 pub type NodeId = usize;
 
-/// The index a ranked scan asks to rank its rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RankKind {
-    /// `nearest($v.prop, q)`: the vector index appends `_distance`.
-    Nearest,
-}
-
-impl RankKind {
-    /// The column Lance appends and the direction the query sorts it by.
-    pub fn score(self) -> (&'static str, bool) {
-        match self {
-            Self::Nearest => ("_distance", false),
-        }
-    }
-}
-
 /// The name an exact `Score`'s kind takes in explain and in a saved plan.
 pub fn score_kind_name(kind: ScoreKind) -> &'static str {
     match kind {
@@ -289,13 +272,14 @@ impl OverfetchRung {
     }
 }
 
-/// The ranking a Lance index computes while a scan runs: the access path of
-/// the ranked binding's scan, not an operator over its rows. The query
-/// argument is carried as the query wrote it; its value is in the bound
-/// plan's value table.
+/// The `nearest` ranking a Lance vector index computes while a scan runs:
+/// the access path of the ranked binding's scan, not an operator over its
+/// rows. The index appends the distance column
+/// ([`DISTANCE_COLUMN`](omnigraph_compiler::query::value::DISTANCE_COLUMN)),
+/// which the query sorts ascending. The query argument is carried as the
+/// query wrote it; its value is in the bound plan's value table.
 #[derive(Debug, Clone)]
 pub struct RankedAccess {
-    pub kind: RankKind,
     pub property: String,
     pub query: IRExpr,
     pub score: IRExpr,
@@ -316,32 +300,29 @@ pub struct RankedAccess {
 }
 
 impl RankedAccess {
-    /// The score ordering this ranking imposes on `binding`'s rows.
+    /// The score ordering this ranking imposes on `binding`'s rows: the
+    /// distance, nearest first.
     pub fn ordering(&self, _binding: &str) -> IROrdering {
-        let (_, descending) = self.kind.score();
         IROrdering {
             expr: self.score.clone(),
-            descending,
+            descending: false,
         }
     }
 
+    /// The explain object; `kind` stays `nearest`, the documented name of
+    /// the one ranking a scan computes.
     fn to_json(&self) -> Value {
-        let mut value = json!({
-            "kind": self.kind,
+        json!({
+            "kind": "nearest",
             "property": self.property,
             "query": self.query.to_string(),
             "typed_query": crate::typed::expr(&self.query),
             "typed_score": crate::typed::expr(&self.score),
             "fetch": self.fetch,
             "scope": self.scope,
-        });
-        match self.kind {
-            RankKind::Nearest => {
-                value["nprobes"] = json!(self.nprobes);
-                value["policy"] = json!(self.policy);
-            }
-        }
-        value
+            "nprobes": self.nprobes,
+            "policy": self.policy,
+        })
     }
 }
 

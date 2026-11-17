@@ -37,8 +37,8 @@ use crate::output::{node_object_types, return_schema};
 use crate::passes::{PassId, PassStage};
 use crate::physical::{
     Assumptions, Estimate, FuseArm, Hop, HydratedBinding, HydratedColumn, NearestPolicy, NodeId,
-    OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankKind,
-    RankScope, RankedAccess, ScanInput, StatisticSource, TextContains,
+    OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankScope,
+    RankedAccess, ScanInput, StatisticSource, TextContains,
 };
 use crate::source::{NodeTypeSpec, PlanSource, SideId};
 use crate::validate::subset::{Role, Rule, Tracer};
@@ -591,10 +591,7 @@ fn resolve_pipeline(
                 // A search over the ranked binding's scan, or rows that
                 // already carry their exact distance, which the key reads.
                 let (ranked, score) = match search_node(input, key, *window, false, *recall) {
-                    Some(node) => (
-                        plan.add(node, schema.clone()),
-                        rank_score(binding, RankKind::Nearest),
-                    ),
+                    Some(node) => (plan.add(node, schema.clone()), rank_score(binding)),
                     None => (input, key.clone()),
                 };
                 // The window: the rows of the `k` nearest targets, in
@@ -1059,10 +1056,11 @@ fn search_node(
     }
 }
 
-pub(crate) fn rank_score(binding: &str, kind: RankKind) -> IRExpr {
+/// The distance column a `nearest` scan appends under `binding`.
+pub(crate) fn rank_score(binding: &str) -> IRExpr {
     IRExpr::PropAccess {
         variable: binding.to_string(),
-        property: kind.score().0.to_string(),
+        property: omnigraph_compiler::query::value::DISTANCE_COLUMN.to_string(),
         ty: omnigraph_compiler::types::ExprType::from_prop(
             &omnigraph_compiler::types::PropType::scalar(
                 omnigraph_compiler::types::ScalarType::F32,
@@ -3804,8 +3802,7 @@ impl Lowering<'_> {
                 let lowered = self.lower(*input)?;
                 let fetch = k.and_then(|k| usize::try_from(k).ok());
                 let access = RankedAccess {
-                    kind: RankKind::Nearest,
-                    score: rank_score(binding, RankKind::Nearest),
+                    score: rank_score(binding),
                     property: property.clone(),
                     query: query.clone(),
                     fetch,

@@ -34,8 +34,8 @@ use crate::logical::{
 use crate::operation::TableRef;
 use crate::physical::{
     Assumptions, Estimate, FuseArm, Hop, HydratedBinding, NearestPolicy, NodeId, OrderKey,
-    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankKind, RankScope,
-    RankedAccess, ScanInput, StatisticSource,
+    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankScope, RankedAccess,
+    ScanInput, StatisticSource,
 };
 use crate::read_shape::InnerRead;
 use crate::source::SideId;
@@ -1039,7 +1039,6 @@ impl From<ScanInputMirror> for ScanInput {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RankedMirror {
-    pub kind: RankKind,
     pub property: String,
     pub query: ExprMirror,
     pub score: ExprMirror,
@@ -1054,7 +1053,6 @@ pub struct RankedMirror {
 impl From<&RankedAccess> for RankedMirror {
     fn from(ranked: &RankedAccess) -> Self {
         Self {
-            kind: ranked.kind,
             property: ranked.property.clone(),
             query: ExprMirror::from(&ranked.query),
             score: ExprMirror::from(&ranked.score),
@@ -1071,7 +1069,6 @@ impl From<&RankedAccess> for RankedMirror {
 impl From<RankedMirror> for RankedAccess {
     fn from(mirror: RankedMirror) -> Self {
         Self {
-            kind: mirror.kind,
             property: mirror.property,
             query: IRExpr::from(mirror.query),
             score: IRExpr::from(mirror.score),

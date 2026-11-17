@@ -31,8 +31,10 @@ use crate::physical::{NodeId, PhysicalPlan};
 /// subtrees, each with its rank kind. Version 14 removes from version 13
 /// the native ranked `bm25` scan: the `bm25` rank kind and expression, a
 /// ranked scan's `eligibility`, a pre-pass's `on_empty` and
-/// `coverage_admits`, and the assumptions' full-text coverage.
-pub const BOUND_PLAN_VERSION: u32 = 14;
+/// `coverage_admits`, and the assumptions' full-text coverage. Version 15
+/// removes from version 14 a ranked scan's `kind`, which named `nearest`,
+/// the one ranking a scan computes.
+pub const BOUND_PLAN_VERSION: u32 = 15;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

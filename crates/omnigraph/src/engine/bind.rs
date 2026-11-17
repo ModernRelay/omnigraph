@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use omnigraph_planner::{AcceptedBoundPlan, AcceptedPlan, PhysicalNode, RankKind, ValueTable};
+use omnigraph_planner::{AcceptedBoundPlan, AcceptedPlan, PhysicalNode, ValueTable};
 
 use super::*;
 
@@ -60,10 +60,7 @@ pub(super) async fn bind(
         let PhysicalNode::Scan { spec, ranked, .. } = node else {
             continue;
         };
-        let Some(ranked) = ranked
-            .as_ref()
-            .filter(|ranked| ranked.kind == RankKind::Nearest)
-        else {
+        let Some(ranked) = ranked.as_ref() else {
             continue;
         };
         let type_name = spec.table.node_type_name().ok_or_else(|| {

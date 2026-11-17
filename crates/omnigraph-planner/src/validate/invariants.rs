@@ -29,8 +29,7 @@ use crate::cost::AntiJoinStrategy;
 use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use crate::optimizer::{arm_score, contains_aggregate, derived_order};
 use crate::physical::{
-    NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, RankKind, RankScope, RankedAccess,
-    score_kind_name,
+    NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, RankScope, RankedAccess, score_kind_name,
 };
 use crate::read_shape::ArmRank;
 use omnigraph_compiler::ir::core::ScoreKind;
@@ -1252,18 +1251,15 @@ impl Requirements {
                 ));
             };
             let same = *binding == retrieval.binding
-                && access.kind == retrieval.kind
                 && access.property == retrieval.property
                 && access.query == retrieval.query;
             if !same {
                 return Err(ValidationError::violated(
                     "search identity",
                     format!(
-                        "the plan ranks `${binding}.{}` by {:?} with `{}`; the query names {:?} of `${}.{}` with `{}`",
+                        "the plan ranks `${binding}.{}` by nearest with `{}`; the query names nearest of `${}.{}` with `{}`",
                         access.property,
-                        access.kind,
                         access.query,
-                        retrieval.kind,
                         retrieval.binding,
                         retrieval.property,
                         retrieval.query
@@ -1368,8 +1364,8 @@ impl Requirements {
             Some(window) => window.and_then(|k| usize::try_from(k).ok()),
             None => limit,
         };
-        let (fetch, overfetch) = match (access.kind, access.scope) {
-            (RankKind::Nearest, RankScope::Order | RankScope::Window) => (
+        let (fetch, overfetch) = match access.scope {
+            RankScope::Order | RankScope::Window => (
                 window,
                 window.map(OverfetchRung::ladder).unwrap_or_default(),
             ),
@@ -1378,8 +1374,8 @@ impl Requirements {
             return Err(ValidationError::violated(
                 "row cut",
                 format!(
-                    "the {:?} scan fetches {:?} with overfetch {:?}; the query's cut requires {fetch:?} with {overfetch:?}",
-                    access.kind, access.fetch, access.overfetch
+                    "the nearest scan fetches {:?} with overfetch {:?}; the query's cut requires {fetch:?} with {overfetch:?}",
+                    access.fetch, access.overfetch
                 ),
             ));
         }
@@ -1387,10 +1383,11 @@ impl Requirements {
             .assumptions()
             .settings
             .get(omnigraph_compiler::settings::SettingId::AnnNprobes.name());
-        let nprobes = match access.kind {
-            // A step that declares `recall: 1` searches every partition.
-            RankKind::Nearest if self.recall == Some(1.0) => None,
-            RankKind::Nearest => setting
+        // A step that declares `recall: 1` searches every partition.
+        let nprobes = if self.recall == Some(1.0) {
+            None
+        } else {
+            setting
                 .map(|value| match value.as_str() {
                     "0" => None,
                     value => value.parse::<usize>().ok(),
@@ -1400,14 +1397,14 @@ impl Requirements {
                         "declared policy",
                         "a nearest scan's probe cap was read from no recorded `ann_nprobes`",
                     )
-                })?,
+                })?
         };
         if access.nprobes != nprobes {
             return Err(ValidationError::violated(
                 "declared policy",
                 format!(
-                    "the {:?} scan probes {:?}; the recorded setting is {nprobes:?}",
-                    access.kind, access.nprobes
+                    "the nearest scan probes {:?}; the recorded setting is {nprobes:?}",
+                    access.nprobes
                 ),
             ));
         }
@@ -1467,10 +1464,10 @@ impl Requirements {
         }
         for (_, call) in &self.projected_ranks {
             let origin = self.written_search.as_ref() == Some(call);
-            let planned = projected_retrieval(call).is_some_and(|(kind, binding, property)| {
-                ranked_scans(plan).into_iter().any(|(_, scanned, access)| {
-                    scanned == binding && access.kind == kind && access.property == property
-                })
+            let planned = projected_retrieval(call).is_some_and(|(binding, property)| {
+                ranked_scans(plan)
+                    .into_iter()
+                    .any(|(_, scanned, access)| scanned == binding && access.property == property)
             });
             if !origin || !planned {
                 return Err(ValidationError::violated(
@@ -1579,10 +1576,11 @@ impl Requirements {
         let lead = match &self.search {
             None if !cut_or_ordered => return None,
             None => Vec::new(),
-            Some(Search::Rank(retrieval)) => {
-                let (column, descending) = retrieval.kind.score();
-                vec![(retrieval.binding.as_str(), column, descending)]
-            }
+            Some(Search::Rank(retrieval)) => vec![(
+                retrieval.binding.as_str(),
+                omnigraph_compiler::query::value::DISTANCE_COLUMN,
+                false,
+            )],
         };
         Some(
             lead.into_iter()
@@ -1858,26 +1856,22 @@ fn check_policies(plan: &PhysicalPlan, budget: &mut Budget) -> Result<(), Valida
         else {
             continue;
         };
-        match (access.kind, access.policy) {
-            (RankKind::Nearest, Some(policy)) => {
-                if policy.probe_factor < 2
-                    || !policy.flat_rescan_on_unreached
-                    || !policy.uncapped_on_missing_counters
-                {
-                    return Err(ValidationError::violated(
-                        "declared policy",
-                        format!(
-                            "the nearest scan's policy {policy:?} lets its probe ladder stall or drops a fallback that keeps its rows in order"
-                        ),
-                    ));
-                }
-            }
-            (kind, policy) => {
-                return Err(ValidationError::violated(
-                    "declared policy",
-                    format!("a {kind:?} scan declares the nearest policy {policy:?}"),
-                ));
-            }
+        let Some(policy) = access.policy else {
+            return Err(ValidationError::violated(
+                "declared policy",
+                "a nearest scan declares no policy",
+            ));
+        };
+        if policy.probe_factor < 2
+            || !policy.flat_rescan_on_unreached
+            || !policy.uncapped_on_missing_counters
+        {
+            return Err(ValidationError::violated(
+                "declared policy",
+                format!(
+                    "the nearest scan's policy {policy:?} lets its probe ladder stall or drops a fallback that keeps its rows in order"
+                ),
+            ));
         }
         if let Some(prefilter) = &access.prefilter {
             if prefilter.feeds != [id] {
@@ -2047,12 +2041,12 @@ fn keys_text(keys: &[IROrdering]) -> String {
         .join(", ")
 }
 
-/// The (kind, binding, property) a projected `nearest` call reads.
-fn projected_retrieval(expr: &IRExpr) -> Option<(RankKind, &str, &str)> {
+/// The (binding, property) a projected `nearest` call reads.
+fn projected_retrieval(expr: &IRExpr) -> Option<(&str, &str)> {
     match expr {
         IRExpr::Nearest {
             variable, property, ..
-        } => Some((RankKind::Nearest, variable, property)),
+        } => Some((variable, property)),
         _ => None,
     }
 }

@@ -31,9 +31,8 @@ use omnigraph_planner::{
     Accumulator, AggregateFields, AntiJoinStrategy, BoundPlan, ColumnRef, ContainsJoinFields,
     CorrelateFields, CsvSourceFields, DeltaSourceFields, ExpandFields, FragmentWriteFields,
     FuseFields, HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan,
-    PlanError, Predicate, ROW_ADDRESS_PREFIX, RankKind, RankedAccess, RuntimeFilterKind,
-    RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields, ValidateFields,
-    ValueTable,
+    PlanError, Predicate, ROW_ADDRESS_PREFIX, RankedAccess, RuntimeFilterKind, RuntimeFilterSpec,
+    ScanInput, ScanSpec, SideId, SortMergeJoinFields, ValidateFields, ValueTable,
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
@@ -187,31 +186,27 @@ impl<'a> Lowering<'a> {
             eligible_ids: pass.eligible(id).cloned(),
             ..SearchMode::default()
         };
-        match ranked.kind {
-            RankKind::Nearest => {
-                let vector = self.values.vectors.get(&id).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "the nearest scan {id} of `{}` has no bound query vector",
-                        spec.table.type_key
-                    ))
-                })?;
-                let k = ranked.fetch.ok_or_else(|| {
-                    OmniError::manifest("nearest() ordering requires a limit clause".to_string())
-                })?;
-                let rung = pass.rung(id);
-                mode.nearest = Some(NearestTarget {
-                    property: ranked.property.clone(),
-                    vector: vector.clone(),
-                    k: rung.map_or(k, |rung| rung.k),
-                });
-                mode.ann_probe_budget = match rung {
-                    Some(rung) => rung.maximum,
-                    None => ranked.nprobes,
-                };
-                mode.nearest_exact = rung.is_some_and(|rung| rung.exact);
-                mode.nearest_policy = ranked.policy;
-            }
-        }
+        let vector = self.values.vectors.get(&id).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "the nearest scan {id} of `{}` has no bound query vector",
+                spec.table.type_key
+            ))
+        })?;
+        let k = ranked.fetch.ok_or_else(|| {
+            OmniError::manifest("a nearest scan needs its window `k`".to_string())
+        })?;
+        let rung = pass.rung(id);
+        mode.nearest = Some(NearestTarget {
+            property: ranked.property.clone(),
+            vector: vector.clone(),
+            k: rung.map_or(k, |rung| rung.k),
+        });
+        mode.ann_probe_budget = match rung {
+            Some(rung) => rung.maximum,
+            None => ranked.nprobes,
+        };
+        mode.nearest_exact = rung.is_some_and(|rung| rung.exact);
+        mode.nearest_policy = ranked.policy;
         Ok(mode)
     }
 

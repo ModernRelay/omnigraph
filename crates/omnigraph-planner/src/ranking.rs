@@ -9,7 +9,7 @@ use omnigraph_compiler::query::value::RRF_COLUMN;
 use omnigraph_compiler::result::{Ranking, SearchFunction};
 
 use crate::error::PlanError;
-use crate::physical::{NodeId, PhysicalNode, PhysicalPlan, RankKind};
+use crate::physical::{NodeId, PhysicalNode, PhysicalPlan};
 
 /// What the plan says of its ranking; the run that executes it says whether
 /// the search was exhaustive.
@@ -74,9 +74,9 @@ pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, Pl
             } => exact_bm25.push(binding.as_str()),
             PhysicalNode::Scan {
                 spec,
-                ranked: Some(ranked),
+                ranked: Some(_),
                 ..
-            } => ordered.push((id, ranked.kind, spec.binding.as_deref())),
+            } => ordered.push((id, spec.binding.as_deref())),
             _ => {}
         }
     }
@@ -96,11 +96,11 @@ pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, Pl
             ),
             _ => return Ok(None),
         },
-        (None, [(id, kind, binding)]) => (
-            search_function(*kind),
+        (None, [(id, binding)]) => (
+            SearchFunction::Nearest,
             binding
                 .ok_or_else(|| PlanError::Internal(format!("ranked scan {id} has no binding")))?,
-            kind.score().0,
+            omnigraph_compiler::query::value::DISTANCE_COLUMN,
             vec![*id],
         ),
         (None, scans) => {
@@ -127,12 +127,6 @@ pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, Pl
         score_columns,
         nearest_scans,
     }))
-}
-
-fn search_function(kind: RankKind) -> SearchFunction {
-    match kind {
-        RankKind::Nearest => SearchFunction::Nearest,
-    }
 }
 
 /// The query's return list: the first `Projection` or `Aggregate` in

@@ -291,9 +291,10 @@ pub struct QueryIoProbes {
     /// Misses of `ReadCaches::compiled_queries`, counted in
     /// `Omnigraph::compile_named_query`.
     pub query_compiles: Arc<AtomicU64>,
-    /// Full-text validations entered (`TableStore::validate_full_text_demand`):
-    /// scans with a full-text query, a SQL-string filter, or a `contains_tokens`
-    /// demand in a typed filter; other scans record nothing.
+    /// Full-text validations entered (`dataset_index::validate_full_text_demand`):
+    /// a scan with a SQL-string filter, or with a `contains_tokens` demand in
+    /// its typed filter. No query reads a full-text index, so a lexical
+    /// query's exact scan, like every other scan, records nothing.
     pub fts_validations: Arc<AtomicU64>,
 }
 

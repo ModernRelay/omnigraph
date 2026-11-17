@@ -23,7 +23,7 @@ use omnigraph_compiler::types::ScalarType;
 use omnigraph_planner::PatternStep;
 use omnigraph_planner::{
     AcceptedBoundPlan, BoundPlan, DatasetPin, Evidence, ExpandMode, ExpandPolicy, NodeId,
-    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, RankKind, RankScope,
+    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, RankScope,
 };
 
 use crate::db::{DatasetEntry, Omnigraph, Snapshot};
@@ -314,7 +314,7 @@ fn nearest_scans(plan: &PhysicalPlan) -> Vec<NearestScan<'_>> {
         else {
             continue;
         };
-        if ranked.kind != RankKind::Nearest || ranked.fetch.is_none() {
+        if ranked.fetch.is_none() {
             continue;
         }
         let window = match ranked.scope {
@@ -935,7 +935,6 @@ mod traversal_admission_tests {
             ordered: false,
             keys_only: false,
             ranked: Some(RankedAccess {
-                kind: RankKind::Nearest,
                 score: IRExpr::PropAccess {
                     variable: "p".into(),
                     property: "_distance".into(),

@@ -1142,7 +1142,6 @@ async fn saved_contains_conjunct_refuses_pairing_and_leaf_type_drift() {
 async fn saved_ranked_score_refuses_owner_and_type_drift() {
     use omnigraph_compiler::ir::IRExpr;
     use omnigraph_compiler::{ExprType, PropType, ScalarType};
-    use omnigraph_planner::RankKind;
 
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
@@ -1159,7 +1158,7 @@ async fn saved_ranked_score_refuses_owner_and_type_drift() {
     let scans: Vec<_> = restored
         .plan
         .live()
-        .filter_map(|(id, node)| node.ranked().map(|ranked| (id, ranked.kind)))
+        .filter_map(|(id, node)| node.ranked().map(|_| id))
         .collect();
     assert_eq!(scans.len(), 2);
     let envelope = first.replay_envelope(DOC_QUERIES, "fused");
@@ -1177,10 +1176,8 @@ async fn saved_ranked_score_refuses_owner_and_type_drift() {
         property: property.into(),
         ty: ExprType::from_prop(&PropType::scalar(scalar, nullable)),
     };
-    for (scan, kind) in scans {
-        let (column, other_column) = match kind {
-            RankKind::Nearest => ("_distance", "_score"),
-        };
+    for scan in scans {
+        let (column, other_column) = ("_distance", "_score");
         assert_eq!(
             restored.plan.node(scan).unwrap().ranked().unwrap().score,
             score("d", column, ScalarType::F32, false),
@@ -1216,11 +1213,11 @@ async fn saved_ranked_score_refuses_owner_and_type_drift() {
                 .await
             {
                 Err(error) => error,
-                Ok(_) => panic!("{kind:?} {label}: inconsistent ranked score replayed"),
+                Ok(_) => panic!("scan {scan} {label}: inconsistent ranked score replayed"),
             };
             assert!(
                 matches!(&error, OmniError::Manifest(error) if error.kind == ManifestErrorKind::Internal),
-                "{kind:?} {label}: {error}"
+                "scan {scan} {label}: {error}"
             );
         }
     }

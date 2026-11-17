@@ -20,7 +20,6 @@ use omnigraph_compiler::types::ExprType;
 
 use super::budget::Budget;
 use super::{AcceptInput, ValidationError};
-use crate::physical::RankKind;
 
 /// The canonical id of a node keyed by one String property, as every write
 /// path derives it from the key's value. The engine implements it with the
@@ -35,7 +34,6 @@ pub trait KeyIds: Sync {
 /// One retrieval a search order names, `nearest($v.p, q)`, with the query argument as the plan's ranked scan carries it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Retrieval {
-    pub kind: RankKind,
     pub binding: String,
     pub property: String,
     pub query: IRExpr,
@@ -50,7 +48,6 @@ impl Retrieval {
                 query,
                 ..
             } => Some(Self {
-                kind: RankKind::Nearest,
                 binding: variable.clone(),
                 property: property.clone(),
                 query: query.as_ref().clone(),

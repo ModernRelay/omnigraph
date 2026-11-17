@@ -14,7 +14,7 @@ use omnigraph_compiler::{ExprType, PropType, SYSTEM_COLUMNS_V3, ScalarType};
 use omnigraph_planner::read_shape::{ArmRank, FuseArm, PatternStep, ReadShape};
 use omnigraph_planner::{
     BOUND_PLAN_VERSION, BoundPlan, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan,
-    RankKind, RankScope, TableRef, ValueTable, plan_query, planned_ranking,
+    RankScope, TableRef, ValueTable, plan_query, planned_ranking,
 };
 
 use crate::fixture_bounds;
@@ -259,7 +259,6 @@ fn a_nearest_plan_with_its_vector_reads_back_equal() {
     assert_eq!(back.plan.post_order(), bound.plan.post_order());
     assert_eq!(back.values.vectors[&scan], vec![0.25, 0.5, 0.75, 1.0]);
     let ranked = back.plan.node(scan).unwrap().ranked().unwrap();
-    assert_eq!(ranked.kind, RankKind::Nearest);
     assert_eq!(ranked.fetch, Some(3));
     assert!(matches!(&ranked.query, IRExpr::Param(name, _) if name == "q"));
 }

@@ -6,7 +6,7 @@ use crate::error::PlanError;
 use crate::logical::{RuntimeInput, ScanAccess, ScanSpec};
 use crate::optimizer::{Optimized, gq_conjunct};
 use crate::passes::{PassId, PassStage};
-use crate::physical::{PhysicalNode, RankKind, ScanInput};
+use crate::physical::{PhysicalNode, ScanInput};
 use crate::source::{IndexFact, IndexKind, PlanSource};
 
 pub const PASS_SCAN_ACCESS: &str = PassId::ScanAccess.name();
@@ -53,11 +53,9 @@ pub async fn finalize_scan_access(
             ScanAccess::Runtime {
                 input: RuntimeInput::JoinFilter,
             }
-        } else if let Some(ranked) = ranked {
+        } else if ranked.is_some() {
             ScanAccess::Runtime {
-                input: match ranked.kind {
-                    RankKind::Nearest => RuntimeInput::Nearest,
-                },
+                input: RuntimeInput::Nearest,
             }
         } else if let Some(input) = source.scan_runtime_input(spec) {
             ScanAccess::Runtime { input }

@@ -21,8 +21,6 @@ use crate::physical::{
     FuseArm, HydratedBinding, NodeId, PhysicalNode, PhysicalPlan, RankedAccess, ScanInput,
 };
 
-#[cfg(doc)]
-use crate::physical::RankKind;
 use crate::source::SideId;
 
 /// Aggregate expressions and their aligned planner-selected implementations.
