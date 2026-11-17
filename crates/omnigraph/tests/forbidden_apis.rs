@@ -1223,7 +1223,7 @@ durable_calls! {
     // rebuilt in memory, so this write can never change a query's result. It
     // runs in a task the run awaits, so a dropped run cannot drop it.
     ("db/omnigraph/optimize.rs", ".write_bytes(", 1, WriteProtocol::PhysicalOnly),
-    ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V9),
+    ("exec/merge.rs", "SnapshotHandle::new(", 3, MERGE_V9),
 }
 
 const DURABLE_PRIMITIVES: &[&str] = &[

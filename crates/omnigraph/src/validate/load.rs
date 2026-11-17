@@ -5,7 +5,8 @@
 //! precedence), each consulting the committed image under its physical
 //! access. Every kept-table write runs here: the `load csv` operator sweeps
 //! its partitions into the judge, the staged routes (a JSONL load, a
-//! mutation, a blob cell, a branch merge) hand it their batches whole.
+//! mutation, a blob cell) hand it their batches whole, and a branch merge
+//! streams its delta from storage through the same [`Sweep`], batch by batch.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -218,12 +219,9 @@ impl WriteJudge {
     }
 
     /// The staged routes' door: every table's batches, already in memory,
-    /// swept in order and judged at once against `db`. A plan that sweeps its
-    /// endpoint checks reads the committed key sets after every table's sweep,
-    /// as the `load csv` operator does before its partitions drain, and an
-    /// endpoint whose node table the same write stages settles against that
-    /// table's delta before the set. `Ok(())` admits the write under
-    /// [`Report::First`]; under [`Report::Every`] the violations come back.
+    /// swept in order ([`Sweep`]) and judged at once against `db`. `Ok(())`
+    /// admits the write under [`Report::First`]; under [`Report::Every`] the
+    /// violations come back.
     pub(crate) async fn judge_batches(
         &self,
         db: &Omnigraph,
@@ -237,29 +235,174 @@ impl WriteJudge {
                 self.tables.len()
             )));
         }
-        let system_columns = self.catalog.system_columns;
-        let plans: Vec<SweepPlan> = (0..self.tables.len())
-            .map(|index| self.sweep_plan(index, 1))
-            .collect();
-        let mut partials: Vec<SweepPartial> = Vec::with_capacity(plans.len());
-        for (batches, plan) in batches.iter().zip(&plans) {
-            let mut partial = SweepPartial::new(plan);
-            let mut base: Position = 0;
+        let mut sweep = Sweep::new(self);
+        for (index, batches) in batches.iter().enumerate() {
             for batch in batches {
-                partial.observe(plan, &self.catalog, batch, system_columns, base)?;
-                base += batch.num_rows() as Position;
+                sweep.observe(index, batch)?;
             }
-            partials.push(partial);
         }
-        let (_retained, _transient) = if plans.iter().any(SweepPlan::sweeps_endpoints) {
+        sweep.judge(db, admission).await
+    }
+}
+
+/// One sweep of a staged write's deltas, a batch at a time: each table's
+/// batches are observed once in source order, every check's facts are
+/// extracted while the batch is hot, and the batch is then let go. What stays
+/// is the facts and the few columns the judgment reads again after the sweep
+/// ([`Sweep::fact_columns`]), so a row's other values are never held past
+/// their batch. The routes that hold their batches in memory
+/// ([`WriteJudge::judge_batches`]) and a branch merge, which streams its
+/// delta from storage, share it.
+///
+/// Tables are swept in the judge's order and a table's batches in its source
+/// order, so every fact keeps the position one pass over the whole delta
+/// would give it. A plan that sweeps its endpoint checks reads the committed
+/// key sets after every table's sweep, as the `load csv` operator does before
+/// its partitions drain, and an endpoint whose node table the same write
+/// stages settles against that table's delta before the set.
+pub(crate) struct Sweep<'j> {
+    judge: &'j WriteJudge,
+    plans: Vec<SweepPlan>,
+    partials: Vec<SweepPartial>,
+    /// The rows observed per table, which is also the position of the next
+    /// batch's first row.
+    rows: Vec<usize>,
+    /// Per table, the columns kept of every batch for the judgment's second
+    /// read ([`retained_columns`]); empty when the judgment reads none.
+    retained_columns: Vec<Vec<&'static str>>,
+    retained: Vec<Vec<RecordBatch>>,
+}
+
+impl<'j> Sweep<'j> {
+    pub(crate) fn new(judge: &'j WriteJudge) -> Self {
+        let plans: Vec<SweepPlan> = (0..judge.tables.len())
+            .map(|index| judge.sweep_plan(index, 1))
+            .collect();
+        let retained_columns = (0..judge.tables.len())
+            .map(|index| retained_columns(judge, &plans[index], index))
+            .collect();
+        Self {
+            judge,
+            partials: plans.iter().map(SweepPartial::new).collect(),
+            rows: vec![0; plans.len()],
+            retained: plans.iter().map(|_| Vec::new()).collect(),
+            retained_columns,
+            plans,
+        }
+    }
+
+    /// The columns of table `index` whose values outlive a batch: the id when
+    /// the sweep keeps it or keys a fact by it (every uniqueness and `@card`
+    /// fact is), each uniqueness group's columns, an edge's source under
+    /// `@card`, and the columns retained for the judgment's second read. A
+    /// column that only a value check reads is judged within its batch and
+    /// outlives none, so the facts of a delta grow with these columns alone.
+    pub(crate) fn fact_columns(&self, index: usize) -> Vec<&str> {
+        fn keep<'c>(columns: &mut Vec<&'c str>, column: &'c str) {
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+        }
+        let system_columns = self.judge.catalog.system_columns;
+        let plan = &self.plans[index];
+        let retained = &self.retained_columns[index];
+        let mut columns: Vec<&str> = Vec::new();
+        if plan.needs_ids || !plan.unique.is_empty() || plan.needs_card || !retained.is_empty() {
+            keep(&mut columns, system_columns.id);
+        }
+        for (_, group) in &plan.unique {
+            for column in group {
+                keep(&mut columns, column.as_str());
+            }
+        }
+        if plan.needs_card {
+            keep(&mut columns, system_columns.src);
+        }
+        for column in retained {
+            keep(&mut columns, column);
+        }
+        columns
+    }
+
+    /// The bytes of `batch`'s [`Self::fact_columns`] the sweep keeps past it:
+    /// each column's non-null values ([`value_bytes`]). A route that streams
+    /// its delta charges this before it observes the batch.
+    pub(crate) fn fact_bytes(&self, index: usize, batch: &RecordBatch) -> Result<u64> {
+        let mut bytes = 0_u64;
+        for name in self.fact_columns(index) {
+            let column = batch.column_by_name(name).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "validation batch of {} is missing column '{name}'",
+                    self.judge.tables[index].table
+                ))
+            })?;
+            bytes = bytes
+                .checked_add(u64::try_from(value_bytes(column.as_ref())).unwrap_or(u64::MAX))
+                .ok_or_else(|| OmniError::manifest_internal("validation byte count overflow"))?;
+        }
+        Ok(bytes)
+    }
+
+    /// Sweep one batch of table `index`; the table's batches arrive in source
+    /// order. Of the batch only its [`retained_columns`] stay.
+    pub(crate) fn observe(&mut self, index: usize, batch: &RecordBatch) -> Result<()> {
+        if index >= self.plans.len() {
+            return Err(OmniError::manifest_internal(format!(
+                "Validate: a batch for table {index} of {} judged tables",
+                self.plans.len()
+            )));
+        }
+        let base = self.rows[index] as Position;
+        self.partials[index].observe(
+            &self.plans[index],
+            &self.judge.catalog,
+            batch,
+            self.judge.catalog.system_columns,
+            base,
+        )?;
+        self.rows[index] += batch.num_rows();
+        if !self.retained_columns[index].is_empty() {
+            let schema = batch.schema();
+            let indices = self.retained_columns[index]
+                .iter()
+                .map(|name| {
+                    schema.index_of(name).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "validation batch of {} is missing column '{name}'",
+                            self.judge.tables[index].table
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.retained[index].push(batch.project(&indices).map_err(OmniError::arrow_internal)?);
+        }
+        Ok(())
+    }
+
+    /// Judge every table over what the sweep kept.
+    pub(crate) async fn judge(
+        self,
+        db: &Omnigraph,
+        admission: &mut LoadAdmission<'_>,
+    ) -> Result<Vec<Violation>> {
+        let Sweep {
+            judge,
+            plans,
+            mut partials,
+            rows,
+            retained,
+            ..
+        } = self;
+        let system_columns = judge.catalog.system_columns;
+        let (_retained_sets, _transient) = if plans.iter().any(SweepPlan::sweeps_endpoints) {
             let admitted =
-                admit_swept_sets(self, &mut |bytes| admission.reserve_bytes(bytes)).await?;
-            let (sets, retained, transient) = admitted.load(system_columns).await?;
+                admit_swept_sets(judge, &mut |bytes| admission.reserve_bytes(bytes)).await?;
+            let (sets, retained_sets, transient) = admitted.load(system_columns).await?;
             let present: Vec<HashSet<String>> = partials
                 .iter_mut()
                 .map(|partial| std::mem::take(&mut partial.ids))
                 .collect();
-            let deleted: Vec<HashSet<&str>> = self
+            let deleted: Vec<HashSet<&str>> = judge
                 .tables
                 .iter()
                 .map(|table| table.deleted_ids.iter().map(String::as_str).collect())
@@ -268,9 +411,9 @@ impl WriteJudge {
                 if !plan.sweeps_endpoints() {
                     continue;
                 }
-                let staged = StagedEndpoints::of(self, plan, &present, &deleted);
+                let staged = StagedEndpoints::of(judge, plan, &present, &deleted);
                 let mut base: Position = 0;
-                for batch in &batches[index] {
+                for batch in &retained[index] {
                     partials[index].probe_endpoints(
                         plan,
                         batch,
@@ -285,21 +428,104 @@ impl WriteJudge {
             for (partial, ids) in partials.iter_mut().zip(present) {
                 partial.ids = ids;
             }
-            (retained, transient)
+            (retained_sets, transient)
         } else {
             (Vec::new(), Vec::new())
         };
-        let deltas = batches
+        let deltas = retained
             .into_iter()
-            .zip(&plans)
-            .zip(partials)
-            .map(|((batches, plan), partial)| TableDelta {
-                rows: batches.iter().map(RecordBatch::num_rows).sum(),
+            .zip(rows)
+            .zip(plans.iter().zip(partials))
+            .map(|((batches, rows), (plan, partial))| TableDelta {
                 batches,
+                rows,
                 extracted: Extracted::prepare(plan, vec![partial]),
             })
             .collect();
-        judge_write_swept(self, db, deltas, admission).await
+        judge_write_swept(judge, db, deltas, admission).await
+    }
+}
+
+/// The bytes of `batch`'s rows, column by column as [`value_bytes`] counts
+/// them: what a batch holds of its values, whatever buffers a scan decoded
+/// them into.
+pub(crate) fn batch_value_bytes(batch: &RecordBatch) -> u64 {
+    batch.columns().iter().fold(0_u64, |total, column| {
+        total.saturating_add(u64::try_from(value_bytes(column.as_ref())).unwrap_or(u64::MAX))
+    })
+}
+
+/// The bytes of `column`'s rows a fact can copy: every non-null value's bytes
+/// plus the column's offsets or views and its validity, so a null counts no
+/// value bytes whatever range its offsets span. A scan may return a null
+/// whose offsets cover a neighbouring row's bytes in a shared decode buffer,
+/// which the slice size and the allocation both count; no fact copies a
+/// null. A fixed-width or nested column counts its slice
+/// (`get_slice_memory_size`), or its whole allocation where that is
+/// unavailable.
+fn value_bytes(column: &dyn Array) -> usize {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+
+    fn sum(lengths: impl Iterator<Item = usize>) -> usize {
+        lengths.fold(0, usize::saturating_add)
+    }
+    let rows = column.len();
+    let validity = column.nulls().map_or(0, |_| rows.div_ceil(8));
+    let (values, framing) = match column.data_type() {
+        DataType::Utf8 => (
+            sum(column.as_string::<i32>().iter().flatten().map(str::len)),
+            rows.saturating_add(1).saturating_mul(4),
+        ),
+        DataType::LargeUtf8 => (
+            sum(column.as_string::<i64>().iter().flatten().map(str::len)),
+            rows.saturating_add(1).saturating_mul(8),
+        ),
+        DataType::Utf8View => (
+            sum(column.as_string_view().iter().flatten().map(str::len)),
+            rows.saturating_mul(16),
+        ),
+        DataType::Binary => (
+            sum(column.as_binary::<i32>().iter().flatten().map(<[u8]>::len)),
+            rows.saturating_add(1).saturating_mul(4),
+        ),
+        DataType::LargeBinary => (
+            sum(column.as_binary::<i64>().iter().flatten().map(<[u8]>::len)),
+            rows.saturating_add(1).saturating_mul(8),
+        ),
+        DataType::BinaryView => (
+            sum(column.as_binary_view().iter().flatten().map(<[u8]>::len)),
+            rows.saturating_mul(16),
+        ),
+        _ => {
+            return column
+                .to_data()
+                .get_slice_memory_size()
+                .unwrap_or_else(|_| column.get_array_memory_size());
+        }
+    };
+    values.saturating_add(framing).saturating_add(validity)
+}
+
+/// The columns of table `index` the judgment reads after the sweep, which
+/// every batch leaves behind: the id and both endpoints of an edge table
+/// whose endpoint checks probe after the sweep (the swept probe, or the
+/// judged [`orphans`] read), and the id of a replaced table whose removal
+/// scans ([`overwrite_removed_ids`]). Nothing else of a batch is read twice.
+fn retained_columns(judge: &WriteJudge, plan: &SweepPlan, index: usize) -> Vec<&'static str> {
+    let system_columns = judge.catalog.system_columns;
+    let table = &judge.tables[index];
+    let endpoints_after_sweep = plan.sweeps_endpoints()
+        || table.checks.iter().any(|spec| {
+            matches!(spec.check, ValidateCheck::EdgeRi { .. })
+                && spec.probe != Some(EndpointProbe::Swept)
+        });
+    if endpoints_after_sweep {
+        vec![system_columns.id, system_columns.src, system_columns.dst]
+    } else if table.delta.replaces() && table.removal == ValidateRemoval::Scan {
+        vec![system_columns.id]
+    } else {
+        Vec::new()
     }
 }
 
@@ -1594,6 +1820,32 @@ mod tests {
     /// The slice key the source tags its batches with (`csv_source.rs`).
     fn slice_key(partition: usize, index: usize) -> usize {
         (partition << 32) | index
+    }
+
+    /// A fact column counts its non-null values: a null whose offsets span a
+    /// neighbour's bytes in a shared buffer counts none of them, as no fact
+    /// copies it (#1427), and a fixed-width column counts its slice.
+    #[test]
+    fn value_bytes_count_non_null_values_not_their_buffers_issue_1427() {
+        use arrow_array::Int64Array;
+        use datafusion::arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
+
+        let spanning_null = StringArray::new(
+            OffsetBuffer::new(vec![0_i32, 5, 10].into()),
+            Buffer::from("aaaaabbbbb".as_bytes()),
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        assert_eq!(
+            spanning_null.to_data().get_slice_memory_size().unwrap(),
+            10 + 2 * 4 + 1,
+            "the slice size counts the null's bytes"
+        );
+        assert_eq!(value_bytes(&spanning_null), 5 + 3 * 4 + 1);
+        assert_eq!(
+            value_bytes(&StringArray::from(vec!["abc", "de"])),
+            5 + 3 * 4
+        );
+        assert_eq!(value_bytes(&Int64Array::from(vec![1, 2, 3])), 3 * 8);
     }
 
     #[test]
