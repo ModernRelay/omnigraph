@@ -878,6 +878,10 @@ impl Facts {
         for optional in &mut self.optionals {
             optional.inner.substitute(lets);
         }
+        // A union's arms read the scope's `let`s and value columns in place.
+        for union in &mut self.unions {
+            union.arms.iter_mut().for_each(|arm| arm.substitute(lets));
+        }
         for correlate in &mut self.correlates {
             correlate.inner.substitute(lets);
             correlate.read.exprs_mut().for_each(|e| substitute(e, lets));
