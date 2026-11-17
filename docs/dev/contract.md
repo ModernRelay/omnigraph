@@ -57,9 +57,11 @@ distribution is their sum.
 | Orient | Learns what exists and what the words mean: the schema, the types and their counts, what changed since it last looked, what others are doing now | Schema and catalogue reads; change feed from a cursor; branch and commit listings; cheap, at every session start and after every pause |
 | Retrieve | Assembles the context for the next step, in two modes. Lookup: the entity by key, its neighborhood, the things like it, the passages that mention it, under filters on type, time and status. Analytical: how many, which most, grouped by what, over a type or a filtered slice, to size a problem, rank candidates or summarize before deciding | Lookup: selective reads combining key lookup, one to three hops, vector, lexical and fused ranking; tens to a few hundred rows; several per step; the most common read. Analytical: aggregates, group-bys, top-N and filtered scans over whole types, small results from wide reads; fewer than lookups but on the same critical path of a step |
 | Acquire | Brings outside information in: fetches pages, documents, API results and files; imports a dataset it was handed or found, structured (tables, exports, API dumps) or unstructured (PDFs, documents, transcripts, mail); extracts entities, relations and passages from the unstructured content; embeds text | Keyed loads from 10^2 records to 10^7 for a whole source, unplanned and bursty, on the task's branch, as many bounded batches; Blob writes of thousands of source documents; extracted entities and passages linked to the Blob they came from; embedding columns; the usual way a new source enters before a sync exists |
+| Sync | Keeps part of the model in step with a system that stays the record of its own data (CRM, ticketing, mail and calendar, documents, code hosting, a warehouse), as a pipeline it runs or supervises: backfill, then incremental pulls or pushed events, then reconciliation; and feeds other systems from the graph | Idempotent keyed upserts under the source's external identity, every few minutes or per event, mostly rows that did not change; the source's deletes propagated; whole-source reruns; outbound, an ordered read of everything that changed since a cursor |
 | Author | Records what it learned, decided and did: observations, claims with evidence, decisions with reasons, tasks, plans, status, and links between things that already exist | Small attributed commits of one to tens of entities, many per task, on the task's branch, append-mostly; the most common write and the densest edges |
 | Derive | Computes over what is there: classifies, scores, resolves duplicates, summarizes, infers edges, consolidates old memory into new | Reads wide across a type, writes many small updates or a batch per run; periodic, often as a pipeline |
 | Coordinate | Shares work with other agents and people: claims a task, hands one off, checks whether something was already done, avoids writing over a concurrent change | Concurrent reads of shared state; conditional writes from the commit it read; one branch per task, so one writer per branch by construction of the work, not by a lock; merges into shared state; a conflict re-decided from a fresh read, not retried blind |
+| React | Wakes on a change instead of on a schedule: a new document to extract, a task assigned, a claim contradicted, a branch ready for review, a sync that landed. Reads what changed, decides, and writes, which may wake others | A standing wait on the change feed of a branch, filtered by type and operation; delivery in commit order, each change at least once, soon after its commit; a read of the changed entities at that commit; a write conditional on it. Chains of reactions make write load follow write load |
 | Verify and correct | Checks what it holds against sources and constraints, finds drift and duplicates, fixes errors | Targeted reads by key and by external identity; corrections as updates or new facts; deletes rarely; constraint refusals as signal |
 | Propose and review | Puts a change up for a person or another agent to accept; reads what a branch would change; approves, merges, or discards | Branch diffs and merge previews; a merge or a branch delete; unpublished commits that wait |
 | Reflect and evaluate | Looks back: what was known at a time, what was decided and why, what happened after; compares a past state with now; evaluates its own earlier actions | Reads at a past commit; diffs across history; commit changes with actors; with orient, the second most common read |
@@ -68,13 +70,9 @@ distribution is their sum.
 
 People do a subset by hand or through a UI, at a low rate: orient, retrieve,
 author (a correction, an annotation), propose and review (the approvals that
-make agent work trusted), and answer. Programs do acquire and derive on
-schedules or events: an initial backfill per system of record (CRM,
-ticketing, mail and calendar, documents, code hosting, warehouses), then
-incremental idempotent keyed upserts under the source's external identity,
-written to shared state directly, with the source's deletes propagated and
-reruns for reconciliation; and they feed downstream systems from the ordered
-change feed, exports and baselines. The graph sits beside those systems and
+make agent work trusted), and report. Programs without an agent in them do
+acquire, sync, derive and react on schedules or events, and write to shared
+state directly. The graph sits beside the systems it syncs with and
 claims no authority over their records: a mirrored record is true as of its
 sync and owned by its source, authored knowledge is owned by the graph, and
 the two provenances stay distinguishable, because agents read both together
@@ -90,6 +88,7 @@ and write only the second, or propose changes to the first.
 | Volume | 10^4 to 10^7 entities per graph, set by the sources; 10 to 100 types; small scalar properties, text bodies, embeddings on a few types, Blobs for documents; agent batches of 10^2 to 10^5 records, whole-source imports and backfills to 10^7 records and 10^4 documents | 10^8 entities or 10^3 types; batches past 10^6; sync as streaming at thousands of events a second |
 | Rate | 10^2 to 10^4 commits a day; tens of live branches with hundreds of commits each and one writer; incremental sync every few minutes; an additive schema change about weekly; history retained long and read as often as the present | Commit rate or branch count up an order; several writers on one branch; conflict retries common; destructive schema changes frequent; history read rarely |
 
+| Reaction | Tens of standing consumers per graph (agents, pipelines, downstream systems), each filtered to a few types; a change reaches its consumers within seconds of its commit; reaction chains a few steps deep | Hundreds of consumers; sub-second delivery needed; reaction storms |
 | Targets | No latency is measured yet. As a starting hypothesis for a warm handle in the store's region: a retrieve read answers in about 100 ms at the median and under 1 s at the tail; a small commit publishes in under 1 s; one branch publishes its commits serially, a few a second at most, which the hypothesized rate needs on average at one every several seconds, with bursts on shared state from merges and syncs | Measured figures replace these; shared state needs sustained tens of commits a second |
 
 ### Against the usual categories
@@ -126,7 +125,9 @@ cost on this work. On cost the direction is: retrieve reads first, lookups
 and then analytical reads, because both sit on the critical path of an agent
 step; then the cost of a small
 commit and of a branch, because authoring and coordination are the common
-writes; then history and change discovery; then bulk acquisition and sync.
+writes; then history, change discovery and delivery of changes to those waiting on
+them; then bulk acquisition and sync, whose cost should follow what changed,
+not what was sent.
 Read capacity scales out by adding reader processes; write capacity on one
 branch does not, and need not at the hypothesized rate. An analytical read
 may cost more than a lookup but not in proportion to history, and a lookup
@@ -160,8 +161,8 @@ belong in the contract.
 | A **typed world model** | Enforce the model on every write, by every writer; let the model change as understanding grows, as reviewably as the data does | 4 |
 | **Continuously**, over a long horizon | Stay available while it is written, maintained and evolved; keep what was known and when, so an agent can resume, reflect, audit and undo; never grow slower with age | 5, 6 |
 | **Retrieve** context | Answer selective, combined-mode and analytical reads from one coherent, current view, at a latency a step can afford, from as many readers as the agents need | 2, 7 |
-| **Update** context | Accept small frequent writes and whole-source imports; let an agent protect a decision against the state it was based on | 1, 2 |
-| **Coordinate work** | Give agents long isolated workspaces that integrate without losing or silently overriding each other's work; let one agent learn of another's change without polling; make a claim on a task exclusive | 2, 3, 6 |
+| **Update** context | Accept small frequent writes, whole-source imports of structured and unstructured data, and sync pipelines that mostly rewrite what did not change, each at a cost that follows what changed; let an agent protect a decision against the state it was based on | 1, 2, 5 |
+| **Coordinate work** | Give agents long isolated workspaces that integrate without losing or silently overriding each other's work; let an agent or a pipeline react to a change soon after it commits, in order, without polling and without missing one; make a claim on a task exclusive | 2, 3, 6 |
 
 ## B: the boundary
 
@@ -433,7 +434,9 @@ time, and a mistake by one agent must be undoable without losing the rest.*
   it merged in. A consumer sees each commit at least once and applies it
   idempotently. Reclaimed history, a schema boundary and a cursor from
   another branch lifetime are typed refusals, never silent gaps. A consumer
-  can wait for the next commit instead of polling for it.
+  can wait for the next matching change instead of polling for it, filtered
+  by type and operation, and learns of a commit soon after it is
+  acknowledged, so agents and pipelines can react to events.
 - A commit records who made it and, when the caller says so, why: the task
   and the reason, readable wherever the commit is.
 - A commit or a merge can be reverted by one operation that publishes its
