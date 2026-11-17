@@ -16,7 +16,6 @@ use datafusion::prelude::Expr;
 use futures::TryStreamExt;
 use lance_select::mask::{RowAddrTreeMap, RowSetOps};
 use omnigraph_compiler::query::value::{BinaryOp, CompOp};
-use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
 use omnigraph_compiler::types::{ExprType, ScalarType};
 
@@ -818,15 +817,16 @@ pub(crate) struct SelectionReader<'a> {
 /// The rows of selection read `read`, run on first use against the
 /// snapshot and catalog the write captured (invariant 3: one accepted view
 /// per attempt) and kept for the group's later statements, so a group's
-/// selection is evaluated once.
+/// selection is evaluated once. The kept rows stay charged to the read's
+/// pool, as does every map a statement builds from them.
 async fn selection_rows<'s>(
     ir: &super::write_plan::WritePlan,
     read: usize,
-    selected: &'s mut [Option<QueryResult>],
+    selected: &'s mut [Option<crate::engine::SelectionRead>],
     params: &ParamMap,
     txn: &crate::db::WriteTxn,
     reader: &SelectionReader<'_>,
-) -> Result<&'s QueryResult> {
+) -> Result<&'s crate::engine::SelectionRead> {
     let slot = selected.get_mut(read).ok_or_else(|| {
         OmniError::manifest_internal(format!("write '{}' has no selection {read}", ir.name))
     })?;
@@ -997,10 +997,12 @@ fn apply_row_values(
 
 /// The entities an `update` or `delete` reaches through its group's rows:
 /// the distinct identities in first-row order, and the values the row-read
-/// assignments give each.
+/// assignments give each, both charged to the selection read's pool for as
+/// long as the statement holds them.
 struct SelectedEntities {
     ids: Vec<String>,
     values: RowValues,
+    _charge: crate::engine::PoolCharge,
 }
 
 /// What an `update` statement runs over.
@@ -1078,18 +1080,35 @@ fn two_values(
     ))
 }
 
+/// The heap bytes `literal` holds, inline size included: what one copy of
+/// it costs a map that keeps it.
+fn literal_bytes(literal: &Literal) -> usize {
+    std::mem::size_of::<Literal>()
+        + match literal {
+            Literal::String(text) | Literal::Date(text) | Literal::DateTime(text) => text.len(),
+            Literal::List(items) => items.iter().map(literal_bytes).sum(),
+            Literal::Null | Literal::Integer(_) | Literal::Float(_) | Literal::Bool(_) => 0,
+        }
+}
+
 fn selected_entities(
     name: &str,
     target: &MutationTarget,
     rows: &SelectedRows,
-    read: &QueryResult,
+    read: &crate::engine::SelectionRead,
 ) -> Result<SelectedEntities> {
     let identity = rows.identity.ok_or_else(|| {
         OmniError::manifest_internal("an update or delete selection names no identity column")
     })?;
+    // The identities and values are charged a batch at a time, before the
+    // next batch adds to them: each id twice (the order and the map's key),
+    // each value once, and the entries of both collections.
+    let charge = read.charge("write selection entities")?;
     let mut ids = Vec::new();
     let mut by_id: HashMap<String, Vec<Literal>> = HashMap::new();
-    for batch in read.batches() {
+    for batch in read.result().batches() {
+        charge.work(batch.num_rows() as u64)?;
+        let (mut added, mut bytes) = (0usize, 0usize);
         let column = batch.column(identity);
         let id_values = column
             .as_any()
@@ -1109,6 +1128,8 @@ fn selected_entities(
             let values = row_literals(batch, rows, row)?;
             match by_id.get(id) {
                 None => {
+                    added += 1;
+                    bytes += 2 * id.len() + values.iter().map(literal_bytes).sum::<usize>();
                     ids.push(id.to_string());
                     by_id.insert(id.to_string(), values);
                 }
@@ -1126,6 +1147,9 @@ fn selected_entities(
                 }
             }
         }
+        charge.entries::<String>(added)?;
+        charge.entries::<(String, Vec<Literal>)>(added)?;
+        charge.grow(bytes as u64)?;
     }
     Ok(SelectedEntities {
         ids,
@@ -1133,6 +1157,7 @@ fn selected_entities(
             properties: rows.values.iter().map(|v| v.property.clone()).collect(),
             by_id,
         },
+        _charge: charge,
     })
 }
 
@@ -1140,18 +1165,22 @@ fn selected_entities(
 /// constant assignments, evaluated once, with each row-read value beside
 /// them. A keyed insert writes the entity its key names, so rows that name
 /// one key with equal values write it once, and with different values are
-/// `E4`; an unkeyed insert writes one entity per row.
+/// `E4`; an unkeyed insert writes one entity per row. The maps, and the key
+/// index of a keyed insert, are charged to the selection read's pool through
+/// the returned charge, which the caller holds as long as the maps.
 fn inserted_entities(
     name: &str,
     catalog: &Catalog,
     target: &MutationTarget,
     assignments: &[Assignment],
     rows: &SelectedRows,
-    read: &QueryResult,
+    read: &crate::engine::SelectionRead,
     params: &ParamMap,
-) -> Result<Vec<HashMap<String, Literal>>> {
+) -> Result<(Vec<HashMap<String, Literal>>, crate::engine::PoolCharge)> {
+    let charge = read.charge("write selection inserts")?;
+    let read = read.result();
     if read.num_rows() == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), charge));
     }
     let constants = evaluate_assignments(assignments, params)?;
     let system = catalog.system_columns;
@@ -1173,15 +1202,28 @@ fn inserted_entities(
             })
         }),
     };
+    // Each kept map is charged a batch at a time: its entries, each
+    // property name and value, and a keyed insert's key tuple in its index.
+    let map_bytes = |values: &HashMap<String, Literal>| -> usize {
+        values
+            .iter()
+            .map(|(property, value)| property.len() + literal_bytes(value))
+            .sum::<usize>()
+    };
     let mut out: Vec<HashMap<String, Literal>> = Vec::new();
     let mut keyed: HashMap<Vec<Literal>, usize> = HashMap::new();
     for batch in read.batches() {
+        charge.work(batch.num_rows() as u64)?;
+        let (mut kept, mut entries, mut bytes) = (0usize, 0usize, 0usize);
         for row in 0..batch.num_rows() {
             let mut values = constants.clone();
             for (value, literal) in rows.values.iter().zip(row_literals(batch, rows, row)?) {
                 values.insert(value.property.clone(), literal);
             }
             let Some(key) = &key else {
+                kept += 1;
+                entries += values.len();
+                bytes += map_bytes(&values);
                 out.push(values);
                 continue;
             };
@@ -1191,6 +1233,9 @@ fn inserted_entities(
                 .collect();
             match keyed.get(&tuple) {
                 None => {
+                    kept += 1;
+                    entries += values.len();
+                    bytes += map_bytes(&values) + tuple.iter().map(literal_bytes).sum::<usize>();
                     keyed.insert(tuple, out.len());
                     out.push(values);
                 }
@@ -1219,8 +1264,14 @@ fn inserted_entities(
                 }
             }
         }
+        charge.entries::<HashMap<String, Literal>>(kept)?;
+        charge.entries::<(String, Literal)>(entries)?;
+        if key.is_some() {
+            charge.entries::<(Vec<Literal>, usize)>(kept)?;
+        }
+        charge.grow(bytes as u64)?;
     }
-    Ok(out)
+    Ok((out, charge))
 }
 
 // ─── Mutation execution ──────────────────────────────────────────────────────
@@ -2211,7 +2262,10 @@ impl Omnigraph {
         // Each group's selection read, run once, at its first statement:
         // it reads only the captured snapshot, so where among the group's
         // statements it runs changes nothing.
-        let mut selected: Vec<Option<QueryResult>> = vec![None; ir.selections.len()];
+        let mut selected: Vec<Option<crate::engine::SelectionRead>> =
+            std::iter::repeat_with(|| None)
+                .take(ir.selections.len())
+                .collect();
         for op in &ir.ops {
             let result = match op {
                 WriteOp::Insert {
@@ -2219,18 +2273,22 @@ impl Omnigraph {
                     assignments,
                     rows,
                 } => {
-                    let rows = match rows {
-                        InsertRows::Once => vec![evaluate_assignments(assignments, params)?],
+                    // A selected insert's maps stay charged until its rows
+                    // are staged.
+                    let (rows, _charge) = match rows {
+                        InsertRows::Once => {
+                            (vec![evaluate_assignments(assignments, params)?], None)
+                        }
                         InsertRows::Matched if matched > 0 => {
                             let values = evaluate_assignments(assignments, params)?;
-                            vec![values; matched as usize]
+                            (vec![values; matched as usize], None)
                         }
-                        InsertRows::Matched => Vec::new(),
+                        InsertRows::Matched => (Vec::new(), None),
                         InsertRows::Selected(rows) => {
                             let read =
                                 selection_rows(ir, rows.read, &mut selected, params, txn, reader)
                                     .await?;
-                            inserted_entities(
+                            let (rows, charge) = inserted_entities(
                                 &ir.name,
                                 &txn.catalog,
                                 target,
@@ -2238,7 +2296,8 @@ impl Omnigraph {
                                 rows,
                                 read,
                                 params,
-                            )?
+                            )?;
+                            (rows, Some(charge))
                         }
                     };
                     self.execute_insert(target, rows, branch, staging, txn)

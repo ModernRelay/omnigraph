@@ -312,7 +312,13 @@ identity, so one selecting more entities than one table stages (8,192,
 predicate holds at most that many. An `insert` with no selection stages one
 row. An `insert` statement opens its table once, however many rows it stages,
 and admits each row to the staging, row and byte limits included, as it builds
-it. A selection read sees the
+it. The selection read's pool and read-work budget outlive its run for as
+long as the write keeps its rows (`engine::SelectionRead`): the kept rows, the
+identity and value maps an `update` or `delete` builds from them and the value
+map an `insert` builds per row are charged to that pool, and each statement's
+pass over the rows charges one unit of `read_work_limit` per row, so a
+selection whose derived state outgrows `query_memory_bytes` or
+`read_work_limit` is refused as the read itself would be. A selection read sees the
 snapshot, not the statements staged before it, so a group whose selection
 reads a table an earlier group of the write changes, and an assignment that
 reads a Blob from a row, are refused at type check (`T86`).

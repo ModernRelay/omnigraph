@@ -2371,3 +2371,91 @@ node Doc { slug: String @key  text: String @index(fulltext, analyzer = "standard
     assert_eq!(batch.num_rows(), 10);
     assert_released(&probes);
 }
+
+/// What a write keeps of its group's selection read is charged to that
+/// read's pool and read-work budget: the kept rows, the identity and value
+/// maps an `update` builds from them, and the value map an `insert` builds
+/// per row, each holding its own copy of the constant assignments. Under a
+/// pool the read alone fits, the insert's maps are refused with
+/// `query_memory_bytes`, and under a `read_work_limit` the read alone fits,
+/// the update's pass over the rows is refused; both release every charge.
+/// Before, the maps and the pass were charged nowhere, and both writes
+/// succeeded under the bounds.
+#[tokio::test]
+#[serial]
+async fn write_selection_maps_are_charged_to_the_read_pool_and_work() {
+    let leaves = 6000;
+    let dir = tempfile::tempdir().unwrap();
+    let db = graph_fixture(&dir, leaves, 0).await;
+    db.apply_schema(&format!(
+        "{GRAPH_SCHEMA}\nnode Badge {{\n    owner: String @key\n    note: String\n}}\n"
+    ))
+    .await
+    .unwrap();
+    let read = r#"query picked() {
+        match { $a: Person, $a knows $b } where $a.name = "hub"
+        return { $b.@id, $b.name }
+    }"#;
+    let writes = r#"query badge($note: String) {
+        match { $a: Person, $a knows $b } where $a.name = "hub"
+        insert Badge { owner: $b.name, note: $note }
+    }
+    query stamp() {
+        match { $a: Person, $a knows $b } where $a.name = "hub"
+        update $b set { payload: $b.name }
+    }"#;
+    let note = "n".repeat(1024);
+    let limit = 4 * MIB;
+    let picked = with_query_memory_limit(limit, query_main(&db, read, "picked", &params(&[])))
+        .await
+        .unwrap();
+    assert_eq!(picked.num_rows(), leaves, "the read alone fits the pool");
+    let probes = QueryMemoryProbes::default();
+    let error = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(
+            limit,
+            mutate_main(&db, writes, "badge", &params(&[("$note", &note)])),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, OmniError::ResourceLimitExceeded { ref resource, limit: refused, .. }
+            if resource == "query_memory_bytes" && refused == limit),
+        "{error:?}"
+    );
+    assert_eq!(probes.refusals(), ["write selection inserts"]);
+    assert_released(&probes);
+    assert_eq!(helpers::count_rows(&db, "node:Badge").await, 0);
+
+    // The read's own work, then one unit per selected row the update reads.
+    let work = 15_000;
+    let tight = with_setting(&db, "read_work_limit", &work.to_string());
+    assert_eq!(
+        query_main(&tight, read, "picked", &params(&[]))
+            .await
+            .unwrap()
+            .num_rows(),
+        leaves,
+        "the read alone fits the work limit"
+    );
+    let error = mutate_main(&tight, writes, "stamp", &params(&[]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OmniError::ResourceLimitExceeded { ref resource, limit: refused, .. }
+            if resource == "read_work_limit" && refused == work),
+        "{error:?}"
+    );
+
+    // Within the bounds both writes land.
+    let badged = mutate_main(&db, writes, "badge", &params(&[("$note", &note)]))
+        .await
+        .unwrap();
+    assert_eq!(badged.affected_nodes, leaves);
+    let stamped = mutate_main(&db, writes, "stamp", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(stamped.affected_nodes, leaves);
+}

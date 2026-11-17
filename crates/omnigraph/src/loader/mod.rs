@@ -208,7 +208,7 @@ enum LoadAttemptInput<'a> {
 struct CsvInput {
     bytes: Arc<csv::CsvBytes>,
     source_max_bytes: u64,
-    source_charge: Arc<crate::engine::LoadCharge>,
+    source_charge: Arc<crate::engine::PoolCharge>,
     capture: tokio::sync::OnceCell<CapturedSource>,
 }
 

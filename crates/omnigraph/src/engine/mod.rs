@@ -72,7 +72,7 @@ pub(crate) use typed_value::{fill_declared_params, validate_params};
 use bind::bind;
 pub(crate) use constant::{evaluate_constant, literal_at};
 use context::QueryContext;
-pub(crate) use context::{LoadCharge, LoadMemory, LoadReuseReservation};
+pub(crate) use context::{LoadMemory, LoadReuseReservation, PoolCharge, SelectionRead};
 pub(crate) use explain::{explain_document, explain_load_rows, explain_rows};
 pub(crate) use graph::{EmbeddingResolver, GraphIndexHandle};
 use lower::Lowering;
@@ -384,7 +384,9 @@ pub(crate) async fn execute_query(
 
 /// A write group's selection: [`execute_query`] against the snapshot and
 /// catalog the write captured, with `now()` the instant the write bound for
-/// every attempt, so the selection and the assignments read one clock.
+/// every attempt, so the selection and the assignments read one clock. The
+/// rows come back held on the read's own pool, which goes on charging what
+/// the write derives from them ([`SelectionRead`]).
 pub(crate) async fn execute_selection(
     query: &CompiledQuery,
     params: &ParamMap,
@@ -394,7 +396,7 @@ pub(crate) async fn execute_selection(
     catalog: &Arc<Catalog>,
     embedding: &EmbeddingResolver<'_>,
     settings: &SessionSettings,
-) -> Result<QueryResult> {
+) -> Result<SelectionRead> {
     let source =
         QuerySource::gather_at(query, catalog, Some(snapshot), params, Some(now), settings).await?;
     let accepted = accept_query(&source).await?;
@@ -405,8 +407,8 @@ pub(crate) async fn execute_selection(
         graph_index: Arc::new(graph_index),
         load: None,
     };
-    let run = Box::pin(execute(bound, &context)).await?;
-    Ok(run.result)
+    let (run, ctx) = Box::pin(execute_held(bound, &context)).await?;
+    SelectionRead::hold(run.result, ctx)
 }
 
 /// [`execute_query`] as an [`Executed`]: the gate plans once, and that one
@@ -524,6 +526,15 @@ pub(crate) async fn execute(
     accepted: AcceptedBoundPlan,
     context: &EngineContext<'_>,
 ) -> Result<PlanRun> {
+    Ok(execute_held(accepted, context).await?.0)
+}
+
+/// [`execute`], with the run's context, whose pool and read-work budget
+/// outlive the run for a caller that keeps charging them.
+async fn execute_held(
+    accepted: AcceptedBoundPlan,
+    context: &EngineContext<'_>,
+) -> Result<(PlanRun, QueryContext)> {
     // Acceptance checked the plan's aggregate specs, output schemas and
     // fusion row keys; only what depends on this run's admission is left.
     let (bound, evidence) = accepted.into_parts();
@@ -548,7 +559,7 @@ pub(crate) async fn execute(
     run.result = run.result.with_ranking(ranking.map(|ranking| {
         ranking.ranking(|scan| scans.get(&scan).is_some_and(|report| report.exact))
     }));
-    Ok(run)
+    Ok((run, ctx))
 }
 
 /// What a load plan run produced: the sink's count and what each node's

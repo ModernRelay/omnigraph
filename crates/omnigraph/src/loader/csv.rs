@@ -161,7 +161,7 @@ pub(super) async fn capture_csv_source(
     bytes: &CsvBytes,
     request: &CsvLoadRequest,
     source_max_bytes: u64,
-    source_charge: Arc<crate::engine::LoadCharge>,
+    source_charge: Arc<crate::engine::PoolCharge>,
 ) -> Result<CapturedSource> {
     let mut capture = match bytes {
         #[cfg(test)]
