@@ -2531,9 +2531,10 @@ async fn mutation_with_deferred_index_coverage_remains_searchable() {
 /// No GQ query reads a full-text index: every lexical call is answered by the
 /// exact lexical scan, so removing every analyzer certificate changes no
 /// query's rows, at the head or at a historical version. A raw scan filter
-/// that reads the postings (`contains_tokens`) still needs a certified index
-/// and refuses with `FullTextIndexRebuildRequired` until the explicit
-/// rebuild writes new certificates.
+/// that reads the postings (`contains_tokens`) names no field analysis, so no
+/// segment qualifies for it: it refuses with `FullTextIndexRebuildRequired`
+/// before and after the explicit rebuild, which writes new certificates that
+/// name each field's fingerprint.
 #[tokio::test]
 #[serial]
 async fn uncertified_full_text_refuses_raw_token_filters_but_no_query() {
@@ -2610,18 +2611,26 @@ async fn uncertified_full_text_refuses_raw_token_filters_but_no_query() {
         .unwrap();
     assert_eq!(result_slugs(&historical), certified[0]);
 
-    let mut scan = dataset.scan();
-    scan.filter("contains_tokens(title, 'Learning')").unwrap();
-    assert!(matches!(
-        scan.try_into_stream().await,
-        Err(OmniError::FullTextIndexRebuildRequired { .. })
-    ));
-    assert!(matches!(
-        dataset
-            .count_rows(Some("contains_tokens(title, 'Learning')".into()))
-            .await,
-        Err(OmniError::FullTextIndexRebuildRequired { .. })
-    ));
+    let raw_filter_refuses = async |dataset: &omnigraph::db::SnapshotDataset| {
+        let mut scan = dataset.scan();
+        scan.filter("contains_tokens(title, 'Learning')").unwrap();
+        for result in [
+            scan.try_into_stream().await.map(|_| ()),
+            dataset
+                .count_rows(Some("contains_tokens(title, 'Learning')".into()))
+                .await
+                .map(|_| ()),
+        ] {
+            match result {
+                Err(OmniError::FullTextIndexRebuildRequired { reason, .. }) => {
+                    assert!(reason.contains("names no field analysis"), "{reason}")
+                }
+                Err(other) => panic!("{other}"),
+                Ok(()) => panic!("a raw token filter read a full-text segment"),
+            }
+        }
+    };
+    raw_filter_refuses(&dataset).await;
 
     let rebuilt = db
         .rebuild_full_text_indices_on_as("main", None)
@@ -2636,13 +2645,51 @@ async fn uncertified_full_text_refuses_raw_token_filters_but_no_query() {
         .open_dataset("node:Doc")
         .await
         .unwrap();
-    assert!(
-        rebuilt_dataset
-            .count_rows(Some("contains_tokens(title, 'Learning')".into()))
-            .await
+    raw_filter_refuses(&rebuilt_dataset).await;
+    // The rebuild certified every segment for its field's declared
+    // fingerprint: a binary whose native pipeline had parity would qualify
+    // it, and this one, whose native pipeline has no NFC step, does not.
+    use lance::index::DatasetIndexExt;
+
+    let catalog = db.catalog();
+    let doc = &catalog.node_types["Doc"];
+    let pinned = open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+    let lance = &pinned;
+    let schema = lance.schema().clone();
+    let mut certified = 0;
+    for index in lance.load_indices().await.unwrap().iter().filter(|index| {
+        omnigraph_core::dataset_index::is_full_text_index(index)
+            && index
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| !bitmap.is_empty())
+    }) {
+        let column = schema.field_by_id(index.fields[0]).unwrap().name.clone();
+        let fingerprint = &doc.full_text_fingerprints[&column];
+        let profile = doc.full_text_profile(&column).unwrap();
+        let native = omnigraph_core::fts_analysis::measured(profile)
             .unwrap()
-            > 0
-    );
+            .native
+            .clone();
+        omnigraph_core::fts_compat::verify_index_against(
+            lance,
+            index,
+            fingerprint,
+            profile,
+            &omnigraph_core::fts_analysis::MeasuredAnalysis {
+                analyzer: native.clone(),
+                native,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            omnigraph_core::fts_compat::verify_index(lance, index, fingerprint, profile).await,
+            Err(OmniError::FullTextIndexRebuildRequired { .. })
+        ));
+        certified += 1;
+    }
+    assert!(certified > 0);
 }
 
 /// A plain `nearest` over a type with full-text-indexed String columns runs no
@@ -2709,12 +2756,17 @@ async fn plain_nearest_skips_the_full_text_validation() {
             .count_rows(Some("contains_tokens(title, 'Learning')".into()))
             .await
     })
-    .await
-    .unwrap();
-    assert!(matched > 0);
+    .await;
+    assert!(
+        matches!(
+            matched,
+            Err(omnigraph::error::OmniError::FullTextIndexRebuildRequired { .. })
+        ),
+        "{matched:?}"
+    );
     assert!(
         probes.fts_validations.load(Ordering::Relaxed) > 0,
-        "a raw token filter reads the postings, so it validates their certificate"
+        "a raw token filter would read the postings, so it runs the validation"
     );
 }
 

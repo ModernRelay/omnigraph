@@ -115,16 +115,54 @@ pub struct StorageFormatV1 {
     pub internal_schema_version: u32,
     /// The pinned `lance` crate version (`Cargo.lock`).
     pub lance_version: String,
-    /// The full-text analyzer generation the engine certifies indexes with.
-    pub fts_analyzer_generation: String,
+    /// What this engine's full-text index certificates record, so a change in
+    /// what analysis writes always yields a new base.
+    pub fts_certificate: FtsCertificateV1,
+}
+
+/// The full-text analysis a base's index certificates record: the
+/// certificate format and, per analyzer profile, the measured fingerprints of
+/// its native configuration and its analyzer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FtsCertificateV1 {
+    pub format_version: u32,
+    pub profiles: Vec<FtsProfileV1>,
+}
+
+/// One analyzer profile's measured fingerprints in the engine that wrote a
+/// base.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FtsProfileV1 {
+    pub profile: String,
+    pub native: String,
+    pub analyzer: String,
 }
 
 impl StorageFormatV1 {
     pub fn current() -> Self {
+        let profiles = omnigraph_compiler::schema::analysis::AnalyzerProfile::ALL
+            .into_iter()
+            .map(|profile| {
+                // The probe corpus and the analyzers are compiled in, so a
+                // measurement that fails is a broken binary, not an input.
+                let measured = omnigraph::fts_measured_analysis(profile)
+                    .expect("the engine measures every analyzer profile");
+                FtsProfileV1 {
+                    profile: profile.name().to_owned(),
+                    native: measured.native.clone(),
+                    analyzer: measured.analyzer.clone(),
+                }
+            })
+            .collect();
         Self {
             internal_schema_version: omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
             lance_version: env!("GQT_LANCE_VERSION").to_owned(),
-            fts_analyzer_generation: omnigraph::FTS_ANALYZER_GENERATION.to_owned(),
+            fts_certificate: FtsCertificateV1 {
+                format_version: omnigraph::FTS_CERTIFICATE_FORMAT_VERSION,
+                profiles,
+            },
         }
     }
 }
@@ -1005,9 +1043,27 @@ mod tests {
         let mut other_lance = format.clone();
         other_lance.lance_version.push_str("-next");
         assert_ne!(key, base_key(&plan, &here, &other_lance, None).unwrap());
-        let mut other_analyzer = format.clone();
-        other_analyzer.fts_analyzer_generation.push_str("-v2");
-        assert_ne!(key, base_key(&plan, &here, &other_analyzer, None).unwrap());
+        // A change in what analysis writes, in either measured fingerprint
+        // of any profile or in the certificate format, is a new base.
+        assert_eq!(format.fts_certificate.profiles.len(), 3);
+        for profile in 0..format.fts_certificate.profiles.len() {
+            for native in [true, false] {
+                let mut other_analysis = format.clone();
+                let measured = &mut other_analysis.fts_certificate.profiles[profile];
+                if native {
+                    measured.native.push_str("-next");
+                } else {
+                    measured.analyzer.push_str("-next");
+                }
+                assert_ne!(key, base_key(&plan, &here, &other_analysis, None).unwrap());
+            }
+        }
+        let mut other_certificate = format.clone();
+        other_certificate.fts_certificate.format_version += 1;
+        assert_ne!(
+            key,
+            base_key(&plan, &here, &other_certificate, None).unwrap()
+        );
         let elsewhere = StoreLocation::S3 {
             bucket: "b".into(),
             prefix: "bench-2".into(),

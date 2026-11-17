@@ -10,7 +10,6 @@ use lance_index::is_system_index;
 use lance_table::format::IndexMetadata;
 
 use crate::error::{OmniError, Result};
-use crate::fts_compat::verify_index;
 
 /// Whether a `key_col IN (...)` scan on a dataset will be served by the
 /// persisted scalar (BTREE) index, or silently fall back to a full filtered
@@ -77,8 +76,13 @@ pub async fn validate_full_text_scan(ds: &Dataset, scanner: &Scanner) -> Result<
 }
 
 /// The validation proper, over an already-derived demand: what the filters
-/// read through `contains_tokens`. A raw filter holds no schema, so any
-/// certified analysis of a segment it reads is accepted.
+/// read through `contains_tokens`. A raw filter names no field analysis, and
+/// [`crate::fts_compat::verify_index`] qualifies a segment only for the
+/// accepted fingerprint of the field it serves, so a raw filter over a column
+/// that holds a full-text segment refuses with
+/// [`OmniError::FullTextIndexRebuildRequired`] before it reads the postings.
+/// A column without a segment has no postings to read. No lexical query
+/// reads a full-text index; the exact scan answers it.
 pub async fn validate_full_text_demand(ds: &Dataset, filter_demand: FtsFilterDemand) -> Result<()> {
     crate::instrumentation::record_fts_validation();
     let all_columns = filter_demand.all_columns;
@@ -94,11 +98,18 @@ pub async fn validate_full_text_demand(ds: &Dataset, filter_demand: FtsFilterDem
     // storage-validation future out of every caller's scan/count state.
     Box::pin(async move {
         let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-        for index in indices.iter().filter(|index| {
+        if let Some(index) = indices.iter().find(|index| {
             (is_full_text_index(index) || index.index_details.is_none())
                 && (all_columns || index.fields.iter().any(|field| fields.contains(field)))
         }) {
-            verify_index(ds, index, None).await?;
+            return Err(OmniError::FullTextIndexRebuildRequired {
+                index: index.name.clone(),
+                reason: format!(
+                    "a raw `contains_tokens` filter names no field analysis, so no full-text \
+                     segment qualifies for it (index UUID {})",
+                    index.uuid
+                ),
+            });
         }
         Ok(())
     })

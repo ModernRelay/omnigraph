@@ -17,6 +17,7 @@ pub mod dst_clock;
 pub mod dst_gate;
 pub mod dst_ids;
 pub mod error;
+pub mod fts_analysis;
 pub mod fts_compat;
 pub mod graph_commit_id;
 pub mod handle_cache;

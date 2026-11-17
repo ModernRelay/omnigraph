@@ -13,6 +13,7 @@ use omnigraph::db::{
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
+use omnigraph_compiler::schema::analysis::AnalyzerProfile;
 use omnigraph_compiler::schema::ast::Cardinality;
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 use omnigraph_core::graph_commit_id::intent_nonce;
@@ -3567,6 +3568,32 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
             Err(omnigraph_core::error::OmniError::FullTextIndexRebuildRequired { .. })
         )
     };
+    // Qualify `index` for a field declaring `fingerprint` with `profile`, as
+    // a binary whose native pipeline has parity with the profile analyzer
+    // would; this binary's has none (no NFC step), so it refuses every one.
+    let qualify = async |dataset: &lance::Dataset,
+                         index: &lance_table::format::IndexMetadata,
+                         fingerprint: &str,
+                         profile: AnalyzerProfile| {
+        let native = omnigraph_core::fts_analysis::measured(profile)
+            .unwrap()
+            .native
+            .clone();
+        assert!(rebuild_required(
+            omnigraph_core::fts_compat::verify_index(dataset, index, fingerprint, profile).await
+        ));
+        omnigraph_core::fts_compat::verify_index_against(
+            dataset,
+            index,
+            fingerprint,
+            profile,
+            &omnigraph_core::fts_analysis::MeasuredAnalysis {
+                analyzer: native.clone(),
+                native,
+            },
+        )
+        .await
+    };
 
     // An index without `analyzer` is `english_v1`: it stems and folds, and
     // its certificate names that profile's fingerprint.
@@ -3575,16 +3602,14 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
     let (edition_2, edition_2_segments) = segments("body").await;
     assert_eq!(edition_2_segments.len(), 1);
     let default_english = fingerprint("body").expect("every full-text field has a fingerprint");
-    omnigraph_core::fts_compat::verify_index(
+    qualify(
         &edition_2,
         &edition_2_segments[0],
-        Some(&default_english),
+        &default_english,
+        AnalyzerProfile::EnglishV1,
     )
     .await
     .unwrap();
-    omnigraph_core::fts_compat::verify_index(&edition_2, &edition_2_segments[0], None)
-        .await
-        .unwrap();
 
     // Declaring `standard_v1` replaces the segment by an untrained one built
     // with the profile and certified for the field's fingerprint.
@@ -3613,22 +3638,34 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
         Some(0),
         "the replacement carries the analyzer without postings"
     );
-    omnigraph_core::fts_compat::verify_index(&declared, &declared_segments[0], Some(&standard))
-        .await
-        .unwrap();
+    qualify(
+        &declared,
+        &declared_segments[0],
+        &standard,
+        AnalyzerProfile::StandardV1,
+    )
+    .await
+    .unwrap();
     // A certificate of the old analysis does not establish the new one, nor
     // the new one the old.
     assert!(rebuild_required(
-        omnigraph_core::fts_compat::verify_index(
+        qualify(
             &edition_2,
             &edition_2_segments[0],
-            Some(&standard)
+            &standard,
+            AnalyzerProfile::StandardV1
         )
         .await
     ));
-    omnigraph_core::fts_compat::verify_index(&declared, &declared_segments[0], None)
+    assert!(rebuild_required(
+        qualify(
+            &declared,
+            &declared_segments[0],
+            &default_english,
+            AnalyzerProfile::EnglishV1
+        )
         .await
-        .unwrap();
+    ));
     // `standard_v1` lowercases but neither stems nor folds.
     assert_eq!(search("body", "run").await, Vec::<String>::new());
     assert_eq!(search("body", "running").await, ["d1"]);
@@ -3646,9 +3683,14 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
             .map(|bitmap| bitmap.len()),
         Some(1)
     );
-    omnigraph_core::fts_compat::verify_index(&built, &built_segments[0], Some(&standard))
-        .await
-        .unwrap();
+    qualify(
+        &built,
+        &built_segments[0],
+        &standard,
+        AnalyzerProfile::StandardV1,
+    )
+    .await
+    .unwrap();
     assert_eq!(search("body", "run").await, Vec::<String>::new());
     assert_eq!(search("body", "running").await, ["d1"]);
 
@@ -3674,10 +3716,11 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
     let (changed, changed_segments) = segments("text").await;
     assert_eq!(changed_segments.len(), 1);
     assert_ne!(changed_segments[0].uuid, built_segments[0].uuid);
-    omnigraph_core::fts_compat::verify_index(
+    qualify(
         &changed,
         &changed_segments[0],
-        Some(&english_fingerprint),
+        &english_fingerprint,
+        AnalyzerProfile::EnglishV1,
     )
     .await
     .unwrap();
@@ -3693,10 +3736,11 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
     let (removed, removed_segments) = segments("text").await;
     assert_eq!(removed_segments.len(), 1);
     assert_eq!(removed_segments[0].uuid, changed_segments[0].uuid);
-    omnigraph_core::fts_compat::verify_index(
+    qualify(
         &removed,
         &removed_segments[0],
-        Some(&english_fingerprint),
+        &english_fingerprint,
+        AnalyzerProfile::EnglishV1,
     )
     .await
     .unwrap();

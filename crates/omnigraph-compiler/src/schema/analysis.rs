@@ -343,12 +343,6 @@ pub const ENGLISH_V1_STOP_WORDS: &[&str] = &[
     "yourselves",
 ];
 
-/// The stemmer `english_v1` applies: Snowball English as the stemmer crate
-/// Lance 13 uses implements it, at the version the lockfile resolves. A
-/// stemmer change is a new profile, so this identity is part of the
-/// profile's descriptor, and a test holds it to the resolved version.
-pub const ENGLISH_STEMMER: &str = "snowball-english@frostem-1.20260821.3";
-
 /// The SHA-256 of a stop list: its words joined by newlines.
 pub fn stop_list_digest(words: &[&str]) -> String {
     let mut hasher = Sha256::new();
@@ -533,7 +527,11 @@ fn descriptor(property_id: u64, profile: AnalyzerProfile, scorer: FullTextScorer
     let stop_words = pipeline
         .stop_words()
         .map_or_else(|| "none".to_string(), stop_list_digest);
-    let stemmer = if stems { ENGLISH_STEMMER } else { "none" };
+    // The stemmer's algorithm, never an implementation or its version: a
+    // binary upgrade never changes an accepted fingerprint. RFC 0043's
+    // measured fingerprint proves an implementation still emits the
+    // profile's terms.
+    let stemmer = if stems { "snowball-english" } else { "none" };
     format!(
         "omnigraph.full-text-analysis.v1\n\
          property_id={property_id}\n\
@@ -632,8 +630,8 @@ mod tests {
                  omnigraph.full-text-analysis.v1\nproperty_id=7\nprofile=standard_v1\nnormalization=nfc\ntokenizer=simple\nfilters=lowercase\nstop_words=none\nstemmer=none\nmax_token_length=disabled\nscorer=none\n\
                  omnigraph.full-text-analysis.v1\nproperty_id=7\nprofile=standard_folded_v1\nnormalization=nfc\ntokenizer=simple\nfilters=lowercase,ascii_folding\nstop_words=none\nstemmer=none\nmax_token_length=disabled\nscorer=bm25_v1\n\
                  omnigraph.full-text-analysis.v1\nproperty_id=7\nprofile=standard_folded_v1\nnormalization=nfc\ntokenizer=simple\nfilters=lowercase,ascii_folding\nstop_words=none\nstemmer=none\nmax_token_length=disabled\nscorer=none\n\
-                 omnigraph.full-text-analysis.v1\nproperty_id=7\nprofile=english_v1\nnormalization=nfc\ntokenizer=simple\nfilters=lowercase,stem:english,stop_words:english,ascii_folding\nstop_words={english_stop_words}\nstemmer={ENGLISH_STEMMER}\nmax_token_length=disabled\nscorer=bm25_v1\n\
-                 omnigraph.full-text-analysis.v1\nproperty_id=7\nprofile=english_v1\nnormalization=nfc\ntokenizer=simple\nfilters=lowercase,stem:english,stop_words:english,ascii_folding\nstop_words={english_stop_words}\nstemmer={ENGLISH_STEMMER}\nmax_token_length=disabled\nscorer=none\n"
+                 omnigraph.full-text-analysis.v1\nproperty_id=7\nprofile=english_v1\nnormalization=nfc\ntokenizer=simple\nfilters=lowercase,stem:english,stop_words:english,ascii_folding\nstop_words={english_stop_words}\nstemmer=snowball-english\nmax_token_length=disabled\nscorer=bm25_v1\n\
+                 omnigraph.full-text-analysis.v1\nproperty_id=7\nprofile=english_v1\nnormalization=nfc\ntokenizer=simple\nfilters=lowercase,stem:english,stop_words:english,ascii_folding\nstop_words={english_stop_words}\nstemmer=snowball-english\nmax_token_length=disabled\nscorer=none\n"
             )
         );
         let fingerprints: Vec<String> = AnalyzerProfile::ALL
@@ -655,13 +653,21 @@ mod tests {
                 "sha256:42f7b664f81c323e425c82aa5060a2bbeae4d9612b3e3d95f5ef5f00ec51a490",
                 "sha256:cfb99c30e5b911dedb8b69be27240e504433047f767204ef23f95b7a7f146a96",
                 "sha256:640e3b66055e49c7f3935dc4cc553a7981bc9186c6913c58e883a7f1f35f55dd",
-                "sha256:5c73936bcc2ef1e590aa912ffc8b17d17d7767b7398a4ca134551ddacb1c3b61",
-                "sha256:6dad0095c7d82fa4ebbc57172e351a59f6369ed409a14514e52fb51d1b2a299b",
+                "sha256:7aa5e092d6754a8876256673a94cad63792e0afacaf5867651d7194edc608b93",
+                "sha256:4005d2de454f5a3713d29182ec87ab3813886a3521eb794af364eec3dc916fef",
             ]
         );
         // Term positions are a build option of an index, never part of a
         // profile.
         assert!(!pinned_descriptors().contains("position"));
+        // A profile names algorithms, never an implementation or its version,
+        // so a binary upgrade never changes an accepted fingerprint.
+        for implementation in ["frostem", "lance", "@"] {
+            assert!(
+                !pinned_descriptors().contains(implementation),
+                "{implementation}"
+            );
+        }
     }
 
     /// The stop list is each of NLTK's 198 English stop words and its
@@ -684,22 +690,6 @@ mod tests {
         for word in ["only", "very", "the", "being", "be", "you've", "you'v"] {
             assert!(ENGLISH_V1_STOP_WORDS.contains(&word), "{word}");
         }
-    }
-
-    /// The stemmer identity names the version the lockfile resolves.
-    #[test]
-    fn the_stemmer_identity_is_the_resolved_stemmer() {
-        let lock = include_str!("../../../../Cargo.lock");
-        let resolved = lock
-            .split("[[package]]")
-            .find(|package| package.contains("name = \"frostem\""))
-            .and_then(|package| package.split("version = \"").nth(1))
-            .and_then(|rest| rest.split('"').next())
-            .unwrap();
-        assert_eq!(
-            ENGLISH_STEMMER,
-            format!("snowball-english@frostem-{resolved}")
-        );
     }
 
     #[test]

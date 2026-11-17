@@ -2655,15 +2655,22 @@ query title_contains_case() {
         !new_certificates.is_empty(),
         "the candidate must build new posting artifacts"
     );
-    // Format 2 records the field's analyzer fingerprint; the predecessor
-    // reads only format 1, so it refuses these postings below.
+    // Format 2 records the field's analyzer fingerprint and the measured
+    // fingerprint of the native pipeline that built the postings, and no
+    // analyzer generation; the predecessor reads only format 1, so it refuses
+    // these postings below.
     for (_, bytes) in new_certificates {
         let certificate: Value = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(
-            certificate["analyzer_generation"],
-            "lance11.0.0-frostem1.20260821.3-v1"
-        );
         assert_eq!(certificate["format_version"], 2);
+        assert!(certificate.get("analyzer_generation").is_none());
+        for fingerprint in ["analyzer_fingerprint", "native_fingerprint"] {
+            assert!(
+                certificate[fingerprint]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("sha256:")),
+                "{certificate}"
+            );
+        }
     }
     run(&current, &["optimize", "--target", uri]);
     run(

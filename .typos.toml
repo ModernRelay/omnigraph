@@ -28,6 +28,18 @@ write_applyable_state = "write_applyable_state"                 # cluster test h
 seed_applyable_state = "seed_applyable_state"                   # same family
 write_cluster_applyable_state = "write_cluster_applyable_state" # CLI test helper, same meaning
 
+# The full-text probe corpus spells every stop word of `english_v1` and its
+# Snowball stem on purpose (crates/omnigraph-core/fts/probe_corpus.txt).
+[type.fts-probes]
+extend-glob = ["probe_corpus.txt"]
+
+[type.fts-probes.extend-words]
+abov = "abov"
+becaus = "becaus"
+befor = "befor"
+ourselv = "ourselv"
+yourselv = "yourselv"
+
 [type.rust.extend-words]
 alph = "alph"         # prefix-filter probe value in literal_filters.rs
 abov = "abov"         # Snowball English stems of stop words in english_v1's stop list (schema/analysis.rs)

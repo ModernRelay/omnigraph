@@ -47,7 +47,6 @@ lance-index = { workspace = true }
 lance-linalg = { workspace = true }
 lance-tokenizer = { workspace = true }
 libm = { workspace = true }
-unicode-normalization = { workspace = true }
 lance-namespace = { workspace = true }
 lance-table = { workspace = true }
 prost = "0.14"
@@ -99,6 +98,8 @@ proptest = "1"
 syn = { workspace = true }
 toml = "0.9"
 libc = "0.2"
+# The exact lexical scan's tests build NFC text; the analyzer itself is omnigraph-core's.
+unicode-normalization = { workspace = true }
 
 [lints]
 workspace = true

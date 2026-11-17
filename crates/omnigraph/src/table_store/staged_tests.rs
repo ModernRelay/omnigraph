@@ -3471,22 +3471,71 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
         .unwrap();
     assert_eq!(rebuilt.version().version, 3);
     assert_eq!(rebuilt.load_indices().await.unwrap().len(), 1);
+    let build = crate::storage_layer::FullTextBuild::for_test();
+    let rebuilt_index = rebuilt.load_indices().await.unwrap()[0].clone();
     for term in ["organism", "university", "running"] {
+        // The rebuilt postings hold every term the old ones lost.
+        let mut raw = rebuilt.scan();
+        raw.full_text_search(FullTextSearchQuery::new(term.into()))
+            .unwrap();
+        let raw_batches: Vec<_> = raw
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            raw_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1
+        );
+        // The guarded scan surface still refuses a raw filter: it names no
+        // field analysis, so no segment qualifies for it.
         let filter = format!("contains_tokens(text, '{term}')");
-        let batches: Vec<_> =
-            TableStore::scan_stream_with(&rebuilt, None, Some(&filter), None, false, |_| Ok(()))
-                .await
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap();
-        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        match TableStore::scan_stream_with(&rebuilt, None, Some(&filter), None, false, |_| Ok(()))
+            .await
+        {
+            Err(OmniError::FullTextIndexRebuildRequired { reason, .. }) => {
+                assert!(reason.contains("names no field analysis"), "{reason}")
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("a raw token filter read a full-text segment"),
+        }
     }
+    // A binary whose native pipeline has parity qualifies the rebuilt
+    // segment for its field; the old one has no certificate at all.
+    let native = super::fts_analysis::measured(build.profile)
+        .unwrap()
+        .native
+        .clone();
+    let parity = super::fts_analysis::MeasuredAnalysis {
+        analyzer: native.clone(),
+        native,
+    };
+    super::fts_compat::verify_index_against(
+        &rebuilt,
+        &rebuilt_index,
+        &build.fingerprint,
+        build.profile,
+        &parity,
+    )
+    .await
+    .unwrap();
     assert_eq!(store.count_rows(&old, None).await.unwrap(), 3);
-    assert!(matches!(
-        super::fts_compat::verify_index(&old, &old_indices[0], None).await,
-        Err(OmniError::FullTextIndexRebuildRequired { .. })
-    ));
+    match super::fts_compat::verify_index_against(
+        &old,
+        &old_indices[0],
+        &build.fingerprint,
+        build.profile,
+        &parity,
+    )
+    .await
+    {
+        Err(OmniError::FullTextIndexRebuildRequired { reason, .. }) => {
+            assert!(reason.contains("certificate is missing"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// Staged delete (Lance 7.0 `DeleteBuilder::execute_uncommitted`, lance#6658):

@@ -36,8 +36,6 @@ use std::collections::{HashMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray};
 use futures::StreamExt;
-use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
-use lance_tokenizer::TokenStream;
 use omnigraph_compiler::catalog::{Catalog, NodeType};
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::ir::IRExpr;
@@ -46,7 +44,6 @@ use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
 use omnigraph_compiler::query::codes::{E1, E3, T20, T71};
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
 use omnigraph_compiler::schema::analysis::AnalyzerProfile;
-use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 
 use super::operators::memory::WorkMemory;
 use super::{OmniError, Result, Snapshot};
@@ -64,71 +61,9 @@ pub(crate) const MAX_EDITS: u8 = 2;
 const EDIT_WEIGHTS: [f64; 3] = [1.0, 0.5, 0.25];
 
 /// One profile's analyzer: NFC, then the profile's tokenizer and filters.
-pub(crate) struct Analyzer {
-    tokenizer: Box<dyn LanceTokenizer>,
-}
-
-impl Analyzer {
-    /// The analyzer `profile` names, built from the parameters its index is
-    /// built with.
-    pub(crate) fn of(profile: AnalyzerProfile) -> Result<Self> {
-        let params = crate::table_store::full_text_index_params(profile)?;
-        let tokenizer = params.build().map_err(|error| {
-            OmniError::manifest_internal(format!("the {profile} analyzer does not build: {error}"))
-        })?;
-        Ok(Self { tokenizer })
-    }
-
-    /// Every analyzed token of `text` into `token`, in order, through Lance's
-    /// search path for a `query` and its document path otherwise. `text` and
-    /// its NFC form hold at most `limit` bytes; `resource` names that bound.
-    /// `normalized` is told the bytes of an NFC copy before it is built.
-    fn analyze(
-        &mut self,
-        text: &str,
-        limit: usize,
-        resource: &'static str,
-        query: bool,
-        mut normalized: impl FnMut(usize) -> Result<()>,
-        mut token: impl FnMut(&str) -> Result<()>,
-    ) -> Result<()> {
-        if text.len() > limit {
-            return Err(OmniError::resource_limit(
-                resource,
-                limit as u64,
-                text.len() as u64,
-            ));
-        }
-        let copy;
-        let text = if is_nfc_quick(text.chars()) == IsNormalized::Yes {
-            text
-        } else {
-            normalized(text.len())?;
-            let mut out = String::with_capacity(text.len());
-            for c in text.nfc() {
-                if out.len() + c.len_utf8() > limit {
-                    return Err(OmniError::resource_limit(
-                        resource,
-                        limit as u64,
-                        (out.len() + c.len_utf8()) as u64,
-                    ));
-                }
-                out.push(c);
-            }
-            copy = out;
-            copy.as_str()
-        };
-        let mut stream = if query {
-            self.tokenizer.token_stream_for_search(text)
-        } else {
-            self.tokenizer.token_stream_for_doc(text)
-        };
-        while stream.advance() {
-            token(&stream.token().text)?;
-        }
-        Ok(())
-    }
-}
+/// It lives in `omnigraph-core` beside the measurement of what it emits, so
+/// the measured fingerprint of the profile analyzer is this scan's own code.
+pub(crate) use omnigraph_core::fts_analysis::ProfileAnalyzer as Analyzer;
 
 /// A `terms(text, mode, max_edits)` value analyzed with its field's
 /// analyzer: the distinct terms in ascending UTF-8 order.
@@ -715,6 +650,8 @@ pub(crate) async fn bm25(
 
 #[cfg(test)]
 mod tests {
+    use unicode_normalization::UnicodeNormalization;
+
     use super::*;
 
     fn chars(text: &str) -> Vec<char> {

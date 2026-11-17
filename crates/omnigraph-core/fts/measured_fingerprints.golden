@@ -1,0 +1,10 @@
+# The measured fingerprints of every analyzer profile: the native configuration's
+# and the profile analyzer's, over fts/probe_corpus.txt. Equal fingerprints mean
+# parity between a native index and the exact scan. Regenerate only as
+# docs/dev/testing.md describes; never refresh it to turn the test green.
+standard_v1 native sha256:76e1636637778021f1690a9c0789bc743088efb9f95ae7906541480f1bc53593
+standard_v1 analyzer sha256:c91eac721fc165c523d6f0d89bf422fed19a9b3325023b195e63e1bbae6e4eec
+standard_folded_v1 native sha256:de15802bb5cc886270be53e7770fcd38c278a760b15456493bcfe0851c807a53
+standard_folded_v1 analyzer sha256:d403ea038f16e1bb3927809cdb5c4dc361bbe7de6d00023910681917b993121d
+english_v1 native sha256:eb980aaeb2cda1a85139f541e09dcaaf2a10288f620a7d6aad1c70cd1c038822
+english_v1 analyzer sha256:bdc9c2f22f06c5d5ad1f588f04d704ed3608b6876e028a8b7142215321c89208

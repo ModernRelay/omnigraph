@@ -4926,6 +4926,174 @@ fn inverted_params_lowercase_stem_then_remove_stop_words_then_fold() {
     assert_eq!(tokens(&english("x"), "resumes"), ["resum"]);
 }
 
+// --- Guard: the native configuration is the tokenizer Lance indexes with ---
+//
+// The measured fingerprint a full-text certificate records is the digest of
+// what `InvertedIndexParams::build` emits for a profile's native parameters
+// (`omnigraph_core::fts_analysis::native_params`). That measures the index
+// only while Lance 13's builder tokenizes documents with that tokenizer's
+// document stream (`InvertedIndexBuilder::update_index` calls `params.build()`)
+// and its query path with the same tokenizer's search stream. This guard pins
+// what the tokenizer emits for each profile, a stop word's stem, folding
+// after stemming, no length filter and no NFC included, and that an index
+// built from the parameters holds those tokens and no others: a decomposed
+// accent splits a word in the postings as it does in the tokenizer. A Lance
+// release that tokenizes differently turns this red by name, beside the
+// measured-fingerprint golden.
+
+#[tokio::test]
+async fn native_configuration_tokenizes_as_the_index_builder_does() {
+    use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
+    use omnigraph_compiler::schema::analysis::AnalyzerProfile;
+    use omnigraph_core::fts_analysis::native_params;
+
+    let tokens = |profile: AnalyzerProfile, text: &str| -> Vec<String> {
+        let mut tokenizer: Box<dyn LanceTokenizer> =
+            native_params(profile).unwrap().build().unwrap();
+        let mut paths = Vec::new();
+        for query in [false, true] {
+            let mut stream = if query {
+                tokenizer.token_stream_for_search(text)
+            } else {
+                tokenizer.token_stream_for_doc(text)
+            };
+            let mut out = Vec::new();
+            while stream.advance() {
+                out.push(stream.token().text.clone());
+            }
+            paths.push(out);
+        }
+        assert_eq!(
+            paths[0], paths[1],
+            "{profile} {text:?}: document and query paths"
+        );
+        paths.remove(0)
+    };
+    let long = "x".repeat(41);
+    for (profile, text, expected) in [
+        (
+            AnalyzerProfile::StandardV1,
+            "Runners RUNNING",
+            vec!["runners", "running"],
+        ),
+        (AnalyzerProfile::StandardV1, "Café", vec!["café"]),
+        (
+            AnalyzerProfile::StandardFoldedV1,
+            "Café Œuvre",
+            vec!["cafe", "oeuvre"],
+        ),
+        (
+            AnalyzerProfile::EnglishV1,
+            "Runners were RUNNING",
+            vec!["runner", "run"],
+        ),
+        // `only` stems to `onli`, which the profile's list holds.
+        (
+            AnalyzerProfile::EnglishV1,
+            "only the human beings",
+            vec!["human"],
+        ),
+        (
+            AnalyzerProfile::EnglishV1,
+            "résumés resumes",
+            vec!["resume", "resum"],
+        ),
+        // No length filter, and no NFC: a combining accent splits the word.
+        (
+            AnalyzerProfile::StandardV1,
+            long.as_str(),
+            vec![long.as_str()],
+        ),
+        (
+            AnalyzerProfile::StandardV1,
+            "e\u{301}tude",
+            vec!["e", "tude"],
+        ),
+        (
+            AnalyzerProfile::StandardFoldedV1,
+            "e\u{301}tude",
+            vec!["e", "tude"],
+        ),
+        (
+            AnalyzerProfile::StandardV1,
+            "x\u{2122} vitamin",
+            vec!["x", "vitamin"],
+        ),
+    ] {
+        assert_eq!(tokens(profile, text), expected, "{profile} {text:?}");
+    }
+
+    // The postings hold the tokenizer's tokens: built from the native
+    // parameters over the decomposed text, the index matches `tude` and not
+    // the composed `étude` the profile analyzer would have indexed.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("native.lance");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["decomposed", "composed"])),
+            Arc::new(StringArray::from(vec![
+                "e\u{301}tude one",
+                "\u{e9}tude two",
+            ])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_fts".into()),
+            &native_params(AnalyzerProfile::StandardV1).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+    for (term, expected) in [
+        ("tude", vec!["decomposed"]),
+        ("\u{e9}tude", vec!["composed"]),
+        ("one", vec!["decomposed"]),
+    ] {
+        let mut scan = dataset.scan();
+        scan.project(&["id"]).unwrap();
+        scan.full_text_search(FullTextSearchQuery::new(term.into()))
+            .unwrap();
+        let batches: Vec<RecordBatch> = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let ids: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch.column_by_name("id").unwrap().as_string::<i32>();
+                (0..batch.num_rows())
+                    .map(|row| column.value(row).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ids, expected, "{term:?}");
+    }
+}
+
 // --- Guard: `distance` scores with the flat kNN's own kernel ---
 //
 // The engine's `distance` operator scores through
