@@ -110,11 +110,18 @@ pub fn written_columns(term: &Term, out: &mut Vec<String>) {
             own.iter().for_each(|name| push(out, name));
         }
         Term::Union { left, .. } => written_columns(left, out),
-        Term::Score { input, out: score, .. } | Term::ApproxTopK { input, out: score, .. } => {
+        Term::Score {
+            input, out: score, ..
+        }
+        | Term::ApproxTopK {
+            input, out: score, ..
+        } => {
             written_columns(input, out);
             push(out, score);
         }
-        Term::Fuse { target, out: score, .. } => {
+        Term::Fuse {
+            target, out: score, ..
+        } => {
             out.clear();
             push(out, target);
             push(out, score);

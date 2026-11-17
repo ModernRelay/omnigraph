@@ -3236,3 +3236,300 @@ async fn saved_return_leaf_types_refuse_drift_when_limit_skips_input() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Law 4: plan acceptance (the GQ 3 RFC, section 10, planner acceptance).
+//
+// A generated read over a generated graph (`omnigraph_compiler::arbitrary`)
+// runs inspected; its replay envelope's plan is then edited once, at a
+// position the mutator picks, by one of the single edits below, and the
+// edited envelope goes through the replay door. The law: every edit is
+// refused, or replays to the run's rows (a no-op edit, an equivalent plan).
+// The unedited envelope reads back to the run's plan, which covers the
+// serialization round trip of every node kind the generator reaches.
+
+/// One single edit of a serialized plan.
+#[derive(Debug, Clone, Copy)]
+enum PlanEdit {
+    /// Remove an array element (a node, conjunct, column, order key, arm).
+    Drop,
+    /// Repeat an array element after itself.
+    Duplicate,
+    /// Swap an array element with the next.
+    Move,
+    /// Change a scalar: a number by one, a Boolean flipped, a string to
+    /// another string the plan holds.
+    Alter,
+    /// Remove an object's key (an option, a cut, a filter).
+    Remove,
+}
+
+const PLAN_EDITS: [PlanEdit; 5] = [
+    PlanEdit::Drop,
+    PlanEdit::Duplicate,
+    PlanEdit::Move,
+    PlanEdit::Alter,
+    PlanEdit::Remove,
+];
+
+/// Every position an edit can take in `value`, as a JSON pointer, with
+/// whether it names an array element.
+fn edit_positions(value: &Value, at: String, out: &mut Vec<(String, bool)>) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let path = format!("{at}/{}", key.replace('~', "~0").replace('/', "~1"));
+                out.push((path.clone(), false));
+                edit_positions(child, path, out);
+            }
+        }
+        Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                let path = format!("{at}/{i}");
+                out.push((path.clone(), true));
+                edit_positions(child, path, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.clone()),
+        Value::Object(o) => o.values().for_each(|v| strings(v, out)),
+        Value::Array(a) => a.iter().for_each(|v| strings(v, out)),
+        _ => {}
+    }
+}
+
+/// `plan` with `edit` applied at `path`; `None` where the edit does not
+/// apply there.
+fn edited(plan: &Value, path: &str, in_array: bool, edit: PlanEdit, pick: usize) -> Option<Value> {
+    let mut plan = plan.clone();
+    let (parent, last) = path.rsplit_once('/')?;
+    let mut pool = Vec::new();
+    strings(&plan, &mut pool);
+    match (edit, in_array) {
+        (PlanEdit::Drop, true) => {
+            let index: usize = last.parse().ok()?;
+            plan.pointer_mut(parent)?.as_array_mut()?.remove(index);
+        }
+        (PlanEdit::Duplicate, true) => {
+            let index: usize = last.parse().ok()?;
+            let items = plan.pointer_mut(parent)?.as_array_mut()?;
+            let copy = items[index].clone();
+            items.insert(index + 1, copy);
+        }
+        (PlanEdit::Move, true) => {
+            let index: usize = last.parse().ok()?;
+            let items = plan.pointer_mut(parent)?.as_array_mut()?;
+            if index + 1 >= items.len() {
+                return None;
+            }
+            items.swap(index, index + 1);
+        }
+        (PlanEdit::Remove, false) => {
+            let key = last.replace("~1", "/").replace("~0", "~");
+            plan.pointer_mut(parent)?.as_object_mut()?.remove(&key)?;
+        }
+        (PlanEdit::Alter, _) => {
+            let slot = plan.pointer_mut(path)?;
+            *slot = match slot {
+                Value::Bool(b) => Value::Bool(!*b),
+                Value::Number(n) => match (n.as_u64(), n.as_i64(), n.as_f64()) {
+                    (Some(u), _, _) => Value::from(u + 1),
+                    (_, Some(i), _) => Value::from(i + 1),
+                    (_, _, Some(f)) => Value::from(f + 1.0),
+                    _ => return None,
+                },
+                Value::String(s) => {
+                    let other: Vec<&String> = pool.iter().filter(|p| *p != s).collect();
+                    if other.is_empty() {
+                        return None;
+                    }
+                    Value::String(other[pick % other.len()].clone())
+                }
+                Value::Null => Value::Bool(true),
+                _ => return None,
+            };
+        }
+        _ => return None,
+    }
+    Some(plan)
+}
+
+/// Rows as a bag unless `ordered`.
+fn comparable(mut rows: Vec<Value>, ordered: bool) -> Vec<Value> {
+    if !ordered {
+        rows.sort_by_key(|row| row.to_string());
+    }
+    rows
+}
+
+static PLAN_NODE_KINDS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+/// `[plans run, edits sent to the door, edits accepted]`.
+static PLAN_EDIT_COUNTS: std::sync::Mutex<[usize; 3]> = std::sync::Mutex::new([0; 3]);
+
+async fn plan_acceptance_sample(
+    s: &[u32],
+    g: &[u32],
+    q: &[u32],
+    e: &[u32],
+    edits: usize,
+) -> Result<(), String> {
+    use omnigraph_compiler::arbitrary::{
+        Choices, GenGraph, GenRead, GenSchema, ReadOptions, SchemaOptions,
+    };
+    let schema = GenSchema::generate(&mut Choices::new(s), SchemaOptions::default());
+    let graph = GenGraph::generate(&mut Choices::new(g), &schema, 5, 8);
+    let read = GenRead::generate(&mut Choices::new(q), &schema, ReadOptions::default());
+    let describe = || {
+        format!(
+            "--- schema\n{}\n--- seed\n{}\n--- query\n{}\n--- params\n{:?}",
+            schema.text(),
+            graph.jsonl(&schema),
+            read.source,
+            read.params
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), &schema.text())
+            .await
+            .map_err(|e| e.to_string())?,
+    );
+    let jsonl = graph.jsonl(&schema);
+    if !jsonl.is_empty() {
+        db.load_jsonl(&jsonl, LoadMode::Overwrite)
+            .await
+            .map_err(|e| format!("load: {e}\n{}", describe()))?;
+    }
+    let params: ParamMap = read.params.iter().cloned().collect();
+    // A read the engine refuses has no plan to edit.
+    let run = match db
+        .query_inspected(ReadTarget::branch("main"), &read.source, "q", &params)
+        .await
+    {
+        Ok(run) => run,
+        Err(e) => {
+            if std::env::var_os("OMNIGRAPH_LAW_TRACE").is_some() {
+                eprintln!("UNPLANNED {e}\n{}", read.source);
+            }
+            return Ok(());
+        }
+    };
+    let envelope = run.replay_envelope(&read.source, "q");
+    let read_back = omnigraph_planner::decode_replay(&envelope, Default::default())
+        .map_err(|e| format!("the envelope does not read back: {e}\n{}", describe()))?;
+    if read_back.plan != run.plan {
+        return Err(format!("the bound plan reads back unequal\n{}", describe()));
+    }
+    let original = comparable(rows_of(&run.result), read.ordered);
+    PLAN_EDIT_COUNTS.lock().unwrap()[0] += 1;
+    let serialized: Value = serde_json::from_slice(&envelope).unwrap();
+    let plan = serialized["plan"].clone();
+    if let Some(slots) = plan.pointer("/body/plan/slots").and_then(Value::as_array) {
+        let mut kinds = PLAN_NODE_KINDS.lock().unwrap();
+        for slot in slots {
+            if let Some(kind) = slot["node"].as_str() {
+                kinds.insert(kind.to_string());
+            }
+        }
+    }
+    let mut positions = Vec::new();
+    edit_positions(&plan, String::new(), &mut positions);
+    let mut c = Choices::new(e);
+    for _ in 0..edits {
+        // An edit, then a position it applies at.
+        let edit = PLAN_EDITS[c.below(PLAN_EDITS.len())];
+        let applicable: Vec<&(String, bool)> = positions
+            .iter()
+            .filter(|(path, in_array)| match edit {
+                PlanEdit::Drop | PlanEdit::Duplicate | PlanEdit::Move => *in_array,
+                PlanEdit::Remove => !*in_array,
+                PlanEdit::Alter => plan
+                    .pointer(path)
+                    .is_some_and(|v| !v.is_object() && !v.is_array()),
+            })
+            .collect();
+        if applicable.is_empty() {
+            continue;
+        }
+        let (path, in_array) = applicable[c.below(applicable.len())].clone();
+        let Some(changed) = edited(&plan, &path, in_array, edit, c.below(1 << 16)) else {
+            continue;
+        };
+        let edited_envelope = with_plan(&envelope, changed);
+        PLAN_EDIT_COUNTS.lock().unwrap()[1] += 1;
+        let replay = std::panic::AssertUnwindSafe(
+            db.replay_bound_plan(ReadTarget::branch("main"), &edited_envelope),
+        );
+        let replay = futures::FutureExt::catch_unwind(replay)
+            .await
+            .map_err(|_| format!("{edit:?} at {path} panicked the replay\n{}", describe()))?;
+        if let Ok(replay) = replay {
+            PLAN_EDIT_COUNTS.lock().unwrap()[2] += 1;
+            let rows = comparable(rows_of(&replay.result), read.ordered);
+            if rows != original {
+                return Err(format!(
+                    "{edit:?} at {path} was accepted and replays to other rows\n{}\n--- run\n{}\n--- edited replay\n{}",
+                    describe(),
+                    Value::Array(original),
+                    Value::Array(rows)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_acceptance_law(cases: u32, edits: usize) {
+    use omnigraph_compiler::arbitrary::choices;
+    use proptest::test_runner::{
+        Config, FileFailurePersistence, RngAlgorithm, TestCaseError, TestRng, TestRunner,
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut runner = TestRunner::new_with_rng(
+        Config {
+            cases,
+            max_shrink_iters: 1_000,
+            failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
+                "tests/regressions/plan_acceptance.txt",
+            ))),
+            ..Config::default()
+        },
+        TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+    );
+    let result = runner.run(
+        &(choices(64), choices(1024), choices(512), choices(256)),
+        |(s, g, q, e)| {
+            rt.block_on(plan_acceptance_sample(&s, &g, &q, &e, edits))
+                .map_err(TestCaseError::fail)
+        },
+    );
+    if let Err(e) = result {
+        panic!("{e}");
+    }
+    let [plans, sent, accepted] = *PLAN_EDIT_COUNTS.lock().unwrap();
+    eprintln!(
+        "{plans} plans, {sent} edits sent, {accepted} accepted with the run's rows; node kinds round-tripped: {:?}",
+        PLAN_NODE_KINDS.lock().unwrap()
+    );
+    assert!(
+        plans * 2 >= cases as usize,
+        "only {plans} of {cases} generated reads planned"
+    );
+}
+
+#[test]
+fn every_single_plan_edit_is_refused_or_replays_the_run() {
+    plan_acceptance_law(24, 40);
+}
+
+#[test]
+#[ignore = "nightly: 1,000 generated plans of 200 edits each; the gate runs 24 of 40"]
+fn every_single_plan_edit_is_refused_or_replays_the_run_at_nightly_breadth() {
+    plan_acceptance_law(1_000, 200);
+}

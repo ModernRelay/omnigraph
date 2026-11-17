@@ -80,7 +80,7 @@ csv-core = "0.1.13"
 arc-swap = { workspace = true }
 
 [dev-dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1", features = ["test-util"] }
 omnigraph-core = { path = "../omnigraph-core", version = "0.15.1", features = ["test-util"] }
 # tests/integration/s3_storage.rs runs the read-through storage contract's rows against a bucket.
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.15.1", features = ["test-util"] }
