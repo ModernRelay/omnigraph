@@ -3,11 +3,11 @@ rfc: "2026-11-11-trust-snapshots-and-credential-refresh"
 title: "Trust snapshots and credential refresh"
 track: maintainer
 status: draft
-implementation: not-started
+implementation: in-progress
 authors:
   - ragnorc
 created: 2026-11-11
-updated: 2026-11-16
+updated: 2026-11-17
 discussion: https://github.com/ModernRelay/omnigraph/issues/434
 supersedes: []
 superseded_by: []
@@ -260,19 +260,28 @@ binary; the documentation says so.
 ```text
 TrustHolder<S: TrustSet>
   installed: ArcSwap<Installed<S>>            // what requests read
-  install:   Mutex<()>                        // one installer at a time
-  source:    Box<dyn TrustSource>             // load() -> raw bytes
-  policy:    Freshness                        // BootOnly | Polled { interval }
-  warned:    Option<Warned>                   // the refusal already logged:
+  install:   Mutex<Option<Warned>>            // one installer at a time; guards
+                                              //   the refusal already logged:
                                               //   Content(raw digest) | NoContent(error class)
+  source:    Option<Box<dyn TrustSource>>     // load() -> raw bytes; None for a set
+                                              //   its loader validated before the holder
+  policy:    Freshness                        // BootOnly | Polled { interval }
+  rules:     S::Rules                         // fixed inputs of every decode
 
 Installed<S>
   set:        S                               // hashed entries, no plaintext
   generation: u64                             // 1 at boot, +1 per installed change
   digest:     Digest                          // canonical digest of `set`
-  raw_digest: Digest                          // digest of the bytes it was parsed from
+  raw_digest: Option<Digest>                  // digest of the bytes it was parsed from
   applied_at: SystemTime
 ```
+
+`warned` lives inside the installer's mutex because only the installer reads or
+writes it. `rules` carries what every decode adds to the raw bytes; for static
+tokens that is the `OMNIGRAPH_SERVER_BEARER_TOKEN` entry, hashed at boot, so no
+plaintext is kept to validate the file against it. A holder with no source is
+boot-only: in phase 1 the Secrets Manager set, which its own loader reads and
+validates at startup, and the sets embedded `AppState` constructors pass.
 
 `TrustSet` has one request-side method, `admit(token, now)`. Per-request
 validity that depends on time lives there: OIDC's `check_at` refuses an
@@ -285,13 +294,17 @@ Each credential surface on `AppState` becomes a `TrustHolder` over its own
 set type: `StaticTokens` (actor → token hash), `DataTokenTrust` and
 `OidcSnapshot`. A request calls `holder.load()` once, at admission, and
 authenticates against that `Arc<Installed<S>>` for its lifetime. The constant
-time scan in `authenticate_bearer_token` is unchanged; it iterates the loaded
-set instead of the field.
+time scan is unchanged; it is `StaticTokens::admit`, which
+`authenticate_bearer_token` calls on the loaded set instead of iterating the
+field.
 
 The authentication mode is a separate immutable field on `AppState`, set
 from `classify_server_runtime_state` at boot. `requires_bearer_auth` is
 `mode.requires_credential() || registry.snapshot_ref().any_policy()`.
-`has_credential_source` reads the mode.
+`has_credential_source` reads the mode. The embedded `AppState` constructors
+run no classifier: they require a credential when given a token or when a
+data-token or OIDC trust is attached, and `serve` sets the classified mode
+before a router exists.
 
 ### One installation protocol
 
@@ -314,7 +327,8 @@ Every refresh, on every surface, runs the same steps in `TrustHolder::refresh`:
    past, and data-token claims check `exp` and `iat`, so bytes refused at one
    tick can be valid at the next, and today `refresh_at` installs such a
    snapshot when the clock reaches it. Refused bytes are therefore validated
-   again on every tick, and their digest only deduplicates the warning.
+   again on every tick, and their digest only deduplicates the warning. Bytes
+   equal to the installed ones are a successful read and clear `warned`.
 3. **Validate.** Parse and run the surface's validator. Static tokens use
    `validate_bearer_tokens` for every source, as #1323 already does for the
    Secrets Manager payload (which also reserves the `principal:` actor
@@ -328,10 +342,10 @@ Every refresh, on every surface, runs the same steps in `TrustHolder::refresh`:
 5. **Policy gate.** The surface's freshness policy may refuse the candidate:
    OIDC refuses a changed binding, a lower or replayed revision. Static
    tokens have no gate beyond validation.
-6. **Install.** If the canonical digest equals the installed one, record the
-   new `raw_digest` and stop: a cosmetic rewrite (whitespace, key order)
-   bumps nothing and logs nothing. Otherwise store a new `Installed` with
-   `generation + 1`, clear `warned`, and log the change line.
+6. **Install.** Valid content clears `warned`. If the canonical digest equals
+   the installed one, record the new `raw_digest` and stop: a cosmetic rewrite
+   (whitespace, key order) bumps nothing and logs nothing. Otherwise store a
+   new `Installed` with `generation + 1` and log the change line.
 
 The whole function runs under the holder's `install` mutex, so there is one
 installer at a time, the store in step 6 is plain, and there is no
@@ -363,7 +377,9 @@ where configuration is refused: `EnvSource` admits only `BootOnly`;
 `SecretsManagerSource` admits `Polled` within `[60 s, 3600 s]`. Setting an
 interval on a source that cannot refresh does not construct, which is the
 startup refusal described above. `supports_refresh()` is removed; the policy
-replaces it.
+replaces it. Until phase 2 there is no `SecretsManagerSource`: Secrets Manager
+is read once by its `TokenSource`, and an interval beside
+`OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` refuses startup before it is read.
 
 The poller is one task per polled holder, `tokio::time::interval` with
 `MissedTickBehavior::Skip`, running `refresh` on the blocking pool, exactly
@@ -375,7 +391,8 @@ and exits when the holder drops.
 Nothing here touches Lance or the engine. Everything is in
 `omnigraph-server`: the holder, the installation function, the source
 constructors, the mode field, and the timer. The `TokenSource` trait
-narrows to `load()`.
+narrows to `load()` and `name()`: a one-shot loader of plaintext pairs, which
+phase 1 keeps for Secrets Manager. The holder's source trait is `TrustSource`.
 
 ## Invariants
 
@@ -450,7 +467,7 @@ Extend existing owners; add no fixture. The `Fix Regression Gate` keys on
   Replace `env_or_file_source_does_not_support_refresh` with holder tests
   that call `refresh` directly, in the shape of `oidc_identity_tests.rs`:
   invalid, missing, non-regular, oversized, empty-bytes and duplicate files
-  keep the installed snapshot and record `refused`; unchanged bytes do
+  keep the installed snapshot and record `warned`; unchanged bytes do
   nothing; a cosmetic rewrite bumps no generation; a rewrite with the same
   size and mtime is installed; a `..data` swap is installed; a valid empty
   object is installed and logged as a change; the AWS payload goes through
@@ -490,14 +507,15 @@ Extend existing owners; add no fixture. The `Fix Regression Gate` keys on
 1. **Holder, mode, static file refresh.** `TrustHolder`, the installation
    function, the boot-fixed mode, `FileSource` with `Polled`, the variable,
    the change log line, the tests above, and the documentation: per-source reload
-   behaviour in `docs/user/operations/server.md` (which also stops saying
+   behaviour and the Kubernetes notes (with `defaultMode: 0400`) on a new
+   `docs/user/operations/bearer-tokens.md`, summarized in
+   `docs/user/operations/server.md` (which also stops saying
    "Choose one static token source", since `_TOKEN` and `_FILE` combine, and
    says that a static token must be a random high-entropy value, because the
-   server keeps only its SHA-256),
-   the Kubernetes notes in `docs/user/deployment.md`, the sentence in
+   server keeps only its SHA-256) and in `docs/user/deployment.md`, which both
+   link it; the sentence in
    `docs/user/clusters/index.md` that credential configuration stays fixed,
-   and one line in `skills/omnigraph/references/server-policy.md`, and `defaultMode: 0400` in
-   the Kubernetes notes. A `changelog.d/<slug>.added.md` note for refresh and
+   and one line in `skills/omnigraph/references/server-policy.md`. A `changelog.d/<slug>.added.md` note for refresh and
    a `.breaking.md` note for the two boot states the mode change alters.
    `implementation: in-progress`.
 2. **AWS Secrets Manager on the holder.** `SecretsManagerSource` with
@@ -544,3 +562,19 @@ available today.
   Plaintext token buffers are zeroized after hashing. The documentation must
   require random high-entropy tokens, since the server keeps only a SHA-256.
   The AWS 60 s interval is a floor; the documented default is minutes.
+- 2026-11-17: phase 1 implemented in `1dc53995` on PR #1354: the holder, the
+  installation function, the boot-fixed mode, the polled token file, the tests
+  and the documentation. The code forced these changes to the text above, each
+  now stated there: `warned` lives inside the installer's mutex; a holder
+  carries the set's fixed decode `rules` (the `OMNIGRAPH_SERVER_BEARER_TOKEN`
+  entry, hashed at boot) and may have no source (the Secrets Manager set and
+  the embedded constructors' sets, both boot-only); `raw_digest` is optional
+  for those sets; the constant-time scan is `StaticTokens::admit`; every
+  successful read clears `warned`, including bytes equal to the installed
+  ones; the embedded constructors, which run no classifier, require a
+  credential when given a token or a trust; the `TokenSource` trait keeps
+  `name()` and serves Secrets Manager until phase 2. The documentation lives on
+  a new `docs/user/operations/bearer-tokens.md`, summarized in and linked from
+  `server.md` and `deployment.md`, because both pages were at the docs
+  checker's 350-line cap. The read-by-others warning is logged once per file
+  mode rather than at every poll, so nothing is logged once per tick.
