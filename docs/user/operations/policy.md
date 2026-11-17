@@ -263,7 +263,9 @@ graph, the policy `omnigraph access` reports for that target. Every write and
 maintenance command is then judged by it before any effect, and a missing actor is
 denied. A standalone graph has no policy. A direct actor is self-declared, so
 this keeps a storage owner within the policy rather than authenticating them:
-storage permissions remain the trust boundary. Only the server resolves a
+storage permissions remain the trust boundary. A refused direct write, like
+every direct writer, keeps the cluster's admission lock
+([S3 cluster roots](s3-cluster-roots.md)). Only the server resolves a
 served write's actor; there `--as` is an assertion the server checks against
 the token ([Assert the actor](server.md#assert-the-actor)).
 

@@ -11,8 +11,13 @@ address, refuses an inline cloud target.
 
 ```bash
 omnigraph --target s3://bucket/company-brain cluster status --json
-omnigraph optimize --target s3://bucket/company-brain --graph knowledge
+omnigraph optimize --target s3://bucket/company-brain --graph knowledge --as act-operator
 ```
+
+A direct write or maintenance command on a graph with an applied policy is
+judged by it, so `--as` names an actor the policy grants the command
+(`maintain` for `optimize`, `reclaim` for `cleanup`); see
+[direct writes](policy.md#actor-identity).
 
 Every direct writer on a root takes the cluster's admission lock and keeps it
 after it finishes, as a direct `cluster apply` does. A stopped server's lock

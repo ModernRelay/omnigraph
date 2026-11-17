@@ -6687,6 +6687,37 @@ query insert_person($name: String, $age: I32) {
         }
     }
 
+    // `--base` over the graph's store is refused before the read-through
+    // adapter writes its clone marker: the graph is not a clone root, and a
+    // refused write must leave it openable without the base.
+    let base = temp.path().join("base.omni");
+    init_graph(&base);
+    let before = manifest_dataset_version(&store);
+    let mut load = cli();
+    load.arg("load").arg("--target").arg(&store);
+    load.arg("--base")
+        .arg(&base)
+        .arg("--data")
+        .arg(temp.path().join("row-1.jsonl"))
+        .args(["--mode", "append", "--as", "act-outsider", "--json"]);
+    let refused = load.output().unwrap();
+    unlock_cluster_fixture(&root);
+    assert!(!refused.status.success(), "{refused:?}");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(said.contains("not a clone root"), "{said}");
+    assert!(!store.join("__clone").exists());
+    assert_eq!(manifest_dataset_version(&store), before);
+    output_success(
+        cli()
+            .args(["schema", "show", "--target"])
+            .arg(&store)
+            .arg("--json"),
+    );
+
     assert!(may_change_main(Some("act-writer")));
     for by_store in [false, true] {
         let before = manifest_dataset_version(&store);
