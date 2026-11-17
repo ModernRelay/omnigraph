@@ -312,8 +312,10 @@ name (`T86`).
 an inline read, each parameter bound to its argument evaluated in the
 caller's scope, and its returned columns enter the caller's scope. An argument
 is a binding, not text: `$p.handle` below reads the caller's `$p`, never the
-`$p` the called read binds for itself. The called read's own aggregate,
-`order` and `limit` belong to it, as an inline read's do:
+`$p` the called read binds for itself. Arguments bind by position, and a
+call may leave out the trailing parameters that have defaults; leaving out
+one without a default is `T7`. The called read's own aggregate, `order` and
+`limit` belong to it, as an inline read's do:
 
 ```gq
 query colleagues($h: String) {

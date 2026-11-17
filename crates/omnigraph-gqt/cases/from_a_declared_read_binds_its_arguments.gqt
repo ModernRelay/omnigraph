@@ -5,8 +5,9 @@
 # notes: as an inline read's do. It is binding, not textual substitution: an
 # notes: argument reading a caller variable whose name the body also binds
 # notes: still reads the caller's, and the body's own names stay inside it.
-# notes: A call that leaves out a parameter with no default, after a defaulted one, or that passes a
-# notes: nullable value for a parameter that is not, is refused (T7).
+# notes: A defaulted parameter is followed only by defaulted ones (T88 at the declaration, whose fix moves it);
+# notes: a call that leaves out a parameter with no default, or that passes a nullable value for a parameter that
+# notes: is not, is refused (T7).
 
 --- runner
 timeout_ms: 10000
@@ -161,7 +162,20 @@ query under_forty() {
     return { $p.handle }
 }
 
---- expect error: T7
+--- expect error: type error: T88: `aged_between`'s parameter `$lo` has a default and `$hi` after it has none
+
+--- query
+query aged_between($lo: I32, $hi: I32 = 120) {
+    match { $p: Person }
+    where $p.age >= $lo and $p.age < $hi
+    return { $p }
+}
+query under_forty() {
+    match { from aged_between() }
+    return { $p.handle }
+}
+
+--- expect error: type error: T7: `aged_between` takes 1 to 2 arguments, got 0; `$lo` has no default
 
 --- query
 query aged($min: I32) {

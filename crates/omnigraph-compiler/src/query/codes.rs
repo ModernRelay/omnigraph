@@ -108,6 +108,10 @@ codes! {
     // The GQ 3 RFC, section 4, Errors: `scorer = "none"`
     // allows matching and makes a ranking call on the field a type error.
     T87 = "a ranking call on a field whose full-text index declares `scorer = \"none\"`";
+    // The GQ 3 RFC, section 6, the freeze list's Parameters row: arguments
+    // bind by position, so a defaulted parameter is followed only by
+    // defaulted ones.
+    T88 = "a parameter with a default is followed by one without; the fix moves it after them";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
     // the binding it ranks, and `rrf` arms that rank two bindings are T75.

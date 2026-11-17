@@ -61,31 +61,31 @@ pub fn print_decl(d: &Decl) -> String {
     out
 }
 
+/// A parameter declaration: `$name: Type?`, then `= default` when it has
+/// one.
+pub(crate) fn param(p: &Param) -> String {
+    let mut out = format!(
+        "${}: {}{}",
+        p.name,
+        p.type_name,
+        if p.nullable { "?" } else { "" }
+    );
+    if let Some(default) = &p.default {
+        let _ = write!(
+            out,
+            " = {}{}",
+            if default.negative { "-" } else { "" },
+            literal(&default.value)
+        );
+    }
+    out
+}
+
 /// A declaration's text before its body's brace: the name, the parameters,
 /// the annotations and the write mode.
 pub fn header(d: &Decl) -> String {
-    let mut out = format!("query {}(", d.name);
-    for (i, p) in d.params.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        let _ = write!(
-            out,
-            "${}: {}{}",
-            p.name,
-            p.type_name,
-            if p.nullable { "?" } else { "" }
-        );
-        if let Some(default) = &p.default {
-            let _ = write!(
-                out,
-                " = {}{}",
-                if default.negative { "-" } else { "" },
-                literal(&default.value)
-            );
-        }
-    }
-    out.push(')');
+    let params: Vec<String> = d.params.iter().map(param).collect();
+    let mut out = format!("query {}({})", d.name, params.join(", "));
     for a in &d.annotations {
         let _ = write!(out, " @{}", a.name);
         if let Some(args) = &a.args {

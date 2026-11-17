@@ -2618,3 +2618,36 @@ node Person { slug: String @key  age: I32  rank: U32  weight: F32  ranks: [U32]?
         assert!(outcome(&source).is_ok(), "{source}");
     }
 }
+
+/// A defaulted parameter is followed only by defaulted ones (the freeze
+/// list's Parameters row): `T88` at the declaration, whose printed fix
+/// moves the defaulted parameters after the others in written order; a
+/// call leaving out a required argument stays `T7`.
+#[test]
+fn a_defaulted_parameter_is_followed_only_by_defaulted_ones() {
+    let d = refused_with(
+        "query q($min: I32 = 30, $city: String, $n: I64 = -2, $tag: String?) { match { $p: Person } where $p.age >= $min and $p.city = $city return { $p } }",
+        "T88",
+    );
+    assert_eq!(
+        d.fix.as_deref(),
+        Some("($city: String, $tag: String?, $min: I32 = 30, $n: I64 = -2)"),
+        "{d}"
+    );
+    assert_eq!(
+        d.position.map(|p| p.column),
+        Some(7),
+        "at the declaration: {d}"
+    );
+    let out = check(
+        "query f($h: String, $min: I32 = 30) { match { $p: Person } where $p.handle = $h and $p.age >= $min return { $p } }\nquery q() { match { from f() } return { $p.name } }",
+    );
+    let (_, outcome) = out.into_iter().find(|(name, _)| name == "q").expect("q");
+    let d = outcome.expect_err("refused");
+    assert_eq!(d.code.as_str(), "T7", "{d}");
+    assert!(
+        d.message
+            .contains("takes 1 to 2 arguments, got 0; `$h` has no default"),
+        "{d}"
+    );
+}

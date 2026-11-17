@@ -38,7 +38,10 @@ Parameter types use the schema scalar types. A non-nullable parameter without
 a default must be supplied; omission fails before execution. A trailing `?`
 accepts `null` or an omitted value, which is null. `= value` declares a
 default, a literal of the type (`T3` otherwise), that an omitted parameter
-takes; a supplied value or an explicit `null` replaces it. `@description` and
+takes; a supplied value or an explicit `null` replaces it. Since a call's
+arguments bind by position, a parameter with a default is followed only by
+parameters with defaults: `($min: I32 = 18, $city: String)` is `T88` at the
+declaration, whose fix moves the defaulted ones last. `@description` and
 `@instruction` attach metadata for tool clients; an annotation without
 arguments takes no parentheses (`@name`, never `@name()`, which is `Q012`). An integer parameter carries
 its type's whole range: a `U64` takes `0` to `18446744073709551615`. A source

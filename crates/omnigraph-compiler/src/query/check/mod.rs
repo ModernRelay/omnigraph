@@ -339,7 +339,7 @@ fn typed_decl_measured(
         typed_exprs: 0,
         largest_charged: std::cell::Cell::new(0),
     };
-    let params = match param_types(&decl.params) {
+    let params = match param_types(&decl.name, &decl.params) {
         Ok(p) => p,
         Err(E::D(d)) => return refused(d.at_span_of(&decl.at)),
         Err(E::Pending(_) | E::Recorded) => unreachable!(),
@@ -1540,7 +1540,7 @@ fn system_assignment_hint(property: &str) -> &'static str {
     }
 }
 
-fn param_types(params: &[Param]) -> R<Vec<(String, PropType)>> {
+fn param_types(decl: &str, params: &[Param]) -> R<Vec<(String, PropType)>> {
     let mut out = Vec::new();
     for p in params {
         if p.name == NOW_PARAM_NAME {
@@ -1582,6 +1582,30 @@ fn param_types(params: &[Param]) -> R<Vec<(String, PropType)>> {
             check_literal_type(&lit, &lt, &ty, &p.name)?;
         }
         out.push((p.name.clone(), ty));
+    }
+    // Arguments bind by position, so a parameter a call may omit is one
+    // every later parameter may omit too: a defaulted parameter is followed
+    // only by defaulted ones. The fix moves the defaulted parameters after
+    // the others, each group in written order; a caller's arguments then
+    // bind other parameters, so it needs review.
+    if let Some(first) = params.iter().position(|p| p.default.is_some())
+        && let Some(after) = params[first..].iter().find(|p| p.default.is_none())
+    {
+        let (required, defaulted): (Vec<&Param>, Vec<&Param>) =
+            params.iter().partition(|p| p.default.is_none());
+        let moved: Vec<String> = required
+            .into_iter()
+            .chain(defaulted)
+            .map(crate::query::syntax::print::param)
+            .collect();
+        return Err(err_fix(
+            T88,
+            format!(
+                "`{decl}`'s parameter `${}` has a default and `${}` after it has none; arguments bind by position, so a parameter with a default is followed only by parameters with defaults",
+                params[first].name, after.name
+            ),
+            format!("({})", moved.join(", ")),
+        ));
     }
     Ok(out)
 }
@@ -1894,7 +1918,7 @@ impl Ctx<'_> {
                 ),
             ));
         };
-        let params = param_types(&decl.params)?;
+        let params = param_types(&decl.name, &decl.params)?;
         let budget = if top {
             let budget = self.recorded_annotations(decl)?;
             self.plan_limit = budget.plan;
@@ -1972,7 +1996,7 @@ impl Ctx<'_> {
     }
 
     fn write_decl(&mut self, decl: &Decl, body: &WriteBody) -> R<CoreWrite> {
-        let params = param_types(&decl.params)?;
+        let params = param_types(&decl.name, &decl.params)?;
         if let MutationWriteMode::Unattached {
             base: Some(UnattachedBase::Param(name)),
         } = &decl.write_mode
@@ -4340,32 +4364,30 @@ impl Ctx<'_> {
                 format!("a declared read takes positional arguments; got `{o}:`"),
             ));
         }
-        let params = param_types(&decl.params)?;
+        let params = param_types(&decl.name, &decl.params)?;
+        // A defaulted parameter is followed only by defaulted ones
+        // (`param_types`, `T88`), so the parameters a call may omit are the
+        // last ones: every parameter past the last argument has a default.
         let required = decl.params.iter().filter(|p| p.default.is_none()).count();
         if c.args.len() < required || c.args.len() > params.len() {
-            return Err(err(
-                T7,
+            let takes = if required == params.len() {
                 format!(
-                    "`{}` takes {} argument{}, got {}",
-                    c.name,
+                    "{} argument{}",
                     params.len(),
-                    if params.len() == 1 { "" } else { "s" },
-                    c.args.len()
-                ),
-            ));
-        }
-        // Arguments bind by position, so every parameter past the last
-        // argument takes its default; one without a default is missing.
-        if let Some(missing) = decl.params[c.args.len()..]
-            .iter()
-            .find(|p| p.default.is_none())
-        {
+                    if params.len() == 1 { "" } else { "s" }
+                )
+            } else {
+                format!("{required} to {} arguments", params.len())
+            };
+            let missing = decl
+                .params
+                .get(c.args.len())
+                .filter(|p| p.default.is_none())
+                .map(|p| format!("; `${}` has no default", p.name))
+                .unwrap_or_default();
             return Err(err(
                 T7,
-                format!(
-                    "`{}`'s parameter `${}` has no default and no argument; arguments bind by position, so pass every parameter up to the last one without a default",
-                    c.name, missing.name
-                ),
+                format!("`{}` takes {takes}, got {}{missing}", c.name, c.args.len()),
             ));
         }
         let mut bindings = Vec::new();
