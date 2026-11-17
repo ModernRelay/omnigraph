@@ -5,9 +5,11 @@ family. OmniGraph does not vendor or patch Lance.
 **Purpose:** required upstream reading and current OmniGraph compatibility
 fences
 
-**Upgrade boundary:** certified Lance 11 full-text indexes retain their analyzer
-compatibility under Lance 13. Uncertified or incompatible indexes still require
-an explicit rebuild before search. See [full-text compatibility](#full-text-compatibility).
+**Upgrade boundary:** no query reads a full-text index; the exact lexical scan
+answers every lexical call. A full-text index qualifies for a field only through
+a certificate whose measured analyzer fingerprint this binary reproduces, so a
+Lance or analyzer dependency change shows as a refusal, never as different
+terms. See [full-text compatibility](#full-text-compatibility).
 
 Lance is OmniGraph's storage substrate. Before changing a Lance-shaped
 behavior, read **every full page in the matching domain below, plus every page
@@ -132,13 +134,46 @@ credentials, or storage fault tests.
 
 ## Full-text compatibility
 
-Lance 11's stemmer is not query-compatible with existing Lance 10 postings.
-Every full-text segment used by a query must carry OmniGraph's artifact-scoped
-analyzer certificate. The certificate is bound to the immutable UUID, index
-details, and file inventory, not the current dataset writer or graph head.
-Missing or unrecognized proof produces `FullTextIndexRebuildRequired` before
+Lance 11's stemmer is not query-compatible with existing Lance 10 postings,
+and no version string proves what a stemmer or tokenizer emits. Every
+full-text segment a native path reads must carry Omnigraph's artifact-scoped
+analyzer certificate, bound to the immutable UUID, index details, and file
+inventory, not the current dataset writer or graph head. No query reads one
+today: the exact lexical scan answers every `match_terms` and `bm25` without
+an index ([RFC](../rfcs/0043-full-text-index-compatibility.md) and the GQ 3
+RFC, section 4).
+
+A profile has two implementations in a binary
+(`omnigraph_core::fts_analysis`): the profile analyzer the exact scan runs
+(NFC, then the profile's tokenizer and filters) and the native configuration
+an index is built with (`native_params`, whose `InvertedIndexParams::build`
+is the tokenizer Lance 13's builder runs over each document and its query
+path over each query). The measured fingerprint of either is a SHA-256 over a
+versioned framing of the tokens it emits, document and query path, for every
+probe of the checked-in corpus `crates/omnigraph-core/fts/probe_corpus.txt`,
+whose header names the pipeline step each group exercises. Each profile is
+measured once per process, on first use (a few milliseconds for all three).
+
+Every certificate this build writes is format 2. It records the field's
+declared analyzer fingerprint, the native configuration's measured fingerprint
+at build time, and the native build's options (no normalization, block size,
+posting format, no positions); it names no implementation version. A segment
+qualifies for a field (`fts_compat::verify_index`, which always takes the
+field's accepted fingerprint and profile) only when the certificate names that
+fingerprint, its recorded native fingerprint equals the one the running binary
+measures (a dependency change under an existing index fails here), and the
+running binary's native fingerprint equals its profile analyzer's (parity
+between index and scan). Lance 13's native configuration has no NFC step, so
+no profile has parity: every native configuration differs from its analyzer
+on the corpus's NFC-sensitive probes and nowhere else
+(`fts_analysis::tests::native_configurations_differ_from_their_analyzers_only_by_nfc`),
+and no segment qualifies until stage L shares one analyzer between index and
+scan. A format-1 certificate, edition 2's analysis, never qualifies for a
+profile. A raw `contains_tokens` scan filter names no field analysis, so it
+refuses over any column holding a segment. Every refusal is
+`FullTextIndexRebuildRequired` with a reason naming the check, raised before
 execution. Successful immutable proof uses Lance's bounded session metadata
-cache; failures are not cached. Ordinary reads do not inspect these certificates.
+cache, keyed by the expected and measured fingerprints; failures are not cached.
 
 The full builder writes proof before the existing CreateIndex publication.
 The same builder with `train(false)` writes an untrained segment (an empty
@@ -155,22 +190,26 @@ searchable until an explicit rebuild. Planning and execution share the same
 foldable-index predicate; pending full-text coverage alone is not recovery work.
 Other index maintenance is unchanged.
 
-Every certificate this build writes is format 2, which records the field's
-analyzer fingerprint. A binary that reads only format 1, such as the Lance 11
-predecessor, refuses such an index as malformed proof (`FullTextIndexRebuildRequired`)
-and returns no rows, never the rows of a different analysis. Rollback in place
-after this build has built or rebuilt an index is therefore not supported; the
-supported rollback restores the whole-root backup taken before the upgrade, or
-rebuilds the indexes with the older binary
+A binary that reads only format 1, such as the Lance 11 predecessor, refuses a
+format-2 index as malformed proof (`FullTextIndexRebuildRequired`) and returns
+no rows, never the rows of a different analysis. Rollback in place after this
+build has built or rebuilt an index is therefore not supported; the supported
+rollback restores the whole-root backup taken before the upgrade, or rebuilds
+the indexes with the older binary
 ([upgrade guide](../user/operations/upgrade.md#lance-substrate-upgrades-v010-v014)).
 The CLI's `genuine_lance11_storage_upgrade_round_trip` journey pins the refusal
 and the backup restore.
 
-The audited analyzer dependency set has exact pins and a resolved-lockfile guard.
-Any change needs a compatibility audit before keeping or changing the certificate
-generation. See
-[RFC 0043](../rfcs/0043-full-text-index-compatibility.md) for the decision and
-[the operator procedure](../user/operations/upgrade.md#full-text-index-upgrade).
+Two tests hold the analyzer. The resolved-lockfile guard
+(`fts_compat::tests::analyzer_dependencies_are_the_audited_resolved_set`) pins
+the audited versions; the golden
+`crates/omnigraph-core/fts/measured_fingerprints.golden`
+(`fts_analysis::tests::measured_fingerprints_are_the_golden`) pins what each
+profile's two implementations emit. A bump that changes either fingerprint of
+a profile is a profile change: keep the old behavior or define a new profile,
+never refresh the golden alone ([testing](testing.md#full-text-fingerprint-golden)).
+See [RFC 0043](../rfcs/0043-full-text-index-compatibility.md) for the decision
+and [the operator procedure](../user/operations/upgrade.md#full-text-index-upgrade).
 
 ## Current compatibility fences
 
@@ -186,7 +225,7 @@ history of dependency bumps.
 | KNN result order | Lance 13 V2 row-stream payload hydration preserves ordering metadata, which `WorkMemory` uses to merge parallel results in rank order. Supported graph writers, including the supported upgrade sources, select V2_2; no Legacy V1 partition fence is needed. | `lance_surface_guards.rs::flat_knn_v2_late_payload_preserves_order`, `search.rs::nearest_large_k_preserves_global_order_through_payload_hydration` |
 | KNN probe budget | A `nearest` scan sets `maximum_nprobes` per index delta and widens it from Lance's execution summary (`partitions_searched` / `partitions_ranked`, read through `scan_stats_callback`); a prefilter admitting fewer rows than `k` makes Lance emit the unreached rows at `_distance = +inf`, which the engine resolves with a flat exact rescan (`use_index(false)`); `count_rows(None)` is the live row count (deletions excluded), read for the ladder's exhaustion stop and as the overfetch loop's exact-pass `k`. A renamed counter or marker turns the ladder fail-closed. The factor and both fallbacks are the plan's declared `NearestPolicy`. Every `nearest` scan pins the field's declared distance as its metric (`ScanTuning::nearest` sets `distance_metric`: `l2`, `cosine` or `dot`), and it uses a vector index only when every vector index on the column ranks exactly by that distance: IVF_FLAT with that metric, as the engine builds it (`table_store::vector_indexes_rank_exactly`). Any other index on disk (quantized, HNSW, built for another distance, details with fields Lance 13 does not know or no details) makes the scan flat; index facts report an IVF_FLAT index of any of the three metrics as a vector index and every other one `Unknown`; an index whose statistics name no partition count fails the fold. The same counters decide whether a read reports its `nearest` search exhaustive: an attempt that searched every partition of such an IVF_FLAT index, or that carries neither counter (Lance's flat kNN), ranked exactly; one counter alone does not. | `lance_surface_guards.rs`, `search.rs` (`nearest_ranks_by_l2_over_a_cosine_index_issue_1297`, `nearest_stays_exact_over_a_quantized_index_issue_1297`) |
 | Vector distance | A field's declared distance (`Vector(n, distance = ...)`, absent meaning `l2`) is the metric of every index the engine builds on it (`IndexBuildSpec::Vector`, `table_store::metric_type`) and of every kNN over it. Lance 13's metrics are the RFC's values: `l2` the sum of squared differences, `cosine` `1 - dot / (norm · norm)`, `dot` `1 - dot` (`lance_linalg::distance`). A cosine IVF_FLAT index stores normalized vectors and normalizes the query, so its `_distance` is the cosine distance up to `F32` rounding, not the flat path's value; every `cosine` search therefore sets `refine(1)` (`ScanTuning::nearest`), which re-scores the candidates on the stored vectors with the flat kernel, so a row's distance does not depend on index coverage (`lance_surface_guards.rs::refined_cosine_index_search_equals_the_flat_distance_bit_for_bit`); it leaves a zero vector out (`KeepFiniteVectors` after normalizing), and the flat kNN drops the zero vector's NaN distance, so the index and the scan agree on the rows a stored zero vector drops. An explicit metric other than the index's makes Lance scan flat (`Scanner::create_plan`), so an index built for another distance is never used. `has_vector_index_for` counts only an index built for the declared distance, so a changed distance makes the reconciler build a replacement, which removes every vector index on the column; the fold keeps an index's own metric and skips a column a replacement builds.  The exact `distance` operator scores through `DistanceType::arrow_batch_func`, the kernel Lance's flat kNN uses (`lance-index` `vector/flat.rs`), so `distance` and an exhaustive `nearest` give one `F32` value per row.| `lance_surface_guards.rs::distance_kernel_equals_the_flat_knn_distance_bit_for_bit`, `lance_surface_guards.rs::ivf_flat_and_flat_knn_score_cosine_and_dot_exactly`, `schema_apply.rs::vector_distance_change_is_applied_in_place_and_serves_exactly_until_the_rebuild`, `staged_tests.rs::stage_create_indices_batches_mixed_types_into_one_exact_commit`, `cases/vector_distance_*.gqt` |
-| Full-text analyzer | Every selected FTS segment needs artifact-scoped compatibility proof. Every lexical field (a free-text String with a one-column `@key`, `@index` or `@index(fulltext, ...)`, `NodeType::is_lexical_field`) has an analyzer profile (`@index(fulltext, analyzer = ...)`, `english_v1` where none is named); only `@index(fulltext, ...)` builds segments (`NodeType::builds_full_text_index`), and every segment is built with every `InvertedIndexParams` field set from it (`full_text_index_params`: tokenizer, language, case, stemmer, the profile's stop list passed as `custom_stop_words` so Lance's language list never applies, folding, token length, n-gram and code flags, `with_position(false)`, block size 128 and posting format V2, so `LANCE_FTS_FORMAT_VERSION` cannot change it), relying on Lance 13 applying `max_token_length`, lowercase, stemmer, stop words and ASCII folding in that order (`InvertedIndexParams::build`); Lance has no Unicode normalization, so the profile's NFC is not applied to the index. The exact lexical scan (`engine/lexical_scan.rs`), which answers every `match_terms` and `bm25` and reads no segment, builds the same tokenizer through `InvertedIndexParams::build` and reads a value's tokens with `token_stream_for_doc` and a query's with `token_stream_for_search` (one filter chain in Lance 13), after its own NFC (`unicode-normalization`). Every certificate is format 2: it records the field's analyzer fingerprint (profile, stop-list digest, stemmer identity, scorer; never positions) and the native build (no normalization, block size, posting format, positions off). Only a raw `contains_tokens` scan filter reads postings, and it accepts any certified analysis, since it holds no schema. Explicit branch rebuilds replace all segments from rows; old snapshots may refuse that filter. With no segment, Lance's flat path tokenizes with a bare `SimpleTokenizer`, so every committed version that holds no segment for a column declaring `@index(fulltext, ...)` gets an untrained one (`TableStore::commit_staged_detached`), and `ensure_indices` builds postings where no segment covers a fragment. A full-text index on a column that no longer declares one (a plain `@index` or a `@key` an earlier build indexed) is left: no read uses it, no writer declares a segment for it, `ensure_indices` neither folds nor removes it and reports it pending when it lags, and the explicit rebuild replaces it. | staged-table tests, `search.rs`, `integration/maintenance.rs`, `schema_apply.rs::full_text_analyzer_survives_schema_evolution_issue_904`, `search.rs::full_text_analyzer_holds_after_first_rows_and_overwrites_issue_904`, `lance_surface_guards.rs::fts_untrained_segment_applies_its_analyzer_to_rows_it_does_not_cover` (the untrained segment carries its analyzer), `core_tests.rs::each_profile_builds_explicit_parameters_and_certifies_its_fingerprint`, `schema_apply.rs::full_text_analyzer_change_is_applied_in_place_with_its_profile`, `cases/fulltext_analyzer_profiles_match.gqt`, in-source `engine::lexical_scan::tests` (the profile's tokens through `build`, NFC first) |
+| Full-text analyzer | Every selected FTS segment needs artifact-scoped compatibility proof. Every lexical field (a free-text String with a one-column `@key`, `@index` or `@index(fulltext, ...)`, `NodeType::is_lexical_field`) has an analyzer profile (`@index(fulltext, analyzer = ...)`, `english_v1` where none is named); only `@index(fulltext, ...)` builds segments (`NodeType::builds_full_text_index`), and every segment is built with every `InvertedIndexParams` field set from it (`fts_analysis::native_params`: tokenizer, language, case, stemmer, the profile's stop list passed as `custom_stop_words` so Lance's language list never applies, folding, token length, n-gram and code flags, `with_position(false)`, block size 128 and posting format V2, so `LANCE_FTS_FORMAT_VERSION` cannot change it), relying on Lance 13 applying `max_token_length`, lowercase, stemmer, stop words and ASCII folding in that order (`InvertedIndexParams::build`); Lance has no Unicode normalization, so the profile's NFC is not applied to the index. The exact lexical scan (`engine/lexical_scan.rs`), which answers every `match_terms` and `bm25` and reads no segment, runs the profile analyzer (`fts_analysis::ProfileAnalyzer`): the same tokenizer through `InvertedIndexParams::build`, a value's tokens through `token_stream_for_doc` and a query's through `token_stream_for_search` (one filter chain in Lance 13), after its own NFC (`unicode-normalization`). Every certificate is format 2: it records the field's declared analyzer fingerprint (profile, stop-list digest, the stemmer's algorithm, scorer; never positions or an implementation version), the native configuration's measured fingerprint over the probe corpus, and the native build (no normalization, block size, posting format, positions off). A segment qualifies only where its recorded native fingerprint equals the running binary's and that equals the profile analyzer's; no profile has that parity under Lance 13, which has no NFC step ([full-text compatibility](#full-text-compatibility)). A raw `contains_tokens` scan filter names no field analysis and refuses over any column holding a segment. Explicit branch rebuilds replace all segments from rows. With no segment, Lance's flat path tokenizes with a bare `SimpleTokenizer`, so every committed version that holds no segment for a column declaring `@index(fulltext, ...)` gets an untrained one (`TableStore::commit_staged_detached`), and `ensure_indices` builds postings where no segment covers a fragment. A full-text index on a column that no longer declares one (a plain `@index` or a `@key` an earlier build indexed) is left: no read uses it, no writer declares a segment for it, `ensure_indices` neither folds nor removes it and reports it pending when it lags, and the explicit rebuild replaces it. | `lance_surface_guards.rs::native_configuration_tokenizes_as_the_index_builder_does` (the tokens `build` emits per profile, and that the postings hold them), `omnigraph-core` `fts_analysis::tests` (the measured-fingerprint golden, parity only off NFC probes) and `fts_compat::tests` (each refusal), staged-table tests, `search.rs`, `integration/maintenance.rs`, `schema_apply.rs::full_text_analyzer_survives_schema_evolution_issue_904`, `search.rs::full_text_analyzer_holds_after_first_rows_and_overwrites_issue_904`, `lance_surface_guards.rs::fts_untrained_segment_applies_its_analyzer_to_rows_it_does_not_cover` (the untrained segment carries its analyzer), `core_tests.rs::each_profile_builds_explicit_parameters_and_certifies_its_fingerprint`, `schema_apply.rs::full_text_analyzer_change_is_applied_in_place_with_its_profile`, `cases/fulltext_analyzer_profiles_match.gqt`, in-source `engine::lexical_scan::tests` (the profile's tokens through `build`, NFC first) |
 | Profile filter order | A profile is a set of `InvertedIndexParams` booleans, and Lance 13's `InvertedIndexParams::build` applies them in one order: token length, lowercase, stemmer, stop words, ASCII folding. `english_v1`'s stop list holds each NLTK stop word and its Snowball stem because the stemmer runs first, and folding after stemming keeps `résumés` (`resume`) apart from `resumes` (`resum`). A bump that reorders the filters changes a released profile's tokens; the profile fingerprint names the stop list's digest and the stemmer's identity, not the order, so the guard is the fence. | `lance_surface_guards.rs::inverted_params_lowercase_stem_then_remove_stop_words_then_fold`, in-source `engine::lexical_scan::tests::english_v1_removes_stop_words_and_their_stems` |
 | Exact corpus statistics | The exact lexical scan's `bm25_v1` corpus is every entity whose value has at least one analyzed term: a null, empty or token-empty value is outside `N`, the document frequencies and the mean length, and never matches. This is the scan's own rule, not Lance's BM25 statistics, which no query reads. | `cases/bm25_v1_matches_the_lexical_scoring_oracle.gqt` (null and token-empty rows), in-source `engine::lexical_scan::tests` |
 | Scan-access planning | A scan's access path (`id_lookup`, `index_probe <column>`, `sequential`, or decided at run time) is read from the physical plan Lance 13 builds for its filter (`plan_source/scan_access.rs::inspect`): a `ScalarIndexExec` or `MaterializeIndexExec` node names the index query, a `LanceFilterExec` a residual, and a `FilteredReadExec` the read. Each leaf of the recorded index query names the index's family from the search's `index_type` (`btree`, `bitmap`, `label_list`, `ngram`, or Lance's own name, lowercased, for another). A bump that renames or restructures those nodes reads every scan as sequential, which changes cost, never rows. | `cases/v2/planner/scalar_index_coercion.gqt`, `cases/v2/planner/key_sequential.gqt`, `cases/v2/planner/scan_access_hash_join_build_side_is_sequential.gqt`, the `cases/v2/planner/scalar_index_*.gqt` cases (their `access` lines go red) |

@@ -55,10 +55,13 @@ the field's analyzer fingerprint, and the next `omnigraph index build` builds
 its postings with the profile. Writing out `analyzer = "english_v1"`, or
 removing it, changes no index. Renaming the property keeps the analysis and
 its index; dropping and re-adding it declares a new one. The fingerprint
-covers the profile, its stop list and stemmer, and the scorer; an index
-stores no term positions, which its certificate records and the fingerprint
-does not. An index built before its field had a profile is rebuilt with the
-profile by `omnigraph index rebuild`.
+covers the profile, its stop list and stemmer, and the scorer; it names no
+software version, so upgrading Omnigraph never changes it. An index stores no
+term positions, which its certificate records and the fingerprint does not.
+The certificate also records a fingerprint of the terms the index's analysis
+produced over a fixed set of probe texts, which a later binary must reproduce
+before it may use the index. An index built before its field had a profile is
+rebuilt with the profile by `omnigraph index rebuild`.
 
 Only `@index(fulltext, ...)` builds a full-text index. A plain `@index` on a
 free-text String builds an NGRAM and a BTREE, and a `@key` alone a BTREE
@@ -79,10 +82,9 @@ field's rows at the query's snapshot, normalizes each value to NFC, applies
 the profile's tokenizer and filters, and decides each row itself. So a query
 returns the same rows whether the field's index is built, partly built (rows
 written after the last build) or not built at all, and no query is refused for
-the state of an index. A raw `contains_tokens` scan filter, outside GQ, reads
-the postings and refuses an index without a valid certificate
-(`full_text_index_rebuild_required`) until `omnigraph index rebuild` writes
-new ones.
+the state of an index. A raw `contains_tokens` scan filter, outside GQ, names
+no field analysis, so it refuses over any field that holds a full-text index
+(`full_text_index_rebuild_required`).
 
 `match_terms($d.f, terms($q, mode: all | any, max_edits: n))` is true where
 every (`all`, the default) or some (`any`) distinct analyzed term of `$q` has

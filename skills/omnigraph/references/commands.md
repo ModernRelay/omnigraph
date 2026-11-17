@@ -356,10 +356,10 @@ omnigraph index rebuild --kind full-text --target "$REPO" --branch main --json
 
 Direct storage only; `--target <root> --graph <id>` also works. Stop overlapping
 writers, preserve a verified whole-store backup, and rebuild every live branch
-that needs search when moving from uncertified pre-Lance-11 indexes. Certified
-Lance 11 indexes remain compatible under Lance 13 and need no rebuild solely
-for that dependency change. Do not mix fleets across an incompatible analyzer
-transition. An earlier binary refuses full-text search on an index this binary
+that needs a full-text index for its field's profile. No GQ query reads a
+full-text index, so no query needs a rebuild; an index built by an earlier
+release, whose certificate names no analyzer profile, never qualifies for a
+native read. Do not mix fleets across an incompatible analyzer transition. An earlier binary refuses full-text search on an index this binary
 built or rebuilt, so roll back by restoring the backup
 ([roll back](migrations.md#roll-back-to-an-earlier-binary)). Rebuilds use each property's analyzer profile (`english_v1` where
 none is declared), replacing custom tokenizer settings; JSON `warnings` reports this for actual work. Check the selected

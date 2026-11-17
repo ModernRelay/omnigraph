@@ -30,7 +30,7 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-planner` | In-source optimizer/cost tests and `tests/integration/query_plan.rs`, `tests/integration/registry.rs`, `tests/integration/lower_walk.rs`; plan assertions over real snapshots live in GQT | `PlanSource` fixtures for metadata and refusal states |
 | `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
 | `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, core, catalog, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed | None |
-| `omnigraph-core` | In-file `#[cfg(test)]` tests of the error type, branch names, branch control, Lance clone, metadata, full-text compatibility and instrumentation | Module-local fixtures |
+| `omnigraph-core` | In-file `#[cfg(test)]` tests of the error type, branch names, branch control, Lance clone, metadata, full-text analysis (the probe corpus and the [measured-fingerprint golden](#full-text-fingerprint-golden)), full-text compatibility and instrumentation | Module-local fixtures; `fts/` holds the probe corpus and the golden |
 | `omnigraph-catalog` | In-source tests: `crates/omnigraph-catalog/src/tests.rs` for `__manifest` publication, state and lineage, plus in-file tests in `migrations.rs` and `retention.rs` | Module-local fixtures; `omnigraph-core`'s `test-util` helpers |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
@@ -142,7 +142,7 @@ Run this first for every Lance change:
 cargo test -p omnigraph-engine --test lance_surface_guards
 ```
 
-The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, the stock-cleanup sweep of old files used only by detached versions (with the attached manifest timestamp preceding the file and the file preceding the seven-day cutoff), index coverage and segment ownership, stable row IDs, native V2 vector ordering, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and replace its negative guard with the native behavior the caller now requires. A persisted layout still needs its own format decision.
+The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, the stock-cleanup sweep of old files used only by detached versions (with the attached manifest timestamp preceding the file and the file preceding the seven-day cutoff), index coverage and segment ownership, the full-text tokenizer a profile's native parameters build, stable row IDs, native V2 vector ordering, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and replace its negative guard with the native behavior the caller now requires. A persisted layout still needs its own format decision.
 
 Qualify a dependency bump in both debug and release profiles: upstream unstable
 capabilities can have different gates under `debug_assertions`. Run the native
@@ -730,6 +730,32 @@ configuration the suite needs:
 DST_REGEN_COSTS=1 cargo test --locked --test scenarios dst_bench_cost_count_golden
 cargo test --locked --test scenarios dst_bench_cost_count_golden
 ```
+
+### Full-text fingerprint golden
+
+`crates/omnigraph-core/fts/measured_fingerprints.golden` records, for every
+analyzer profile, the measured fingerprints of its native configuration and of
+its profile analyzer: digests of the tokens each emits over the probe corpus
+`crates/omnigraph-core/fts/probe_corpus.txt`
+([lance.md](lance.md#full-text-compatibility)).
+`fts_analysis::tests::measured_fingerprints_are_the_golden` compares them with
+what the binary measures, so a dependency bump that changes what a profile
+emits fails by name. Such a failure is a profile change, and a profile never
+changes once accepted (the GQ 3 RFC, section 4): keep the old behavior (pin or
+patch the dependency) or define a new profile. Never refresh the golden alone.
+
+Regenerate only for a new profile or a reviewed change of the probe corpus,
+both of which change what every certificate records; say in the pull request
+why each changed line moved. The test refuses to regenerate when `CI` is set:
+
+```bash
+OMNIGRAPH_REGEN_FTS_FINGERPRINTS=1 cargo dev-nextest \
+  -E 'package(omnigraph-core) & test(measured_fingerprints_are_the_golden)'
+cargo dev-nextest -E 'package(omnigraph-core) & test(/fts_analysis::/)'
+```
+
+The resolved-lockfile guard (`fts_compat::tests::analyzer_dependencies_are_the_audited_resolved_set`)
+pins the analyzer's dependency versions; the golden pins its behavior.
 
 For embedded execution, the benchmark runner executes `gqt-v1` dataset/query
 pairs through the same

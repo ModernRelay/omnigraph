@@ -375,8 +375,11 @@ be `${ENV_VAR}` references and are resolved by the server at startup. Generated
 vectors are finite, nonzero, and L2-normalized.
 
 No GQ query reads a full-text index, so none fails for one. A raw
-`contains_tokens` scan filter (an SDK read, not GQ) reads the postings and fails
-with HTTP `409` `full_text_index_rebuild_required` on an index without a valid
-certificate, such as one built before Lance 11; it clears with
-`index rebuild --kind full-text` on the branch; see
+`contains_tokens` scan filter (an SDK read, not GQ) names no field analysis, so
+it fails with HTTP `409` `full_text_index_rebuild_required` on any field that
+holds a full-text index. An index qualifies for a field only when its
+certificate names the field's analyzer profile and records the terms its
+analysis produced over a fixed set of probe texts, which the running binary must
+reproduce; `index rebuild --kind full-text` on the branch replaces an index
+built with another analysis; see
 [`commands.md`](commands.md#index-rebuild--explicit-analyzer-upgrade).

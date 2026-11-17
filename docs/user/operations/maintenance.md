@@ -99,8 +99,8 @@ build skipped for its size is counted again, up to the limit, by each such run.
 
 Existing full-text indexes are preserved rather than incrementally merged.
 Unindexed rows remain searchable, but a growing uncovered tail can cost more to
-scan. Use `index rebuild --kind full-text` to refresh that coverage or migrate
-an old analyzer generation. Optimize reports uncovered full-text coverage under
+scan. Use `index rebuild --kind full-text` to refresh that coverage or replace
+an index built with another analysis, an earlier release's or another profile's. Optimize reports uncovered full-text coverage under
 `pending_indexes` with this remedy. Deferred coverage alone creates no graph
 commit or maintenance work. A vector index whose property has no usable vectors
 also stays pending; run optimize again after loading or generating vectors.

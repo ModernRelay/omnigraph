@@ -165,11 +165,10 @@ see the [v0.10 upgrade guide](https://github.com/ModernRelay/omnigraph/blob/v0.1
 for its branch inventory, rebuild and rollback steps. The current CLI cannot open
 v6, so a graph still on that format needs an [export/import rebuild](#rebuild).
 
-In v0.14, certified full-text indexes from Lance 11 remain searchable with
-Lance 13 because the analyzer generation is unchanged. Missing or incompatible
-analyzer proofs still fail closed. For a graph that normal open accepts
-(formats 14–17), use the explicit maintenance command on each branch that needs
-new indexes:
+No query reads a full-text index, so an earlier release's index changes no rows. An index
+qualifies only where its certificate's [analyzer profile](../search/analyzers.md) and terms
+over fixed probe texts match this binary's, never for an earlier release's index. For a graph
+that normal open accepts (formats 14–17), rebuild on each branch that needs new indexes:
 
 ```bash
 omnigraph index rebuild --kind full-text --target ./graph.omni --branch main --as operator --json
