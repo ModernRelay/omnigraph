@@ -221,13 +221,6 @@ pub(crate) const SPILL_COMPRESSION: datafusion::common::config::SpillCompression
 /// The built read and its scanner-normalized filter.
 pub(crate) type PlannedScan = (Arc<dyn ExecutionPlan>, Option<Expr>);
 
-/// Configuration surface for a scan after projection, filtering, and ordering
-/// have been selected by [`TableStore::scan_stream_with`].
-///
-/// Deliberately does not expose `Scanner::order_by`: ordering is a routing
-/// decision because it requires the bounded spill executor below. Keeping that
-/// method out of the callback type makes it impossible for a caller to add an
-/// ordered plan after `scan_stream_with` chose the ordinary Lance executor.
 /// Lance batches a pipelined read decodes ahead, which no memory pool sees.
 pub(crate) const PIPELINED_READAHEAD: usize = 2;
 
@@ -237,6 +230,13 @@ pub(crate) const PIPELINED_READAHEAD: usize = 2;
 /// first batch; two 32 MiB pages keep its throughput.
 pub(crate) const PIPELINED_IO_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Configuration surface for a scan after projection, filtering, and ordering
+/// have been selected by [`TableStore::scan_stream_with`].
+///
+/// Deliberately does not expose `Scanner::order_by`: ordering is a routing
+/// decision because it requires the bounded spill executor below. Keeping that
+/// method out of the callback type makes it impossible for a caller to add an
+/// ordered plan after `scan_stream_with` chose the ordinary Lance executor.
 pub(crate) struct ScanTuning<'a> {
     scanner: &'a mut Scanner,
     full_text_columns: Option<HashSet<String>>,
@@ -8955,8 +8955,10 @@ fn finish_proven_insert_batch(
 /// can copy. A null counts no value bytes, whatever range its offsets span
 /// ([`batch_slice_memory_size`] counts that range, and so does the
 /// allocation). A view array keeps a value of at most 12 bytes inside its
-/// 16-byte view, so only longer values add bytes. A fixed-width or nested
-/// column counts its slice, or its whole allocation where that is
+/// 16-byte view, so only longer values add bytes; it is measured here but not
+/// compacted by [`copy_batch_range`], which keeps its data buffers, so a copy
+/// of a view array is no smaller than the slice it copies. A fixed-width or
+/// nested column counts its slice, or its whole allocation where that is
 /// unavailable.
 pub(crate) fn column_logical_bytes(column: &dyn Array) -> usize {
     use arrow_array::cast::AsArray;

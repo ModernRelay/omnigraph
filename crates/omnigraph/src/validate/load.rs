@@ -288,7 +288,7 @@ impl<'j> Sweep<'j> {
     }
 
     /// A sweep of batches read from storage and freed as it goes: a kept
-    /// column is copied into buffers of its own ([`copy_batch_range`]), so
+    /// column is copied into buffers of its own ([`crate::table_store::copy_batch_range`]), so
     /// what stays is its rows' bytes alone.
     pub(crate) fn streamed(judge: &'j WriteJudge) -> Self {
         Self::with_copy_kept(judge, true)

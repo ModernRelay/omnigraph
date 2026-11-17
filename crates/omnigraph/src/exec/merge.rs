@@ -3498,7 +3498,7 @@ impl ValidationDelta<'_> {
     }
 }
 
-/// Every candidate's delta in the judge's order ([`judgment_rank`]), with
+/// Every candidate's delta in the judge's order ([`crate::validate::plan::judgment_rank`]), with
 /// its removed ids copied out of the physical delete plan and charged; a
 /// table that adds, changes and removes nothing is left out.
 fn merge_validation_deltas<'c>(
