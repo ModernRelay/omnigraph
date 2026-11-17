@@ -3887,7 +3887,7 @@ impl Omnigraph {
     }
 
     pub async fn export_jsonl(&self, branch: &str, type_names: &[String]) -> Result<String> {
-        export::export_jsonl(self, branch, type_names).await
+        export::export_jsonl(self, ReadTarget::branch(branch), type_names).await
     }
 
     pub async fn export_jsonl_to_writer<W: Write>(
@@ -3896,7 +3896,19 @@ impl Omnigraph {
         type_names: &[String],
         writer: &mut W,
     ) -> Result<()> {
-        export::export_jsonl_to_writer(self, branch, type_names, writer).await
+        export::export_jsonl_to_writer(self, ReadTarget::branch(branch), type_names, writer).await
+    }
+
+    /// [`Self::export_jsonl`] at a read target, a branch head or a captured
+    /// snapshot: the rows a query at that target reads. GQT's reference
+    /// comparison reads a step's target through it.
+    #[doc(hidden)]
+    pub async fn export_jsonl_at(
+        &self,
+        target: impl Into<ReadTarget>,
+        type_names: &[String],
+    ) -> Result<String> {
+        export::export_jsonl(self, target, type_names).await
     }
 
     /// Stream export rows without a defined physical row order.
