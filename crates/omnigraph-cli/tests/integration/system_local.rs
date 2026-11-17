@@ -2110,23 +2110,7 @@ graphs:
 }
 
 fn seed_graph(dir: &std::path::Path, graph: &str, row: &str) {
-    let data = dir.join(format!("{graph}-seed.jsonl"));
-    std::fs::write(&data, row).unwrap();
-    let output = cli()
-        .arg("load")
-        .arg("--mode")
-        .arg("overwrite")
-        .arg("--data")
-        .arg(&data)
-        .arg("--target")
-        .arg(dir.join(format!("graphs/{graph}.omni")))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "seed {graph} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    seed_as_storage_owner(&dir.join(format!("graphs/{graph}.omni")), row);
     unlock_cluster_fixture(dir);
 }
 
@@ -2691,6 +2675,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     output_success(
         cli()
             .arg("load")
+            .args(["--as", "act-op"])
             .arg("--data")
             .arg(fixture("test.jsonl"))
             .arg("--mode")

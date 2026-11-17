@@ -21,13 +21,13 @@ targets accept local files only; an inline [S3 cluster root](s3-cluster-roots.md
 is the one cloud-direct exception. See
 [operator configuration](../cli/targets.md#transport-and-capability-boundaries).
 
-Each command acts as the operator configuration's `operator.actor`, and the
-commit it publishes records that actor; `index build` and `index rebuild` also
-accept `--as` in its place. Direct CLI access, including `--target`, does not
-load the server's Cedar policy; storage permissions are its trust boundary. An
-embedded host that installs a policy checker enforces the
+Each command acts as its `--as` actor, and the commit it publishes records
+that actor. On a cluster graph the CLI installs the policy the cluster applied
+to it, and an embedded host may install its own; either checks the
 [policy actions](policy.md#actions) before any effect: `maintain` for optimize,
-index builds and the full-text rebuild, and `reclaim` for cleanup.
+index builds and the full-text rebuild, and `reclaim` for cleanup. A standalone
+graph has no policy. The actor is self-declared, so storage permissions remain
+the trust boundary.
 
 ## Optimize
 

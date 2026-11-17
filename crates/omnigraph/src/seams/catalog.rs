@@ -94,6 +94,7 @@ omnigraph_seams::catalog! {
     crate::exec::merge::BRANCH_MERGE_REWRITE_AFTER_INSERT_PRE_UPDATE,
     crate::exec::merge::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE,
     crate::exec::mutation::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE,
+    crate::exec::mutation::MUTATION_POST_EXECUTE_PRE_VALIDATE,
     crate::exec::mutation::MUTATION_POST_FINALIZE_PRE_PUBLISHER,
     crate::exec::mutation::MUTATION_POST_NO_EFFECT_PRE_GATE,
     crate::exec::mutation::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
