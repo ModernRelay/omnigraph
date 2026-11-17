@@ -235,6 +235,13 @@ fn a_predicate_inside_match_prints_the_where_after_the_braces() {
         ),
         // A block holding only a filter of an outer name kept the rows its
         // filter did not hold on, a null one included.
+        // A nested block is rewritten in the same suggestion as its
+        // enclosing one, so a block per pass never chains the fixes.
+        (
+            "query q() { match { $p: Person, not { $p knows $q  $q.age > 3  not { $q worksAt $c } } } return { $p } }",
+            "Q012",
+            "query q() { match { $p: Person } where not exists { $p knows $q where $q.age > 3 and not exists { $q worksAt $c } } return { $p } }",
+        ),
         (
             "query q() { match { $p: Person, not { $p.age > 20 } } return { $p } }",
             "Q012",

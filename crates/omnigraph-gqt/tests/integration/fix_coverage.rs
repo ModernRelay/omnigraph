@@ -70,7 +70,10 @@ fn inputs(dir: &Path) -> Vec<(String, Vec<String>)> {
         let queries = (0..sections.len())
             .filter(|&i| {
                 let (h, b) = &sections[i];
-                (h == "query" || h.starts_with("query ") || h == "mutate" || h.starts_with("mutate "))
+                (h == "query"
+                    || h.starts_with("query ")
+                    || h == "mutate"
+                    || h.starts_with("mutate "))
                     && b.trim_start().starts_with("query ")
                     && !refused_by_edition_2(i)
             })
@@ -135,6 +138,12 @@ fn fix_coverage_over_edition_2_text() {
             let mut outcome = None;
             for pass in 0..=PASSES {
                 let refusals = check_source_all(&catalog, &text);
+                // `OMNIGRAPH_FIX_COVERAGE_CODES=1` prints each pass's codes,
+                // never text.
+                if std::env::var("OMNIGRAPH_FIX_COVERAGE_CODES").as_deref() == Ok("1") {
+                    let codes: Vec<String> = refusals.iter().map(|d| d.code.to_string()).collect();
+                    println!("pass {pass}: {codes:?}");
+                }
                 if refusals.is_empty() {
                     outcome = Some(Ok(pass));
                     break;

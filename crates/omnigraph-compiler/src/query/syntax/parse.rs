@@ -2494,7 +2494,10 @@ fn only_filters(negation: &Pair<Rule>) -> Option<Vec<String>> {
     }
     let elements = child(&body, Rule::elements)?;
     let mut preds = Vec::new();
-    for e in elements.into_inner().filter(|e| e.as_rule() == Rule::element) {
+    for e in elements
+        .into_inner()
+        .filter(|e| e.as_rule() == Rule::element)
+    {
         let k = kind(&e);
         if k.as_rule() != Rule::filter_rec || keyword_filter(&k).is_some() {
             return None;
@@ -2504,6 +2507,22 @@ fn only_filters(negation: &Pair<Rule>) -> Option<Vec<String>> {
         preds.push(pred_text(&x));
     }
     (!preds.is_empty()).then_some(preds)
+}
+
+/// A `not { … }` block's content rewritten as a block's braces hold it
+/// (elements, then its own `where`), its nested blocks included; `None` when
+/// an element is refused on its own, whose text then stays as written.
+fn rendered_block(negation: &Pair<Rule>) -> Option<String> {
+    let body = child(negation, Rule::block_body)?;
+    let list = child(&body, Rule::elements)?;
+    let mut pieces = Pieces::default();
+    if pieces.collect(&list).is_some() {
+        return None;
+    }
+    if let Some(w) = child(&body, Rule::where_clause) {
+        pieces.preds.push(where_expr_text(&w));
+    }
+    Some(pieces.render_block())
 }
 
 /// The text between the outermost braces of `p`, trimmed.
@@ -2615,7 +2634,12 @@ impl Pieces {
                 let filters = only_filters(&k);
                 self.preds.push(match filters {
                     Some(preds) => format!("not coalesce({}, false)", preds.join(" and ")),
-                    None => format!("not exists {{ {} }}", inner_text(&k)),
+                    // The block's own elements rewritten the same way, so
+                    // one suggestion repairs every nested level at once.
+                    None => format!(
+                        "not exists {{ {} }}",
+                        rendered_block(&k).unwrap_or_else(|| inner_text(&k))
+                    ),
                 });
                 note_problem(
                     &mut self.problem,
