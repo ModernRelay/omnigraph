@@ -285,6 +285,35 @@ unsigned 64-bit seed and `generate: v1`; load headers additionally require a
 mode. A load requires at least one nonempty batch; empty recipes are admitted
 only as seeds. Unknown, repeated or inapplicable arguments are refused.
 
+A third fixture section may follow the seed. `--- branches generate: v1
+seed: <u64> count: <n> prefix: <name> [from: <branch>]` declares `count`
+branches named `<prefix>0` to `<prefix><count-1>`, forked from `from`
+(default `main`) after the seed has loaded and, under a `# traversal:` pin,
+after its indexes are built, each then loaded with the
+section's recipe in append mode, `${branch}` in the recipe bound to that
+branch's name; an empty body forks bare branches, and a recipe that loads
+nothing is refused as a load's is. `${branch}` is replaced as text before
+the recipe is read as YAML, so inside a flow mapping it is quoted as the
+YAML needs. It is state the case
+declares, built before step 1 on every route, so no step, label, report
+row, measure row or DST observation names it; a failure is a setup failure
+as a seed's is. `count` is in `1..=10000`, the loop's cap. `${branch}` is
+the only marker the body admits, and the recipe is validated once with the
+longest name substituted; a `${` in the header is refused as on any header
+line. The section is refused before `--- seed`, after any step, and twice:
+
+```yaml
+--- branches generate: v1 seed: 0 count: 64 prefix: w from: main
+tables:
+  - kind: node
+    name: Chunk
+    rows: 4
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: ${branch}-, width: 3}
+      n: {kind: ordinal, start: 0, step: 1}
+```
+
 Each table requires `kind: node|edge`, `name`, `rows`, `commits` and `columns`.
 `start` defaults to zero; row `i` has ordinal `start + i`. Optional `wrap`
 reduces that ordinal modulo a positive bound, allowing reversible updates to

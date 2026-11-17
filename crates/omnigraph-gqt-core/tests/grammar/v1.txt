@@ -1,6 +1,6 @@
 gqt format 1
 header keys: issue, red_on, notes, traversal, csv_slice_bytes, overwrite_chunk_rows, writer
-sections: runner, schema, seed, csv, load, query, mutate, concurrent, params, expect, bind, restart, loop, foreach, endloop, seam
+sections: runner, schema, seed, branches, csv, load, query, mutate, concurrent, params, expect, bind, restart, loop, foreach, endloop, seam
 expect modes: ok, unordered, ordered, error:, affected:, outcome:, shape, plan, same as v1
 corpus timeout_ms: at most 10000
 rules:
@@ -13,7 +13,7 @@ rules:
   file_name: an issue case is `issue_<N>_<short_name>.gqt` matching its `# issue:`; a feature case is `<short_name>.gqt` over [a-z0-9_]
   missing_runner: the first section is `--- runner` with explicit configuration
   runner_config: the runner section is YAML with `timeout_ms` in 1..=600000 and 1 to 16 distinct `environments`, each a known `target` with its `storage` and, under DST, 1 to 64 distinct `seeds`
-  section_order: `--- runner` leads the file; `--- schema` then `--- seed` follow it together, once each; no later section repeats them; a `--- seam` is followed by the step it arms
+  section_order: `--- runner` leads the file; `--- schema` then `--- seed` follow it together, once each, and `--- branches` only after them; no later section repeats them; a `--- seam` is followed by the step it arms
   unknown_section: a section header names a known section kind
   body_shape: a section's body has the shape its kind takes: a header-only section carries none, a seed or expect body carries no `#` lines, `--- csv <name>` names one bare file, a generator recipe is YAML within its limits
   query_parse: a query, mutate, schema or concurrent-session body parses under its grammar
@@ -29,7 +29,7 @@ rules:
   loop_structure: a loop holds at least one step, closes with a bare `--- endloop`, and nests no loop, bind, seam or concurrent block
   bind_shape: `--- bind commit $name` follows a write expected to succeed, once per name, with no body
   unbound_name: a `${name}` operand, a `snapshot: $name` or a `from commit ${name}` names a commit bound by an earlier `--- bind commit $name`
-  substitution_placement: `${...}` appears only in a params or expect body and names the enclosing loop's variable or a bound commit
+  substitution_placement: `${...}` appears only in a params or expect body and names the enclosing loop's variable or a bound commit, or is `${branch}` in a branches recipe; a `${` in the branches header is refused as on any header line
   batch_bound: a generated load's batch stays within 16 MiB and 4096 rows, with `commits` in 1..=rows and `batch_rows` producing exactly `commits` nonempty batches
   corpus_timeout: a case under the required corpus (the runner's `cases/`, not `cases_slow/`) declares `timeout_ms` of at most 10000
   invalid_case: a rule the parser states in its message
