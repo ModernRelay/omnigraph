@@ -293,7 +293,8 @@ Tell the user what they have, then offer the step that fits:
 
 - **See it in Studio:** Omnigraph Studio, the desktop app, shows the schema,
   each type as a table, a node's links as a tree or canvas, and a branch's
-  changes before the merge. See [the next section](#see-the-graph-in-studio).
+  changes before the merge, and agents can steer it over MCP. See
+  [the next section](#see-the-graph-in-studio).
 - **More data:** bulk loads and imports in [data changes](data.md); CSV through
   `load csv` statements.
 - **Search:** embeddings and vector, keyword and hybrid ranking in
@@ -365,6 +366,42 @@ knowledge` land in `./served`, not in `./graph.omni`. If the user keeps using
 the served one, update the agent file's `--target` to match, and add `served/`
 to `.gitignore`. See [Open Studio](../../../docs/user/cli/studio.md) and
 [cluster](cluster.md).
+
+### Show the user things in Studio
+
+From Studio 0.4.8, agents can steer Studio's window over MCP. Its tools open a
+type's table, a node's page, a canvas or tree walked from a node, the schema's
+map, a branch's review or history, a commit, or a query tab with text in it
+that is not run. No tool writes to the graph, runs a query or returns property
+values: read and write with the CLI, then use Studio to show the user what you
+found. The agent panel inside Studio has these tools already.
+
+An agent outside Studio needs the user's say-so. Ask the user to turn on
+**Settings › Agent › Let agents outside Studio show things in Studio**, which
+is off by default. Studio then shows the command that adds it to Claude Code
+and the `config.toml` entry for Codex, each with a Copy button. Either the user
+runs it, or you run the same command, which reads the token from Studio's data
+directory so it never appears on screen. On macOS the directory is
+`~/Library/Application Support/Omnigraph Studio`:
+
+```bash
+D="$HOME/Library/Application Support/Omnigraph Studio/ui-tools"
+claude mcp add --transport http omnigraph-studio "$(jq -r .url "$D/endpoint.json")" \
+  --header "Authorization: Bearer $(cat "$D/token")"
+```
+
+The address and the token change each time Studio starts, so add the server
+again after a restart (`claude mcp remove omnigraph-studio` first). Most agents
+load MCP servers when a session starts, so tell the user to start a new session
+before you use the tools.
+
+Call `studio_windows` first: it lists each window's id, server, graph and
+branch, and every other tool names a window by that id. Then, for example,
+`graph_open_type` opens a type's table and `graph_open_branch` opens a branch's
+review against main. The server's `tools/list` describes the rest. If the user
+connected Studio, add a line to the agent file's section: before asking the
+user to approve a merge, open the branch's review in Studio with
+`graph_open_branch`.
 
 Point them to the [quickstart](../../../docs/user/quickstart.md) and the
 [Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
