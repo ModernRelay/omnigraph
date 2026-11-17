@@ -48,8 +48,8 @@ edits.
 > `--set write_max_bytes=<bytes>` or `OMNIGRAPH_WRITE_MAX_BYTES`; a served JSONL
 > load uses the server's value and refuses `--set`.
 > A `branch merge` that is not a fast forward also holds the scalar columns of
-> every changed row for validation, bounded by one `write_max_bytes` allowance
-> for the whole merge: chunking the branch's loads does not split it, so a
+> every changed row for validation, bounded by 32 MiB (or a higher
+> `write_max_bytes`) for the whole merge: chunking the branch's loads does not split it, so a
 > refusal naming `branch-merge retained validation delta bytes` needs
 > `--set write_max_bytes=<bytes>` on the merge itself.
 > Against a non-local

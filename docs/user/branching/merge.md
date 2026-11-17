@@ -212,12 +212,13 @@ A merge that writes rows is also bounded by the Blob payload it copies; see
 
 Before it publishes, a merge that is not a fast forward holds every changed
 row's scalar columns in memory to check constraints; Vector and Blob columns
-are left out. Across all tables this is bounded by
-[`write_max_bytes`](../queries/settings.md) (default 32 MiB). A larger delta
-is refused as `branch-merge retained validation delta bytes`, with no effect.
-The bound covers the whole merge, so splitting the branch's earlier writes into
-smaller commits does not change it; raise `write_max_bytes` for the merge
-instead (`set write_max_bytes = <bytes>;` before `branch merge`, or
+are left out. Across all tables this is bounded by 32 MiB, or by
+[`write_max_bytes`](../queries/settings.md) when it is set higher; a lower
+value does not lower this bound. A larger delta is refused as
+`branch-merge retained validation delta bytes`, with no effect. The bound
+covers the whole merge, so splitting the branch's earlier writes into smaller
+commits does not change it; raise `write_max_bytes` for the merge instead
+(`set write_max_bytes = <bytes>;` before `branch merge`, or
 `--set write_max_bytes=<bytes>`).
 
 See [Branches, Commits, and History](index.md) for the complete branch workflow.

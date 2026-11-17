@@ -3377,9 +3377,12 @@ fn classify_merge_conflict(
 /// cross-table `ChangeSet`, so projected scalar deltas stay resident until
 /// evaluation completes. Without a second aggregate ceiling, many valid chunks
 /// (or many candidate tables) could be collected back into an unbounded
-/// resident delta before the first effect. The ceiling is the merge's captured
-/// `write_max_bytes` allowance, independent of the per-transaction chunks, so
-/// a caller can raise it the way it raises the merge's other write accounts.
+/// resident delta before the first effect. The ceiling is independent of the
+/// per-transaction chunks: the keyed-write default (32 MiB), or the merge's
+/// captured `write_max_bytes` when that is larger. Raising the setting lifts
+/// it; a lowered setting bounds only the merge's write accounts, never this
+/// validation input, which a merge that writes no row (a pointer adoption)
+/// still retains.
 #[derive(Debug)]
 struct MergeValidationBudget {
     retained_bytes: u64,
@@ -3390,7 +3393,7 @@ impl MergeValidationBudget {
     fn new(write_budget: WriteBudget) -> Self {
         Self {
             retained_bytes: 0,
-            limit: write_budget.bytes(),
+            limit: write_budget.bytes().max(KEYED_WRITE_MAX_BYTES),
         }
     }
 

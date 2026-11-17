@@ -1,1 +1,1 @@
-- A three-way `branch merge` whose retained validation delta passes 32 MiB can now run: `write_max_bytes` sets that allowance too, like the merge's other write limits.
+- A three-way `branch merge` whose retained validation delta passes 32 MiB can now run: a `write_max_bytes` above 32 MiB raises that allowance too.
