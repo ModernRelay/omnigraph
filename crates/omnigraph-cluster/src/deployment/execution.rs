@@ -2344,6 +2344,10 @@ fn authorize_graph_deletion(
 /// on a graph with an applied policy needs an actor that policy permits
 /// `schema_apply` on `main`, the check the engine makes when it settles. Other
 /// work runs no graph action as the caller. The engine keeps its own gate.
+/// The check under admission can refuse only if the outstanding record changed
+/// after the first check (a changed policy is refused first, as
+/// `deployment_base_changed`). That refusal keeps the lock, as every recovery
+/// exit after admission does.
 fn authorize_recovery(
     policy: &AppliedPolicies,
     caller: &DeploymentCaller,

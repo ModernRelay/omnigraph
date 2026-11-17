@@ -197,7 +197,7 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
     let actors = "[principal:original, principal:recovery, principal:adopter]";
     fs::write(
         dir.path().join("graph.policy.yaml"),
-        format!("version: 1\ngroups:\n  operators: {actors}\nrules:\n  - id: read\n    allow: {{ actors: {{ group: operators }}, actions: [read] }}\n  - id: schema\n    allow: {{ actors: {{ group: operators }}, actions: [schema_apply], target_branch_scope: any }}\n"),
+        format!("version: 1\ngroups:\n  operators: {actors}\n  appliers: [principal:applier]\nrules:\n  - id: read\n    allow: {{ actors: {{ group: operators }}, actions: [read] }}\n  - id: schema\n    allow: {{ actors: {{ group: operators }}, actions: [schema_apply], target_branch_scope: any }}\n  - id: applier-schema\n    allow: {{ actors: {{ group: appliers }}, actions: [schema_apply], target_branch_scope: any }}\n"),
     ).unwrap();
     // principal:manager manages the cluster but holds no graph action.
     fs::write(
@@ -453,9 +453,72 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
         .unwrap();
     force_unlock_storage_root(root, &lock).await.unwrap();
 
+    // Settling a started schema change needs only `schema_apply` on `main`,
+    // the check the engine makes when it settles: a storage owner whose actor
+    // holds `schema_apply` but not `read` recovers it. The deletion below
+    // refuses the same caller, which pins the difference between the rules.
+    let applier = DeploymentCaller::storage_owner(Some("principal:applier".into()));
+    fs::write(
+        dir.path().join("people.pg"),
+        "node Person { name: String @key\n email: String? }",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: people.pg\npolicies:\n  graph:\n    file: graph.policy.yaml\n    applies_to: [knowledge]\n  management:\n    file: cluster.policy.yaml\n    applies_to: [cluster]\n",
+    )
+    .unwrap();
+    let mut schema_change = String::new();
+    {
+        let _fail = cluster_seams::DEPLOYMENT_AFTER_STARTED.fire_always();
+        let error = Box::pin(apply_deployment(
+            dir.path(),
+            None,
+            &original,
+            |issued, _, _| schema_change = issued.to_string(),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "injected_failpoint");
+    }
+    let lock = deployment_status(root, Some(&schema_change), &original)
+        .await
+        .unwrap()
+        .lock_id
+        .unwrap();
+    force_unlock_storage_root(root, &lock).await.unwrap();
+    fs::remove_file(dir.path().join("people.pg")).unwrap();
+    fs::remove_file(dir.path().join("cluster.yaml")).unwrap();
+    let DeploymentLookup::Complete { result } =
+        Box::pin(reconcile_deployment(root, &schema_change, true, &applier))
+            .await
+            .unwrap()
+    else {
+        panic!("expected terminal schema result");
+    };
+    assert_eq!(
+        result.recovery_executors["knowledge"].actor.as_deref(),
+        Some("principal:applier")
+    );
+    assert!(
+        matches!(
+            result.graphs["knowledge"],
+            GraphDeploymentResult::Schema { .. }
+        ),
+        "{:?}",
+        result.graphs
+    );
+    let lock = deployment_status(root, Some(&schema_change), &original)
+        .await
+        .unwrap()
+        .lock_id
+        .unwrap();
+    force_unlock_storage_root(root, &lock).await.unwrap();
+
     // A pending deletion: recovery needs what forward deletion needs, `read`
     // and `schema_apply`, and a caller without them is refused before
-    // admission too.
+    // admission too, including the storage owner `--as` principal:applier
+    // that settled the schema change above.
     fs::write(
         dir.path().join("cluster.yaml"),
         "version: 1\ngraphs: {}\npolicies:\n  management:\n    file: cluster.policy.yaml\n    applies_to: [cluster]\n",
@@ -490,7 +553,7 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
     force_unlock_storage_root(root, &lock).await.unwrap();
     let ledger_before_denial = fs::read(&ledger_path).unwrap();
     let cluster_bytes = file_bytes(dir.path());
-    for caller in &refused {
+    for caller in refused.iter().chain([&applier]) {
         refuse_recovery_before_admission(dir.path(), &deletion, caller).await;
     }
     assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before_denial);
