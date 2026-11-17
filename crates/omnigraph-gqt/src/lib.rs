@@ -510,3 +510,75 @@ pub async fn run_case_bounded(path: PathBuf, budget: Duration, bless: bool) -> C
 
 #[cfg(test)]
 mod tests;
+
+/// One read judged against the core reference interpreter, for the
+/// generated laws (`tests/integration/law_*.rs`): both answers rendered,
+/// and the corpus's verdict on them ([`omnigraph_gqt_core::judge_reference`]).
+#[derive(Debug)]
+pub struct ReferenceJudgment {
+    pub engine: String,
+    pub reference: String,
+    pub verdict: Result<(), String>,
+}
+
+/// Runs the read `name` of `source` on `session`'s `main` and on the
+/// reference interpreter over the same branch, judged as the corpus judges
+/// a read step: as ordered rows when `ordered`, as bags otherwise, or as
+/// the same refusal. A compile-time refusal is an error: the read has no
+/// core term, so the law has nothing to compare.
+pub async fn judge_read_against_reference(
+    session: &Session,
+    source: &str,
+    name: &str,
+    params: &omnigraph_compiler::ParamMap,
+    ordered: bool,
+) -> Result<ReferenceJudgment, String> {
+    use omnigraph_compiler::ir::core::CoreDecl;
+    use omnigraph_gqt_core::{EngineRefusal, judge_reference};
+    let catalog = session.catalog();
+    let checked = omnigraph_compiler::query::check::check_source(&catalog, source)
+        .map_err(|d| format!("the source does not parse: {}: {}", d.code, d.message))?;
+    let read = match checked.into_iter().find(|(n, _)| n == name).map(|(_, r)| r) {
+        Some(Ok(checked)) => match checked.core {
+            CoreDecl::Read(read) => read,
+            CoreDecl::Write(_) => return Err(format!("`{name}` is a write")),
+        },
+        Some(Err(d)) => {
+            return Err(format!(
+                "the checker refuses `{name}`: {}: {}",
+                d.code, d.message
+            ));
+        }
+        None => return Err(format!("no declaration `{name}`")),
+    };
+    let target = omnigraph::db::ReadTarget::branch("main");
+    let engine = match session.query(target.clone(), source, name, params).await {
+        Ok(result) => match result.to_rust_json() {
+            Ok(Value::Array(rows)) => Ok((rows, ordered)),
+            Ok(other) => return Err(format!("the engine rendered {other}")),
+            Err(e) => return Err(format!("the engine's rows did not render: {e}")),
+        },
+        Err(error) => match EngineRefusal::of(&error) {
+            EngineRefusal::Static => {
+                return Err(format!("the engine refused at compile time: {error}"));
+            }
+            refusal => Err(refusal),
+        },
+    };
+    let reference = PLAIN_HOST
+        .reference_rows(session, &read, &target, params)
+        .await?;
+    let render_engine = match &engine {
+        Ok((rows, _)) => Value::Array(rows.clone()).to_string(),
+        Err(refusal) => format!("refused: {refusal:?}"),
+    };
+    let render_reference = match &reference {
+        Ok(rows) => Value::Array(rows.clone()).to_string(),
+        Err(refusal) => format!("refused: {refusal}"),
+    };
+    Ok(ReferenceJudgment {
+        verdict: judge_reference(&reference, &engine),
+        engine: render_engine,
+        reference: render_reference,
+    })
+}

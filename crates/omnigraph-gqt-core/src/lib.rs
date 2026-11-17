@@ -4504,7 +4504,7 @@ fn stale_reference_skip(why: &str) -> String {
 /// How the engine refused a read step, as the reference comparison reads
 /// it.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum EngineRefusal {
+pub enum EngineRefusal {
     /// A parse, type or plan diagnostic: the query never ran, and there is
     /// no core term to evaluate.
     Static,
@@ -4522,7 +4522,7 @@ pub(crate) enum EngineRefusal {
 }
 
 impl EngineRefusal {
-    fn of(error: &omnigraph::error::OmniError) -> Self {
+    pub fn of(error: &omnigraph::error::OmniError) -> Self {
         use omnigraph::error::OmniError;
         use omnigraph_compiler::error::CompilerError;
         use omnigraph_compiler::query::diagnostic::QueryDiagnosticKind;
@@ -4623,7 +4623,7 @@ async fn compare_with_reference(
 /// refuse its input; a resource bound, which the reference does not have,
 /// needs the reference to answer rows. Any other pairing disagrees, and so
 /// does a reference that does not evaluate the query.
-pub(crate) fn judge_reference(
+pub fn judge_reference(
     reference: &Result<Vec<Value>, ReferenceRefusal>,
     engine: &Result<(Vec<Value>, bool), EngineRefusal>,
 ) -> Result<(), String> {
