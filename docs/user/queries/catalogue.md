@@ -168,6 +168,7 @@ binary's rows.
 | history_release_bytes | integer(1024..=262144) | 262144 | request |
 | load_source_max_bytes | integer(1..) | 33554432 | request |
 | merge_lineage | enum(off, on, verify) | on | request |
+| plan_budget_limit | integer(1..=9223372036854775807) | 65536 | request |
 | query_memory_bytes | integer(1..) | 157286400 | request |
 | read_work_limit | integer(1..=9223372036854775807) | 100000000 | request |
 | rrf_plan | enum(auto, force_prefilter, force_postfilter) | auto | process |
