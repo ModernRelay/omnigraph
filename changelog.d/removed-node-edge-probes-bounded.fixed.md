@@ -1,0 +1,1 @@
+- Removing nodes an edge type references (by overwrite load, delete or merge) now probes edges in bounded id chunks, so memory no longer grows with removed ids times edge fragments.

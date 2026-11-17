@@ -788,6 +788,59 @@ async fn overwrite_node_removal_rejects_retained_orphan_edge() {
     );
 }
 
+/// The retained-edge check of a node overwrite probes the removed ids one
+/// bounded chunk per scan (`validate::PROBE_CHUNK_KEYS`, 8,192), never one
+/// filter over every removed id, whose memory grew with removed ids times edge
+/// fragments (#1442). Across those chunks it still finds a retained edge whose
+/// endpoint was removed in the last chunk, and passes when every retained edge
+/// keeps both endpoints. The scale symptom is `--stats` peak RSS, which the
+/// engine suite cannot observe in one process; the issue holds the script.
+#[tokio::test]
+async fn overwrite_finds_a_retained_orphan_past_the_first_removed_id_chunk_issue_1442() {
+    let removed = 2 * 8_192 + 5;
+    let last = format!("d{:07}", removed - 1);
+    let mut seed = vec![r#"{"type":"Person","data":{"name":"keep"}}"#.to_string()];
+    seed.extend(
+        (0..removed).map(|i| format!(r#"{{"type":"Person","data":{{"name":"d{i:07}"}}}}"#)),
+    );
+    let keep_only = r#"{"type":"Person","data":{"name":"keep"}}"#;
+
+    // Every retained edge keeps both endpoints: the overwrite removes the
+    // other ids and succeeds.
+    let (_dir, db) = init_with(RI_SCHEMA, &seed.join("\n")).await;
+    for _ in 0..2 {
+        db.load_jsonl(
+            r#"{"edge":"Knows","from":"keep","to":"keep"}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+    }
+    db.load_jsonl(keep_only, LoadMode::Overwrite)
+        .await
+        .expect("no retained edge references a removed node");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+    assert_eq!(count_rows(&db, "edge:Knows").await, 2);
+
+    // A retained edge to the last removed id, in its own fragment, is found.
+    let (_dir, db) = init_with(RI_SCHEMA, &seed.join("\n")).await;
+    for edge in [
+        r#"{"edge":"Knows","from":"keep","to":"keep"}"#.to_string(),
+        format!(r#"{{"edge":"Knows","from":"keep","to":"{last}"}}"#),
+    ] {
+        db.load_jsonl(&edge, LoadMode::Append).await.unwrap();
+    }
+    let err = db
+        .load_jsonl(keep_only, LoadMode::Overwrite)
+        .await
+        .expect_err("Knows(keep->last) is retained while its dst is removed");
+    assert!(
+        err.to_string().contains(&format!("'{last}' not found")),
+        "the orphan in the last removed-id chunk must be named, got: {err}"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, removed + 1);
+}
+
 /// Finding 2: uniqueness must evaluate the final coalesced image per id, not
 /// accumulate superseded keys. One mutation updates Alice.email temp -> final,
 /// then inserts Carol.email = temp. The final state (Alice=final, Carol=temp) is

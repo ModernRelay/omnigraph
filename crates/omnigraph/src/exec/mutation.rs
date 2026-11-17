@@ -12,7 +12,7 @@ use crate::session::Session;
 use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle, WriteBudget};
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
-use lance_select::mask::RowAddrTreeMap;
+use lance_select::mask::{RowAddrTreeMap, RowSetOps};
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
@@ -819,48 +819,34 @@ pub(super) async fn open_table_for_mutation(
     Ok((opened.handle, opened.full_path, opened.table_branch))
 }
 
-/// Build the committed-snapshot filter used to COUNT a delete statement's
-/// `affected_*`, excluding rows a prior delete statement on the same table
-/// already scheduled for removal in this query.
+/// The rows earlier delete statements of this query already scheduled on
+/// `table_key`: their row addresses, recorded at `version`, or `None` when no
+/// statement has touched the table. A statement skips them when it counts its
+/// `affected_*`, so overlapping statements count each row once and their
+/// counts sum to the union the combined staged delete removes. Matching by
+/// address rather than re-evaluating the earlier predicates puts no earlier
+/// statement's test into this scan's filter: a cascade's predicate lists every
+/// removed id (#1442), and a row an earlier predicate left null-valued was not
+/// matched, so it has no address and is not skipped (#1277).
 ///
-/// Deletes stage — they no longer inline-commit — so every statement in a
-/// delete-only query scans the same unchanged committed snapshot. Counting each
-/// predicate independently would double-count overlapping statements (the old
-/// inline path did not, because each delete committed before the next ran). The
-/// combined staged delete actually removes the UNION `p₁ ∪ p₂ ∪ …`; excluding
-/// the prior predicates here makes each statement contribute `|pₙ \ (p₁ ∪ …)|`,
-/// whose sum is exactly that distinct count. `base` (the original predicate) is
-/// still what gets recorded — only the count uses this exclusion.
-///
-/// LOAD-BEARING on D₂: this exclusion assumes the committed snapshot is
-/// invariant across the query's statements, which holds only because D₂
-/// (`enforce_no_mixed_destructive_constructive`) forbids mixing inserts/updates
-/// with deletes — so a delete-touched table never has pending writes that would
-/// shift what a later statement sees. If D₂ is ever relaxed, this dedup must be
-/// revisited (a later delete would then need to see prior in-query writes).
-///
-/// The exclusion uses `IS NOT TRUE`, not `NOT`, because of SQL three-valued
-/// logic: a prior predicate referencing a column that is NULL for some row
-/// (e.g. `age > 30` on a row with NULL `age`) evaluates to UNKNOWN, and
-/// `NOT UNKNOWN` is still UNKNOWN — which a `WHERE` treats as not-matched, so
-/// the row would be wrongly dropped from this statement's scan even though the
-/// prior delete never matched it (dropping it from `deleted_ids` skips its
-/// cascade, or — if it is the only match — leaves the node undeleted). Only
-/// rows a prior predicate matched as definitely TRUE should be excluded:
-/// `(prior) IS NOT TRUE` keeps both FALSE and UNKNOWN rows.
-///
-/// Each prior predicate gets its own `IS NOT TRUE` (`(p1 OR p2) IS NOT TRUE`
-/// is `p1 IS NOT TRUE AND p2 IS NOT TRUE`). An `OR` of the priors would put
-/// their tests side by side, where Lance's simplifier folds two disjoint
-/// `NOT IN` tests of one nullable column to `true` and so excludes the rows
-/// whose value is null (#1277); `IS NOT TRUE` has no rewrite there.
-fn dedup_delete_filter(base: &Expr, prior: &[Expr]) -> Expr {
-    prior
-        .iter()
-        .cloned()
-        .fold(base.clone(), |filter, excluded| {
-            filter.and(excluded.is_not_true())
-        })
+/// LOAD-BEARING on D₂: every statement of a delete-only query reads the same
+/// committed snapshot, because `enforce_no_mixed_destructive_constructive`
+/// leaves a delete-touched table no pending writes, so one address names one
+/// row across statements. If D₂ is ever relaxed, this must be revisited.
+/// Addresses recorded at another version would name other rows, an internal
+/// contract failure as in `MutationStaging::record_deleted_row_addrs`.
+fn recorded_row_addrs<'a>(
+    recorded: &'a HashMap<String, (u64, RowAddrTreeMap)>,
+    table_key: &str,
+    version: u64,
+) -> Result<Option<&'a RowAddrTreeMap>> {
+    match recorded.get(table_key) {
+        None => Ok(None),
+        Some((recorded_version, addrs)) if *recorded_version == version => Ok(Some(addrs)),
+        Some((recorded_version, _)) => Err(OmniError::manifest_internal(format!(
+            "delete row addresses for '{table_key}' captured at versions {recorded_version} and {version}"
+        ))),
+    }
 }
 
 /// D₂ parse-time check: a single mutation query is either insert/update-only
@@ -2226,16 +2212,19 @@ impl Omnigraph {
                 Some(id_conjunct) => pred_expr.clone().and(id_conjunct),
                 None => pred_expr.clone(),
             };
-        let scan_filter = dedup_delete_filter(
-            &scan_predicate,
-            staging.recorded_delete_predicates(&table_key),
-        );
-        let (deleted_ids, deleted_addrs) = scan_deleted_ids(
+        // A row an earlier delete statement on this table already matched is
+        // skipped by its recorded row address, so it is counted once.
+        let mut deleted_ids = Vec::new();
+        let mut deleted_addrs = RowAddrTreeMap::new();
+        scan_deleted_ids(
             self,
             &ds,
             txn.catalog.system_columns.id,
-            scan_filter,
+            scan_predicate,
+            recorded_row_addrs(&staging.deleted_row_addrs, &table_key, ds.version())?,
             &mut staging.deleted_id_budget,
+            &mut deleted_ids,
+            &mut deleted_addrs,
         )
         .await?;
 
@@ -2270,21 +2259,22 @@ impl Omnigraph {
             .collect();
 
         for (edge_name, from_type, to_type) in &edge_info {
-            let mut cascade_filters = Vec::new();
+            let mut endpoints = Vec::new();
             if from_type == type_name {
-                cascade_filters.push(id_in_list_expr(
-                    &deleted_ids,
-                    txn.catalog.system_columns.src,
-                ));
+                endpoints.push(txn.catalog.system_columns.src);
             }
             if to_type == type_name {
-                cascade_filters.push(id_in_list_expr(
-                    &deleted_ids,
-                    txn.catalog.system_columns.dst,
-                ));
+                endpoints.push(txn.catalog.system_columns.dst);
             }
-            let Some(cascade_filter) = cascade_filters.into_iter().reduce(Expr::or) else {
+            if endpoints.is_empty() {
                 continue;
+            }
+            let probed = |column: &str| -> &[String] {
+                if endpoints.contains(&column) {
+                    &deleted_ids
+                } else {
+                    &[]
+                }
             };
 
             let edge_table_key = format!("edge:{}", edge_name);
@@ -2300,35 +2290,52 @@ impl Omnigraph {
             // Delete is a STRICT op, so collapse #1 never skips its open.
             let edge_ds = edge_handle.expect("strict Delete op always opens its dataset");
 
-            // `affected_edges` was the post-inline-commit `deleted_rows`; with
-            // staged deletes the rows aren't removed until end-of-query, so
-            // count the matching committed edges now. Exact under D₂ (no staged
-            // inserts can add matches mid-query), and bounded by the cascade
-            // working set. Exclude edges a prior delete statement (a prior
-            // cascade, or an explicit edge delete) on this table already
-            // scheduled, so an edge incident to two deleted nodes — or matched
-            // by both a cascade and an explicit `delete <Edge>` — is counted
-            // once. Record the ORIGINAL cascade filter (the combined staged
-            // delete removes the union); skip only when nothing NEW matches.
-            let count_filter = dedup_delete_filter(
-                &cascade_filter,
-                staging.recorded_delete_predicates(&edge_table_key),
+            // `affected_edges` counts the committed edges the cascade removes;
+            // the staged delete removes them at end-of-query. Exact under D₂
+            // (no staged inserts can add matches mid-query). The removed node
+            // ids are probed one bounded chunk per scan, never as one filter
+            // over every id (#1442). An edge whose endpoints fall in two
+            // chunks, or that an earlier delete statement on this table (a
+            // prior cascade or an explicit `delete <Edge>`) already
+            // scheduled, is skipped by its row address, so it is counted once. Scan (not count) the removed edge ids so
+            // validation recounts the OTHER endpoint's @card after the
+            // cascade; `len()` is the affected count.
+            let mut matched_ids = Vec::new();
+            let mut matched_addrs = RowAddrTreeMap::new();
+            let (src, dst) = (
+                txn.catalog.system_columns.src,
+                txn.catalog.system_columns.dst,
             );
-            // Scan (not count) the cascade-removed edge ids so validation
-            // recounts the OTHER endpoint's @card after the cascade; `len()` is
-            // the affected count.
-            let (matched_ids, matched_addrs) = scan_deleted_ids(
-                self,
-                &edge_ds,
-                txn.catalog.system_columns.id,
-                count_filter,
-                &mut staging.deleted_id_budget,
-            )
-            .await?;
+            for filter in
+                crate::validate::endpoint_probe_filters((src, probed(src)), (dst, probed(dst)))
+            {
+                scan_deleted_ids(
+                    self,
+                    &edge_ds,
+                    txn.catalog.system_columns.id,
+                    filter,
+                    recorded_row_addrs(
+                        &staging.deleted_row_addrs,
+                        &edge_table_key,
+                        edge_ds.version(),
+                    )?,
+                    &mut staging.deleted_id_budget,
+                    &mut matched_ids,
+                    &mut matched_addrs,
+                )
+                .await?;
+            }
             let matched = matched_ids.len();
             affected_edges += matched;
 
             if matched > 0 {
+                // The staged delete removes exactly the recorded addresses;
+                // the predicate is the transaction's recorded text.
+                let cascade_filter = endpoints
+                    .iter()
+                    .map(|column| id_in_list_expr(&deleted_ids, column))
+                    .reduce(Expr::or)
+                    .expect("a cascade has at least one endpoint");
                 cascaded_edge_tables.push(edge_table_key.clone());
                 staging.record_deleted_ids(&edge_table_key, matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
@@ -2383,21 +2390,26 @@ impl Omnigraph {
         // Count matching committed edges now (the staged delete won't remove
         // them until end-of-query). Exact under D₂; exclude edges a prior delete
         // statement on this table (an earlier cascade or edge delete) already
-        // scheduled, so overlapping statements don't double-count. Record the
-        // ORIGINAL predicate below (the combined staged delete removes the
-        // union); only record when something NEW matches.
-        let count_filter =
-            dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
+        // scheduled, by its recorded row address, so overlapping statements
+        // don't double-count. Record the ORIGINAL predicate below (the combined
+        // staged delete removes the union); only record when something NEW
+        // matches.
+        //
         // Scan the matched edge ids (not just count): the ids feed validation so
         // a delete emptying a src below @card min is rejected; `len()` is the
         // affected count. One scan replaces the former count-here + resolve-at-
         // validation re-scan.
-        let (deleted_ids, deleted_addrs) = scan_deleted_ids(
+        let mut deleted_ids = Vec::new();
+        let mut deleted_addrs = RowAddrTreeMap::new();
+        scan_deleted_ids(
             self,
             &ds,
             txn.catalog.system_columns.id,
-            count_filter,
+            pred_expr.clone(),
+            recorded_row_addrs(&staging.deleted_row_addrs, &table_key, ds.version())?,
             &mut staging.deleted_id_budget,
+            &mut deleted_ids,
+            &mut deleted_addrs,
         )
         .await?;
         let affected = deleted_ids.len();
@@ -2488,20 +2500,26 @@ async fn key_id_conjunct(
 
 /// Walk the exact typed predicate a batch at a time, admitting each id against
 /// `budget` before copying it, and keep each matched row's address so the
-/// staged delete removes exactly these rows without scanning again.
+/// staged delete removes exactly these rows without scanning again. The ids
+/// and addresses accumulate into `removed` and `addrs` across a statement's
+/// probes; a row already in `addrs` (an earlier probe of this statement) or in
+/// `scheduled` (an earlier statement's rows) is skipped before it is charged.
 async fn scan_deleted_ids(
     db: &Omnigraph,
     snapshot: &SnapshotHandle,
     id_column: &str,
     filter: Expr,
+    scheduled: Option<&RowAddrTreeMap>,
     budget: &mut DeletedIdBudget,
-) -> Result<(Vec<String>, RowAddrTreeMap)> {
+    removed: &mut Vec<String>,
+    addrs: &mut RowAddrTreeMap,
+) -> Result<()> {
     let mut stream = db
         .storage()
         .scan_filtered_row_addrs(snapshot, &[id_column], filter)
         .await?;
-    let mut removed = Vec::new();
-    let mut addrs = RowAddrTreeMap::new();
+    let mut scanned = RowAddrTreeMap::new();
+    let mut found = Vec::new();
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
         let ids = batch
             .column(0)
@@ -2520,17 +2538,25 @@ async fn scan_deleted_ids(
             ));
         }
         for i in 0..ids.len() {
-            let id = ids.value(i);
-            budget.retain(id)?;
-            removed.push(id.to_owned());
-            if !addrs.insert(row_addrs.value(i)) {
+            let addr = row_addrs.value(i);
+            if !scanned.insert(addr) {
                 return Err(OmniError::manifest_internal(
                     "delete id scan returned one row address twice",
                 ));
             }
+            if addrs.contains(addr) || scheduled.is_some_and(|rows| rows.contains(addr)) {
+                continue;
+            }
+            let id = ids.value(i);
+            budget.retain(id)?;
+            removed.push(id.to_owned());
+            found.push(addr);
         }
     }
-    Ok((removed, addrs))
+    for addr in found {
+        addrs.insert(addr);
+    }
+    Ok(())
 }
 
 /// Concat the matched batches from `scan_with_pending` into a single batch.
@@ -2773,26 +2799,5 @@ edge Shared: Endpoint -> Endpoint { label: String }
         assert!(staging.is_empty());
         assert!(staging.paths.is_empty());
         assert!(staging.deleted_ids.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod delete_filter_tests {
-    use super::dedup_delete_filter;
-    use crate::engine::lance_filter_support::selected_rows;
-    use datafusion::prelude::{col, lit, not};
-
-    /// A later statement selects `k = "a"`, the row whose `s` is null; the
-    /// earlier statements' disjoint `NOT IN` tests are null there, so they
-    /// did not match it and must not exclude it.
-    #[test]
-    fn earlier_disjoint_not_in_statements_do_not_exclude_a_null_row_issue_1277() {
-        let prior = [
-            not(col("s").in_list(vec![lit("y")], false)),
-            not(col("s").in_list(vec![lit("x")], false)),
-        ];
-        let filter = dedup_delete_filter(&col("k").eq(lit("a")), &prior);
-        assert_eq!(selected_rows(filter.clone(), false), vec![0]);
-        assert_eq!(selected_rows(filter, true), vec![0]);
     }
 }

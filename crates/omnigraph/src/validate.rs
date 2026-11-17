@@ -89,6 +89,38 @@ pub(crate) enum AccessPath {
 /// and a load holds many keyed batches of `KEYED_WRITE_MAX_ROWS` rows.
 const PROBE_CHUNK_KEYS: usize = 8_192;
 
+/// The filters of a node removal's edge probes (the retained-edge check and
+/// the delete cascade), one per [`PROBE_CHUNK_KEYS`] removed ids: the `i`-th
+/// is `src IN (chunk i of the src ids) OR dst IN (chunk i of the dst ids)`,
+/// leaving out an endpoint whose ids are used up. A removal of at most one
+/// chunk keeps the single filter it always had; a larger one scans once per
+/// filter instead of once with every removed id, because Lance prepares a
+/// filter, and hands an unindexed fragment its own copy of the key list, per
+/// scan, so one filter over every id costs memory in removed ids times
+/// fragments that no allowance charges (#1442). An edge whose endpoints fall
+/// in two chunks matches two filters; callers keep it once.
+pub(crate) fn endpoint_probe_filters<'a>(
+    src: (&'a str, &'a [String]),
+    dst: (&'a str, &'a [String]),
+) -> impl Iterator<Item = Expr> + 'a {
+    let chunks = src.1.len().max(dst.1.len()).div_ceil(PROBE_CHUNK_KEYS);
+    (0..chunks).map(move |chunk| {
+        let start = chunk * PROBE_CHUNK_KEYS;
+        [src, dst]
+            .into_iter()
+            .filter(|(_, ids)| start < ids.len())
+            .map(|(column, ids)| {
+                let end = ids.len().min(start + PROBE_CHUNK_KEYS);
+                col(column).in_list(
+                    ids[start..end].iter().map(|id| lit(id.clone())).collect(),
+                    false,
+                )
+            })
+            .reduce(Expr::or)
+            .expect("a chunk below the longer list's count holds ids")
+    })
+}
+
 /// Index-backed view of committed target state for the merge delta's lookups.
 /// Every method reads the (indexed) target table via a structured `filter_expr`
 /// so Lance serves it from the BTREE (index-search → take) rather than a full
@@ -476,6 +508,11 @@ impl<'a> CommittedState<'a> {
     /// Committed edges `(id, src, dst)` of `edge_table` whose src is in
     /// `src_nodes` or dst in `dst_nodes`, the edges a node removal would strand;
     /// `limit_one` reads the first alone when no delta or deletion can exempt it.
+    /// The removed ids are probed [`PROBE_CHUNK_KEYS`] at a time
+    /// ([`endpoint_probe_filters`]), so one filter never carries every removed
+    /// id, which Lance would copy per unindexed fragment. An edge two probes
+    /// find is returned once, from the first; under `limit_one` the first chunk
+    /// that finds an edge ends the probing.
     async fn edges_referencing(
         &self,
         edge_table: &str,
@@ -491,57 +528,52 @@ impl<'a> CommittedState<'a> {
         let Some(ds) = self.open(edge_table).await? else {
             return Ok(Vec::new());
         };
-        let mut expr: Option<Expr> = None;
-        if !src_nodes.is_empty() {
-            expr = Some(
-                col(system_columns.src)
-                    .in_list(src_nodes.iter().map(|k| lit(k.clone())).collect(), false),
-            );
-        }
-        if !dst_nodes.is_empty() {
-            let dst = col(system_columns.dst)
-                .in_list(dst_nodes.iter().map(|k| lit(k.clone())).collect(), false);
-            expr = Some(match expr {
-                Some(acc) => acc.or(dst),
-                None => dst,
-            });
-        }
-        let mut stream = TableStore::scan_stream_with(
-            &ds,
-            Some(&[system_columns.id, system_columns.src, system_columns.dst]),
-            None,
-            None,
-            false,
-            move |scanner| {
-                scanner.filter_expr(expr.expect("at least one endpoint has removed ids"));
-                if limit_one {
-                    scanner.limit(1)?;
-                    scanner.batch_size(1);
-                    scanner.batch_size_bytes(ID_SCAN_BATCH_BYTES);
-                    scanner.batch_readahead(1);
-                }
-                Ok(())
-            },
-        )
-        .await?;
+        let projection = [system_columns.id, system_columns.src, system_columns.dst];
         let mut out = Vec::new();
-        while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            admit(&batch)?;
-            let ids = string_col(&batch, system_columns.id)?;
-            let srcs = string_col(&batch, system_columns.src)?;
-            let dsts = string_col(&batch, system_columns.dst)?;
-            for i in 0..batch.num_rows() {
-                out.push((
-                    ids.value(i).to_string(),
-                    srcs.value(i).to_string(),
-                    dsts.value(i).to_string(),
-                ));
-            }
-            if limit_one {
-                break;
+        let mut found: HashSet<String> = HashSet::new();
+        for expr in endpoint_probe_filters(
+            (system_columns.src, src_nodes),
+            (system_columns.dst, dst_nodes),
+        ) {
+            let mut stream = TableStore::scan_stream_with(
+                &ds,
+                Some(&projection),
+                None,
+                None,
+                false,
+                move |scanner| {
+                    scanner.filter_expr(expr);
+                    if limit_one {
+                        scanner.limit(1)?;
+                        scanner.batch_size(1);
+                        scanner.batch_size_bytes(ID_SCAN_BATCH_BYTES);
+                        scanner.batch_readahead(1);
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                admit(&batch)?;
+                let ids = string_col(&batch, system_columns.id)?;
+                let srcs = string_col(&batch, system_columns.src)?;
+                let dsts = string_col(&batch, system_columns.dst)?;
+                for i in 0..batch.num_rows() {
+                    if !found.insert(ids.value(i).to_string()) {
+                        continue;
+                    }
+                    out.push((
+                        ids.value(i).to_string(),
+                        srcs.value(i).to_string(),
+                        dsts.value(i).to_string(),
+                    ));
+                }
+                if limit_one {
+                    return Ok(out);
+                }
             }
         }
         Ok(out)
@@ -824,4 +856,93 @@ where
         &HashMap::new(),
         sink,
     )
+}
+
+#[cfg(test)]
+mod endpoint_probe_tests {
+    use super::{PROBE_CHUNK_KEYS, endpoint_probe_filters};
+    use datafusion::prelude::{Expr, col, lit};
+    use datafusion::scalar::ScalarValue;
+
+    /// A removal's edge probes carry at most one chunk of ids per endpoint in
+    /// each filter, and together list every id once, in order; one chunk
+    /// keeps the single `src IN … OR dst IN …` filter.
+    #[test]
+    fn removed_id_probes_hold_one_chunk_per_filter_issue_1442() {
+        let src: Vec<String> = (0..2 * PROBE_CHUNK_KEYS + 1)
+            .map(|i| format!("s{i:07}"))
+            .collect();
+        let dst: Vec<String> = (0..PROBE_CHUNK_KEYS + 3)
+            .map(|i| format!("d{i:07}"))
+            .collect();
+        let mut shapes = Vec::new();
+        let mut listed: Vec<(String, String)> = Vec::new();
+        for filter in endpoint_probe_filters(("__src", &src), ("__dst", &dst)) {
+            let mut lists = Vec::new();
+            for test in or_terms(filter) {
+                let Expr::InList(in_list) = test else {
+                    panic!("an endpoint probe ORs IN lists: {test}");
+                };
+                assert!(!in_list.negated);
+                let Expr::Column(column) = *in_list.expr else {
+                    panic!("an endpoint probe tests a column");
+                };
+                lists.push((column.name.clone(), in_list.list.len()));
+                for item in in_list.list {
+                    let Expr::Literal(ScalarValue::Utf8(Some(id)), _) = item else {
+                        panic!("an endpoint probe lists string literals: {item}");
+                    };
+                    listed.push((column.name.clone(), id));
+                }
+            }
+            shapes.push(lists);
+        }
+        let full = PROBE_CHUNK_KEYS;
+        assert_eq!(
+            shapes,
+            vec![
+                vec![("__src".to_string(), full), ("__dst".to_string(), full)],
+                vec![("__src".to_string(), full), ("__dst".to_string(), 3)],
+                vec![("__src".to_string(), 1)],
+            ]
+        );
+        let src_listed: Vec<&String> = listed
+            .iter()
+            .filter(|(c, _)| c == "__src")
+            .map(|(_, id)| id)
+            .collect();
+        let dst_listed: Vec<&String> = listed
+            .iter()
+            .filter(|(c, _)| c == "__dst")
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(src_listed, src.iter().collect::<Vec<_>>());
+        assert_eq!(dst_listed, dst.iter().collect::<Vec<_>>());
+
+        let one = vec!["a".to_string()];
+        let single: Vec<Expr> = endpoint_probe_filters(("__src", &one), ("__dst", &one)).collect();
+        assert_eq!(
+            single,
+            vec![
+                col("__src")
+                    .in_list(vec![lit("a")], false)
+                    .or(col("__dst").in_list(vec![lit("a")], false))
+            ]
+        );
+        assert_eq!(
+            endpoint_probe_filters(("__src", &[]), ("__dst", &[])).count(),
+            0
+        );
+    }
+
+    fn or_terms(expr: Expr) -> Vec<Expr> {
+        match expr {
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
+                let mut terms = or_terms(*binary.left);
+                terms.extend(or_terms(*binary.right));
+                terms
+            }
+            other => vec![other],
+        }
+    }
 }

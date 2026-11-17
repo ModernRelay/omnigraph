@@ -3613,6 +3613,81 @@ query cascade_then_explicit($name: String, $other: String) {
     );
 }
 
+/// A node delete's cascade probes the removed ids one bounded chunk per scan
+/// (`validate::PROBE_CHUNK_KEYS`, 8,192), never one filter over every removed id, whose memory grew with removed ids
+/// times edge fragments (#1442). Across those chunks: an edge whose deleted
+/// endpoint sits in the last chunk is found, an edge with both endpoints
+/// deleted (first chunk as `src`, last chunk as `dst`) is counted once, and a
+/// later `delete <Edge>` statement that selects that edge again skips it by its
+/// recorded row address. The scale symptom is `--stats` peak RSS, which the
+/// engine suite cannot observe in one process; the issue holds the script.
+#[tokio::test]
+async fn delete_cascade_across_removed_id_chunks_counts_each_edge_once_issue_1442() {
+    const SCHEMA: &str = "\
+node Doc { slug: String @key }
+edge Link: Doc -> Doc
+";
+    const QUERY: &str = r#"
+query drop_docs($first: String) {
+    delete Doc where slug != "keep"
+    delete Link where from = $first
+}
+"#;
+    let removed = 2 * 8_192 + 5;
+    let first = format!("d{:07}", 0);
+    let last = format!("d{:07}", removed - 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let mut input = vec![serde_json::json!({"type":"Doc","data":{"slug":"keep"}}).to_string()];
+    input.extend(
+        (0..removed).map(|i| {
+            serde_json::json!({"type":"Doc","data":{"slug":format!("d{i:07}")}}).to_string()
+        }),
+    );
+    db.load_jsonl(&input.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    // One edge per append, so the edge table holds three fragments.
+    for (from, to) in [
+        ("keep", last.as_str()),
+        (first.as_str(), last.as_str()),
+        ("keep", "keep"),
+    ] {
+        db.load_jsonl(
+            &serde_json::json!({"edge":"Link","from":from,"to":to}).to_string(),
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+    }
+
+    let result = db
+        .mutate(
+            "main",
+            QUERY,
+            "drop_docs",
+            &params(&[("$first", first.as_str())]),
+        )
+        .await
+        .expect("a cascade over several removed-id chunks must succeed");
+    assert_eq!(result.affected_nodes, removed);
+    assert_eq!(
+        result.affected_edges, 2,
+        "keep->{last} and {first}->{last} are cascaded once each; the explicit delete adds nothing"
+    );
+    assert_eq!(count_rows(&db, "node:Doc").await, 1);
+    assert_eq!(
+        count_rows(&db, "edge:Link").await,
+        1,
+        "only keep->keep survives"
+    );
+}
+
 /// The engine cardinality path must enforce `min` bounds. Pre-fix the
 /// engine path silently dropped the min check (a `let _ = card.min;`
 /// line). The loader path always enforced both. Post-fix, both paths
