@@ -731,7 +731,17 @@ reason (`COSTS` in the script, or an `open:` key); CI runs it as its own
 pass, since the measure ledger moves a concurrent block's park points. The
 report lists every changed step's requests and class deltas under `costs`.
 `--case <path>` (repeatable) selects cases; `--reuse` compares the traces an
-earlier run left under `--work`. The report (`report.json` under `--work`)
+earlier run left under `--work`.
+
+Fix coverage over edition-2 text is an instrument beside it,
+`fix_coverage::fix_coverage_over_edition_2_text` in `omnigraph-gqt`'s
+`integration` binary (`#[ignore = "instrument: …"]`): point
+`OMNIGRAPH_FIX_COVERAGE_DIR` at the edition-2 commit's `cases/` or at stored
+queries exported as `<name>.gq` beside `<name>.pg`, and it applies every
+printed suggestion pass by pass and prints counts only (compiled as written,
+respelled by the fixes per pass, stuck by code and message shape), so it may
+run over a private registry; `OMNIGRAPH_FIX_COVERAGE_SHOW=1` also prints the
+stuck text, for a corpus whose text may be shown. The report (`report.json` under `--work`)
 holds every difference with both observations.
 
 ### OpenAPI
