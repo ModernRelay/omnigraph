@@ -75,8 +75,6 @@ s: F64
 --- expect plan
 fuse $d: arms [distance, bm25]
 
---- expect same as reference
-
 --- query
 query three_weighted_arms() {
     match {
@@ -102,8 +100,6 @@ s: F64
 fuse $d: arms [nearest, bm25, distance]
 scan Doc as $d: ranked nearest fetch 2
 
---- expect same as reference
-
 --- query
 query different_populations() {
     match {
@@ -124,8 +120,6 @@ query different_populations() {
 --- expect shape
 d.slug: String
 s: F64
-
---- expect same as reference
 
 --- query
 query ordered_arm() {
@@ -149,8 +143,6 @@ s: F64
 
 --- expect plan
 fuse $d: arms [ordered, bm25]
-
---- expect same as reference
 
 --- query
 query nested_fusion_arm() {
@@ -176,5 +168,3 @@ s: F64
 --- expect plan
 fuse $d: arms [rrf, distance]
 fuse $d: arms [nearest, bm25]
-
---- expect same as reference

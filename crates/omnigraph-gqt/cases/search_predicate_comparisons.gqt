@@ -32,8 +32,6 @@ query compared_with_false() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query not_equal_to_true() {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) != true
@@ -46,8 +44,6 @@ query not_equal_to_true() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query less_than_true() {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) < true
@@ -59,8 +55,6 @@ query less_than_true() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query compared_with_a_parameter($enabled: Bool) {
@@ -77,8 +71,6 @@ query compared_with_a_parameter($enabled: Bool) {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query true_compared_with_it() {
     match { $d: Doc } where true = match_terms($d.text, terms("needle", mode: any))
@@ -90,8 +82,6 @@ query true_compared_with_it() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query match_text_compared_with_false() {
@@ -105,8 +95,6 @@ query match_text_compared_with_false() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query fuzzy_compared_with_false() {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any, max_edits: 2)) = false
@@ -119,8 +107,6 @@ query fuzzy_compared_with_false() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query accepted_joined_by_and() {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) and $d.slug = "d"
@@ -132,5 +118,3 @@ query accepted_joined_by_and() {
 
 --- expect shape
 d.slug: String
---- expect same as reference
-

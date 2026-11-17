@@ -68,8 +68,6 @@ s: F64
 fuse $d: arms [nearest, distance]
 scan Doc as $d: ranked nearest fetch 2
 
---- expect same as reference
-
 --- query
 query fan_out_carries_the_score() {
     match {
@@ -93,8 +91,6 @@ d.slug: String
 p.name: String
 s: F64
 
---- expect same as reference
-
 --- query
 query ties_and_one_arm_targets() {
     match {
@@ -113,5 +109,3 @@ query ties_and_one_arm_targets() {
 --- expect shape
 d.slug: String
 s: F64
-
---- expect same as reference

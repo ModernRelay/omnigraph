@@ -64,6 +64,8 @@ scan @Operator as $o: columns [name, inputs]
 scan @Operator as $o: access sequential
 not pass aggregate_pushdown
 
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows
+
 --- query
 query passes_in_order() {
     match { $p: @Pass }
@@ -89,6 +91,8 @@ query passes_in_order() {
 --- expect shape
 p.position: I64
 p.name: String
+
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows
 
 --- query
 query logical_kinds() {
@@ -126,3 +130,5 @@ query logical_kinds() {
 --- expect shape
 k.name: String
 k.coverage: String
+
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows

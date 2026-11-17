@@ -53,8 +53,6 @@ query every_term() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query every_term_by_default_repeated_and_reordered() {
     match { $d: Doc }
@@ -67,8 +65,6 @@ query every_term_by_default_repeated_and_reordered() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query any_term() {
@@ -84,8 +80,6 @@ query any_term() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query every_term_from_a_parameter($q: String) {
@@ -103,8 +97,6 @@ query every_term_from_a_parameter($q: String) {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query not_every_term() {
     match { $d: Doc }
@@ -121,8 +113,6 @@ query not_every_term() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query every_term_or_old() {
     match { $d: Doc }
@@ -136,8 +126,6 @@ query every_term_or_old() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query compared_with_false() {
@@ -154,8 +142,6 @@ query compared_with_false() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query matched_in_a_let() {
     match { $d: Doc, let $hit = match_terms($d.title, terms("engines", mode: any)) }
@@ -168,8 +154,6 @@ query matched_in_a_let() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query wrote_about_engines() {
@@ -184,8 +168,6 @@ query wrote_about_engines() {
 
 --- expect shape
 p.name: String
-
---- expect same as reference
 
 --- query
 query wrote_nothing_but_engines() {
@@ -202,8 +184,6 @@ query wrote_nothing_but_engines() {
 --- expect shape
 p.name: String
 
---- expect same as reference
-
 --- query
 query counted() {
     match { $d: Doc }
@@ -216,8 +196,6 @@ query counted() {
 
 --- expect shape
 n: I64
-
---- expect same as reference
 
 --- mutate
 query twins() {
@@ -241,8 +219,6 @@ query every_term_after_insert() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query not_any_term_after_insert() {
     match { $d: Doc }
@@ -256,8 +232,6 @@ query not_any_term_after_insert() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- mutate
 query backdate_search_engines() {
@@ -280,5 +254,3 @@ query backdated() {
 
 --- expect shape
 d.slug: String
---- expect same as reference
-

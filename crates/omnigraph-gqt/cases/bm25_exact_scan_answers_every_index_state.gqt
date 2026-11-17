@@ -157,8 +157,6 @@ query unbuilt_matches() {
 --- expect shape
 m.slug: String
 
---- expect same as reference
-
 --- query
 query unbuilt_ranks() {
     match { let $pop = { match { $m: Memo } return { $m } }, from bm25($pop, $m.body, terms("cafe", max_edits: 1)) as $score }
@@ -173,5 +171,3 @@ query unbuilt_ranks() {
 --- expect shape
 m.slug: String
 score: F64
-
---- expect same as reference

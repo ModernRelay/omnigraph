@@ -37,8 +37,6 @@ cast $x.n: I64 -> F64
 no cast 9007199254740992.0
 type 9007199254740992.0: F64
 
---- expect same as reference
-
 --- query
 query above_a_whole_float() {
     match { $x: Number } where $x.n > 9007199254740992.0
@@ -53,8 +51,6 @@ x.key: String
 cast $x.n: I64 -> F64
 no cast 9007199254740992.0
 
---- expect same as reference
-
 --- query
 query equals_the_float_above_its_neighbours() {
     match { $x: Number } where $x.n = 9007199254740996.0
@@ -67,8 +63,6 @@ x.key: String
 --- expect plan
 cast $x.n: I64 -> F64
 no cast 9007199254740996.0
-
---- expect same as reference
 
 --- query
 query returns_the_float_comparison() {
@@ -87,8 +81,6 @@ at_least: Bool
 cast $x.n: I64 -> F64
 no cast 9007199254740994.0
 
---- expect same as reference
-
 --- query
 query an_integer_literal_compares_exactly() {
     match { $x: Number } where $x.n = 9007199254740993
@@ -101,5 +93,3 @@ x.key: String
 --- expect plan
 no cast $x.n
 type 9007199254740993: I64
-
---- expect same as reference

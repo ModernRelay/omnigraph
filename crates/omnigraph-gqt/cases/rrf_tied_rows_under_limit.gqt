@@ -116,8 +116,6 @@ query fused_v2($t: String) {
 --- expect shape
 p.slug: String
 
---- expect same as reference
-
 --- query
 query fused_explicit_id($t: String) {
     match {
@@ -144,8 +142,6 @@ p.slug: String
 --- expect plan
 fuse $d: arms [bm25, bm25]
 
---- expect same as reference
-
 --- query
 query fused_covered_return($t: String) {
     match {
@@ -171,5 +167,3 @@ p.slug: String
 
 --- expect plan
 fuse $d: arms [bm25, bm25]
---- expect same as reference
-

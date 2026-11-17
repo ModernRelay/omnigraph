@@ -35,8 +35,6 @@ type $p.amount: I64
 aggregate total: sum(I64) exact_integer round_to_nearest -> F64?
 result columns [total: F64?]
 
---- expect same as reference
-
 --- query
 query grouped_total() {
     match { $p: Person }
@@ -55,8 +53,6 @@ type $p.amount: I64
 aggregate total: sum(I64) exact_integer round_to_nearest -> F64?
 result columns [total: F64?, p.team: String]
 
---- expect same as reference
-
 --- query
 query exact_average() {
     match { $p: Person } where $p.team = "cancel"
@@ -70,5 +66,3 @@ mean: F64
 type $p.amount: I64
 aggregate mean: avg(I64) exact_integer round_to_nearest -> F64?
 result columns [mean: F64?]
-
---- expect same as reference

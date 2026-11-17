@@ -55,8 +55,6 @@ n.slug: String
 --- expect plan
 scan Note as $n: access index_probe text ngram
 
---- expect same as reference
-
 --- query
 query contains_exact_case_unindexed() {
     match { $n: PlainNote }
@@ -73,8 +71,6 @@ n.slug: String
 --- expect plan
 scan PlainNote as $n: access sequential
 
---- expect same as reference
-
 --- query
 query contains_other_case_indexed() {
     match { $n: Note }
@@ -90,8 +86,6 @@ n.slug: String
 --- expect plan
 scan Note as $n: access index_probe text ngram
 
---- expect same as reference
-
 --- query
 query contains_other_case_unindexed() {
     match { $n: PlainNote }
@@ -106,8 +100,6 @@ n.slug: String
 
 --- expect plan
 scan PlainNote as $n: access sequential
-
---- expect same as reference
 
 --- query
 query contains_lower_indexed() {
@@ -125,8 +117,6 @@ n.slug: String
 --- expect plan
 scan Note as $n: access index_probe text ngram
 
---- expect same as reference
-
 --- query
 query contains_lower_unindexed() {
     match { $n: PlainNote }
@@ -142,8 +132,6 @@ n.slug: String
 
 --- expect plan
 scan PlainNote as $n: access sequential
-
---- expect same as reference
 
 --- query
 query contains_accented_indexed() {
@@ -161,8 +149,6 @@ n.slug: String
 --- expect plan
 scan Note as $n: access index_probe text ngram
 
---- expect same as reference
-
 --- query
 query contains_accented_unindexed() {
     match { $n: PlainNote }
@@ -179,8 +165,6 @@ n.slug: String
 --- expect plan
 scan PlainNote as $n: access sequential
 
---- expect same as reference
-
 --- query
 query contains_folded_accent_indexed() {
     match { $n: Note }
@@ -196,8 +180,6 @@ n.slug: String
 --- expect plan
 scan Note as $n: access index_probe text ngram
 
---- expect same as reference
-
 --- query
 query contains_folded_accent_unindexed() {
     match { $n: PlainNote }
@@ -212,8 +194,6 @@ n.slug: String
 
 --- expect plan
 scan PlainNote as $n: access sequential
-
---- expect same as reference
 
 --- query
 query contains_short_indexed() {
@@ -232,8 +212,6 @@ n.slug: String
 --- expect plan
 scan Note as $n: access sequential
 
---- expect same as reference
-
 --- query
 query contains_short_unindexed() {
     match { $n: PlainNote }
@@ -251,8 +229,6 @@ n.slug: String
 --- expect plan
 scan PlainNote as $n: access sequential
 
---- expect same as reference
-
 --- query
 query contains_no_trigram_indexed() {
     match { $n: Note }
@@ -269,8 +245,6 @@ n.slug: String
 --- expect plan
 scan Note as $n: access sequential
 
---- expect same as reference
-
 --- query
 query contains_no_trigram_unindexed() {
     match { $n: PlainNote }
@@ -286,8 +260,6 @@ n.slug: String
 
 --- expect plan
 scan PlainNote as $n: access sequential
-
---- expect same as reference
 
 --- query
 query not_contains_indexed() {
@@ -308,8 +280,6 @@ n.slug: String
 --- expect plan
 scan Note as $n: access sequential
 
---- expect same as reference
-
 --- query
 query not_contains_unindexed() {
     match { $n: PlainNote }
@@ -328,8 +298,6 @@ n.slug: String
 
 --- expect plan
 scan PlainNote as $n: access sequential
-
---- expect same as reference
 
 --- mutate
 query append_notes() {
@@ -356,8 +324,6 @@ n.slug: String
 --- expect plan
 scan Note as $n: access index_probe text ngram
 
---- expect same as reference
-
 --- query
 query appended_contains_lower_unindexed() {
     match { $n: PlainNote }
@@ -375,8 +341,6 @@ n.slug: String
 --- expect plan
 scan PlainNote as $n: access sequential
 
---- expect same as reference
-
 --- query
 query appended_contains_no_trigram_indexed() {
     match { $n: Note }
@@ -393,8 +357,6 @@ n.slug: String
 --- expect plan
 scan Note as $n: access sequential
 
---- expect same as reference
-
 --- query
 query appended_contains_no_trigram_unindexed() {
     match { $n: PlainNote }
@@ -410,8 +372,6 @@ n.slug: String
 
 --- expect plan
 scan PlainNote as $n: access sequential
-
---- expect same as reference
 
 --- mutate
 query delete_no_trigram() {
@@ -436,8 +396,6 @@ n.slug: String
 --- expect plan
 scan Note as $n: access sequential
 
---- expect same as reference
-
 --- query
 query deleted_no_trigram_lower() {
     match { $n: Note }
@@ -454,5 +412,3 @@ n.slug: String
 
 --- expect plan
 scan Note as $n: access index_probe text ngram
-
---- expect same as reference

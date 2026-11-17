@@ -52,7 +52,6 @@ query leading_nearest_runs($q: Vector(2)) {
 --- expect shape
 p.slug: String
 
---- expect same as reference
 --- query
 query bare_boolean_property() {
     match { $p: Person } where $p.enabled

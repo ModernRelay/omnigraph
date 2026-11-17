@@ -68,8 +68,6 @@ query q() {
 p.handle: String
 c.slug: String?
 
---- expect same as reference
-
 --- query
 query q() {
     match {
@@ -96,8 +94,6 @@ c.slug: String?
 w.since: I64?
 q.handle: String?
 
---- expect same as reference
-
 --- query
 query q() {
     match {
@@ -120,8 +116,6 @@ query q() {
 --- expect shape
 p.handle: String
 
---- expect same as reference
-
 --- query
 query q() {
     match {
@@ -143,8 +137,6 @@ query q() {
 --- expect shape
 h: String
 a: I64
-
---- expect same as reference
 
 --- query
 query q() {
@@ -175,8 +167,6 @@ query q() {
 c.slug: String
 p.handle: String
 
---- expect same as reference
-
 --- query
 query colleagues($h: String) {
     match { $me: Person, $c: Company, $q: Person, $me worksAt $c, $q worksAt $c }
@@ -202,8 +192,6 @@ query q() {
 p.handle: String
 q.handle: String
 
---- expect same as reference
-
 --- query
 query q() {
     match {
@@ -227,8 +215,6 @@ p.handle: String
 years: I32
 ratio: I64
 
---- expect same as reference
-
 --- query
 query q($n: I64) {
     match { $p: Person, $c: Company, $p worksAt $c }
@@ -247,8 +233,6 @@ query q($n: I64) {
 --- expect shape
 p.handle: String
 c.slug: String
-
---- expect same as reference
 
 --- query
 query q() {
@@ -270,8 +254,6 @@ query q() {
 p.handle: String
 n: I64
 
---- expect same as reference
-
 --- query
 query q() {
     match {
@@ -290,8 +272,6 @@ c.slug: String
 p.handle: String
 since: I64
 
---- expect same as reference
-
 --- query
 query q() {
     match { $p: Person }
@@ -305,8 +285,6 @@ query q() {
 
 --- expect shape
 p.handle: String
-
---- expect same as reference
 
 --- query
 query q() {
@@ -324,5 +302,3 @@ query q() {
 
 --- expect shape
 p.handle: String
-
---- expect same as reference

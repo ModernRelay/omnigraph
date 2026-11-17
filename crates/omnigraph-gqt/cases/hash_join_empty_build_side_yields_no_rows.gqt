@@ -34,7 +34,6 @@ query empty_build() {
 p.name: String
 q.name: String
 
---- expect same as reference
 --- query
 query empty_probe() {
     match { $p: Person, $p knows $q }
@@ -45,7 +44,6 @@ query empty_probe() {
 --- expect shape
 q.name: String
 
---- expect same as reference
 --- query
 query partial_build() {
     match { $p: Person, $p knows $q }
@@ -59,7 +57,6 @@ query partial_build() {
 p.name: String
 q.name: String
 
---- expect same as reference
 --- query
 query every_hop() {
     match { $p: Person, $p knows $q }
@@ -72,5 +69,3 @@ query every_hop() {
 --- expect shape
 p.name: String
 q.name: String
-
---- expect same as reference

@@ -49,8 +49,6 @@ d.slug: String
 --- expect plan
 scan Doc as $d: access index_probe tags label_list
 
---- expect same as reference
-
 --- query
 query holds_rust_unindexed() {
     match { $d: PlainDoc }
@@ -66,8 +64,6 @@ d.slug: String
 
 --- expect plan
 scan PlainDoc as $d: access sequential
-
---- expect same as reference
 
 --- query
 query holds_db_indexed() {
@@ -86,8 +82,6 @@ d.slug: String
 --- expect plan
 scan Doc as $d: access index_probe tags label_list
 
---- expect same as reference
-
 --- query
 query holds_db_unindexed() {
     match { $d: PlainDoc }
@@ -105,8 +99,6 @@ d.slug: String
 --- expect plan
 scan PlainDoc as $d: access sequential
 
---- expect same as reference
-
 --- query
 query holds_nothing_stored_indexed() {
     match { $d: Doc }
@@ -122,8 +114,6 @@ d.slug: String
 --- expect plan
 scan Doc as $d: access index_probe tags label_list
 
---- expect same as reference
-
 --- query
 query holds_nothing_stored_unindexed() {
     match { $d: PlainDoc }
@@ -138,8 +128,6 @@ d.slug: String
 
 --- expect plan
 scan PlainDoc as $d: access sequential
-
---- expect same as reference
 
 --- query
 query lacks_db_indexed() {
@@ -158,8 +146,6 @@ d.slug: String
 --- expect plan
 scan Doc as $d: access index_probe tags label_list
 
---- expect same as reference
-
 --- query
 query lacks_db_unindexed() {
     match { $d: PlainDoc }
@@ -176,8 +162,6 @@ d.slug: String
 
 --- expect plan
 scan PlainDoc as $d: access sequential
-
---- expect same as reference
 
 --- mutate
 query append_docs() {
@@ -204,8 +188,6 @@ d.slug: String
 --- expect plan
 scan Doc as $d: access index_probe tags label_list
 
---- expect same as reference
-
 --- query
 query appended_holds_rust_unindexed() {
     match { $d: PlainDoc }
@@ -222,5 +204,3 @@ d.slug: String
 
 --- expect plan
 scan PlainDoc as $d: access sequential
-
---- expect same as reference

@@ -35,6 +35,8 @@ query jobs_with_a_real_operator() {
 j.name: String
 o.inputs: [I64]
 
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows
+
 --- query
 query jobs_naming_no_operator() {
     match { $j: Job }
@@ -47,6 +49,8 @@ query jobs_naming_no_operator() {
 
 --- expect shape
 j.name: String
+
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows
 
 --- mutate
 query rename_scan() {

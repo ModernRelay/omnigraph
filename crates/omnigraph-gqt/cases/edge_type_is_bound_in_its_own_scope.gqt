@@ -44,7 +44,6 @@ query known_in_one_block_employed_in_another() {
 --- expect shape
 p.handle: String
 
-
 --- query
 query edge_kinds() {
     match { $p: Person, optional { $c: Company, $p $e:worksAt $c } }
@@ -59,7 +58,6 @@ query edge_kinds() {
 --- expect shape
 p.handle: String
 kind: String?
-
 
 --- mutate
 query drop_both() {

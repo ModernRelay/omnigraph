@@ -44,8 +44,6 @@ query standard_terms($q: String) {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query folded_terms($q: String) {
     match { $d: Doc }
@@ -61,8 +59,6 @@ query folded_terms($q: String) {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query english_terms($q: String) {
@@ -96,8 +92,6 @@ d.slug: String
 --- expect plan
 scan Doc as $d: access index_probe plain ngram
 
---- expect same as reference
-
 --- query
 query contains_sign_between_letters() {
     match { $d: Doc }
@@ -113,5 +107,3 @@ d.slug: String
 
 --- expect plan
 scan Doc as $d: access index_probe plain ngram
-
---- expect same as reference

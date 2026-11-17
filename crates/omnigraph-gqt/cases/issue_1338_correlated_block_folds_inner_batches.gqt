@@ -55,3 +55,5 @@ a.name: String
 
 --- expect plan
 anti join $a: correlated
+
+--- reference skipped: scale: the reference's nested loops over 16,384 neighbors of 1 KiB each outrun the case's budget; the case holds the engine's memory bound

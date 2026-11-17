@@ -56,7 +56,6 @@ d.slug: String
 --- expect plan
 pipeline 1: Scan -> Expand -> HashJoin(probe) -> Score -> Projection => Sort after 0
 
---- expect same as reference
 --- query
 query bm25_two_hops_from_the_source() {
     match {
@@ -76,7 +75,6 @@ d.slug: String
 --- expect plan
 pipeline 2: Scan -> Expand -> HashJoin(probe) -> Expand -> HashJoin(probe) -> Score -> Projection => Sort after 0, 1
 
---- expect same as reference
 --- query
 query bm25_on_a_traversal_source() {
     match {
@@ -94,7 +92,6 @@ d.slug: String
 --- expect plan
 pipeline 1: Scan -> Expand -> HashJoin(probe) -> Score -> Projection => Sort after 0
 
---- expect same as reference
 --- query
 query bm25_over_an_undirected_traversal() {
     match {
@@ -112,5 +109,3 @@ query bm25_over_an_undirected_traversal() {
 d.slug: String
 --- expect plan
 pipeline 1: Scan -> Expand -> HashJoin(probe) -> Score -> Projection => Sort after 0
-
---- expect same as reference

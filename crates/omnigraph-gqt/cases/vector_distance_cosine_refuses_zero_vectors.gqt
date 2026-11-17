@@ -160,5 +160,3 @@ query scored_dot($q: Vector(2)) {
 --- expect shape
 x.slug: String
 distance: F32
-
---- expect same as reference

@@ -38,5 +38,3 @@ p.name: String
 e.weight: I64
 --- expect plan
 sort tiebreak [$p, $d, $e]
---- expect same as reference
-

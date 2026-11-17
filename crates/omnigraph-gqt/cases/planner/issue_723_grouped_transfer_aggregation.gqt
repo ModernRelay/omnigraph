@@ -51,8 +51,6 @@ scan Account as $dst: columns [__id, accountId]
 pass projection_pushdown
 not pass aggregate_pushdown
 
---- expect same as reference
-
 --- query
 query top_two_senders() {
     match { $src: Account, $src $t:accountTransferAccount $dst }
@@ -68,7 +66,6 @@ src.accountId: String
 transfers: I64
 sent: F64?
 
---- expect same as reference
 --- query
 query filtered_transfers() {
     match { $src: Account, $src $t:accountTransferAccount $dst } where $t.amount > 10
@@ -83,8 +80,6 @@ sent: F64?
 --- expect plan
 not pass aggregate_pushdown
 
---- expect same as reference
-
 --- query
 query empty_frontier() {
     match { $src: Account, $src $t:accountTransferAccount $dst } where $src.accountId = "absent"
@@ -95,8 +90,6 @@ query empty_frontier() {
 src.accountId: String
 transfers: I64
 sent: F64?
-
---- expect same as reference
 
 --- query
 query empty_expansion() {
@@ -109,8 +102,6 @@ src.accountId: String
 transfers: I64
 sent: F64?
 
---- expect same as reference
-
 --- query
 query no_qualifying_edges() {
     match { $src: Account, $src $t:accountTransferAccount $dst } where $t.amount > 100
@@ -121,8 +112,6 @@ query no_qualifying_edges() {
 src.accountId: String
 transfers: I64
 sent: F64?
-
---- expect same as reference
 
 --- mutate
 query add_direction_boundaries() {
@@ -145,8 +134,6 @@ src.accountId: String
 transfers: I64
 sent: F64?
 
---- expect same as reference
-
 --- query
 query either_direction_once_per_edge() {
     match { $src: Account, $src $t:<accountTransferAccount> $dst }
@@ -159,8 +146,6 @@ query either_direction_once_per_edge() {
 edges: I64
 transfers: I64
 sent: F64?
-
---- expect same as reference
 
 --- query
 query repeated_source_rows() {
@@ -175,8 +160,6 @@ src.accountId: String
 transfers: I64
 sent: F64?
 
---- expect same as reference
-
 --- query
 query filtered_destination() {
     match { $src: Account, $src $t:accountTransferAccount $dst, $dst: Account }
@@ -189,8 +172,6 @@ query filtered_destination() {
 src.accountId: String
 transfers: I64
 sent: F64?
-
---- expect same as reference
 
 --- query
 query largest_individual_transfers() {
@@ -206,5 +187,3 @@ query largest_individual_transfers() {
 src.accountId: String
 dst.accountId: String
 t.amount: I64?
-
---- expect same as reference

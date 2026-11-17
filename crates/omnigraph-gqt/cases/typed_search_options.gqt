@@ -106,8 +106,6 @@ query largest_rrf_option($k: I64) {
 --- expect shape
 d.key: String
 
---- expect same as reference
-
 --- query
 query typed_rrf_option($k: U32) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
@@ -121,8 +119,6 @@ query typed_rrf_option($k: U32) {
 {"d.key":"a"}
 --- expect shape
 d.key: String
-
---- expect same as reference
 
 --- query
 query null_search_query($q: String?) {

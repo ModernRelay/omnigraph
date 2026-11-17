@@ -147,8 +147,6 @@ query rare_variant() {
 d.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query zero_edits() {
     match { let $pop = { match { $d: ZeroEdits } return { $d } }, from bm25($pop, $d.text, terms("beta", mode: any, max_edits: 0)) as $score }
@@ -165,8 +163,6 @@ query zero_edits() {
 d.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query zero_edits_multi_term() {
     match { let $pop = { match { $d: ZeroEditsMultiTerm } return { $d } }, from bm25($pop, $d.text, terms("gamma beta", mode: any, max_edits: 0)) as $score }
@@ -182,8 +178,6 @@ query zero_edits_multi_term() {
 --- expect shape
 d.slug: String
 score: F64
-
---- expect same as reference
 
 --- query
 query alternatives_do_not_add() {
@@ -203,8 +197,6 @@ query alternatives_do_not_add() {
 d.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query one_term_satisfies_two_groups() {
     match { let $pop = { match { $d: OneTermSatisfiesTwoGroups } return { $d } }, from bm25($pop, $d.text, terms("beta beto", mode: all, max_edits: 1)) as $score }
@@ -221,8 +213,6 @@ query one_term_satisfies_two_groups() {
 d.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query all_counts_each_family_before_query_filter() {
     match { let $pop = { match { $d: AllCountsEachFamilyBeforeQueryFilter } return { $d } }, from bm25($pop, $d.text, terms("beta gamma", mode: all, max_edits: 1)) as $score }
@@ -238,8 +228,6 @@ query all_counts_each_family_before_query_filter() {
 --- expect shape
 d.slug: String
 score: F64
-
---- expect same as reference
 
 --- query
 query any_uses_the_same_statistics() {
@@ -259,8 +247,6 @@ query any_uses_the_same_statistics() {
 d.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query null_and_token_empty_are_outside_corpus() {
     match { let $pop = { match { $d: NullAndTokenEmptyAreOutsideCorpus } return { $d } }, from bm25($pop, $d.text, terms("beta", mode: any, max_edits: 1)) as $score }
@@ -276,8 +262,6 @@ query null_and_token_empty_are_outside_corpus() {
 --- expect shape
 d.slug: String
 score: F64
-
---- expect same as reference
 
 --- query
 query two_edits_and_transposition() {
@@ -297,8 +281,6 @@ query two_edits_and_transposition() {
 d.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query unicode_scalar_edit() {
     match { let $pop = { match { $d: UnicodeScalarEdit } return { $d } }, from bm25($pop, $d.text, terms("cafe", mode: any, max_edits: 1)) as $score }
@@ -314,8 +296,6 @@ query unicode_scalar_edit() {
 d.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query empty_corpus() {
     match { let $pop = { match { $d: EmptyCorpus } return { $d } }, from bm25($pop, $d.text, terms("beta", mode: any, max_edits: 1)) as $score }
@@ -328,8 +308,6 @@ query empty_corpus() {
 --- expect shape
 d.slug: String
 score: F64
-
---- expect same as reference
 
 --- query
 query only_missing_and_token_empty() {
@@ -344,8 +322,6 @@ query only_missing_and_token_empty() {
 d.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query no_matching_family() {
     match { let $pop = { match { $d: NoMatchingFamily } return { $d } }, from bm25($pop, $d.text, terms("beta", mode: any, max_edits: 1)) as $score }
@@ -358,5 +334,3 @@ query no_matching_family() {
 --- expect shape
 d.slug: String
 score: F64
-
---- expect same as reference

@@ -68,8 +68,6 @@ query single_hop($q1: String, $q2: String) {
 c.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query filtered_population($q1: String, $q2: String) {
     match {
@@ -92,8 +90,6 @@ query filtered_population($q1: String, $q2: String) {
 --- expect shape
 c.slug: String
 score: F64
-
---- expect same as reference
 
 --- query
 query multi_hop($q1: String, $q2: String) {
@@ -119,8 +115,6 @@ query multi_hop($q1: String, $q2: String) {
 c.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query multi_hop_min_two($q1: String, $q2: String) {
     match {
@@ -144,8 +138,6 @@ query multi_hop_min_two($q1: String, $q2: String) {
 c.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query destination_filtered($q1: String, $q2: String) {
     match {
@@ -167,8 +159,6 @@ query destination_filtered($q1: String, $q2: String) {
 --- expect shape
 c.slug: String
 score: F64
-
---- expect same as reference
 
 --- query
 query direction_both($q1: String, $q2: String) {
@@ -195,8 +185,6 @@ query direction_both($q1: String, $q2: String) {
 c.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query direction_in($q1: String, $q2: String) {
     match {
@@ -221,8 +209,6 @@ query direction_in($q1: String, $q2: String) {
 c.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query several_expands($q1: String, $q2: String) {
     match {
@@ -244,8 +230,6 @@ query several_expands($q1: String, $q2: String) {
 --- expect shape
 c.slug: String
 score: F64
-
---- expect same as reference
 
 --- query
 query block_only($q1: String, $q2: String) {
@@ -271,8 +255,6 @@ query block_only($q1: String, $q2: String) {
 c.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query ranked_destination($q1: String, $q2: String) {
     match {
@@ -296,8 +278,6 @@ query ranked_destination($q1: String, $q2: String) {
 --- expect shape
 c.slug: String
 score: F64
-
---- expect same as reference
 
 --- query
 query no_traversal($q1: String, $q2: String) {
@@ -323,5 +303,3 @@ query no_traversal($q1: String, $q2: String) {
 --- expect shape
 c.slug: String
 score: F64
-
---- expect same as reference

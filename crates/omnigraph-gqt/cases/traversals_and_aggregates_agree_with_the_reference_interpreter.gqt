@@ -64,8 +64,6 @@ query q() {
 p.handle: String
 q.handle: String
 
---- expect same as reference
-
 --- query
 query q() {
     match { $p: Person, $p $k:knows $q }
@@ -85,8 +83,6 @@ p.handle: String
 q.handle: String
 k.weight: I64?
 
---- expect same as reference
-
 --- query
 query q() {
     match { $k: Knows }
@@ -105,8 +101,6 @@ query q() {
 k.@src: String
 k.@dst: String
 k.weight: I64?
-
---- expect same as reference
 
 --- query
 query q() {
@@ -129,8 +123,6 @@ query q() {
 p.handle: String
 q.handle: String
 
---- expect same as reference
-
 --- query
 query q() {
     match { $p: Person, $p knows{2,2} $q }
@@ -146,8 +138,6 @@ query q() {
 --- expect shape
 p.handle: String
 q.handle: String
-
---- expect same as reference
 
 --- query
 query q() {
@@ -170,8 +160,6 @@ query q() {
 p.handle: String
 q.handle: String
 
---- expect same as reference
-
 --- query
 query q() {
     match { $p: Person, $q: Person, $p knows $q, $q knows $p }
@@ -184,8 +172,6 @@ query q() {
 --- expect shape
 p.handle: String
 q.handle: String
-
---- expect same as reference
 
 --- query
 query q() {
@@ -204,8 +190,6 @@ query q() {
 p.handle: String
 q.handle: String
 
---- expect same as reference
-
 --- query
 query q() {
     match { $p: Person }
@@ -218,8 +202,6 @@ query q() {
 
 --- expect shape
 p.handle: String
-
---- expect same as reference
 
 --- query
 query q() {
@@ -241,8 +223,6 @@ youngest: I32?
 last: String
 ages: I64
 
---- expect same as reference
-
 --- query
 query q() {
     match { $p: Person } where $p.age > 99
@@ -257,8 +237,6 @@ n: I64
 total: F64?
 youngest: I32?
 
---- expect same as reference
-
 --- query
 query q() {
     match { $c: Company }
@@ -272,8 +250,6 @@ query q() {
 
 --- expect shape
 c.slug: String
-
---- expect same as reference
 
 --- query
 query q() {
@@ -291,8 +267,6 @@ query q() {
 c.slug: String
 p.city: String?
 
---- expect same as reference
-
 --- query
 query q() {
     match { $p: Person, $c: Company, $p worksAt $c }
@@ -309,8 +283,6 @@ query q() {
 c.slug: String
 staff: I64
 
---- expect same as reference
-
 --- query
 query q() {
     match { $p: Person, $p $k:knows $q } where $k.weight * 2 + $p.quota > 4
@@ -326,8 +298,6 @@ q.handle: String
 less: I64
 odd: I64
 
---- expect same as reference
-
 --- query
 query q() {
     match { $p: Person } where $p.handle in ["ada", "cy", "zed"] or starts_with($p.handle, "e") or contains($p.city, "ari")
@@ -341,5 +311,3 @@ query q() {
 
 --- expect shape
 p.handle: String
-
---- expect same as reference

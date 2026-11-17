@@ -51,7 +51,6 @@ query over_an_optional($q: Vector(4)) {
 d.slug: String
 t.name: String?
 distance: F32
---- expect same as reference
 
 --- query
 query over_a_union($q: Vector(4)) {
@@ -72,4 +71,3 @@ query over_a_union($q: Vector(4)) {
 --- expect shape
 d.slug: String
 distance: F32
---- expect same as reference

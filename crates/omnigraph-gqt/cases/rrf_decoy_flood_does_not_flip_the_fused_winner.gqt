@@ -61,8 +61,6 @@ c.slug: String
 expand $c $a: selection named [ChunkOfArtifact out]
 fuse $c: arms [bm25, bm25]
 
---- expect same as reference
-
 --- query
 query recall_alternation($q1: String, $q2: String) {
     match {
@@ -92,8 +90,6 @@ expand $c $a: selection alternation [ChunkOfArtifact out]
 fuse $c: arms [bm25, bm25]
 expand $c $a: mode indexed_scan ran indexed_scan
 
---- expect same as reference
-
 --- query
 query recall_wildcard($q1: String, $q2: String) {
     match {
@@ -122,5 +118,3 @@ c.slug: String
 expand $c $a: selection wildcard [ChunkOfArtifact out]
 fuse $c: arms [bm25, bm25]
 expand $c $a: mode indexed_scan ran indexed_scan
---- expect same as reference
-

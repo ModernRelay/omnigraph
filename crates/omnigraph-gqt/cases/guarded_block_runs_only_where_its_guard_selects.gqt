@@ -46,7 +46,6 @@ query or_guards_a_block_whose_where_can_fail() {
 {"p.handle":"bob"}
 --- expect shape
 p.handle: String
---- expect same as reference
 
 --- query
 query if_guards_an_aggregate_argument() {
@@ -61,7 +60,6 @@ query if_guards_an_aggregate_argument() {
 --- expect shape
 p.handle: String
 s: F64
---- expect same as reference
 
 --- query
 query coalesce_guards_a_later_argument() {
@@ -76,7 +74,6 @@ query coalesce_guards_a_later_argument() {
 --- expect shape
 p.handle: String
 n: I64
---- expect same as reference
 
 --- query
 query and_guards_a_let_inside_the_block() {
@@ -90,7 +87,6 @@ query and_guards_a_let_inside_the_block() {
 {"p.handle":"bob"}
 --- expect shape
 p.handle: String
---- expect same as reference
 
 --- query
 query a_guard_holding_a_block_binds_nothing_in_the_guarded_one() {
@@ -103,4 +99,3 @@ query a_guard_holding_a_block_binds_nothing_in_the_guarded_one() {
 {"p.handle":"bob"}
 --- expect shape
 p.handle: String
---- expect same as reference

@@ -44,8 +44,6 @@ cast $x.n: I64 -> F64
 no cast 9007199254740992.0
 type $x.n: I64
 
---- expect same as reference
-
 --- query
 query integer_edge_literal() {
     match { $x: Number, $x $e:link $y } where $e.n > 9007199254740992.0
@@ -58,8 +56,6 @@ x.key: String
 cast $e.n: I64 -> F64
 no cast 9007199254740992.0
 type $e.n: I64
-
---- expect same as reference
 
 --- query
 query integer_projection_literal() {
@@ -76,8 +72,6 @@ above: Bool
 cast $x.n: I64 -> F64
 no cast 9007199254740992.0
 
---- expect same as reference
-
 --- query
 query f32_node_nonrepresentable_literal() {
     match { $x: Number } where $x.f = 0.1
@@ -89,8 +83,6 @@ x.key: String
 --- expect plan
 cast $x.f: F32 -> F64
 type 0.1: F64
-
---- expect same as reference
 
 --- query
 query f32_edge_nonrepresentable_literal() {
@@ -104,8 +96,6 @@ x.key: String
 cast $e.f: F32 -> F64
 type 0.1: F64
 
---- expect same as reference
-
 --- query
 query f32_exact_literal() {
     match { $x: Number } where $x.f = 0.10000000149011612
@@ -118,8 +108,6 @@ x.key: String
 --- expect plan
 cast 0.10000000149011612: F64 -> F32
 no cast $x.f
-
---- expect same as reference
 
 --- query
 query declared_f64_parameter($bound: F64) {
@@ -135,8 +123,6 @@ x.key: String
 cast $x.f: F32 -> F64
 type $bound: F64
 
---- expect same as reference
-
 --- query
 query declared_f64_parameter($bound: F64) {
     match { $x: Number } where $x.f = $bound
@@ -151,8 +137,6 @@ x.key: String
 --- expect plan
 cast $x.f: F32 -> F64
 type $bound: F64
-
---- expect same as reference
 
 --- query
 query declared_f32_parameter($bound: F32) {
@@ -170,8 +154,6 @@ no cast $x.f
 no cast $bound
 type $bound: F32
 
---- expect same as reference
-
 --- query
 query integer_fractional_literal() {
     match { $x: Number } where $x.small > 2.5
@@ -184,8 +166,6 @@ x.key: String
 --- expect plan
 cast $x.small: I32 -> F64
 type 2.5: F64
-
---- expect same as reference
 
 --- query
 query unsigned_negative_parameter($bound: I64) {
@@ -203,8 +183,6 @@ x.key: String
 cast $x.u: U64 -> exact_integer
 cast $bound: I64 -> exact_integer
 
---- expect same as reference
-
 --- query
 query signed_list_float_literal() {
     match { $x: Number }
@@ -219,8 +197,6 @@ member: Bool
 --- expect plan
 cast $x.ns: [I64] -> [F64]
 no cast 9007199254740992.0
-
---- expect same as reference
 
 --- query
 query literal_list_of_whole_floats() {
@@ -238,8 +214,6 @@ cast $x.n: I64 -> F64
 type [9007199254740992.0]: [F64]
 no cast [9007199254740992.0]
 
---- expect same as reference
-
 --- query
 query literal_list_one_common_domain() {
     match { $x: Number }
@@ -254,8 +228,6 @@ member: Bool
 --- expect plan
 cast $x.n: I64 -> F64
 type [9007199254740992.0, 1.5]: [F64]
-
---- expect same as reference
 
 --- query
 query unsigned_list_negative_needle($needle: I64) {
@@ -274,8 +246,6 @@ member: Bool
 cast $x.us: [U64] -> [exact_integer]
 cast $needle: I64 -> exact_integer
 
---- expect same as reference
-
 --- query
 query f32_list_nonrepresentable_needle() {
     match { $x: Number } where 0.1 in $x.fs
@@ -287,8 +257,6 @@ x.key: String
 --- expect plan
 cast $x.fs: [F32] -> [F64]
 type 0.1: F64
-
---- expect same as reference
 
 --- query
 query parameter_rounding_before_widening($small: F32, $wide: F64) {
@@ -303,5 +271,3 @@ query parameter_rounding_before_widening($small: F32, $wide: F64) {
 --- expect shape
 x.key: String
 rounded: Bool
-
---- expect same as reference

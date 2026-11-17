@@ -45,8 +45,6 @@ query the_lowered_shape() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query window_smaller_than_the_limit() {
     match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 2) as $distance }
@@ -62,8 +60,6 @@ query window_smaller_than_the_limit() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query window_without_a_limit() {
     match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 2) as $distance }
@@ -76,8 +72,6 @@ query window_without_a_limit() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query distance_descending() {
@@ -94,8 +88,6 @@ query distance_descending() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query score_after_another_key() {
     match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 2) as $distance }
@@ -110,8 +102,6 @@ query score_after_another_key() {
 --- expect shape
 d.slug: String
 distance: F32
-
---- expect same as reference
 
 --- query
 query a_where_after_the_window_is_not_refilled() {
@@ -129,8 +119,6 @@ d.slug: String
 --- expect plan
 pipeline 0: Scan => Sort
 pipeline 1: Sort -> TargetCut -> Filter -> Projection => consumer after 0
-
---- expect same as reference
 
 --- query
 query a_traversal_after_the_window() {
@@ -152,8 +140,6 @@ d.slug: String
 e.slug: String
 distance: F32
 
---- expect same as reference
-
 --- query
 query a_window_keeps_every_row_of_a_target() {
     match {
@@ -172,8 +158,6 @@ query a_window_keeps_every_row_of_a_target() {
 d.slug: String
 e.slug: String
 
---- expect same as reference
-
 --- query
 query the_ladder_fills_a_window_its_population_thins() {
     match {
@@ -191,8 +175,6 @@ query the_ladder_fills_a_window_its_population_thins() {
 d.slug: String
 distance: F32
 
---- expect same as reference
-
 --- query
 query bm25_score_after_another_key() {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, "needle") as $score }
@@ -207,8 +189,6 @@ query bm25_score_after_another_key() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query bm25_limit_without_an_order() {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, "needle") as $score }
@@ -222,8 +202,6 @@ query bm25_limit_without_an_order() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query bm25_where_on_the_score() {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, "needle") as $score }
@@ -236,8 +214,6 @@ query bm25_where_on_the_score() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query rrf_arm_window_other_than_the_limit() {
@@ -256,8 +232,6 @@ query rrf_arm_window_other_than_the_limit() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query rrf_ordered_by_another_key() {
@@ -278,8 +252,6 @@ query rrf_ordered_by_another_key() {
 d.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query aggregate_over_the_score() {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, "needle") as $score }
@@ -291,8 +263,6 @@ query aggregate_over_the_score() {
 
 --- expect shape
 best: F64?
-
---- expect same as reference
 
 --- query
 query aggregate_over_a_window() {
@@ -307,8 +277,6 @@ query aggregate_over_a_window() {
 n: I64
 farthest: F32?
 nearest: F32?
-
---- expect same as reference
 
 --- query
 query aggregate_over_a_fusion() {
@@ -325,5 +293,3 @@ query aggregate_over_a_fusion() {
 --- expect shape
 n: I64
 best: F64?
---- expect same as reference
-

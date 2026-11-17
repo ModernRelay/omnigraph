@@ -399,7 +399,7 @@ const INTENDED: &[(&str, &str)] = &[
 }"#,
     ),
     (
-        "typed_search_options.gqt step 43",
+        "typed_search_options.gqt step 41",
         r#"query positional_window($q: Vector(2)) {
     match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
     return { $d.key }

@@ -71,8 +71,6 @@ weight: I64?
 expand $from $to: selection alternation [Knows out, Likes out]
 expand $from $to: mode indexed_scan ran indexed_scan
 
---- expect same as reference
-
 --- query
 query distinct_neighbors() {
     match { $from: Person, $from (knows | likes) $to }
@@ -88,8 +86,6 @@ query distinct_neighbors() {
 --- expect shape
 destination: String
 
---- expect same as reference
-
 --- query
 query exactly_two_hops() {
     match { $from: Person, $from (knows | likes){2,2} $to }
@@ -103,8 +99,6 @@ query exactly_two_hops() {
 --- expect shape
 destination: String
 
---- expect same as reference
-
 --- query
 query exactly_three_hops() {
     match { $from: Person, $from (knows | likes){3,3} $to }
@@ -117,8 +111,6 @@ query exactly_three_hops() {
 
 --- expect shape
 destination: String
-
---- expect same as reference
 
 --- query
 query bounded_reachable_people() {
@@ -135,8 +127,6 @@ query bounded_reachable_people() {
 
 --- expect shape
 destination: String
-
---- expect same as reference
 
 --- query
 query wildcard_concrete_edges() {
@@ -157,5 +147,3 @@ destination: String
 edge_type: String
 edge_id: String
 weight: I64?
-
---- expect same as reference

@@ -45,6 +45,8 @@ s.kind: String
 s.default: String
 s.scope: String
 
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows
+
 --- query
 query engine_formats() {
     match { $e: @Engine }
@@ -57,6 +59,8 @@ query engine_formats() {
 --- expect shape
 e.current_internal_schema_version: I64
 e.min_supported_internal_schema_version: I64
+
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows
 
 --- query
 query operator_count() {
@@ -72,6 +76,8 @@ n: I64
 
 --- expect plan
 not pass aggregate_pushdown
+
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows
 
 --- query
 query first_operator_inputs() {
@@ -89,6 +95,8 @@ o.inputs: [I64]
 
 --- expect plan
 not pass late_materialization
+
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows
 
 --- query
 query process_settings() {
@@ -109,6 +117,8 @@ s.name: String
 not pass predicate_pushdown
 filter reads [s.scope]
 
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows
+
 --- query
 query distinct_identities() {
     match { $o: @Operator }
@@ -121,3 +131,5 @@ query distinct_identities() {
 --- expect shape
 ids: I64
 rows: I64
+
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows

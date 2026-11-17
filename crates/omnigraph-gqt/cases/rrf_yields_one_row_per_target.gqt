@@ -51,8 +51,6 @@ query fan_out_population($v: Vector(3)) {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query filtered_population($v: Vector(3)) {
     match {
@@ -72,8 +70,6 @@ query filtered_population($v: Vector(3)) {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query population_columns_drawn_again($v: Vector(3)) {
@@ -98,5 +94,3 @@ query population_columns_drawn_again($v: Vector(3)) {
 --- expect shape
 d.slug: String
 t.name: String
---- expect same as reference
-

@@ -50,8 +50,6 @@ query not_searched() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query searched_or_old() {
     match { $d: Doc }
@@ -67,8 +65,6 @@ query searched_or_old() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query searched_compared_with_false() {
     match { $d: Doc }
@@ -82,8 +78,6 @@ query searched_compared_with_false() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query not_matched_text() {
@@ -100,8 +94,6 @@ query not_matched_text() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query fuzzed() {
     match { $d: Doc }
@@ -115,8 +107,6 @@ query fuzzed() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query not_fuzzed() {
@@ -132,8 +122,6 @@ query not_fuzzed() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query not_coalesced() {
     match { $d: Doc }
@@ -147,8 +135,6 @@ query not_coalesced() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query searched_or_another_binding() {
@@ -165,8 +151,6 @@ query searched_or_another_binding() {
 p.name: String
 d.slug: String
 
---- expect same as reference
-
 --- query
 query wrote_nothing_else() {
     match { $p: Person }
@@ -180,8 +164,6 @@ query wrote_nothing_else() {
 
 --- expect shape
 p.name: String
-
---- expect same as reference
 
 --- mutate
 query twins() {
@@ -208,8 +190,6 @@ query not_searched_after_insert() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query searched_or_old_after_insert() {
     match { $d: Doc }
@@ -227,8 +207,6 @@ query searched_or_old_after_insert() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query not_matched_text_after_insert() {
     match { $d: Doc }
@@ -245,8 +223,6 @@ query not_matched_text_after_insert() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- mutate
 query backdate_unsearched() {
@@ -269,5 +245,3 @@ query backdated() {
 
 --- expect shape
 d.slug: String
---- expect same as reference
-

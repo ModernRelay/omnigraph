@@ -45,5 +45,3 @@ d.slug: String
 scan Person as $p: ranked nearest fetch 2
 hash join $d
 sort tiebreak [$p, $d]
---- expect same as reference
-

@@ -57,8 +57,6 @@ query q() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query q() {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, terms("search engines", mode: all)) as $score }
@@ -74,8 +72,6 @@ query q() {
 d.slug: String
 score: F64
 
---- expect same as reference
-
 --- query
 query q() {
     match { $d: Doc } where match_terms($d.text, terms("grapj engine", mode: all, max_edits: 1))
@@ -87,8 +83,6 @@ query q() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query q() {
@@ -104,8 +98,6 @@ query q() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query q() {
     match { $d: Doc } where not match_terms($d.text, terms("graph vectors", mode: any))
@@ -119,8 +111,6 @@ query q() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query q() {
@@ -137,8 +127,6 @@ query q() {
 --- expect shape
 d.slug: String
 distance: F32
-
---- expect same as reference
 
 --- query
 query q($k: I64) {
@@ -158,8 +146,6 @@ query q($k: I64) {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query q() {
     match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, [0.5, 0.5]) as $dist }
@@ -178,8 +164,6 @@ query q() {
 d.slug: String
 dist: F32
 
---- expect same as reference
-
 --- query
 query q() {
     match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 4) as $distance }
@@ -193,8 +177,6 @@ query q() {
 n: I64
 best: F32
 worst: F32
-
---- expect same as reference
 
 --- query
 query q() {
@@ -216,8 +198,6 @@ query q() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query q() {
     match {
@@ -235,8 +215,6 @@ query q() {
 --- expect shape
 d.slug: String
 distance: F32
-
---- expect same as reference
 
 --- query
 query q() {
@@ -259,5 +237,3 @@ query q() {
 --- expect shape
 p.handle: String
 d.slug: String
-
---- expect same as reference

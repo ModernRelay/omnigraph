@@ -41,5 +41,3 @@ query top($s: String, $k: I64) {
 
 --- expect shape
 d.slug: String
---- expect same as reference
-

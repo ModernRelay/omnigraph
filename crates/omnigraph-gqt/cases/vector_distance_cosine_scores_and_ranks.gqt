@@ -61,8 +61,6 @@ query scored_indexed($q: Vector(4)) {
 x.slug: String
 distance: F32
 
---- expect same as reference
-
 --- query
 query nearest_indexed($q: Vector(4)) {
     match {
@@ -87,8 +85,6 @@ query nearest_indexed($q: Vector(4)) {
 x.slug: String
 distance: F32
 
---- expect same as reference
-
 --- query
 query nearest_indexed_window($q: Vector(4)) {
     match {
@@ -109,8 +105,6 @@ query nearest_indexed_window($q: Vector(4)) {
 --- expect shape
 x.slug: String
 distance: F32
-
---- expect same as reference
 
 --- query
 query scored_unindexed($q: Vector(4)) {
@@ -136,8 +130,6 @@ query scored_unindexed($q: Vector(4)) {
 x.slug: String
 distance: F32
 
---- expect same as reference
-
 --- query
 query nearest_unindexed($q: Vector(4)) {
     match {
@@ -162,8 +154,6 @@ query nearest_unindexed($q: Vector(4)) {
 x.slug: String
 distance: F32
 
---- expect same as reference
-
 --- query
 query nearest_unindexed_window($q: Vector(4)) {
     match {
@@ -184,8 +174,6 @@ query nearest_unindexed_window($q: Vector(4)) {
 --- expect shape
 x.slug: String
 distance: F32
-
---- expect same as reference
 
 --- mutate
 query add($s: String, $e: Vector(4)) { insert Doc { slug: $s, embedding: $e } }
@@ -229,8 +217,6 @@ query scored_partially_indexed($q: Vector(4)) {
 x.slug: String
 distance: F32
 
---- expect same as reference
-
 --- query
 query nearest_partially_indexed($q: Vector(4)) {
     match {
@@ -257,8 +243,6 @@ query nearest_partially_indexed($q: Vector(4)) {
 x.slug: String
 distance: F32
 
---- expect same as reference
-
 --- query
 query nearest_partially_indexed_window($q: Vector(4)) {
     match {
@@ -280,5 +264,3 @@ query nearest_partially_indexed_window($q: Vector(4)) {
 --- expect shape
 x.slug: String
 distance: F32
-
---- expect same as reference

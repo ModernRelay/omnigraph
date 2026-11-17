@@ -46,8 +46,6 @@ query later_binder_guards() {
 --- expect shape
 a.handle: String
 
---- expect same as reference
-
 --- query
 query block_under_or() {
     match { $p: Person }
@@ -62,8 +60,6 @@ query block_under_or() {
 --- expect shape
 p.handle: String
 
---- expect same as reference
-
 --- query
 query block_under_if() {
     match { $p: Person }
@@ -77,8 +73,6 @@ query block_under_if() {
 
 --- expect shape
 p.handle: String
-
---- expect same as reference
 
 --- query
 query failing_optional_runs_before_where() {
@@ -104,5 +98,3 @@ p.handle: String
 
 --- expect plan
 anti join $p: correlated
-
---- expect same as reference

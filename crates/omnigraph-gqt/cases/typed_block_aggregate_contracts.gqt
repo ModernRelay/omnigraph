@@ -63,8 +63,6 @@ block aggregate sum($c.signed): sum(I64?) exact_integer round_to_nearest -> F64?
 type sum($c.signed): F64?
 cast 1: I64 -> F64
 
---- expect same as reference
-
 --- query
 query single_sum_rounds_before_comparison() {
     match { $g: Group }
@@ -78,8 +76,6 @@ group_name: String
 block aggregate sum($c.signed): sum(I64?) exact_integer round_to_nearest -> F64?
 cast 9007199254740992: I64 -> F64
 no cast sum($c.signed)
-
---- expect same as reference
 
 --- query
 query overflow_order_a_rounds_final_total() {
@@ -95,8 +91,6 @@ group_name: String
 block aggregate sum($c.signed): sum(I64?) exact_integer round_to_nearest -> F64?
 cast 9223372036854775806: I64 -> F64
 
---- expect same as reference
-
 --- query
 query overflow_order_b_rounds_final_total() {
     match { $g: Group }
@@ -110,8 +104,6 @@ group_name: String
 --- expect plan
 block aggregate sum($c.signed): sum(I64?) exact_integer round_to_nearest -> F64?
 cast 9223372036854775806: I64 -> F64
-
---- expect same as reference
 
 --- query
 query unsigned_sum_rounds_once() {
@@ -127,8 +119,6 @@ group_name: String
 --- expect plan
 block aggregate sum($c.unsigned): sum(U64?) exact_integer round_to_nearest -> F64?
 cast 9223372036854775807: I64 -> F64
-
---- expect same as reference
 
 --- query
 query unsigned_min_retains_exact_value($bound: I64) {
@@ -147,8 +137,6 @@ block aggregate min($c.unsigned): min(U64?) extremum error -> U64?
 cast min($c.unsigned): U64? -> exact_integer?
 cast $bound: I64 -> exact_integer
 
---- expect same as reference
-
 --- query
 query unsigned_max_retains_exact_value($bound: I64) {
     match { $g: Group }
@@ -166,8 +154,6 @@ block aggregate max($c.unsigned): max(U64?) extremum error -> U64?
 cast max($c.unsigned): U64? -> exact_integer?
 cast $bound: I64 -> exact_integer
 
---- expect same as reference
-
 --- query
 query integer_max_widens_for_a_float_literal() {
     match { $g: Group }
@@ -181,8 +167,6 @@ group_name: String
 block aggregate max($c.signed): max(I64?) extremum error -> I64?
 cast max($c.signed): I64? -> F64?
 no cast 9007199254740992.0
-
---- expect same as reference
 
 --- query
 query integer_max_widens_for_declared_float($bound: F64) {
@@ -201,8 +185,6 @@ cast max($c.signed): I64? -> F64?
 type $bound: F64
 no cast $bound
 
---- expect same as reference
-
 --- query
 query integer_avg_divides_an_exact_total() {
     match { $g: Group }
@@ -218,8 +200,6 @@ block aggregate avg($c.signed): avg(I64?) exact_integer round_to_nearest -> F64?
 type avg($c.signed): F64?
 no cast 0.5
 
---- expect same as reference
-
 --- query
 query empty_sum_stays_null() {
     match { $g: Group }
@@ -232,8 +212,6 @@ group_name: String
 --- expect plan
 block aggregate sum($c.signed): sum(I64?) exact_integer round_to_nearest -> F64?
 type sum($c.signed): F64?
-
---- expect same as reference
 
 --- query
 query integer_max_keeps_declared_float_domain_for_second_value($bound: F64) {
@@ -251,8 +229,6 @@ group_name: String
 cast max($c.signed): I64? -> F64?
 type $bound: F64
 no cast $bound
-
---- expect same as reference
 
 --- query
 query row_count_f64_bound_0($bound: F64) {
@@ -275,8 +251,6 @@ cast count: I64 -> F64
 type $bound: F64
 no cast $bound
 
---- expect same as reference
-
 --- query
 query row_count_f64_bound_1($bound: F64) {
     match { $g: Group }
@@ -296,8 +270,6 @@ type count: I64
 cast count: I64 -> F64
 type $bound: F64
 no cast $bound
-
---- expect same as reference
 
 --- query
 query row_count_u64_bound_0($bound: U64) {
@@ -320,8 +292,6 @@ cast count: I64 -> exact_integer
 type $bound: U64
 cast $bound: U64 -> exact_integer
 
---- expect same as reference
-
 --- query
 query row_count_u64_bound_1($bound: U64) {
     match { $g: Group }
@@ -342,8 +312,6 @@ cast count: I64 -> exact_integer
 type $bound: U64
 cast $bound: U64 -> exact_integer
 
---- expect same as reference
-
 --- query
 query null_unsigned_row_count_bound_satisfies_nothing($bound: U64?) {
     match { $g: Group }
@@ -359,8 +327,6 @@ group_name: String
 type count: I64
 cast count: I64 -> exact_integer
 cast $bound: U64? -> exact_integer?
-
---- expect same as reference
 
 --- query
 query filtered_row_count_uses_the_same_float_comparison($bound: F64) {
@@ -379,5 +345,3 @@ group_name: String
 type count: I64
 cast count: I64 -> F64
 no cast $bound
-
---- expect same as reference

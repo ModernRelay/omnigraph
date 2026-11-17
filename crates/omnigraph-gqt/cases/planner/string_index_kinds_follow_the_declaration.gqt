@@ -64,8 +64,6 @@ n.text: String
 --- expect plan
 scan KeyOnly as $n: access sequential
 
---- expect same as reference
-
 --- query
 query plain_contains() {
     match { $n: Plain }
@@ -82,8 +80,6 @@ n.text: String
 
 --- expect plan
 scan Plain as $n: access index_probe text ngram
-
---- expect same as reference
 
 --- query
 query key_indexed_contains() {
@@ -102,8 +98,6 @@ n.text: String
 --- expect plan
 scan KeyIndexed as $n: access index_probe text ngram
 
---- expect same as reference
-
 --- query
 query full_text_contains() {
     match { $n: FullText }
@@ -121,8 +115,6 @@ n.text: String
 --- expect plan
 scan FullText as $n: access index_probe text ngram
 
---- expect same as reference
-
 --- query
 query key_only_range() {
     match { $n: KeyOnly }
@@ -139,8 +131,6 @@ n.text: String
 
 --- expect plan
 scan KeyOnly as $n: access index_probe text btree
-
---- expect same as reference
 
 --- query
 query key_only_matches() {

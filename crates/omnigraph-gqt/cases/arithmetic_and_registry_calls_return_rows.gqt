@@ -81,7 +81,6 @@ total: F64
 negated: F64
 n: I64
 
-
 --- query
 query aggregate_under_a_call_over_no_rows() {
     match { $p: Person } where $p.handle = "zz"
@@ -93,4 +92,3 @@ query aggregate_under_a_call_over_no_rows() {
 
 --- expect shape
 top: I32
-

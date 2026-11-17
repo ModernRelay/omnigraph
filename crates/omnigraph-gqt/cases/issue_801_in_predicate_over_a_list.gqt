@@ -54,8 +54,6 @@ m.number: String
 --- expect plan
 scan Matter as $m: filter reads [m.number]
 
---- expect same as reference
-
 --- query
 query literal_list() {
     match { $m: Matter }
@@ -92,8 +90,6 @@ p.pid: String
 
 --- expect plan
 scan Matter as $m: filter reads [m.number]
-
---- expect same as reference
 
 --- query
 query edge_a_reserved_word_names($ms: [String]) {

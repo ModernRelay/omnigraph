@@ -4137,6 +4137,8 @@ query any_reached() {
 --- expect shape
 f.role: String
 
+--- reference skipped: scale: the reference's nested loops over the multi-hop expansion take most of the case's 30 s budget; the case holds the engine's answer within it
+
 --- query
 query pair_count() {
     match { $p: Person, $p knows{1,2} $f }
@@ -4147,3 +4149,5 @@ query pair_count() {
 {"n":1050624}
 --- expect shape
 n: I64
+
+--- reference skipped: scale: the reference's nested loops over the multi-hop expansion take most of the case's 30 s budget; the case holds the engine's answer within it

@@ -91,9 +91,6 @@ query smallest_k() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
-
 --- query
 query largest_k() {
     match {
@@ -110,9 +107,6 @@ query largest_k() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
-
 
 --- query
 query weights_of_another_length() {
@@ -167,9 +161,6 @@ query largest_weight() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
-
 --- query
 query sixteen_arms() {
     match {
@@ -187,9 +178,6 @@ query sixteen_arms() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
-
 
 --- query
 query seventeen_arms() {

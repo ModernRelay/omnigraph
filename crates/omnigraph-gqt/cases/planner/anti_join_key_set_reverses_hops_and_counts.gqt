@@ -53,8 +53,6 @@ p.name: String
 --- expect plan
 anti join $p: key_set
 
---- expect same as reference
-
 --- query
 query not_within_two_of_e() {
     match { $p: Person }
@@ -76,8 +74,6 @@ p.name: String
 
 --- expect plan
 anti join $p: key_set
-
---- expect same as reference
 
 --- query
 query not_known_by_c() {
@@ -101,8 +97,6 @@ p.name: String
 
 --- expect plan
 anti join $p: key_set
-
---- expect same as reference
 
 --- query
 query one_neighbour_e() {

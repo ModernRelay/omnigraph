@@ -48,8 +48,6 @@ query zero_edits() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query one_edit() {
     match { $d: Doc }
@@ -64,8 +62,6 @@ query one_edit() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query two_edits() {
@@ -82,8 +78,6 @@ query two_edits() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query budget_from_a_parameter($q: String, $n: I64) {
@@ -103,8 +97,6 @@ query budget_from_a_parameter($q: String, $n: I64) {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query transposition_is_two_edits_one() {
     match { $d: Doc }
@@ -117,8 +109,6 @@ query transposition_is_two_edits_one() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query transposition_is_two_edits_two() {
@@ -134,8 +124,6 @@ query transposition_is_two_edits_two() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query unicode_scalar_zero() {
     match { $d: Doc }
@@ -147,8 +135,6 @@ query unicode_scalar_zero() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query unicode_scalar_one() {
@@ -163,8 +149,6 @@ query unicode_scalar_one() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query every_term_repeated_and_reordered() {
     match { $d: Doc }
@@ -178,8 +162,6 @@ query every_term_repeated_and_reordered() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query any_term() {
@@ -197,8 +179,6 @@ query any_term() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query null_and_token_empty_never_match() {
     match { $d: Doc }
@@ -213,8 +193,6 @@ query null_and_token_empty_never_match() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query fuzzy_means_two_edits() {
@@ -232,8 +210,6 @@ query fuzzy_means_two_edits() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query fuzzy_with_its_budget() {
     match { $d: Doc }
@@ -249,8 +225,6 @@ query fuzzy_with_its_budget() {
 --- expect shape
 d.slug: String
 
---- expect same as reference
-
 --- query
 query search_means_any_term() {
     match { $d: Doc }
@@ -265,8 +239,6 @@ query search_means_any_term() {
 
 --- expect shape
 d.slug: String
-
---- expect same as reference
 
 --- query
 query budget_out_of_range() {
