@@ -3,7 +3,9 @@
 # notes: A Doc row of 18 x 2 MiB (36 MiB), written under write_max_bytes = 40 MiB, merged on each route. b1 merges into a
 # notes: main that wrote only an Other row, so Doc adopts b1's proven inserts; b2 merges once main's Doc holds b1's row,
 # notes: so Doc merges three ways from a staged delta. Validation keeps neither row's wide values, so neither route
-# notes: bounds a validation batch: each merge publishes its row under the write_max_bytes it runs with.
+# notes: bounds a validation batch: each merge publishes its row under the write_max_bytes it runs with. b3 then
+# notes: merges a third such row by pointer under the default write_max_bytes: a pointer adoption writes no row, so
+# notes: no bound but the key budget applies to it.
 
 --- runner
 timeout_ms: 10000
@@ -82,9 +84,30 @@ set write_max_bytes = 41943040;
 branch merge b2 into main
 --- expect outcome: merged
 
+--- mutate
+branch create b3
+--- expect ok
+
+--- mutate
+query on_main_again() { insert Other { slug: "other_again" } }
+--- expect affected: nodes=1 edges=0
+
+--- foreach $v cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+--- mutate branch: b3
+set write_max_bytes = 41943040;
+query insert_wide($s: String, $p: String) { insert Doc { slug: $s, p0: $p, p1: $p, p2: $p, p3: $p, p4: $p, p5: $p, p6: $p, p7: $p, p8: $p, p9: $p, p10: $p, p11: $p, p12: $p, p13: $p, p14: $p, p15: $p, p16: $p, p17: $p, n: 1 } }
+--- params
+{"s": "${v}", "p": "${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}"}
+--- expect affected: nodes=1 edges=0
+--- endloop
+
+--- mutate
+branch merge b3 into main
+--- expect outcome: merged
+
 --- query
 query docs() { match { $d: Doc } return { count($d) as n } }
 --- expect unordered
-{"n": 2}
+{"n": 3}
 --- expect shape
 n: I64
