@@ -304,8 +304,10 @@ pub(crate) fn typing_work(catalog: &Catalog, source: &str) -> Vec<(String, Typin
         .collect()
 }
 
-/// What [`typed_decl_measured`] reports of its pass.
+/// What [`typed_decl_measured`] reports of its pass; only the tests read
+/// it.
 #[derive(Default)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct Measured {
     exprs: usize,
     largest_term: usize,
