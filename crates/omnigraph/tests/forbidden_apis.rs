@@ -342,6 +342,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "entity_at"),
     ("db/omnigraph.rs", "snapshot_at_graph_manifest_version"),
     ("db/omnigraph.rs", "export_jsonl"),
+    ("db/omnigraph.rs", "export_jsonl_at"),
     ("db/omnigraph.rs", "export_jsonl_to_writer"),
     ("db/omnigraph.rs", "export_jsonl_unordered_to_writer"),
     ("db/omnigraph.rs", "graph_index"),
