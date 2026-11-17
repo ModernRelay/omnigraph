@@ -31,7 +31,7 @@ use helpers::collector::{
 };
 use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
 use helpers::{
-    MUTATION_QUERIES, Session, TEST_QUERIES, collect_column_strings, count_rows,
+    MUTATION_QUERIES, Session, TEST_QUERIES, collect_column_strings, count_rows, count_rows_branch,
     forge_linear_head_from_pin, init_and_load, is_detached_version, mixed_params, mutate_main,
     node_blob_cell, params, pinned_version, read_managed_blob_bytes, read_table, version_main,
 };
@@ -3087,9 +3087,20 @@ query hold($task: String, $agent: String) {
 /// before the winner published, so its live `@card` count sees the winner's
 /// edge; that read is past the caller's head, and the loser must report its
 /// failed precondition (412 on the server), not a `@card` violation.
+///
+/// One row on `main` and one on a named branch forked from it and never
+/// written: there the gate and the live read both take the head the fork
+/// inherits, and the winner (itself a conditional `@card` insert) is the
+/// fork's first write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn conditional_edge_insert_that_loses_the_race_fails_its_precondition_issue_1424() {
+    for branch in ["main", "review"] {
+        conditional_edge_insert_loses_the_race(branch).await;
+    }
+}
+
+async fn conditional_edge_insert_loses_the_race(branch: &str) {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(helpers::session(
@@ -3100,16 +3111,21 @@ async fn conditional_edge_insert_that_loses_the_race_fails_its_precondition_issu
     db.load_jsonl(CARD_RACE_SEED, LoadMode::Overwrite)
         .await
         .unwrap();
-    let read_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let main_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    if branch != "main" {
+        db.branch_create(branch).await.unwrap();
+    }
+    let read_head = branch_head_commit_id(dir.path(), branch).await.unwrap();
 
     let rendezvous =
         helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_EXECUTE_PRE_VALIDATE);
     let loser = {
         let db = Arc::clone(&db);
         let read_head = read_head.clone();
+        let branch = branch.to_string();
         tokio::spawn(async move {
             db.mutate_as_with_expected_head(
-                "main",
+                &branch,
                 CARD_RACE_MUTATIONS,
                 "hold",
                 &params(&[("$task", "task-0"), ("$agent", "a")]),
@@ -3121,7 +3137,7 @@ async fn conditional_edge_insert_that_loses_the_race_fails_its_precondition_issu
     };
     rendezvous.wait_until_reached().await;
     db.mutate_as_with_expected_head(
-        "main",
+        branch,
         CARD_RACE_MUTATIONS,
         "hold",
         &params(&[("$task", "task-0"), ("$agent", "b")]),
@@ -3129,33 +3145,43 @@ async fn conditional_edge_insert_that_loses_the_race_fails_its_precondition_issu
         Some(&read_head),
     )
     .await
-    .expect("the winner's precondition holds");
-    let winner_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    .unwrap_or_else(|err| panic!("{branch}: the winner's precondition holds: {err}"));
+    let winner_head = branch_head_commit_id(dir.path(), branch).await.unwrap();
     rendezvous.release();
 
     let err = loser
         .await
         .unwrap()
         .expect_err("the loser's precondition must fail");
-    assert!(!rendezvous.timed_out(), "the loser stayed parked");
+    assert!(!rendezvous.timed_out(), "{branch}: the loser stayed parked");
     match err {
         OmniError::PreconditionFailed {
-            branch,
+            branch: refused,
             expected,
             actual,
         } => {
-            assert_eq!(branch, "main");
+            assert_eq!(refused, branch);
             assert_eq!(expected, read_head);
             assert_eq!(actual.as_deref(), Some(winner_head.as_str()));
         }
-        other => panic!("the losing conditional write must be PreconditionFailed, got: {other}"),
+        other => panic!(
+            "{branch}: the losing conditional write must be PreconditionFailed, got: {other}"
+        ),
     }
     assert_eq!(
-        branch_head_commit_id(dir.path(), "main").await.unwrap(),
+        branch_head_commit_id(dir.path(), branch).await.unwrap(),
         winner_head,
-        "the loser must not commit"
+        "{branch}: the loser must not commit"
     );
-    assert_eq!(count_rows(&db, "edge:HeldBy").await, 1);
+    assert_eq!(count_rows_branch(&db, branch, "edge:HeldBy").await, 1);
+    if branch != "main" {
+        assert_eq!(
+            branch_head_commit_id(dir.path(), "main").await.unwrap(),
+            main_head,
+            "neither write reaches main"
+        );
+        assert_eq!(count_rows(&db, "edge:HeldBy").await, 0);
+    }
 }
 
 /// A fresh named branch needs its inherited lineage fallback because it has no
