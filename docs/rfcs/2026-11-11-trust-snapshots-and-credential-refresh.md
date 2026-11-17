@@ -177,7 +177,9 @@ fixed for the process and the file's entries refresh around it, matching how
 later phase, with a minimum interval of 60 s: each poll is one
 `GetSecretValue` request, which is billed and shares a region-wide request
 quota with every other caller in the account. A throttled or failed request
-keeps the last good snapshot like any other refusal.
+keeps the last good snapshot like any other refusal. The 60 s floor is a
+floor, not a recommendation: AWS's own secrets-caching clients default to an
+hour, and the documented default for that phase is minutes.
 
 ### Kubernetes
 
