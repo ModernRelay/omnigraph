@@ -1,0 +1,90 @@
+# issue: 1427
+# red_on: 2026-11-17, main @ 8ab65713: step 6 (branch merge): error does not contain "branch-merge retained validation key bytes": … retained validation delta bytes: actual 56635328, limit 33554432
+# notes: Merge validation keeps the key columns of the whole delta since the merge base, never the other values
+# notes: (issue_1427_three_way_merge_past_validation_budget.gqt). Here every 2 MiB column is `@unique`, a key a
+# notes: uniqueness check judges across the delta, so b0's two 18 MiB rows (36 MiB) cross the fixed 32 MiB ceiling
+# notes: and the merge is refused with nothing published, while each row alone fits. The documented recovery merges
+# notes: in stages: `stage`, created at b0's commit after its first row, merges first, which moves the merge base
+# notes: past that row, and b0 then merges the rest.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    p0: String? @unique
+    p1: String? @unique
+    p2: String? @unique
+    p3: String? @unique
+    p4: String? @unique
+    p5: String? @unique
+    p6: String? @unique
+    p7: String? @unique
+    p8: String? @unique
+}
+
+--- seed
+
+--- mutate
+branch create b0
+--- expect ok
+
+--- mutate
+query onmain() { insert Doc { slug: "onmain" } }
+--- expect affected: nodes=1 edges=0
+
+--- foreach $v aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+--- mutate branch: b0
+query insert_big($s: String, $p: String) { insert Doc { slug: $s, p0: $p, p1: $p, p2: $p, p3: $p, p4: $p, p5: $p, p6: $p, p7: $p, p8: $p } }
+--- params
+{"s": "${v}", "p": "${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}"}
+--- expect affected: nodes=1 edges=0
+--- endloop
+
+--- mutate branch: b0
+query mark() { insert Doc { slug: "mark" } }
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $first_row
+
+--- foreach $v bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+--- mutate branch: b0
+query insert_big($s: String, $p: String) { insert Doc { slug: $s, p0: $p, p1: $p, p2: $p, p3: $p, p4: $p, p5: $p, p6: $p, p7: $p, p8: $p } }
+--- params
+{"s": "${v}", "p": "${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}${v}"}
+--- expect affected: nodes=1 edges=0
+--- endloop
+
+--- mutate
+branch merge b0 into main
+--- expect error: branch-merge retained validation key bytes
+
+--- query
+query docs_after_refusal() { match { $d: Doc } return { count($d) as n } }
+--- expect unordered
+{"n": 1}
+--- expect shape
+n: I64
+
+--- mutate
+branch create stage from commit "${first_row}"
+--- expect ok
+
+--- mutate
+branch merge stage into main
+--- expect outcome: merged
+
+--- mutate
+branch merge b0 into main
+--- expect outcome: merged
+
+--- query
+query docs_after_stages() { match { $d: Doc } return { count($d) as n } }
+--- expect unordered
+{"n": 4}
+--- expect shape
+n: I64

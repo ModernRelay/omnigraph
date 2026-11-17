@@ -200,6 +200,52 @@ Later writes create fresh table storage when needed and leave unused former
 storage for explicit cleanup. They do not reclaim a previous table history as
 part of preparing the write or merge.
 
+## Validation limit
+
+Before it publishes, a merge checks the target's constraints (value and enum
+checks, uniqueness, edge endpoints and `@card`) against its delta: every row
+the merge adds or changes since the merge base, and every id it removes. It
+reads the delta from storage one batch at a time. A value that only a
+single-row check reads, such as a long description or a property under
+`@range`, is checked in its batch and then released, and vectors and Blob
+payloads are not read at all. What the merge keeps until the checks finish
+is the delta's keys: entity ids, the values of each `@key` and `@unique`
+group, an edge's endpoints when they or its `@card` are checked, and the
+removed ids.
+
+Those keys are limited to 32 MiB per merge, counted as the bytes of their
+values (a string's length, plus 4 bytes; a null counts nothing), whatever
+buffers storage returned them in. The checks hold each key in lookup tables of
+their own, so their memory is several times this count, not bounded by it.
+The limit is fixed: `write_max_bytes` and `query_memory_bytes` do not change
+it. The check sets no bound of its own on a row's width. A merge that writes
+rows (for a table both branches changed) keeps its own `write_max_bytes`
+allowance, as any write does, so a row wider than 32 MiB, written under a
+raised value, needs that value again; a merge that adopts the source's table
+by pointer writes no row.
+It applies to the whole delta since the merge base, however the source's
+commits were chunked, so a branch whose every load fit its own bounds can
+still reach it. A merge past the limit publishes nothing and fails with
+`resource limit exceeded for branch-merge retained validation key bytes`
+(over HTTP, `413` with a `resource_limit` detail naming the resource, its
+limit and the actual bytes; disposition `effects: none`, `action: fix`).
+
+Merge such a branch in stages, each holding part of its commits:
+
+1. List the source's commits and pick one partway along it:
+   `omnigraph commit list --branch <source> --target ./graph.omni`.
+2. Start a branch at that commit:
+   `omnigraph branch create <stage> --from-commit <commit-id> --target ./graph.omni`.
+3. Merge `<stage>`, then merge the source. The first merge records the
+   commit as part of the target's history, so it becomes the base of the
+   second merge, whose delta holds only the later commits.
+
+Use more stages if a part is still past the limit. A single commit whose own
+keys pass the limit cannot be split this way; write that change again as
+smaller commits. A fast-forward whose tables only gain nodes of types with no
+`@unique`, `@range`, `@check` or enum property, and no edge type with a
+`@card` minimum from them, needs no check and has no such limit.
+
 ## After a large merge
 
 Indexes do not define merge correctness. Newly merged entities remain queryable even

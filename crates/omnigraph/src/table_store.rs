@@ -221,6 +221,15 @@ pub(crate) const SPILL_COMPRESSION: datafusion::common::config::SpillCompression
 /// The built read and its scanner-normalized filter.
 pub(crate) type PlannedScan = (Arc<dyn ExecutionPlan>, Option<Expr>);
 
+/// Lance batches a pipelined read decodes ahead, which no memory pool sees.
+pub(crate) const PIPELINED_READAHEAD: usize = 2;
+
+/// Bytes Lance may hold fetched and not yet decoded for one pipelined read,
+/// which no memory pool sees either. Lance's default is 32 MiB per I/O thread
+/// (2 GiB on a cloud store), read ahead of a consumer that may stop after its
+/// first batch; two 32 MiB pages keep its throughput.
+pub(crate) const PIPELINED_IO_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Configuration surface for a scan after projection, filtering, and ordering
 /// have been selected by [`TableStore::scan_stream_with`].
 ///
@@ -350,6 +359,15 @@ impl ScanTuning<'_> {
     pub(crate) fn io_buffer_size(&mut self, bytes: u64) -> &mut Self {
         self.scanner.io_buffer_size(bytes);
         self
+    }
+
+    /// Bound what Lance decodes ([`PIPELINED_READAHEAD`]) and fetches
+    /// ([`PIPELINED_IO_BUFFER_BYTES`]) ahead of a consumer that takes one
+    /// batch at a time: an engine read's scan, and branch merge validation's
+    /// sweep of its delta. `fragment_readahead` keeps Lance's default.
+    pub(crate) fn pipelined(&mut self) -> &mut Self {
+        self.batch_readahead(PIPELINED_READAHEAD);
+        self.io_buffer_size(PIPELINED_IO_BUFFER_BYTES)
     }
 
     pub(crate) fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
@@ -8892,6 +8910,11 @@ fn largest_proven_insert_prefix(
     Ok((low, batch_slice_memory_size(batch, offset, low)?))
 }
 
+/// The bytes `rows` rows of `batch` from `offset` span in their buffers
+/// (`ArrayData::get_slice_memory_size`): every slot's offset range, a null's
+/// included. A Lance scan can return a null whose offsets span a neighbouring
+/// row's bytes in a shared decode buffer, so this counts what a `concat` of
+/// the rows would copy, not what they hold ([`column_logical_bytes`]).
 pub(crate) fn batch_slice_memory_size(
     batch: &RecordBatch,
     offset: usize,
@@ -8926,9 +8949,97 @@ fn finish_proven_insert_batch(
     Ok(batch)
 }
 
+/// The bytes `column`'s rows hold: every non-null value's bytes plus the
+/// column's offsets or views and its validity, which is what a
+/// [`copy_batch_range`] of the rows holds and what a fact built from them
+/// can copy. A null counts no value bytes, whatever range its offsets span
+/// ([`batch_slice_memory_size`] counts that range, and so does the
+/// allocation). A view array keeps a value of at most 12 bytes inside its
+/// 16-byte view, so only longer values add bytes; it is measured here but not
+/// compacted by [`copy_batch_range`], which keeps its data buffers, so a copy
+/// of a view array is no smaller than the slice it copies. A fixed-width or
+/// nested column counts its slice, or its whole allocation where that is
+/// unavailable.
+pub(crate) fn column_logical_bytes(column: &dyn Array) -> usize {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+
+    fn sum(lengths: impl Iterator<Item = usize>) -> usize {
+        lengths.fold(0, usize::saturating_add)
+    }
+    // A view of at most this many bytes stores the value inline.
+    const VIEW_INLINE_BYTES: usize = 12;
+    let outlined = |length: usize| {
+        if length > VIEW_INLINE_BYTES {
+            length
+        } else {
+            0
+        }
+    };
+    let rows = column.len();
+    let validity = column.nulls().map_or(0, |_| rows.div_ceil(8));
+    let (values, framing) = match column.data_type() {
+        DataType::Utf8 => (
+            sum(column.as_string::<i32>().iter().flatten().map(str::len)),
+            rows.saturating_add(1).saturating_mul(4),
+        ),
+        DataType::LargeUtf8 => (
+            sum(column.as_string::<i64>().iter().flatten().map(str::len)),
+            rows.saturating_add(1).saturating_mul(8),
+        ),
+        DataType::Utf8View => (
+            sum(column
+                .as_string_view()
+                .iter()
+                .flatten()
+                .map(|value| outlined(value.len()))),
+            rows.saturating_mul(16),
+        ),
+        DataType::Binary => (
+            sum(column.as_binary::<i32>().iter().flatten().map(<[u8]>::len)),
+            rows.saturating_add(1).saturating_mul(4),
+        ),
+        DataType::LargeBinary => (
+            sum(column.as_binary::<i64>().iter().flatten().map(<[u8]>::len)),
+            rows.saturating_add(1).saturating_mul(8),
+        ),
+        DataType::BinaryView => (
+            sum(column
+                .as_binary_view()
+                .iter()
+                .flatten()
+                .map(|value| outlined(value.len()))),
+            rows.saturating_mul(16),
+        ),
+        _ => {
+            return column
+                .to_data()
+                .get_slice_memory_size()
+                .unwrap_or_else(|_| column.get_array_memory_size());
+        }
+    };
+    values.saturating_add(framing).saturating_add(validity)
+}
+
+/// The bytes `batch`'s rows hold, column by column ([`column_logical_bytes`]).
+pub(crate) fn batch_logical_bytes(batch: &RecordBatch) -> u64 {
+    batch.columns().iter().fold(0_u64, |total, column| {
+        total.saturating_add(
+            u64::try_from(column_logical_bytes(column.as_ref())).unwrap_or(u64::MAX),
+        )
+    })
+}
+
 /// `rows` rows of `batch` from `offset`, copied into buffers of their own: an
 /// Arrow slice keeps every buffer of its parent alive, a copy only its rows.
-fn copy_batch_range(batch: &RecordBatch, offset: usize, rows: usize) -> Result<RecordBatch> {
+/// `take` copies a variable-width column's valid values alone, so a null
+/// whose offsets span a neighbour's bytes is not copied with them; a view
+/// array keeps its data buffers.
+pub(crate) fn copy_batch_range(
+    batch: &RecordBatch,
+    offset: usize,
+    rows: usize,
+) -> Result<RecordBatch> {
     let end = offset
         .checked_add(rows)
         .ok_or_else(|| OmniError::manifest_internal("batch copy range overflow"))?;
@@ -9004,6 +9115,60 @@ fn staged_keyed_merge_result(
 mod tests {
     use super::*;
     use arrow_array::{StringArray, UInt8Array, UInt32Array};
+
+    /// A row's logical bytes count its non-null values: a null whose offsets
+    /// span a neighbour's bytes in a shared buffer counts none of them, as no
+    /// copy or fact holds them (#1427); a view counts a value inline in it
+    /// once; a fixed-width column counts its slice.
+    #[test]
+    fn column_logical_bytes_count_values_not_their_buffers_issue_1427() {
+        use arrow_array::{BinaryViewArray, Int64Array, StringViewArray};
+        use datafusion::arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
+
+        let spanning_null = StringArray::new(
+            OffsetBuffer::new(vec![0_i32, 5, 10].into()),
+            Buffer::from("aaaaabbbbb".as_bytes()),
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        assert_eq!(
+            spanning_null.to_data().get_slice_memory_size().unwrap(),
+            10 + 2 * 4 + 1,
+            "the slice size counts the null's bytes"
+        );
+        assert_eq!(column_logical_bytes(&spanning_null), 5 + 3 * 4 + 1);
+        let copied = copy_batch_range(
+            &RecordBatch::try_from_iter([("s", Arc::new(spanning_null) as ArrayRef)]).unwrap(),
+            0,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            copied.column(0).to_data().get_slice_memory_size().unwrap(),
+            5 + 2 * 4 + 1,
+            "a copy holds the valid value's bytes alone"
+        );
+        assert_eq!(
+            column_logical_bytes(&StringArray::from(vec!["abc", "de"])),
+            5 + 3 * 4
+        );
+        assert_eq!(
+            column_logical_bytes(&Int64Array::from(vec![1, 2, 3])),
+            3 * 8
+        );
+        let long = "x".repeat(13);
+        assert_eq!(
+            column_logical_bytes(&StringViewArray::from(vec!["inline", long.as_str()])),
+            2 * 16 + 13,
+            "a view holds a value of at most 12 bytes inline"
+        );
+        assert_eq!(
+            column_logical_bytes(&BinaryViewArray::from(vec![
+                b"twelve bytes".as_slice(),
+                long.as_bytes()
+            ])),
+            2 * 16 + 13
+        );
+    }
 
     /// Issue #1264: the write mode an update takes from its byte estimate.
     #[test]
