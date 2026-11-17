@@ -140,6 +140,14 @@ fn fold_extremum(
     Ok(())
 }
 
+/// Whether the right side is a constant, evaluated once before any outer
+/// row. A right side that reads no column but can fail (a negation, an
+/// arithmetic term, a call) is evaluated over the outer rows like one that
+/// reads them, so it fails only where an outer row reaches it (A3).
+fn right_is_constant(predicate: &SubqueryPredicate) -> bool {
+    predicate.right.columns_empty() && crate::engine::constant::is_constant(&predicate.right)
+}
+
 /// Bound once, retaining the left recipe and the right Arrow scalar domain:
 /// a constant right side evaluated once, or one reading an outer row's
 /// columns evaluated over the outer rows by the caller.
@@ -155,7 +163,7 @@ impl BoundComparison {
         Ok(Self {
             left: predicate.left.clone(),
             op: predicate.op,
-            right: if predicate.right.columns_empty() {
+            right: if right_is_constant(predicate) {
                 Some(evaluate_constant_array(&predicate.right, params)?)
             } else {
                 None
@@ -247,7 +255,7 @@ impl RowCountPredicate {
         params: &ParamMap,
     ) -> Result<Option<Self>> {
         // A right side read from the outer row takes the tagged path.
-        if !predicate.is_row_count() || !predicate.right.columns_empty() {
+        if !predicate.is_row_count() || !right_is_constant(predicate) {
             return Ok(None);
         }
         Ok(Some(Self {
