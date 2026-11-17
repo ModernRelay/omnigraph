@@ -14,6 +14,11 @@
 //! stage's refusals; every other pass must leave fewer refusals than it
 //! found, and no pass may leave an earlier stage's refusal than the one it
 //! found.
+//!
+//! A step whose refusal prints a machine-applicable fix is listed in
+//! [`INTENDED`] with the text its fixes are meant to write, and the repaired
+//! text must be that text: a fix that converges somewhere else, or a listed
+//! step whose first pass prints no edit, fails.
 
 use std::path::{Path, PathBuf};
 
@@ -160,8 +165,9 @@ fn render(refusals: &[QueryDiagnostic]) -> String {
         .join(" | ")
 }
 
-/// The violation of the convergence rule for one source, if any.
-fn converge(cat: &Catalog, source: &str) -> Result<usize, String> {
+/// The violation of the convergence rule for one source, if any; else the
+/// passes that moved it and the text they repaired it to.
+fn converge(cat: &Catalog, source: &str) -> Result<(usize, String), String> {
     let mut seen = vec![source.to_string()];
     let mut current = source.to_string();
     let mut refusals = check_source_all(cat, &current);
@@ -169,7 +175,7 @@ fn converge(cat: &Catalog, source: &str) -> Result<usize, String> {
     for pass in 0..=PASSES {
         let edits = pass_edits(&refusals).map_err(|e| format!("pass {pass}: {e}"))?;
         if refusals.is_empty() || edits.is_empty() {
-            return Ok(pass);
+            return Ok((pass, current));
         }
         if pass == PASSES {
             return Err(format!(
@@ -211,14 +217,206 @@ fn converge(cat: &Catalog, source: &str) -> Result<usize, String> {
     unreachable!("the loop returns by its last pass")
 }
 
+/// The text every refused corpus step that prints a machine-applicable fix
+/// is repaired to, by its case and step: what its printed fixes intend,
+/// reviewed when the step was added. A step that prints a fix and is not
+/// listed, or is listed and prints none, fails the test.
+const INTENDED: &[(&str, &str)] = &[
+    (
+        "boolean_literal_refused_where_a_property_is_named_false.gqt step 3",
+        r#"query shadowed_property() {
+    match { $x: Flag } where false = false  delete $x
+}"#,
+    ),
+    (
+        "diagnostics/q002_missing_parameter_list.gqt step 3",
+        r#"query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/q007_arrow_traversal.gqt step 3",
+        r#"query q() { match { $a: Person, $a knows $b } return { $b.name } }"#,
+    ),
+    (
+        "diagnostics/q008_where_on_a_statement.gqt step 3",
+        r#"query w($h: String) { match { $x: Person } where $x.handle = $h  delete $x }"#,
+    ),
+    (
+        "diagnostics/q009_mutation_keyword.gqt step 3",
+        r#"query w($h: String) { match { $p: Person } where $p.handle = $h delete $p }"#,
+    ),
+    (
+        "diagnostics/q010_comparison_in_binding_braces.gqt step 3",
+        r#"query q() { match { $d: Doc } where $d.year >= 2025 return { $d.title } }"#,
+    ),
+    (
+        "diagnostics/q011_as_commit_on_a_read.gqt step 3",
+        r#"query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/q012_concatenation_operator.gqt step 3",
+        r#"query q() { match { $p: Person } return { concat($p.name, $p.handle) as n } }"#,
+    ),
+    (
+        "diagnostics/q013_element_after_the_last_statement.gqt step 3",
+        r#"query w($h: String) { match { $p: Person, $q: Person } where $p.handle = $h delete $p }"#,
+    ),
+    (
+        "diagnostics/q014_foreign_where.gqt step 3",
+        r#"query q() { match { $p: Person } where $p.age > 30 return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/q016_missing_comma.gqt step 3",
+        r#"query q() { match { $p: Person, $p knows $q } return { $q.name } }"#,
+    ),
+    (
+        "diagnostics/q017_filter_inside_match.gqt step 3",
+        r#"query q() { match { $p: Person } where $p.age > 30 return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/q019_element_keyword_call.gqt step 3",
+        r#"query q() { match { $p: Person } where $p.city is not null return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/q020_match_without_braces.gqt step 3",
+        r#"query q() { match { $p: Person }  return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/q021_annotation_argument_with_colon.gqt step 3",
+        r#"query q() @budget(plan = 10) { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/t65_ranking_in_order.gqt step 3",
+        r#"query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 3) as $distance } return { $d.title } order { $distance } limit 3 }"#,
+    ),
+    (
+        "diagnostics/t68_block_binds_an_outer_name.gqt step 3",
+        r#"query not_bob() { match { $p: Person } where not ($p.name = "Bob") return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/t68_block_binds_an_outer_name.gqt step 5",
+        r#"query knows_someone() { match { $p: Person } where exists { $q: Person, $p knows $q } return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/t68_block_binds_an_outer_name.gqt step 7",
+        r#"query employers() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name } }"#,
+    ),
+    (
+        "diagnostics/t6_fuzzy_is_not_a_registry_row.gqt step 3",
+        r#"query q() { match { $d: Doc } where match_terms($d.title, terms("graf", mode: any, max_edits: 2)) return { $d.slug } }"#,
+    ),
+    (
+        "diagnostics/t6_match_text_is_not_a_registry_row.gqt step 3",
+        r#"query q() { match { $d: Doc } where match_terms($d.title, terms("graph", mode: any)) return { $d.slug } }"#,
+    ),
+    (
+        "diagnostics/t6_search_is_not_a_registry_row.gqt step 3",
+        r#"query q() { match { $d: Doc } where match_terms($d.title, terms("graph", mode: any)) return { $d.slug } }"#,
+    ),
+    (
+        "diagnostics/t71_positional_option.gqt step 3",
+        r#"query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 3) as $distance } return { $d.title } }"#,
+    ),
+    (
+        "diagnostics/t7_infix_contains.gqt step 3",
+        r#"query q() { match { $d: Doc } where "rust" in $d.tags return { $d.title } }"#,
+    ),
+    (
+        "diagnostics/t81_pattern_components_share_no_variable.gqt step 3",
+        r#"query staff() { match { $c: Company, $p: Person, $p worksAt $c } return { $p.name, $c.name } }"#,
+    ),
+    (
+        "diagnostics/t82_triple_written_against_its_edge_direction.gqt step 3",
+        r#"query staff($slug: String) { match { $c: Company, $p worksAt $c } where $c.slug = $slug return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/t82_triple_written_against_its_edge_direction.gqt step 5",
+        r#"query ties() { match { $c: Company } where exists { $p: Person, $p $k:(worksAt | founded) $c } return { $c.name } }"#,
+    ),
+    (
+        "diagnostics/t82_triple_written_against_its_edge_direction.gqt step 7",
+        r#"query everyone() { match { $c: Company, $p: Person, $p * $c } return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/t84_triple_names_a_name_no_binding_introduces.gqt step 3",
+        r#"query loners() { match { $p: Person } where not exists { $q: Person, $p knows $q } return { $p.name } }"#,
+    ),
+    (
+        "diagnostics/t84_triple_names_a_name_no_binding_introduces.gqt step 5",
+        r#"query headcounts() { match { from { match { $p: Person, $c: Company, $p worksAt $c } return { $c, count($p) as n } } } return { $c.name, $n } }"#,
+    ),
+    (
+        "diagnostics/t84_triple_names_a_name_no_binding_introduces.gqt step 7",
+        r#"query employers() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name } }"#,
+    ),
+    (
+        "diagnostics/t85_ranked_from_names_its_score.gqt step 3",
+        r#"query near($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $distance } return { $d.slug, $distance } order { $distance } }"#,
+    ),
+    (
+        "diagnostics/t85_ranked_from_names_its_score.gqt step 5",
+        r#"query docs() { match { let $docs = { match { $d: Doc } return { $d } }, from $docs } return { $d.slug } }"#,
+    ),
+    (
+        "diagnostics/t85_ranked_from_names_its_score.gqt step 7",
+        r#"query near_by_name($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, let $near = nearest($pop, $d.embedding, $q, k: 2), from $near as $distance } return { $d.slug } }"#,
+    ),
+    (
+        "diagnostics/t85_ranked_from_names_its_score.gqt step 9",
+        r#"query wrapped($q: Vector(3)) { match { from { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $dist } return { $d, $dist } } } return { $d.slug } }"#,
+    ),
+    (
+        "issue_640_search_score_projection.gqt step 23",
+        r#"query nearest_projected_without_retrieval($v: Vector(2)) {
+    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.embedding, $v, k: 2) as $distance }
+    return { $p.name, $distance as score }
+    order { $p.name }
+    limit 2
+}"#,
+    ),
+    (
+        "issue_659_edge_selection_contract.gqt step 33",
+        r#"query single_name_group_is_not_edge_alternation() {
+    match { $a: Person, $b: Person, $a knows $b }
+    return { $a.name }
+}"#,
+    ),
+    (
+        "rank_key_asc_direction_refused.gqt step 6",
+        r#"query bm25_asc() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, "needle") as $score }
+    return { $d.slug }
+    order { $score desc }
+    limit 2
+}"#,
+    ),
+    (
+        "rank_key_asc_direction_refused.gqt step 8",
+        r#"query rrf_asc($v: Vector(2), $w: Vector(2)) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 2), nearest($all, $d.embedding, $w, k: 2), k: 60) as $score,  $d: Doc }
+    return { $d.slug }
+    order { $score desc }
+    limit 2
+}"#,
+    ),
+    (
+        "typed_search_options.gqt step 43",
+        r#"query positional_window($q: Vector(2)) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
+    return { $d.key }
+}"#,
+    ),
+];
+
 #[test]
 fn every_expect_error_case_reaches_a_fixed_point_within_three_passes() {
     let steps = error_steps();
-    assert!(steps.len() > 300, "the corpus shrank: {}", steps.len());
-    let mut refused = 0;
-    // Sources a machine-applicable fix moved at least one pass: a refusal
-    // that prints none passes the rule without being tested by it.
-    let mut fixed = 0;
+    // Every `cases/diagnostics/` case, one per code the parser and the type
+    // checker raise, holds a step the compiler refuses.
+    let mut diagnostics: Vec<PathBuf> = Vec::new();
+    gqt_files(&cases_root().join("diagnostics"), &mut diagnostics);
+    assert!(!diagnostics.is_empty());
+    let mut refused_cases: Vec<String> = Vec::new();
+    let mut fixed: Vec<String> = Vec::new();
     // The codes whose fixes are part of the break's contract (the GQ 3 RFC,
     // section 6, "Stored sources at upgrade"), each fixed somewhere.
     let mut contract: Vec<(&str, bool)> = ["T7", "T65", "T71", "Q008"]
@@ -234,10 +432,20 @@ fn every_expect_error_case_reaches_a_fixed_point_within_three_passes() {
         if first.is_empty() {
             continue;
         }
-        refused += 1;
-        match converge(&cat, &step.source) {
-            Ok(passes) if passes > 0 => {
-                fixed += 1;
+        refused_cases.push(step.origin.clone());
+        let intended = INTENDED
+            .iter()
+            .find(|(origin, _)| *origin == step.origin)
+            .map(|(_, text)| *text);
+        match (converge(&cat, &step.source), intended) {
+            (Ok((passes, repaired)), Some(intended)) if passes > 0 => {
+                fixed.push(step.origin.clone());
+                if repaired.trim_end() != intended {
+                    violations.push(format!(
+                        "{}: the fixes repair the source to\n{repaired}\nnot the intended\n{intended}",
+                        step.origin
+                    ));
+                }
                 for diagnostic in &first {
                     let applicable = diagnostic
                         .suggestion
@@ -251,16 +459,41 @@ fn every_expect_error_case_reaches_a_fixed_point_within_three_passes() {
                     }
                 }
             }
-            Ok(_) => {}
-            Err(violation) => {
+            (Ok((_, _)), Some(_)) => violations.push(format!(
+                "{}: its intended repair is listed, but its refusal prints no machine-applicable edit\n{}",
+                step.origin, step.source
+            )),
+            (Ok((passes, repaired)), None) if passes > 0 => violations.push(format!(
+                "{}: its fixes repair the source to\n{repaired}\nlist the intended text in INTENDED",
+                step.origin
+            )),
+            (Ok(_), None) => {}
+            (Err(violation), _) => {
                 violations.push(format!("{}: {violation}\n{}", step.origin, step.source))
             }
         }
     }
-    assert!(refused > 100, "few compile refusals: {refused}");
+    for file in &diagnostics {
+        let name = file
+            .strip_prefix(cases_root())
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        assert!(
+            refused_cases
+                .iter()
+                .any(|origin| origin.starts_with(&format!("{name} "))),
+            "{name}: no step the compiler refuses"
+        );
+    }
+    let stale: Vec<&str> = INTENDED
+        .iter()
+        .map(|(origin, _)| *origin)
+        .filter(|origin| !fixed.iter().any(|f| f == origin))
+        .collect();
     assert!(
-        fixed >= 35,
-        "few refusals print a fix the rule tests: {fixed} of {refused}"
+        stale.is_empty(),
+        "INTENDED lists steps no fix repaired: {stale:?}"
     );
     let untested: Vec<&str> = contract
         .iter()
@@ -273,8 +506,9 @@ fn every_expect_error_case_reaches_a_fixed_point_within_three_passes() {
     );
     assert!(
         violations.is_empty(),
-        "{} of {refused} refused sources break the fix-convergence rule:\n{}",
+        "{} of {} refused sources break the fix-convergence rule:\n{}",
         violations.len(),
+        refused_cases.len(),
         violations.join("\n")
     );
 }

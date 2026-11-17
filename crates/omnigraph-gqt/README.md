@@ -159,7 +159,9 @@ others ride the diagnostic's `further` list. Every expect-error step the
 compiler refuses is also held to fix convergence
 (`tests/integration/fix_convergence.rs`): applying every machine-applicable
 suggestion of one pass at once shrinks the refusals and reaches a fixed point
-within three passes. A `--- query` or `--- mutate` section the compiler refuses at
+within three passes, and a step whose refusal prints such a fix is listed
+there with the text its fixes are meant to write, which the repair must
+equal. A `--- query` or `--- mutate` section the compiler refuses at
 parse is a step only under `expect error:` (any other expectation refuses the
 case with the parse error); it runs through the engine's door like any query
 and fails there with the same refusal. The cases under `cases/diagnostics/` use this:

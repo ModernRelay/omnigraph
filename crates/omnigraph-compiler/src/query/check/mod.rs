@@ -263,13 +263,23 @@ enum Typed {
 }
 
 fn typed_decl(catalog: &Catalog, unit: &HashMap<String, &Decl>, decl: &Decl) -> Typed {
-    typed_decl_measured(catalog, unit, decl, &mut 0)
+    typed_decl_measured(catalog, unit, decl, &mut Measured::default())
 }
 
-/// How many expressions typing each declaration of `source` typed
-/// ([`Ctx::typed_exprs`]), with whether it was accepted.
+/// The measured work of typing one declaration.
 #[cfg(test)]
-pub(crate) fn typing_work(catalog: &Catalog, source: &str) -> Vec<(String, usize, bool)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TypingWork {
+    /// The expressions typed ([`Ctx::typed_exprs`]).
+    pub exprs: usize,
+    /// The largest term charged to the plan budget ([`Ctx::largest_charged`]).
+    pub largest_term: usize,
+    pub accepted: bool,
+}
+
+/// The work typing each declaration of `source` took, by name.
+#[cfg(test)]
+pub(crate) fn typing_work(catalog: &Catalog, source: &str) -> Vec<(String, TypingWork)> {
     let file = crate::query::syntax::parse::parse_source(source).expect("parses");
     let decls: Vec<&Decl> = match &file.body {
         Body::Decls(d) => d.iter().collect(),
@@ -280,18 +290,32 @@ pub(crate) fn typing_work(catalog: &Catalog, source: &str) -> Vec<(String, usize
     decls
         .iter()
         .map(|d| {
-            let mut work = 0;
+            let mut work = Measured::default();
             let typed = typed_decl_measured(catalog, &unit, d, &mut work);
-            (d.name.clone(), work, matches!(typed, Typed::Checked(_)))
+            (
+                d.name.clone(),
+                TypingWork {
+                    exprs: work.exprs,
+                    largest_term: work.largest_term,
+                    accepted: matches!(typed, Typed::Checked(_)),
+                },
+            )
         })
         .collect()
+}
+
+/// What [`typed_decl_measured`] reports of its pass.
+#[derive(Default)]
+struct Measured {
+    exprs: usize,
+    largest_term: usize,
 }
 
 fn typed_decl_measured(
     catalog: &Catalog,
     unit: &HashMap<String, &Decl>,
     decl: &Decl,
-    work: &mut usize,
+    work: &mut Measured,
 ) -> Typed {
     let refused = |d: QueryDiagnostic| Typed::Refused {
         refusals: vec![d],
@@ -311,6 +335,7 @@ fn typed_decl_measured(
         plan_limit: DEFAULT_PLAN_BUDGET,
         typed_calls: HashMap::new(),
         typed_exprs: 0,
+        largest_charged: std::cell::Cell::new(0),
     };
     let params = match param_types(&decl.params) {
         Ok(p) => p,
@@ -339,7 +364,10 @@ fn typed_decl_measured(
         }),
         DeclBody::Write(w) => ctx.write_decl(decl, w).map(CoreDecl::Write),
     };
-    *work = ctx.typed_exprs;
+    *work = Measured {
+        exprs: ctx.typed_exprs,
+        largest_term: ctx.largest_charged.get(),
+    };
     // Every refusal recorded by a recovery point, then the one that ended
     // the pass, each at its span or at the declaration's name.
     let mut refusals = std::mem::take(&mut ctx.refusals);
@@ -1126,6 +1154,9 @@ struct Ctx<'a> {
     /// per time it is typed: the deterministic measure of a declaration's
     /// typing work that the tests hold to the source's size.
     typed_exprs: usize,
+    /// The largest term size charged to the plan budget
+    /// ([`Self::charge`]): how far a build went before a refusal stopped it.
+    largest_charged: std::cell::Cell<usize>,
 }
 
 struct Frame {
@@ -1802,6 +1833,8 @@ impl Ctx<'_> {
     /// stops at the first term over it instead of after the whole tree is
     /// built.
     fn charge(&self, size: usize, term: &Term) -> R<()> {
+        self.largest_charged
+            .set(self.largest_charged.get().max(size));
         if size <= self.plan_limit {
             return Ok(());
         }

@@ -783,20 +783,14 @@ fn a_run_of_optionals_grows_the_term_linearly() {
 /// 2^30 nodes first.
 #[test]
 fn a_plan_budget_overrun_stops_as_the_term_is_built() {
-    // The size the refusal reports: the first term over the 4096-node
-    // budget, at most one doubling past it, never the 2^30 nodes of the
-    // whole expansion.
-    let reported = |m: &str| -> usize {
-        let at = m
-            .find("alone has ")
-            .map(|i| i + "alone has ".len())
-            .or_else(|| m.find("expands to ").map(|i| i + "expands to ".len()))
-            .unwrap_or_else(|| panic!("no size in {m}"));
-        m[at..]
-            .split(|c: char| !c.is_ascii_digit())
-            .next()
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| panic!("no size in {m}"))
+    // How far the build went: the first term over the 4096-node budget, at
+    // most one doubling past it, never the 2^30 nodes of the whole
+    // expansion.
+    let largest = |source: &str| -> usize {
+        let work = super::typing_work(&catalog(), source);
+        let (_, first) = &work[0];
+        assert!(!first.accepted, "{source}");
+        first.largest_term
     };
     let mut nested = String::from("$q30: Person, $q29 knows $q30");
     for i in (1..30).rev() {
@@ -805,14 +799,13 @@ fn a_plan_budget_overrun_stops_as_the_term_is_built() {
             i - 1
         );
     }
-    let m = refused(
-        &format!(
-            "query q() {{ match {{ $q0: Person, optional {{ {nested} }} }} return {{ $q0.handle }} }}"
-        ),
-        "T70",
+    let source = format!(
+        "query q() {{ match {{ $q0: Person, optional {{ {nested} }} }} return {{ $q0.handle }} }}"
     );
+    let m = refused(&source, "T70");
     assert!(m.contains("plan budget"), "{m}");
-    assert!(reported(&m) < 3 * 4096, "{m}");
+    let built = largest(&source);
+    assert!((4096..3 * 4096).contains(&built), "{built}: {m}");
     let mut reads = vec!["query r30() { match { $p: Person } return { $p } }".to_string()];
     for i in (0..30).rev() {
         reads.push(format!(
@@ -822,9 +815,11 @@ fn a_plan_budget_overrun_stops_as_the_term_is_built() {
         ));
     }
     reads.reverse();
-    let m = refused(&reads.join("\n"), "T70");
+    let source = reads.join("\n");
+    let m = refused(&source, "T70");
     assert!(m.contains("plan budget") && m.contains("r1 → r2"), "{m}");
-    assert!(reported(&m) < 3 * 4096, "{m}");
+    let built = largest(&source);
+    assert!((4096..3 * 4096).contains(&built), "{built}: {m}");
 }
 
 /// A declared read is typed once per declaration however often it is
@@ -851,9 +846,9 @@ fn a_called_read_is_typed_once_however_often_it_is_called() {
     // reads it reaches: one more read reached adds the same work.
     let work: Vec<usize> = super::typing_work(&catalog(), &source)
         .into_iter()
-        .map(|(_, work, accepted)| {
-            assert!(accepted);
-            work
+        .map(|(_, work)| {
+            assert!(work.accepted);
+            work.exprs
         })
         .collect();
     let steps: Vec<usize> = work.windows(2).map(|w| w[0] - w[1]).collect();
@@ -905,11 +900,11 @@ fn guarded_blocks_are_typed_once_each_and_capture_no_name() {
                 let source = format!(
                     "query q() {{ match {{ $p: Person }} where {predicate} return {{ $p.handle }} }}"
                 );
-                let [(_, work, accepted)] = super::typing_work(&catalog(), &source)[..] else {
+                let [(_, work)] = super::typing_work(&catalog(), &source)[..] else {
                     panic!("one declaration");
                 };
-                assert!(accepted, "{form}: {source}");
-                work
+                assert!(work.accepted, "{form}: {source}");
+                work.exprs
             })
             .collect();
         let steps: Vec<usize> = work.windows(2).map(|w| w[1] - w[0]).collect();
@@ -1241,6 +1236,7 @@ fn every_numeric_operand_pair_types_to_a_term_the_planner_accepts() {
         }
     }
     let mut accepted = 0;
+    let mut refused: std::collections::BTreeMap<String, usize> = Default::default();
     for e in &expressions {
         let src = format!("query q({params}) {{ match {{ $p: Person }} return {{ {e} as v }} }}");
         for (_, result) in check(&src) {
@@ -1254,14 +1250,29 @@ fn every_numeric_operand_pair_types_to_a_term_the_planner_accepts() {
                 }
                 // `U64` with a signed integer, unary minus over an unsigned
                 // integer, and a literal outside a property's range.
-                Err(d) => assert!(
-                    ["T72", "T7", "T3"].contains(&d.code.as_str()),
-                    "`{e}` is refused without its typing code: {d}"
-                ),
+                Err(d) => {
+                    assert!(
+                        ["T72", "T7", "T3"].contains(&d.code.as_str()),
+                        "`{e}` is refused without its typing code: {d}"
+                    );
+                    *refused.entry(d.code.as_str().to_string()).or_default() += 1;
+                }
             }
         }
     }
-    assert!(accepted > expressions.len() / 2, "{accepted} accepted");
+    // Every expression is accounted for, by the typing rules' own outcome:
+    // a change to which pairs type, or to the code that refuses one, moves
+    // these counts.
+    assert_eq!(expressions.len(), 3990);
+    assert_eq!(
+        (accepted, refused),
+        (
+            3730,
+            [("T3", 4), ("T7", 72), ("T72", 184)]
+                .map(|(code, n)| (code.to_string(), n))
+                .into()
+        ),
+    );
 }
 
 #[test]
