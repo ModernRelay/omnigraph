@@ -35,12 +35,16 @@ branch, for the actor the bearer token resolves to.
 
 A per-table ceiling is checked before any of that table's work starts. The
 fragment, row, byte and blob ceilings are measured from the table's compaction
-plan; `_MAX_INDEX_ROWS` counts all of the table's rows, and only when the table
+plan; `_MAX_INDEX_ROWS` counts the table's live rows, and only when the table
 has index work. A table over one is `deferred` with reason `resource_limit`:
 the run does not compact it, rebuild its lagging indexes or rewrite its dropped
 properties, and goes on to the next table. This does not move the resume
 position (`resume_at`), so every later run defers that table again until a
-ceiling is raised or a direct run optimizes it. The run byte budget defers,
+ceiling is raised or a direct run optimizes it. After a direct run, the next
+write that adds rows leaves rows that the index on the table's id does not
+cover, so the table has index work again. A table with more live rows than
+`_MAX_INDEX_ROWS` is therefore deferred again after any such write, and while
+it gets writes only a direct run optimizes it. The run byte budget defers,
 with reason `byte_budget`, the first table that would take the run past it and
 every table after it, and the run resumes there.
 

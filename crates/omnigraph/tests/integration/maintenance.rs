@@ -621,7 +621,8 @@ async fn optimize_defers_a_table_over_a_ceiling_and_writes_nothing_for_it() {
 /// the new fragments (Lance 13 drops coverage only for zone-map, Bloom and FM
 /// indexes, which the engine does not build), so compaction alone is no index
 /// work: the index-rows ceiling counts only a rebuild the plan already shows,
-/// and the rewrite publishes as one link with no fold after it.
+/// and the rewrite publishes as one link with no fold after it. A later write
+/// that adds rows is index work again, so the ceiling defers the table again.
 #[tokio::test]
 async fn optimize_rewrite_keeps_index_coverage_so_index_rows_count_only_a_lagging_rebuild() {
     let dir = tempfile::tempdir().unwrap();
@@ -707,6 +708,59 @@ async fn optimize_rewrite_keeps_index_coverage_so_index_rows_count_only_a_laggin
     assert!(
         settled.tables.iter().all(|stat| !stat.committed()),
         "every index still covers every fragment: {settled:?}"
+    );
+
+    // A write that adds rows leaves them outside the id index, so the table
+    // has index work again and the ceiling counts its live rows on every run
+    // until a run without it folds the index, as
+    // docs/user/operations/recorded-operations.md (Table ceilings and the
+    // byte budget) says.
+    db.load_jsonl(
+        &serde_json::json!({
+            "type": "Doc",
+            "data": {"slug": "d4", "n": 4, "embedding": [4.0, 0.0, 0.0, 0.0]},
+        })
+        .to_string(),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let pin = doc_pin(&db).await;
+    for _ in 0..2 {
+        let report = db
+            .optimize_as(
+                None,
+                OptimizeRequest::default().with_limits(
+                    OptimizeLimits::default()
+                        .with_table_ceilings(TableCeilings::default().with_index_rows(1)),
+                ),
+            )
+            .await
+            .unwrap();
+        let doc = report
+            .tables
+            .iter()
+            .find(|stat| stat.type_key == "node:Doc")
+            .unwrap();
+        let TableOptimizeOutcome::Deferred(DeferReason::ResourceLimit(exceeded)) = doc.outcome
+        else {
+            panic!("a write that adds rows is index work again: {doc:?}");
+        };
+        assert_eq!(exceeded.measure, ResourceMeasure::IndexRows);
+        assert_eq!(exceeded.measured, Some(5), "the table's live rows");
+        assert_eq!(report.resume_at, None);
+        assert_eq!(doc_pin(&db).await, pin, "a deferred table writes nothing");
+    }
+    let report = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        report
+            .tables
+            .iter()
+            .any(|stat| stat.type_key == "node:Doc" && stat.committed()),
+        "a run without the ceiling optimizes it: {report:?}"
     );
 }
 
