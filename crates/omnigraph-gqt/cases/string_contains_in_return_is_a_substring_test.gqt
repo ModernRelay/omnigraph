@@ -22,7 +22,6 @@ node Person {
 {"type":"Person","data":{"slug":"b","name":"Bob","tags":["go"]}}
 
 --- query
-set engine = v2;
 query substring_and_membership() {
     match { $p: Person }
     return { $p.slug, contains($p.name, "li") as hit, "rust" in $p.tags as tagged }

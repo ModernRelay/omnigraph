@@ -23,7 +23,6 @@ edge Likes: Person -> Person
 {"edge":"Likes","from":"p2","to":"p4"}
 
 --- query
-set engine = v2;
 query budgeted_two_hops() {
     match { $p: Person, $p (knows | likes){1,2} $q }
     where $p.name = "alice"

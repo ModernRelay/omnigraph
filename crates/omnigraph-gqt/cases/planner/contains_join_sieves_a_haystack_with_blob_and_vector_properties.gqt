@@ -29,7 +29,6 @@ node Passage {
 {"type":"Passage","data":{"pid":"p-null"}}
 
 --- query
-set engine = v2;
 query found_numbers() {
     match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number)

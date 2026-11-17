@@ -27,7 +27,6 @@ edge Knows: Person -> Doc
 {"edge":"Knows","from":"p1","to":"a"}
 
 --- query
-set engine = v2;
 query nearest_person_docs($q: Vector(2)) {
     match { let $pop = { match { $p: Person, $d: Doc, $p knows $d } return { $p, $d } }, from nearest($pop, $p.embedding, $q, k: 2) as $distance }
     return { $p.name, $d.slug }

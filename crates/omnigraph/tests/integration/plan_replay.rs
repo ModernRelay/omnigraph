@@ -616,7 +616,7 @@ async fn citations(dir: &tempfile::TempDir) -> Session {
     db.load_jsonl(&CITATION_SEED.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    with_setting(&db, "engine", "v2")
+    db.clone()
 }
 
 async fn people(dir: &tempfile::TempDir) -> Session {
@@ -628,7 +628,7 @@ async fn people(dir: &tempfile::TempDir) -> Session {
     db.load_jsonl(&PEOPLE_SEED.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    with_setting(&db, "engine", "v2")
+    db.clone()
 }
 
 async fn docs(dir: &tempfile::TempDir) -> Session {
@@ -650,7 +650,7 @@ async fn docs(dir: &tempfile::TempDir) -> Session {
     db.load_jsonl(&seed.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    with_setting(&db, "engine", "v2")
+    db.clone()
 }
 
 fn rows_of(result: &omnigraph_compiler::result::QueryResult) -> Vec<Value> {

@@ -20,7 +20,6 @@ node Person {
 {"type":"Person","data":{"slug":"gamma","age":33}}
 
 --- query
-set engine = v2;
 query either() {
     match { $p: Person } where ($p.slug = "alpha" or $p.slug = "beta")
     return { $p.age }
@@ -34,7 +33,6 @@ p.age: I32
 not pass key_to_id
 
 --- query
-set engine = v2;
 query nested() {
     match { $p: Person } where (($p.slug = "alpha" and $p.age = 11) or $p.slug = "gamma")
     return { $p.age }
@@ -48,7 +46,6 @@ p.age: I32
 not pass key_to_id
 
 --- query
-set engine = v2;
 query negated() {
     match { $p: Person } where not $p.slug = "alpha"
     return { $p.age }
@@ -62,7 +59,6 @@ p.age: I32
 not pass key_to_id
 
 --- query
-set engine = v2;
 query unequal() {
     match { $p: Person } where $p.slug != "alpha"
     return { $p.age }
@@ -76,7 +72,6 @@ p.age: I32
 not pass key_to_id
 
 --- query
-set engine = v2;
 query contradictory() {
     match { $p: Person } where $p.slug = "alpha" and $p.slug = "beta"
     return { $p.age }
@@ -87,7 +82,6 @@ query contradictory() {
 p.age: I32
 
 --- query
-set engine = v2;
 query contradictory_reversed() {
     match { $p: Person } where $p.slug = "beta" and $p.slug = "alpha"
     return { $p.age }
@@ -98,7 +92,6 @@ query contradictory_reversed() {
 p.age: I32
 
 --- query
-set engine = v2;
 query repeated() {
     match { $p: Person } where $p.slug = "alpha" and $p.slug = "alpha"
     return { $p.age }
@@ -111,7 +104,6 @@ p.age: I32
 pass key_to_id
 
 --- query
-set engine = v2;
 query after_a_negative_literal() {
     match { $p: Person } where $p.age > -1 and $p.slug = "beta"
     return { $p.age }

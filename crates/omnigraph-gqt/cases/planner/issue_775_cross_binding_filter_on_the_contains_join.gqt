@@ -44,7 +44,6 @@ edge PassageOfRevision: Passage -> SourceRevision
 {"edge":"PassageOfRevision","from":"p6","to":"r-two"}
 
 --- query
-set engine = v2;
 query cross_binding_filter_stays_below_traversal() {
     match {
         $m: Matter,
@@ -76,7 +75,6 @@ scan Passage as $p: runtime filter text
 pass join_algorithm
 
 --- query
-set engine = v2;
 query passage_reached_by_the_traversal() {
     match { $m: Matter, let $rs = { match { $r: SourceRevision, $p: Passage, $p passageOfRevision $r } return { $r, $p } }, from $rs }
     where contains($p.text, $m.number) and $r.matter_number != $m.number

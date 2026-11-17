@@ -24,7 +24,6 @@ edge Knows: T -> T
 {"edge":"Knows","from":"a","to":"b"}
 
 --- query
-set engine = v2;
 query plain() {
     match { $c: T }
     return { $c.state }
@@ -40,7 +39,6 @@ scan T as $c: columns [slug, state]
 pass projection_pushdown
 
 --- query
-set engine = v2;
 query contribute() {
     match { $c: T } where $c.state = "open"
     return { $c.rank, count($c.slug) as n }
@@ -55,7 +53,6 @@ n: I64
 scan T as $c: columns [slug, state, rank]
 
 --- query
-set engine = v2;
 query entity() {
     match { $c: T }
     return { $c }
@@ -70,7 +67,6 @@ c: T
 scan T as $c: columns [__id, slug, state, rank, kind, kind_ref]
 
 --- query
-set engine = v2;
 query leading_nearest() {
     match { let $pop = { match { $c: T } return { $c } }, from nearest($pop, $c.embedding, [1.0, 0.0], k: 1) as $distance }
     return { $c.slug }
@@ -85,7 +81,6 @@ c.slug: String
 scan T as $c: columns [__id, slug]
 
 --- query
-set engine = v2;
 query negated() {
     match { $c: T } where not exists { $x: T where $x.kind = $c.kind_ref }
     return { $c.slug }
@@ -98,7 +93,6 @@ scan T as $c: columns [__id, slug, kind_ref]
 scan T as $x: columns [slug, kind]
 
 --- query
-set engine = v2;
 query destination() {
     match { $a: T, $a knows $b } where $a.state = "open" and $b.kind = $a.kind_ref
     return { $b.slug }
@@ -114,7 +108,6 @@ scan T as $b: no filter
 filter reads [b.kind, a.kind_ref]
 
 --- query
-set engine = v2;
 query unused_binding() {
     match { $c: T, let $ds = { match { $d: T } return { $d } }, from $ds }
     return { $c.slug }

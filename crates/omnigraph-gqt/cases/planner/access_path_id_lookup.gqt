@@ -100,7 +100,6 @@ edge Links: Source -> Doc
 {"edge":"Links","from":"s4","to":"f"}
 
 --- query
-set engine = v2;
 query open_needles() {
     match { $s: Source, $s links $d, $d: Doc }
     where $d.state = "open" and match_terms($d.body, terms("needle", mode: any))
@@ -122,7 +121,6 @@ scan Doc as $d: filter reads [d.state]
 pass access_path
 
 --- query
-set engine = v2;
 query member_needles($states: [String]) {
     match { $s: Source, $s links $d }
     where $d.state in $states and match_terms($d.body, terms("needle", mode: any))
@@ -146,7 +144,6 @@ scan Doc as $d: filter reads [d.state]
 pass access_path
 
 --- query
-set engine = v2;
 query every_link() {
     match { $s: Source, $s links $d }
     return { $s.slug, $d.slug }
@@ -170,7 +167,6 @@ scan Doc as $d: no filter
 pass access_path
 
 --- query
-set engine = v2;
 query open_needle_beacons() {
     match { $s: Source, $s links $d, $d: Doc }
     where $d.state = "open"

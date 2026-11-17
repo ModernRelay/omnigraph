@@ -26,7 +26,6 @@ node Person {
 {"type":"Person","data":{"slug":"dave","name":"Dave","stage":"open"}}
 
 --- query
-set engine = v2;
 query same_property_or() {
     match { $p: Person } where ($p.name = "Alice" or $p.name = "Bob")
     return { $p.slug }
@@ -40,7 +39,6 @@ query same_property_or() {
 p.slug: String
 
 --- query
-set engine = v2;
 query cross_property_or_returns_a_double_match_once() {
     match { $p: Person } where ($p.name = "Alice" or $p.age > 30)
     return { $p.slug }
@@ -54,7 +52,6 @@ query cross_property_or_returns_a_double_match_once() {
 p.slug: String
 
 --- query
-set engine = v2;
 query nested_grouping($cut: I64) {
     match { $p: Person }
     where ($p.stage = "open" or $p.stage = "paused") and not $p.age < $cut
@@ -71,7 +68,6 @@ query nested_grouping($cut: I64) {
 p.slug: String
 
 --- query
-set engine = v2;
 query parameters_in_both_arms($first: String, $second: String) {
     match { $p: Person } where ($p.name = $first or $p.name = $second)
     return { $p.slug }

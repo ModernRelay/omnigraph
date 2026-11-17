@@ -19,7 +19,6 @@ node Person {
 {"type":"Person","data":{"slug":"beta","age":22}}
 
 --- query
-set engine = v2;
 query by_block($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }
@@ -36,7 +35,6 @@ pass key_to_id
 pass scan_access
 
 --- query
-set engine = v2;
 query by_block($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }
@@ -51,7 +49,6 @@ p.age: I32
 pass key_to_id
 
 --- query
-set engine = v2;
 query by_block($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }
@@ -67,7 +64,6 @@ scan Person as $p: access index_probe __id
 pass key_to_id
 
 --- query
-set engine = v2;
 query nullable_typed($s: String?) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }

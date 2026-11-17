@@ -28,7 +28,6 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","id":"e004_0","from":"d004","to":"d005","data":{}}
 
 --- query
-set engine = v2;
 query fused_v2($q: Vector(4), $t: String) {
     match {
       let $all = { match { $d: Doc } return { $d } },

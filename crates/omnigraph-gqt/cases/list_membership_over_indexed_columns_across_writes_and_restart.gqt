@@ -36,7 +36,6 @@ edge Holds: Root -> Item
 {"edge":"Holds","from":"root","to":"z"}
 
 --- query
-set engine = v2;
 query membership_of_a_node() {
     match { $r: Root }
     where $r in $i
@@ -46,7 +45,6 @@ query membership_of_a_node() {
 --- expect error: T6: variable `$i` is not bound
 
 --- query
-set engine = v2;
 query indexed_identity($ids: [String]) {
     match { $i: Item }
     where $i.@id in $ids
@@ -70,7 +68,6 @@ pass predicate_pushdown
 
 
 --- query
-set engine = v2;
 query indexed_integer() {
     match { $i: Item }
     where $i.code in [1, 3, 7, 9]
@@ -91,7 +88,6 @@ pass predicate_pushdown
 
 
 --- query
-set engine = v2;
 query indexed_date($days: [Date]) {
     match { $i: Item }
     where $i.day in $days
@@ -115,7 +111,6 @@ pass predicate_pushdown
 
 
 --- query
-set engine = v2;
 query string_without_an_index() {
     match { $i: Item }
     where $i.word in ["alpha", "gamma", "theta", "omega"]
@@ -136,7 +131,6 @@ pass predicate_pushdown
 
 
 --- query
-set engine = v2;
 query indexed_negated() {
     match { $i: Item }
     where not ($i.code in [1, 3, 7, 9])
@@ -166,7 +160,6 @@ query append_tail() {
 --- expect affected: nodes=2 edges=2
 
 --- query
-set engine = v2;
 query tail_identity($ids: [String]) {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.@id in $ids
@@ -192,7 +185,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query tail_integer() {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.code in [1, 3, 7, 9]
@@ -215,7 +207,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query tail_date($days: [Date]) {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.day in $days
@@ -241,7 +232,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query tail_string() {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.word in ["alpha", "gamma", "theta", "omega"]
@@ -274,7 +264,6 @@ query change_covered_rows() {
 --- expect affected: nodes=2 edges=0
 
 --- query
-set engine = v2;
 query updated_integer() {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.code in [1, 3, 7, 9]
@@ -297,7 +286,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query updated_date($days: [Date]) {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.day in $days
@@ -323,7 +311,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query updated_string() {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.word in ["alpha", "gamma", "theta", "omega"]
@@ -354,7 +341,6 @@ query delete_covered_member() {
 --- expect affected: nodes=1 edges=1
 
 --- query
-set engine = v2;
 query deleted_identity($ids: [String]) {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.@id in $ids
@@ -379,7 +365,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query deleted_integer() {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.code in [1, 3, 7, 9]
@@ -401,7 +386,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query deleted_negated() {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and not ($i.code in [1, 3, 7, 9])
@@ -425,7 +409,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 --- restart
 
 --- query
-set engine = v2;
 query reopened_identity($ids: [String]) {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.@id in $ids
@@ -450,7 +433,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query reopened_integer() {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.code in [1, 3, 7, 9]
@@ -472,7 +454,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query reopened_date($days: [Date]) {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.day in $days
@@ -497,7 +478,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query reopened_string() {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and $i.word in ["alpha", "gamma", "theta", "omega"]
@@ -519,7 +499,6 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query reopened_negated() {
     match { $r: Root, $r holds $i }
     where $r.rid = "root" and not ($i.code in [1, 3, 7, 9])

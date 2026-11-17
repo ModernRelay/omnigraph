@@ -49,7 +49,6 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 {"edge":"ChunkOfArtifact","id":"e-z19","from":"chunk-z19","to":"art-0","data":{"label":"of"}}
 
 --- query
-set engine = v2;
 query recall($q: String) {
     match {
       let $pop = { match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } where match_terms($c.text, terms($q, mode: any)) return { $c, $a } },
@@ -71,7 +70,6 @@ c.slug: String
 a.slug: String
 
 --- query
-set engine = v2;
 query root_tie($q: String) {
     match { let $pop = { match { $c: Chunk } return { $c } }, from bm25($pop, $c.text, $q) as $score }
     return { $c.slug }

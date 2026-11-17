@@ -33,7 +33,6 @@ node Doc {
 {"type":"Doc","data":{"slug":"d11","title":"t-11","body":"body 11","text":"filler filler filler filler","embedding":[11.0,0.0]}}
 
 --- query
-set engine = v2;
 query fused_top_two($q: Vector(2), $t: String) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 2), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
     return { $d.slug, $d.body, $d.title }
@@ -59,7 +58,6 @@ scan Doc as $d: ranked nearest fetch 2
 fuse $d: arms [nearest, bm25]
 
 --- query
-set engine = v2;
 query ranked_top_two($t: String) {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $t) as $score }
     return { $d.slug, $d.body, $d.title }

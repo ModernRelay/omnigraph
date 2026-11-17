@@ -26,7 +26,6 @@ query delete_main() { match { $x: Doc } where $x.slug = "a"  delete $x }
 --- expect affected: nodes=1 edges=0
 
 --- query branch: main
-set engine = v2;
 query count_docs() { match { $d: Doc } return { count($d) as n } }
 
 --- expect unordered
@@ -39,7 +38,6 @@ n: I64
 pass aggregate_pushdown
 
 --- query branch: saved
-set engine = v2;
 query count_docs() { match { $d: Doc } return { count($d) as n } }
 
 --- expect unordered
@@ -57,7 +55,6 @@ query delete_saved() { match { $x: Doc } where $x.slug = "b"  delete $x }
 --- expect affected: nodes=1 edges=0
 
 --- query branch: saved
-set engine = v2;
 query count_docs() { match { $d: Doc } return { count($d) as n } }
 
 --- expect unordered
@@ -75,7 +72,6 @@ query delete_remaining() { match { $x: Doc } where $x.slug != "a"  delete $x }
 --- expect affected: nodes=2 edges=0
 
 --- query branch: main
-set engine = v2;
 query count_docs() { match { $d: Doc } return { count($d) as n } }
 
 --- expect unordered
@@ -88,7 +84,6 @@ n: I64
 pass aggregate_pushdown
 
 --- query branch: saved
-set engine = v2;
 query count_docs() { match { $d: Doc } return { count($d) as n } }
 
 --- expect unordered

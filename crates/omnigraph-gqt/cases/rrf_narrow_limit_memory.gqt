@@ -19,7 +19,6 @@ tables:
       slug: {kind: key, prefix: "", width: 6}
       text: {kind: literal, value: needle}
 --- query
-set engine = v2;
 set query_memory_bytes = 4194304;
 query narrow_fused_limit() {
   match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: 60) as $score }

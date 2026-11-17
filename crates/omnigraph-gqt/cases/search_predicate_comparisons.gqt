@@ -21,7 +21,6 @@ node Doc {
 {"type":"Doc","data":{"slug":"e","text":"haystack"}}
 
 --- query
-set engine = v2;
 query compared_with_false() {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) = false
     return { $d.slug }
@@ -36,7 +35,6 @@ d.slug: String
 --- expect same as reference
 
 --- query
-set engine = v2;
 query not_equal_to_true() {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) != true
     return { $d.slug }
@@ -51,7 +49,6 @@ d.slug: String
 --- expect same as reference
 
 --- query
-set engine = v2;
 query less_than_true() {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) < true
     return { $d.slug }
@@ -66,7 +63,6 @@ d.slug: String
 --- expect same as reference
 
 --- query
-set engine = v2;
 query compared_with_a_parameter($enabled: Bool) {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) = $enabled
     return { $d.slug }
@@ -84,7 +80,6 @@ d.slug: String
 --- expect same as reference
 
 --- query
-set engine = v2;
 query true_compared_with_it() {
     match { $d: Doc } where true = match_terms($d.text, terms("needle", mode: any))
     return { $d.slug }
@@ -99,7 +94,6 @@ d.slug: String
 --- expect same as reference
 
 --- query
-set engine = v2;
 query match_text_compared_with_false() {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) = false
     return { $d.slug }
@@ -114,7 +108,6 @@ d.slug: String
 --- expect same as reference
 
 --- query
-set engine = v2;
 query fuzzy_compared_with_false() {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any, max_edits: 2)) = false
     return { $d.slug }
@@ -129,7 +122,6 @@ d.slug: String
 --- expect same as reference
 
 --- query
-set engine = v2;
 query accepted_joined_by_and() {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) and $d.slug = "d"
     return { $d.slug }

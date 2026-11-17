@@ -77,7 +77,6 @@ refuses startup; no default is substituted.
 
 | Name | Type and values | Default | Scope | Process default variable | What it chooses |
 |---|---|---|---|---|---|
-| `engine` | enum `v2` | `v2` | request | `OMNIGRAPH_ENGINE` | the engine a read query runs on; `v2`, the plan runner, is the only value, and `v1` is refused as an unknown value; this setting does not change change-feed or merge execution |
 | `rrf_plan` | enum `auto`, `force_prefilter`, `force_postfilter` | `auto` | process | `OMNIGRAPH_RRF_PLAN` | the prefilter gate of a traversal-constrained `nearest`, an `rrf` arm included: decide by size, or force one plan, for diagnosis |
 | `merge_lineage` | enum `off`, `on`, `verify` | `on` (a debug build defaults to `verify`) | request | `OMNIGRAPH_MERGE_LINEAGE` | how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared |
 | `change_lineage` | enum `off`, `on`, `verify` | `on` (a debug build defaults to `verify`) | request | `OMNIGRAPH_CHANGE_LINEAGE` | how a graph diff or commit page finds the entities it compares across a window with no adjacent transaction: the exact ordered merge of both versions, the entities paired by stable identity, or both compared |
@@ -172,7 +171,7 @@ settings line's refusal as `ERROR line <n>, column <c>: <message>`.
 set merge_lineage = fast;
 error: unknown value `fast` for setting `merge_lineage`; expected one of off, on, verify
 set traversal = csr;                      (likewise reset traversal; and show traversal;)
-error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, change_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, read_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir
+error: unknown setting `traversal`; expected one of rrf_plan, merge_lineage, change_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, read_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir
 set ann_nprobes = "many";
 error: setting `ann_nprobes` takes an integer of at least 0, got a string
 set stage_write_concurrency = 0;

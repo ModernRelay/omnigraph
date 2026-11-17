@@ -25,7 +25,6 @@ node Person {
 {"type":"Person","data":{"slug":"p4","name":"alice","age":30}}
 
 --- query
-set engine = v2;
 query ages_then_names() {
     match { $p: Person }
     return distinct { $p.age, $p.name }

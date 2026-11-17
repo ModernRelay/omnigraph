@@ -21,7 +21,6 @@ node Person {
 {"type":"Person","data":{"slug":"c"}}
 
 --- query
-set engine = v2;
 query pushed_not_contains() {
     match { $p: Person } where not (contains($p.name, "li"))
     return { $p.slug }
@@ -38,7 +37,6 @@ pass predicate_pushdown
 scan Person as $p: filter reads [p.name]
 
 --- query
-set engine = v2;
 query pushed_not_starts_with() {
     match { $p: Person } where not (starts_with($p.name, "a"))
     return { $p.slug }
@@ -51,7 +49,6 @@ query pushed_not_starts_with() {
 p.slug: String
 
 --- query
-set engine = v2;
 query pushed_not_list_contains() {
     match { $p: Person } where not ("rust" in $p.tags)
     return { $p.slug }
@@ -64,7 +61,6 @@ query pushed_not_list_contains() {
 p.slug: String
 
 --- query
-set engine = v2;
 query null_parameter_needle($needle: String?) {
     match { $p: Person } where not (contains($p.name, $needle))
     return { $p.slug }
@@ -79,7 +75,6 @@ query null_parameter_needle($needle: String?) {
 p.slug: String
 
 --- query
-set engine = v2;
 query residual_not_contains() {
     match { $p: Person, $q: Person }
     where $q.slug = "a" and not (contains($p.name, $q.name))
@@ -97,7 +92,6 @@ scan Person as $p: no filter
 filter reads [p.name, q.name]
 
 --- query
-set engine = v2;
 query residual_not_starts_with() {
     match { $p: Person, $q: Person }
     where $q.slug = "b" and not (starts_with($p.name, $q.name))
@@ -111,7 +105,6 @@ query residual_not_starts_with() {
 p.slug: String
 
 --- query
-set engine = v2;
 query residual_not_list_contains() {
     match { $p: Person, $q: Person }
     where $q.slug = "a" and not ($q.name in $p.tags)

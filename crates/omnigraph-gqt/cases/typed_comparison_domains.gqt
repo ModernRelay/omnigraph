@@ -31,7 +31,6 @@ edge Link: Number -> Number {
 {"edge":"Link","from":"a","to":"b","data":{"n":9007199254740993,"f":0.1}}
 
 --- query
-set engine = v2;
 query integer_node_literal() {
     match { $x: Number } where $x.n > 9007199254740992.0
     return { $x.key }
@@ -48,7 +47,6 @@ type $x.n: I64
 --- expect same as reference
 
 --- query
-set engine = v2;
 query integer_edge_literal() {
     match { $x: Number, $x $e:link $y } where $e.n > 9007199254740992.0
     return { $x.key }
@@ -64,7 +62,6 @@ type $e.n: I64
 --- expect same as reference
 
 --- query
-set engine = v2;
 query integer_projection_literal() {
     match { $x: Number }
     return { $x.key, $x.n > 9007199254740992.0 as above }
@@ -82,7 +79,6 @@ no cast 9007199254740992.0
 --- expect same as reference
 
 --- query
-set engine = v2;
 query f32_node_nonrepresentable_literal() {
     match { $x: Number } where $x.f = 0.1
     return { $x.key }
@@ -97,7 +93,6 @@ type 0.1: F64
 --- expect same as reference
 
 --- query
-set engine = v2;
 query f32_edge_nonrepresentable_literal() {
     match { $x: Number, $x $e:link $y } where $e.f = 0.1
     return { $x.key }
@@ -112,7 +107,6 @@ type 0.1: F64
 --- expect same as reference
 
 --- query
-set engine = v2;
 query f32_exact_literal() {
     match { $x: Number } where $x.f = 0.10000000149011612
     return { $x.key }
@@ -128,7 +122,6 @@ no cast $x.f
 --- expect same as reference
 
 --- query
-set engine = v2;
 query declared_f64_parameter($bound: F64) {
     match { $x: Number } where $x.f = $bound
     return { $x.key }
@@ -145,7 +138,6 @@ type $bound: F64
 --- expect same as reference
 
 --- query
-set engine = v2;
 query declared_f64_parameter($bound: F64) {
     match { $x: Number } where $x.f = $bound
     return { $x.key }
@@ -163,7 +155,6 @@ type $bound: F64
 --- expect same as reference
 
 --- query
-set engine = v2;
 query declared_f32_parameter($bound: F32) {
     match { $x: Number } where $x.f = $bound
     return { $x.key }
@@ -182,7 +173,6 @@ type $bound: F32
 --- expect same as reference
 
 --- query
-set engine = v2;
 query integer_fractional_literal() {
     match { $x: Number } where $x.small > 2.5
     return { $x.key }
@@ -198,7 +188,6 @@ type 2.5: F64
 --- expect same as reference
 
 --- query
-set engine = v2;
 query unsigned_negative_parameter($bound: I64) {
     match { $x: Number } where $x.u > $bound
     return { $x.key }
@@ -217,7 +206,6 @@ cast $bound: I64 -> exact_integer
 --- expect same as reference
 
 --- query
-set engine = v2;
 query signed_list_float_literal() {
     match { $x: Number }
     return { $x.key, 9007199254740992.0 in $x.ns as member }
@@ -235,7 +223,6 @@ no cast 9007199254740992.0
 --- expect same as reference
 
 --- query
-set engine = v2;
 query literal_list_of_whole_floats() {
     match { $x: Number }
     return { $x.key, $x.n in [9007199254740992.0] as member }
@@ -254,7 +241,6 @@ no cast [9007199254740992.0]
 --- expect same as reference
 
 --- query
-set engine = v2;
 query literal_list_one_common_domain() {
     match { $x: Number }
     return { $x.key, $x.n in [9007199254740992.0, 1.5] as member }
@@ -272,7 +258,6 @@ type [9007199254740992.0, 1.5]: [F64]
 --- expect same as reference
 
 --- query
-set engine = v2;
 query unsigned_list_negative_needle($needle: I64) {
     match { $x: Number }
     return { $x.key, $needle in $x.us as member }
@@ -292,7 +277,6 @@ cast $needle: I64 -> exact_integer
 --- expect same as reference
 
 --- query
-set engine = v2;
 query f32_list_nonrepresentable_needle() {
     match { $x: Number } where 0.1 in $x.fs
     return { $x.key }
@@ -307,7 +291,6 @@ type 0.1: F64
 --- expect same as reference
 
 --- query
-set engine = v2;
 query parameter_rounding_before_widening($small: F32, $wide: F64) {
     match { $x: Number }
     return { $x.key, $small = $wide as rounded }

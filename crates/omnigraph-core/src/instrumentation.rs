@@ -375,7 +375,7 @@ tokio::task_local! {
     static QUERY_MEMORY_LIMIT: u64;
 }
 
-/// Run `fut` with the engine v2 read route's memory pool capped at `bytes`
+/// Run `fut` with the read route's memory pool capped at `bytes`
 /// for every query it runs. Test-only entry point; nothing in production
 /// sets it, so the pool takes its constant.
 pub async fn with_query_memory_limit<F>(bytes: u64, fut: F) -> F::Output

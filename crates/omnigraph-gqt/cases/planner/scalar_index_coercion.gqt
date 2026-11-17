@@ -19,7 +19,6 @@ node Person {
 {"type":"Person","data":{"slug":"beta","age":22}}
 
 --- query
-set engine = v2;
 query reversed() {
     match { $p: Person } where 11 = $p.age
     return { $p.slug }
@@ -40,7 +39,6 @@ query append_person() {
 --- expect affected: nodes=1 edges=0
 
 --- query
-set engine = v2;
 query partial() {
     match { $p: Person } where $p.age = 11
     return { $p.slug }
@@ -54,7 +52,6 @@ p.slug: String
 scan Person as $p: access index_probe age
 
 --- query
-set engine = v2;
 query appended_key() {
     match { $p: Person } where $p.slug = "gamma"
     return { $p.slug }

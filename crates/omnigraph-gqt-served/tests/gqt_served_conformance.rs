@@ -10,18 +10,17 @@
 //! empty served set): `cargo test -p omnigraph-server --test
 //! gqt_served_conformance -- --nocapture` prints one line per case.
 //!
-//! The server boots with the same `engine` default the corpus seeds from
-//! `OMNIGRAPH_GQ_ENGINE`, unauthenticated, with no policy, so a verdict
-//! difference is a route or rendering difference, never an engine one.
+//! The server boots under the definition's default settings, as the corpus
+//! session does, unauthenticated, with no policy, so a verdict difference is
+//! a route or rendering difference, never an engine one.
 #![recursion_limit = "512"]
 
 use std::path::Path;
 
 use omnigraph::db::Omnigraph;
-use omnigraph::settings::SessionSettings;
 use omnigraph_gqt::ServerTarget;
 use omnigraph_gqt_core::{Case, Execution};
-use omnigraph_server::{AppState, ProcessDefaults, build_app};
+use omnigraph_server::{AppState, build_app};
 
 fn case(path: &Path) -> datatest_stable::Result<()> {
     if let Some(reason) = omnigraph_gqt::settings_override_refusal(std::env::var_os) {
@@ -90,7 +89,6 @@ async fn served_verdict(case: &Case) -> Result<(), String> {
         .fixture
         .as_ref()
         .ok_or("conformance needs a case with schema and seed")?;
-    let engine = omnigraph_gqt::engine_from_env()?;
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
     let uri = dir
         .path()
@@ -102,16 +100,9 @@ async fn served_verdict(case: &Case) -> Result<(), String> {
             .await
             .map_err(|e| format!("init failed: {e}"))?,
     );
-    let settings = SessionSettings::default()
-        .with("engine", engine.as_str())
-        .map_err(|e| format!("engine default: {e}"))?;
     let state = AppState::open(&uri)
         .await
-        .map_err(|e| format!("server boot failed: {e}"))?
-        .with_process_defaults(ProcessDefaults {
-            settings,
-            ..ProcessDefaults::default()
-        });
+        .map_err(|e| format!("server boot failed: {e}"))?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("bind failed: {e}"))?;

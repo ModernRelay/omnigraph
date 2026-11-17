@@ -32,7 +32,6 @@ query assign($xs: [I64]) {
 --- expect affected: nodes=1 edges=0
 
 --- query
-set engine = v2;
 query read($xs: [I64]) {
     match { $p: Person }
     return { $p.adult, 1.0 in $xs as projected, 2.0 in $xs as absent, 1.0 in [1] as folded }

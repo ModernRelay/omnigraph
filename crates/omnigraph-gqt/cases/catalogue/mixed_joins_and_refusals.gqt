@@ -21,7 +21,6 @@ node Job {
 {"type":"Job","data":{"name":"adhoc","uses":"Teleport"}}
 
 --- query
-set engine = v2;
 query jobs_with_a_real_operator() {
     match { $j: Job, let $os = { match { $o: @Operator } return { $o } }, from $os } where $j.uses = $o.name
     return { $j.name, $o.inputs }
@@ -37,7 +36,6 @@ j.name: String
 o.inputs: [I64]
 
 --- query
-set engine = v2;
 query jobs_naming_no_operator() {
     match { $j: Job }
     where not exists { $o: @Operator where $o.name = $j.uses }
@@ -66,7 +64,6 @@ query add_operator() {
 --- expect error: catalogue type `@Operator` is read-only
 
 --- query
-set engine = v2;
 query search_operators($q: String) {
     match { $o: @Operator } where match_terms($o.name, terms($q, mode: any))
     return { $o.name }

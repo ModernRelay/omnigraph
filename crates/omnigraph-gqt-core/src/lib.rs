@@ -29,7 +29,7 @@ use omnigraph_compiler::query::syntax::{
 use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::schema::ast::{Annotation, PropDecl, SchemaDecl};
 use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::settings::{Engine, SessionSettings, SettingId, SettingRow, Traversal};
+use omnigraph_compiler::settings::{SessionSettings, SettingId, SettingRow, Traversal};
 use omnigraph_compiler::{
     JsonParamMode, PropType, QueryResult, ScalarType, json_params_to_param_map,
 };
@@ -5220,13 +5220,10 @@ pub async fn run_session(
     }
 }
 
-/// The case session: the definition's defaults over the fresh handle, the
-/// runner's `engine` (`OMNIGRAPH_GQ_ENGINE`) as the baseline `engine` row,
-/// then the `# traversal:` pin on the harness-only field no `show` reports.
-pub fn case_session(db: Omnigraph, case: &Case, engine: Engine) -> Result<Session, String> {
-    let mut settings = SessionSettings::default()
-        .with("engine", engine.as_str())
-        .map_err(|e| format!("invalid_case: {e}"))?;
+/// The case session: the definition's defaults over the fresh handle, then
+/// the `# traversal:` pin on the harness-only field no `show` reports.
+pub fn case_session(db: Omnigraph, case: &Case) -> Result<Session, String> {
+    let mut settings = SessionSettings::default();
     if let Some(mode) = case.traversal {
         let pinned = Traversal::from_spelling(mode).ok_or_else(|| {
             format!("`# traversal: {mode}` refused: expected one of auto, indexed, csr")

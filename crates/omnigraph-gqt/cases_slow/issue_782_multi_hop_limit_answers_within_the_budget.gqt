@@ -4126,7 +4126,6 @@ edge Knows: Person -> Person
 {"edge":"Knows","from":"hub","to":"t1023"}
 
 --- query
-set engine = v2;
 query any_reached() {
     match { $p: Person, $p knows{1,2} $f }
     return { $f.role }
@@ -4139,7 +4138,6 @@ query any_reached() {
 f.role: String
 
 --- query
-set engine = v2;
 query pair_count() {
     match { $p: Person, $p knows{1,2} $f }
     return { count($f) as n }

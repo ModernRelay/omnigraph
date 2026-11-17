@@ -22,7 +22,6 @@ edge Knows: Person -> Person
 {"edge":"Knows","from":"middle","to":"end"}
 
 --- query
-set engine = v2;
 query two_hops() {
     match { $a: Person, $a knows{1,2} $b }
     where $a.name = "start"
@@ -50,7 +49,6 @@ query link_side() {
 --- expect affected: nodes=0 edges=1
 
 --- query
-set engine = v2;
 query two_hops() {
     match { $a: Person, $a knows{1,2} $b }
     where $a.name = "start"

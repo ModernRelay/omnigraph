@@ -1,4 +1,4 @@
-//! Engine behavior a query runs by design: the v2 plan nodes and their operators.
+//! Engine behavior a query runs by design: the plan nodes and their operators.
 
 use arrow_array::{Array, Int64Array};
 use serial_test::serial;
@@ -50,7 +50,7 @@ query whole_docs() {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let db = vector_doc_graph(&dir).await;
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
 
     fn sorted_projections(probes: &QueryIoProbes) -> Vec<Option<Vec<String>>> {
         probes
@@ -202,7 +202,7 @@ async fn fan_out_graph(dir: &tempfile::TempDir, leaves: usize) -> omnigraph::Ses
     db.load_jsonl(&fan_out_seed(leaves), LoadMode::Overwrite)
         .await
         .unwrap();
-    with_setting(&db, "engine", "v2")
+    db.clone()
 }
 
 /// Every v2 operator charges what it retains to the query's pool: 64 KiB
@@ -315,7 +315,7 @@ async fn expand_streams_a_single_hop_under_a_pool_the_pairs_would_not_fit() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
 
     let probes = QueryMemoryProbes::default();
     let answered = with_query_memory_probes(
@@ -410,7 +410,7 @@ async fn indexed_single_hop_switches_to_the_csr_between_input_batches() {
     db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap();
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
 
     let pinned = first_column_sorted(
         &query_main(
@@ -483,7 +483,7 @@ async fn explain_resolves_omitted_nullable_parameters_before_planning() {
         .await
         .unwrap();
     assert_eq!(omitted_plan, explicit_plan);
-    let source = format!("set engine = v2; explain {source}");
+    let source = format!("explain {source}");
     let omitted_rows = db.query("main", &source, "adults", &omitted).await.unwrap();
     let explicit_rows = db
         .query("main", &source, "adults", &explicit)
@@ -586,7 +586,7 @@ async fn a_streamed_scan_gathers_small_fragments_into_one_batch() {
             .await
             .unwrap();
     }
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
 
     let probes = QueryMemoryProbes::default();
     let answered = with_query_memory_probes(
@@ -711,7 +711,7 @@ async fn explain_search_uses_vector_params_without_initializing_embeddings() {
     use std::sync::atomic::Ordering;
 
     let dir = tempfile::tempdir().unwrap();
-    let v2 = with_setting(&vector_doc_graph(&dir).await, "engine", "v2");
+    let v2 = vector_doc_graph(&dir).await;
     for (ranking, ordering, parameter_type, values, available) in [
         (
             "let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance",
@@ -805,7 +805,7 @@ async fn rrf_order_runs_a_cross_join_over_multiple_probe_batches() {
             .unwrap(),
     );
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
-    let db = with_setting(&db, "engine", "v2");
+    let db = db.clone();
     let source = "query fused($t: Vector(2)) {\n    match {\n      let $all = { match { $d: Doc } return { $d } },\n      from rrf(nearest($all, $d.embedding, $t, k: 2), nearest($all, $d.embedding, [0.5, 0.5], k: 2), k: 60) as $score,\n      $d: Doc,\n      $p: Probe,\n    }\n    where $d.n = $p.n\n    return { $d.slug }\n    order { $score desc }\n    limit 1\n}";
     let result = query_main(
         &db,
@@ -916,7 +916,7 @@ query total($q: Vector(4)) {
             .unwrap(),
     );
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
-    let db = with_setting(&db, "engine", "v2");
+    let db = db.clone();
     let params = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
     for name in ["rows", "total"] {
         let explain = db

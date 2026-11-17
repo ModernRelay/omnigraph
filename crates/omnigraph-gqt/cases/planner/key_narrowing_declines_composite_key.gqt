@@ -21,7 +21,6 @@ node Pair {
 {"type":"Pair","data":{"first":"alan","last":"turing"}}
 
 --- query
-set engine = v2;
 query exact() {
     match { $p: Pair }
     where $p.first = "ada" and $p.last = "lovelace"
@@ -36,7 +35,6 @@ scan Pair as $p: access sequential
 not pass key_to_id
 
 --- query
-set engine = v2;
 query first_only() {
     match { $p: Pair }
     where $p.first = "ada"

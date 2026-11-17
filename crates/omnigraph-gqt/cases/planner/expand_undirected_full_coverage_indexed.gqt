@@ -22,7 +22,6 @@ edge Knows: Person -> Person
 {"edge":"Knows","from":"middle","to":"end"}
 
 --- query
-set engine = v2;
 query around() {
     match { $a: Person, $a <knows> $b }
     where $a.name = "middle"

@@ -22,7 +22,6 @@ node Doc {
 {"type":"Doc","data":{"slug":"x2"}}
 
 --- query
-set engine = v2;
 query count_non_x_docs() {
     match { $d: Doc }
     where not (starts_with($d.slug, "x"))

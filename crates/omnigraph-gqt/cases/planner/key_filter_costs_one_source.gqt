@@ -216,7 +216,6 @@ edge Links: Person -> Person
 {"edge": "Links", "from": "p098", "to": "p099"}
 
 --- query
-set engine = v2;
 query one_start() {
     match { $a: Person, $a links{1,2} $b } where $a.name = "p000"
     return { $b.name }
@@ -231,7 +230,6 @@ expand $a Links $b: mode indexed_scan
 scan Person as $b: access id_lookup
 
 --- query
-set engine = v2;
 query one_member() {
     match { $a: Person, $a links{1,2} $b } where $a.name in ["p000"]
     return { $b.name }
@@ -246,7 +244,6 @@ expand $a Links $b: mode indexed_scan
 scan Person as $b: access id_lookup
 
 --- query
-set engine = v2;
 query two_members($names: [String]) {
     match { $a: Person, $a links{1,2} $b } where $a.name in $names
     return { $b.name }

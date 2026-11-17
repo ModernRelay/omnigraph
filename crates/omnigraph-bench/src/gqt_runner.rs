@@ -29,7 +29,6 @@ use omnigraph::instrumentation::{
     with_merge_write_probes, with_query_io_probes,
 };
 use omnigraph::storage::StorageAdapter;
-use omnigraph_compiler::settings::Engine;
 use omnigraph_gqt_core::runner_config::SeamDirective;
 use omnigraph_gqt_core::{ExecutionHost, Step, StepKind, case_session, execute_steps};
 use serde::{Deserialize, Serialize};
@@ -608,7 +607,7 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
         .map_err(|_| failure("whole-file timeout during open"))?
         .map_err(failure)?;
         let merge_probes = MergeWriteProbes::default();
-        let session = case_session(db, &case, Engine::V2).map_err(failure)?;
+        let session = case_session(db, &case).map_err(failure)?;
         let host = BenchHost {
             signals: Mutex::new(signals),
             selected: bound.plan.definition.workload.measured_step.ordinal,

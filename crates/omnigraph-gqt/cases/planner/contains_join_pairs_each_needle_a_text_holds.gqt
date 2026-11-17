@@ -41,7 +41,6 @@ node Passage {
 {"type":"Passage","data":{"pid":"p-null"}}
 
 --- query
-set engine = v2;
 query found_numbers() {
     match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number) and $m.mid != "m-empty"
@@ -73,7 +72,6 @@ scan Matter as $m: no runtime filter
 pass join_algorithm
 
 --- query
-set engine = v2;
 query found_numbers_and_the_empty_one() {
     match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number)
@@ -106,7 +104,6 @@ m.mid: String
 p.pid: String
 
 --- query
-set engine = v2;
 query found_numbers_by_every_pair() {
     match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where ((contains($p.text, $m.number)) or false)
@@ -144,7 +141,6 @@ scan Matter as $m: no runtime filter
 not pass join_algorithm
 
 --- query
-set engine = v2;
 query found_numbers_under_a_second_filter() {
     match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number)
@@ -182,7 +178,6 @@ scan Matter as $m: no runtime filter
 pass join_algorithm
 
 --- query
-set engine = v2;
 query passage_written_first() {
     match { $p: Passage, let $ms = { match { $m: Matter } return { $m } }, from $ms }
     where contains($p.text, $m.number) and $m.mid != "m-empty"

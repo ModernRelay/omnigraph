@@ -25,7 +25,6 @@ edge Knows: Person -> Doc {
 {"edge":"Knows","from":"ann","to":"x","data":{"weight":2}}
 
 --- query
-set engine = v2;
 query weights_by_name() {
     match { $p: Person, $p $e:knows $d }
     return { $p.name, $e.weight }

@@ -22,7 +22,6 @@ node Doc {
 {"type":"Doc","data":{"key":"a","text":"needle","embedding":[1.0,0.0]}}
 
 --- query
-set engine = v2;
 query omitted_nullable_fuzzy_option($edits: I64?) {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any, max_edits: $edits))
     return { $d.key }
@@ -32,7 +31,6 @@ query omitted_nullable_fuzzy_option($edits: I64?) {
 --- expect error: search option must resolve to a non-null integer
 
 --- query
-set engine = v2;
 query negative_fuzzy_option($edits: I64) {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any, max_edits: $edits))
     return { $d.key }
@@ -42,7 +40,6 @@ query negative_fuzzy_option($edits: I64) {
 --- expect error: T71: `max_edits: -1` is outside 0..=2
 
 --- query
-set engine = v2;
 query oversized_fuzzy_option($edits: U64) {
     match { $d: Doc } where match_terms($d.text, terms("needle", mode: any, max_edits: $edits))
     return { $d.key }
@@ -52,7 +49,6 @@ query oversized_fuzzy_option($edits: U64) {
 --- expect error: T71: `max_edits: 4294967296` is outside 0..=2
 
 --- query
-set engine = v2;
 query null_rrf_option($k: I64?) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
@@ -64,7 +60,6 @@ query null_rrf_option($k: I64?) {
 --- expect error: search option must resolve to a non-null integer
 
 --- query
-set engine = v2;
 query zero_rrf_option($k: I64) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
@@ -76,7 +71,6 @@ query zero_rrf_option($k: I64) {
 --- expect error: rrf k must be an integer in 1..=1000000
 
 --- query
-set engine = v2;
 query oversized_rrf_option($k: U64) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
@@ -88,7 +82,6 @@ query oversized_rrf_option($k: U64) {
 --- expect error: rrf k must be an integer in 1..=1000000
 
 --- query
-set engine = v2;
 query bound_rrf_option($k: I64) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
@@ -100,7 +93,6 @@ query bound_rrf_option($k: I64) {
 --- expect error: rrf k must be an integer in 1..=1000000, got 1000001
 
 --- query
-set engine = v2;
 query largest_rrf_option($k: I64) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
@@ -117,7 +109,6 @@ d.key: String
 --- expect same as reference
 
 --- query
-set engine = v2;
 query typed_rrf_option($k: U32) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
@@ -134,7 +125,6 @@ d.key: String
 --- expect same as reference
 
 --- query
-set engine = v2;
 query null_search_query($q: String?) {
     match { $d: Doc } where match_terms($d.text, terms($q, mode: any))
     return { $d.key }
@@ -144,7 +134,6 @@ query null_search_query($q: String?) {
 --- expect error: search query must resolve to a non-null String
 
 --- query
-set engine = v2;
 query null_bm25_query($q: String?) {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $q) as $score }
     return { $d.key }
@@ -156,7 +145,6 @@ query null_bm25_query($q: String?) {
 --- expect error: search query must resolve to a non-null String
 
 --- query
-set engine = v2;
 query null_nearest_query($q: Vector(2)?) {
     match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
     return { $d.key }

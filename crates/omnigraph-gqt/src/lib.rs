@@ -5,7 +5,7 @@ use omnigraph::Session;
 use omnigraph::db::Omnigraph;
 use omnigraph::storage::StorageAdapter;
 use omnigraph_compiler::QueryResult;
-use omnigraph_compiler::settings::{DEFINITIONS, Engine};
+use omnigraph_compiler::settings::DEFINITIONS;
 use omnigraph_gqt_core::concurrent::ConcurrentStep;
 pub use omnigraph_gqt_core::runner_config;
 use omnigraph_gqt_core::runner_config::{Execution, SeamDirective};
@@ -38,7 +38,6 @@ pub use dst_runner::{
 pub const CASE_TIMEOUT_ENV: &str = "OMNIGRAPH_GQ_CASE_TIMEOUT_SECS";
 pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 10;
 pub const BLESS_ENV: &str = "OMNIGRAPH_GQ_BLESS";
-pub const ENGINE_ENV: &str = "OMNIGRAPH_GQ_ENGINE";
 pub(crate) const RETIRED_SETTING_ENVIRONMENT: [&str; 1] = ["OMNIGRAPH_TRAVERSAL_MODE"];
 
 /// The runner's host; with `base`, every reopen of the store root is
@@ -152,10 +151,7 @@ pub fn measure_model_names() -> Vec<&'static str> {
     measure::MODELS.iter().map(|model| model.name).collect()
 }
 
-async fn open_case_store(
-    case: &Case,
-    engine: Engine,
-) -> Result<(Session, String, tempfile::TempDir), String> {
+async fn open_case_store(case: &Case) -> Result<(Session, String, tempfile::TempDir), String> {
     let fixture = case
         .fixture
         .as_ref()
@@ -170,7 +166,7 @@ async fn open_case_store(
         .await
         .map_err(|e| format!("init failed: {e}"))?;
     let db = with_case_external_blob_policy(db, case)?;
-    let session = case_session(db, case, engine)?;
+    let session = case_session(db, case)?;
     seed_case(&session, &fixture.seed, case.needs_indices).await?;
     Ok((session, uri, dir))
 }
@@ -191,10 +187,7 @@ fn execute_case<'a>(
     path: &'a Path,
     bless: bool,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    match engine_from_env() {
-        Ok(engine) => execute_case_on_engine(case, path, bless, engine, None, None),
-        Err(error) => futures::future::ready(Err(error)).boxed(),
-    }
+    execute_case_on_engine(case, path, bless, None, None)
 }
 
 /// The in-process verdict of a parsed case on a fresh engine, as the
@@ -220,11 +213,10 @@ fn execute_case_on_engine<'a>(
     case: &'a Case,
     path: &'a Path,
     bless: bool,
-    engine: Engine,
     store: Option<&'a str>,
     base: Option<&'a str>,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    execute_case_inner(case, path, bless, engine, store, base).boxed()
+    execute_case_inner(case, path, bless, store, base).boxed()
 }
 
 /// With `base`, the `--store` root is opened as a clone read through to that
@@ -233,7 +225,6 @@ async fn execute_case_inner(
     case: &Case,
     path: &Path,
     bless: bool,
-    engine: Engine,
     store: Option<&str>,
     base: Option<&str>,
 ) -> Result<(), String> {
@@ -245,7 +236,7 @@ async fn execute_case_inner(
         }
         .map_err(|e| format!("open failed: {e}"))?;
         let db = with_case_external_blob_policy(db, case)?;
-        let session = case_session(db, case, engine)?;
+        let session = case_session(db, case)?;
         let host = GqtHost {
             base: base.map(str::to_owned),
         };
@@ -253,7 +244,7 @@ async fn execute_case_inner(
             .await
             .map(|_| ());
     }
-    let (session, uri, _dir) = open_case_store(case, engine).await?;
+    let (session, uri, _dir) = open_case_store(case).await?;
     omnigraph_gqt_core::execute_steps(case, path, bless, session, &uri, None, &PLAIN_HOST)
         .await
         .map(|_| ())
@@ -265,7 +256,6 @@ async fn execute_case_with_storage(
     path: &Path,
     uri: &str,
     storage: Arc<dyn StorageAdapter>,
-    engine: Engine,
     prepared: Option<&str>,
 ) -> Result<(), String> {
     let db = match (prepared, case.fixture.as_ref()) {
@@ -283,7 +273,7 @@ async fn execute_case_with_storage(
         (None, None) => return Err("invalid_case: DST requires schema and seed, or --store".into()),
     };
     let db = with_case_external_blob_policy(db, case)?;
-    let session = case_session(db, case, engine)?;
+    let session = case_session(db, case)?;
     if let (None, Some(fixture)) = (prepared, case.fixture.as_ref()) {
         seed_case(&session, &fixture.seed, case.needs_indices).await?;
     }
@@ -402,19 +392,6 @@ pub fn bless_from_env() -> Result<bool, String> {
         Ok(v) => Err(format!(
             "invalid_case: {BLESS_ENV} takes 1 (or 0/empty/unset), got `{v}`"
         )),
-    }
-}
-
-pub fn engine_from_env() -> Result<Engine, String> {
-    match std::env::var(ENGINE_ENV) {
-        Err(std::env::VarError::NotPresent) => Ok(Engine::V2),
-        Err(std::env::VarError::NotUnicode(v)) => Err(format!(
-            "invalid_case: {ENGINE_ENV} requires UTF-8, got {v:?}"
-        )),
-        Ok(v) if v.is_empty() => Ok(Engine::V2),
-        Ok(v) => Engine::from_spelling(&v).ok_or_else(|| {
-            format!("invalid_case: {ENGINE_ENV} takes v2 (or empty/unset), got `{v}`")
-        }),
     }
 }
 

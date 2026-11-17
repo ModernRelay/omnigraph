@@ -94,7 +94,6 @@ query equality_disjunctions_without_in() {
 i.slug: String
 
 --- query
-set engine = v2;
 query equality_disjunction_keeps_the_index() {
     match { $i: Item }
     where ($i.n = 1 or $i.n = 2)
@@ -111,7 +110,6 @@ i.slug: String
 scan Item as $i: access index_probe n
 
 --- query
-set engine = v2;
 query overlapping_equality_disjunctions_keep_the_index() {
     match { $i: Item }
     where ($i.n = 1 or $i.n = 2) and ($i.n = 1 or $i.n = 3)

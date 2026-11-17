@@ -23,7 +23,6 @@ node Doc {
 {"type":"Doc","data":{"slug":"d004","embedding":[4.0,0.0,0.0,0.0],"text":"filler"}}
 
 --- query
-set engine = v2;
 query by_text($t: String) {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $t) as $score }
     return { $d.slug }
@@ -41,7 +40,6 @@ d.slug: String
 pipeline 0: Scan -> Score -> Projection => Sort
 
 --- query
-set engine = v2;
 query by_vector($q: Vector(4)) {
     match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $distance }
     return { $d.slug }
@@ -59,7 +57,6 @@ d.slug: String
 scan Doc as $d: ranked nearest fetch 2 diagnostics present
 
 --- query
-set engine = v2;
 query by_vector_among_members($q: Vector(4), $members: [String]) {
     match { let $pop = { match { $d: Doc } where $d.slug in $members return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
     return { $d.slug }
@@ -77,7 +74,6 @@ scan Doc as $d: ranked nearest fetch 1 diagnostics present
 scan Doc as $d: filter reads [d.slug]
 
 --- query
-set engine = v2;
 query fused($q: Vector(4), $t: String) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
     return { $d.slug }

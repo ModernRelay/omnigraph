@@ -24,7 +24,6 @@ edge Knows: Person -> Person
 {"edge":"Knows","from":"p2","to":"p4"}
 
 --- query
-set engine = v2;
 query empty_build() {
     match { $p: Person, $p knows $q }
     where $q.name = "nobody"
@@ -37,7 +36,6 @@ q.name: String
 
 --- expect same as reference
 --- query
-set engine = v2;
 query empty_probe() {
     match { $p: Person, $p knows $q }
     where $p.name = "nobody"
@@ -49,7 +47,6 @@ q.name: String
 
 --- expect same as reference
 --- query
-set engine = v2;
 query partial_build() {
     match { $p: Person, $p knows $q }
     where $q.name = "bob"
@@ -64,7 +61,6 @@ q.name: String
 
 --- expect same as reference
 --- query
-set engine = v2;
 query every_hop() {
     match { $p: Person, $p knows $q }
     return { $p.name, $q.name }

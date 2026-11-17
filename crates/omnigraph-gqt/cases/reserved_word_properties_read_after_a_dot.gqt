@@ -48,7 +48,6 @@ p.slug: String
 p.is: I64
 
 --- query
-set engine = v2;
 query both_in_one_expression() {
     match { $p: Person } where ($p.and = 1 or $p.is = 1)
     return { $p.slug }
@@ -82,7 +81,6 @@ query inline_match_bare() {
 p.slug: String
 
 --- query
-set engine = v2;
 query is_property_before_is_null() {
     match { $p: Person } where $p.is is not null
     return { $p.slug }

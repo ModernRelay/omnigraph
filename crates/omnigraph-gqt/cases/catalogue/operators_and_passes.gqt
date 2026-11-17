@@ -19,7 +19,6 @@ node Person {
 {"type":"Person","data":{"name":"ann"}}
 
 --- query
-set engine = v2;
 query operators() {
     match { $o: @Operator }
     return { $o.name, $o.inputs }
@@ -66,7 +65,6 @@ scan @Operator as $o: access sequential
 not pass aggregate_pushdown
 
 --- query
-set engine = v2;
 query passes_in_order() {
     match { $p: @Pass }
     return { $p.position, $p.name }
@@ -93,7 +91,6 @@ p.position: I64
 p.name: String
 
 --- query
-set engine = v2;
 query logical_kinds() {
     match { $k: @LogicalKind }
     return { $k.name, $k.coverage }

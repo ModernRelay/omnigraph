@@ -39,7 +39,6 @@ edge In: Passage -> Matter
 {"edge":"In","from":"p2","to":"m4"}
 
 --- query
-set engine = v2;
 query q($ms: [String]) { match { $m: Matter } where $m.number in $ms return { $m.number } limit 5 }
 
 --- params
@@ -58,7 +57,6 @@ scan Matter as $m: filter reads [m.number]
 --- expect same as reference
 
 --- query
-set engine = v2;
 query literal_list() {
     match { $m: Matter }
     where $m.number in ["M-1", "M-3", "M-9"]
@@ -76,7 +74,6 @@ m.number: String
 scan Matter as $m: filter reads [m.number]
 
 --- query
-set engine = v2;
 query traversal_destination($ms: [String]) {
     match { $p: Passage, $p passageOf $m }
     where $m.number in $ms
@@ -99,7 +96,6 @@ scan Matter as $m: filter reads [m.number]
 --- expect same as reference
 
 --- query
-set engine = v2;
 query edge_a_reserved_word_names($ms: [String]) {
     match { $p: Passage, $p in $m }
     where $m.number in $ms
@@ -117,7 +113,6 @@ p.pid: String
 m.number: String
 
 --- query
-set engine = v2;
 query bare_word_is_the_membership_test() {
     match { $p: Passage }
     where $p in $m
@@ -127,7 +122,6 @@ query bare_word_is_the_membership_test() {
 --- expect error: T7: `$m` is bound by nothing but the edge named `in`, so `$p in $m` is a triple over it, an element of `match { … }`, not a predicate
 
 --- query
-set engine = v2;
 query contains_spelling($ms: [String]) {
     match { $m: Matter }
     where ($m.number in $ms)
@@ -148,7 +142,6 @@ m.number: String
 scan Matter as $m: filter reads [m.number]
 
 --- query
-set engine = v2;
 query null_needle_under_not($cs: [I64]) {
     match { $m: Matter }
     where not ($m.code in $cs)
@@ -168,7 +161,6 @@ m.mid: String
 scan Matter as $m: filter reads [m.code]
 
 --- query
-set engine = v2;
 query empty_set_under_not($cs: [I64]) {
     match { $m: Matter }
     where not ($m.code in $cs)
@@ -189,7 +181,6 @@ m.mid: String
 scan Matter as $m: filter reads [m.code]
 
 --- query
-set engine = v2;
 query empty_literal_on_an_integer_column() {
     match { $m: Matter }
     where $m.code in []
@@ -205,7 +196,6 @@ m.mid: String
 scan Matter as $m: filter reads [m.code]
 
 --- query
-set engine = v2;
 query constant_date_member() {
     match { $m: Matter }
     where date("2026-01-01") in [date("2026-02-01"), date("2026-01-01")]
@@ -222,7 +212,6 @@ query constant_date_member() {
 m.mid: String
 
 --- query
-set engine = v2;
 query integers_beside_floats_projected() {
     match { $m: Matter }
     return { $m.mid, $m.code in [1, 2.5] as member }
@@ -239,7 +228,6 @@ m.mid: String
 member: Bool?
 
 --- query
-set engine = v2;
 query member_of_an_f32_column() {
     match { $m: Matter }
     where $m.weight in [0.1, 0.7]
@@ -257,7 +245,6 @@ cast $m.weight: F32? -> F64?
 type [0.1, 0.7]: [F64]
 
 --- query
-set engine = v2;
 query equal_on_an_f32_column() {
     match { $m: Matter }
     where $m.weight = 0.1
@@ -274,7 +261,6 @@ cast $m.weight: F32? -> F64?
 type 0.1: F64
 
 --- query
-set engine = v2;
 query float_members_of_an_integer_column() {
     match { $m: Matter }
     where $m.code in [1.0, 2.5]
@@ -291,7 +277,6 @@ m.mid: String
 scan Matter as $m: filter reads [m.code]
 
 --- query
-set engine = v2;
 query type_mismatch($ns: [I64]) {
     match { $m: Matter }
     where $m.number in $ns
@@ -304,7 +289,6 @@ query type_mismatch($ns: [I64]) {
 --- expect error: membership
 
 --- query
-set engine = v2;
 query scalar_on_the_right() {
     match { $m: Matter }
     where $m.number in $m.mid
@@ -325,7 +309,6 @@ query recode($ms: [String]) {
 --- expect affected: nodes=2 edges=0
 
 --- query
-set engine = v2;
 query recoded() {
     match { $m: Matter }
     where $m.code = 9
@@ -362,7 +345,6 @@ query recode_outside_the_empty_set($cs: [I64]) {
 --- expect affected: nodes=3 edges=0
 
 --- query
-set engine = v2;
 query recoded_outside_the_empty_set() {
     match { $m: Matter }
     where $m.code = 7

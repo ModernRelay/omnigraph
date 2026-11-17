@@ -292,7 +292,7 @@ Stable code owners:
 | Read shape (the core read as the planner reads it) | `crates/omnigraph-planner/src/read_shape.rs` |
 | Read doors | `crates/omnigraph/src/exec/query_doors.rs` |
 | Plan acceptance | `crates/omnigraph-planner/src/validate/` |
-| Plan lowering, operators and context (engine v2) | `crates/omnigraph/src/engine/` |
+| Plan lowering, operators and context | `crates/omnigraph/src/engine/` |
 | Lance scan boundary | `crates/omnigraph/src/table_store.rs` |
 | Topology build/cache | `crates/omnigraph/src/graph_index/`, `runtime_cache.rs` |
 | Mutation orchestration | `crates/omnigraph/src/exec/mutation.rs` |
@@ -515,9 +515,7 @@ right side.
 
 ## Filters and pushdown
 
-A read query runs on engine v2, from a plan. The session setting `engine`
-(`omnigraph_compiler::settings::Engine`, the Session settings RFC) keeps one
-value, `v2`, and refuses `v1` as an unknown value. The doors
+A read query runs from a plan. The doors
 (`Session::query`, `query_with_head`, `run_query_at` in
 `exec/query_doors.rs`) plan every read through `engine::execute_query`. A
 query shape the planner refuses (`UnsupportedQuery`) is a `BadRequest` user

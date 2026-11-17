@@ -6,9 +6,8 @@ Every `.gqt` file under `cases/`, including subdirectories, is one test
 in the complete corpus. Test names retain the path relative to `cases/`.
 Shared cases live directly under `cases/`, plan assertions under
 `cases/planner/`, catalogue reads under `cases/catalogue/` and compiler
-refusals under `cases/diagnostics/`. These directories organize the corpus. Every case runs on engine v2, the one
-engine; a case's `set engine = v2;` line changes nothing, and discovery never
-selects an engine.
+refusals under `cases/diagnostics/`. These directories organize the corpus;
+discovery selects nothing by directory.
 The format contract and future extensions live in
 [RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
 
@@ -1196,17 +1195,6 @@ unset, empty, or `0` leaves it disabled. Other values, including non-UTF-8
 values, produce an `invalid_case` report before execution or rewriting.
 Replay ignores this variable and refuses saved blessing invocations.
 
-`OMNIGRAPH_GQ_ENGINE` names the initial `engine` setting for direct and
-DST case sessions, the baseline `reset engine` restores. It accepts only `v2`,
-empty or unset, all three meaning engine v2, the setting's one value.
-
-Invocation reports freeze the engine in the worker input before clearing the
-worker environment, and replay uses the recorded value. An input without the
-field means `v2`. Engine input is covered by the report's input digest, and
-the executable and source identity checks still apply. Any other value, `v1`
-and non-UTF-8 values included, produces an `invalid_case` report before
-workers start, including on replay.
-
 `OMNIGRAPH_GQ_BLESS=1` is supported only for a case declaring one direct-engine
 environment. A subset selection cannot bless a multi-environment case. It rewrites a failing row or shape expectation and still returns
 failure until a subsequent run confirms it. DST cannot bless. The legacy
@@ -1214,12 +1202,11 @@ failure until a subsequent run confirms it. DST cannot bless. The legacy
 file invocations refuse that ambient override and take their timeout from the
 runner section. Ambient fault, entropy and pool overrides also refuse
 admission, including replay, as does a set settings variable
-(`OMNIGRAPH_ENGINE`, `OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`,
+(`OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`,
 `OMNIGRAPH_ANN_NPROBES`, `OMNIGRAPH_LOAD_CONCURRENCY`,
 `OMNIGRAPH_TRAVERSAL_WORK_LIMIT`, `OMNIGRAPH_HISTORY_RELEASE_BYTES`) and the retired
 `OMNIGRAPH_TRAVERSAL_MODE`, which names no setting any more. A case session
-never reads the environment (the runner's own `OMNIGRAPH_GQ_ENGINE` above is
-the one seed), so neither variable decides anything; the refusal keeps a stale
+never reads the environment, so neither variable decides anything; the refusal keeps a stale
 one in a CI environment from being mistaken for a live control, and keeps the
 retired name from lingering. A case that must run one value writes it in a
 `set` step.

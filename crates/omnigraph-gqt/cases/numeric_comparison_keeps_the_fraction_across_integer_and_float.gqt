@@ -21,7 +21,6 @@ node Person {
 {"type":"Person","data":{"slug":"a","age":2,"adult":true}}
 
 --- query
-set engine = v2;
 query projected() {
     match { $p: Person }
     return { 2 = 2.7 as same, $p.age = 2.7 as row_same, 2.7 = $p.age as swapped, $p.age < 2.7 as below, 2.0 = $p.age as whole }
@@ -61,7 +60,6 @@ query stored() {
 p.adult: Bool
 
 --- query
-set engine = v2;
 query pushed_filter() {
     match { $p: Person } where $p.age = 2.7
     return { $p.slug }
@@ -73,7 +71,6 @@ query pushed_filter() {
 p.slug: String
 
 --- query
-set engine = v2;
 query pushed_filter_below() {
     match { $p: Person } where $p.age < 2.7
     return { $p.slug }

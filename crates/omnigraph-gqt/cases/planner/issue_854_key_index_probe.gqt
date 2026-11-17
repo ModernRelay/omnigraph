@@ -21,7 +21,6 @@ node Person {
 {"type":"Person","data":{"slug":"","age":33}}
 
 --- query
-set engine = v2;
 query plain($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }
@@ -38,7 +37,6 @@ pass key_to_id
 pass scan_access
 
 --- query
-set engine = v2;
 query escaped($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }
@@ -55,7 +53,6 @@ pass key_to_id
 pass scan_access
 
 --- query
-set engine = v2;
 query empty($s: String) {
     match { $p: Person } where $s = $p.slug
     return { $p.age }

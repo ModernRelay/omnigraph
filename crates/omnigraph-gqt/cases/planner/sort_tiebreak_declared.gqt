@@ -22,7 +22,6 @@ edge Knows: Person -> Person
 {"edge":"Knows","from":"p1","to":"p2"}
 
 --- query
-set engine = v2;
 query names_only() {
     match { $p: Person }
     return { $p.name }
@@ -40,7 +39,6 @@ scan Person as $p: columns [slug, name]
 sort no tiebreak
 
 --- query
-set engine = v2;
 query names_and_ages() {
     match { $p: Person }
     return { $p.name, $p.age }
@@ -58,7 +56,6 @@ scan Person as $p: columns [__id, slug, name, age]
 sort tiebreak [$p]
 
 --- query
-set engine = v2;
 query traversed() {
     match { $p: Person, $p knows $q }
     return { $q.name }
@@ -74,7 +71,6 @@ scan Person as $q: columns [__id, slug, name]
 sort no tiebreak
 
 --- query
-set engine = v2;
 query counted() {
     match { $p: Person }
     return { $p.name, count($p) as n }

@@ -21,7 +21,6 @@ node Doc {
 {"type":"Doc","data":{"slug":"d2"}}
 
 --- query
-set engine = v2;
 query count_docs() {
     match { $d: Doc }
     return { count($d) as n }

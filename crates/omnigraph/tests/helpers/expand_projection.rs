@@ -8,7 +8,7 @@ use omnigraph::instrumentation::{
 };
 use omnigraph::loader::LoadMode;
 
-use super::{Session, params, query_main, session, with_setting};
+use super::{Session, params, query_main, session};
 
 const SCHEMA: &str = r#"
 node Segment {
@@ -64,7 +64,7 @@ pub async fn fixture(dir: &tempfile::TempDir, sources: usize, payload_bytes: usi
             .unwrap();
     }
     db.ensure_indices_as(None).await.unwrap();
-    with_setting(&db, "engine", "v2")
+    db.clone()
 }
 
 fn assert_released(probes: &QueryMemoryProbes) {

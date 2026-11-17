@@ -39,7 +39,6 @@ edge SegmentOf: Segment -> Artifact
 {"edge":"SegmentOf","from":"s2","to":"c"}
 
 --- query
-set engine = v2;
 query grouped_fanout() {
     match { $s: Segment, $s segmentOf $t }
     return { $t.slug, count($s) as segments }
@@ -57,7 +56,6 @@ scan Artifact as $t: columns [__id, slug]
 pass projection_pushdown
 
 --- query
-set engine = v2;
 query destination_count() {
     match { $s: Segment, $s segmentOf $t }
     return { count($t) as targets }
@@ -70,7 +68,6 @@ targets: I64
 scan Artifact as $t: columns [__id, slug]
 
 --- query
-set engine = v2;
 query hidden_dependencies() {
     match { $s: Segment, $s segmentOf $t, $t: Artifact }
     where $t.state = "open"
@@ -87,7 +84,6 @@ t.slug: String
 scan Artifact as $t: columns [__id, slug, state, rank]
 
 --- query
-set engine = v2;
 query bare_destination() {
     match { $s: Segment, $s segmentOf $t } where $s.slug = "s1"
     return { $t }
@@ -102,7 +98,6 @@ t: Artifact
 scan Artifact as $t: columns [__id, slug, content, state, rank]
 
 --- query
-set engine = v2;
 query empty_expansion() {
     match { $s: Segment, $s segmentOf $t } where $s.slug = "orphan"
     return { $t.slug }
@@ -114,7 +109,6 @@ t.slug: String
 scan Artifact as $t: columns [__id, slug]
 
 --- query
-set engine = v2;
 query filtered_destinations_are_empty() {
     match { $s: Segment, $s segmentOf $t, $t: Artifact }
     where $t.state = "absent"
@@ -127,7 +121,6 @@ t.slug: String
 scan Artifact as $t: columns [__id, slug, state]
 
 --- query
-set engine = v2;
 query empty_source() {
     match { $s: Segment, $s segmentOf $t } where $s.slug = "absent"
     return { $t.slug }
@@ -139,7 +132,6 @@ t.slug: String
 scan Artifact as $t: columns [__id, slug]
 
 --- query
-set engine = v2;
 query unused_destination() {
     match { $s: Segment, $s segmentOf $t }
     return { count($s) as segments }

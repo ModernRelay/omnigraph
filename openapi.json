@@ -6157,7 +6157,7 @@
           {
             "name": "set",
             "in": "query",
-            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings; `engine` does not change\nchange-feed execution.",
+            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings.",
             "required": false,
             "schema": {
               "type": "array",
@@ -7838,7 +7838,7 @@
           {
             "name": "set",
             "in": "query",
-            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings; `engine` does not change\nchange-feed execution.",
+            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings.",
             "required": false,
             "schema": {
               "type": "array",
@@ -16995,13 +16995,6 @@
               "off",
               "on",
               "verify"
-            ]
-          },
-          "engine": {
-            "type": "string",
-            "description": "the engine a read query runs on; `v2`, the plan runner, is the one value; this setting does not change change-feed or merge execution",
-            "enum": [
-              "v2"
             ]
           },
           "history_release_bytes": {

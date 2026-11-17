@@ -20,7 +20,6 @@ node Person {
 {"type":"Person","data":{"name":"a"}}
 
 --- query
-set engine = v2;
 query scalar_params($i: I32, $w: U32, $f: F32, $u: U64) {
     match { $p: Person }
     return { $i as i, $w as w, $f as f, $u as u }
@@ -42,7 +41,6 @@ u: U64
 result columns [i: I32, w: U32, f: F32, u: U64]
 
 --- query
-set engine = v2;
 query aggregated_params($i: I32, $u: U32, $f: F32) {
     match { $p: Person }
     return { min($i) as mn, max($u) as mx, min($f) as mf }
@@ -63,7 +61,6 @@ mf: F32
 result columns [mn: I32?, mx: U32?, mf: F32?]
 
 --- query
-set engine = v2;
 query f32_overflow($f: F32) {
     match { $p: Person }
     return { $f as f }
@@ -75,7 +72,6 @@ query f32_overflow($f: F32) {
 --- expect error: exceeds F32 range
 
 --- query
-set engine = v2;
 query f32_max($f: F32) {
     match { $p: Person }
     return { $f as f }
@@ -94,7 +90,6 @@ f: F32
 result columns [f: F32]
 
 --- query
-set engine = v2;
 query unprojected_vector_overflow($x: Vector(2)) {
     match { $p: Person }
     return { $p.name }
@@ -106,7 +101,6 @@ query unprojected_vector_overflow($x: Vector(2)) {
 --- expect error: exceeds F32 range
 
 --- query
-set engine = v2;
 query list_params($x: Vector(2), $l: [U32], $f: [F32]) {
     match { $p: Person }
     return { $x as x, $l as l, $f as f }
@@ -127,7 +121,6 @@ f: [F32]
 result columns [x: Vector(2), l: [U32], f: [F32]]
 
 --- query
-set engine = v2;
 query null_param($n: I64?) {
     match { $p: Person }
     return { $p.name, $n as n }
@@ -147,7 +140,6 @@ n: I64?
 result columns [p.name: String, n: I64?]
 
 --- query
-set engine = v2;
 query omitted_datetime_param($d: DateTime?) {
     match { $p: Person }
     return { $p.name, $d as t }

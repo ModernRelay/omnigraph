@@ -22,7 +22,6 @@ node Person {
 {"type":"Person","data":{"slug":"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz-b","age":5}}
 
 --- query
-set engine = v2;
 query trailing($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }
@@ -38,7 +37,6 @@ scan Person as $p: access index_probe __id
 pass key_to_id
 
 --- query
-set engine = v2;
 query slashed($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }
@@ -54,7 +52,6 @@ scan Person as $p: access index_probe __id
 pass key_to_id
 
 --- query
-set engine = v2;
 query long_key($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }

@@ -35,7 +35,6 @@ branch merge child into main
 --- expect outcome: fast_forward
 
 --- query
-set engine = v2;
 query fast_forwarded($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }
@@ -69,7 +68,6 @@ branch merge child into main
 --- expect outcome: merged
 
 --- query
-set engine = v2;
 query merged_update($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }
@@ -85,7 +83,6 @@ scan Person as $p: access index_probe __id
 pass key_to_id
 
 --- query
-set engine = v2;
 query merged_main_insert($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }
@@ -100,7 +97,6 @@ p.age: I32
 scan Person as $p: access index_probe __id
 
 --- query
-set engine = v2;
 query merged_child_insert($s: String) {
     match { $p: Person } where $p.slug = $s
     return { $p.age }

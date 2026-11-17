@@ -25,7 +25,6 @@ edge Knows: Doc -> Doc
 {"edge":"Knows","from":"a","to":"c","data":{}}
 
 --- query
-set engine = v2;
 query count_empty() {
     match { $e: Empty } return { count($e) as n, count($e) > 0 as has_rows }
 }
@@ -43,7 +42,6 @@ result columns [n: I64?, has_rows: Bool?]
 validation scope invariants_only
 
 --- query
-set engine = v2;
 query count_aliases() {
     match { $d: Doc } return { count($d) as a, count($d) as b } order { a desc } limit 1
 }
@@ -60,7 +58,6 @@ pass aggregate_pushdown
 result columns [a: I64?, b: I64?]
 
 --- query
-set engine = v2;
 query count_unaliased() {
     match { $d: Doc } return { count($d) }
 }
@@ -76,7 +73,6 @@ pass aggregate_pushdown
 result columns [d: I64?]
 
 --- query
-set engine = v2;
 query count_limit_zero() {
     match { $d: Doc } return { count($d) as n } limit 0
 }
@@ -92,7 +88,6 @@ pass aggregate_pushdown
 result columns [n: I64?]
 
 --- query
-set engine = v2;
 query count_property() {
     match { $d: Doc } return { count($d.score) as n }
 }
@@ -107,7 +102,6 @@ n: I64
 not pass aggregate_pushdown
 
 --- query
-set engine = v2;
 query count_filtered() {
     match { $d: Doc } where $d.score > 0 return { count($d) as n }
 }
@@ -122,7 +116,6 @@ n: I64
 not pass aggregate_pushdown
 
 --- query
-set engine = v2;
 query count_grouped() {
     match { $d: Doc } return { $d.score, count($d) as n, count($d) > 1 as multiple }
 }
@@ -141,7 +134,6 @@ not pass aggregate_pushdown
 validation scope invariants_only
 
 --- query
-set engine = v2;
 query count_traversal() {
     match { $d: Doc, $d knows $t } return { count($d) as n }
 }
@@ -156,7 +148,6 @@ n: I64
 not pass aggregate_pushdown
 
 --- query
-set engine = v2;
 query count_pairs() {
     match { $d: Doc, let $es = { match { $e: Doc } return { $e } }, from $es } return { count($d) as n }
 }
@@ -171,7 +162,6 @@ n: I64
 not pass aggregate_pushdown
 
 --- query
-set engine = v2;
 query count_mixed() {
     match { $d: Doc } return { count($d) as n, sum($d.score) as total }
 }

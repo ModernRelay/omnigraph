@@ -44,7 +44,6 @@ edge Hops: Doc -> Doc
 {"edge":"Hops","from":"d-hit","to":"z-end"}
 
 --- query
-set engine = v2;
 query destination_search() {
     match { $s: Source, $s links $d }
     where match_terms($d.body, terms("needle", mode: any))
@@ -63,7 +62,6 @@ hash join $d
 scan Doc as $d: no filter
 
 --- query
-set engine = v2;
 query destination_match_text() {
     match { $s: Source, $s links $d }
     where match_terms($d.body, terms("needle", mode: any))
@@ -82,7 +80,6 @@ hash join $d
 scan Doc as $d: no filter
 
 --- query
-set engine = v2;
 query scalar_and_two_destination_searches() {
     match { $s: Source, $s links $d, $d: Doc }
     where $d.state = "open"
@@ -100,7 +97,6 @@ hash join $d
 scan Doc as $d: filter reads [d.state]
 
 --- query
-set engine = v2;
 query two_searches_on_one_property() {
     match { $s: Source, $s links $d, $d: Doc }
     where $d.state = "open" and match_terms($d.body, terms("needle", mode: any)) and match_terms($d.body, terms("zeta", mode: any))
@@ -116,7 +112,6 @@ hash join $d
 scan Doc as $d: filter reads [d.state]
 
 --- query
-set engine = v2;
 query multihop_endpoint_membership() {
     match { $s: Source, $s links $d, $d: Doc, $d hops $e }
     where $d.state = "open" and match_terms($e.body, terms("endpoint", mode: any))
@@ -133,7 +128,6 @@ scan Doc as $d: filter reads [d.state]
 scan Doc as $e: no filter
 
 --- query
-set engine = v2;
 query limit_counts_surviving_paths() {
     match { $s: Source, $s links $d, $d: Doc }
     where $d.state = "open"
@@ -152,7 +146,6 @@ hash join $d
 scan Doc as $d: filter reads [d.state]
 
 --- query
-set engine = v2;
 query empty_source_destination_search() {
     match { $s: Source, $s links $d }
     where $s.slug = "orphan" and match_terms($d.body, terms("needle", mode: any))
@@ -166,7 +159,6 @@ hash join $d
 scan Doc as $d: no filter
 
 --- query
-set engine = v2;
 query destination_search_has_no_matches() {
     match { $s: Source, $s links $d }
     where match_terms($d.body, terms("absenttoken", mode: any))

@@ -27,7 +27,6 @@ node Passage {
 {"type":"Passage","data":{"pid":"case","text":"law case","embedding":[0.5,0.5]}}
 
 --- query
-set engine = v2;
 query bm25_order() {
     match {
       let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },
@@ -49,7 +48,6 @@ contains join $p.text contains $m.number
 scan Passage as $p: runtime filter text
 
 --- query
-set engine = v2;
 query nearest_order() {
     match {
       let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },
@@ -72,7 +70,6 @@ scan Passage as $p: no runtime filter
 scan Passage as $p: ranked nearest fetch 10
 
 --- query
-set engine = v2;
 query rrf_order() {
     match {
       let $all = { match { $p: Passage } return { $p } },
@@ -98,7 +95,6 @@ scan Passage as $p: no runtime filter
 scan Passage as $p: ranked nearest fetch 10
 
 --- query
-set engine = v2;
 query search_filter_unranked() {
     match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number) and match_terms($p.text, terms("law", mode: any)) and $m.number != $p.pid
@@ -117,7 +113,6 @@ scan Passage as $p: runtime filter text
 pass join_algorithm
 
 --- query
-set engine = v2;
 query bm25_order_on_the_needles() {
     match {
       let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },

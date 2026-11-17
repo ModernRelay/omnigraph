@@ -18,7 +18,6 @@ node Counter {
 {"type":"Counter","data":{"number":9007199254740993}}
 
 --- query
-set engine = v2;
 query rounded($n: F64) {
     match { $c: Counter } where $c.number = $n
     return { $c.number }

@@ -545,7 +545,6 @@ impl GraphClient {
             id.refuse_from_request()?;
             given.set(*id, value)?;
             match id {
-                SettingId::Engine => request.engine = Some(given.engine()),
                 SettingId::MergeLineage => request.merge_lineage = Some(given.merge_lineage()),
                 SettingId::ChangeLineage => request.change_lineage = Some(given.change_lineage()),
                 SettingId::AnnNprobes => {

@@ -1,4 +1,4 @@
-//! Pool and concurrency acceptance for engine v2. GQT cannot select a per-query
+//! Pool and concurrency acceptance for query execution. GQT cannot select a per-query
 //! pool, inspect native spill metrics, or drop an in-flight query future.
 
 use crate::helpers;
@@ -228,7 +228,7 @@ node Item {
         }
         out
     }
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
     let unbounded = query_main(&v2, &query, "totals", &params(&[]))
         .await
         .unwrap();
@@ -340,7 +340,7 @@ async fn graph_fixture(dir: &tempfile::TempDir, leaves: usize, payload_bytes: us
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    with_setting(&db, "engine", "v2")
+    db.clone()
 }
 
 /// A checkpoint after charged frontier work makes cancellation deterministic;
@@ -521,7 +521,7 @@ node Doc {
     }
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices_as(None).await.unwrap();
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
     let source = r#"query fused($q: Vector(2)) {
         match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 5000), nearest($all, $d.embedding, [5000.0, 1.0], k: 5000), k: 60) as $score, $d: Doc }
         return { $d.slug }
@@ -609,8 +609,7 @@ edge Knows: Doc -> Doc
         .await
         .unwrap();
     db.ensure_indices_as(None).await.unwrap();
-    let v2 = with_setting(
-        &with_setting(&db, "engine", "v2"),
+    let v2 = with_setting(&db,
         "rrf_plan",
         "force_postfilter",
     );
@@ -726,7 +725,7 @@ edge Knows: Person -> Person
         .await
         .unwrap();
         db.ensure_indices_as(None).await.unwrap();
-        let v2 = with_setting(&db, "engine", "v2");
+        let v2 = db.clone();
         let queries = r#"
 query fused($q: Vector(2)) {
     match { let $all = { match { $p: Person } return { $p } }, from rrf(nearest($all, $p.embedding, $q, k: 3), nearest($all, $p.embedding, [2.0, 1.0], k: 3), k: 60) as $score, $p: Person, $p knows $friend }
@@ -848,7 +847,7 @@ async fn hash_join_output_is_the_refusing_reservation() {
     db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap();
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
 
     let limit = 8 * MIB;
     let explain = with_query_memory_limit(
@@ -933,7 +932,7 @@ async fn underestimated_hash_build_retries_id_lookup() {
     db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap();
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
     let limit = 16 * MIB;
     let explain = with_query_memory_limit(
         limit,
@@ -1095,7 +1094,7 @@ async fn csr_single_hop_materializes_only_emitted_destination_ids() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    let v2 = with_traversal(&with_setting(&db, "engine", "v2"), Traversal::Csr);
+    let v2 = with_traversal(&db, Traversal::Csr);
     let queries = r#"
 query two_hops() {
     match { $a: Person, $a knows{1,2} $b } where $a.name = "hub"
@@ -1217,7 +1216,7 @@ async fn citation_graph(
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    with_setting(&db, "engine", "v2")
+    db.clone()
 }
 
 /// The `(matter, passage)` pairs of a `cited` answer, sorted.
@@ -1370,7 +1369,7 @@ async fn hydrated_copies_of_a_joined_row_stay_within_the_chunk_bound() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
     let fanout = r#"query fanout() {
         match { $a: Person, $a knows $b }
         return { $a.name, $a.payload }
@@ -1452,7 +1451,7 @@ async fn a_hydrated_fetch_stops_at_the_chunk_bound_when_rows_widen() {
     db.load_jsonl(&wide_rows.join("\n"), LoadMode::Append)
         .await
         .unwrap();
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
     let widening = r#"query widening() {
         match { $p: Person }
         return { $p.name, $p.payload }
@@ -1953,7 +1952,7 @@ async fn a_contains_join_and_its_cross_join_agree_on_generated_texts_over_severa
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
     for (extra, keeps_empty) in [("", true), (r#"$m.mid != "m-empty""#, false)] {
         let mut expected: Vec<(String, String)> = matters
             .iter()
@@ -2058,7 +2057,7 @@ async fn multi_hop_expand_hands_every_pair_to_the_tie_rule_cut() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
     let queries = r#"
 query first() {
     match { $p: Person, $p knows{1,2} $f }
@@ -2138,7 +2137,7 @@ async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
     let query = r#"query tagged() {
         match { $a: Person, $a $t:knows $b } where $a.name = "hub"
         return { $b.name, $t.labels }
@@ -2276,7 +2275,7 @@ async fn a_query_that_fits_a_budget_fits_every_larger_budget_issue_1361() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    let db = with_setting(&db, "engine", "v2");
+    let db = db.clone();
     let source = r#"
 query pairs() {
     match { $p: Person, $p $e:knows $q }

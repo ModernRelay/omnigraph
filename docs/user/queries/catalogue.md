@@ -164,7 +164,6 @@ binary's rows.
 |---|---|---|---|
 | ann_nprobes | integer(0..) | 20 | request |
 | change_lineage | enum(off, on, verify) | on | request |
-| engine | enum(v2) | v2 | request |
 | explain_dump_dir | text |  | process |
 | history_release_bytes | integer(1024..=262144) | 262144 | request |
 | load_source_max_bytes | integer(1..) | 33554432 | request |

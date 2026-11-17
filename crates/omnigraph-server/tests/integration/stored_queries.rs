@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::http::StatusCode;
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
-use omnigraph_server::{AppState, ProcessDefaults};
+use omnigraph_server::AppState;
 use serde_json::{Value, json};
 use serial_test::serial;
 
@@ -1177,62 +1177,39 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
 
 const OLDER_OR_NAMED_GQ: &str = "query older_or_named($name: String) { match { $p: Person } where ($p.age > 30 or $p.name = $name) return { $p.name } }";
 
-/// [`app_with_stored_queries`] with the process defaults every invocation's
-/// session starts from, seeded here instead of the process environment.
-async fn app_with_stored_queries_on_process_defaults(
-    specs: &[(&str, &str, bool)],
-    defaults: ProcessDefaults,
-) -> (tempfile::TempDir, axum::Router) {
-    let temp = init_loaded_graph().await;
-    let graph = graph_path(temp.path());
-    let policy_path = temp.path().join("policy.yaml");
-    std::fs::write(&policy_path, INVOKE_POLICY_YAML).unwrap();
-    let state = AppState::open_single_with_queries(
-        graph.to_string_lossy().to_string(),
-        vec![("act-invoke".to_string(), "t-invoke".to_string())],
-        Some(&policy_path),
-        stored_query_registry(specs),
-    )
-    .await
-    .unwrap()
-    .with_process_defaults(defaults);
-    (temp, omnigraph_server::build_app(state))
-}
-
-/// A stored query carries no `set engine`, so a compound predicate in it runs on
-/// the process default, v2, and answers the same under an explicit `OMNIGRAPH_ENGINE=v2`.
+/// A stored query whose predicate is a disjunction answers with the rows of
+/// both arms.
 #[tokio::test(flavor = "multi_thread")]
-async fn stored_read_with_a_compound_predicate_answers_on_the_process_engine() {
+async fn stored_read_with_a_compound_predicate_answers_both_arms() {
     let specs: &[(&str, &str, bool)] = &[("older_or_named", OLDER_OR_NAMED_GQ, false)];
-    let params = json!({ "params": { "name": "Bob" } });
-    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
-        (variable == "OMNIGRAPH_ENGINE").then(|| "v2".to_string())
-    })
-    .unwrap();
-    for defaults in [
-        ProcessDefaults::default(),
-        ProcessDefaults { settings, sources },
-    ] {
-        let (_temp, app) = app_with_stored_queries_on_process_defaults(specs, defaults).await;
-        let (status, body) = json_response(
-            &app,
-            invoke_request("older_or_named", "t-invoke", params.clone()),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "body: {body}");
-        assert_eq!(
-            body["row_count"], 2,
-            "Charlie is older than 30 and Bob is named; body: {body}"
-        );
-        let mut names: Vec<&str> = body["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| row["p.name"].as_str().unwrap_or_default())
-            .collect();
-        names.sort_unstable();
-        assert_eq!(names, ["Bob", "Charlie"], "body: {body}");
-    }
+    let (_temp, app) = app_with_stored_queries(
+        specs,
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "older_or_named",
+            "t-invoke",
+            json!({ "params": { "name": "Bob" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["row_count"], 2,
+        "Charlie is older than 30 and Bob is named; body: {body}"
+    );
+    let mut names: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["p.name"].as_str().unwrap_or_default())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["Bob", "Charlie"], "body: {body}");
 }
 
 fn spec(name: &str, source: &str) -> RegistrySpec {

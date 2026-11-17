@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use omnigraph::error::OmniError;
 use omnigraph_compiler::QueryResult;
-use omnigraph_compiler::settings::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -383,8 +382,6 @@ struct Input {
     environment: Environment,
     seed: Option<u64>,
     effective_settings: settings::EffectiveSettings,
-    #[serde(default)]
-    engine: Engine,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     store: Option<String>,
     /// `--base`: the `--store` root is opened as a clone of this graph, read
@@ -1569,7 +1566,6 @@ fn run_invocation(
     summary: &mut Summary,
 ) -> Result<(), String> {
     refuse_ambient()?;
-    let engine = crate::engine_from_env()?;
     let selected = selection.target;
     let selected_storage = selection.storage;
     let selected_seed = selection.seed;
@@ -1768,7 +1764,6 @@ fn run_invocation(
                     environment: env.clone(),
                     seed,
                     effective_settings: settings::EffectiveSettings::for_seed(seed),
-                    engine,
                     store: selection.store.map(str::to_owned),
                     base: selection.base.map(str::to_owned),
                     server: selection.server.cloned(),
@@ -2101,7 +2096,6 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
                     &case,
                     &input.case_path,
                     input.bless,
-                    input.engine,
                     input.store.as_deref(),
                     input.base.as_deref(),
                 ),
@@ -2268,7 +2262,6 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
                         &self.input.case_path,
                         &resources.root,
                         storage,
-                        self.input.engine,
                         prepared.as_deref(),
                     ),
                 ),
@@ -2396,7 +2389,6 @@ fn replay_attempts(
     executed: &mut Vec<Attempt>,
 ) -> Result<(), String> {
     refuse_ambient()?;
-    crate::engine_from_env()?;
     if summary.attempts.iter().any(external_attempt) {
         return Err("invalid_case: external-store invocations cannot replay, nor served ones; the report does not freeze store or server contents".into());
     }
@@ -2565,7 +2557,6 @@ mod action_tests {
             },
             seed: Some(0),
             effective_settings: settings::EffectiveSettings::for_seed(Some(0)),
-            engine: Engine::V2,
             store: None,
             base: None,
             server: None,
@@ -2623,7 +2614,7 @@ mod action_tests {
                 "FAILPOINTS",
                 "RAYON_NUM_THREADS",
                 "LANCE_CPU_THREADS",
-                "OMNIGRAPH_ENGINE",
+                "OMNIGRAPH_MERGE_LINEAGE",
                 "DST_ENTROPY_SEED",
                 "HOME",
                 "PATH",

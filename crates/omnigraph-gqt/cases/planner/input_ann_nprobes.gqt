@@ -22,7 +22,6 @@ node Doc {
 {"type":"Doc","data":{"slug":"d004","embedding":[4.0,0.0,0.0,0.0]}}
 
 --- query
-set engine = v2;
 set ann_nprobes = 1;
 query by_vector($q: Vector(4)) {
     match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $distance }
@@ -41,7 +40,6 @@ d.slug: String
 scan Doc as $d: ranked nearest fetch 2 nprobes 1
 
 --- query
-set engine = v2;
 query by_vector($q: Vector(4)) {
     match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $distance }
     return { $d.slug }

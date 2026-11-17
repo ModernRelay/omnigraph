@@ -28,7 +28,6 @@ edge Knows: Person -> Person
 {"edge":"Knows","from":"d","to":"c"}
 
 --- query
-set engine = v2;
 query not_over_a_value() {
     match { $p: Person } where not $p.age > 35
     return { $p.slug }
@@ -42,7 +41,6 @@ query not_over_a_value() {
 p.slug: String
 
 --- query
-set engine = v2;
 query both_in_one_block() {
     match { $p: Person }
     where not $p.age > 35 and not exists { $q: Person, $p knows $q }

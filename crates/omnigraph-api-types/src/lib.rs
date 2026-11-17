@@ -14,7 +14,7 @@ use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::file::Param;
 use omnigraph_compiler::result::{QueryResult, Ranking, SearchFunction as ResultSearchFunction};
 use omnigraph_compiler::settings::{
-    ChangeLineage, Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
+    ChangeLineage, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
 };
 use omnigraph_compiler::types::{PropType, ScalarType};
 use serde::{Deserialize, Serialize};
@@ -168,10 +168,6 @@ pub mod query_file_refusals {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct SettingsRequest {
-    /// `engine`: `v1` or `v2`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(schema_with = engine_schema)]
-    pub engine: Option<Engine>,
     /// `merge_lineage`: `off`, `on` or `verify`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = merge_lineage_schema)]
@@ -229,12 +225,6 @@ impl SettingsRequest {
     /// a session applies with source `request`.
     pub fn assignments(&self) -> Vec<(SettingId, SettingValue)> {
         let mut assignments = Vec::new();
-        if let Some(engine) = self.engine {
-            assignments.push((
-                SettingId::Engine,
-                SettingValue::Ident(engine.as_str().to_string()),
-            ));
-        }
         if let Some(merge_lineage) = self.merge_lineage {
             assignments.push((
                 SettingId::MergeLineage,
@@ -289,10 +279,6 @@ fn setting_schema(id: SettingId) -> utoipa::openapi::schema::Object {
             .build(),
         SettingKind::Text => builder.schema_type(Type::String).build(),
     }
-}
-
-fn engine_schema() -> utoipa::openapi::schema::Object {
-    setting_schema(SettingId::Engine)
 }
 
 fn merge_lineage_schema() -> utoipa::openapi::schema::Object {
@@ -1234,8 +1220,7 @@ pub struct CommitChangesQuery {
     pub op: Vec<ChangeOp>,
     /// Repeatable session setting, `name=value` in GQ spelling
     /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
-    /// Values are validated as session settings; `engine` does not change
-    /// change-feed execution.
+    /// Values are validated as session settings.
     #[serde(default)]
     pub set: Vec<String>,
 }
@@ -1364,8 +1349,7 @@ pub struct ChangeFeedQuery {
     pub op: Vec<ChangeOp>,
     /// Repeatable session setting, `name=value` in GQ spelling
     /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
-    /// Values are validated as session settings; `engine` does not change
-    /// change-feed execution.
+    /// Values are validated as session settings.
     #[serde(default)]
     pub set: Vec<String>,
 }
@@ -4210,7 +4194,6 @@ mod tests {
             .map(|spec| spec.name)
             .collect();
         let populated = SettingsRequest {
-            engine: Some(Engine::V2),
             merge_lineage: Some(MergeLineage::Off),
             change_lineage: Some(ChangeLineage::Off),
             ann_nprobes: Some(7),
@@ -4222,7 +4205,7 @@ mod tests {
             history_release_bytes: Some(2048),
         };
         let expected = format!(
-            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":456,\"{}\":4093,\"{}\":8186,\"{}\":524288,\"{}\":2048}}",
+            "{{\"{}\":\"off\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":456,\"{}\":4093,\"{}\":8186,\"{}\":524288,\"{}\":2048}}",
             request_rows[0],
             request_rows[1],
             request_rows[2],
@@ -4231,10 +4214,9 @@ mod tests {
             request_rows[5],
             request_rows[6],
             request_rows[7],
-            request_rows[8],
-            request_rows[9]
+            request_rows[8]
         );
-        assert_eq!(request_rows.len(), 10);
+        assert_eq!(request_rows.len(), 9);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated

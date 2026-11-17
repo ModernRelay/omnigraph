@@ -80,7 +80,6 @@ query has_any_image_filtered_after() {
 n.slug: String
 
 --- query
-set engine = v2;
 query outer_variable_read_after_the_inner_binding() {
     match { $n: Actor }
     where exists {

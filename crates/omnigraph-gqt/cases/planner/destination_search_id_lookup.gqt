@@ -56,7 +56,6 @@ edge Links: Source -> Doc
 {"edge":"Links","from":"root","to":"summary-only"}
 
 --- query
-set engine = v2;
 query one_destination_search() {
     match { $s: Source, $s links $d }
     where match_terms($d.body, terms("needle", mode: any))
@@ -72,7 +71,6 @@ scan Doc as $d: access id_lookup
 scan Doc as $d: no filter
 
 --- query
-set engine = v2;
 query two_destination_searches() {
     match { $s: Source, $s links $d }
     where match_terms($d.body, terms("needle", mode: any)) and match_terms($d.summary, terms("beacon", mode: any))

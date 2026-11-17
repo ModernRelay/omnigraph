@@ -111,7 +111,7 @@ async fn graph(dir: &tempfile::TempDir) -> omnigraph::Session {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    with_setting(&db, "engine", "v2")
+    db.clone()
 }
 
 fn rows_of(result: &omnigraph_compiler::result::QueryResult) -> Vec<Value> {
@@ -290,7 +290,7 @@ async fn ann_nprobes_is_a_field_of_the_ranked_scan_and_the_rows_do_not_move() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    let v2 = with_setting(&db, "engine", "v2");
+    let v2 = db.clone();
     let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
     let mut runs = Vec::new();
     let mut plans = Vec::new();
@@ -443,7 +443,7 @@ async fn profile_rows_carry_the_report_in_the_explain_row_schema() {
     .await
     .unwrap();
     let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
-    let run = with_setting(&db, "engine", "v2")
+    let run = db.clone()
         .query_inspected(ReadTarget::branch("main"), NEAREST, "by_vector", &params)
         .await
         .unwrap();

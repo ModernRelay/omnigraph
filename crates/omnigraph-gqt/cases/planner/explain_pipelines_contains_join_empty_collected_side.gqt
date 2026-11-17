@@ -21,7 +21,6 @@ node Matter {
 {"type":"Paper","data":{"slug":"p2","text":"nothing cited"}}
 
 --- query
-set engine = v2;
 query cites() {
     match { $p: Paper, let $ms = { match { $m: Matter } return { $m } }, from $ms }
     where contains($p.text, $m.number)

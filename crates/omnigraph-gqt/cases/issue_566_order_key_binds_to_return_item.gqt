@@ -49,7 +49,6 @@ edge RelevantMarket: Deal -> Market {}
 {"edge":"RelevantMarket","from":"d3","to":"us"}
 
 --- query
-set engine = v2;
 query per_market($slug: String) {
     match { $p: Person, $d: Deal, $d ledByPerson $p, $d relevantMarket $m } where $p.slug = $slug
     return { $m.name, count($d) as deals }
@@ -69,7 +68,6 @@ m.name: String
 deals: I64
 
 --- query
-set engine = v2;
 query top_market($slug: String) {
     match { $p: Person, $d: Deal, $d ledByPerson $p, $d relevantMarket $m } where $p.slug = $slug
     return { $m.name, count($d) as deals }
@@ -88,7 +86,6 @@ m.name: String
 deals: I64
 
 --- query
-set engine = v2;
 query smallest_market_unaliased($slug: String) {
     match { $p: Person, $d: Deal, $d ledByPerson $p, $d relevantMarket $m } where $p.slug = $slug
     return { $m.name, count($d) }
@@ -107,7 +104,6 @@ m.name: String
 d: I64
 
 --- query
-set engine = v2;
 query per_market_by_max() {
     match { $d: Deal, $d relevantMarket $m }
     return { $m.name, count($d) as deals }
@@ -117,7 +113,6 @@ query per_market_by_max() {
 --- expect error: T42: an aggregate order key must repeat a return item; order by its alias
 
 --- query
-set engine = v2;
 query adults_first() {
     match { $p: Person }
     return { $p.slug, $p.age > 30 as adult }
@@ -134,7 +129,6 @@ p.slug: String
 adult: Bool?
 
 --- query
-set engine = v2;
 query boolean_key_unbound() {
     match { $p: Person }
     return { $p.slug }

@@ -22,7 +22,6 @@ edge Links: Person -> Person
 {"edge":"Links","from":"bob","to":"carol"}
 
 --- query
-set engine = v2;
 query linked_either_way() {
     match { $s: Person, $s <links> $d }
     return { $s.name, $d.name }

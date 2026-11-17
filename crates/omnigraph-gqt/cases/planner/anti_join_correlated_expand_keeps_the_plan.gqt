@@ -24,7 +24,6 @@ edge Knows: Person -> Person
 {"edge":"Knows","from":"alice","to":"bob"}
 
 --- query
-set engine = v2;
 query people_without_outgoing_edges() {
     match { $p: Person }
     where not exists { $q: Person, $p knows $q }

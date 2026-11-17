@@ -20,11 +20,6 @@ node Item {
 {"type":"Item","data":{"name":"b"}}
 {"type":"Item","data":{"name":"c"}}
 
---- mutate
-set engine = v2;
-
---- expect ok
-
 --- query
 query repeated_now_over_rows() {
     match { $i: Item }

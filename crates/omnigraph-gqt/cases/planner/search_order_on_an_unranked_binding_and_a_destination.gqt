@@ -56,7 +56,6 @@ query connected_rrf_t_first($q: Vector(4)) {
 --- expect error: T75: `rrf` arm 2 ranks `$t` (node Doc), arm 1 ranks `$d` (node Doc); the fused target would be a pair
 
 --- query
-set engine = v2;
 query search_only_order_with_an_unranked_binding($q: Vector(4)) {
     match { let $pop = { match { $c: Doc, let $zs = { match { $z: Zone } return { $z } }, from $zs } return { $c, $z } }, from nearest($pop, $c.embedding, $q, k: 3) as $distance }
     return { $c.slug, $z.name }
@@ -76,7 +75,6 @@ z.name: String
 sort tiebreak [$c, $z]
 
 --- query
-set engine = v2;
 query nearest_on_a_traversal_destination($q: Vector(4)) {
     match { let $pop = { match { $p: Person, $d: Doc, $p knows $d } return { $p, $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
     return { $d.slug }

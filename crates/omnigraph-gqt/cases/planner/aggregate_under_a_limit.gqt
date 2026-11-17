@@ -21,7 +21,6 @@ node Person {
 {"type":"Person","data":{"name":"cyd","age":30}}
 
 --- query
-set engine = v2;
 query youngest_group() {
     match { $p: Person }
     return { count($p) as n, $p.age }

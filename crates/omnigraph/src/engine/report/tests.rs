@@ -55,8 +55,7 @@ async fn graph(dir: &tempfile::TempDir, schema: &str, seed: &[&str]) -> Session 
     let db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
         .await
         .unwrap();
-    let settings = SessionSettings::default().with("engine", "v2").unwrap();
-    let db = Session::from_defaults(Arc::new(db), settings);
+    let db = Session::from_defaults(Arc::new(db), SessionSettings::default());
     db.load_jsonl(&seed.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
@@ -66,7 +65,7 @@ async fn graph(dir: &tempfile::TempDir, schema: &str, seed: &[&str]) -> Session 
 async fn run(db: &Session, source: &str, name: &str, params: &ParamMap) -> (usize, Captured) {
     let (result, run) = captured(db.query(ReadTarget::branch("main"), source, name, params)).await;
     let rows = result.unwrap().num_rows();
-    (rows, run.expect("the query ran on engine v2"))
+    (rows, run.expect("the query ran"))
 }
 
 fn text(name: &str, value: &str) -> ParamMap {
@@ -920,7 +919,7 @@ async fn an_aggregate_is_one_datafusion_operator_and_the_result_keeps_the_return
     .await;
     let result = result.unwrap();
     assert_eq!(result.num_rows(), 3);
-    let run = run.expect("the query ran on engine v2");
+    let run = run.expect("the query ran");
     assert_covers(&run);
     let aggregate = node_id(&run.plan, |node| {
         matches!(node, PhysicalNode::Aggregate { .. })
@@ -1041,7 +1040,7 @@ async fn a_hydrating_top_k_builds_one_operator_above_its_limit() {
         &ParamMap::new(),
     ))
     .await;
-    let run = run.expect("the query ran on engine v2");
+    let run = run.expect("the query ran");
     let batch = result.unwrap().concat_batches().unwrap();
     let texts: Vec<&str> = batch
         .column(1)

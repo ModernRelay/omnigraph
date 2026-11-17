@@ -4335,7 +4335,6 @@ async fn settings_show_all_lists_the_definition_in_order() {
     assert_eq!(
         body,
         show_output(&[
-            show_row("engine", "v2", "v2", "default", "request"),
             show_row("rrf_plan", "auto", "auto", "default", "process"),
             show_row(
                 "merge_lineage",
@@ -4473,7 +4472,7 @@ async fn settings_set_parameter_on_the_change_routes_follows_the_definition() {
 
     let cases: [(&str, Option<&str>); 6] = [
         ("set=merge_lineage=off", None),
-        ("set=engine=v2", None),
+        ("set=change_lineage=off", None),
         ("set=merge_lineage=both", Some(UNKNOWN_VALUE_NEEDLE)),
         (
             "set=stage_write_concurrency=8",
@@ -4513,18 +4512,13 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
         &app,
         json_post(
             "/query",
-            &json!({"query": "set engine = v2;\nset merge_lineage = off;\nset change_lineage = off;\nreset all;\nshow all;"}),
+            &json!({"query": "set ann_nprobes = 3;\nset merge_lineage = off;\nset change_lineage = off;\nreset all;\nshow all;"}),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        body["rows"][0],
-        show_row("engine", "v2", "v2", "default", "request"),
-        "{body}"
-    );
-    assert_eq!(
-        body["rows"][2],
+        body["rows"][1],
         show_row(
             "merge_lineage",
             default_merge_lineage(),
@@ -4535,7 +4529,7 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
         "{body}"
     );
     assert_eq!(
-        body["rows"][3],
+        body["rows"][2],
         show_row(
             "change_lineage",
             default_change_lineage(),
@@ -4546,7 +4540,7 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
         "{body}"
     );
     assert_eq!(
-        body["rows"][4],
+        body["rows"][3],
         show_row("ann_nprobes", "5", "20", "env", "request"),
         "reset all returns to the process value, not the definition's: {body}"
     );

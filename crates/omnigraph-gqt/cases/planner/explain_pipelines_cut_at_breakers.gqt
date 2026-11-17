@@ -20,7 +20,6 @@ edge Knows: Person -> Person
 {"edge":"Knows","from":"p1","to":"p2"}
 
 --- query
-set engine = v2;
 query sorted() {
     match { $p: Person }
     return { $p.name }
@@ -36,7 +35,6 @@ pipeline 0: Scan -> Projection => Sort
 pipeline 1: Sort => consumer after 0
 
 --- query
-set engine = v2;
 query one_hop() {
     match { $p: Person, $p knows $q }
     return { $q.name }
@@ -50,7 +48,6 @@ pipeline 0: Scan => HashJoin(build)
 pipeline 1: Scan -> Expand -> HashJoin(probe) -> Projection => consumer after 0
 
 --- query
-set engine = v2;
 query two_hops() {
     match { $p: Person, $p knows{1,2} $q }
     return { $q.name }
@@ -65,7 +62,6 @@ pipeline 1: Scan => Expand
 pipeline 2: Expand -> HashJoin(probe) -> Projection => consumer after 0, 1
 
 --- query
-set engine = v2;
 query knows_nobody() {
     match { $p: Person }
     where not exists { $q: Person, $p knows $q }
@@ -81,7 +77,6 @@ pipeline 1: Scan => AntiJoin
 pipeline 2: AntiJoin -> Projection => consumer after 0, 1
 
 --- query
-set engine = v2;
 query counted() {
     match { $p: Person }
     return { $p.name, count($p) as n }

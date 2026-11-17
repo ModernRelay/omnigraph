@@ -25,7 +25,6 @@ node Row {
 {"type":"Row","data":{"slug":"r4","a":true,"b":false,"c":true}}
 
 --- query
-set engine = v2;
 query bare_or_and() {
     match { $r: Row } where ($r.a or $r.b and $r.c)
     return { $r.slug }
@@ -40,7 +39,6 @@ query bare_or_and() {
 r.slug: String
 
 --- query
-set engine = v2;
 query explicit_or_over_and() {
     match { $r: Row } where ($r.a or ($r.b and $r.c))
     return { $r.slug }
@@ -55,7 +53,6 @@ query explicit_or_over_and() {
 r.slug: String
 
 --- query
-set engine = v2;
 query parenthesized_or_under_and() {
     match { $r: Row } where ($r.a or $r.b) and $r.c
     return { $r.slug }
@@ -69,7 +66,6 @@ query parenthesized_or_under_and() {
 r.slug: String
 
 --- query
-set engine = v2;
 query bare_not_and() {
     match { $r: Row } where not $r.a and $r.c
     return { $r.slug }
@@ -82,7 +78,6 @@ query bare_not_and() {
 r.slug: String
 
 --- query
-set engine = v2;
 query parenthesized_and_under_not() {
     match { $r: Row } where not ($r.a and $r.c)
     return { $r.slug }

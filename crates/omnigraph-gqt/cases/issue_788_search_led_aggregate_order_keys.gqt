@@ -23,7 +23,6 @@ node Doc {
 {"type":"Doc","data":{"slug":"c","kind":"y","text":"needle"}}
 
 --- query
-set engine = v2;
 query largest_group($t: String) {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $t) as $score }
     return { $d.kind, count($d) as n }
@@ -42,7 +41,6 @@ d.kind: String
 n: I64
 
 --- query
-set engine = v2;
 query smallest_group($t: String) {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $t) as $score }
     return { $d.kind, count($d) as n }
@@ -61,7 +59,6 @@ d.kind: String
 n: I64
 
 --- query
-set engine = v2;
 query every_group_ordered($t: String) {
     match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $t) as $score }
     return { $d.kind, count($d) as n }
@@ -81,7 +78,6 @@ d.kind: String
 n: I64
 
 --- query
-set engine = v2;
 query fused_largest_group($t: String) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60) as $score, $d: Doc }
     return { $d.kind, count($d) as n }
@@ -100,7 +96,6 @@ d.kind: String
 n: I64
 
 --- query
-set engine = v2;
 query fused_smallest_group($t: String) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60) as $score, $d: Doc }
     return { $d.kind, count($d) as n }

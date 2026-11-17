@@ -20,7 +20,6 @@ node Doc {
 {"type":"Doc","data":{"slug":"doc-title-only","title":"alpha memo","body":"plain filler"}}
 
 --- query
-set engine = v2;
 query filtered_rank($t: String, $q: String) {
     match {
       let $pop = { match { $d: Doc } where match_terms($d.title, terms($t, mode: any)) return { $d } },

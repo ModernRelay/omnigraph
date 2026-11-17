@@ -22,7 +22,6 @@ node Person {
 {"type":"Person","data":{"slug":"a","name":"alice","age":40,"text":"hello","adult":true}}
 
 --- query
-set engine = v2;
 query and_over_non_boolean() {
     match { $p: Person } where $p.age and $p.name
     return { $p.slug }
@@ -31,7 +30,6 @@ query and_over_non_boolean() {
 --- expect error: T41: a filter needs a Bool, got I64
 
 --- query
-set engine = v2;
 query not_over_non_boolean() {
     match { $p: Person } where not $p.age
     return { $p.slug }
@@ -40,7 +38,6 @@ query not_over_non_boolean() {
 --- expect error: T41: `not` needs a Bool, got I64
 
 --- query
-set engine = v2;
 query aggregate_in_a_filter() {
     match { $p: Person } where count($p) > 1
     return { $p.slug }
@@ -49,7 +46,6 @@ query aggregate_in_a_filter() {
 --- expect error: T8: `count($p)` is an aggregate over the read's own rows; it belongs in `return`
 
 --- query
-set engine = v2;
 query unaliased_comparison_in_return() {
     match { $p: Person }
     return { $p.slug, $p.age > 30 }
@@ -74,7 +70,6 @@ query property_leaf_in_an_assignment() {
 --- expect error: Q018: `age` is a bare name, which is not a value in a read: a property is `$x.age`, a parameter `$age`, a string `"age"`; a bare name is a return alias in `order` only
 
 --- query
-set engine = v2;
 query property_leaf_in_a_where() {
     match { $p: Person } where $p.adult = (age > 30)
     return { $p.slug }
@@ -98,7 +93,6 @@ query count_in_an_assignment() {
 --- expect error: T8: `count(…)` is an aggregate; it belongs in `return`, or as a block `count($x.p) { … }`
 
 --- query
-set engine = v2;
 query or_over_non_boolean() {
     match { $p: Person } where ($p.adult or $p.name)
     return { $p.slug }
@@ -107,7 +101,6 @@ query or_over_non_boolean() {
 --- expect error: T41: `or` needs a Bool, got String
 
 --- query
-set engine = v2;
 query string_as_a_filter() {
     match { $p: Person } where $p.name
     return { $p.slug }
@@ -124,7 +117,6 @@ query string_as_a_mutation_where() {
 --- expect error: T41: a filter needs a Bool, got String
 
 --- query
-set engine = v2;
 query boolean_item_in_an_aggregate_return() {
     match { $p: Person }
     return { $p.name, count($p) as n, $p.age > 30 as adult }

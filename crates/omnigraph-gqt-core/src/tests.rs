@@ -197,7 +197,7 @@ async fn generated_load_calls_the_host_once_before_checking_its_expectation() {
         "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append\n{GENERATED_PERSON}--- expect error: deliberately false\n"
     );
     let case = parse_case("generated", &text).unwrap();
-    let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+    let (session, uri, _dir) = open_case_store(&case).await.unwrap();
     let host = RecordingHost::default();
     let result = execute_steps(
         &case,
@@ -224,7 +224,7 @@ async fn generated_append_partitions_publish_the_declared_number_of_commits() {
             .replace("commits: 1\n", &format!("commits: {commits}\n{batch}"));
         let text = format!("{HDR}{SCHEMA}--- seed generate: v1 seed: 7\n{recipe}");
         let case = parse_case("generated", &text).unwrap();
-        let (session, _, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let (session, _, _dir) = open_case_store(&case).await.unwrap();
         assert_eq!(
             session.list_commits(Some("main")).await.unwrap().len(),
             commits + 1
@@ -248,7 +248,7 @@ async fn generated_load_repeats_the_same_recipe_in_a_loop() {
         "{HDR}{SCHEMA}--- seed\n--- loop $i 0 3\n--- load generate: v1 seed: 7 mode: merge\n{GENERATED_PERSON}{EXPECT_OK}--- endloop\n"
     );
     let case = parse_case("generated", &text).unwrap();
-    let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+    let (session, uri, _dir) = open_case_store(&case).await.unwrap();
     let host = RecordingHost::default();
     let session = execute_steps(
         &case,
@@ -299,7 +299,7 @@ async fn generated_load_observes_typed_errors_for_single_and_multiple_calls() {
             "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append branch: absent\n{recipe}--- expect error: absent\n"
         );
         let case = parse_case("generated", &text).unwrap();
-        let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let (session, uri, _dir) = open_case_store(&case).await.unwrap();
         let host = RecordingHost::default();
         execute_steps(
             &case,
@@ -2639,7 +2639,7 @@ async fn writer_header_claims_main_in_one_version_that_moves_no_head() {
         let pin = if held { "# writer: held\n" } else { "" };
         let text = format!("{HDR}{pin}{SCHEMA}{SEED}{QUERY}{EXPECT}");
         let case = parse_case("x", &text).unwrap();
-        let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let (session, uri, _dir) = open_case_store(&case).await.unwrap();
         let (seeded, head) = main_version_and_head(session.db()).await;
 
         let session = execute_steps(
@@ -2739,7 +2739,7 @@ async fn pinned_step_runs_only_its_pinned_path() {
             .await
             .unwrap_or_else(|e| panic!("{mode}: {e}"));
 
-        let (session, _uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let (session, _uri, _dir) = open_case_store(&case).await.unwrap();
         assert_eq!(session.settings().traversal().as_str(), mode);
         let Some(Item::Step(Step::Query(step))) = case.items.first() else {
             panic!("first item is the query step");
@@ -2793,7 +2793,7 @@ async fn traversal_pin_survives_settings_steps_and_rebind() {
          --- restart\n"
     );
     let case = parse_case("pinned", &text).unwrap();
-    let (mut session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+    let (mut session, uri, _dir) = open_case_store(&case).await.unwrap();
     let Some(Item::Step(Step::Query(query))) = case.items.first() else {
         panic!("first item is the query step");
     };
@@ -3176,10 +3176,7 @@ fn fault_limits_and_loop_scope_are_enforced() {
     );
 }
 
-async fn open_case_store(
-    case: &Case,
-    engine: Engine,
-) -> Result<(Session, String, tempfile::TempDir), String> {
+async fn open_case_store(case: &Case) -> Result<(Session, String, tempfile::TempDir), String> {
     let fixture = case
         .fixture
         .as_ref()
@@ -3193,7 +3190,7 @@ async fn open_case_store(
     let db = Omnigraph::init(&uri, &fixture.schema)
         .await
         .map_err(|e| format!("init failed: {e}"))?;
-    let session = case_session(db, case, engine)?;
+    let session = case_session(db, case)?;
     seed_case(&session, &fixture.seed, case.needs_indices).await?;
     Ok((session, uri, dir))
 }
@@ -3204,7 +3201,7 @@ fn execute_case<'a>(
     bless: bool,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
     async move {
-        let (session, uri, _dir) = open_case_store(case, Engine::V2).await?;
+        let (session, uri, _dir) = open_case_store(case).await?;
         execute_steps(case, path, bless, session, &uri, None, &PlainHost)
             .await
             .map(|_| ())
@@ -3352,7 +3349,7 @@ async fn engine_operation_finishes_before_failed_expectation() {
         EXPECT.replace("alice", "bob")
     );
     let case = parse_case("failed_expectation", &text).unwrap();
-    let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+    let (session, uri, _dir) = open_case_store(&case).await.unwrap();
     let host = RecordingHost::default();
     let result = execute_steps(
         &case,
@@ -3376,7 +3373,7 @@ async fn restart_preserves_supplied_storage_and_returns_current_session() {
     let both = "--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n--- expect shape\np.name: String\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}--- restart\n{QUERY}{both}");
     let case = parse_case("restart_storage", &text).unwrap();
-    let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+    let (session, uri, _dir) = open_case_store(&case).await.unwrap();
     let storage: Arc<dyn StorageAdapter> =
         Arc::new(omnigraph::storage::ObjectStorageAdapter::local());
     let host = RecordingHost {
@@ -3734,7 +3731,7 @@ async fn a_reference_disagreement_or_refusal_fails_the_step() {
             Some("the reference refused: E2: a divisor is zero"),
         ),
     ] {
-        let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let (session, uri, _dir) = open_case_store(&case).await.unwrap();
         let host = FixedReferenceHost { reference };
         let result = execute_steps(
             &case,

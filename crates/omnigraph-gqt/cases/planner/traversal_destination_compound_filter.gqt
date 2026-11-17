@@ -27,7 +27,6 @@ edge Knows: Person -> Person
 {"edge":"Knows","from":"r","to":"b1"}
 
 --- query
-set engine = v2;
 query adult_friends_named_a() {
     match { $p: Person, $p knows $f }
     where $p.slug = "r" and $f.age > 30 and starts_with($f.name, "a")

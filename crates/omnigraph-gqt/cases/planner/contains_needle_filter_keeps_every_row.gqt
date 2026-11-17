@@ -34,7 +34,6 @@ node Passage {
 {"type":"Passage","data":{"pid":"p-null"}}
 
 --- query
-set engine = v2;
 query literal_needles_with_passage_written_first() {
     match { $p: Passage, let $ms = { match { $m: Matter } return { $m } }, from $ms }
     where contains($p.text, $m.number) and $m.mid != "m-empty"
@@ -57,7 +56,6 @@ scan Matter as $m: no runtime filter
 pass join_algorithm
 
 --- query
-set engine = v2;
 query empty_needle() {
     match { $m: Matter, $p: Passage }
     where contains($p.text, $m.number) and $m.mid = "m-empty"
@@ -77,7 +75,6 @@ m.mid: String
 p.pid: String
 
 --- query
-set engine = v2;
 query null_needles_only() {
     match { $m: Matter, $p: Passage }
     where contains($p.text, $m.number) and $m.mid = "m-null"
@@ -91,7 +88,6 @@ m.mid: String
 p.pid: String
 
 --- query
-set engine = v2;
 query contains_inside_an_or() {
     match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where (contains($p.text, $m.number) or $p.pid = "p-digit")

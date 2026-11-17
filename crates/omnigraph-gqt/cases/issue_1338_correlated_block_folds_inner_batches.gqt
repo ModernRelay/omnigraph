@@ -39,7 +39,6 @@ tables:
     columns: {}
 
 --- query
-set engine = v2;
 set query_memory_bytes = 12582912;
 query hubs() {
     match { $a: Person }

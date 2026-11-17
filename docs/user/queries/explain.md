@@ -184,7 +184,7 @@ these keys alone; its `ordering` property
 is its whole comparator, those keys included as `$p.@id asc`, and a `Filter`
 keeps its input's ordering.
 
-The `datafusion` tree is the plan the query executes on the `v2` route: the
+The `datafusion` tree is the plan the query executes: the
 physical tree lowered to operators, every read operator omnigraph's own
 (`ScanExec`, `ExpandExec`, `HashJoinExec`, `FilterExec`, `ProjectionExec`,
 `SortExec`, `LimitExec`, `HydrateExec`, `CrossJoinExec`, `ContainsJoinExec`,
@@ -314,6 +314,5 @@ the same doors with a `--branch` target only: a historical `--snapshot` is
 refused, since a load targets a branch head. Served load explain requests
 require the load's `change` permission on that branch before source access.
 
-Every read executes on engine v2, the one value of the session setting
-`engine`, so explain describes the route the query runs. See
-[session settings](index.md#session-settings).
+Every read executes from its plan, so explain describes the route the query
+runs.

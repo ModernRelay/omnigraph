@@ -31,7 +31,6 @@ node B {
 {"type":"B","data":{"name":"b","bar":"different"}}
 
 --- query
-set engine = v2;
 query independent_negations() {
     match { $p: P }
     where not exists {

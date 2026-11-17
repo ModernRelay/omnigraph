@@ -38,7 +38,6 @@ edge Links: Source -> Doc
 {"edge":"Links","from":"s4","to":"f"}
 
 --- query
-set engine = v2;
 query open_links() {
     match { $s: Source, $s links $d, $d: Doc }
     where $d.state = "open"

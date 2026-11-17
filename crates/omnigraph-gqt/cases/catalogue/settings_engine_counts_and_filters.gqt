@@ -20,14 +20,12 @@ node Person {
 {"type":"Person","data":{"name":"ann"}}
 
 --- query
-set engine = v2;
 query settings_with_defaults() {
     match { $s: @Setting }
     return { $s.name, $s.kind, $s.default, $s.scope }
 }
 
 --- expect unordered
-{"s.name":"engine","s.kind":"enum(v2)","s.default":"v2","s.scope":"request"}
 {"s.name":"rrf_plan","s.kind":"enum(auto, force_prefilter, force_postfilter)","s.default":"auto","s.scope":"process"}
 {"s.name":"merge_lineage","s.kind":"enum(off, on, verify)","s.default":"on","s.scope":"request"}
 {"s.name":"change_lineage","s.kind":"enum(off, on, verify)","s.default":"on","s.scope":"request"}
@@ -48,7 +46,6 @@ s.default: String
 s.scope: String
 
 --- query
-set engine = v2;
 query engine_formats() {
     match { $e: @Engine }
     return { $e.current_internal_schema_version, $e.min_supported_internal_schema_version }
@@ -62,7 +59,6 @@ e.current_internal_schema_version: I64
 e.min_supported_internal_schema_version: I64
 
 --- query
-set engine = v2;
 query operator_count() {
     match { $o: @Operator }
     return { count($o) as n }
@@ -78,7 +74,6 @@ n: I64
 not pass aggregate_pushdown
 
 --- query
-set engine = v2;
 query first_operator_inputs() {
     match { $o: @Operator }
     return { $o.inputs }
@@ -96,7 +91,6 @@ o.inputs: [I64]
 not pass late_materialization
 
 --- query
-set engine = v2;
 query process_settings() {
     match { $s: @Setting } where $s.scope = "process"
     return { $s.name }
@@ -116,7 +110,6 @@ not pass predicate_pushdown
 filter reads [s.scope]
 
 --- query
-set engine = v2;
 query distinct_identities() {
     match { $o: @Operator }
     return { count(distinct $o.@id) as ids, count($o) as rows }

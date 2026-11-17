@@ -90,7 +90,6 @@ node Probe {
 {"type":"Probe","data":{"slug":"p00","n":1}}
 
 --- query
-set engine = v2;
 query fused_v2($t: String) {
     match {
       let $all = { match { $d: Doc } return { $d } },
@@ -120,7 +119,6 @@ p.slug: String
 --- expect same as reference
 
 --- query
-set engine = v2;
 query fused_explicit_id($t: String) {
     match {
       let $all = { match { $d: Doc } return { $d } },
@@ -149,7 +147,6 @@ fuse $d: arms [bm25, bm25]
 --- expect same as reference
 
 --- query
-set engine = v2;
 query fused_covered_return($t: String) {
     match {
       let $all = { match { $d: Doc } return { $d } },

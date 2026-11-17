@@ -22,7 +22,6 @@ node Person {
 {"type":"Person","data":{"slug":"c","x":3,"y":3}}
 
 --- query
-set engine = v2;
 query cross_binding_or() {
     match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
     where ($p.x = 1 or $q.y = 2)
@@ -47,7 +46,6 @@ scan Person as $q: no filter
 not pass predicate_pushdown
 
 --- query
-set engine = v2;
 query single_binding_or() {
     match { $p: Person }
     where ($p.x = 1 or $p.y = 3)

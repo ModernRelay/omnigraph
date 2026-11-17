@@ -104,7 +104,6 @@ p.adult: Bool
 p.maybe: Bool?
 
 --- query
-set engine = v2;
 query inline_match_null_selects_no_row($age: I64?) {
     match { $p: Person } where $p.adult = ($age > 30)
     return { $p.slug }

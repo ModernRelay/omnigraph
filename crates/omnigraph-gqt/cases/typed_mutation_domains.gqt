@@ -54,7 +54,6 @@ query fractional_bound() {
 --- expect affected: nodes=1 edges=0
 
 --- query
-set engine = v2;
 query marked_rows() {
     match { $x: Number }
     return { $x.key, $x.marked }
@@ -76,7 +75,6 @@ query parameter_assignment_rounding($small: F32, $wide: F64) {
 --- expect affected: nodes=1 edges=0
 
 --- query
-set engine = v2;
 query assigned_rounding() {
     match { $x: Number }
     return { $x.key, $x.rounded }
