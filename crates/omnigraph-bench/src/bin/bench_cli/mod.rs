@@ -22,8 +22,11 @@ use super::{Cli, print_diagnostics, print_json_success};
 #[derive(Debug, Args)]
 pub struct CatalogArgs {
     /// Read this config; otherwise discover benchmarks/benchmarks.yaml from cwd ancestors.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "catalog")]
     pub config: Option<PathBuf>,
+    /// A catalog, repeatable: a benchmarks.yaml or the directory holding one; a name resolves in the first that declares it.
+    #[arg(long, value_name = "DIR|FILE")]
+    pub catalog: Vec<PathBuf>,
     /// Emit versioned machine-readable output.
     #[arg(long)]
     pub json: bool,
@@ -47,7 +50,7 @@ pub struct ShowArgs {
     #[arg(required_unless_present = "workload", conflicts_with = "workload")]
     pub name: Option<String>,
     /// Inspect parser operation ordinals/text in this cwd-relative GQT file.
-    #[arg(long, conflicts_with = "config")]
+    #[arg(long, conflicts_with_all = ["config", "catalog"])]
     pub workload: Option<PathBuf>,
     #[command(flatten)]
     pub catalog: CatalogArgs,
@@ -129,6 +132,53 @@ pub fn legacy_input(path: &Path) -> Result<bool, Vec<Diagnostic>> {
 pub fn load(args: &CatalogArgs) -> Result<Catalog, Vec<Diagnostic>> {
     Catalog::load(&catalog::find_config(args.config.as_deref())?)
 }
+/// Every `--catalog` in command-line order, a directory meaning its
+/// `benchmarks.yaml`; the `--config` or discovered catalog alone when none.
+pub fn load_all(args: &CatalogArgs) -> Result<Vec<Catalog>, Vec<Diagnostic>> {
+    if args.catalog.is_empty() {
+        return Ok(vec![load(args)?]);
+    }
+    args.catalog
+        .iter()
+        .map(|path| {
+            if path.is_dir() {
+                Catalog::load(&path.join("benchmarks.yaml"))
+            } else {
+                Catalog::load(path)
+            }
+        })
+        .collect()
+}
+/// The catalog a name resolves in: the first `--catalog` that declares the
+/// suite or scenario, the first one with no name; one catalog answers itself.
+pub fn load_for(args: &CatalogArgs, selector: Option<&str>) -> Result<Catalog, Vec<Diagnostic>> {
+    let mut catalogs = load_all(args)?;
+    if catalogs.len() == 1 {
+        return Ok(catalogs.swap_remove(0));
+    }
+    let Some(name) = selector else {
+        return Ok(catalogs.swap_remove(0));
+    };
+    let paths = catalogs
+        .iter()
+        .map(|catalog| catalog.path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for catalog in catalogs {
+        match catalog.selection(Some(name)) {
+            Ok(_) => return Ok(catalog),
+            Err(diagnostics)
+                if diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.code == "unknown_selection") => {}
+            Err(diagnostics) => return Err(diagnostics),
+        }
+    }
+    Err(problem(
+        "unknown_selection",
+        format!("unknown suite or scenario '{name}' in {paths}"),
+    ))
+}
 pub fn failure(diagnostics: Vec<Diagnostic>, json_output: bool) -> ExitCode {
     if json_output {
         print_json_success(&json!({"cli_output_version":1,"ok":false,"diagnostics":diagnostics}));
@@ -163,53 +213,80 @@ fn problem(code: &str, message: impl Into<String>) -> Vec<Diagnostic> {
     vec![Diagnostic::error(code, "$", message)]
 }
 
+/// One inventory per catalog, in `--catalog` order; the `--config` or
+/// discovered catalog alone keeps the one-inventory output.
 pub fn list(args: ListArgs) -> ExitCode {
-    let catalog = match load(&args.catalog) {
-        Ok(c) => c,
+    let catalogs = match load_all(&args.catalog) {
+        Ok(catalogs) => catalogs,
         Err(e) => return failure(e, args.catalog.json),
     };
-    match args.kind {
-        InventoryKind::Scenarios => {
-            let inventory = discovery::scenarios(&catalog);
-            if args.catalog.json {
-                return success(&inventory, true);
-            }
-            println!("SCENARIO  SOURCE  GROUPS");
-            for entry in inventory.entries {
-                println!(
-                    "{}  {:?}  {}",
-                    entry.id,
-                    entry.source,
-                    entry.groups.join(", ")
-                );
-                for diagnostic in entry.diagnostics {
-                    eprintln!("{}: {}", diagnostic.path, diagnostic.message);
-                }
-            }
-            ExitCode::SUCCESS
-        }
-        kind => match discovery::sources(&catalog, matches!(kind, InventoryKind::Fixtures)) {
-            Ok(inventory) => {
-                if args.catalog.json {
-                    return success(&inventory, true);
-                }
-                println!("PATH  SOURCE  KIND  SCENARIOS");
-                for entry in inventory.entries {
-                    println!(
-                        "{}  {:?}  {}  {}",
-                        entry.path.display(),
-                        entry.source,
-                        entry.kind,
-                        entry.scenarios.join(", ")
-                    );
-                    for diagnostic in entry.diagnostics {
-                        eprintln!("{}: {}", diagnostic.path, diagnostic.message);
+    let several = !args.catalog.catalog.is_empty();
+    let mut inventories = Vec::with_capacity(catalogs.len());
+    for catalog in &catalogs {
+        let inventory = match args.kind {
+            InventoryKind::Scenarios => {
+                let inventory = discovery::scenarios(catalog);
+                if !args.catalog.json {
+                    if several {
+                        println!("CATALOG {}", catalog.path.display());
+                    }
+                    println!("SCENARIO  SOURCE  SUITES");
+                    for entry in &inventory.entries {
+                        println!(
+                            "{}  {:?}  {}",
+                            entry.id,
+                            entry.source,
+                            entry.suites.join(", ")
+                        );
+                        for diagnostic in &entry.diagnostics {
+                            eprintln!("{}: {}", diagnostic.path, diagnostic.message);
+                        }
                     }
                 }
-                ExitCode::SUCCESS
+                serde_json::to_value(&inventory)
             }
-            Err(e) => failure(e, args.catalog.json),
-        },
+            kind => match discovery::sources(catalog, matches!(kind, InventoryKind::Fixtures)) {
+                Ok(inventory) => {
+                    if !args.catalog.json {
+                        if several {
+                            println!("CATALOG {}", catalog.path.display());
+                        }
+                        println!("PATH  SOURCE  KIND  SCENARIOS");
+                        for entry in &inventory.entries {
+                            println!(
+                                "{}  {:?}  {}  {}",
+                                entry.path.display(),
+                                entry.source,
+                                entry.kind,
+                                entry.scenarios.join(", ")
+                            );
+                            for diagnostic in &entry.diagnostics {
+                                eprintln!("{}: {}", diagnostic.path, diagnostic.message);
+                            }
+                        }
+                    }
+                    serde_json::to_value(&inventory)
+                }
+                Err(e) => return failure(e, args.catalog.json),
+            },
+        };
+        match inventory {
+            Ok(inventory) => inventories.push(inventory),
+            Err(e) => {
+                return failure(
+                    problem("output_serialization_failed", e.to_string()),
+                    args.catalog.json,
+                );
+            }
+        }
+    }
+    if !args.catalog.json {
+        return ExitCode::SUCCESS;
+    }
+    if several {
+        success(&json!({"catalogs": inventories}), true)
+    } else {
+        success(&inventories.swap_remove(0), true)
     }
 }
 
@@ -235,14 +312,14 @@ pub fn show(args: ShowArgs) -> ExitCode {
             args.catalog.json,
         );
     }
-    let catalog = match load(&args.catalog) {
-        Ok(c) => c,
-        Err(e) => return failure(e, args.catalog.json),
-    };
     let name = args
         .name
         .as_deref()
         .expect("clap requires scenario or workload");
+    let catalog = match load_for(&args.catalog, Some(name)) {
+        Ok(c) => c,
+        Err(e) => return failure(e, args.catalog.json),
+    };
     let plan = match catalog.plan(name) {
         Ok(p) => p,
         Err(e) => return failure(e, args.catalog.json),
@@ -316,7 +393,7 @@ pub fn cache(command: CacheCommand) -> ExitCode {
             fixtures,
             verify,
         } => {
-            let catalog = match load(&args) {
+            let catalog = match load_for(&args, Some(&name)) {
                 Ok(c) => c,
                 Err(e) => return failure(e, args.json),
             };
@@ -489,7 +566,7 @@ fn generate(args: &InitArgs) -> Result<PathBuf, Vec<Diagnostic>> {
             deadline_seconds: None,
             protocol: ProtocolOverrides::default(),
         }],
-        groups: BTreeMap::new(),
+        suites: BTreeMap::new(),
         run: vec![args.name.clone()],
     };
     let yaml = yaml_serde::to_string(&config)
@@ -506,7 +583,7 @@ fn generate(args: &InitArgs) -> Result<PathBuf, Vec<Diagnostic>> {
     Ok(output)
 }
 
-const CONFIG_HELP: &str = "Config version 2\n\nfixtures/ contains starting-state GQT; workloads/ contains operations and checks.\nbenchmarks.yaml defines scenarios once, optional groups of scenario IDs, and an explicit run list.\n\nrun NAME selects one scenario or group. run --config FILE uses only FILE's run list.\nWithout --config, explicit paths, filenames with a suffix, and existing local entries use the legacy case loader.\nUse ./NAME to force a case path; use --config to select a catalog name even if a local entry has that name.\nPaths inside YAML are relative to that YAML's directory and must stay inside it.\n--config never falls back if the file is missing or invalid.\n\nEach scenario needs id, fixture, workload and measured_step (ordinal plus exact operation text).\nA fixture is a GQT path, or {kind: registered, reference: ..., preparation: ...}.\nDefaults: repetitions=5, deadline_seconds=60; a scenario names what is measured, never where.\nThe run supplies the environment (--server; --store, a fixture store at the clone reset level, with --backend for an s3:// store; the host's local default, APFS/clonefile on macOS or XFS/plain-copy elsewhere, otherwise) and the reset level follows it;\nenvironment and protocol are expanded before identity: per-phase attribution, manual schedule, monotonic timer.\nScenario fields override defaults; run --repetitions overrides only sample quantity.\ndeadline_seconds: null disables the measurement deadline, not the supervisor watchdog.\nProtocol overrides are attribution, schedule, reset and timer; deadline_seconds is a scenario/default field.\n\nCopy benchmarks/custom.example.yaml, or generate a checked config:\n  omnigraph-bench show --workload benchmarks/workloads/tiny_read.gqt\n  omnigraph-bench init --fixture benchmarks/fixtures/tiny_graph.gqt --workload benchmarks/workloads/tiny_read.gqt --step 1 --output custom.yaml\n  omnigraph-bench run --config custom.yaml\n";
+const CONFIG_HELP: &str = "Config version 2\n\nfixtures/ contains starting-state GQT; workloads/ contains operations and checks.\nbenchmarks.yaml defines scenarios once, optional suites of scenario IDs, and an explicit run list.\n\nrun NAME selects one scenario or suite. run --config FILE uses only FILE's run list.\n--catalog DIR|FILE, repeatable, reads several catalogs: a name resolves in the first that declares it, run and report use that one, list prints every catalog, show names the one it read.\nWithout --config or --catalog, explicit paths, filenames with a suffix, and existing local entries use the legacy case loader.\nUse ./NAME to force a case path; use --config to select a catalog name even if a local entry has that name.\nPaths inside YAML are relative to that YAML's directory and must stay inside it.\n--config and --catalog never fall back if a file is missing or invalid.\n\nEach scenario needs id, fixture, workload and measured_step (ordinal plus exact operation text).\nA fixture is a GQT path, or {kind: registered, reference: ..., preparation: ...}.\nDefaults: repetitions=5, deadline_seconds=60; a scenario names what is measured, never where.\nThe run supplies the environment (--server; --store, a fixture store at the clone reset level, with --backend for an s3:// store; the host's local default, APFS/clonefile on macOS or XFS/plain-copy elsewhere, otherwise) and the reset level follows it;\nenvironment and protocol are expanded before identity: per-phase attribution, manual schedule, monotonic timer.\nScenario fields override defaults; run --repetitions overrides only sample quantity.\ndeadline_seconds: null disables the measurement deadline, not the supervisor watchdog.\nProtocol overrides are attribution, schedule, reset and timer; deadline_seconds is a scenario/default field.\n\nCopy benchmarks/custom.example.yaml, or generate a checked config:\n  omnigraph-bench show --workload benchmarks/workloads/tiny_read.gqt\n  omnigraph-bench init --fixture benchmarks/fixtures/tiny_graph.gqt --workload benchmarks/workloads/tiny_read.gqt --step 1 --output custom.yaml\n  omnigraph-bench run --config custom.yaml\n";
 const CACHE_HELP: &str = "Cache inspection is read-only and never builds, restores, cleans or quarantines data.\n\n  omnigraph-bench cache status tiny-read --json\n  omnigraph-bench cache status tiny-read --verify --json\n  omnigraph-bench cache list --limit 100 --json\n\nThe default cache is target/gqt-datasets relative to cwd. Use the same --dataset-cache path for run and status.\nKeys bind recipe, engine/builder, backend/reset, cache location, required indexes and registered-source identity.\nHistorical variants may exist while the current scenario has a cache miss.\nSource: available, missing, invalid, unbound. Cache: missing, present, cached, busy, invalid, incomplete, unknown.\npresent checks published evidence; --verify audits full bytes before reporting cached.\nbusy returns immediately for a held lease. Missing or unbound sources give unknown cache status.\nStatus inspects the host's local environment; a served run reads a provisioned graph and uses no dataset cache.\nA status is a snapshot, not a reservation. Cache missing is a successful observation; inability to inspect fails.\nrun builds missing fixtures unless --no-build is supplied. dataset build prepares fixtures explicitly.\nLegacy dataset validate acquires a lease and stages worker files; use cache status for read-only inspection.\n";
 
 pub fn help(args: HelpArgs) -> ExitCode {
