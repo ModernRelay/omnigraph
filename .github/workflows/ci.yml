@@ -1126,6 +1126,109 @@ jobs:
           grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
             || { echo "::error::v5↔v10 format fence matched the wrong test set"; exit 1; }
 
+  cross_edition:
+    name: Cross-Edition Comparison
+    needs: classify_changes
+    # Runs wherever GQT runs (engine input or the `.gqt` corpus), since its
+    # input is the corpus and the engine both.
+    if: needs.classify_changes.outputs.run_gqt == 'true'
+    runs-on: ubuntu-latest
+    # Two runner builds share one target directory (the pinned edition-2
+    # commit's `omnigraph-gqt`, then this tree's), then every case pair runs
+    # under the deterministic simulation twice per side.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
+
+      - name: Check the cross-edition comparator
+        run: python3 scripts/cross-edition.py --self-test
+
+      # The edition-2 side: the GQT runner of the merge base with main that
+      # the GQ 3 break was measured against. Keep it immutable: the edition-2
+      # engine is what every case is compared with, and a moving reference
+      # would compare edition 3 with itself (docs/dev/testing.md, Cross-edition
+      # comparison).
+      - name: Build the edition-2 GQT runner
+        env:
+          EDITION_2_SOURCE_COMMIT: 42013036b50ecfff3d63f071f32db951be9cbd54
+        run: |
+          set -euo pipefail
+          e2_source="$RUNNER_TEMP/omnigraph-edition-2"
+          e2_bin="$RUNNER_TEMP/omnigraph-gqt-edition-2"
+          git fetch --no-tags --depth=1 origin "$EDITION_2_SOURCE_COMMIT"
+          git worktree add --detach "$e2_source" "$EDITION_2_SOURCE_COMMIT"
+          test "$(git -C "$e2_source" rev-parse HEAD)" = "$EDITION_2_SOURCE_COMMIT"
+          # Run inside the predecessor checkout so its workspace configuration
+          # (the `tokio_unstable` cfg the simulation needs) applies.
+          (cd "$e2_source" && cargo build --locked \
+            --package omnigraph-gqt \
+            --bin omnigraph-gqt \
+            --target-dir "$GITHUB_WORKSPACE/target")
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph-gqt" "$e2_bin"
+          test -x "$e2_bin"
+          # The two commits' path packages share names and versions; remove
+          # both identities before the current runner links.
+          cargo clean --workspace --locked \
+            --manifest-path "$e2_source/Cargo.toml" \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          cargo clean --workspace --locked \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          echo "EDITION_2_SOURCE_COMMIT=$EDITION_2_SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_EDITION_2_GQT_BIN=$e2_bin" >> "$GITHUB_ENV"
+
+      - name: Build the current GQT runner
+        run: cargo build --locked --package omnigraph-gqt --bin omnigraph-gqt
+
+      - name: Compare every case both editions hold
+        run: |
+          set -euo pipefail
+          python3 scripts/cross-edition.py run \
+            --edition-2-runner "$OMNIGRAPH_EDITION_2_GQT_BIN" \
+            --current-runner target/debug/omnigraph-gqt \
+            --base-ref "$EDITION_2_SOURCE_COMMIT" \
+            --work "$RUNNER_TEMP/cross-edition" \
+            --jobs "$(nproc)"
+
+      - name: Retain the cross-edition report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cross-edition-report
+          path: ${{ runner.temp }}/cross-edition/report.json
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
+
   test_aws_feature:
     name: Test omnigraph-server --features aws
     needs: classify_changes
@@ -1743,7 +1846,7 @@ jobs:
   # only where the job's own `if:` was false (docs/dev/branch-protection.md).
   ci_gate:
     name: CI Gate
-    needs: [classify_changes, check_agents_md, workflow_action_pins, cargo_deny, graph_vocabulary_guard, fmt, lint, test, storage_upgrade_compatibility, test_aws_feature]
+    needs: [classify_changes, check_agents_md, workflow_action_pins, cargo_deny, graph_vocabulary_guard, fmt, lint, test, storage_upgrade_compatibility, cross_edition, test_aws_feature]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1760,4 +1863,5 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_REF: ${{ github.ref }}
           RUN_FULL_CI: ${{ needs.classify_changes.outputs.run_full_ci }}
+          RUN_GQT: ${{ needs.classify_changes.outputs.run_gqt }}
         run: python3 scripts/ci_gate.py

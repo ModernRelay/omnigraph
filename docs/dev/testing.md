@@ -685,6 +685,46 @@ DST cases. The [GQT README](../../crates/omnigraph-gqt/README.md)
 defines supported targets, hooks, replay observations, and limits. The configured
 CI owner enrolls the complete corpus.
 
+### Cross-edition comparison
+
+GQ 3 replaced the query language in one break, and the corpus was respelled
+with it. `scripts/cross-edition.py` makes "the respelled corpus answers as
+edition 2 did" a check: for every `.gqt` case present at the pinned edition-2
+commit (`EDITION_2_SOURCE_COMMIT` in `ci.yml`, the merge base with `main`) and
+in this tree, under the same path or one git's rename detection pairs, it runs
+the commit's text of the case with that commit's `omnigraph-gqt` and this
+tree's text with this tree's runner. Both texts get one rewrite, the same on
+both sides: the `--- runner` section becomes a single deterministic-simulation
+environment (in-memory store, seed 0), because only that environment's trace
+(`--trace`) records each step's result: a read's Arrow schema and rows, a
+write's affected counts, an error's text. Steps pair by kind and declared
+query name in sequence order, so an inserted or removed step does not shift
+the rest. For each pair the script compares column names, Arrow types, rows (a
+multiset unless both steps' rows are ordered), affected counts, and the error:
+whether the step failed and its diagnostic code. A difference passes only when
+`crates/omnigraph-gqt/cross-edition.tsv` lists it by case, current step
+ordinal (`e2:<n>` for an edition-2 step with no counterpart) and aspect,
+naming the bullet of the GQ 3 RFC's Compatibility and reversibility section
+that sanctions it (`BULLETS` in the script, each with the sentence it cites)
+and why; a row that excuses no difference fails too. A row citing an `open:`
+key (`OPEN` in the script) is a difference no Compatibility bullet names: it
+does not fail the job, which prints it as a warning, and the key leaves the
+list when the RFC decides it. A case both editions fail at the same step with
+the same message under the simulation is a warning, its later steps
+uncompared; any other run failure is an error.
+
+```bash
+git worktree add --detach /tmp/e2 <EDITION_2_SOURCE_COMMIT>
+(cd /tmp/e2 && cargo build --locked -p omnigraph-gqt --bin omnigraph-gqt --target-dir /tmp/e2-target)
+cargo build --locked -p omnigraph-gqt --bin omnigraph-gqt
+python3 scripts/cross-edition.py run --edition-2-runner /tmp/e2-target/debug/omnigraph-gqt \
+  --current-runner target/debug/omnigraph-gqt --base-ref <EDITION_2_SOURCE_COMMIT> --work /tmp/cross-edition
+```
+
+`--case <path>` (repeatable) selects cases; `--reuse` compares the traces an
+earlier run left under `--work`. The report (`report.json` under `--work`)
+holds every difference with both observations.
+
 ### OpenAPI
 
 `crates/omnigraph-server/tests/integration/openapi.rs` regenerates the specification in memory and compares it with `openapi.json`. For an intentional API change:
