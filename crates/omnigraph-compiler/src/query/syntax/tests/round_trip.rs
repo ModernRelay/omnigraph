@@ -31,7 +31,7 @@
 //!   positional arguments, inline reads and options (a bare word as an
 //!   option's whole value), blocks (`count`, `sum($x)`, …, `exists`, each
 //!   with its own `where`) and `count(distinct …)`;
-//! - literals: integers to `i64::MAX`, floats over every finite bit
+//! - literals: `null` as an operand, integers to `i64::MAX`, floats over every finite bit
 //!   pattern, infinity and the subnormals, Booleans, `date(…)` and
 //!   `datetime(…)`, and lists, nested, holding negative numbers (a list is
 //!   where the grammar reads `-` before a number as part of the literal);
@@ -262,6 +262,8 @@ fn leaf() -> impl Strategy<Value = Expr> {
         3 => (pick(VARS), pick(PROPS)).prop_map(|(variable, property)| Expr::Prop { variable, property }),
         1 => (pick(VARS), pick(META)).prop_map(|(variable, m)| Expr::Prop { variable, property: format!("@{m}") }),
         1 => pick(META).prop_map(Expr::Meta),
+        // `null`, an operand wherever its context fixes its type.
+        1 => Just(Expr::Literal(Literal::Null)),
     ]
 }
 

@@ -4862,7 +4862,12 @@ impl Ctx<'_> {
                 SExpr::new(SKind::Lit(l.clone()), Ty::Value(want)).to_ir(),
             ));
         }
-        let v = self.expr(sc, value, At::Value)?;
+        let v = if is_untyped_null(value) {
+            // The property fixes the type of a `null` nothing else does.
+            self.null_as(sc, value, pt)?
+        } else {
+            self.expr(sc, value, At::Value)?
+        };
         if !sc.block_buf.is_empty() {
             return Err(err(
                 T44,
@@ -5056,12 +5061,7 @@ impl Ctx<'_> {
                         .is_some_and(|p| p.list),
                 )));
             }
-            Expr::Literal(Literal::Null) => {
-                return Err(err(
-                    T7,
-                    "`null` is not a value in a read; test it with `is null`",
-                ));
-            }
+            Expr::Literal(Literal::Null) => return Err(untyped_null_refusal()),
             Expr::Literal(l) => SExpr::new(SKind::Lit(l.clone()), Ty::Value(literal_type(l)?)),
             Expr::Variable(v) => {
                 if let Some(ty) = sc.col(v) {
@@ -5263,6 +5263,14 @@ impl Ctx<'_> {
                 left,
                 right,
                 at: written,
+            } if is_null_literal(left) || is_null_literal(right) => {
+                return Err(null_comparison(*op, left, right, written));
+            }
+            Expr::Compare {
+                op,
+                left,
+                right,
+                at: written,
             } => {
                 // A refusal inside a comparison is placed at it.
                 let l = self
@@ -5434,6 +5442,39 @@ impl Ctx<'_> {
         })
     }
 
+    /// `e`, a `null` whatever it is typed as ([`is_untyped_null`]), typed
+    /// as `want`, nullable: the literal, or an `if` whose branches or a
+    /// `coalesce` whose arguments are all such, each typed the same way.
+    fn null_as(&mut self, sc: &mut Scope, e: &Expr, want: &PropType) -> R<SExpr> {
+        let mut want = want.clone();
+        want.nullable = true;
+        let ty = Ty::Value(want.clone());
+        let Expr::Call(c) = e else {
+            return Ok(SExpr::new(SKind::Null, ty));
+        };
+        let mut args = Vec::with_capacity(c.args.len());
+        for (position, a) in c.args.iter().enumerate() {
+            let Arg::Expr(arg) = a else {
+                unreachable!("`is_untyped_null` admits expression arguments only")
+            };
+            args.push(if c.name == "if" && position == 0 {
+                let cnd = self.expr(sc, arg, At::Value)?;
+                require_bool(&cnd, "`if`'s condition")?;
+                cnd
+            } else {
+                self.null_as(sc, arg, &want)?
+            });
+        }
+        Ok(SExpr::new(
+            SKind::Call {
+                func: c.name.clone(),
+                args,
+                options: Vec::new(),
+            },
+            ty,
+        ))
+    }
+
     fn call_scalar(&mut self, sc: &mut Scope, c: &Call, at: At) -> R<SExpr> {
         let name = c.name.as_str();
         if matches!(name, "nearest" | "bm25" | "rrf" | "distance") {
@@ -5464,8 +5505,27 @@ impl Ctx<'_> {
         // Every argument is typed, so a refusal in one does not hide an
         // independent refusal in another.
         let mut failed: Option<E> = None;
+        // A `null` takes the type its context fixes (the GQ 3 RFC,
+        // section 5): an argument of `if`'s branches or of `coalesce` that
+        // is a `null` whatever it is typed as is typed after the others, as
+        // their common type.
+        let deferred: Vec<usize> = c
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(position, a)| {
+                matches!(a, Arg::Expr(e) if is_untyped_null(e))
+                    && match name {
+                        "if" => *position > 0,
+                        "coalesce" => true,
+                        _ => false,
+                    }
+            })
+            .map(|(position, _)| position)
+            .collect();
         for (position, a) in c.args.iter().enumerate() {
             match a {
+                Arg::Expr(_) if deferred.contains(&position) => typed_at.push(None),
                 Arg::Expr(e) => {
                     if matches!(e, Expr::Call(t) if t.name == "terms")
                         && matches!(name, "match_terms")
@@ -5481,7 +5541,10 @@ impl Ctx<'_> {
                     let guard = match (name, position) {
                         ("if", 1) => earlier(0).map(|cnd| lazy_guard(&cnd, true, false)),
                         ("if", 2) => earlier(0).map(|cnd| lazy_guard(&cnd, false, true)),
+                        // An earlier argument that is a `null` is null on
+                        // every row: it guards nothing.
                         ("coalesce", p) if p > 0 => (0..p)
+                            .filter(|i| !deferred.contains(i))
                             .map(earlier)
                             .collect::<Option<Vec<_>>>()
                             .and_then(|before| {
@@ -5532,6 +5595,24 @@ impl Ctx<'_> {
         }
         if let Some(e) = failed {
             return Err(e);
+        }
+        if !deferred.is_empty() {
+            // The type the other branch or arguments fix: the first of them,
+            // which the row's own typing below joins with the rest.
+            let fixed = match name {
+                "if" => args.get(1).map(|other| other.ty.clone()),
+                _ => args.first().map(|other| other.ty.clone()),
+            };
+            let Some(Ty::Value(want)) = fixed else {
+                return Err(untyped_null_refusal());
+            };
+            for &position in &deferred {
+                let Some(Arg::Expr(e)) = c.args.get(position) else {
+                    unreachable!("a deferred argument is an expression")
+                };
+                let typed = self.null_as(sc, e, &want)?;
+                args.insert(position.min(args.len()), typed);
+            }
         }
         let bool_ty = |nullable| Ty::scalar(ScalarType::Bool, nullable);
         let string =
@@ -6991,6 +7072,70 @@ fn fit(e: SExpr, ty: &Ty) -> SExpr {
 }
 
 /// The common type of two branches (`if`, `coalesce`).
+fn is_null_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(Literal::Null))
+}
+
+/// Whether `e` is null on every row whatever type it is given, so only its
+/// context can fix its type: the `null` literal, an `if` whose branches
+/// and a `coalesce` whose arguments are all such.
+fn is_untyped_null(e: &Expr) -> bool {
+    let all = |args: &[Arg]| {
+        args.iter()
+            .all(|a| matches!(a, Arg::Expr(x) if is_untyped_null(x)))
+    };
+    match e {
+        Expr::Literal(Literal::Null) => true,
+        Expr::Call(c) if c.options.is_empty() && c.name == "if" && c.args.len() == 3 => {
+            all(&c.args[1..])
+        }
+        Expr::Call(c) if c.options.is_empty() && c.name == "coalesce" && !c.args.is_empty() => {
+            all(&c.args)
+        }
+        _ => false,
+    }
+}
+
+/// A `null` whose type nothing fixes (the GQ 3 RFC, section 5).
+fn untyped_null_refusal() -> E {
+    err_fix(
+        T7,
+        "nothing fixes the type of this `null`: a `null` is a value where the other branch of `if`, another argument of `coalesce` or the property it is assigned to gives it a type",
+        "if(<condition>, <value>, null), or coalesce(<value>, …)",
+    )
+}
+
+/// A comparison with the `null` literal, null on every row: the test is
+/// `is null`, or `is not null` for `!=`, which the fix writes.
+fn null_comparison(op: CompOp, left: &Expr, right: &Expr, written: &SourceSpan) -> E {
+    let other = if is_null_literal(left) { right } else { left };
+    let test = match op {
+        CompOp::Ne => "is not null",
+        _ => "is null",
+    };
+    let replacement = format!("{} {test}", crate::query::syntax::print::expr(other));
+    let mut d = QueryDiagnostic::typecheck(
+        T7,
+        format!("a comparison with `null` is null on every row; a null test is `{test}`"),
+    )
+    .with_fix(replacement.clone());
+    if matches!(op, CompOp::Eq | CompOp::Ne) && written.end > written.start {
+        d = d.with_suggestion(Suggestion {
+            applicability: Applicability::MachineApplicable,
+            edits: vec![TextEdit {
+                start: written.start,
+                end: written.end,
+                replacement,
+            }],
+        });
+    }
+    if written.end > written.start {
+        d.position = Some(written.position);
+        d.end = Some(written.end_position);
+    }
+    E::D(d)
+}
+
 fn common(a: &SExpr, b: &SExpr, what: &str) -> R<Ty> {
     let a2 = adapt(a.clone(), &b.ty);
     let b2 = adapt(b.clone(), &a2.ty);

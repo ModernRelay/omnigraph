@@ -293,6 +293,14 @@ const INTENDED: &[(&str, &str)] = &[
         r#"query q() @budget(plan = 10) { match { $p: Person } return { $p.name } }"#,
     ),
     (
+        "null_literal_takes_its_contexts_type.gqt step 18",
+        r#"query equals_null() { match { $p: Person } where $p.city is null return { $p.handle } }"#,
+    ),
+    (
+        "null_literal_takes_its_contexts_type.gqt step 20",
+        r#"query differs_from_null() { match { $p: Person } where $p.city is not null return { $p.handle } }"#,
+    ),
+    (
         "diagnostics/t65_ranking_in_order.gqt step 3",
         r#"query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 3) as $distance } return { $d.title } order { $distance } limit 3 }"#,
     ),

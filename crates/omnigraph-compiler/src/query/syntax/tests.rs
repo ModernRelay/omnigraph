@@ -933,8 +933,10 @@ fn a_write_groups_elements_are_in_its_match() {
         if assignments[0].value == Expr::Literal(crate::query::value::Literal::Null))
     );
     write("query w() { insert P { a: null,  b: 1 } }");
-    assert!(parse_text("query w() { insert P { a: null + 1 } }").is_err());
-    assert!(parse_text("query q() { match { $p: P } where $p.a = null return { $p } }").is_err());
+    // `null` is a literal operand; the type checker refuses it where its
+    // context fixes no type, and a comparison with it.
+    assert!(parse_text("query w() { insert P { a: null + 1 } }").is_ok());
+    assert!(parse_text("query q() { match { $p: P } where $p.a = null return { $p } }").is_ok());
 }
 
 #[test]
@@ -1441,7 +1443,6 @@ const SYNTAX_RULES: &[&str] = &[
     "not_block_rec",
     "not_expr",
     "not_in_rec",
-    "null_compare_rec",
     "null_test",
     "null_value",
     "offset_rec",
@@ -2093,16 +2094,6 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query q() { match { $p: Person, from { match { $p knows $q } return { $q } } } return { $q.name } }"#,
     ),
     (
-        r#"!= null"#,
-        "Q014",
-        r#"query q() {
-  match { $p: Person }
-  where $p.city != null
-  return { $p.name }
-}"#,
-        r#"query q() { match { $p: Person } where $p.city is not null return { $p.name } }"#,
-    ),
-    (
         r#"<>"#,
         "Q014",
         r#"query q() {
@@ -2302,16 +2293,6 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
   delete $p, $q
 }"#,
         r#"query w() { match { $p knows $q } delete $p delete $q }"#,
-    ),
-    (
-        r#"null in a read filter"#,
-        "Q014",
-        r#"query q() {
-  match { $p: Person }
-  where $p.city = null
-  return { $p.name }
-}"#,
-        r#"query q() { match { $p: Person } where $p.city is null return { $p.name } }"#,
     ),
     (
         r#"a direction before its key"#,

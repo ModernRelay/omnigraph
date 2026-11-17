@@ -1,6 +1,7 @@
 # issue: none
 # notes: Null parameters retain their declarations; casts preserve nullable numeric and list results.
-# notes: Empty sets use the needle domain. GQ has no source null literal.
+# notes: Empty sets use the needle domain. A source `null` literal is typed by its context (see
+# notes: `null_literal_takes_its_contexts_type.gqt`).
 
 --- runner
 timeout_ms: 10000

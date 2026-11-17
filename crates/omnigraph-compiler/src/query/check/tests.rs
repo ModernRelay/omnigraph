@@ -2651,3 +2651,55 @@ fn a_defaulted_parameter_is_followed_only_by_defaulted_ones() {
         "{d}"
     );
 }
+
+/// A `null` literal takes the type its context fixes (section 5): the
+/// other branch of `if`, the other arguments of `coalesce`, the assigned
+/// property. Where nothing fixes it, it is `T7`; a comparison with it is
+/// `T7` whose machine fix writes `is null` or `is not null`.
+#[test]
+fn a_null_literal_takes_the_type_its_context_fixes() {
+    let c = ok(
+        "query q() { match { $p: Person, let $n = coalesce($p.age, 0), let $r = if($n > 0, 72 / $n, null) } return { $r, if($p.age > 3, null, \"x\") as band, coalesce(null, $p.city, null) as town } }",
+    );
+    assert_eq!(
+        cols(&c),
+        vec![
+            ("r".into(), "I32?".into()),
+            ("band".into(), "String?".into()),
+            ("town".into(), "String?".into()),
+        ]
+    );
+    ok(
+        "query w() { match { $p: Person } update $p set { city: if($p.age > 3, null, null), age: coalesce(null, $p.age) } }",
+    );
+    for text in [
+        "query q() { match { $p: Person } return { null as n } }",
+        "query q() { match { $p: Person } return { if($p.age > 3, null, null) as n } }",
+        "query q() { match { $p: Person } return { $p.age + null as n } }",
+        "query q() { match { $p: Person, let $x = null } return { $p } }",
+    ] {
+        let m = refused(text, "T7");
+        assert!(
+            m.contains("nothing fixes the type of this `null`"),
+            "{text}: {m}"
+        );
+    }
+    for (op, test) in [("=", "is null"), ("!=", "is not null")] {
+        let text = format!(
+            "query q() {{ match {{ $p: Person }} where $p.city {op} null return {{ $p }} }}"
+        );
+        let d = refused_with(&text, "T7");
+        let edits = &d.suggestion.as_ref().expect("a machine fix").edits;
+        assert_eq!(edits[0].replacement, format!("$p.city {test}"), "{d}");
+        assert_eq!(
+            &text[edits[0].start..edits[0].end],
+            format!("$p.city {op} null"),
+            "{d}"
+        );
+    }
+    let d = refused_with(
+        "query q() { match { $p: Person } where null = $p.city return { $p } }",
+        "T7",
+    );
+    assert_eq!(d.fix.as_deref(), Some("$p.city is null"), "{d}");
+}

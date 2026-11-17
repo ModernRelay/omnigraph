@@ -90,7 +90,11 @@ property's type is `T3` ([checked literals](diagnostics.md#checked-literals)).
 | `true` | `false` | `false` | `true` |
 
 `x is null` and `x is not null` are always `Bool` and are the only null tests:
-GQ has no `null` literal, so `$p.x = null` is a parse error. A parameter bound
+A `null` literal takes the type its context fixes: the other branch of `if`,
+the other arguments of `coalesce`, the property it is assigned to, as in
+`let $r = if($n > 0, $t / $n, null)`. Where nothing fixes its type (`return
+{ null as x }`, `$p.age + null`) it is `T7`, and `$p.x = null` and `$p.x !=
+null` are `T7` whose fix writes `$p.x is null` and `$p.x is not null`. A parameter bound
 to `null` makes every comparison on it null, and `is null` refuses a `Blob`.
 `not ($p.age > 30) or $p.age is null` selects every row the comparison did not.
 

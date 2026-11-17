@@ -3858,15 +3858,6 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                 },
             })
         }
-        Rule::null_compare_rec => {
-            let negated = op.as_str().starts_with("!=");
-            whole(
-                format!("{left_source} is {}null", if negated { "not " } else { "" }),
-                "a read has no null literal; a null test is `is null` or `is not null`",
-                Q014,
-                MACHINE,
-            )
-        }
         Rule::regex_rec => Err(refusal_note(
             input,
             Q014,
@@ -4351,13 +4342,9 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
         }
         Rule::meta_field => Ok(Expr::Meta(inner.as_str()[1..].to_string())),
         Rule::variable => Ok(Expr::Variable(inner.as_str()[1..].to_string())),
-        Rule::reserved_property if inner.as_str() == "null" => Err(refusal_note(
-            input,
-            Q005,
-            "a read has no `null` literal; a null test is `x is null` or `x is not null`, and `null` is an assignment value only",
-            span,
-            "$x.<property> is null",
-        )),
+        // `null` is a literal wherever its context fixes its type; the type
+        // checker refuses it where nothing does, and a comparison with it.
+        Rule::reserved_property if inner.as_str() == "null" => Ok(Expr::Literal(Literal::Null)),
         Rule::reserved_property => Err(diagnostic_at(
             Q005,
             format!(

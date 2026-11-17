@@ -790,6 +790,23 @@ fn if_and_coalesce_evaluate_only_what_they_select() {
     );
 }
 
+/// A `null` literal typed by its context: the other branch of `if`, the
+/// other arguments of `coalesce`, is null on every row it is selected; a
+/// null value leaves its row's object.
+#[test]
+fn a_typed_null_is_null_where_it_is_selected() {
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $p: Person, let $r = if($p.age > 35, 80 / $p.age, null) } return { $p.name, $r, coalesce(null, $p.city) as c } }"
+        )),
+        vec![
+            json!({"c": "Oslo", "p.name": "ann"}),
+            json!({"c": "Rome", "p.name": "cyd"}),
+            json!({"p.name": "bob", "r": 2})
+        ]
+    );
+}
+
 #[test]
 fn an_inline_read_groups_once_per_outer_row() {
     assert_eq!(

@@ -379,8 +379,7 @@ and_expr   = { not_expr ~ (kw_and ~ not_expr)* }
 not_expr   = { not_block_rec | (kw_not ~ not_expr) | comparison }
 // `not { … }` as an operand: the block is `not exists { … }`.
 not_block_rec = { kw_not ~ "{" ~ block_body ~ "}" }
-comparison = { sum ~ (null_compare_rec | regex_rec | comp_op ~ sum ~ chained_rec? | not_in_rec | kw_in ~ (in_paren_rec | sum) | between_rec | like_rec | starts_with_words_rec | infix_string_op ~ sum | null_test)? }
-null_compare_rec = { ("!=" | "=") ~ kw_null }
+comparison = { sum ~ (regex_rec | comp_op ~ sum ~ chained_rec? | not_in_rec | kw_in ~ (in_paren_rec | sum) | between_rec | like_rec | starts_with_words_rec | infix_string_op ~ sum | null_test)? }
 regex_rec = { "=~" ~ sum }
 chained_rec = { (comp_op ~ sum)+ }
 not_in_rec = { kw_not ~ kw_in ~ sum }
