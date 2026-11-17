@@ -22,14 +22,32 @@ record, refuses them; direct `omnigraph optimize` stays available there.
 | `OMNIGRAPH_OPTIMIZE_MAX_GATE_HOLD_SECONDS` | `300` | The largest gate hold a request may ask for. |
 | `OMNIGRAPH_OPTIMIZE_ARTIFACT_WRITE_LIMIT_BYTES` | `536870912` | The largest adjacency artifact a served run writes. |
 | `OMNIGRAPH_OPTIMIZE_PLANNING_CONCURRENCY` | `8` | Tables a served run plans ahead of the one it rewrites; it rewrites one at a time. |
-| `OMNIGRAPH_OPTIMIZE_MAX_SOURCE_FRAGMENTS`, `_MAX_SOURCE_ROWS`, `_MAX_SOURCE_BYTES`, `_MAX_BLOB_BYTES`, `_MAX_INDEX_ROWS` | unset | The per-table ceilings every served run applies ([bounding a run](maintenance.md#bounding-a-run)). |
-| `OMNIGRAPH_OPTIMIZE_RUN_SOURCE_BYTES` | unset | The run byte budget. |
+| `OMNIGRAPH_OPTIMIZE_MAX_SOURCE_FRAGMENTS`, `_MAX_SOURCE_ROWS`, `_MAX_SOURCE_BYTES`, `_MAX_BLOB_BYTES`, `_MAX_INDEX_ROWS` | unset | The per-table ceilings every served run applies ([table ceilings and the byte budget](#table-ceilings-and-the-byte-budget)). |
+| `OMNIGRAPH_OPTIMIZE_RUN_SOURCE_BYTES` | unset | The run byte budget, and the table byte ceiling when `_MAX_SOURCE_BYTES` is unset. |
 
 A value that does not parse, a default above its ceiling, or a table byte
 ceiling above the run budget stops the server at startup. The ceilings are the
 server's: a request names only its tables and how long writers wait. Every
 route needs the [`maintain`](policy.md#actions) action on the graph's `main`
 branch, for the actor the bearer token resolves to.
+
+### Table ceilings and the byte budget
+
+A per-table ceiling is measured from a table's compaction plan before anything
+is written. A table over one is `deferred` with reason `resource_limit`, and
+the run goes on to the next table. This does not move the resume position
+(`resume_at`), so every later run defers that table again until it fits. The
+run byte budget defers, with reason `byte_budget`, the first table that would
+take the run past it and every table after it, and the run resumes there.
+
+The budget is also the table byte ceiling when
+`OMNIGRAPH_OPTIMIZE_MAX_SOURCE_BYTES` is unset. A table whose compaction reads
+more bytes than the budget is therefore never compacted by a served run. To
+compact it, raise the budget, or stop the server and run `omnigraph optimize`
+on the cluster root directly, which applies neither. A direct run keeps the
+root's admission lock: release it with `cluster force-unlock`, as after a
+[direct apply](../clusters/index.md#bootstrap-a-cluster), before the server
+starts again.
 
 ## Submit, look up, cancel
 
@@ -105,7 +123,11 @@ when its server stopped is `interrupted` at the next submission or lookup.
 
 A full-catalog run that a gate hold or the byte budget stopped records the
 table to start at; the next full-catalog submission for that graph starts
-there, so successive bounded runs reach every table.
+there, so successive bounded runs reach every table that fits the server's
+per-table ceilings. A table over a ceiling, including a table larger than the
+byte budget when no table byte ceiling is set, does not move that position: it
+is deferred with `resource_limit` on every run until the ceiling is raised
+([table ceilings](#table-ceilings-and-the-byte-budget)).
 
 Cancellation stops the run at its next safe boundary. A run that already
 started its publication finishes it and reports that the cancellation arrived
