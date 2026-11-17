@@ -9,13 +9,19 @@
 //! literals and comments as the grammar does, opens a level at `(`, `{` and
 //! `[`, charges a level for each prefix operator in a run of adjacent ones
 //! (`not` in any case, `!`, a unary `-`) and for each nested `case`, charges
-//! each `and`/`or` (in any case, and `&&`) to the total, and charges the
-//! longest run of binary operators (arithmetic, `||`, comparisons) between
-//! two `and`/`or`s. Every spelling the habit rewrite turns into an operator
-//! is counted as that operator, so the rewrite's reparse meets the same
-//! bound. The estimate never undercounts the tree a source can build; it
-//! overcounts operators of sibling clauses that share a level, which only
-//! matters for a source near the bound.
+//! each `and`/`or` (in any case, and `&&`) of an expression to the total,
+//! and charges the longest run of binary operators (arithmetic, `||`,
+//! comparisons, `in`) between two `and`/`or`s. Every spelling the habit
+//! rewrite turns into an operator is counted as that operator, so the
+//! rewrite's reparse meets the same bound.
+//!
+//! The bound is on depth, not breadth. An expression ends where a list
+//! separator (`,`, `;`, `:`) or a second operand follows it (a clause word,
+//! a variable or a literal right after an operand: no expression puts two
+//! operands side by side), and the next one starts from zero; a level
+//! charges only its deepest expression, so sibling clauses, arguments and
+//! write groups never add up. The estimate never undercounts the tree a
+//! source can build.
 
 use super::codes::Q006;
 use super::diagnostic::{Position, QueryDiagnostic};
@@ -67,9 +73,11 @@ struct Level {
     cases: usize,
     /// The prefix-operator run in progress, ended by any other token.
     run: usize,
-    /// `and`/`or` operators at this level, plus the longest run of binary
-    /// operators between two of them.
+    /// `and`/`or` operators of the expression in progress at this level,
+    /// plus the longest run of binary operators between two of them.
     chain: usize,
+    /// The deepest `chain` of an expression this level has completed.
+    chain_max: usize,
     /// The binary-operator run in progress, ended by `and`/`or` or `,`.
     ops: usize,
     /// The longest binary-operator run at this level.
@@ -160,6 +168,16 @@ fn measure(
             level.chain += 1;
             *total += 1;
         };
+        // An expression ended: the next one at this level starts from zero,
+        // and the level keeps only the deeper of the two.
+        let end_expression = |level: &mut Level, total: &mut usize| {
+            level.run = 0;
+            *total -= level.chain;
+            level.chain_max = level.chain_max.max(level.chain);
+            level.chain = 0;
+            level.ops = 0;
+            level.ops_max = 0;
+        };
         match bytes[i] {
             b' ' | b'\t' | b'\r' | b'\n' => {
                 i += 1;
@@ -174,6 +192,9 @@ fn measure(
                 continue;
             }
             b'"' => {
+                if after_operand {
+                    end_expression(level, &mut total);
+                }
                 level.run = 0;
                 i += 1;
                 while i < bytes.len() && bytes[i] != b'"' {
@@ -204,7 +225,7 @@ fn measure(
                     parent.child_nesting = parent.child_nesting.max(own + child.child_nesting);
                     parent.child_total = parent
                         .child_total
-                        .max(own + child.chain + child.child_total);
+                        .max(own + child.chain.max(child.chain_max) + child.child_total);
                 }
                 i += 1;
                 after_operand = true;
@@ -216,8 +237,23 @@ fn measure(
                 // `$not`, `@and` and `$p.or` are names, not operators.
                 let operator = start == 0 || !matches!(bytes[start - 1], b'$' | b'@' | b'.');
                 let word = &bytes[start..i];
+                let keyword = |words: &[&[u8]]| words.iter().any(|w| word.eq_ignore_ascii_case(w));
+                // A word right after an operand that is not an operator
+                // starts the next expression.
+                if operator
+                    && after_operand
+                    && !keyword(&[
+                        b"and", b"or", b"not", b"in", b"is", b"when", b"then", b"else",
+                    ])
+                {
+                    end_expression(level, &mut total);
+                }
+                let was_operand = after_operand;
                 after_operand = true;
-                if operator && word.eq_ignore_ascii_case(b"not") {
+                if operator && word.eq_ignore_ascii_case(b"in") && was_operand {
+                    binary(level, &mut total);
+                    after_operand = false;
+                } else if operator && word.eq_ignore_ascii_case(b"not") {
                     prefix(level, &mut nesting, &mut total);
                     after_operand = false;
                 } else if operator
@@ -270,8 +306,12 @@ fn measure(
                 after_operand = false;
             }
             b',' | b';' | b':' => {
-                level.run = 0;
-                level.ops = 0;
+                end_expression(level, &mut total);
+                i += 1;
+                after_operand = false;
+            }
+            b'$' if after_operand => {
+                end_expression(level, &mut total);
                 i += 1;
                 after_operand = false;
             }
@@ -372,6 +412,36 @@ mod tests {
         );
         let siblings = filter(&vec!["not $p.age > 1"; 100].join("\n"));
         assert_eq!(depth(&siblings).0, base.0 + 1);
+    }
+
+    /// Breadth is not depth: sibling expressions (write groups, the
+    /// arguments of a call, the assignments of a `set`) each start from
+    /// zero, so a source as wide as the size budget allows measures as deep
+    /// as one of its siblings.
+    #[test]
+    fn siblings_are_measured_by_the_deepest_not_their_sum() {
+        let group = |i: usize| {
+            format!(
+                "match {{ $p: Person }} where $p.handle = \"h{i}\" and $p.age > 1 or $p.age < 0 update $p set {{ age: $p.age + 1, city: \"c\" }}"
+            )
+        };
+        let write = |n: usize| {
+            format!(
+                "query w() {{ {} }}",
+                (0..n).map(group).collect::<Vec<_>>().join("\n")
+            )
+        };
+        assert_eq!(depth(&write(1)), depth(&write(1_000)));
+        assert!(check_query_nesting(&write(1_000)).is_ok());
+        let arguments = |n: usize| {
+            filter(&format!(
+                "coalesce({}) > 0",
+                vec!["$p.age > 1 or $p.age < 0 and $p.age = 3"; n].join(", ")
+            ))
+        };
+        assert_eq!(depth(&arguments(1)), depth(&arguments(500)));
+        // One expression still counts every operator of its chain.
+        assert!(depth(&filter(&vec!["$p.age > 1"; 20].join(" or "))).1 > depth(&arguments(500)).1);
     }
 
     /// A source at the bounds compiles on the stack [`on_query_stack`]
