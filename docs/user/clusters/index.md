@@ -186,7 +186,9 @@ and require a single live branch.
 Policies, provider definitions and graph bindings, and external-Blob rules can
 change on existing graphs. Current permissions authorize the deployment; proposed
 permissions cannot authorize themselves. Provider changes do not re-embed stored
-vectors. Roots, format and credential/trust configuration stay fixed.
+vectors. Roots, format and credential/trust configuration stay fixed, except
+that static bearer tokens in a token file can refresh without a restart when
+refresh is enabled ([refresh static tokens](../operations/bearer-tokens.md#refresh-static-tokens)).
 A refusal before effects restores unchanged serving views, including after a
 drain timeout. That timeout bounds draining admitted requests; once drained,
 the server owns preparation, completion and activation through the existing

@@ -85,27 +85,28 @@ APIs keep their separate protocol.
 
 ## Authentication
 
-Choose one static token source:
-
-| Environment variable | Value |
-|---|---|
-| `OMNIGRAPH_SERVER_BEARER_TOKEN` | One bearer token; actor is `default` |
-| `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON` | Actor-to-token object, e.g. `{"act-alice":"secret-a"}` |
-| `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` | Path to that JSON object. On Unix a file other accounts can write is refused at startup, and one they can read logs a warning; use `chmod 600`, or `defaultMode: 0400` on a Kubernetes secret volume |
-| `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` | Secrets Manager mapping; requires an AWS-enabled build: the container images, the release archives from v0.14.0 and every edge build, or a source build with `cargo build -p omnigraph-server --features aws` |
-
-Every source refuses a blank actor, a duplicate token value and an actor name
-starting with `principal:`, which is reserved for signed and OIDC identities
-(`principal:<id>`), so a static token cannot match their policy rules.
+Static bearer tokens come from `OMNIGRAPH_SERVER_BEARER_TOKEN` (actor `default`),
+`OMNIGRAPH_SERVER_BEARER_TOKENS_JSON`, `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` or
+`OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET`. [Static bearer tokens](bearer-tokens.md)
+lists them, how they combine and what every source refuses. Make every token a
+random, high-entropy value: the server keeps only each token's SHA-256 digest.
+The server reads the tokens at startup. With
+`OMNIGRAPH_SERVER_BEARER_TOKENS_REFRESH_SECONDS` it also reads the token file
+again on that interval and logs `static credential refresh enabled` at startup;
+the environment and Secrets Manager stay startup-only. While the file is invalid
+the last valid tokens stay in force, so revocation stops, and a valid empty file
+refuses every static token ([refresh](bearer-tokens.md#refresh-static-tokens)).
 
 Send `Authorization: Bearer secret-a` (the scheme is case-insensitive). The token selects the
 actor for authorization and commit attribution; clients cannot claim another actor. See
 [Authorization and actors](policy.md). Every 401 carries a `WWW-Authenticate: Bearer` challenge, with `error="invalid_token"` when
 the server refused the token sent; a valid OIDC token it does not admit gets 403 ([MCP](mcp.md)).
 
-A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
-pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
-on a trusted development network. A graph without an applied policy refuses
+A server with no static token source, no signed-token or OIDC trust, and no
+policy refuses to start unless you explicitly pass `--unauthenticated` (or set
+`OMNIGRAPH_UNAUTHENTICATED=1`). Use that only on a trusted development network.
+A set token variable is a source whatever it holds: a token file holding `{}`
+requires bearer authentication, also with `--unauthenticated`. A graph without an applied policy refuses
 every action to every token, reads included: bearer tokens are not scoped to
 graphs, so a permit there would reach every graph that lacks a policy. Apply a
 [graph policy](policy.md) to each graph a token should reach. Setting

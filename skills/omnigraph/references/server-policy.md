@@ -103,9 +103,16 @@ printf '%s\n' "$TOKEN" | omnigraph credentials set --target production --stdin
 omnigraph query get_person --target production --graph knowledge
 ```
 
+The server reads static tokens at startup; with
+`OMNIGRAPH_SERVER_BEARER_TOKENS_REFRESH_SECONDS` (1 to 3600) it re-reads
+`OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` on that interval, and an invalid file keeps
+the last valid tokens.
+
 A server with no credential source (static tokens or signed-token trust) and no
 policy refuses to start unless explicitly
-given `--unauthenticated` (or `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only on a
+given `--unauthenticated` (or `OMNIGRAPH_UNAUTHENTICATED=1`). A set token
+variable is a source whatever it holds, so a token file holding `{}` still
+requires bearer authentication. Use that only on a
 trusted development network. A graph without a policy denies every action to
 every token, reads included, because tokens are not scoped to graphs; apply a
 policy to each graph. `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` in the server's

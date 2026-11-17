@@ -324,12 +324,12 @@ server.
 
 ## Authentication and policy
 
-Configure tokens from environment or a mounted secret file:
-
-- `OMNIGRAPH_SERVER_BEARER_TOKEN`
-- `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON`
-- `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` (mode 600, or `defaultMode: 0400` for a Kubernetes secret volume; a file other accounts can write is refused)
-- `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` in the AWS-enabled build
+Configure static bearer tokens from the environment, a mounted secret file or
+Secrets Manager; [static bearer tokens](operations/bearer-tokens.md) lists the
+variables. On Kubernetes, mount the token Secret as a directory, never with
+`subPath`, with `defaultMode: 0400`, and replace whole files atomically;
+[that page](operations/bearer-tokens.md#kubernetes) covers refresh without a
+restart and the kubelet's delay.
 
 Policy bundles come from the applied cluster. See
 [HTTP server](operations/server.md) and

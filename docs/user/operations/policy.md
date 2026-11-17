@@ -281,12 +281,17 @@ omnigraph commit show <COMMIT_ID> --target ./graph.omni --json
 
 For static token authentication:
 
-| Tokens | Policy | Startup and authorization |
+| Token source | Policy | Startup and authorization |
 |---|---|---|
 | none | none | Requires explicit `--unauthenticated`; otherwise startup fails |
 | configured | none | Every action is denied, reads included; `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` lets static tokens `read` ([authentication](server.md#authentication)) |
 | configured | configured | The policy decides each action |
 | none | configured | Startup fails because no request could establish an actor |
+
+A token source is configured when one of its variables is set, whatever it
+holds: a token file holding `{}` is configured and refuses every static token.
+The mode is fixed at startup, so refreshing the token file changes which tokens
+are admitted, never whether one is required.
 
 `GET /graphs` is denied unless a `cluster`-scoped policy grants `graph_list`,
 including when graph policies exist.

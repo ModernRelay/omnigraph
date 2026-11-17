@@ -49,6 +49,7 @@ p256 = { version = "0.14", features = ["ecdsa", "pem"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 libc = "0.2"
 subtle = { workspace = true }
+zeroize = "1"
 async-trait = { workspace = true }
 arc-swap = { workspace = true }
 regex = { workspace = true }
