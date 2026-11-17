@@ -2533,3 +2533,63 @@ fn a_triple_is_written_in_its_edges_declared_order() {
         outcome("query q() { match { $p: Person, $q: Person, $q * $p } return { $q } }").is_ok()
     );
 }
+
+/// A literal meeting a declared type is a value of that type, by one range
+/// rule: a parameter's default of every type (a scalar, each element of a
+/// list or a vector) and an assigned value. `T3` names the value and the
+/// type; a literal at a range's edge is accepted.
+#[test]
+fn a_literal_meeting_a_declared_type_is_in_its_range() {
+    const SCHEMA: &str = r#"
+node Person { slug: String @key  age: I32  rank: U32  weight: F32  ranks: [U32]?  embedding: Vector(2)? }
+"#;
+    let catalog = build_catalog(&parse_schema(SCHEMA).unwrap()).unwrap();
+    let outcome = |src: &str| {
+        type_source(&catalog, src)
+            .unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
+            .remove(0)
+            .1
+    };
+    let with_default =
+        |param: &str| format!("query q({param}) {{ match {{ $p: Person }} return {{ $p.slug }} }}");
+    let assigned = |assignment: &str| {
+        format!(
+            "query w() {{ match {{ $p: Person }} where $p.slug = \"a\" update $p set {{ {assignment} }} }}"
+        )
+    };
+    for (source, outside) in [
+        (
+            with_default("$x: I32 = 3000000000"),
+            "3000000000 is outside its range",
+        ),
+        (with_default("$x: U32 = -1"), "-1 is outside its range"),
+        (
+            with_default("$xs: [I32] = [1, 3000000000]"),
+            "3000000000 is outside its range",
+        ),
+        (with_default("$xs: [U64] = [-1]"), "-1 is outside its range"),
+        (with_default("$x: F32 = 1.0e39"), "is not a finite F32"),
+        (
+            with_default("$v: Vector(2) = [0.5, 1.0e39]"),
+            "is not a finite F32",
+        ),
+        (
+            assigned("age: 3000000000"),
+            "3000000000 is outside its range",
+        ),
+        (assigned("ranks: [-1]"), "-1 is outside its range"),
+        (assigned("embedding: [1.0e39, 0.0]"), "is not a finite F32"),
+    ] {
+        let refused = outcome(&source).expect_err(&source);
+        assert_eq!(refused.code.as_str(), "T3", "{source}: {refused}");
+        assert!(refused.message.contains(outside), "{source}: {refused}");
+    }
+    for source in [
+        with_default("$xs: [I32] = [-2147483648, 2147483647]"),
+        with_default("$x: U32 = 4294967295"),
+        with_default("$v: Vector(2) = [-0.5, 3.0e38]"),
+        assigned("age: 2147483647, ranks: [0, 4294967295]"),
+    ] {
+        assert!(outcome(&source).is_ok(), "{source}");
+    }
+}

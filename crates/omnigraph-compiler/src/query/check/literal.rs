@@ -92,6 +92,15 @@ pub(crate) fn check_literal_type(
         };
     }
 
+    if let Some(outside) = out_of_range(lit, expected) {
+        return Err(CompilerError::typed(
+            T3,
+            format!(
+                "`{prop_name}` has type {}, but {outside}",
+                expected.display_name()
+            ),
+        ));
+    }
     if !expected.list
         && let ScalarType::Vector(expected_dim) = expected.scalar
         && let Some(actual_dim) = numeric_vector_literal_dim(lit)
@@ -358,6 +367,32 @@ pub(crate) fn tested_enum_literal(
         fix: nearest.clone(),
         replacement: Some(nearest),
     })
+}
+
+/// Where a literal of a type compatible with `expected` is not a value of
+/// it: an integer outside its integer type's range, a float that is not a
+/// finite `F32` for an `F32`, and each element of a list or a vector by its
+/// element type. `None` when every value is in range. The one range rule
+/// for a literal meeting a declared type: a parameter's default, an
+/// assigned value.
+pub(crate) fn out_of_range(lit: &Literal, expected: &PropType) -> Option<String> {
+    let element = match expected.scalar {
+        ScalarType::Vector(_) => ScalarType::F32,
+        scalar => scalar,
+    };
+    let scalar = |lit: &Literal| match (lit, element) {
+        (Literal::Integer(n), scalar) => {
+            let (low, high) = integer_range(scalar)?;
+            (!(low..=high).contains(n)).then(|| format!("{n} is outside its range {low} to {high}"))
+        }
+        (Literal::Float(f), ScalarType::F32) => (!f.is_finite() || f.abs() > f64::from(f32::MAX))
+            .then(|| format!("{f} is not a finite F32")),
+        _ => None,
+    };
+    match lit {
+        Literal::List(items) => items.iter().find_map(scalar),
+        lit => scalar(lit),
+    }
 }
 
 /// The inclusive range of an integer type.
