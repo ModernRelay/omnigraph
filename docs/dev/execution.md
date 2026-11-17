@@ -1194,7 +1194,10 @@ directions (every lowered conjunct is tested, and every tested conjunct is a low
 constant `true`, or the identity equality key narrowing derives through
 `AcceptInput.keys`), the region of every conjunct (each is tested in the
 `optional`, `union` arm, correlated read or side of a `nearest` window's
-`TargetCut` that writes it, and in no other: `validate::requirements::Region`),
+`TargetCut` that writes it, and in no other: `validate::requirements::Region`;
+each `optional` and correlated read is its own region, numbered in written
+order within the region that holds it, so a conjunct moved between two
+sibling `optional`s over one binding is refused),
 correlated blocks, the exact projection and the origin
 of every projected score, order and cut, late materialization
 (`HydrateColumns`), and the policies the plan declares for its search.

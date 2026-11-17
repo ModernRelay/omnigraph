@@ -157,6 +157,12 @@ pub(super) fn conjuncts(plan: &PhysicalPlan, nodes: &[NodeId]) -> Vec<(NodeId, I
 /// inside that arm, a `Correlate`'s inner tree is inside its read, and a
 /// `TargetCut`'s input is below its window. A block's inner tree and a
 /// fusion's arms are scopes of their own and are not walked.
+///
+/// The walk numbers each `OptionalJoin` and `Correlate` within its region
+/// after every node of its input side, the first input of a node before its
+/// second: the order the planner builds them in, one written element
+/// wrapping the rows of the elements before it, and the order the
+/// requirements number the written ones in.
 fn plan_regions(
     plan: &PhysicalPlan,
     root: NodeId,
@@ -181,9 +187,43 @@ fn plan_regions(
             _ => (Vec::new(), vec![id]),
         }
     }
+    enum Visit {
+        /// The node's region is its path; its input side comes next.
+        Enter(NodeId, Vec<Region>),
+        /// Its input side is numbered: the node takes its ordinal and its
+        /// inner tree is walked inside it.
+        Leave(NodeId, Vec<Region>),
+    }
     let mut regions = std::collections::HashMap::new();
-    let mut pending = vec![(root, Vec::<Region>::new())];
-    while let Some((id, path)) = pending.pop() {
+    let mut ordinals = super::requirements::RegionOrdinals::default();
+    let mut pending = vec![Visit::Enter(root, Vec::new())];
+    while let Some(visit) = pending.pop() {
+        let (id, path) = match visit {
+            Visit::Enter(id, path) => (id, path),
+            Visit::Leave(id, path) => {
+                let within = |region: Region| {
+                    let mut nested = path.clone();
+                    nested.push(region);
+                    nested
+                };
+                match plan.node(id) {
+                    Some(PhysicalNode::OptionalJoin {
+                        inner, outer_var, ..
+                    }) => pending.push(Visit::Enter(
+                        *inner,
+                        within(ordinals.optional(&path, outer_var)),
+                    )),
+                    Some(PhysicalNode::Correlate {
+                        inner, outer_var, ..
+                    }) => pending.push(Visit::Enter(
+                        *inner,
+                        within(ordinals.correlate(&path, outer_var)),
+                    )),
+                    _ => {}
+                }
+                continue;
+            }
+        };
         budget.visit(1)?;
         let Some(node) = plan.node(id) else {
             continue;
@@ -194,24 +234,15 @@ fn plan_regions(
             nested
         };
         match node {
-            PhysicalNode::OptionalJoin {
-                input,
-                inner,
-                outer_var,
-            } => {
-                pending.push((*input, path.clone()));
-                pending.push((*inner, within(Region::Optional(outer_var.clone()))));
+            PhysicalNode::OptionalJoin { input, .. } => {
+                pending.push(Visit::Leave(id, path.clone()));
+                pending.push(Visit::Enter(*input, path.clone()));
             }
-            PhysicalNode::Correlate {
-                input,
-                inner,
-                outer_var,
-                ..
-            } => {
+            PhysicalNode::Correlate { input, .. } => {
+                pending.push(Visit::Leave(id, path.clone()));
                 if let Some(input) = input {
-                    pending.push((*input, path.clone()));
+                    pending.push(Visit::Enter(*input, path.clone()));
                 }
-                pending.push((*inner, within(Region::Correlate(outer_var.clone()))));
             }
             PhysicalNode::Union { bindings, .. } => {
                 let (spine, arms) = fold_arms(plan, id, bindings);
@@ -219,18 +250,27 @@ fn plan_regions(
                     regions.insert(node, path.clone());
                 }
                 for (position, arm) in arms.into_iter().enumerate() {
-                    pending.push((arm, within(Region::UnionArm(bindings.clone(), position))));
+                    pending.push(Visit::Enter(
+                        arm,
+                        within(Region::UnionArm(bindings.clone(), position)),
+                    ));
                 }
                 continue;
             }
-            PhysicalNode::TargetCut { input, .. } => pending.push((*input, within(Region::Window))),
-            PhysicalNode::AntiJoin { input, .. } => pending.push((*input, path.clone())),
+            PhysicalNode::TargetCut { input, .. } => {
+                pending.push(Visit::Enter(*input, within(Region::Window)))
+            }
+            PhysicalNode::AntiJoin { input, .. } => {
+                pending.push(Visit::Enter(*input, path.clone()))
+            }
             PhysicalNode::Fuse { .. } => {}
+            // The first input is walked first: it is the last pushed.
             other => pending.extend(
                 other
                     .inputs()
                     .into_iter()
-                    .map(|input| (input, path.clone())),
+                    .rev()
+                    .map(|input| Visit::Enter(input, path.clone())),
             ),
         }
         regions.insert(id, path);
@@ -1138,9 +1178,13 @@ impl Requirements {
             }
             path.iter()
                 .map(|region| match region {
-                    Region::Optional(var) => format!("the optional over `${var}`"),
+                    Region::Optional(var, ordinal) => {
+                        format!("optional {} over `${var}`", ordinal + 1)
+                    }
                     Region::UnionArm(_, position) => format!("union arm {}", position + 1),
-                    Region::Correlate(_) => "the correlated read".to_string(),
+                    Region::Correlate(_, ordinal) => {
+                        format!("correlated read {}", ordinal + 1)
+                    }
                     Region::Window => "below the window's cut".to_string(),
                 })
                 .collect::<Vec<_>>()

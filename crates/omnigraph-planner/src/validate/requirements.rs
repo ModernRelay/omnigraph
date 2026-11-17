@@ -149,17 +149,61 @@ fn own_eligibility(inner: &[PatternStep]) -> Vec<IRExpr> {
 }
 
 /// A nested region of a scope a conjunct is tested in: inside an
-/// `optional`'s inner tree (on its correlation binding), in one arm of a
-/// `union` (its bindings and the arm's position), inside a correlated read's
-/// inner tree, or below a `nearest` window's cut. A conjunct is tested in the
-/// regions that write it and nowhere else: moved into or out of one, it
-/// changes which rows the region keeps.
+/// `optional`'s inner tree, in one arm of a `union` (its bindings and the
+/// arm's position), inside a correlated read's inner tree, or below a
+/// `nearest` window's cut. A conjunct is tested in the regions that write it
+/// and nowhere else: moved into or out of one, it changes which rows the
+/// region keeps.
+///
+/// Each region names one scope, not a kind of scope: an `optional` and a
+/// correlated read carry their correlation binding and their ordinal among
+/// the regions of their kind that the enclosing region holds, in written
+/// order, which is the order the plan runs them in (each wraps the rows of
+/// the elements before it). Two sibling `optional`s over one binding are two
+/// regions, so a conjunct moved from one to the other is refused.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Region {
-    Optional(String),
+    Optional(String, usize),
     UnionArm(Vec<String>, usize),
-    Correlate(Option<String>),
+    Correlate(Option<String>, usize),
     Window,
+}
+
+/// The ordinal of each `optional` and correlated read within the region
+/// that holds it ([`Region`]): the count of regions of its kind already met
+/// there. The requirements number the written steps and the plan its nodes,
+/// each in the order its rows are built.
+#[derive(Debug, Default)]
+pub(crate) struct RegionOrdinals {
+    next: std::collections::HashMap<(Vec<Region>, NumberedKind), usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NumberedKind {
+    Optional,
+    Correlate,
+}
+
+impl RegionOrdinals {
+    /// The region of the next `optional` over `outer_var` in `path`.
+    pub(crate) fn optional(&mut self, path: &[Region], outer_var: &str) -> Region {
+        Region::Optional(
+            outer_var.to_string(),
+            self.take(path, NumberedKind::Optional),
+        )
+    }
+
+    /// The region of the next correlated read over `outer_var` in `path`.
+    pub(crate) fn correlate(&mut self, path: &[Region], outer_var: &Option<String>) -> Region {
+        Region::Correlate(outer_var.clone(), self.take(path, NumberedKind::Correlate))
+    }
+
+    fn take(&mut self, path: &[Region], kind: NumberedKind) -> usize {
+        let next = self.next.entry((path.to_vec(), kind)).or_default();
+        let ordinal = *next;
+        *next += 1;
+        ordinal
+    }
 }
 
 /// Every eligibility conjunct of `steps` with the regions it is written in,
@@ -175,6 +219,7 @@ pub(crate) fn conjunct_regions(
     let window = steps
         .iter()
         .rposition(|step| matches!(step, PatternStep::Rank { .. }));
+    let mut ordinals = RegionOrdinals::default();
     for (index, step) in steps.iter().enumerate() {
         let mut here = path.to_vec();
         if window.is_some_and(|window| index < window) {
@@ -201,7 +246,7 @@ pub(crate) fn conjunct_regions(
                 out.extend(own.into_iter().map(|conjunct| (conjunct, here.clone())));
             }
             PatternStep::Optional { outer_var, inner } => {
-                conjunct_regions(inner, &within(Region::Optional(outer_var.clone())), out)
+                conjunct_regions(inner, &within(ordinals.optional(&here, outer_var)), out)
             }
             PatternStep::Union { arms, bindings, .. } => {
                 for (position, arm) in arms.iter().enumerate() {
@@ -214,7 +259,7 @@ pub(crate) fn conjunct_regions(
             }
             PatternStep::Correlate {
                 outer_var, inner, ..
-            } => conjunct_regions(inner, &within(Region::Correlate(outer_var.clone())), out),
+            } => conjunct_regions(inner, &within(ordinals.correlate(&here, outer_var)), out),
             PatternStep::Rank { .. }
             | PatternStep::Score { .. }
             | PatternStep::Let { .. }

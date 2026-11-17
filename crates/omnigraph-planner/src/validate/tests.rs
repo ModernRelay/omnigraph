@@ -1164,6 +1164,94 @@ fn a_conjunct_tested_in_another_scope_is_refused() {
     }
     let (check, detail) = windowed.refused(plan);
     assert_eq!(check, "predicate origin", "{detail}");
+    // One of two sibling `optional`s on one binding: its conjunct moved into
+    // the other's inner tree, which would keep the first's rows and null the
+    // second's instead. The written region no longer tests it.
+    let siblings = Fixture::new(
+        r#"query q() {
+    match { $d: Doc, optional { $e: Doc, $d cites $e where $d.year > 2000 }, optional { $f: Doc, $d cites $f } }
+    return { $d.slug, $e.slug, $f.slug }
+}"#,
+        &[],
+    );
+    let plan = siblings.plan();
+    siblings
+        .accept(plan.clone())
+        .expect("the planned optionals");
+    let joins: Vec<(usize, usize)> = node_ids(&plan, |node| {
+        matches!(node, PhysicalNode::OptionalJoin { .. })
+    })
+    .into_iter()
+    .filter_map(|id| match plan.node(id) {
+        Some(PhysicalNode::OptionalJoin { inner, .. }) => Some((id, *inner)),
+        _ => None,
+    })
+    .collect();
+    let (check, detail) = siblings.refused(move_conjunct(&plan, &joins, "year"));
+    assert_eq!(check, "predicate retention", "{detail}");
+    // One of two sibling correlated reads on one binding, alike.
+    let reads = Fixture::new(
+        r#"query q() {
+    match { $d: Doc,
+        from { match { $e: Doc, $d cites $e } where $d.year > 2000 return { $e } order { $e.year desc } limit 1 },
+        from { match { $f: Doc, $d cites $f } return { $f } order { $f.year desc } limit 1 } }
+    return { $d.slug, $e.slug, $f.slug }
+}"#,
+        &[],
+    );
+    let plan = reads.plan();
+    reads.accept(plan.clone()).expect("the planned reads");
+    let correlates: Vec<(usize, usize)> =
+        node_ids(&plan, |node| matches!(node, PhysicalNode::Correlate { .. }))
+            .into_iter()
+            .filter_map(|id| match plan.node(id) {
+                Some(PhysicalNode::Correlate { inner, .. }) => Some((id, *inner)),
+                _ => None,
+            })
+            .collect();
+    let (check, detail) = reads.refused(move_conjunct(&plan, &correlates, "year"));
+    assert_eq!(check, "predicate retention", "{detail}");
+}
+
+/// `plan` with the conjunct naming `written`, tested in the inner tree of
+/// one of two sibling scopes (`scopes`: each scope's node and inner root),
+/// tested at the top of the other's inner tree instead.
+fn move_conjunct(plan: &PhysicalPlan, scopes: &[(usize, usize)], written: &str) -> PhysicalPlan {
+    let [first, second] = scopes else {
+        panic!("two sibling scopes: {scopes:?}");
+    };
+    let mut plan = plan.clone();
+    let holds = |plan: &PhysicalPlan, inner: usize| {
+        let mut nodes = Vec::new();
+        let mut pending = vec![inner];
+        while let Some(id) = pending.pop() {
+            nodes.push(id);
+            pending.extend(plan.node(id).map(PhysicalNode::inputs).unwrap_or_default());
+        }
+        super::invariants::conjuncts(plan, &nodes)
+            .into_iter()
+            .find(|(_, conjunct)| conjunct.to_string().contains(written))
+    };
+    let ((holder, conjunct), to) = match (holds(&plan, first.1), holds(&plan, second.1)) {
+        (Some(held), None) => (held, second),
+        (None, Some(held)) => (held, first),
+        other => panic!("one scope tests `{written}`: {other:?}"),
+    };
+    match plan.node_mut(holder) {
+        Some(PhysicalNode::Filter { filters, .. }) => filters.retain(|own| *own != conjunct),
+        other => panic!("`{written}` is tested by a filter: {other:?}"),
+    }
+    let filter = plan.add(PhysicalNode::Filter {
+        input: to.1,
+        filters: vec![conjunct],
+    });
+    match plan.node_mut(to.0) {
+        Some(PhysicalNode::OptionalJoin { inner, .. } | PhysicalNode::Correlate { inner, .. }) => {
+            *inner = filter
+        }
+        other => panic!("a scope node: {other:?}"),
+    }
+    plan
 }
 
 /// A `nearest` window drawn as a pattern step keeps its `k` targets with a
