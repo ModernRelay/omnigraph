@@ -652,7 +652,7 @@ fn run_law(cases: u32) {
                     Ok(())
                 } else if let Some(without) = without_start_node(&read) {
                     // The difference the cross-edition table cites as
-                    // `open:hop-range-self-loop`: a hop range no longer
+                    // `results.hop-range-self-loop`: a hop range no longer
                     // returns its start node through a self-loop. With
                     // the start node excluded, the rows must agree.
                     let (old, new) = (edition_2(&schema, &without), edition_3(&schema, &without));
@@ -701,7 +701,7 @@ fn run_law(cases: u32) {
     let self_loop = SELF_LOOP.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!(
         "{compared} reads compared: {with_rows} with rows, {refused} refused by both, \
-         {self_loop} differing only by a hop range's start node (open:hop-range-self-loop)"
+         {self_loop} differing only by a hop range's start node (results.hop-range-self-loop)"
     );
     assert!(
         with_rows * 3 >= compared,

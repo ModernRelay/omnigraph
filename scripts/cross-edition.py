@@ -75,6 +75,12 @@ BULLETS = {
     "results.limit-tie-rule": "Results: a read with `limit` and no `order` returns the first rows under the tie rule rather than the first rows a scan yields.",
     "results.integer-float-comparison": "Results: an integer property compared with a whole-number float literal compares as `F64`.",
     "results.distance-rename": "Language (respelling map): an unaliased `nearest` column `d._distance` becomes `_distance`, the one rename the fixed map carries.",
+    "results.hop-range-self-loop": "Results: a hop range other than the single hop no longer returns its start node through a self-loop, since the start is at distance 0 and the range starts at 1 (section 2's `Expand` row).",
+    "results.avg-exact-integer": "Results: `avg` over integers is computed exactly and rounded once to `F64`, where edition 2 summed in `F64`, so its value changes only where that sum lost precision.",
+    "results.bm25-score-rename": "Results: a full-text score edition 2 returned as `<binding>._score` is the `_score` column, the same rename the fixed map makes for `_distance`.",
+    "results.mutation-where-lexical": "Results: a lexical predicate in a write's `where` is accepted, as in a read (`T38` lifted).",
+    "settings.engine-setting-removed": "Settings and introspection: the `engine` setting, whose only value since 0.12 is `v2` and which changes nothing, is removed: `set engine = v2;` and `OMNIGRAPH_ENGINE` are refused as an unknown setting, with a fix that deletes the line.",
+    "settings.catalogue-operators": "Settings and introspection: the catalogue's operator rows describe edition 3's operators, so a read of them returns different rows.",
 }
 
 # Why a step's store requests may rise (aspect `requests`, under
@@ -91,14 +97,8 @@ COSTS = {
 # the key leaves this list when the RFC's Compatibility section decides it
 # (adds a bullet, which a row then cites) or the branch reverts the change.
 OPEN = {
-    "open:hop-range-self-loop": "A hop range other than the single hop no longer returns its start node through a self-loop (the RFC's core operator table, `Expand`, marks it *[choice]*); the Results bullet does not list it.",
-    "open:avg-exact-integer": "`avg` over integers divides an exact total once, where edition 2 accumulated in F64 and lost precision; the Results bullet does not list it.",
-    "open:engine-setting-removed": "The session setting `engine` (released in 0.12) is removed; no RFC section names it.",
-    "open:bm25-score-rename": "An unaliased `bm25` column `d._score` becomes `_score`; the Language bullet's respelling map names `_distance` as the one rename.",
-    "open:mutation-where-lexical": "A lexical predicate in a write's `where`, which edition 2 refused (`T44`), is accepted; the Language bullet's list of nine accepted refusals does not include it.",
     "open:index-pages-read-twice": "A filter's scalar index pages (`page_data`, `page_lookup`) are read by scan-access planning and again by execution, where edition 2 read them once.",
     "open:block-reads-table-again": "A correlated block reads its table's data file once more than the edition-2 read did.",
-    "open:catalogue-operators": "The `@Operator` and logical-kind catalogue rows follow the new core operators (`RankFuse` and `TextSearch` leave, `Correlate`, `Fuse`, `Let`, `OptionalJoin`, `Score`, `TargetCut` and `Union` arrive); no Compatibility bullet names the catalogue.",
 }
 
 DIAGNOSTIC_CODE = re.compile(r"\b([QTPL]\d{1,3})\b")

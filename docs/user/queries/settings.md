@@ -73,7 +73,10 @@ without `-e` or `--query` refuses `--set`, and `POST /queries/{query_name}` take
 Each setting's environment variable is its process default: the server reads
 it once at startup, the CLI once per run, and the value is what every request
 starts from and what `reset` returns to. An invalid or out-of-range value
-refuses startup; no default is substituted.
+refuses startup; no default is substituted. The removed `engine` setting is an
+unknown setting: `set engine = v2;`, `--set engine=v2`, an `engine` key and a
+set `OMNIGRAPH_ENGINE` variable are refused, and the fix deletes the line or
+the variable.
 
 | Name | Type and values | Default | Scope | Process default variable | What it chooses |
 |---|---|---|---|---|---|

@@ -788,6 +788,17 @@ pub fn from_env() -> Result<(SessionSettings, Sources), SessionSettingsError> {
 pub fn from_env_with(
     mut lookup: impl FnMut(&'static str) -> Option<String>,
 ) -> Result<(SessionSettings, Sources), SessionSettingsError> {
+    for removed in REMOVED_SETTINGS {
+        if lookup(removed.env).is_some_and(|raw| !raw.trim().is_empty()) {
+            return Err(SessionSettingsError::Environment {
+                variable: removed.env,
+                message: format!(
+                    "unknown setting `{}`; it was removed ({}), so delete the variable",
+                    removed.name, removed.why
+                ),
+            });
+        }
+    }
     let mut settings = SessionSettings::default();
     let mut sources = [Source::Default; DEFINITIONS.len()];
     for id in SettingId::ALL {
@@ -812,7 +823,11 @@ pub fn from_env_with(
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SessionSettingsError {
-    #[error("unknown setting `{name}`; expected one of {}", setting_names())]
+    #[error(
+        "unknown setting `{name}`; {}expected one of {}",
+        removed_note(name),
+        setting_names()
+    )]
     UnknownSetting { name: String },
     #[error("unknown value `{value}` for setting `{}`; expected one of {}", setting.name(), enum_values(*setting))]
     UnknownValue { setting: SettingId, value: String },
@@ -834,6 +849,33 @@ pub enum SessionSettingsError {
         variable: &'static str,
         message: String,
     },
+}
+
+/// A setting a release removed: its name, its environment variable and why
+/// it went. Each is refused as an unknown setting, whose fix deletes it.
+pub const REMOVED_SETTINGS: &[RemovedSetting] = &[RemovedSetting {
+    name: "engine",
+    env: "OMNIGRAPH_ENGINE",
+    why: "every read runs from its plan, and `v2` was its one value",
+}];
+
+/// One row of [`REMOVED_SETTINGS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedSetting {
+    pub name: &'static str,
+    pub env: &'static str,
+    pub why: &'static str,
+}
+
+/// The removed setting a name denotes, if any.
+pub fn removed_setting(name: &str) -> Option<&'static RemovedSetting> {
+    REMOVED_SETTINGS.iter().find(|removed| removed.name == name)
+}
+
+fn removed_note(name: &str) -> String {
+    removed_setting(name)
+        .map(|removed| format!("it was removed ({}), so delete it; ", removed.why))
+        .unwrap_or_default()
 }
 
 fn setting_names() -> String {
@@ -1116,6 +1158,30 @@ mod tests {
             };
             assert_eq!(defaults.get(id), expected, "{}", id.name());
         }
+    }
+
+    #[test]
+    fn the_removed_engine_setting_is_refused_with_a_fix_that_deletes_it() {
+        let err = SettingId::parse("engine").unwrap_err();
+        assert!(
+            err.to_string().starts_with(
+                "unknown setting `engine`; it was removed (every read runs from its plan, and `v2` was its one value), so delete it; expected one of rrf_plan,"
+            ),
+            "{err}"
+        );
+        assert!(SettingId::parse_assignment("engine", "v2").is_err());
+        let err =
+            from_env_with(|variable| (variable == "OMNIGRAPH_ENGINE").then(|| "v2".to_string()))
+                .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "OMNIGRAPH_ENGINE: unknown setting `engine`; it was removed (every read runs from its plan, and `v2` was its one value), so delete the variable"
+        );
+        assert!(
+            from_env_with(|variable| (variable == "OMNIGRAPH_ENGINE").then(|| " ".to_string()))
+                .is_ok(),
+            "an empty variable is unset, as for every row"
+        );
     }
 
     #[test]

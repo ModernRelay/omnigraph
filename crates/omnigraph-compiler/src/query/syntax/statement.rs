@@ -6,7 +6,7 @@
 use super::Rule;
 use crate::error::{CompilerError, Result, decode_string_literal};
 use crate::query::codes::{Q003, Q004, Q005};
-use crate::query::diagnostic::{Position, QueryDiagnostic};
+use crate::query::diagnostic::{Applicability, Position, QueryDiagnostic, Suggestion, TextEdit};
 use crate::query::file::*;
 use crate::settings::{SessionSettings, SessionSettingsError, SettingId, SettingValue};
 
@@ -31,6 +31,56 @@ pub(crate) fn query_error_at(
 }
 
 pub(crate) fn parse_setting_stmt(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<SettingStmt, QueryDiagnostic> {
+    let statement = pair.as_span();
+    parse_setting_form(pair).map_err(|diagnostic| delete_removed_setting(diagnostic, statement))
+}
+
+/// A `set` or `reset` line that names a removed setting is refused as an
+/// unknown setting; its fix deletes the line, with the whitespace up to and
+/// including the line break after it.
+fn delete_removed_setting(
+    diagnostic: QueryDiagnostic,
+    statement: pest::Span<'_>,
+) -> QueryDiagnostic {
+    let removed = statement
+        .as_str()
+        .split(|c: char| c.is_whitespace() || c == '=' || c == ';')
+        .filter(|word| !word.is_empty())
+        .nth(1)
+        .and_then(crate::settings::removed_setting);
+    let Some(removed) = removed else {
+        return diagnostic;
+    };
+    if !diagnostic
+        .message
+        .starts_with(&format!("unknown setting `{}`", removed.name))
+    {
+        return diagnostic;
+    }
+    let source = statement.get_input();
+    let rest = &source[statement.end()..];
+    let trailing = rest
+        .find('\n')
+        .filter(|at| rest[..*at].trim().is_empty())
+        .map_or_else(|| rest.len() - rest.trim_start().len(), |at| at + 1);
+    diagnostic
+        .with_fix(format!(
+            "delete the line: the `{}` setting was removed",
+            removed.name
+        ))
+        .with_suggestion(Suggestion {
+            applicability: Applicability::MachineApplicable,
+            edits: vec![TextEdit {
+                start: statement.start(),
+                end: statement.end() + trailing,
+                replacement: String::new(),
+            }],
+        })
+}
+
+fn parse_setting_form(
     pair: pest::iterators::Pair<Rule>,
 ) -> std::result::Result<SettingStmt, QueryDiagnostic> {
     let form = pair

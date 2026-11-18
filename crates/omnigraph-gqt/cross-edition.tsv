@@ -4,26 +4,26 @@
 bare_node_projection_object_fields.gqt	7	error	language.diagnostic	Both refuse `min` over a bare node name; edition 3 refuses at the word, since a bare identifier is not a value (section 5), where edition 2's type checker raised T8.
 boolean_literal_refused_where_a_property_is_named_false.gqt	1	error	language.diagnostic	Edition 2's `delete T where` form stops compiling; it now fails with the statement-where parse error and its printed fix (Q008), where edition 2 refused the bare `false` with T46.
 catalogue/mixed_joins_and_refusals.gqt	5	error	language.diagnostic	Both refuse a full-text call over a catalogue binding; `match_text` is respelled `match_terms`, whose refusal is the full-text code T27 (section 5: T27 stays the full-text code) where edition 2 used T23.
-catalogue/operators_and_passes.gqt	1	rows	open:catalogue-operators	The operator catalogue lists the engine's operators; the new core adds seven and drops RankFuse.
-catalogue/operators_and_passes.gqt	3	rows	open:catalogue-operators	The logical-kind catalogue follows the new core: seven kinds arrive, RankFuse and TextSearch leave.
-catalogue/settings_engine_counts_and_filters.gqt	1	rows	open:engine-setting-removed	The `engine` setting row is gone; `read_work_limit` and `plan_budget_limit` rows are added (additive).
-catalogue/settings_engine_counts_and_filters.gqt	3	rows	open:catalogue-operators	The operator count follows the catalogue: 23 operators became 29.
-catalogue/settings_engine_counts_and_filters.gqt	6	rows	open:catalogue-operators	The distinct operator identities follow the catalogue: 23 became 29.
+catalogue/operators_and_passes.gqt	1	rows	settings.catalogue-operators	The operator catalogue lists the engine's operators; the new core adds seven and drops RankFuse.
+catalogue/operators_and_passes.gqt	3	rows	settings.catalogue-operators	The logical-kind catalogue follows the new core: seven kinds arrive, RankFuse and TextSearch leave.
+catalogue/settings_engine_counts_and_filters.gqt	1	rows	settings.engine-setting-removed	The `engine` setting row is gone; `read_work_limit` and `plan_budget_limit` rows are added (additive).
+catalogue/settings_engine_counts_and_filters.gqt	3	rows	settings.catalogue-operators	The operator count follows the catalogue: 23 operators became 29.
+catalogue/settings_engine_counts_and_filters.gqt	6	rows	settings.catalogue-operators	The distinct operator identities follow the catalogue: 23 became 29.
 expression_type_errors.gqt	e2:4	steps	language.accepted-lexical-under-not-or	Edition 2's step refused a search under `or` (T38); edition 3 accepts it, so the refusal step was removed.
 expression_type_errors.gqt	3	error	language.diagnostic	Both refuse an aggregate compared in a filter; edition 3 names the aggregate rule (T8) where edition 2 raised the comparison code T7.
 expression_type_errors.gqt	5	error	language.diagnostic	Both refuse `count` in a write's `where`; the write's `where` is a read's `where` in edition 3, which refuses the aggregate with T8 where edition 2 raised T44.
 expression_type_errors.gqt	6	error	language.diagnostic	Both refuse a bare property name in a write; edition 3 refuses at the word, since a bare identifier is not a value (section 5), where edition 2 raised T45.
 expression_type_errors.gqt	7	error	language.diagnostic	Both refuse a bare property name in an assignment; edition 3 refuses at the word, since a bare identifier is not a value (section 5), where edition 2 raised T45.
-expression_type_errors.gqt	8	error	open:mutation-where-lexical	Edition 2 refused a search predicate in a write's `where` (T44); edition 3 accepts the lexical predicate there and the write succeeds.
+expression_type_errors.gqt	8	error	results.mutation-where-lexical	Edition 2 refused a search predicate in a write's `where` (T44); edition 3 accepts the lexical predicate there and the write succeeds.
 expression_type_errors.gqt	9	error	language.diagnostic	Both refuse `count` in an assignment value; edition 3 names the aggregate rule (T8) where edition 2 raised T44.
 expression_type_errors.gqt	13	error	language.accepted-item-beside-aggregates	A Boolean return item beside an aggregate, refused by edition 2 (T9), is accepted.
 inline_list_match_by_membership.gqt	3	error	language.diagnostic	Both refuse list equality; the property brace becomes the equality `$x.tags = [...]`, refused by the comparison code T7 where edition 2's brace raised T3.
 issue_566_order_key_binds_to_return_item.gqt	6	error	language.accepted-order-key-not-returned	An order key that is not a return item, refused by edition 2 (T42), is accepted.
-issue_613_self_loop_pinned_hop_distance.gqt	2	rows	open:hop-range-self-loop	`knows{1,2}` from bob no longer returns bob through bob's self-loop.
+issue_613_self_loop_pinned_hop_distance.gqt	2	rows	results.hop-range-self-loop	`knows{1,2}` from bob no longer returns bob through bob's self-loop.
 issue_640_search_score_projection.gqt	2	columns	results.distance-rename	The unaliased `nearest` column `p._distance` is `_distance`, the rename the respelling map carries.
 issue_640_search_score_projection.gqt	2	rows	results.distance-rename	The same row under the renamed `_distance` key; the distance is equal.
-issue_640_search_score_projection.gqt	3	columns	open:bm25-score-rename	The unaliased `bm25` column `p._score` is `_score`; the respelling map names only `_distance`.
-issue_640_search_score_projection.gqt	3	rows	open:bm25-score-rename	The same rows in the same order under the renamed `_score` key, the scores bm25_v1's F64 rather than Lance's F32 (results.bm25-f64).
+issue_640_search_score_projection.gqt	3	columns	results.bm25-score-rename	The unaliased `bm25` column `p._score` is `_score`, the rename the fixed map makes for `_distance`.
+issue_640_search_score_projection.gqt	3	rows	results.bm25-score-rename	The same rows in the same order under the renamed `_score` key, the scores bm25_v1's F64 rather than Lance's F32 (results.bm25-f64).
 issue_640_search_score_projection.gqt	5	types	results.bm25-f64	The `bm25` score column is F64 where edition 2 gave Lance's F32; no row matches in either edition.
 issue_640_search_score_projection.gqt	6	error	language.diagnostic	Both refuse `nearest` in `return`; a ranking written as a call is T65 with the `from` fix (section 5), where edition 2 raised T33.
 issue_640_search_score_projection.gqt	7	error	language.diagnostic	Both refuse `nearest` in `return`; a ranking written as a call is T65 with the `from` fix (section 5), where edition 2 raised T33.
@@ -35,10 +35,10 @@ issue_659_compiler_scopes.gqt	12	error	language.accepted-unbound-triple	A triple
 issue_659_compiler_scopes.gqt	13	error	language.accepted-unbound-triple	A triple with neither end bound, refused by edition 2 (T5), is accepted.
 issue_659_edge_selection_contract.gqt	4	error	language.accepted-unbound-triple	A wildcard triple with neither end bound, refused by edition 2 (T5), is accepted.
 issue_659_edge_selection_contract.gqt	14	error	language.diagnostic	Both refuse a parenthesized single edge used as a filter; edition 3 refuses it at parse with the fix `(a | b)`, where edition 2's type checker raised T41.
-issue_659_typed_edge_alternation.gqt	5	rows	open:hop-range-self-loop	`(knows | likes){1,3}` from `a` no longer returns `a` through its self-loop.
+issue_659_typed_edge_alternation.gqt	5	rows	results.hop-range-self-loop	`(knows | likes){1,3}` from `a` no longer returns `a` through its self-loop.
 issue_764_relationship_count_filter.gqt	e2:9	steps	language.accepted-block-compared	Edition 2's step refused a block compared with an outer property (T40); edition 3 accepts it, so the refusal step was removed.
 issue_764_relationship_count_filter.gqt	1	error	language.diagnostic	Both refuse an aggregate compared in a filter; edition 3 names the aggregate rule (T8, with the block as its fix) where edition 2 raised T7.
-issue_858_integer_sum_exact_total.gqt	3	rows	open:avg-exact-integer	`avg` over integers that cancel is 0.5 exactly where edition 2's F64 accumulation returned 0.0.
+issue_858_integer_sum_exact_total.gqt	3	rows	results.avg-exact-integer	`avg` over integers that cancel is 0.5 exactly where edition 2's F64 accumulation returned 0.0.
 issue_955_aggregate_comparison.gqt	12	error	language.diagnostic	Both refuse an aggregate compared in a filter; edition 3 names the aggregate rule (T8) where edition 2 raised T7.
 issue_955_aggregate_comparison.gqt	13	error	language.diagnostic	Both refuse a property beside an aggregate that no item groups by; edition 3 raises T9 where edition 2 raised T58.
 issue_955_aggregate_comparison.gqt	22	error	language.grouped-order-meta-field	An order key over grouped rows that is a meta-field neither returned nor a key is refused.
@@ -50,13 +50,13 @@ meta_fields_resolve_by_role.gqt	29	error	language.diagnostic	Both refuse the unk
 meta_fields_resolve_by_role.gqt	30	error	language.diagnostic	Both refuse an unknown meta-field; edition 3 reports it with T6 where edition 2 raised T11.
 meta_fields_resolve_by_role.gqt	31	error	language.diagnostic	Both refuse an unknown meta-field; edition 3 reports it with T6 where edition 2 raised T11.
 meta_fields_resolve_by_role.gqt	36	error	language.diagnostic	Both refuse the unknown property `id`; edition 3 reports it with T6 where edition 2 raised T11.
-now_is_query_scoped.gqt	e2:1	steps	open:engine-setting-removed	Edition 2's `set engine = v2` step has no counterpart: the setting is gone.
+now_is_query_scoped.gqt	e2:1	steps	settings.engine-setting-removed	Edition 2's `set engine = v2` step has no counterpart: the setting is gone.
 planner/search_order_on_an_unranked_binding_and_a_destination.gqt	1	error	language.rrf-two-bindings	An `rrf` whose arms rank two bindings is a type error (T75, an rrf arm fault) where edition 2 raised T59.
 planner/search_order_on_an_unranked_binding_and_a_destination.gqt	2	error	language.rrf-two-bindings	An `rrf` whose arms rank two bindings is a type error (T75, an rrf arm fault) where edition 2 raised T59.
 rank_key_asc_direction_refused.gqt	2	error	language.diagnostic	Both refuse `asc` on a `bm25` rank key; the ranking written in `order` is T65 through the code map (section 6), where edition 2 raised T54.
 rank_key_asc_direction_refused.gqt	3	error	language.diagnostic	Both refuse `asc` on an `rrf` rank key; the ranking written in `order` is T65 through the code map (section 6), where edition 2 raised T54.
-settings_show_set_reset.gqt	e2:1	steps	open:engine-setting-removed	Edition 2's `set engine = v2` step has no counterpart: the setting is gone.
-settings_show_set_reset.gqt	e2:2	steps	open:engine-setting-removed	Edition 2's `show engine` step has no counterpart: the setting is gone.
+settings_show_set_reset.gqt	e2:1	steps	settings.engine-setting-removed	Edition 2's `set engine = v2` step has no counterpart: the setting is gone.
+settings_show_set_reset.gqt	e2:2	steps	settings.engine-setting-removed	Edition 2's `show engine` step has no counterpart: the setting is gone.
 subquery_column_aggregate_predicate.gqt	14	error	language.diagnostic	Both refuse a Date aggregate compared with a number; T40 no longer restricts a block's partner (section 5), so the comparison code T7 refuses it.
 text_search_fuzzy_and_match_text_filters.gqt	3	rows	results.index-state	Edition 2's `fuzzy` asked Lance's index, whose default tokenizer matched nothing (the case's documented limitation); edition 3's exact scan finds the two titles within two edits.
 typed_block_aggregate_contracts.gqt	8	rows	results.integer-float-comparison	`max` of 2^53+1 compared with the float literal 2^53 compares as F64, where both round to 2^53, so the row no longer qualifies.

@@ -233,6 +233,10 @@ const INTENDED: &[(&str, &str)] = &[
         r#"query q() { match { $p: Person } return { $p.name } }"#,
     ),
     (
+        "diagnostics/q003_refused_setting.gqt step 5",
+        "query q() { match { $p: Person } return { $p.name } }",
+    ),
+    (
         "diagnostics/q007_arrow_traversal.gqt step 3",
         r#"query q() { match { $a: Person, $a knows $b } return { $b.name } }"#,
     ),

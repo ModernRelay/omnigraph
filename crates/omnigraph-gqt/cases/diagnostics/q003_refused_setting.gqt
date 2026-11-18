@@ -1,5 +1,5 @@
 # issue: none
-# notes: The compiler refuses a settings line naming no setting with `Q003`; nothing executes.
+# notes: The compiler refuses a settings line naming no setting with `Q003`; nothing executes. The removed `engine` setting is refused the same way, and its fix deletes the line.
 
 --- runner
 timeout_ms: 10000
@@ -47,3 +47,9 @@ set no_such_setting = 1;
 query q() { match { $p: Person } return { $p.name } }
 
 --- expect error: parse error: Q003:
+
+--- query
+set engine = v2;
+query q() { match { $p: Person } return { $p.name } }
+
+--- expect error: parse error: Q003: unknown setting `engine`; it was removed
