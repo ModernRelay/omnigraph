@@ -696,12 +696,14 @@ query mixed_insert_and_delete($name: String, $age: I32, $victim: String) {
 
 query update_then_filter_by_old_value(
     $first_name: String, $first_new_age: I32,
-    $second_threshold: I32, $second_new_age: I32
+    $second_threshold: I32, $second_new_age: I32, $third_new_age: I32
 ) {
     match { $x: Person } where $x.name = $first_name
     update $x set { age: $first_new_age }
     match { $x: Person } where $x.age > $second_threshold
     update $x set { age: $second_new_age }
+    match { $x: Person } where $x.age > $second_threshold
+    update $x set { age: $third_new_age }
 }
 
 query delete_two_persons($first: String, $second: String) {
@@ -3509,30 +3511,39 @@ edge WorksAt: Person -> Company @card(0..1)
 /// asserts both ends: Alice ends at age=10, the publisher publishes
 /// once.
 #[tokio::test]
-async fn chained_updates_with_overlapping_predicate_respects_intermediate_value() {
+async fn chained_updates_with_overlapping_predicate_respects_intermediate_value_issue_925() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
 
     let pre_version = version_main(&db).await.unwrap();
 
-    db.mutate(
-        "main",
-        STAGED_QUERIES,
-        "update_then_filter_by_old_value",
-        &mixed_params(
-            &[("$first_name", "Alice")],
-            &[
-                ("$first_new_age", 99),
-                ("$second_threshold", 50),
-                ("$second_new_age", 10),
-            ],
-        ),
-    )
-    .await
-    .unwrap();
+    let result = db
+        .mutate(
+            "main",
+            STAGED_QUERIES,
+            "update_then_filter_by_old_value",
+            &mixed_params(
+                &[("$first_name", "Alice")],
+                &[
+                    ("$first_new_age", 99),
+                    ("$second_threshold", 50),
+                    ("$second_new_age", 10),
+                    ("$third_new_age", 77),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
 
     // After op-1: Alice = 99. After op-2 (where age > 50): Alice
-    // matches (99 > 50) → set to 10. End state: Alice = 10.
+    // matches (99 > 50) → set to 10. Op-3 repeats op-2's predicate: Alice's
+    // current version (10) does not match it, and her superseded version
+    // (99) is no longer in the write's pending image, so nothing matches.
+    // End state: Alice = 10, and the three statements changed two rows.
+    assert_eq!(
+        result.affected_nodes, 2,
+        "op-3 must not match Alice's superseded pending version"
+    );
     let batches = read_table(&db, "node:Person").await;
     let mut alice_age: Option<i32> = None;
     for batch in &batches {
@@ -3557,7 +3568,7 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value(
     assert_eq!(
         alice_age,
         Some(10),
-        "chained-update final value must reflect the second update applied to op-1's pending value"
+        "chained-update final value must reflect the second update applied to op-1's pending value, untouched by op-3"
     );
 
     // One manifest version bump: the graph commit rides the same publish CAS

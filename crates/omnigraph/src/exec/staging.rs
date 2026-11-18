@@ -85,15 +85,6 @@ impl PendingTable {
     fn total_rows(&self) -> usize {
         self.batches.iter().map(|b| b.num_rows()).sum()
     }
-
-    fn total_bytes(&self) -> Result<u64> {
-        self.batches.iter().try_fold(0_u64, |bytes, batch| {
-            let batch_bytes = crate::table_store::write_batch_bytes(batch)?.rows;
-            bytes
-                .checked_add(batch_bytes)
-                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))
-        })
-    }
 }
 
 /// Stable per-table identifiers captured on first touch and reused at
@@ -259,6 +250,40 @@ impl MutationStaging {
         mode: PendingMode,
         batch: RecordBatch,
     ) -> Result<()> {
+        self.append(table_key, schema, mode, batch, None)
+    }
+
+    /// Append an upsert batch whose rows are the successors, within this
+    /// write, of their ids' pending versions: an update's rows, or a keyed
+    /// insert's. Every earlier pending row of an id in `batch` is removed
+    /// first, so the pending table stays a keyed image, one current version
+    /// per id, which a later statement's read, whole-write validation, the
+    /// entity count and staging all read alike. A load does not call this: its
+    /// input is a set, in which one key twice stays a violation.
+    pub(crate) fn append_successors(
+        &mut self,
+        table_key: &str,
+        schema: SchemaRef,
+        batch: RecordBatch,
+        id_column: &str,
+    ) -> Result<()> {
+        self.append(
+            table_key,
+            schema,
+            PendingMode::Upsert,
+            batch,
+            Some(id_column),
+        )
+    }
+
+    fn append(
+        &mut self,
+        table_key: &str,
+        schema: SchemaRef,
+        mode: PendingMode,
+        batch: RecordBatch,
+        supersede_by: Option<&str>,
+    ) -> Result<()> {
         if batch.num_rows() == 0 && mode != PendingMode::Overwrite {
             // No-op for additive modes. For Overwrite, an empty batch is
             // observable: it means "replace this table with zero rows".
@@ -304,6 +329,20 @@ impl MutationStaging {
                 )));
             }
         }
+        // The earlier versions this batch supersedes leave the image before
+        // its row and byte ceilings are checked, and only once every check
+        // has passed does the image change.
+        let remaining = match (supersede_by, self.pending.get(table_key)) {
+            (Some(id_column), Some(existing)) => {
+                Some(without_ids_of(&existing.batches, &batch, id_column)?)
+            }
+            _ => None,
+        };
+        let existing_batches = match (&remaining, self.pending.get(table_key)) {
+            (Some(remaining), _) => remaining.as_slice(),
+            (None, Some(existing)) => existing.batches.as_slice(),
+            (None, None) => &[],
+        };
         let batch_usage = crate::table_store::write_batch_bytes(&batch)?;
         let batch_bytes = batch_usage.rows;
         let pending_payload_bytes = self
@@ -316,11 +355,8 @@ impl MutationStaging {
             mode,
             PendingMode::StrictInsert | PendingMode::Upsert | PendingMode::ColumnPatch
         ) {
-            self.admit_keyed_rows(table_key, batch.num_rows())?;
-            let existing_bytes = match self.pending.get(table_key) {
-                Some(existing) => existing.total_bytes()?,
-                None => 0,
-            };
+            admit_keyed_rows(table_key, rows_of(existing_batches), batch.num_rows())?;
+            let existing_bytes = bytes_of(existing_batches)?;
             let bytes = existing_bytes
                 .checked_add(batch_bytes)
                 .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?;
@@ -345,6 +381,9 @@ impl MutationStaging {
         if mode == PendingMode::Upsert && entry.mode == PendingMode::StrictInsert {
             entry.mode = PendingMode::Upsert;
         }
+        if let Some(remaining) = remaining {
+            entry.batches = remaining;
+        }
         entry.batches.push(batch);
         self.pending_bytes = pending_bytes;
         self.pending_payload_bytes = pending_payload_bytes;
@@ -362,17 +401,7 @@ impl MutationStaging {
             .get(table_key)
             .map(PendingTable::total_rows)
             .unwrap_or(0);
-        let rows = existing_rows
-            .checked_add(additional)
-            .ok_or_else(|| OmniError::manifest_internal("pending keyed row count overflow"))?;
-        if rows > KEYED_WRITE_MAX_ROWS {
-            return Err(OmniError::resource_limit(
-                format!("keyed entities for {table_key}"),
-                KEYED_WRITE_MAX_ROWS as u64,
-                rows as u64,
-            ));
-        }
-        Ok(())
+        admit_keyed_rows(table_key, existing_rows, additional)
     }
 
     /// Stage an `update`'s column patch: `batch` holds every carried column
@@ -1413,6 +1442,79 @@ impl StagedMutation {
             carried_txn: carried_txn.map(|txn| *txn),
         })
     }
+}
+
+fn admit_keyed_rows(table_key: &str, existing_rows: usize, additional: usize) -> Result<()> {
+    let rows = existing_rows
+        .checked_add(additional)
+        .ok_or_else(|| OmniError::manifest_internal("pending keyed row count overflow"))?;
+    if rows > KEYED_WRITE_MAX_ROWS {
+        return Err(OmniError::resource_limit(
+            format!("keyed entities for {table_key}"),
+            KEYED_WRITE_MAX_ROWS as u64,
+            rows as u64,
+        ));
+    }
+    Ok(())
+}
+
+fn rows_of(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn bytes_of(batches: &[RecordBatch]) -> Result<u64> {
+    batches.iter().try_fold(0_u64, |bytes, batch| {
+        let batch_bytes = crate::table_store::write_batch_bytes(batch)?.rows;
+        bytes
+            .checked_add(batch_bytes)
+            .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))
+    })
+}
+
+fn id_values<'a>(batch: &'a RecordBatch, id_column: &str) -> Result<&'a StringArray> {
+    batch
+        .column_by_name(id_column)
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("a pending batch has no '{id_column}' column"))
+        })?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("a pending batch's '{id_column}' is not Utf8"))
+        })
+}
+
+/// `pending` less every row whose id `successors` holds, the batches left
+/// empty dropped; the rows kept keep their order.
+fn without_ids_of(
+    pending: &[RecordBatch],
+    successors: &RecordBatch,
+    id_column: &str,
+) -> Result<Vec<RecordBatch>> {
+    let ids = id_values(successors, id_column)?;
+    let superseded = (0..ids.len())
+        .filter(|&row| ids.is_valid(row))
+        .map(|row| ids.value(row))
+        .collect::<HashSet<_>>();
+    let mut kept = Vec::with_capacity(pending.len());
+    for batch in pending {
+        let pending_ids = id_values(batch, id_column)?;
+        let keep = (0..pending_ids.len())
+            .map(|row| {
+                Some(!(pending_ids.is_valid(row) && superseded.contains(pending_ids.value(row))))
+            })
+            .collect::<arrow_array::BooleanArray>();
+        if keep.true_count() == batch.num_rows() {
+            kept.push(batch.clone());
+            continue;
+        }
+        let filtered = arrow_select::filter::filter_record_batch(batch, &keep)
+            .map_err(OmniError::arrow_internal)?;
+        if filtered.num_rows() > 0 {
+            kept.push(filtered);
+        }
+    }
+    Ok(kept)
 }
 
 /// Compare two schemas for the purposes of `MutationStaging::append_batch`'s

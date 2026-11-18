@@ -253,8 +253,10 @@ entities per touched type. The [`write_max_bytes`](../queries/settings.md)
 setting (default 32 MiB) bounds retained row data per type and across all
 touched types. Blob payloads have a separate allowance of the same size,
 including inline bytes, copied external bytes and carried update values.
-Every version of a key written in one mutation counts, so an insert and an
-update of the same row charge its Blob twice.
+The 8,192 entities count each key once however many statements write it,
+since a later statement's version replaces the earlier one. The bytes retained
+across all touched types and the Blob allowance count every version, so an
+insert and an update of the same row charge its Blob twice.
 Keyed loads also bound their parser estimate independently. A strict JSONL
 load retains its projected input check, `strict_input_arrow_bytes`.
 A vector counts its full width (dimension × 4 bytes), present or null: 12 KiB for `Vector(3072)`.

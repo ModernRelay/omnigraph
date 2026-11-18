@@ -2464,7 +2464,16 @@ impl Omnigraph {
                 )
                 .await?;
             }
-            staging.append_batch(&table_key, schema.clone(), mode, batch)?;
+            if mode == PendingMode::Upsert {
+                staging.append_successors(
+                    &table_key,
+                    schema.clone(),
+                    batch,
+                    catalog.system_columns.id,
+                )?;
+            } else {
+                staging.append_batch(&table_key, schema.clone(), mode, batch)?;
+            }
             staged += 1;
         }
         Ok(match target {
@@ -2794,13 +2803,11 @@ impl Omnigraph {
         let updated = apply_row_values(updated, row_values, id_column)?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
-        // Accumulate the updated batch into the Merge-mode pending stream.
-        // The accumulator may now contain entries with the same id as a
-        // prior insert or update on this table; `prepare_pending_table`
-        // dedupes by id (last-occurrence wins) before issuing the single
-        // `stage_keyed_write` call at end-of-query.
+        // The updated rows replace their ids' earlier pending versions, so
+        // the pending table stays one current version per id: the next
+        // statement's read, whole-write validation and staging see that.
         let updated_schema = updated.schema();
-        staging.append_batch(&table_key, updated_schema, PendingMode::Upsert, updated)?;
+        staging.append_successors(&table_key, updated_schema, updated, id_column)?;
 
         Ok(MutationResult {
             affected_nodes: affected_count,
