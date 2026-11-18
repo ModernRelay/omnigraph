@@ -1,7 +1,7 @@
 //! Managed human credentials never share the legacy named-server token file.
 use super::{Api, Failure, Method, Result, Value, canonical_origin, json, write_diagnostic};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::Instant;
@@ -633,8 +633,14 @@ async fn select_human_with(
     let saved = renewal::load_selected(store, origin, organization)?.ok_or_else(login_required)?;
     let provider = provider::Provider::new(&saved.config)?;
     let saved = renewal::credential_loaded(store, saved, &provider).await?;
-    let (verified, _, _) =
-        renewal::verify(origin, &saved.config, saved.access_token(), None).await?;
+    let (verified, _, _) = renewal::verify(
+        origin,
+        &saved.config,
+        saved.access_token(),
+        None,
+        renewal::Source::Saved,
+    )
+    .await?;
     if verified != saved.identity {
         return Err(Failure::refused(
             "session_identity_mismatch",
@@ -858,6 +864,12 @@ fn seconds(value: f64, minimum: u64, maximum: u64) -> Result<u64> {
     Ok(value as u64)
 }
 
+#[derive(Debug)]
+pub(crate) struct LoginReceipt {
+    pub(crate) body: Value,
+    pub(crate) created_session: bool,
+}
+
 #[cfg(test)]
 async fn login_with(
     store: &dyn Store,
@@ -866,7 +878,7 @@ async fn login_with(
     provider: &provider::Provider,
     organization: Option<&str>,
     stderr: &mut dyn Write,
-) -> Result<Value> {
+) -> Result<LoginReceipt> {
     let cached = renewal::validate_custody(store, origin)?;
     login_validated(
         store,
@@ -874,21 +886,24 @@ async fn login_with(
         config,
         provider,
         organization,
+        OrganizationChoice::Refuse,
         stderr,
         cached,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn login_validated(
     store: &dyn Store,
     origin: &str,
     config: provider::Config,
     provider: &provider::Provider,
     organization: Option<&str>,
+    choice: OrganizationChoice<'_>,
     stderr: &mut dyn Write,
     cached: Vec<renewal::Session>,
-) -> Result<Value> {
+) -> Result<LoginReceipt> {
     if replacement_principal().is_none()
         && organization.is_some()
         && let Some(saved) = cached
@@ -900,7 +915,14 @@ async fn login_validated(
     {
         match renewal::credential_loaded(store, saved.clone(), provider).await {
             Ok(current) => {
-                let verified = renewal::verify(origin, &config, current.access_token(), None).await;
+                let verified = renewal::verify(
+                    origin,
+                    &config,
+                    current.access_token(),
+                    None,
+                    renewal::Source::Saved,
+                )
+                .await;
                 match verified {
                     Ok((identity, expiry, mut body)) => {
                         if identity != saved.identity {
@@ -917,7 +939,10 @@ async fn login_validated(
                             &expiry
                         });
                         body["data"]["refresh_expires_at"] = json!(saved.refresh_expires_at);
-                        return Ok(body);
+                        return Ok(LoginReceipt {
+                            body,
+                            created_session: false,
+                        });
                     }
                     Err(error)
                         if matches!(
@@ -982,7 +1007,21 @@ async fn login_validated(
             })?;
         match reply {
             Ok(tokens) => {
-                return accept_device(store, origin, config, provider, tokens, organization).await;
+                return accept_device(
+                    store,
+                    origin,
+                    config,
+                    provider,
+                    tokens,
+                    organization,
+                    choice,
+                    stderr,
+                )
+                .await
+                .map(|body| LoginReceipt {
+                    body,
+                    created_session: true,
+                });
             }
             Err(error) if error.code() == Some("authorization_pending") => {}
             Err(error) if error.code() == Some("slow_down") => {
@@ -993,6 +1032,164 @@ async fn login_validated(
     }
 }
 
+/// How a login that named no organization settles on one when the person is
+/// an active member of several. A profile is bound to one organization for
+/// good, so it is never the one a browser session happened to carry.
+pub(crate) enum OrganizationChoice<'a> {
+    /// No one to ask: refuse, and list the organizations to choose from.
+    Refuse,
+    /// Ask on the terminal: the list goes to stderr and the answer is read
+    /// from here.
+    Ask(&'a mut dyn Read),
+}
+
+/// The answers a person gets to give before the sign-in is abandoned.
+const CHOICE_ATTEMPTS: usize = 3;
+
+fn several_organizations(listed: &[super::organization::Membership], why: &str) -> Failure {
+    let organizations: Vec<String> = listed
+        .iter()
+        .map(super::organization::Membership::label)
+        .collect();
+    let mut failure = Failure::refused(
+        "organization_required",
+        &format!(
+            "{why}; run login again with --organization ORG_ID, one of: {}",
+            organizations.join(", ")
+        ),
+    );
+    failure.body["organizations"] = json!(listed);
+    failure
+}
+
+/// Asks which of `listed` the profile is for. An answer is a row's number or
+/// an organization ID; an end of input, or [`CHOICE_ATTEMPTS`] answers that
+/// name none, abandons the sign-in.
+fn ask_organization(
+    listed: &[super::organization::Membership],
+    signed: &str,
+    input: &mut dyn Read,
+    stderr: &mut dyn Write,
+) -> Result<String> {
+    let mut rows = String::from("You are an active member of several organizations:\n");
+    for (index, organization) in listed.iter().enumerate() {
+        rows.push_str(&format!(
+            "  {}. {}{}\n",
+            index + 1,
+            organization.label(),
+            if organization.organization_id == signed {
+                "  · the one this sign-in opened"
+            } else {
+                ""
+            }
+        ));
+    }
+    write_diagnostic(stderr, format_args!("{rows}"))?;
+    for _ in 0..CHOICE_ATTEMPTS {
+        write_diagnostic(
+            stderr,
+            format_args!(
+                "Organization for this profile [1-{} or an organization ID]: ",
+                listed.len()
+            ),
+        )?;
+        let line = crate::input::read_line(input).map_err(|_| {
+            several_organizations(listed, "the organization choice could not be read")
+        })?;
+        if line.is_empty() {
+            break;
+        }
+        let answer = line.trim();
+        let chosen = answer
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| listed.get(number.checked_sub(1)?))
+            .or_else(|| {
+                listed
+                    .iter()
+                    .find(|organization| organization.organization_id == answer)
+            });
+        if let Some(chosen) = chosen {
+            return Ok(chosen.organization_id.clone());
+        }
+    }
+    Err(several_organizations(listed, "no organization was chosen"))
+}
+
+/// Select the sole active membership, or ask the person to choose. Their wait is
+/// unbounded, so this runs before the claims lock and the network deadline
+/// of [`accept_device`]; it reads no saved state and keeps nothing.
+async fn settle_organization(
+    origin: &str,
+    tokens: &workos::AuthenticateResponse,
+    initial: &renewal::Claims,
+    choice: OrganizationChoice<'_>,
+    stderr: &mut dyn Write,
+) -> Result<String> {
+    // The API authenticates a person's session by its organization, so a
+    // sign-in without one cannot ask it which organizations there are.
+    let signed = initial
+        .organization()
+        .ok_or_else(renewal::organization_required)?;
+    let access: &str = tokens.access_token.as_ref();
+    let api = Api::new(origin.into(), Some(access.to_owned()))?;
+    let listed = super::organization::list_memberships(&api)
+        .await
+        .map(|(_, listed)| listed)
+        .map_err(|error| {
+            let error = scrub(error, access);
+            if error.response_status == Some(reqwest::StatusCode::NOT_FOUND) {
+                // An API that cannot say whether there are others cannot make
+                // this sign-in's organization the right one by default.
+                return Failure::refused(
+                    "organization_required",
+                    "this API does not list your organizations; run login again with --organization ORG_ID",
+                );
+            }
+            error
+        })?;
+    match listed.as_slice() {
+        [] => Err(Failure::refused(
+            "organization_required",
+            "no active organization membership was found; join an organization before signing in",
+        )),
+        [only] => Ok(only.organization_id.clone()),
+        _ => match choice {
+            OrganizationChoice::Refuse => Err(several_organizations(
+                &listed,
+                "you are an active member of several organizations and this login names none",
+            )),
+            OrganizationChoice::Ask(input) => ask_organization(&listed, signed, input, stderr),
+        },
+    }
+}
+
+/// Revokes a device sign-in that will not be kept, once it is known to be a
+/// new session and none this machine already holds. Best effort: the tokens
+/// are dropped either way, and without its refresh token the session cannot
+/// be renewed.
+async fn discard_device_session(
+    store: &dyn Store,
+    origin: &str,
+    config: &provider::Config,
+    tokens: &workos::AuthenticateResponse,
+    initial: &renewal::Claims,
+) {
+    let _claims_lock = if crate::operator_routing::journal_owner().is_some() {
+        match coordination::global_session_lock().await {
+            Ok(lock) => Some(lock),
+            Err(_) => return,
+        }
+    } else {
+        None
+    };
+    if renewal::check_device_session(store, origin, config, initial).is_ok() {
+        let access: &str = tokens.access_token.as_ref();
+        renewal::revoke(origin, access.to_owned()).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn accept_device(
     store: &dyn Store,
     origin: &str,
@@ -1000,6 +1197,37 @@ async fn accept_device(
     provider: &provider::Provider,
     tokens: workos::AuthenticateResponse,
     organization: Option<&str>,
+    choice: OrganizationChoice<'_>,
+    stderr: &mut dyn Write,
+) -> Result<Value> {
+    let initial = renewal::device_claims(&config, &tokens, OffsetDateTime::now_utc())?;
+    let settled = match organization {
+        Some(organization) => organization.to_owned(),
+        None => match settle_organization(origin, &tokens, &initial, choice, stderr).await {
+            Ok(organization) => organization,
+            Err(error) => {
+                // A sign-in without an organization is no session the API
+                // knows, so there is nothing it could revoke.
+                if tokens.organization_id.is_some() {
+                    discard_device_session(store, origin, &config, &tokens, &initial).await;
+                }
+                return Err(error);
+            }
+        },
+    };
+    finish_device(store, origin, config, provider, tokens, initial, &settled).await
+}
+
+/// The access token was checked when received. It may have expired during the
+/// prompt, so check custody here and renew it before verifying the chosen session.
+async fn finish_device(
+    store: &dyn Store,
+    origin: &str,
+    config: provider::Config,
+    provider: &provider::Provider,
+    tokens: workos::AuthenticateResponse,
+    initial: renewal::Claims,
+    organization: &str,
 ) -> Result<Value> {
     let _claims_lock = if crate::operator_routing::journal_owner().is_some() {
         Some(coordination::global_session_lock().await?)
@@ -1008,7 +1236,7 @@ async fn accept_device(
     };
     // Keychain reads can require interactive OS consent. Complete the cached
     // session collision check under the origin lock before timing network work.
-    let initial = renewal::check_device_session(store, origin, &config, &tokens)?;
+    renewal::check_device_session(store, origin, &config, &initial)?;
     let (saved, body) = tokio::time::timeout(Duration::from_secs(35), async {
         let tokens =
             renewal::select_device_organization(&config, provider, tokens, initial, organization)
@@ -1017,7 +1245,7 @@ async fn accept_device(
     })
     .await
     .map_err(|_| renewal::unknown())??;
-    if let Err(error) = check_account(organization, &saved.identity.account_id) {
+    if let Err(error) = check_account(Some(organization), &saved.identity.account_id) {
         saved.revoke().await;
         return Err(error);
     }
@@ -1064,29 +1292,69 @@ pub(super) async fn login_replacing(
     principal: Option<&str>,
     stderr: &mut dyn Write,
 ) -> Result<Value> {
+    let _lock = coordination::lock(&origin).await?;
+    // An existing profile names its organization, so there is nothing to ask.
     REPLACE_PRINCIPAL
         .scope(
             principal.map(str::to_owned),
-            login(origin, organization, stderr),
+            login_locked(&origin, organization, OrganizationChoice::Refuse, stderr),
         )
         .await
+        .map(|receipt| receipt.body)
 }
 
-pub(super) async fn login(
-    origin: String,
+/// Keeps a new profile's credential in the creating invocation's custody until
+/// the config edit publishes the profile or the new session is discarded.
+pub(crate) struct ProfileRegistration<'a> {
+    origin: &'a str,
+    organization: Option<&'a str>,
+    _lock: LockGuard,
+}
+
+impl<'a> ProfileRegistration<'a> {
+    pub(crate) async fn begin(origin: &'a str, organization: Option<&'a str>) -> Result<Self> {
+        if let Some(id) = organization {
+            super::organization_id(id)?;
+        }
+        Ok(Self {
+            origin,
+            organization,
+            _lock: coordination::lock(origin).await?,
+        })
+    }
+
+    pub(crate) async fn login(
+        &self,
+        choice: OrganizationChoice<'_>,
+        stderr: &mut dyn Write,
+    ) -> Result<LoginReceipt> {
+        login_locked(self.origin, self.organization, choice, stderr).await
+    }
+
+    pub(crate) async fn discard(&self, organization: &str) -> Result<()> {
+        // An unpublished profile has acquired no data credentials. Other API
+        // bindings of this profile name share the data-credential index.
+        renewal::logout(&AUTHKIT_STORE, self.origin, Some(organization)).await?;
+        Ok(())
+    }
+}
+
+async fn login_locked(
+    origin: &str,
     organization: Option<&str>,
+    choice: OrganizationChoice<'_>,
     stderr: &mut dyn Write,
-) -> Result<Value> {
-    let _lock = coordination::lock(&origin).await?;
-    let cached = renewal::validate_custody(&AUTHKIT_STORE, &origin)?;
-    let config = provider::Config::discover(&origin).await?;
+) -> Result<LoginReceipt> {
+    let cached = renewal::validate_custody(&AUTHKIT_STORE, origin)?;
+    let config = provider::Config::discover(origin).await?;
     let provider = provider::Provider::new(&config)?;
     login_validated(
         &AUTHKIT_STORE,
-        &origin,
+        origin,
         config,
         &provider,
         organization,
+        choice,
         stderr,
         cached,
     )

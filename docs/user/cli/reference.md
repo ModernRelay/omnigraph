@@ -95,6 +95,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its resource credential, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server or managed |
 | `studio` | Open Omnigraph Studio on a server target or a managed cluster target through an `omnigraph-studio://` link and print it; no request or credential; `--json` adds the facts the link was built from: a server's `binding` and `home` digests, or a cluster's control plane, organization, ID and incarnation ([Open Studio](studio.md)) | server or managed |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
+| `organization list` | List the organizations you are an active member of, marking the profile's ([your organizations](managed-team.md#find-your-organizations)) | profile |
 | `organization members/invitations` | List members, set service roles, offboard and manage invitations; see [team access](managed-team.md) | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
 | `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
