@@ -5415,3 +5415,193 @@ query bump_all() {
         "an update of every row patches the column"
     );
 }
+
+/// A keyed `insert` and a `merge` load replace the whole row on an existing
+/// key: every nullable property the statement or record omits becomes null,
+/// a managed Blob and a vector included, and an explicit `null` clears too.
+/// A missing required property is refused on an existing key as on a new
+/// one. Setting only named properties is `update`'s job. Pinned on main and
+/// on a branch, and across a reopen; the GQT case
+/// `issue_1278_keyed_upsert_replaces_the_whole_row.gqt` pins the scalar,
+/// list and vector rows of the mutation door.
+#[tokio::test]
+async fn keyed_insert_and_merge_load_replace_the_whole_row_issue_1278() {
+    use arrow_array::cast::AsArray;
+    use base64::Engine as _;
+
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    title: String
+    n: I64?
+    tags: [String]?
+    emb: Vector(3)?
+    file: Blob?
+}
+"#;
+    const WRITES: &str = r#"
+query retitle($slug: String) {
+    insert Doc { slug: $slug, title: "retitled" }
+}
+"#;
+
+    fn full_row(slug: &str, byte: u8) -> String {
+        serde_json::json!({"type": "Doc", "data": {
+            "slug": slug,
+            "title": "full",
+            "n": 7,
+            "tags": ["a", "b"],
+            "emb": [1.0, 2.0, 3.0],
+            "file": format!(
+                "base64:{}",
+                base64::engine::general_purpose::STANDARD.encode(vec![byte; 300])
+            ),
+        }})
+        .to_string()
+    }
+
+    /// `(title, n, tags, emb)` presence per slug: the title's value and
+    /// whether each nullable column holds a value.
+    async fn row_state(db: &Omnigraph, branch: &str, slug: &str) -> (String, bool, bool, bool) {
+        let ds = open_pinned_dataset_for_test(db, branch, "node:Doc").await;
+        let batch = ds
+            .scan()
+            .project(&["slug", "title", "n", "tags", "emb"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let slugs = batch.column_by_name("slug").unwrap().as_string::<i32>();
+        let row = (0..batch.num_rows())
+            .find(|&row| slugs.value(row) == slug)
+            .unwrap_or_else(|| panic!("{branch}: no row {slug}"));
+        let title = batch.column_by_name("title").unwrap().as_string::<i32>();
+        (
+            title.value(row).to_string(),
+            batch.column_by_name("n").unwrap().is_valid(row),
+            batch.column_by_name("tags").unwrap().is_valid(row),
+            batch.column_by_name("emb").unwrap().is_valid(row),
+        )
+    }
+
+    async fn blob_is_null(db: &Omnigraph, branch: &str, slug: &str) -> bool {
+        match db
+            .read_blob_at(
+                ReadTarget::branch(branch),
+                node_blob_cell("Doc", slug, "file"),
+            )
+            .await
+        {
+            Ok(_) => false,
+            Err(error) => {
+                let text = error.to_string();
+                assert!(text.contains("is null for id"), "{branch}/{slug}: {text}");
+                true
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::session(Omnigraph::init(&uri, SCHEMA).await.unwrap());
+    let seed = [full_row("d1", 1), full_row("d2", 2), full_row("d3", 3)].join("\n");
+    db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+    db.branch_create("feature").await.unwrap();
+
+    // The mutation door on main, the merge load on the branch.
+    let result = db
+        .mutate("main", WRITES, "retitle", &params(&[("$slug", "d1")]))
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    db.load_as(
+        "feature",
+        None,
+        r#"{"type":"Doc","data":{"slug":"d2","title":"merged"}}"#,
+        LoadMode::Merge,
+        None,
+    )
+    .await
+    .unwrap();
+    // An explicit null clears through the merge load too.
+    db.load_jsonl(
+        &serde_json::json!({"type": "Doc", "data": {
+            "slug": "d3", "title": "full", "n": 7, "tags": ["a", "b"],
+            "emb": null, "file": null,
+        }})
+        .to_string(),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // A missing required property is refused on an existing key, by both doors,
+    // and moves nothing.
+    let error = db
+        .mutate(
+            "main",
+            "query untitled() { insert Doc { slug: \"d2\", n: 1 } }",
+            "untitled",
+            &params(&[]),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("T12"), "{error}");
+    let error = db
+        .load_jsonl(
+            r#"{"type":"Doc","data":{"slug":"d2","n":1}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("title"), "{error}");
+
+    for reopened in [false, true] {
+        let db = if reopened {
+            helpers::session(Omnigraph::open(&uri).await.unwrap())
+        } else {
+            db.clone()
+        };
+        let when = if reopened {
+            "after a reopen"
+        } else {
+            "before a reopen"
+        };
+        assert_eq!(
+            row_state(&db, "main", "d1").await,
+            ("retitled".to_string(), false, false, false),
+            "{when}: the keyed insert nulls every omitted property"
+        );
+        assert!(blob_is_null(&db, "main", "d1").await, "{when}");
+        assert_eq!(
+            row_state(&db, "feature", "d2").await,
+            ("merged".to_string(), false, false, false),
+            "{when}: the merge load nulls every omitted property on the branch"
+        );
+        assert!(blob_is_null(&db, "feature", "d2").await, "{when}");
+        assert_eq!(
+            row_state(&db, "main", "d2").await,
+            ("full".to_string(), true, true, true),
+            "{when}: main keeps the row the branch replaced"
+        );
+        assert_eq!(
+            read_managed_blob_bytes(
+                &db,
+                ReadTarget::branch("main"),
+                node_blob_cell("Doc", "d2", "file")
+            )
+            .await,
+            vec![2_u8; 300],
+            "{when}"
+        );
+        assert_eq!(
+            row_state(&db, "main", "d3").await,
+            ("full".to_string(), true, true, false),
+            "{when}: an explicit null clears the vector"
+        );
+        assert!(
+            blob_is_null(&db, "main", "d3").await,
+            "{when}: and the Blob"
+        );
+    }
+}

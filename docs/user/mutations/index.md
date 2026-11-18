@@ -81,8 +81,10 @@ them visible on the target in one atomic step. See
 
 ## Insert and update identity
 
-- Inserting a node or edge with `@key` is an upsert by its derived id.
-  Inserting the same key again updates the existing row.
+- Inserting a node or edge with `@key` is an upsert by its derived id that
+  replaces the whole row: an omitted nullable property becomes null, Blob and
+  vector included, and a missing required property is an error on a new or an
+  existing key. Use `update` to change only the properties it names.
 - Inserting a node without a key is a strict insert with a generated or supplied
   id.
 - Inserting an edge without a key is a strict insert with a generated or
@@ -124,7 +126,7 @@ Choose the mode explicitly:
 | Mode | Existing id | Use |
 |---|---|---|
 | `append` | Fails with `key_conflict` | Add entities without replacing anything. |
-| `merge` | Updates the existing entity | Upsert a batch. |
+| `merge` | Replaces the existing entity whole, as a keyed insert does | Upsert a batch of complete records. |
 | `overwrite` | Replaces every node or edge type represented in the batch; types absent from the batch remain unchanged | Rebuild from a complete export or seed. |
 
 For a keyed edge the existing-id column applies to its derived id: `append`
@@ -194,26 +196,24 @@ written as its decimal value. The statement never forks a branch.
 
 The source is a URI the engine reads under the graph's external Blob policy
 ([External Blob references](../clusters/config.md#external-blob-references)):
-`s3://` objects beneath a configured
-base, and for an embedded run `file://` paths beneath an `embedded_only`
-base. A graph with no policy denies every source; a URI outside every base,
-an unsupported scheme, and an object over the
-[`load_source_max_bytes`](../queries/settings.md) setting (default 32 MiB)
-are refused before any byte is read, and every read of the object (each
-range an overwrite's partition reads, or the one read of an append or merge)
-is bounded by a 120-second deadline. A refused source names `csv_source_bytes`; raising the setting in
-the statement's `set` prefix (or the request's `settings` field) admits a
-larger object. A direct `omnigraph mutate`
-run installs an embedded-only base over a `file://` source's directory for
-that statement, so the file is admitted by the same rule; a served run
-refuses a `file://` source, since the server reads only what it may reach.
+`s3://` objects beneath a configured base, and for an embedded run `file://`
+paths beneath an `embedded_only` base. A graph with no policy denies every
+source; a URI outside every base, an unsupported scheme, and an object over the
+[`load_source_max_bytes`](../queries/settings.md) setting (default 32 MiB) are
+refused before any byte is read, and every read of the object (each range an
+overwrite's partition reads, or the one read of an append or merge) is bounded
+by a 120-second deadline. A refused source names `csv_source_bytes`; raising the
+setting in the statement's `set` prefix (or the request's `settings` field)
+admits a larger object. A direct `omnigraph mutate` run installs an embedded-
+only base over a `file://` source's directory for that statement, so the file is
+admitted by the same rule; a served run refuses a `file://` source, since the
+server reads only what it may reach.
 
 `explain` before a `load csv` statement prints the load's plan, the same
 document a query's explain prints: the source, the one validation with each
-check and its access path, and the write.
-An overwrite runs that plan; append and merge run the keyed adapters.
-It reads the source's metadata and no payload byte.
-See [Explaining a load statement](../queries/explain-load.md).
+check and its access path, and the write. An overwrite runs that plan; append
+and merge run the keyed adapters. It reads the source's metadata and no payload
+byte. See [Explaining a load statement](../queries/explain-load.md).
 
 #### CLI and HTTP requests
 
@@ -252,44 +252,42 @@ Insert/update mutations and incremental keyed loads are bounded to 8,192
 entities per touched type. The [`write_max_bytes`](../queries/settings.md)
 setting (default 32 MiB) bounds retained row data per type and across all
 touched types. Blob payloads have a separate allowance of the same size,
-including inline bytes, copied external bytes and carried update values.
-The 8,192 entities count each key once however many statements write it,
-since a later statement's version replaces the earlier one. The bytes retained
-across all touched types and the Blob allowance count every version, so an
-insert and an update of the same row charge its Blob twice.
-Keyed loads also bound their parser estimate independently. A strict JSONL
-load retains its projected input check, `strict_input_arrow_bytes`.
-A vector counts its full width (dimension × 4 bytes), present or null: 12 KiB for `Vector(3072)`.
-A CSV load has no whole-statement input check; it applies `write_max_bytes` to each staged-write input instead.
-An overwrite stages the reader's 8,192-row batches, and a batch over the
-allowance refuses as `staged_write_input_bytes`.
-An overwrite writes a fragment per parse partition, up to 1 Mi rows each, as
-the rows drain; nothing commits before the publish, a refusal deletes them all.
-An append or merge keeps the keyed adapter's ceilings
-(`retained keyed batch bytes per operation`, `keyed entities for <table>`,
-`keyed entity bytes for <table>`).
-The [`query_memory_bytes`](../queries/settings.md) setting bounds one
-`load csv` statement's tracked memory as a whole: the retained source, every
-decoded batch, validation state and the staging working set; a streaming
-overwrite's working set is its open fragments and the writers in flight.
-An overwrite admits that memory once, before any partition reads, one share per
-parse partition that only its own reader charges, so a refusal and its `actual`
-(the smallest admitting limit) are the same on every run (the shares: the
-settings reference); a statement it cannot hold refuses before any fragment write.
-The source object is bounded by `load_source_max_bytes` before it is read
-(refused as `csv_source_bytes`).
-An overwrite probes the object's metadata once, then each parse partition reads
-its own byte range in 8 MiB pieces, every read conditional on the etag and size
-the probe captured; a refusal of the partitioned run reads the ranges once more
-as one partition. An append or merge reads the object once per statement under
-the same validators, and every reprepare attempt reuses those bytes.
-An object replaced between the probe and the read refuses as an
-external-source error, and nothing is staged.
-Raising `write_max_bytes` lifts `strict_input_arrow_bytes` and
-`staged_write_input_bytes`; raising `query_memory_bytes` admits a larger
-statement; raising `load_source_max_bytes` lifts `csv_source_bytes`. No setting
-lifts a merge's [validation limit](../branching/merge.md#validation-limit),
-which counts a branch's commits together. See [Blob limits](../blobs.md#limits).
+including inline bytes, copied external bytes and carried update values. The
+8,192 entities count each key once however many statements write it, since a
+later statement's version replaces the earlier one. The bytes retained across
+all touched types and the Blob allowance count every version, so an insert and
+an update of the same row charge its Blob twice. Keyed loads also bound their
+parser estimate independently. A strict JSONL load retains its projected input
+check, `strict_input_arrow_bytes`. A vector counts its full width (dimension × 4
+bytes), present or null: 12 KiB for `Vector(3072)`. A CSV load has no whole-
+statement input check; it applies `write_max_bytes` to each staged-write input
+instead. An overwrite stages the reader's 8,192-row batches, and a batch over
+the allowance refuses as `staged_write_input_bytes`. An overwrite writes a
+fragment per parse partition, up to 1 Mi rows each, as the rows drain; nothing
+commits before the publish, a refusal deletes them all. An append or merge keeps
+the keyed adapter's ceilings (`retained keyed batch bytes per operation`, `keyed
+entities for <table>`, `keyed entity bytes for <table>`). The
+[`query_memory_bytes`](../queries/settings.md) setting bounds one `load csv`
+statement's tracked memory as a whole: the retained source, every decoded batch,
+validation state and the staging working set; a streaming overwrite's working
+set is its open fragments and the writers in flight. An overwrite admits that
+memory once, before any partition reads, one share per parse partition that only
+its own reader charges, so a refusal and its `actual` (the smallest admitting
+limit) are the same on every run (the shares: the settings reference); a
+statement it cannot hold refuses before any fragment write. The source object is
+bounded by `load_source_max_bytes` before it is read (refused as
+`csv_source_bytes`). An overwrite probes the object's metadata once, then each
+parse partition reads its own byte range in 8 MiB pieces, every read conditional
+on the etag and size the probe captured; a refusal of the partitioned run reads
+the ranges once more as one partition. An append or merge reads the object once
+per statement under the same validators, and every reprepare attempt reuses
+those bytes. An object replaced between the probe and the read refuses as an
+external-source error, and nothing is staged. Raising `write_max_bytes` lifts
+`strict_input_arrow_bytes` and `staged_write_input_bytes`; raising
+`query_memory_bytes` admits a larger statement; raising `load_source_max_bytes`
+lifts `csv_source_bytes`. No setting lifts a merge's [validation
+limit](../branching/merge.md#validation-limit), which counts a branch's commits
+together. See [Blob limits](../blobs.md#limits).
 
 Deletes, including cascades, and overwrite loads collecting replaced IDs have
 a separate `write_max_bytes` allowance per operation for those IDs, summed over all

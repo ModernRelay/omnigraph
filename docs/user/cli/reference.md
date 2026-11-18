@@ -228,7 +228,7 @@ addressing are refused; see [storage upgrade](../operations/upgrade.md#storage-u
 |---|---|---|
 | `overwrite` | Each node or edge type represented in the batch is replaced; other types remain | Initial load or import of a complete export |
 | `append` | Kept; duplicate IDs fail | Strict batch insertion |
-| `merge` | Updated by ID | Idempotent synchronization |
+| `merge` | Replaced whole by ID; an omitted property becomes null | Idempotent synchronization |
 
 `--branch <NAME>` selects an existing branch. Add `--from <BASE>` to create a
 missing branch from an explicit base. Overwrite is destructive and may require

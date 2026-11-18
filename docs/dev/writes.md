@@ -707,7 +707,9 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
 
 - strict insert probes the pinned parent and returns `KeyConflict` for an
   existing ID;
-- upsert updates or inserts without changing modes on retry. With an id
+- upsert replaces a matched row whole (its source is the full catalog row,
+  an omitted nullable property null, Blob and vector included) or inserts,
+  without changing modes on retry. With an id
   BTREE it first runs the strict insert's exact-id probe, while the fragments
   the BTREE leaves uncovered times the source ids stay within one keyed batch
   (8,192), since Lance plans the probe's `IN` list once per uncovered

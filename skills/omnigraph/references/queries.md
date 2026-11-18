@@ -571,7 +571,9 @@ query add_and_link($slug: String, $pattern: String, $createdAt: DateTime, $updat
 ```
 
 There is no `upsert` keyword: `insert` on a node or edge with `@key` upserts
-the derived identity. Without a key, `insert` is strict; inserting an unkeyed
+the derived identity and replaces an existing row whole: a property the insert
+omits becomes null, Blob and vector included, and a missing required property
+is refused. Use `update` to change only named properties. Without a key, `insert` is strict; inserting an unkeyed
 edge twice creates two edges. Use `load --mode merge` for bulk upsert. Edge
 `update` is unsupported; reinsert a keyed edge to change non-key properties,
 or delete and reinsert an unkeyed edge.

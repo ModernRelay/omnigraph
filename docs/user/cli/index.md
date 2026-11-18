@@ -56,7 +56,8 @@ Other graph commands take their destination through `--target`.
 - `overwrite` replaces each node or edge type represented in the batch. Types
   absent from the batch are unchanged.
 - `append` inserts new entities and rejects duplicate IDs.
-- `merge` inserts new IDs and updates existing IDs.
+- `merge` inserts new IDs and replaces existing IDs whole: a property a
+  record omits becomes null. Use an `update` mutation to change named properties.
 
 For a stored query, omit `--query`; the positional name selects the query from
 the selected backend's registry.
