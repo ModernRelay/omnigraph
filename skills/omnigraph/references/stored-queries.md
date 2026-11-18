@@ -70,7 +70,7 @@ omnigraph queries list --target prod --graph dev --json # a server's GET /graphs
 | Route | Gate | Purpose |
 |-------|------|---------|
 | `GET /graphs/{graph_id}/queries` | `read` | Typed tool catalog of the served queries. Graph-wide (branch-independent; `read` authorized against `main`). |
-| `POST /graphs/{graph_id}/queries/{query_name}` | `invoke_query` (+ `change` for a stored mutation) | Invoke a named query. Body carries params only — **never** `.gq` source. A stored mutation cannot target a `snapshot` (`400`); a param type error is a structured `400` naming the param. |
+| `POST /graphs/{graph_id}/queries/{query_name}` | `invoke_query` (+ `change` for a stored mutation) | Invoke a named query. Body carries `params`, `branch`, `snapshot` and `expect_mutation` only — **never** `.gq` source; any other key is a `400 bad_request` naming it. A stored mutation cannot target a `snapshot` (`400`); a param type error is a structured `400` naming the param. |
 
 The JSON body carries `params` and optionally `branch` (default `main`; the
 write target for a stored mutation) or `snapshot` (reads only); `branch` and

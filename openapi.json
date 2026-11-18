@@ -14222,7 +14222,8 @@
             "type": "string",
             "description": "Name of the new branch. Must not already exist."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "BranchDeleteOutput": {
         "type": "object",
@@ -14424,7 +14425,8 @@
             ],
             "description": "Target branch that will receive the merge. Defaults to `main`."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "BranchOutcomeOutput": {
         "oneOf": [
@@ -14639,7 +14641,8 @@
               "type": "string"
             }
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ChangeBlockOutput": {
         "type": "object",
@@ -16072,7 +16075,8 @@
               }
             ]
           }
-        }
+        },
+        "additionalProperties": false
       },
       "InvokeStoredQueryOutput": {
         "oneOf": [
@@ -16113,7 +16117,8 @@
             ],
             "description": "Snapshot id to read from (read queries only — rejected for a stored\nmutation). Mutually exclusive with `branch`."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "KeyConflictOutput": {
         "type": "object",

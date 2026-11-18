@@ -425,6 +425,7 @@ pub struct SnapshotOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BranchCreateRequest {
     /// Parent branch to fork from; the new branch starts at its head.
     /// Mutually exclusive with `from_commit`. Defaults to `main`.
@@ -511,6 +512,7 @@ pub struct BranchDeleteOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BranchMergeRequest {
     /// Source branch whose commits will be merged.
     pub source: String,
@@ -1370,6 +1372,7 @@ pub struct ChangeFeedQuery {
 
 /// Body for the change baseline handshake.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeBaselineRequest {
     /// Branch to capture. Defaults to `main`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1809,6 +1812,7 @@ pub struct ChangeRequest {
 /// named in the path. The query source and name come from the registry,
 /// never the body; only the runtime inputs are supplied here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InvokeStoredQueryRequest {
     /// JSON object whose keys match the stored query's declared parameters.
     #[serde(default)]
@@ -2077,6 +2081,7 @@ impl From<omnigraph_compiler::SystemColumns> for SystemColumnsOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IngestRequest {
     /// Target branch. Defaults to `main`. Without `from`, the branch must
     /// already exist — a missing branch is a 404, never an implicit fork.

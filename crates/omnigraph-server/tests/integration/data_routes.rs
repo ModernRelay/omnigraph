@@ -4158,6 +4158,64 @@ async fn main_head_commit_id(app: &axum::Router) -> String {
         .to_string()
 }
 
+/// Every JSON body refuses a key it does not define, before the handler runs:
+/// a misspelled optional key would otherwise fall back to its default (`main`,
+/// `merge`, the whole feed) and answer 200. The refusal names the key and the
+/// keys the body accepts, and nothing moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn json_bodies_refuse_unknown_keys_issue_528() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let head = main_head_commit_id(&app).await;
+    for (path, body, key, accepted) in [
+        (
+            "/branches",
+            json!({"name": "side", "form": "main"}),
+            "form",
+            "from_commit",
+        ),
+        (
+            "/branches/merge",
+            json!({"source": "main", "into": "main"}),
+            "into",
+            "delete_branch",
+        ),
+        (
+            "/changes/baseline",
+            json!({"branch": "main", "types": ["Person"]}),
+            "types",
+            "type",
+        ),
+        (
+            "/load",
+            json!({
+                "branch": "side",
+                "from": "main",
+                "load_mode": "append",
+                "data": "{\"type\": \"Person\", \"data\": {\"name\": \"Zed\", \"age\": 1}}"
+            }),
+            "load_mode",
+            "mode",
+        ),
+    ] {
+        let (status, body) = json_response(&app, json_post(path, &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["code"], "bad_request", "{path}: {body}");
+        assert_eq!(body["disposition"]["effects"], "none", "{path}: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains(&format!("unknown field `{key}`")),
+            "{path}: the refusal names the key; {body}"
+        );
+        assert!(
+            error.contains(&format!("`{accepted}`")),
+            "{path}: the refusal names the accepted keys; {body}"
+        );
+    }
+    assert_eq!(main_head_commit_id(&app).await, head, "nothing published");
+    let (_, branches) = get_json(&app, g("/branches")).await;
+    assert_eq!(branches["branches"], json!(["main"]), "no branch created");
+}
+
 /// `branch create <name>` then one insert on it, so a merge into `main`
 /// fast-forwards.
 async fn branch_one_commit_ahead(app: &axum::Router, name: &str, person: &str) {

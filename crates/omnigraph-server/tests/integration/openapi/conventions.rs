@@ -276,6 +276,15 @@ fn convention_errors(doc: &Value) -> Vec<String> {
         if !name.ends_with(convention(&rows, "request-schema-suffix")) {
             errors.push(format!("request schema {name} needs its request suffix"));
         }
+        assert_eq!(
+            convention(&rows, "closed-request-body"),
+            "additionalProperties=false"
+        );
+        if doc["components"]["schemas"][name]["additionalProperties"] != Value::Bool(false) {
+            errors.push(format!(
+                "request schema {name} must refuse unknown keys (deny_unknown_fields)"
+            ));
+        }
     }
     for name in &response_schemas {
         if !name.ends_with(convention(&rows, "response-schema-suffix"))
@@ -352,7 +361,14 @@ fn change_page_limits_match_engine_bounds() {
 fn conventions_reject_new_deviations() {
     let doc = openapi_json();
     assert!(convention_errors(&doc).is_empty());
-    for defect in ["operationId", "tag", "status", "limit", "limit-default"] {
+    for defect in [
+        "operationId",
+        "tag",
+        "status",
+        "limit",
+        "limit-default",
+        "open-request",
+    ] {
         let mut changed = doc.clone();
         let expected = match defect {
             "operationId" => {
@@ -389,6 +405,13 @@ fn conventions_reject_new_deviations() {
                     .unwrap();
                 limit["schema"].as_object_mut().unwrap().remove("default");
                 "limit needs an integer schema default"
+            }
+            "open-request" => {
+                changed["components"]["schemas"]["InvokeStoredQueryRequest"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("additionalProperties");
+                "InvokeStoredQueryRequest must refuse unknown keys"
             }
             _ => unreachable!(),
         };

@@ -904,6 +904,48 @@ async fn invoke_stored_query_bad_param_is_400() {
     assert_eq!(body["code"], "bad_request", "body: {body}");
 }
 
+/// A key the invocation body does not define is refused, never ignored: a
+/// misspelled `branch` would otherwise read `main`, a misspelled `params`
+/// would bind nothing, and a misspelled `expect_mutation` would skip the kind
+/// check. The refusal names the key and the keys the body accepts.
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_query_refuses_unknown_body_keys_issue_528() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    for (body, key) in [
+        (
+            json!({ "params": { "name": "Alice" }, "branchh": "main" }),
+            "branchh",
+        ),
+        (json!({ "paramz": { "name": "Alice" } }), "paramz"),
+        (
+            json!({ "params": { "name": "Alice" }, "expect_mutaton": true }),
+            "expect_mutaton",
+        ),
+    ] {
+        let (status, body) =
+            json_response(&app, invoke_request("find_person", "t-invoke", body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["code"], "bad_request", "body: {body}");
+        assert_eq!(body["disposition"]["effects"], "none", "body: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains(&format!("unknown field `{key}`")),
+            "the refusal names the key; body: {body}"
+        );
+        for accepted in ["params", "branch", "snapshot", "expect_mutation"] {
+            assert!(
+                error.contains(&format!("`{accepted}`")),
+                "the refusal names the accepted key {accepted}; body: {body}"
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
     use tower::ServiceExt;

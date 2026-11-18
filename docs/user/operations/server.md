@@ -274,9 +274,9 @@ curl -sS http://localhost:8080/graphs/knowledge/queries/find_person \
   -d '{"params":{"name":"Ada"}}'
 ```
 
-Authorization denials for stored-query invocation appear as `404`, preventing
-callers from probing registry names. A stored query then receives the normal
-`read` or `change` authorization check for its body.
+The body takes `params`, `branch`, `snapshot` and `expect_mutation`. Denials appear
+as `404`, preventing callers from probing registry names; a stored query then
+receives the normal `read` or `change` authorization check for its body.
 
 ## Conditional mutations
 
@@ -341,9 +341,9 @@ resume cursor ([Changes, Diffs and Change Feeds](../branching/changes.md)).
 ## Errors and retries
 
 Every error body, an unknown route's and a malformed request's included, carries
-a `code`, its details and a `disposition` (`effects`, `action`; see
-[failed writes](troubleshooting.md#failed-data-write-commands)); a write the
-server could not settle is `outcome_unknown`, with `500`. Admission limits use `429`, size limits `413`, blocked graphs or closed admission `503`, each refusal
+a `code`, its details and a `disposition` (`effects`, `action`; see [failed writes](troubleshooting.md#failed-data-write-commands)).
+A JSON body key a route does not define is `400 bad_request`, naming it and the
+accepted keys; a write the server could not settle is `outcome_unknown`, with `500`. Admission limits use `429`, size limits `413`, blocked graphs or closed admission `503`, each refusal
 that asks for a retry with `Retry-After`. Admitted writes continue after disconnect.
 
 For TLS, secrets, storage credentials, container examples and Azure admission,
