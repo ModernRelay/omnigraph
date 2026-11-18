@@ -237,7 +237,7 @@ documents only before it) carry a pipeline `id` and `depends_on`, with
 `physical_plan` node ids; an operator's emission is set by the shape wrapper
 the engine builds its stream through, the one the planner's cut names, so the
 printed pipelines are the executed ones. Saved physical
-plans use a `bound_plan_version: 16` envelope whose `body` contains `plan` and
+plans use a `bound_plan_version: 17` envelope whose `body` contains `plan` and
 `values`. Unversioned plans and other versions are refused with a regeneration
 instruction, including plans without traversal nodes.
 

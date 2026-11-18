@@ -112,7 +112,7 @@ any scalar of the outer row or another block's value (`count { … } >=
 $p.quota`), by the [comparison rules](#boolean-expressions-and-nulls), and
 under `or` or `not` a block is a Boolean operand like any other. A block is
 also a value, `let $n = count { … }` or `count { … } as n` in `return`, one
-per outer row. Its argument is a scalar expression in the block's scope: numeric for
+per outer row; `collect($q.name) { … }` is the list of its values, `[]` with none. Its argument is a scalar expression in the block's scope: numeric for
 `sum` and `avg`; numeric, `String`, `Bool`, `Date` or `DateTime` for `min` and
 `max`, as in `return`. With no matches `count` is `0` and the others are null.
 
@@ -196,26 +196,27 @@ limit 20
 ```
 
 Return expressions include variables, properties, literals, [arithmetic](traversal.md#values-and-inline-reads), `if`, `coalesce`, `concat`, `now()`, `count`,
-`sum`, `avg`, `min`, `max`, and a [ranking](../search/index.md)'s score, named
+`sum`, `avg`, `min`, `max`, `collect`, and a [ranking](../search/index.md)'s score, named
 by its `from`'s `as` (`T85`). Each gives one column named by its alias or
 expression (`$p.name` gives `p.name`; a score drawn `as $s` gives `s`); duplicates are
 refused (`T25`).
 
-Integer `sum` accumulates exactly in 128 bits and rounds once to `F64`, integer
-`avg` divides that total once, and a float `sum` or `avg` uses `F64`. `min` and `max` accept numeric, `String`,
-`Bool`, `Date`, or `DateTime` columns and keep their type (false before true,
-dates chronologically). With no matches, an aggregate-only return gives one row
-(`count` 0, the rest null); a return that also projects a group value gives no rows.
+Integer `sum` accumulates exactly in 128 bits and rounds once to `F64`, integer `avg` divides that
+total once, and a float `sum` or `avg` uses `F64`. `min` and `max` accept numeric, `String`, `Bool`,
+`Date`, or `DateTime` columns and keep their type (false before true, dates chronologically).
+`collect(x)` is a group's non-null values as a `[T]` list in the value order (`-0.0` before `0.0`),
+`collect(distinct x)` without repeats, held in `query_memory_bytes` as it grows; a reference
+argument is `T86`. With no matches, an aggregate-only return gives one row (`count` 0, `collect`
+`[]`, the rest null); a return that also projects a group value gives no rows.
 
 A bare node returns one object with `@id` and every property except `Blob` and
 `Vector`: `$p` produces column `p`; project a property for one field. `count($p)`
 counts rows, `count(distinct $p)` distinct nodes (or edges) and `count(distinct $p.city)`
 distinct non-null values, so a node reached by several paths counts once.
-Other aggregates require a property (`T8`) and refuse `distinct` (`T57`).
+`sum`, `avg`, `min` and `max` require a property (`T8`) and refuse `distinct` (`T57`).
 
-A comparison or Boolean expression requires an alias (`T43`), such as
-`$p.age > 30 as adult`; its result is `Bool`, or `Bool?` with a nullable operand,
-and `is null` is always `Bool`. In an aggregated return an item over
+A comparison or Boolean expression requires an alias (`T43`), such as `$p.age > 30 as adult`;
+its result is `Bool`, or `Bool?` with a nullable operand, and `is null` is always `Bool`. In an aggregated return an item over
 aggregates, literals, `now()` and parameters is evaluated per group after
 aggregation: `count($p) > 0 as any` is `Bool?` because `count` is `I64?`. An
 item that reads no aggregate, a property or a Boolean such as
@@ -225,10 +226,9 @@ column no return item groups by is refused (`T9`).
 `return distinct { $p.name }` keeps one row per complete projected tuple.
 Repeated traversal matches and equal values on different entities collapse;
 nulls compare equal. Every projection is a key, including comparisons, and
-bare nodes deduplicate by identity. Deduplication follows `match` and precedes
-ordering and limiting, so the limit counts distinct rows. Aggregates with
-`distinct` are refused (`T56`). DISTINCT order keys must be projected values
-or aliases, including property keys (`T42`).
+bare nodes deduplicate by identity. Deduplication follows `match` and precedes ordering and
+limiting, so the limit counts distinct rows. Aggregates with `distinct` are refused (`T56`).
+DISTINCT order keys must be projected values or aliases, including property keys (`T42`).
 
 Order is total under the tie rule: after the written keys (ascending puts nulls
 first, descending last), each entity id in the order the pattern writes it (a

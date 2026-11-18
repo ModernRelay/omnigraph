@@ -249,7 +249,8 @@ A block is an operand of `where`: it matches its pattern once per outer row
 and keeps the row by a comparison on the aggregate of its matches:
 `not exists { ... }` (no match), `exists { ... }` (at least one),
 `count { ... } > 2`, and `sum($d.size) { ... } > 100` (also `min`, `max`,
-`avg`). A block holds elements and its own `where` inside its braces,
+`avg`). As a value, `collect($d.title) { ... } as titles` is each row's list
+of the block's values, `[]` when it has none. A block holds elements and its own `where` inside its braces,
 `count { $p: Pattern, $s formsPattern $p where $p.kind = "x" }`, and
 correlates on every element of the enclosing `match`; it must read at least
 one outer variable.
@@ -399,11 +400,14 @@ query friend_counts() {
 }
 ```
 
-Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggregated return fields.
+Supported: `count`, `sum`, `avg`, `min`, `max`, `collect`. Grouping is implicit on non-aggregated return fields.
 `count(distinct $f)` counts distinct nodes (distinct edges over an edge
 binding `$k`) and `count(distinct $f.city)`
-distinct non-null values; `distinct` under another aggregate is refused
-(`T57`). `return distinct { … }` keeps one row per distinct projected tuple
+distinct non-null values; `distinct` under another aggregate but `collect` is refused
+(`T57`). `collect($r.key) as keys` gathers each group's non-null values into a
+`[T]` list in the value order (`collect(distinct …)` drops repeats), `[]` over no
+rows; a node or edge argument is `T86` (collect a property), and a large list
+counts against `query_memory_bytes`. `return distinct { … }` keeps one row per distinct projected tuple
 before `order`/`limit` (with aggregates: `T56`). A comparison in `return`
 needs an alias (`T43`): `$p.age > 30 as adult`, or over aggregates
 `count($f) > 0 as any`. Beside aggregates, an item that reads no aggregate

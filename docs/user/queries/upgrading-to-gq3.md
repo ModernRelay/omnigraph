@@ -149,14 +149,14 @@ code. Scripts and agents that match codes need these changes.
 
 `T23` still refuses an edge binding over a multi-hop traversal, one reusing
 a name bound in `match`, and one named like its own endpoint. `T40` still
-refuses a `sum`, `avg`, `min` or `max` block without its argument.
+refuses a `sum`, `avg`, `min`, `max` or `collect` block without its argument.
 
 ## Other changes a reader sees
 
 - A read may not be named after a registry function or an element keyword
   (`T74`): `distance`, `nearest`, `bm25`, `rrf`, `union`, `contains`,
   `starts_with`, `match_terms`, `terms`, `now`, `if`, `coalesce`, `concat`,
-  `count`, `sum`, `avg`, `min`, `max`, `let`, `from`, `optional`, `exists`
+  `count`, `sum`, `avg`, `min`, `max`, `collect`, `let`, `from`, `optional`, `exists`
   and `not`. A write's name is not checked.
 - Over grouped rows (an aggregate or `return distinct`), every order key must
   be a `return` item or its alias (`T42`); before, a key such as `$p.@id` or
