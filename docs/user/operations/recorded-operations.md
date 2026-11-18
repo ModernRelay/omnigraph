@@ -89,6 +89,10 @@ returns the existing record without starting work again. A lookup answers
 the id. `unknown` does not prove the operation never ran, and it is never a
 reason to resubmit the same work under the same id.
 
+Earlier edge builds wrote `tables` and `more_tables`. If the cluster's
+operation record contains either field, submit, lookup and cancel return
+HTTP 409 with `operation_record_invalid` after upgrading.
+
 | Refusal | Status |
 |---|---|
 | The same id with a different request (message prefix `[operation_request_mismatch]`); an id at or before the record's eviction mark (`[operation_id_expired]`, mint a new one); an outstanding deployment; four unresolved publications; a record from another ledger at this root (`[operation_record_foreign]`); a cluster state file whose text is not valid cluster state (`[invalid_state_json]`) or an operation record whose text is not a valid record (`[operation_record_invalid]`; restore the object from a trusted copy, while bytes that are not text answer 500) | 409 `conflict` |
