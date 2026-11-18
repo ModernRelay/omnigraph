@@ -476,6 +476,7 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .unwrap();
@@ -536,6 +537,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .unwrap();
@@ -1250,6 +1252,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .unwrap();
@@ -3261,6 +3264,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                     column: "embedding".to_string(),
                 },
             ],
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .unwrap();
@@ -3435,6 +3439,7 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
             &[IndexBuildSpec::FullText {
                 column: "text".into(),
             }],
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .unwrap();
@@ -3659,7 +3664,7 @@ fn compaction_blob_batch_rows_bounds_one_batch() {
 /// plan of any other version instead of rewriting fragments it never chose.
 #[tokio::test]
 async fn table_compaction_planning_refuses_source_budgets() {
-    use crate::table_store::OptimizeStepLimit;
+    use crate::table_store::MaintenanceBudget;
     use lance::dataset::optimize::CompactionOptions;
 
     let dir = tempfile::tempdir().unwrap();
@@ -3676,7 +3681,7 @@ async fn table_compaction_planning_refuses_source_budgets() {
     assert_ne!(ds.manifest.version, planned_at);
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
     match store
-        .stage_compaction(&ds, stale, &OptimizeStepLimit::new(1))
+        .stage_compaction(&ds, stale, &MaintenanceBudget::new(1))
         .await
     {
         Err(OmniError::Manifest(manifest))
@@ -4027,6 +4032,118 @@ async fn segments_of_one_btree_cover_together_issue_1298() {
     );
 }
 
+/// #1385: a full-text or vector build waits until every BTREE build has
+/// released its permit, and a BTREE requested after it waits behind it
+/// instead of overtaking it.
+#[tokio::test]
+async fn index_build_limit_runs_a_lone_build_after_every_shared_one_issue_1385() {
+    use futures::FutureExt;
+    use lance_index::IndexType;
+
+    let limit = crate::table_store::MaintenanceBudget::new(2);
+    assert_eq!(limit.width(), 2);
+    assert_eq!(
+        crate::table_store::MaintenanceBudget::new(usize::MAX).width(),
+        tokio::sync::Semaphore::MAX_PERMITS.min(u32::MAX as usize),
+        "a width beyond the semaphore is clamped, so a lone build still takes every permit"
+    );
+    let first = limit.permit_for(IndexType::BTree).await.unwrap();
+    let second = limit.permit_for(IndexType::BTree).await.unwrap();
+
+    let mut alone = Box::pin(limit.permit_for(IndexType::Inverted));
+    assert!(
+        (&mut alone).now_or_never().is_none(),
+        "a lone build waits for both BTREEs"
+    );
+    let mut later = Box::pin(limit.permit_for(IndexType::BTree));
+    drop(first);
+    assert!(
+        (&mut alone).now_or_never().is_none(),
+        "one BTREE is still running"
+    );
+    assert!(
+        (&mut later).now_or_never().is_none(),
+        "a later BTREE does not overtake the waiting lone build"
+    );
+    drop(second);
+    let held = alone.await.unwrap();
+    assert!(
+        (&mut later).now_or_never().is_none(),
+        "no BTREE runs beside a lone build"
+    );
+    drop(held);
+    let _permit = later.await.unwrap();
+    assert!(
+        limit.permit_for(IndexType::Vector).now_or_never().is_none(),
+        "a vector build also runs alone"
+    );
+
+    // An optimize run's budget is its rewrite width (8 on the direct path):
+    // a BTREE takes a share of it, so still at most four build at once.
+    let wide = crate::table_store::MaintenanceBudget::new(8);
+    let mut held = Vec::new();
+    for _ in 0..crate::table_store::INDEX_BUILD_CONCURRENCY {
+        held.push(wide.permit_for(IndexType::BTree).await.unwrap());
+    }
+    assert!(
+        wide.permit_for(IndexType::BTree).now_or_never().is_none(),
+        "a fifth BTREE waits in a budget of eight"
+    );
+    drop(held);
+    assert!(
+        crate::table_store::MaintenanceBudget::new(1)
+            .permit_for(IndexType::BTree)
+            .now_or_never()
+            .is_some(),
+        "a budget of one, the served path's, still admits a BTREE"
+    );
+}
+
+/// #1385: the first specification fails. At most the initial window can
+/// enter Lance's builder before that error ends the batch.
+#[tokio::test]
+async fn stage_create_indices_stops_at_the_first_failed_build_issue_1385() {
+    use crate::instrumentation::{IndexBuildProbes, with_index_build_probes};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/stop.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("a", Some(1)), ("b", Some(2))]))
+        .await
+        .unwrap();
+    let mut specs = vec![IndexBuildSpec::BTree {
+        column: "no_such_column".to_string(),
+        name: None,
+    }];
+    specs.extend((0..4).map(|i| IndexBuildSpec::BTree {
+        column: "id".to_string(),
+        name: Some(format!("id_btree_{i}")),
+    }));
+
+    let limit = crate::table_store::MaintenanceBudget::new(2);
+    let probes = IndexBuildProbes::rendezvous(1);
+    let observed = probes.clone();
+    let Err(error) =
+        with_index_build_probes(probes, store.stage_create_indices(&ds, &specs, &limit)).await
+    else {
+        panic!("a build on a missing column fails the batch");
+    };
+    assert!(
+        error.to_string().contains("no_such_column"),
+        "the batch fails with the first build's error: {error}"
+    );
+    assert!(
+        observed.entered() <= 2,
+        "no build starts after the failed one; {} of 5 builds entered",
+        observed.entered()
+    );
+    assert_eq!(
+        ds.version().version,
+        Dataset::open(&uri).await.unwrap().version().version,
+        "a failed batch moves nothing"
+    );
+}
+
 /// #1384: a table's compaction tasks run at once, as Lance's own
 /// `compact_files` runs them, instead of one after another. Each task waits
 /// at a two-party rendezvous inside its execution, so tasks that never
@@ -4034,7 +4151,7 @@ async fn segments_of_one_btree_cover_together_issue_1298() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
     use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
-    use crate::table_store::OptimizeStepLimit;
+    use crate::table_store::MaintenanceBudget;
     use lance::dataset::optimize::CompactionOptions;
 
     let dir = tempfile::tempdir().unwrap();
@@ -4062,7 +4179,7 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
         std::time::Duration::from_secs(30),
         with_optimize_step_probes(
             probes.clone(),
-            store.stage_compaction(&ds, plan.clone(), &OptimizeStepLimit::new(2)),
+            store.stage_compaction(&ds, plan.clone(), &MaintenanceBudget::new(2)),
         ),
     )
     .await
@@ -4091,7 +4208,7 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
     let probes = OptimizeStepProbes::rendezvous(1);
     with_optimize_step_probes(
         probes.clone(),
-        store.stage_compaction(&ds, plan, &OptimizeStepLimit::new(1)),
+        store.stage_compaction(&ds, plan, &MaintenanceBudget::new(1)),
     )
     .await
     .unwrap()
@@ -4100,7 +4217,7 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
     assert_eq!(probes.peak_in_flight(), 1);
 }
 
-/// #1384: one `OptimizeStepLimit` bounds every heavy step taken through it,
+/// #1384: one `MaintenanceBudget` bounds every heavy step taken through it,
 /// not only compaction tasks. Two tables' compaction tasks (two each) and two
 /// other tables' index links (each the fold of a lagging index) run within
 /// one budget of two, and never more than two execute at once. Each step
@@ -4113,7 +4230,7 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
     use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
-    use crate::table_store::OptimizeStepLimit;
+    use crate::table_store::MaintenanceBudget;
     use lance::dataset::optimize::CompactionOptions;
     use lance::index::DatasetIndexExt;
     use lance_index::IndexType;
@@ -4167,7 +4284,7 @@ async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
     let second_plan = plans.pop().unwrap();
     let first_plan = plans.pop().unwrap();
 
-    let limit = OptimizeStepLimit::new(2);
+    let limit = MaintenanceBudget::new(2);
     let probes = OptimizeStepProbes::rendezvous(2);
     let (first, second, third, fourth) = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -4175,8 +4292,8 @@ async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
             tokio::join!(
                 store.stage_compaction(&first, first_plan, &limit),
                 store.stage_compaction(&second, second_plan, &limit),
-                limit.run(store.stage_index_fold(&third)),
-                limit.run(store.stage_index_fold(&fourth)),
+                store.stage_index_fold(&third, &limit),
+                store.stage_index_fold(&fourth, &limit),
             )
         }),
     )
@@ -4241,21 +4358,19 @@ async fn index_fold_skips_only_a_vector_column_that_cannot_train() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let store = TableStore::new(root, test_session());
-    // An embedding vector index (and, with `btree`, an id BTREE) over the
+    // An embedding vector index and an id BTREE over the
     // first fragment, then an appended fragment no index covers: each lags.
-    let lagging = |name: &'static str, btree: bool, appended_vectors: bool| {
+    let lagging = |name: &'static str, appended_vectors: bool| {
         let batch = &batch;
         async move {
             let uri = format!("{root}/{name}.lance");
             let mut ds = TableStore::write_dataset(&uri, batch(0, 8, true))
                 .await
                 .unwrap();
-            if btree {
-                ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
-                    .name("id_idx".to_string())
-                    .await
-                    .unwrap();
-            }
+            ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+                .name("id_idx".to_string())
+                .await
+                .unwrap();
             ds.create_index_builder(
                 &["embedding"],
                 IndexType::Vector,
@@ -4275,7 +4390,7 @@ async fn index_fold_skips_only_a_vector_column_that_cannot_train() {
 
     // The indexed rows are deleted and the appended ones hold no vector: the
     // vector index lags over a column with nothing to train on.
-    let (uri, mut untrainable) = lagging("untrainable", true, false).await;
+    let (uri, mut untrainable) = lagging("untrainable", false).await;
     let indexed = (0..8)
         .map(|row| format!("'v{row}'"))
         .collect::<Vec<_>>()
@@ -4286,8 +4401,9 @@ async fn index_fold_skips_only_a_vector_column_that_cannot_train() {
         .unwrap();
     let untrainable = Dataset::open(&uri).await.unwrap();
     assert_eq!(untrainable.count_rows(None).await.unwrap(), 4);
+    let budget = super::MaintenanceBudget::new(1);
     let reconciliation = store
-        .stage_index_reconciliation(&untrainable, &[])
+        .stage_index_reconciliation(&untrainable, &[], &budget)
         .await
         .unwrap();
     assert_eq!(reconciliation.skipped.len(), 1, "the vector column");
@@ -4304,10 +4420,9 @@ async fn index_fold_skips_only_a_vector_column_that_cannot_train() {
     );
     assert!(reconciliation.staged.is_some());
 
-    // A lagging vector index alone, over trainable vectors, with the
-    // appended fragment's data file gone: the rebuild fails on the read, and
-    // that is an error of the vector index's own rebuild.
-    let (uri, faulted) = lagging("faulted", false, true).await;
+    // The trainable vector comes first in index-name order. With a width
+    // of one, its missing fragment must stop the fold before the BTREE starts.
+    let (uri, faulted) = lagging("faulted", true).await;
     let appended = faulted
         .get_fragments()
         .into_iter()
@@ -4315,7 +4430,14 @@ async fn index_fold_skips_only_a_vector_column_that_cannot_train() {
         .unwrap();
     let data_file = appended.metadata().files[0].path.clone();
     std::fs::remove_file(format!("{uri}/data/{data_file}")).unwrap();
-    let error = match store.stage_index_reconciliation(&faulted, &[]).await {
+    let probes = crate::instrumentation::IndexBuildProbes::rendezvous(1);
+    let result = crate::instrumentation::with_index_build_probes(
+        probes.clone(),
+        store.stage_index_reconciliation(&faulted, &[], &budget),
+    )
+    .await;
+    assert_eq!(probes.entered(), 0, "the later BTREE build must not start");
+    let error = match result {
         Ok(reconciliation) => panic!(
             "a rebuild that could not read its rows was reported as skipped {:?}",
             reconciliation.skipped

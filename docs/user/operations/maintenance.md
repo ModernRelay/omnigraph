@@ -67,25 +67,24 @@ moved; none reports a conflict for it. Lance compacts neighbouring fragments onl
 same indexes cover them, so a table whose index coverage was uneven before a run
 may coalesce fully only on the next run, after the rebuilt coverage is in place.
 
-Compacting a table with Blob properties reads each managed Blob value into
-memory. Optimize sizes each compaction batch from its largest row, whatever
-`LANCE_DEFAULT_BATCH_SIZE` says, so one batch holds at most 32 MiB of managed
-Blob payload; a larger row is read whole, external references are not read,
-and the writer's own copies come on top. A Blob descriptor the decoder rejects
-refuses the compaction before that table is rewritten. Optimize plans up to
-`OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables ahead (default 8) and rewrites up to
-that many at once, with that many compaction tasks, index folds and builds in
-all (a Blob table's tasks one at a time): budget for that many Blob tables.
+Optimize sizes each Blob batch from the table task's largest row, overriding
+`LANCE_DEFAULT_BATCH_SIZE`. A batch holds up to 32 MiB of managed payload or one larger row, plus writer copies.
+External Blobs stay unread. An invalid descriptor stops the rewrite of its table.
+
+Direct optimize plans and rewrites up to `OMNIGRAPH_MAINTENANCE_CONCURRENCY`
+tables at once (default 8). The run shares that many slots. Each compaction task
+uses one slot, with one task at a time per Blob table. Each BTREE build uses a
+quarter of the slots rounded up (four builds at width 8, two at width 5).
+Full-text and vector builds use all slots. Served optimize uses one slot.
 
 ### Bounding a run
 
-With `--max-gate-hold 30s`, the first table runs even if the deadline has
-passed. After the deadline, remaining tables are deferred and completed work
-publishes. Writers to `main` wait at most the bound plus one rewrite.
-Direct runs visit tables in type-key order. Copy the printed argument (e.g.
-`--start-at node:Person`) to resume at the first deferred table and wrap around.
-JSON exposes the same key in `resume_at`. A [server](recorded-operations.md)
-remembers its position. Use `--datasets` to visit only the listed tables, in order.
+With `--max-gate-hold 30s`, the first table always runs. After the deadline, writers
+wait for tables already started, graph publication and configuration clear.
+Remaining tables are deferred. Direct runs visit tables in type-key order. Copy
+the printed `--start-at` argument to resume there and wrap around. JSON returns
+that key in `resume_at`. A [server](recorded-operations.md) remembers its position.
+Use `--datasets` to visit only the listed tables, in order.
 
 Check each table's `outcome` even on exit 0. It can be `optimized`, `unchanged`,
 `deferred` or `failed`. A failed table includes its `error`. Other tables still publish.
@@ -126,6 +125,7 @@ omnigraph index build --target ./cluster-root --graph knowledge \
   --branch review --json
 ```
 
+Up to four BTREEs build together across tables. A full-text or vector build runs alone.
 On any branch, `index build` builds every declared index a table lacks, such as
 those of a type whose first rows were loaded there, and rebuilds whole each
 BTREE or vector index that leaves rows uncovered. Every table publishes in one
