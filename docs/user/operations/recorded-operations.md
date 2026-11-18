@@ -41,12 +41,15 @@ the run does not compact it, rebuild its lagging indexes or rewrite its dropped
 properties, and goes on to the next table. This does not move the resume
 position (`resume_at`), so every later run defers that table again until a
 ceiling is raised or a direct run optimizes it. After a direct run, the next
-write that adds rows leaves rows that the index on the table's id does not
-cover, so the table has index work again. A table with more live rows than
-`_MAX_INDEX_ROWS` is therefore deferred again after any such write, and while
-it gets writes only a direct run optimizes it. The run byte budget defers,
-with reason `byte_budget`, the first table that would take the run past it and
-every table after it, and the run resumes there.
+write that inserts rows puts them in a fragment that the index on the table's
+id does not cover, so the table has index work again. An update can do the
+same, because it can move the updated rows to a new fragment: a `load --mode
+merge` of existing keys always does. A table with more live rows than
+`_MAX_INDEX_ROWS` is therefore deferred again after any such write, even one
+that adds no rows, and while it gets writes only a direct run optimizes it.
+The run byte budget defers, with reason `byte_budget`, the first table that
+would take the run past it and every table after it, and the run resumes
+there.
 
 The budget is also the table byte ceiling when
 `OMNIGRAPH_OPTIMIZE_MAX_SOURCE_BYTES` is unset. A table whose compaction reads

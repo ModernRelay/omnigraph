@@ -710,58 +710,61 @@ async fn optimize_rewrite_keeps_index_coverage_so_index_rows_count_only_a_laggin
         "every index still covers every fragment: {settled:?}"
     );
 
-    // A write that adds rows leaves them outside the id index, so the table
-    // has index work again and the ceiling counts its live rows on every run
-    // until a run without it folds the index, as
+    // A write that inserts rows, or rewrites a row (a merge of an existing
+    // key moves it to a new fragment), leaves a fragment outside the id
+    // index, so the table has index work again and the ceiling counts its
+    // live rows on every run until a run without it folds the index, as
     // docs/user/operations/recorded-operations.md (Table ceilings and the
-    // byte budget) says.
-    db.load_jsonl(
-        &serde_json::json!({
-            "type": "Doc",
-            "data": {"slug": "d4", "n": 4, "embedding": [4.0, 0.0, 0.0, 0.0]},
-        })
-        .to_string(),
-        LoadMode::Merge,
-    )
-    .await
-    .unwrap();
-    let pin = doc_pin(&db).await;
-    for _ in 0..2 {
-        let report = db
-            .optimize_as(
-                None,
-                OptimizeRequest::default().with_limits(
-                    OptimizeLimits::default()
-                        .with_table_ceilings(TableCeilings::default().with_index_rows(1)),
-                ),
-            )
-            .await
-            .unwrap();
-        let doc = report
-            .tables
-            .iter()
-            .find(|stat| stat.type_key == "node:Doc")
-            .unwrap();
-        let TableOptimizeOutcome::Deferred(DeferReason::ResourceLimit(exceeded)) = doc.outcome
-        else {
-            panic!("a write that adds rows is index work again: {doc:?}");
-        };
-        assert_eq!(exceeded.measure, ResourceMeasure::IndexRows);
-        assert_eq!(exceeded.measured, Some(5), "the table's live rows");
-        assert_eq!(report.resume_at, None);
-        assert_eq!(doc_pin(&db).await, pin, "a deferred table writes nothing");
-    }
-    let report = db
-        .optimize_as(None, OptimizeRequest::default())
+    // byte budget) says. Both writes leave 5 live rows.
+    for (write, slug, n) in [("insert", "d4", 4), ("upsert", "d1", 10)] {
+        db.load_jsonl(
+            &serde_json::json!({
+                "type": "Doc",
+                "data": {"slug": slug, "n": n, "embedding": [n as f32, 0.0, 0.0, 0.0]},
+            })
+            .to_string(),
+            LoadMode::Merge,
+        )
         .await
         .unwrap();
-    assert!(
-        report
-            .tables
-            .iter()
-            .any(|stat| stat.type_key == "node:Doc" && stat.committed()),
-        "a run without the ceiling optimizes it: {report:?}"
-    );
+        let pin = doc_pin(&db).await;
+        for _ in 0..2 {
+            let report = db
+                .optimize_as(
+                    None,
+                    OptimizeRequest::default().with_limits(
+                        OptimizeLimits::default()
+                            .with_table_ceilings(TableCeilings::default().with_index_rows(1)),
+                    ),
+                )
+                .await
+                .unwrap();
+            let doc = report
+                .tables
+                .iter()
+                .find(|stat| stat.type_key == "node:Doc")
+                .unwrap();
+            let TableOptimizeOutcome::Deferred(DeferReason::ResourceLimit(exceeded)) = doc.outcome
+            else {
+                panic!("an {write} is index work again: {doc:?}");
+            };
+            assert_eq!(exceeded.measure, ResourceMeasure::IndexRows);
+            assert_eq!(exceeded.measured, Some(5), "the table's live rows");
+            assert_eq!(report.resume_at, None);
+            assert_eq!(doc_pin(&db).await, pin, "a deferred table writes nothing");
+        }
+        let report = db
+            .optimize_as(None, OptimizeRequest::default())
+            .await
+            .unwrap();
+        assert!(
+            report
+                .tables
+                .iter()
+                .any(|stat| stat.type_key == "node:Doc" && stat.committed()),
+            "a run without the ceiling optimizes it after the {write}: {report:?}"
+        );
+    }
 }
 
 /// The run budget stops the run at the first table that would pass it:
