@@ -5,8 +5,8 @@
 //! lists them with the sentence each rests on):
 //!
 //! - `T7`, a comparison with `null`: null on every row;
-//! - `T3`, a literal outside its property's domain: the RFC's reason is that
-//!   the comparison returns no rows (section 5);
+//! - `T3`, a literal outside its property's domain, under `=` and `in`: the
+//!   comparison returns no rows (section 5);
 //! - `T82`, a reversed triple, or a selection none of whose members points
 //!   along the written order: the written order is the direction, so no
 //!   edge matches;
@@ -25,12 +25,12 @@
 //! `mode: all` such a query would hold on every document, vacuously, so it
 //! is not one of these.
 //!
-//! A counterexample is a wrongful refusal. The `T3` refusal of a literal
-//! outside its property's domain under `!=`, `<`, `<=`, `>` or `>=` is one
-//! (the comparison keeps rows), and the RFC's rule refuses it wherever the
-//! literal is compared, so it is pinned below as a hunt and reported rather
-//! than narrowed; this law checks `T3` under `=` and `in`, the operators its
-//! stated reason covers.
+//! A counterexample is a wrongful refusal. `T3`'s reason is misspelling, not
+//! emptiness: a literal no row can hold is refused wherever it is compared,
+//! and under `!=`, `<` or `>` it would keep rows (section 5's literal-checking
+//! bullet), so the law checks the emptiness claim for `=` and `in` only. The
+//! refusal under every other operator is pinned by the
+//! `t3_literal_checked_against_its_property.gqt` case.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -451,33 +451,4 @@ fn an_admitted_selection_returns_rows_on_some_generated_graph() {
         .run(&read)
         .unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
-}
-
-/// `T3` refuses a literal outside its property's domain under every
-/// comparison, as the RFC's rule states ("wherever it is written"), but its
-/// stated reason, that the comparison returns no rows, holds only for `=`
-/// and `in`: `$x.e != "purple"` keeps every row with a value. Narrowing the
-/// rule would contradict the RFC's text, so the counterexample is pinned
-/// and reported.
-#[test]
-#[ignore = "hunt: T3 refuses a literal outside its property's domain under != and the order comparisons, which keep rows"]
-fn literal_outside_the_domain_under_other_comparisons_keeps_rows() {
-    let schema = "node A {\n    k: String @key\n    e: enum(red, green, blue)\n    n: I32\n}\n";
-    let catalog = build_catalog(&parse_schema(schema).unwrap()).unwrap();
-    let seed = "{\"type\":\"A\",\"data\":{\"k\":\"a\",\"e\":\"red\",\"n\":1}}\n";
-    let graph = omnigraph_reference::Graph::from_export(&catalog, seed).unwrap();
-    for cmp in [
-        "$x.e != \"purple\"",
-        "$x.n < 9999999999",
-        "$x.n != 9999999999",
-    ] {
-        let probe = Probe {
-            claim: Claim::LiteralOutsideDomain,
-            shape: "outside the domain under another comparison",
-            source: format!("query q() {{ match {{ $x: A }} where {cmp} return {{ $x.k }} }}"),
-            expect: Expect::NoRows,
-        };
-        let rows = evaluate(&catalog, &graph, &probe).unwrap().unwrap();
-        assert!(rows.is_empty(), "{cmp} keeps {rows:?}");
-    }
 }

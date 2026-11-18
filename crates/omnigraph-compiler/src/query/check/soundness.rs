@@ -20,8 +20,9 @@
 pub enum Claim {
     /// `T7`: "a comparison with `null` is null on every row".
     NullComparison,
-    /// `T3`: a literal outside its property's domain; the RFC's reason is
-    /// that "without this rule a misspelled enum value returns no rows".
+    /// `T3`: a literal outside its property's domain. The RFC's reason is
+    /// misspelling, refused under every operator; the claim this law checks,
+    /// that the comparison returns no rows, holds under `=` and `in` only.
     LiteralOutsideDomain,
     /// `T82`: a triple written against its edge's declared direction, or a
     /// selection none of whose members points along the written order; the

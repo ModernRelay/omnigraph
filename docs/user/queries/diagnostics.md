@@ -102,8 +102,8 @@ checked against the property's type wherever it is written: a `where`, a
 block's or an `optional`'s `where`, a write group's `where` and a `let`, in
 either operand order. An enum value outside the declared set, a number against
 a property that is not numeric, an integer outside an integer property's range
-and a `date(…)` or `datetime(…)` that does not parse are `T3`, so a misspelled
-enum value is refused instead of matching no rows. A float against an integer
+and a `date(…)` or `datetime(…)` that does not parse are `T3`: a misspelling,
+refused under every operator, `!=` and `<` included. A float against an integer
 or `F32` property is admitted: it compares through a cast and keeps its
 fraction. `contains(…)` and `starts_with(…)` over an enum property refuse a
 literal that no declared value passes. A parameter is not checked.
