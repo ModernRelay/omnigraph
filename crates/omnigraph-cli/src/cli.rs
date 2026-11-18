@@ -63,8 +63,9 @@ pub(crate) struct Cli {
     /// On a served write, and on every request `mcp` relays, it is an assertion:
     /// the request carries `omnigraph-if-actor`, and the server refuses it
     /// before anything runs when the bearer token resolves to another actor.
-    /// With a policy configured but no actor set, a direct operation is
-    /// denied — see docs/user/operations/policy.md.
+    /// A direct write to a cluster graph is judged by the policy the cluster
+    /// applied to that graph, and with one but no actor set it is denied —
+    /// see docs/user/operations/policy.md.
     #[arg(long = "as", global = true, value_name = "ACTOR", value_parser = crate::invocation::single_selector("--as"))]
     pub(crate) as_actor: Option<String>,
 

@@ -162,7 +162,7 @@ async fn open_case_store(
         .map_err(|e| format!("init failed: {e}"))?;
     let db = with_case_external_blob_policy(db, case)?;
     let session = case_session(db, case, engine)?;
-    seed_case(&session, &fixture.seed, case.needs_indices).await?;
+    seed_case(&session, fixture, case.needs_indices).await?;
     Ok((session, uri, dir))
 }
 
@@ -276,7 +276,7 @@ async fn execute_case_with_storage(
     let db = with_case_external_blob_policy(db, case)?;
     let session = case_session(db, case, engine)?;
     if let (None, Some(fixture)) = (prepared, case.fixture.as_ref()) {
-        seed_case(&session, &fixture.seed, case.needs_indices).await?;
+        seed_case(&session, fixture, case.needs_indices).await?;
     }
     omnigraph_gqt_core::execute_steps(case, path, false, session, uri, Some(storage), &PLAIN_HOST)
         .await

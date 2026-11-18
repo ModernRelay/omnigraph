@@ -472,7 +472,18 @@ server API (Execution routes, below) is refused: the pin is a task-local seam of
 A file starts with required `--- runner` (Explicit execution environments),
 optionally followed by `--- schema` and then `--- seed`, then zero or more
 steps. Schema and seed must both be present or both absent; neither may occur
-after a step. Without them, execution requires an existing store supplied
+after a step. A `--- branches generate: v1 seed: <u64> count: <n> prefix:
+<name> [from: <branch>]` section may follow the seed, once: it declares
+`count` branches named `<prefix>0` to `<prefix><count-1>`, forked from
+`from` (default `main`) after the seed loads and each appended with the
+section's table recipe, `${branch}` in it bound to the branch's name, an
+empty body forking bare branches. Declared branches are fixture, not steps:
+built before step 1 on every route, with no ordinal, label, expectation,
+report row or measure row, so a case that needs N branches before the step
+it measures declares them rather than looping `branch create`. The grammar
+and limits are the [generated fixture
+contract](../../crates/omnigraph-gqt/README.md#generated-fixtures-and-loads).
+Without schema and seed, execution requires an existing store supplied
 through `omnigraph-gqt --store <URI>`. With them, `--store` is refused.
 Dataset-only and restart-only files are admitted. The corpus supplies no
 store and refuses files without schema and seed. External stores require
@@ -720,7 +731,8 @@ outside a params or expect body (a query, mutate or cli body, a seed row, a
 header line), loop or no loop, is refused, and inside a params or expect
 body every `${...}` must name the enclosing loop's variable (no enclosing
 loop, or any other name, is refused); no escape syntax exists for a
-literal `${`.
+literal `${`. The one fixture exception is `${branch}` in a `--- branches`
+recipe, bound to each declared branch's name (the file structure above).
 
 Commit bindings (RFC "Unpublished graph commits") are the one exception
 to the statement-body fence. `--- bind commit $name`, an empty section

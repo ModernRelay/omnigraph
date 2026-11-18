@@ -493,9 +493,9 @@ pub struct Omnigraph {
     /// (MR-725), which extends the same trait with a different method.
     /// Don't be tempted to add per-row enforcement here.
     ///
-    /// Set via `with_policy(checker)` after construction. Today only
-    /// `apply_schema_as` consults this field (PR #2 proof-of-concept);
-    /// PR #3 fans the `enforce()` call out to the remaining writers.
+    /// Set via `with_policy(checker)` after construction: the server,
+    /// cluster deployment and the CLI's writable opener of a cluster graph
+    /// install the policy the applied revision binds to the graph.
     policy: Option<Arc<dyn omnigraph_policy::PolicyChecker>>,
     /// Lazily-built, reused-across-queries embedding client. Built on the first
     /// `nearest($v, "string")` that needs server-side embedding (so a graph that
@@ -1183,11 +1183,10 @@ impl Omnigraph {
     /// Engine-layer policy enforcement gate (MR-722 chassis core).
     ///
     /// * If no policy is installed → no-op (returns `Ok(())`).
-    /// * If policy is installed AND actor is None → denial with a
-    ///   clear "no actor for engine-layer policy check" message.
-    ///   Forces server / CLI / SDK callers to thread an actor through
-    ///   when policy is configured — silent bypass via "I forgot the
-    ///   actor" is exactly the footgun this gate is here to prevent.
+    /// * If policy is installed AND actor is None → denial naming the
+    ///   action. A direct CLI write on a cluster graph with a policy and
+    ///   no `--as` reaches this, as does any embedder that names no
+    ///   actor: no actor is never a bypass.
     /// * If policy is installed AND actor is Some → call
     ///   `PolicyChecker::check(action, scope, actor)`; map denial /
     ///   internal failure to `OmniError::Policy(...)`.
@@ -1209,12 +1208,10 @@ impl Omnigraph {
             return Ok(());
         };
         let Some(actor) = actor else {
-            return Err(OmniError::Policy(
-                "no actor for engine-layer policy check (policy is configured but the call site \
-                 didn't thread an actor through — this is almost certainly a bug, not an \
-                 intended bypass)"
-                    .to_string(),
-            ));
+            return Err(OmniError::Policy(format!(
+                "policy denied action '{action}': a policy is installed and the request names \
+                 no actor"
+            )));
         };
         checker
             .check(action, scope, actor)
@@ -2468,10 +2465,13 @@ impl Omnigraph {
     /// The re-read goes through this handle's control session, so it observes
     /// the destination the handle is bound to rather than one the ambient
     /// provider configuration selects.
+    ///
+    /// Returns the snapshot with the branch's effective graph head at that
+    /// same `__manifest` version (an unpublished fork's inherited head).
     pub(crate) async fn fresh_snapshot_for_branch_unchecked(
         &self,
         branch: Option<&str>,
-    ) -> Result<Snapshot> {
+    ) -> Result<(Snapshot, String)> {
         let session = self.control_session();
         let manifest = match branch {
             Some(branch) => {
@@ -2487,7 +2487,8 @@ impl Omnigraph {
                     .await?
             }
         };
-        Ok(Snapshot::wrap(manifest.snapshot()))
+        let head = manifest.head().graph_commit_id.clone();
+        Ok((Snapshot::wrap(manifest.snapshot()), head))
     }
 
     #[cfg(test)]

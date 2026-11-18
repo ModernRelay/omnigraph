@@ -111,7 +111,13 @@ pub(crate) struct AliasArgs {
     pub(crate) name: String,
     #[command(flatten)]
     pub(crate) params: ParamsArgs,
-    #[arg(long, conflicts_with = "json")]
+    // An alias invokes a stored query on a server, which answers JSON, so
+    // `arrow` is not offered.
+    #[arg(
+        long,
+        conflicts_with = "json",
+        value_parser = crate::read_format::rendered_format_parser()
+    )]
     pub(crate) format: Option<ReadOutputFormat>,
     #[arg(long, conflicts_with = "format")]
     pub(crate) json: bool,

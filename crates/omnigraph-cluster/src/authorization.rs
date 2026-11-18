@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use omnigraph_policy::{PolicyAction, PolicyEngine, PolicyRequest};
 
+use crate::policy_binding::{PolicyBindings, Scope};
+
 use super::*;
 
 const MAX_AUTHORIZATION_RESOURCES: usize = 4096;
@@ -226,78 +228,71 @@ impl AppliedPolicies {
                 "applied resource count exceeds the authorization bound",
             ));
         }
+        let bindings = PolicyBindings::of(&state.applied_revision.resources)?;
         let mut cluster = None;
         let mut graphs = BTreeMap::new();
         let mut digests = BTreeMap::new();
         let mut total_bytes = 0usize;
-        for (address, entry) in &state.applied_revision.resources {
-            let kind = resource_kind(address);
-            if !matches!(kind, ResourceKind::Policy(_)) {
-                continue;
-            }
-            let bindings = entry.applies_to.as_ref().ok_or_else(|| {
-                refusal(
-                    "applied_policy_invalid",
-                    address,
-                    "applied policy has no scope bindings",
-                )
-            })?;
-            let source = backend
-                .read_verified_payload_bounded(
-                    &kind,
-                    &entry.digest,
-                    address,
-                    MAX_POLICY_BYTES.min(MAX_POLICY_TOTAL_BYTES.saturating_sub(total_bytes)),
-                )
-                .await?;
+        for (address, scopes) in bindings.bundles() {
+            let entry = &state.applied_revision.resources[address];
+            let source = read_policy_payload(
+                backend,
+                address,
+                entry,
+                MAX_POLICY_BYTES.min(MAX_POLICY_TOTAL_BYTES.saturating_sub(total_bytes)),
+            )
+            .await?;
             total_bytes = total_bytes.saturating_add(source.len());
-            if source.len() > MAX_POLICY_BYTES || total_bytes > MAX_POLICY_TOTAL_BYTES {
-                return Err(refusal(
-                    "policy_bounds_exceeded",
-                    address,
-                    "applied policy bytes exceed the authorization bound",
-                ));
+            if total_bytes > MAX_POLICY_TOTAL_BYTES {
+                return Err(policy_bytes_exceeded(address));
             }
-            for binding in bindings {
-                if binding == "cluster" {
-                    let engine =
-                        PolicyEngine::load_cluster_from_source(&source).map_err(|err| {
-                            refusal("applied_policy_invalid", address, err.to_string())
-                        })?;
-                    if cluster.replace(engine).is_some() {
-                        return Err(refusal(
-                            "applied_policy_invalid",
-                            address,
-                            "more than one policy binds cluster configuration",
-                        ));
+            for scope in scopes {
+                match scope {
+                    Scope::Cluster => {
+                        cluster = Some(PolicyEngine::load_cluster_from_source(&source).map_err(
+                            |err| refusal("applied_policy_invalid", address, err.to_string()),
+                        )?);
                     }
-                } else if let Some(graph) = binding.strip_prefix("graph.") {
-                    let engine =
-                        PolicyEngine::load_graph_from_source(&source, graph).map_err(|err| {
-                            refusal("applied_policy_invalid", address, err.to_string())
-                        })?;
-                    if graphs.insert(graph.to_string(), Arc::new(engine)).is_some() {
-                        return Err(refusal(
-                            "applied_policy_invalid",
-                            address,
-                            "more than one policy binds the graph",
-                        ));
+                    Scope::Graph(graph) => {
+                        graphs.insert(
+                            graph.to_string(),
+                            Arc::new(compile_graph(address, &source, graph)?),
+                        );
                     }
-                } else {
-                    return Err(refusal(
-                        "applied_policy_invalid",
-                        address,
-                        "unrecognized applied policy binding",
-                    ));
                 }
             }
-            digests.insert(address.clone(), entry.digest.clone());
+            digests.insert(address.to_string(), entry.digest.clone());
         }
         Ok(Self {
             cluster,
             graphs,
             digests,
         })
+    }
+
+    /// The policy bound to `graph` alone, by the bindings every reader uses
+    /// ([`PolicyBindings`]). Only that bundle's payload is read, so a damaged
+    /// payload the graph does not use cannot block it, while its own bundle
+    /// refuses when it is absent, oversized or invalid.
+    pub(crate) async fn load_graph(
+        backend: &ClusterStore,
+        state: &ClusterState,
+        graph: &str,
+    ) -> Result<Option<Arc<PolicyEngine>>, Diagnostic> {
+        if state.applied_revision.resources.len() > MAX_AUTHORIZATION_RESOURCES {
+            return Err(refusal(
+                "policy_bounds_exceeded",
+                CLUSTER_STATE_FILE,
+                "applied resource count exceeds the authorization bound",
+            ));
+        }
+        let bindings = PolicyBindings::of(&state.applied_revision.resources)?;
+        let Some(address) = bindings.graph(graph) else {
+            return Ok(None);
+        };
+        let entry = &state.applied_revision.resources[address];
+        let source = read_policy_payload(backend, address, entry, MAX_POLICY_BYTES).await?;
+        Ok(Some(Arc::new(compile_graph(address, &source, graph)?)))
     }
 
     pub(crate) fn check_cluster(&self, actor: &str) -> Result<(), Diagnostic> {
@@ -809,6 +804,36 @@ pub(crate) fn valid_digest(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
+/// One bound bundle's verified payload, at most `limit` bytes and never more
+/// than one bundle may hold.
+async fn read_policy_payload(
+    backend: &ClusterStore,
+    address: &str,
+    entry: &StateResource,
+    limit: usize,
+) -> Result<String, Diagnostic> {
+    let source = backend
+        .read_verified_payload_bounded(&resource_kind(address), &entry.digest, address, limit)
+        .await?;
+    if source.len() > MAX_POLICY_BYTES {
+        return Err(policy_bytes_exceeded(address));
+    }
+    Ok(source)
+}
+
+fn policy_bytes_exceeded(address: &str) -> Diagnostic {
+    refusal(
+        "policy_bounds_exceeded",
+        address,
+        "applied policy bytes exceed the authorization bound",
+    )
+}
+
+fn compile_graph(address: &str, source: &str, graph: &str) -> Result<PolicyEngine, Diagnostic> {
+    PolicyEngine::load_graph_from_source(source, graph)
+        .map_err(|err| refusal("applied_policy_invalid", address, err.to_string()))
+}
+
 fn refusal(code: &str, path: impl Into<String>, message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(code, path, message)
 }

@@ -41,6 +41,8 @@ pub(crate) struct ServedOptimize {
 enum Refusal {
     /// The id names another request.
     DifferentRequest,
+    /// The credential resolves to another actor than `--as` asserts.
+    ActorMismatch,
     /// Another operation holds the scope's active slot.
     AnotherActive,
     /// Refused before acceptance: nothing ran.
@@ -60,6 +62,9 @@ fn classify(error: &color_eyre::Report) -> Refusal {
             .starts_with("[operation_request_mismatch]") =>
         {
             Refusal::DifferentRequest
+        }
+        412 if remote.output.code == Some(omnigraph_api_types::ErrorCode::ActorMismatch) => {
+            Refusal::ActorMismatch
         }
         429 => Refusal::AnotherActive,
         // A server error that says it took no effect (routes off, admission
@@ -182,6 +187,10 @@ pub(crate) async fn run(
                     Refusal::DifferentRequest => {
                         writeln!(stderr, "error: {error}")?;
                         return Ok(Completion::exit(DIFFERENT_REQUEST));
+                    }
+                    Refusal::ActorMismatch => {
+                        writeln!(stderr, "error: {error}")?;
+                        return Ok(Completion::exit(crate::EXIT_PRECONDITION_FAILED));
                     }
                     Refusal::AnotherActive => {
                         writeln!(stderr, "error: {error}")?;
@@ -383,6 +392,18 @@ mod tests {
         );
         assert_eq!(
             classify(&remote(409, "conflict", "deployment d is outstanding")),
+            Refusal::BeforeAcceptance
+        );
+        assert_eq!(
+            classify(&remote(
+                412,
+                "actor_mismatch",
+                "the credential is another actor"
+            )),
+            Refusal::ActorMismatch
+        );
+        assert_eq!(
+            classify(&remote(412, "precondition_failed", "graph moved")),
             Refusal::BeforeAcceptance
         );
         assert_eq!(

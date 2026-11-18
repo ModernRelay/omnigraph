@@ -1324,12 +1324,6 @@ fn optimize_timeout_bounds_a_stalled_submission() {
 }
 
 #[test]
-fn optimize_with_as_flag_errors() {
-    let output = output_failure(cli().args(["optimize", "--as", "act-op"]));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("optimize does not accept --as"));
-}
-
-#[test]
 fn retired_address_flags_refuse_before_resolving_a_target() {
     for flag in ["--store", "--server", "--cluster", "--profile", "--uri"] {
         let output =
@@ -2503,6 +2497,192 @@ fn read_resolves_uri_from_default_store_scope() {
     assert_eq!(payload["row_count"], 1);
 }
 
+/// `--format arrow` writes the query's result as one Arrow IPC stream when
+/// stdout is a pipe or a file, with each column's declared type and nulls
+/// kept, and refuses a terminal before any work, writing nothing to it. A
+/// statement has no result batches and refuses too. All of these used to
+/// refuse alike.
+#[test]
+fn query_format_arrow_writes_a_query_s_batches_unless_stdout_is_a_terminal_issue_1428() {
+    const PEOPLE: &str =
+        "query people() { match { $p: Person } return { $p.name, $p.age } order { $p.name asc } }";
+    let graph = SystemGraph::loaded();
+    output_success(
+        cli()
+            .args(["mutate", "--target"])
+            .arg(graph.path())
+            .args(["-e", "query add() { insert Person { name: \"Eve\" } }"]),
+    );
+    let arrow_query = |source: &str| {
+        let mut command = cli_process();
+        command
+            .args(["query", "--target"])
+            .arg(graph.path())
+            .args(["-e", source, "--format", "arrow"])
+            .stdin(std::process::Stdio::null());
+        command
+    };
+
+    // A pipe.
+    let piped = arrow_query(PEOPLE).output().unwrap();
+    assert!(
+        piped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&piped.stderr)
+    );
+    assert_people_stream(&piped.stdout);
+
+    // A file.
+    let path = graph.path().with_extension("arrow");
+    let file = arrow_query(PEOPLE)
+        .stdout(fs::File::create(&path).unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        file.status.success(),
+        "{}",
+        String::from_utf8_lossy(&file.stderr)
+    );
+    assert_people_stream(&fs::read(&path).unwrap());
+
+    // A terminal.
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        let (mut terminal, stdout) = open_terminal();
+        let refused = arrow_query(PEOPLE).stdout(stdout).output().unwrap();
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains(
+                "`--format arrow` writes a binary Arrow IPC stream, and stdout is a terminal; \
+                 redirect stdout to a file or a pipe, for example `> result.arrow`\n\
+                 disposition: {\"effects\":\"none\",\"action\":\"fix\"}\n"
+            ),
+            "{stderr}"
+        );
+        // Every descriptor of the terminal's other end is closed now, so a
+        // read returns what the command wrote to it, then ends.
+        let mut written = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match terminal.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => written.extend_from_slice(&buffer[..count]),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(libc::EIO) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("read the terminal: {error}"),
+            }
+        }
+        assert!(written.is_empty(), "wrote to the terminal: {written:?}");
+    }
+
+    // A statement's answer is rendered JSON with no batches.
+    let statement = arrow_query("branch list").output().unwrap();
+    let stderr = String::from_utf8_lossy(&statement.stderr);
+    assert_eq!(statement.status.code(), Some(1), "{stderr}");
+    assert!(statement.stdout.is_empty());
+    assert!(
+        stderr.contains(
+            "`--format arrow` writes a query's result batches, and `branch list` has none; \
+             use `--format json` or `--format jsonl`\n\
+             disposition: {\"effects\":\"none\",\"action\":\"fix\"}\n"
+        ),
+        "{stderr}"
+    );
+}
+
+/// The `people` result read back from an Arrow IPC stream: complete, with
+/// the declared column types and Eve's absent age a null.
+fn assert_people_stream(stream: &[u8]) {
+    use arrow_array::{Array, Int32Array, StringArray};
+    use arrow_schema::DataType;
+
+    assert!(
+        stream.ends_with(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]),
+        "the stream ends with its end-of-stream marker"
+    );
+    let reader =
+        arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(stream), None).unwrap();
+    let columns = reader
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            (
+                field.name().clone(),
+                field.data_type().clone(),
+                field.is_nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        columns,
+        [
+            ("p.name".to_owned(), DataType::Utf8, false),
+            ("p.age".to_owned(), DataType::Int32, true),
+        ]
+    );
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let names = batch.column(0).as_any().downcast_ref::<StringArray>();
+        let ages = batch.column(1).as_any().downcast_ref::<Int32Array>();
+        let (names, ages) = (names.unwrap(), ages.unwrap());
+        for row in 0..batch.num_rows() {
+            rows.push((
+                names.value(row).to_owned(),
+                ages.is_valid(row).then(|| ages.value(row)),
+            ));
+        }
+    }
+    assert_eq!(
+        rows,
+        [
+            ("Alice".to_owned(), Some(30)),
+            ("Bob".to_owned(), Some(25)),
+            ("Charlie".to_owned(), Some(35)),
+            ("Diana".to_owned(), Some(28)),
+            ("Eve".to_owned(), None),
+        ]
+    );
+}
+
+/// A pseudo-terminal: its reading end, nonblocking, and the terminal a
+/// child takes as stdout.
+#[cfg(unix)]
+fn open_terminal() -> (fs::File, fs::File) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // SAFETY: each call takes a descriptor this function owns, and
+    // `ptsname`'s buffer is copied before any other call can reuse it.
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(master >= 0, "{}", std::io::Error::last_os_error());
+        let master = fs::File::from_raw_fd(master);
+        let fd = master.as_raw_fd();
+        assert_eq!(libc::grantpt(fd), 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(libc::unlockpt(fd), 0, "{}", std::io::Error::last_os_error());
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+        let name = libc::ptsname(fd);
+        assert!(!name.is_null(), "{}", std::io::Error::last_os_error());
+        let name = std::ffi::CStr::from_ptr(name).to_str().unwrap().to_owned();
+        let terminal = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(name)
+            .unwrap();
+        (master, terminal)
+    }
+}
+
 #[test]
 fn read_csv_format_outputs_header_and_row_values() {
     let temp = tempdir().unwrap();
@@ -2527,6 +2707,99 @@ fn read_csv_format_outputs_header_and_row_values() {
 
     assert!(stdout.lines().next().unwrap().contains("p.name"));
     assert!(stdout.contains("Alice"));
+}
+
+/// `query --format csv` output loads back through `load csv` with the same
+/// values: a null stays null, the stored string "null" stays a string, and a
+/// null in a number column loads. The writer (`csv_cell`) and the reader
+/// (`utf8_without_empty`) spell null in two crates; this test keeps them in
+/// agreement. An empty string reads back as null, because `load csv` has no
+/// spelling for an empty string.
+#[test]
+fn csv_query_output_round_trips_through_load_csv() {
+    let temp = tempdir().unwrap();
+    let schema = temp.path().join("schema.pg");
+    fs::write(
+        &schema,
+        "node X {\n    slug: String @key\n    s: String?\n    n: I32?\n}\n",
+    )
+    .unwrap();
+    let source = temp.path().join("source.omni");
+    let copy = temp.path().join("copy.omni");
+    for graph in [&source, &copy] {
+        output_success(cli().arg("init").arg("--schema").arg(&schema).arg(graph));
+    }
+    let rows = temp.path().join("rows.jsonl");
+    fs::write(
+        &rows,
+        concat!(
+            r#"{"type":"X","data":{"slug":"empty","s":"","n":1}}"#,
+            "\n",
+            r#"{"type":"X","data":{"slug":"nul","n":2}}"#,
+            "\n",
+            r#"{"type":"X","data":{"slug":"word","s":"null"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&rows)
+            .arg("--mode")
+            .arg("merge")
+            .arg("--target")
+            .arg(&source),
+    );
+
+    let read = "query q() { match { $x: X } \
+                return { $x.slug as slug, $x.s as s, $x.n as n } order { $x.slug } }";
+    let csv = stdout_string(&output_success(
+        cli()
+            .arg("query")
+            .arg("--target")
+            .arg(&source)
+            .arg("-e")
+            .arg(read)
+            .arg("--format")
+            .arg("csv"),
+    ));
+    let sources = temp.path().join("sources");
+    fs::create_dir(&sources).unwrap();
+    let csv_path = sources.join("x.csv");
+    fs::write(&csv_path, &csv).unwrap();
+    output_success(
+        cli()
+            .arg("mutate")
+            .arg("--target")
+            .arg(&copy)
+            .arg("--yes")
+            .arg("-e")
+            .arg(format!(
+                "load csv \"file://{}\" into node:X mode overwrite header",
+                csv_path.display()
+            )),
+    );
+
+    let loaded = parse_stdout_json(&output_success(
+        cli()
+            .arg("query")
+            .arg("--target")
+            .arg(&copy)
+            .arg("-e")
+            .arg(read)
+            .arg("--json"),
+    ));
+    assert_eq!(
+        loaded["rows"],
+        json!([
+            {"slug": "empty", "n": 1},
+            {"slug": "nul", "n": 2},
+            {"slug": "word", "s": "null"},
+        ]),
+        "csv written by query:\n{csv}"
+    );
 }
 
 /// RFC-007 PR 1: the format cascade's operator hop — `defaults.output` in
@@ -6547,6 +6820,223 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
     ]));
     let refusal = parse_stdout_json(&refused);
     assert_eq!(refusal["code"], "target_unknown", "{refusal}");
+}
+
+/// A graph policy where only `act-writer` may change `main`, `act-reader`
+/// may only read, and only `act-maintainer` may maintain and reclaim.
+const WRITER_READER_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  writers: [act-writer]
+  maintainers: [act-maintainer]
+  everyone: [act-writer, act-reader]
+protected_branches: [main]
+rules:
+  - id: maintainers-maintain
+    allow:
+      actors: { group: maintainers }
+      actions: [maintain]
+      branch_scope: any
+  - id: maintainers-reclaim
+    allow:
+      actors: { group: maintainers }
+      actions: [reclaim]
+  - id: everyone-reads
+    allow:
+      actors: { group: everyone }
+      actions: [read]
+      branch_scope: any
+  - id: writers-change
+    allow:
+      actors: { group: writers }
+      actions: [change]
+      branch_scope: any
+"#;
+
+/// A direct write to a cluster graph is judged by the policy the cluster
+/// applied to it, as `access` reports and as a server would judge it: through
+/// the root target and through the graph's own store, for loads, mutations
+/// and maintenance. A refused write publishes nothing; an actor the policy
+/// admits writes, and the commit records it.
+#[test]
+fn direct_writes_to_a_cluster_graph_obey_its_applied_policy_issue_1414() {
+    let cluster = converged_loaded_cluster("knowledge", Some(WRITER_READER_POLICY_YAML));
+    let root = cluster.path().to_path_buf();
+    let store = root.join("graphs").join("knowledge.omni");
+    let temp = tempdir().unwrap();
+    let mutation = temp.path().join("insert.gq");
+    write_query_file(
+        &mutation,
+        r#"
+query insert_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+"#,
+    );
+    let with_actor = |command: &mut Command, actor: Option<&str>| {
+        if let Some(actor) = actor {
+            command.args(["--as", actor]);
+        }
+    };
+    let may_change_main = |actor: Option<&str>| -> bool {
+        let mut command = cli();
+        command.arg("access").arg("--target").arg(&root).args([
+            "--graph",
+            "knowledge",
+            "--branch",
+            "main",
+            "--json",
+        ]);
+        with_actor(&mut command, actor);
+        let report = parse_stdout_json(&output_success(&mut command));
+        report["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action == "change")
+    };
+    // One command per address: the root with `--graph`, and the store.
+    let addressed = |command: &mut Command, by_store: bool| {
+        if by_store {
+            command.arg("--target").arg(&store);
+        } else {
+            command
+                .arg("--target")
+                .arg(&root)
+                .args(["--graph", "knowledge"]);
+        }
+    };
+    let mut row = 0;
+    let mut writes = |actor: Option<&str>, by_store: bool| -> Vec<std::process::Output> {
+        row += 1;
+        let data = temp.path().join(format!("row-{row}.jsonl"));
+        fs::write(
+            &data,
+            format!("{{\"type\": \"Person\", \"data\": {{\"name\": \"p{row}\", \"age\": 1}}}}\n"),
+        )
+        .unwrap();
+        let mut load = cli();
+        load.arg("load");
+        addressed(&mut load, by_store);
+        load.arg("--data")
+            .arg(&data)
+            .args(["--mode", "append", "--json"]);
+        with_actor(&mut load, actor);
+        let mut mutate = cli();
+        mutate.arg("mutate");
+        addressed(&mut mutate, by_store);
+        mutate
+            .arg("--query")
+            .arg(&mutation)
+            .arg("--params")
+            .arg(format!(r#"{{"name":"m{row}","age":2}}"#))
+            .arg("--json");
+        with_actor(&mut mutate, actor);
+        [load, mutate]
+            .into_iter()
+            .map(|mut command| {
+                let output = command.output().unwrap();
+                // A direct write keeps its cluster admission; release it so
+                // the next command is admitted.
+                unlock_cluster_fixture(&root);
+                output
+            })
+            .collect()
+    };
+
+    for actor in [Some("act-outsider"), Some("act-reader"), None] {
+        assert!(!may_change_main(actor), "{actor:?}");
+        for by_store in [false, true] {
+            let before = manifest_dataset_version(&store);
+            for output in writes(actor, by_store) {
+                assert!(!output.status.success(), "{actor:?}: {output:?}");
+                let refusal = parse_stdout_json(&output);
+                assert_eq!(refusal["code"], "forbidden", "{actor:?}: {refusal}");
+                assert_eq!(
+                    refusal["disposition"]["effects"], "none",
+                    "{actor:?}: {refusal}"
+                );
+                let message = refusal["error"].as_str().unwrap();
+                assert!(message.contains("'change'"), "{message}");
+                if actor.is_none() {
+                    assert!(message.contains("names no actor"), "{message}");
+                }
+            }
+            assert_eq!(manifest_dataset_version(&store), before, "{actor:?}");
+        }
+    }
+
+    // `--base` over the graph's store is refused before the read-through
+    // adapter writes its clone marker: the graph is not a clone root, and a
+    // refused write must leave it openable without the base.
+    let base = temp.path().join("base.omni");
+    init_graph(&base);
+    let before = manifest_dataset_version(&store);
+    let mut load = cli();
+    load.arg("load").arg("--target").arg(&store);
+    load.arg("--base")
+        .arg(&base)
+        .arg("--data")
+        .arg(temp.path().join("row-1.jsonl"))
+        .args(["--mode", "append", "--as", "act-outsider", "--json"]);
+    let refused = load.output().unwrap();
+    unlock_cluster_fixture(&root);
+    assert!(!refused.status.success(), "{refused:?}");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(said.contains("not a clone root"), "{said}");
+    assert!(!store.join("__clone").exists());
+    assert_eq!(manifest_dataset_version(&store), before);
+    output_success(
+        cli()
+            .args(["schema", "show", "--target"])
+            .arg(&store)
+            .arg("--json"),
+    );
+
+    assert!(may_change_main(Some("act-writer")));
+    for by_store in [false, true] {
+        let before = manifest_dataset_version(&store);
+        for output in writes(Some("act-writer"), by_store) {
+            assert!(output.status.success(), "{output:?}");
+            let report = parse_stdout_json(&output);
+            assert_eq!(report["commit"]["actor_id"], "act-writer", "{report}");
+        }
+        assert_eq!(manifest_dataset_version(&store), before + 2);
+    }
+
+    // Maintenance takes the same handle and names its actor with `--as`:
+    // changing data grants neither `maintain` nor `reclaim`.
+    let maintenance: [(&[&str], &str); 3] = [
+        (&["index", "build", "--branch", "main"], "'maintain'"),
+        (&["optimize"], "'maintain'"),
+        (
+            &["cleanup", "--keep", "100", "--confirm", "--yes"],
+            "'reclaim'",
+        ),
+    ];
+    let maintain = |args: &[&str], actor: &str| {
+        let mut command = cli();
+        command.args(args);
+        addressed(&mut command, false);
+        command.args(["--as", actor, "--json"]);
+        let output = command.output().unwrap();
+        unlock_cluster_fixture(&root);
+        output
+    };
+    for (args, action) in maintenance {
+        let before = manifest_dataset_version(&store);
+        let refused = maintain(args, "act-writer");
+        assert!(!refused.status.success(), "{args:?}: {refused:?}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains(action), "{args:?}: {stderr}");
+        assert_eq!(manifest_dataset_version(&store), before, "{args:?}");
+        let admitted = maintain(args, "act-maintainer");
+        assert!(admitted.status.success(), "{args:?}: {admitted:?}");
+    }
 }
 
 #[test]

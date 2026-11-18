@@ -1,5 +1,5 @@
 # Fixtures describe starting states; workloads describe operations and checks.
-# Named runs and settings live here. Large history groups are explicitly opt-in.
+# Named runs and settings live here. Large history suites are explicitly opt-in.
 # A scenario names what is measured; the run names where: `--store` or
 # `--server` supply the environment and the reset level follows it.
 version: 2
@@ -763,7 +763,7 @@ scenarios:
       --- mutate
       query add() as commit { insert Item { key: "c", val: 3 } }
 
-groups:
+suites:
   end-to-end:
   - e2e-merge-all-changed
   - e2e-merge-all-new
