@@ -2321,3 +2321,122 @@ query pairs() {
         );
     }
 }
+
+/// A traversal step consumes its edge probe one batch at a time (issue
+/// #1459). Lance answers a BTREE-covered `key IN (…)` probe with one batch
+/// per contiguous row range, each a slice of a decode buffer whose capacity
+/// the pool charges, and an unindexed probe past 1,024 keys arrives as slices
+/// of large parent buffers too. A step that held its whole probe was charged
+/// that capacity once per batch: on this graph, the issue's synthetic code
+/// graph at 20,000 nodes, the hub read needed 512 MiB once the edge table was
+/// indexed and 64 MiB before. Held one batch at a time, the read fits the same
+/// pool on both sides of `ensure_indices`, with the same rows.
+#[tokio::test]
+#[serial]
+async fn hub_traversal_fits_one_pool_before_and_after_indexing_issue_1459() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), GRAPH_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(&layered_reference_graph(20_000), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let db = with_setting(&db, "engine", "v2");
+    let query = r#"set traversal_work_limit = 1000000000000;
+query impact() {
+    match { $t: Person { name: "n0" } $c (knows | knows){1,16} $t }
+    return distinct { $c.name }
+    order { $c.name asc }
+    limit 5000
+}"#;
+    let limit = 128 * MIB;
+    let mut answers = Vec::new();
+    for indexed in [false, true] {
+        if indexed {
+            db.ensure_indices_as(None).await.unwrap();
+        }
+        let probes = QueryMemoryProbes::default();
+        let result = with_query_memory_probes(
+            probes.clone(),
+            with_query_memory_limit(limit, query_main(&db, query, "impact", &params(&[]))),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("indexed={indexed}: the hub read must fit {limit} bytes: {error}")
+        });
+        assert_released(&probes);
+        let names = result.concat_batches().unwrap();
+        let names = names
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        answers.push(
+            (0..names.len())
+                .map(|row| names.value(row).to_owned())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(answers[0].len(), 5000);
+    assert_eq!(answers[0], answers[1], "indexing must not change the rows");
+}
+
+/// The issue's `gen.py` shape, deterministic: `n0` alone in layer 0, layers
+/// growing geometrically to `nodes` over six layers, each node referencing
+/// one to six nodes of the layer below and three of its own.
+fn layered_reference_graph(nodes: usize) -> String {
+    let mut state = 7u64;
+    let mut next = move |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    let layers = 6;
+    let growth = (nodes as f64).powf(1.0 / (layers - 1) as f64);
+    let mut sizes = vec![1usize];
+    let mut total = 1;
+    for k in 1..layers {
+        let size = if k < layers - 1 {
+            ((growth.powi(k as i32)) as usize).max(2)
+        } else {
+            nodes - total
+        };
+        sizes.push(size);
+        total += size;
+    }
+    let mut lines = Vec::new();
+    let mut starts = Vec::new();
+    let mut id = 0;
+    for &size in &sizes {
+        starts.push(id);
+        for node in id..id + size {
+            lines.push(
+                serde_json::json!({"type":"Person", "data":{"name":format!("n{node}"), "payload":""}})
+                    .to_string(),
+            );
+        }
+        id += size;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for k in 1..layers {
+        for node in starts[k]..starts[k] + sizes[k] {
+            let fan_out = 1 + next(6);
+            let mut targets: Vec<usize> = (0..fan_out)
+                .map(|_| starts[k - 1] + next(sizes[k - 1]))
+                .collect();
+            targets.extend((0..3).map(|_| starts[k] + next(sizes[k])));
+            for target in targets {
+                if target != node && seen.insert((node, target)) {
+                    lines.push(
+                        serde_json::json!({"edge":"Knows", "from":format!("n{node}"), "to":format!("n{target}")})
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
