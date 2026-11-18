@@ -5415,3 +5415,287 @@ query bump_all() {
         "an update of every row patches the column"
     );
 }
+
+const KEEP_OMITTED_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    title: String
+    n: I64?
+    tags: [String]?
+    emb: Vector(2)?
+    file: Blob?
+    note: String?
+}
+
+edge Cites: Doc -> Doc {
+    @key(@src, @dst)
+    weight: I32?
+    note: String?
+}
+"#;
+
+const KEEP_OMITTED_READ: &str = r#"
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.n, $d.tags, $d.emb, $d.note }
+    order { $d.slug }
+}
+"#;
+
+async fn keep_omitted_rows(db: &omnigraph::Session) -> serde_json::Value {
+    query_main(db, KEEP_OMITTED_READ, "docs", &params(&[]))
+        .await
+        .unwrap()
+        .to_rust_json()
+        .unwrap()
+}
+
+async fn keep_omitted_file(db: &omnigraph::Session, slug: &str) -> Option<Vec<u8>> {
+    match db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Doc", slug, "file"),
+        )
+        .await
+    {
+        Ok(_) => Some(
+            read_managed_blob_bytes(
+                db,
+                ReadTarget::branch("main"),
+                node_blob_cell("Doc", slug, "file"),
+            )
+            .await,
+        ),
+        Err(_) => None,
+    }
+}
+
+/// A keyed `insert` on an existing key keeps every property it omits, the
+/// Blob and the vector included, and an explicit `null` clears one; the same
+/// holds for a key written earlier in the same write.
+#[tokio::test]
+async fn keyed_insert_keeps_omitted_blob_and_vector_issue_1278() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), KEEP_OMITTED_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d1","title":"one","n":7,"tags":["a"],"emb":[1.0,2.0],"file":"base64:AQID","note":"keep"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    mutate_main(
+        &db,
+        r#"query q() { insert Doc { slug: "d1", title: "new" } }"#,
+        "q",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        keep_omitted_rows(&db).await,
+        serde_json::json!([{"d.slug": "d1", "d.title": "new", "d.n": 7, "d.tags": ["a"], "d.emb": [1.0, 2.0], "d.note": "keep"}])
+    );
+    assert_eq!(
+        keep_omitted_file(&db, "d1").await.as_deref(),
+        Some(&[1u8, 2, 3][..])
+    );
+
+    // An insert that writes the key and then names it again in the same write
+    // keeps the first statement's Blob.
+    mutate_main(
+        &db,
+        r#"query q($f: Blob) {
+            insert Doc { slug: "d2", title: "two", file: $f, emb: [3.0, 4.0] }
+            insert Doc { slug: "d2", title: "two again" }
+        }"#,
+        "q",
+        &params(&[("$f", "base64:BAUG")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        keep_omitted_file(&db, "d2").await.as_deref(),
+        Some(&[4u8, 5, 6][..])
+    );
+
+    // An explicit null clears the Blob and the vector; the rest stays.
+    mutate_main(
+        &db,
+        r#"query q() { insert Doc { slug: "d1", file: null, emb: null } }"#,
+        "q",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(keep_omitted_file(&db, "d1").await, None);
+    assert_eq!(
+        keep_omitted_rows(&db).await,
+        serde_json::json!([
+            {"d.slug": "d1", "d.title": "new", "d.n": 7, "d.tags": ["a"], "d.note": "keep"},
+            {"d.slug": "d2", "d.title": "two again", "d.emb": [3.0, 4.0]}
+        ])
+    );
+}
+
+/// A `merge` load keeps the properties a record omits and clears the ones it
+/// sets to null, record by record within one input, through the lenient JSONL
+/// door and the strict graph-batch door; a new key takes null for a missing
+/// nullable property and is refused for a missing required one.
+#[tokio::test]
+async fn merge_load_keeps_omitted_properties_issue_1278() {
+    for strict in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = helpers::session(
+            Omnigraph::init(dir.path().to_str().unwrap(), KEEP_OMITTED_SCHEMA)
+                .await
+                .unwrap(),
+        );
+        db.load_jsonl(
+            concat!(
+                r#"{"type":"Doc","data":{"slug":"d1","title":"one","n":7,"tags":["a"],"emb":[1.0,2.0],"file":"base64:AQID","note":"keep"}}"#,
+                "\n",
+                r#"{"type":"Doc","data":{"slug":"d2","title":"two","n":8,"tags":["b"],"emb":[3.0,4.0],"file":"base64:BAUG","note":"two"}}"#,
+                "\n",
+                r#"{"edge":"Cites","from":"d1","to":"d2","data":{"weight":3,"note":"cited"}}"#,
+            ),
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        let load = |input: &'static str| {
+            let db = &db;
+            async move {
+                if strict {
+                    db.load_graph_batch("main", input, LoadMode::Merge).await
+                } else {
+                    db.load_jsonl(input, LoadMode::Merge).await
+                }
+            }
+        };
+        load(concat!(
+            r#"{"type":"Doc","data":{"slug":"d1","title":"merged"}}"#,
+            "\n",
+            r#"{"type":"Doc","data":{"slug":"d2","n":null,"emb":null,"file":null}}"#,
+            "\n",
+            r#"{"type":"Doc","data":{"slug":"d3","title":"three"}}"#,
+            "\n",
+            r#"{"edge":"Cites","from":"d1","to":"d2","data":{"weight":4}}"#,
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("strict={strict}: {error}"));
+        const CITES: &str = r#"
+query cites() {
+    match { $a: Doc, $a $c:cites $b }
+    return { $a.slug, $b.slug, $c.weight, $c.note }
+}
+"#;
+        assert_eq!(
+            query_main(&db, CITES, "cites", &params(&[]))
+                .await
+                .unwrap()
+                .to_rust_json()
+                .unwrap(),
+            serde_json::json!([{"a.slug": "d1", "b.slug": "d2", "c.weight": 4, "c.note": "cited"}]),
+            "strict={strict}"
+        );
+        assert_eq!(
+            keep_omitted_rows(&db).await,
+            serde_json::json!([
+                {"d.slug": "d1", "d.title": "merged", "d.n": 7, "d.tags": ["a"], "d.emb": [1.0, 2.0], "d.note": "keep"},
+                {"d.slug": "d2", "d.title": "two", "d.tags": ["b"], "d.note": "two"},
+                {"d.slug": "d3", "d.title": "three"}
+            ]),
+            "strict={strict}"
+        );
+        assert_eq!(
+            keep_omitted_file(&db, "d1").await.as_deref(),
+            Some(&[1u8, 2, 3][..])
+        );
+        assert_eq!(keep_omitted_file(&db, "d2").await, None, "strict={strict}");
+
+        let error = load(r#"{"type":"Doc","data":{"slug":"d4","n":1}}"#)
+            .await
+            .expect_err("a new key without its required property is refused");
+        assert!(
+            error.to_string().contains("title"),
+            "strict={strict}: {error}"
+        );
+    }
+}
+
+/// A `merge` CSV load keeps a property its source has no column for and
+/// clears one whose field is empty.
+#[tokio::test]
+async fn merge_csv_load_keeps_a_property_without_a_column_issue_1278() {
+    use omnigraph::loader::CsvLoadRequest;
+    use omnigraph_compiler::query::file::LoadTarget;
+    const SCHEMA: &str = "node Person { id: I64 @key name: String age: I32? city: String? }";
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("people.csv");
+    std::fs::write(&csv_path, "id,name\n1,alice b\n2,bob\n").unwrap();
+    let source = format!("file://{}", csv_path.display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"id":1,"name":"alice","age":30,"city":"Oslo"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let request = |path: &std::path::Path| CsvLoadRequest {
+        source: format!("file://{}", path.display()),
+        target: LoadTarget::Node("Person".to_string()),
+        mode: LoadMode::Merge,
+        delimiter: b',',
+        header: true,
+        columns: None,
+    };
+    db.load_csv_as_with_receipt("main", &request(&csv_path), None)
+        .await
+        .unwrap();
+    let _ = source;
+    let empty_city = dir.path().join("cities.csv");
+    std::fs::write(&empty_city, "id,city\n2,\n").unwrap();
+    db.load_csv_as_with_receipt("main", &request(&empty_city), None)
+        .await
+        .unwrap();
+    const READ: &str = r#"
+query people() {
+    match { $p: Person }
+    return { $p.id, $p.name, $p.age, $p.city }
+    order { $p.id }
+}
+"#;
+    let rows = query_main(&db, READ, "people", &params(&[]))
+        .await
+        .unwrap()
+        .to_rust_json()
+        .unwrap();
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"p.id": 1, "p.name": "alice b", "p.age": 30, "p.city": "Oslo"},
+            {"p.id": 2, "p.name": "bob"}
+        ])
+    );
+}

@@ -1,0 +1,191 @@
+# issue: 1278
+# red_on: c2e13c80a55c3d29a731ea62b61a168c27741a57: a keyed insert of an existing key nulls every property it does not name, so d1's n, tags, emb and note read back absent after `insert Doc { slug: "d1", title: "new" }`.
+# notes: A keyed insert is an upsert: on an existing key, committed or written earlier in the same write, a property the
+# notes: statement omits keeps its stored value, Blob and vector included, and an explicit null clears it; on a new key a
+# notes: missing nullable property is null and a missing required one is refused. Keyed edges behave alike, and a branch
+# notes: keeps its own values. The restart and the Blob half are in issue_1278_omitted_properties_survive_a_restart.gqt
+# notes: and writes.rs.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String
+    n: I64?
+    tags: [String]?
+    emb: Vector(2)?
+    note: String?
+}
+
+edge Cites: Doc -> Doc {
+    @key(@src, @dst)
+    weight: I32?
+    note: String?
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","title":"one","n":7,"tags":["a","b"],"emb":[1.0,2.0],"note":"keep"}}
+{"type":"Doc","data":{"slug":"d2","title":"two","n":8,"tags":["c"],"emb":[3.0,4.0],"note":"two"}}
+{"edge":"Cites","from":"d1","to":"d2","data":{"weight":3,"note":"cited"}}
+
+--- mutate
+query retitle_d1() {
+    insert Doc { slug: "d1", title: "new" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query d1() {
+    match { $d: Doc } where $d.slug = "d1"
+    return { $d.slug, $d.title, $d.n, $d.tags, $d.emb, $d.note }
+}
+
+--- expect unordered
+{"d.slug": "d1", "d.title": "new", "d.n": 7, "d.tags": ["a", "b"], "d.emb": [1.0, 2.0], "d.note": "keep"}
+
+--- expect shape
+d.slug: String
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(2)?
+d.note: String?
+
+--- mutate
+query clear_n_keep_required_title() {
+    insert Doc { slug: "d1", n: null }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query d1_after_clear() {
+    match { $d: Doc } where $d.slug = "d1"
+    return { $d.slug, $d.title, $d.n, $d.tags, $d.emb, $d.note }
+}
+
+--- expect unordered
+{"d.slug": "d1", "d.title": "new", "d.tags": ["a", "b"], "d.emb": [1.0, 2.0], "d.note": "keep"}
+
+--- expect shape
+d.slug: String
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(2)?
+d.note: String?
+
+--- mutate
+query insert_then_reinsert_in_one_write() {
+    insert Doc { slug: "d3", title: "three", n: 9, tags: ["z"], emb: [5.0, 6.0] }
+    insert Doc { slug: "d3", title: "three again" }
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- mutate
+query new_key_missing_nullable() {
+    insert Doc { slug: "d4", title: "four" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query new_key_missing_required() {
+    insert Doc { slug: "d5", n: 1 }
+}
+
+--- expect error: missing required property 'title'
+
+--- query
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.n, $d.tags, $d.emb }
+}
+
+--- expect unordered
+{"d.slug": "d1", "d.title": "new", "d.tags": ["a", "b"], "d.emb": [1.0, 2.0]}
+{"d.slug": "d2", "d.title": "two", "d.n": 8, "d.tags": ["c"], "d.emb": [3.0, 4.0]}
+{"d.slug": "d3", "d.title": "three again", "d.n": 9, "d.tags": ["z"], "d.emb": [5.0, 6.0]}
+{"d.slug": "d4", "d.title": "four"}
+
+--- expect shape
+d.slug: String
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(2)?
+
+--- mutate
+query reweigh_citation() {
+    insert Cites { from: "d1", to: "d2", weight: 4 }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- query
+query citations() {
+    match { $a: Doc, $a $c:cites $b }
+    return { $a.slug, $b.slug, $c.weight, $c.note }
+}
+
+--- expect unordered
+{"a.slug": "d1", "b.slug": "d2", "c.weight": 4, "c.note": "cited"}
+
+--- expect shape
+a.slug: String
+b.slug: String
+c.weight: I32?
+c.note: String?
+
+--- mutate
+branch create side
+
+--- expect ok
+
+--- mutate branch: side
+query retitle_d2_on_side() {
+    insert Doc { slug: "d2", title: "on side" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: side
+query d2_on_side() {
+    match { $d: Doc } where $d.slug = "d2"
+    return { $d.title, $d.n, $d.tags, $d.emb, $d.note }
+}
+
+--- expect unordered
+{"d.title": "on side", "d.n": 8, "d.tags": ["c"], "d.emb": [3.0, 4.0], "d.note": "two"}
+
+--- expect shape
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(2)?
+d.note: String?
+
+--- query
+query d2_on_main() {
+    match { $d: Doc } where $d.slug = "d2"
+    return { $d.title, $d.n }
+}
+
+--- expect unordered
+{"d.title": "two", "d.n": 8}
+
+--- expect shape
+d.title: String
+d.n: I64?

@@ -20,7 +20,7 @@ edits.
 | Task | Command | Why |
 |------|---------|-----|
 | Add/update a single entity | `mutate` with a named mutation | typechecked, parameterized, auditable |
-| Bulk upsert by logical entity ID | `load --mode merge` | preserves rows not in the file; keyed node and edge IDs derive from `@key` |
+| Bulk upsert by logical entity ID | `load --mode merge` | preserves rows not in the file and properties a record omits (`null` clears one); keyed node and edge IDs derive from `@key` |
 | Additive-only bulk | `load --mode append` | fails on key collision |
 | Replace complete batches by type | `load --mode overwrite` | **destructive for represented types**; absent types remain |
 | Bulk load onto a fresh review branch | `load --from main --mode merge --branch <name>` | forks `<name>` from `main`, loads onto it, leaves it for review |
@@ -117,7 +117,9 @@ renderable calendar range are refused; `mutate --params` takes date strings
 only. Rows stored with out-of-range counts by an earlier release fail reads and
 exports of that column until corrected.
 Query/export JSON uses date strings, renders `DateTime` without a trailing `Z`,
-and omits null-valued property keys; change images keep explicit nulls.
+and omits null-valued property keys; change images keep explicit nulls. A
+`merge` of such an export keeps a value set since the export where the export
+left the property out; reload with `overwrite` to restore it exactly.
 
 Load command:
 

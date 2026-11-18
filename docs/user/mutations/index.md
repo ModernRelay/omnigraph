@@ -81,12 +81,11 @@ them visible on the target in one atomic step. See
 
 ## Insert and update identity
 
-- Inserting a node or edge with `@key` is an upsert by its derived id.
-  Inserting the same key again updates the existing row.
-- Inserting a node without a key is a strict insert with a generated or supplied
-  id.
-- Inserting an edge without a key is a strict insert with a generated or
-  supplied id; the same pair inserted twice is two edges.
+- Inserting a node or edge with `@key` is an upsert by its derived id. On an
+  existing key a property the statement omits keeps its value (Blob and vector
+  included) and `null` clears it; a new key refuses a missing required one.
+- Inserting a node or edge without a key is a strict insert with a generated or
+  supplied id; the same edge pair inserted twice is two edges.
 - Key properties cannot be changed by an update. Edge types do not support
   update at all: change a keyed edge by inserting its key again with the new
   values (an upsert), and an unkeyed edge by delete and re-insert.
@@ -124,7 +123,7 @@ Choose the mode explicitly:
 | Mode | Existing id | Use |
 |---|---|---|
 | `append` | Fails with `key_conflict` | Add entities without replacing anything. |
-| `merge` | Updates the existing entity | Upsert a batch. |
+| `merge` | Updates the properties each record names; one it omits keeps its value | Upsert a batch. |
 | `overwrite` | Replaces every node or edge type represented in the batch; types absent from the batch remain unchanged | Rebuild from a complete export or seed. |
 
 For a keyed edge the existing-id column applies to its derived id: `append`
@@ -170,7 +169,7 @@ load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" head
   is required without `header` and overrides a header's names. `from` and
   `to` name an edge file's endpoint columns and are refused on a node file.
 - An empty field and `""` are null (there is no empty-string spelling); an empty line is not a
-  record, so a one-column file skips its null rows. A null for a non-nullable property, a column
+  record, so a one-column file skips its null rows. In mode `merge` a property with no column keeps its value. A null for a non-nullable property, a column
   the type does not declare, a count of `columns` that differs from the source, a malformed
   number, a repeated name, and an edge file without `from` or `to` are refused before anything is staged.
 
@@ -253,10 +252,8 @@ entities per touched type. The [`write_max_bytes`](../queries/settings.md)
 setting (default 32 MiB) bounds retained row data per type and across all
 touched types. Blob payloads have a separate allowance of the same size,
 including inline bytes, copied external bytes and carried update values.
-The 8,192 entities count each key once however many statements write it,
-since a later statement's version replaces the earlier one. The bytes retained
-across all touched types and the Blob allowance count every version, so an
-insert and an update of the same row charge its Blob twice.
+The 8,192 count each key once; the byte and Blob allowances count every
+version written, so an insert and an update of one row charge its Blob twice.
 Keyed loads also bound their parser estimate independently. A strict JSONL
 load retains its projected input check, `strict_input_arrow_bytes`.
 A vector counts its full width (dimension × 4 bytes), present or null: 12 KiB for `Vector(3072)`.

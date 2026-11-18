@@ -124,6 +124,28 @@ pub(crate) struct PreparedCsvBatch {
     pub(crate) is_edge: bool,
     pub(crate) batches: Vec<RecordBatch>,
     pub(crate) rows: usize,
+    /// A `merge` load's properties the source has no column for: every
+    /// record omits them, so an existing key keeps its stored values and the
+    /// batches are on the relaxed schema until those cells are filled.
+    pub(crate) omitted_columns: Vec<String>,
+}
+
+impl PreparedCsvBatch {
+    /// The batches beside the cells their records omit.
+    pub(crate) fn batches_with_omitted_cells(
+        &self,
+    ) -> Vec<(RecordBatch, crate::exec::keep_omitted::OmittedCells)> {
+        self.batches
+            .iter()
+            .map(|batch| {
+                let mut omitted = crate::exec::keep_omitted::OmittedCells::default();
+                for column in &self.omitted_columns {
+                    omitted.push(column, vec![true; batch.num_rows()]);
+                }
+                (batch.clone(), omitted)
+            })
+            .collect()
+    }
 }
 
 /// The strict batch shape the target's delta carries: the type's own Arrow
@@ -327,12 +349,44 @@ pub(crate) fn prepare_csv_batches(
         )));
     }
 
+    // A `merge` load keeps what its source omits: a non-key property with no
+    // column is left to the stored row of each existing key. An empty field
+    // is a value, null, which clears it.
+    let omitted_columns = if request.mode == LoadMode::Merge {
+        let key = match &request.target {
+            LoadTarget::Node(name) => catalog.node_types[name].key.as_ref(),
+            LoadTarget::Edge(name) => catalog.edge_types[name].key.as_ref(),
+        };
+        let leading = if resolved.is_edge { 3 } else { 1 };
+        resolved
+            .arrow_schema
+            .fields()
+            .iter()
+            .skip(leading)
+            .map(|field| field.name())
+            .filter(|name| !key.is_some_and(|key| key.iter().any(|k| k == *name)))
+            .filter(|name| {
+                !resolved.roles.iter().any(
+                    |role| matches!(role, ColumnRole::Property { name: column, .. } if column == *name),
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut relaxed_omitted = crate::exec::keep_omitted::OmittedCells::default();
+    for column in &omitted_columns {
+        relaxed_omitted.push(column, vec![true]);
+    }
+    let arrow_schema =
+        crate::exec::keep_omitted::relaxed_schema(&resolved.arrow_schema, &relaxed_omitted);
     let typing = CsvTyping {
         catalog,
         target: &request.target,
         table_key: &table_key,
         properties: resolved.properties,
-        arrow_schema: &resolved.arrow_schema,
+        arrow_schema: &arrow_schema,
         roles: &resolved.roles,
         is_edge: resolved.is_edge,
     };
@@ -344,6 +398,7 @@ pub(crate) fn prepare_csv_batches(
         is_edge: resolved.is_edge,
         batches,
         rows,
+        omitted_columns,
     })
 }
 

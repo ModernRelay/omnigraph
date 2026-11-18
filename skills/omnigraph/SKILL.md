@@ -111,8 +111,10 @@ query retitle($slug: String, $t: String) { match { $x: Signal } where $x.slug = 
 query remove($slug: String)              { match { $x: Signal } where $x.slug = $slug  delete $x }
 ```
 
-- **Every non-nullable property must be supplied.** Lint normally reports T12
-  when one is missing. A non-null Vector target carrying `@embed`
+- **Every non-nullable property must be supplied on a new key.** Lint reports
+  T12 when an unkeyed insert, or a keyed insert's key, misses one; a keyed
+  insert that omits a required non-key property keeps the stored value on an
+  existing key and is refused when the query runs on a new one. A non-null Vector target carrying `@embed`
   is a known exception: source-only insert can lint successfully even though
   execution still requires the vector. Supply it explicitly; writes never
   embed automatically.
@@ -132,7 +134,7 @@ omnigraph load --data seed.jsonl --mode merge --target $GRAPH                   
 omnigraph load --data delta.jsonl --from main --branch review --mode merge --target $GRAPH     # fork a review branch in one shot
 ```
 
-- `--mode`: `merge` (upsert by logical entity ID; keyed node and keyed edge IDs derive from their `@key` tuple — re-running a merge file duplicates unkeyed edges) · `append` (fails on ID collision) · `overwrite` (destructive, staged). `--from <base>` forks a missing `--branch`; bare `load` needs an existing branch. Works local **and** remote.
+- `--mode`: `merge` (upsert by logical entity ID; keyed node and keyed edge IDs derive from their `@key` tuple — re-running a merge file duplicates unkeyed edges; a property a record omits keeps its stored value, `null` clears it) · `append` (fails on ID collision) · `overwrite` (destructive, staged). `--from <base>` forks a missing `--branch`; bare `load` needs an existing branch. Works local **and** remote.
 - **Date values**: use a calendar-day string (`YYYY-MM-DD`) for `Date` and an ISO timestamp to the millisecond for `DateTime` (`.123` or `.123000`; `.123456` is refused), in both `mutate --params` and JSONL. `load` also accepts integer epoch days for `Date`.
 - **CSV** is a GQ statement, not an `omnigraph load` format (`load` reads JSONL only): `omnigraph mutate --target $GRAPH -e 'load csv "s3://imports/person.csv" into node:Person mode append header'`, with `mode` required, optional `delimiter "|"`, and `columns (a, b)` when there is no `header`. The source must lie under the graph's external Blob policy base (a direct run admits its own `file://` directory; a served run refuses `file://`) and within `load_source_max_bytes` (32 MiB default). See [CSV loading](../../docs/user/mutations/index.md#csv-loading).
 
@@ -440,7 +442,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | `schema apply` dropping a property/type | nothing is reclaimed at apply; older commits still read the dropped data, and a dropped property's values stay in the current data files | a type: `cleanup` with a retention that excludes the pre-drop commits. A property: `optimize` first, delete branches and tags from before it, then that `cleanup`; the data is then unrecoverable |
 | Committing `.env.omni` | credential leak | Add `.env*` to `.gitignore` |
 | Non-parameterized query values | typecheck surprise, injection risk | Declare `$param: Type` and pass via `--params` |
-| Missing required field in `insert` | ``T12: insert for `X` must provide non-nullable property `Y` `` | Accept the param in the mutation signature |
+| Missing required field in `insert` | ``T12: insert for `X` must provide non-nullable property `Y` `` (a key property, or any required property of an unkeyed type); at run time ``missing required property 'Y'`` for a new key of a keyed type | Accept the param in the mutation signature |
 | Mixing `delete` with `insert`/`update` in one query | `T76` | Split into two mutations |
 | Two `query` declarations of one name in one source (file, `-e` text or stored-query file) | `T83`, naming the line and column of both | Rename or delete the later one; names compare case-sensitively |
 | `update T set { … } where …`, `delete T where …` | `Q008` | `match { $x: T } where $x.prop = $v  update $x set { … }` / `delete $x`; the diagnostic prints it |

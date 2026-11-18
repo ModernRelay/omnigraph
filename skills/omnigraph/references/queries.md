@@ -498,12 +498,16 @@ query add_signal($slug: String, $name: String, $brief: String,
 }
 ```
 
-**Every non-nullable property must be provided.** Lint normally catches missing
-ones as:
+**Every non-nullable property must be provided on a new key.** Lint catches a
+missing key property, and any missing required property of an unkeyed type, as:
 
 ```
-type error: T12: insert for `Signal` must provide non-nullable property `brief`
+type error: T12: insert for `Signal` must provide non-nullable property `slug`
 ```
+
+A keyed insert that omits a required non-key property is an upsert: on an
+existing key it keeps the stored value, and on a new key it fails when it runs
+with ``missing required property 'brief': Signal has no row with key …``.
 
 For an `@embed` target the message ends ``… property `embedding` or @embed source `text` ``.
 
@@ -559,7 +563,9 @@ query add_and_link($slug: String, $pattern: String, $createdAt: DateTime, $updat
 ```
 
 There is no `upsert` keyword: `insert` on a node or edge with `@key` upserts
-the derived identity. Without a key, `insert` is strict; inserting an unkeyed
+the derived identity. On an existing key it changes only the properties it
+names: an omitted property (Blob and vector included) keeps its stored value,
+and `null` clears it; a new key must name every required property. Without a key, `insert` is strict; inserting an unkeyed
 edge twice creates two edges. Use `load --mode merge` for bulk upsert. Edge
 `update` is unsupported; reinsert a keyed edge to change non-key properties,
 or delete and reinsert an unkeyed edge.

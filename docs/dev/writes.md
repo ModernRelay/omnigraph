@@ -714,7 +714,18 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
   BTREE, as a node delete does, so the scan reads the index;
 - a bare Lance Append is not a production graph-table write;
 - one table's keyed input is bounded to 8,192 rows and the effective
-  `write_max_bytes` (default 32 MiB) before its data is staged.
+  `write_max_bytes` (default 32 MiB) before its data is staged;
+- a keyed `insert` and a `merge` load keep the properties their input omits
+  (`exec::keep_omitted`): a row that leaves a property out is built on its
+  type's schema with the omitted columns nullable, and before it is staged
+  one id-membership scan of its run (`scan_with_pending_materialized_blobs`,
+  pinned table version; a mutation also reads the pending image, a load
+  only committed rows) fills each omitted cell from the row its key
+  replaces, reading only the columns some row omits, so a Blob nobody omits
+  is never read; a still-null required cell is refused, naming a new key.
+  Lance's merge-insert takes one source schema per call and cannot tell an
+  omitted column from a null one per row, so the staged row is the
+  entity's complete next state. A row that omits nothing costs no read.
 
 Insert/update mutations and keyed Append/Merge loads also cap the sum of
 retained row data across tables at `write_max_bytes`
