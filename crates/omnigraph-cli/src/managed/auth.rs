@@ -864,6 +864,12 @@ fn seconds(value: f64, minimum: u64, maximum: u64) -> Result<u64> {
     Ok(value as u64)
 }
 
+#[derive(Debug)]
+pub(crate) struct LoginReceipt {
+    pub(crate) body: Value,
+    pub(crate) created_session: bool,
+}
+
 #[cfg(test)]
 async fn login_with(
     store: &dyn Store,
@@ -872,7 +878,7 @@ async fn login_with(
     provider: &provider::Provider,
     organization: Option<&str>,
     stderr: &mut dyn Write,
-) -> Result<Value> {
+) -> Result<LoginReceipt> {
     let cached = renewal::validate_custody(store, origin)?;
     login_validated(
         store,
@@ -897,7 +903,7 @@ async fn login_validated(
     choice: OrganizationChoice<'_>,
     stderr: &mut dyn Write,
     cached: Vec<renewal::Session>,
-) -> Result<Value> {
+) -> Result<LoginReceipt> {
     if replacement_principal().is_none()
         && organization.is_some()
         && let Some(saved) = cached
@@ -933,7 +939,10 @@ async fn login_validated(
                             &expiry
                         });
                         body["data"]["refresh_expires_at"] = json!(saved.refresh_expires_at);
-                        return Ok(body);
+                        return Ok(LoginReceipt {
+                            body,
+                            created_session: false,
+                        });
                     }
                     Err(error)
                         if matches!(
@@ -1008,7 +1017,11 @@ async fn login_validated(
                     choice,
                     stderr,
                 )
-                .await;
+                .await
+                .map(|body| LoginReceipt {
+                    body,
+                    created_session: true,
+                });
             }
             Err(error) if error.code() == Some("authorization_pending") => {}
             Err(error) if error.code() == Some("slow_down") => {
@@ -1279,28 +1292,65 @@ pub(super) async fn login_replacing(
     principal: Option<&str>,
     stderr: &mut dyn Write,
 ) -> Result<Value> {
+    let _lock = coordination::lock(&origin).await?;
     // An existing profile names its organization, so there is nothing to ask.
     REPLACE_PRINCIPAL
         .scope(
             principal.map(str::to_owned),
-            login(origin, organization, OrganizationChoice::Refuse, stderr),
+            login_locked(&origin, organization, OrganizationChoice::Refuse, stderr),
         )
         .await
+        .map(|receipt| receipt.body)
 }
 
-pub(super) async fn login(
-    origin: String,
+/// Keeps a new profile's credential in the creating invocation's custody until
+/// the config edit publishes the profile or the new session is discarded.
+pub(crate) struct ProfileRegistration<'a> {
+    origin: &'a str,
+    organization: Option<&'a str>,
+    _lock: LockGuard,
+}
+
+impl<'a> ProfileRegistration<'a> {
+    pub(crate) async fn begin(origin: &'a str, organization: Option<&'a str>) -> Result<Self> {
+        if let Some(id) = organization {
+            super::organization_id(id)?;
+        }
+        Ok(Self {
+            origin,
+            organization,
+            _lock: coordination::lock(origin).await?,
+        })
+    }
+
+    pub(crate) async fn login(
+        &self,
+        choice: OrganizationChoice<'_>,
+        stderr: &mut dyn Write,
+    ) -> Result<LoginReceipt> {
+        login_locked(self.origin, self.organization, choice, stderr).await
+    }
+
+    pub(crate) async fn discard(&self, organization: &str) -> Result<()> {
+        // An unpublished profile has acquired no data credentials. Other API
+        // bindings of this profile name share the data-credential index.
+        renewal::logout(&AUTHKIT_STORE, self.origin, Some(organization)).await?;
+        Ok(())
+    }
+}
+
+async fn login_locked(
+    origin: &str,
     organization: Option<&str>,
     choice: OrganizationChoice<'_>,
     stderr: &mut dyn Write,
-) -> Result<Value> {
-    let _lock = coordination::lock(&origin).await?;
-    let cached = renewal::validate_custody(&AUTHKIT_STORE, &origin)?;
-    let config = provider::Config::discover(&origin).await?;
+) -> Result<LoginReceipt> {
+    let cached = renewal::validate_custody(&AUTHKIT_STORE, origin)?;
+    let config = provider::Config::discover(origin).await?;
     let provider = provider::Provider::new(&config)?;
     login_validated(
         &AUTHKIT_STORE,
-        &origin,
+        origin,
         config,
         &provider,
         organization,

@@ -12,6 +12,12 @@ omnigraph login --create-profile research --organization org_example
 omnigraph login --profile work
 ```
 
+If two commands try to create the same profile name, the first to save it
+keeps its sign-in. A failed profile save also preserves any sign-in the CLI
+reused. If the profile file was replaced but the operating system could not
+confirm the change was saved to disk, the CLI reports the error and keeps the
+sign-in with the visible profile.
+
 ## Choose the organization
 
 A profile belongs to one organization. With `--organization ID`, the sign-in is

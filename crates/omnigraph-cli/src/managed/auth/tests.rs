@@ -735,8 +735,20 @@ async fn cached_login_does_not_restart_provider_authorization() {
         )
         .await
         .unwrap();
-        assert_eq!(output["data"]["principal_id"], "principal_one");
-        assert_eq!(output["data"]["refresh_expires_at"], deadline);
+        assert_eq!(output.body["data"]["principal_id"], "principal_one");
+        assert_eq!(output.body["data"]["refresh_expires_at"], deadline);
+        let before = store.0.borrow().clone();
+        let failure = crate::commands::targets::registration_save_error(
+            color_eyre::eyre::eyre!("config edit refused"),
+            output.created_session,
+            async {
+                renewal::logout(&store, &api.origin, Some("org_test")).await?;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(failure.to_string().contains("sign-in preserved"));
+        assert_eq!(*store.0.borrow(), before);
         assert!(provider.requests.lock().unwrap().is_empty());
         api.assert_complete();
     })
@@ -771,7 +783,8 @@ async fn device_login_polls_the_provider_and_never_the_old_broker() {
     )
     .await
     .unwrap();
-    assert_eq!(output["data"]["principal_id"], "principal_one");
+    assert_eq!(output.body["data"]["principal_id"], "principal_one");
+    assert!(output.created_session);
     assert_eq!(transport.requests.lock().unwrap().len(), 4);
     // No organization was named: the sign-in's own is the person's only one.
     assert_eq!(api.requests()[0].path, "/v1/organizations");
@@ -1722,6 +1735,60 @@ async fn fresh_device_selection_refuses_substitutions_without_changing_cached_cu
         })
         .await;
     }
+}
+
+#[tokio::test]
+async fn queued_profile_registration_refuses_before_using_the_winners_session() {
+    let home = tempfile::tempdir().unwrap();
+    let input = crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None);
+    let api = IntentApiFixture::new(vec![]);
+    let race = crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        let owner =
+            crate::operator_routing::registration_auth(&input, "work", &api.origin).unwrap();
+        let first = crate::operator_routing::AUTH
+            .scope(Some(owner), coordination::lock(&api.origin))
+            .await
+            .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let second = crate::commands::targets::onboard(
+            &input,
+            "work",
+            &api.origin,
+            Some("org_test"),
+            OrganizationChoice::Refuse,
+            &mut stdout,
+            &mut stderr,
+        );
+        tokio::pin!(second);
+        assert!(
+            futures::poll!(&mut second).is_pending(),
+            "the second login must wait for the first"
+        );
+
+        let config = input.config_path().unwrap();
+        let winner = json!({
+            "version": 1,
+            "profiles": {"work": {
+                "api": api.origin,
+                "organization_id": "org_test",
+                "auth": {"provider":"omnigraph"}
+            }}
+        })
+        .to_string();
+        std::fs::write(&config, &winner).unwrap();
+        drop(first);
+        let refusal = second.await.unwrap_err();
+        assert!(
+            refusal.to_string().contains("profile already exists"),
+            "{refusal}"
+        );
+        assert_eq!(std::fs::read_to_string(config).unwrap(), winner);
+        api.assert_complete();
+    });
+    coordination::TEST_LOCK_DIRECTORY
+        .scope(home.path().join("locks"), race)
+        .await;
 }
 
 #[tokio::test]

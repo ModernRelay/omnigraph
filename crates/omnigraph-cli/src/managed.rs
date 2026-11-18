@@ -19,7 +19,7 @@ mod deployment;
 mod lifecycle;
 mod members;
 mod organization;
-pub(crate) use auth::{OrganizationChoice, VerifiedIdentity};
+pub(crate) use auth::{OrganizationChoice, ProfileRegistration, VerifiedIdentity};
 
 pub(crate) fn import_custody(
     source: &Path,
@@ -423,28 +423,6 @@ pub(crate) fn credential_status(binding: &Binding) -> Value {
 pub(crate) async fn credential_lock() -> color_eyre::Result<auth::LockGuard> {
     auth::cache_lock("static-credential-edit")
         .await
-        .map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))
-}
-
-pub(crate) async fn register_login(
-    api: String,
-    organization: Option<&str>,
-    choice: OrganizationChoice<'_>,
-    stderr: &mut dyn Write,
-) -> Result<Value> {
-    if let Some(id) = organization {
-        organization_id(id)?;
-    }
-    auth::login(api, organization, choice, stderr).await
-}
-
-pub(crate) async fn discard_registration(
-    api: String,
-    organization: &str,
-) -> color_eyre::Result<()> {
-    auth::logout(api, Some(organization))
-        .await
-        .map(|_| ())
         .map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))
 }
 
