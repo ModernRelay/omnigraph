@@ -968,6 +968,7 @@ gateway_surfaces! {
         "predicted_materialized_blob_batch_bytes",
         "materialize_blob_batch_bounded_with_preflight_cache", "managed_blob_payloads",
         "can_fold_index", "has_foldable_unindexed_fragments", "index_is_vector",
+        "is_degenerate_vector_index", "non_null_vector_count", "target_vector_partitions",
         "plan_table_compaction", "managed_blob_bytes",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [

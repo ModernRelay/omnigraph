@@ -105,10 +105,9 @@ pub(crate) const INSERT_ABSENCE_PROPERTY: &str = "omnigraph.insert_absence";
 pub(crate) const INSERT_ABSENCE_V1: &str = "v1";
 
 const EXTERNAL_BLOB_PROBE_CONCURRENCY: usize = 8;
-/// The IVF partition count the engine builds a declared vector index with.
-/// A fold keeps an index's own count, except for an index that holds no
-/// rows (`TableStore::vector_partition_count`).
-const ENGINE_VECTOR_PARTITIONS: usize = 1;
+/// The minimum and maximum IVF partition count for vector indexes.
+pub(crate) const ENGINE_VECTOR_PARTITIONS_MIN: usize = 1;
+pub(crate) const ENGINE_VECTOR_PARTITIONS_MAX: usize = 4096;
 const EXTERNAL_BLOB_REFERENCE_RESOURCE: &str = "external Blob reference cells";
 const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata bytes";
 
@@ -2136,6 +2135,46 @@ impl TableStore {
         }
     }
 
+    /// Sizes IVF partitions for vector indexes dynamically based on non-null vector row count:
+    /// `clamp(isqrt(rows), 1, 4096).min(rows)`.
+    /// Never exceeds the row count, ensuring k-means has at least 1 training point per centroid.
+    pub(crate) fn target_vector_partitions(rows: usize) -> usize {
+        if rows == 0 {
+            return ENGINE_VECTOR_PARTITIONS_MIN;
+        }
+        rows.isqrt()
+            .clamp(ENGINE_VECTOR_PARTITIONS_MIN, ENGINE_VECTOR_PARTITIONS_MAX)
+            .min(rows)
+    }
+
+    /// Whether an existing vector index with `partitions` IVF partitions is undersized/degenerate
+    /// given the table's current `rows`.
+    /// Catches:
+    /// - Any mono-partition index (`partitions == 1`) when the table has grown to where multi-partitioning
+    ///   is appropriate (`target > 1`, i.e. >= 4 rows).
+    /// - Any index whose partition count has fallen below half the target (`partitions * 2 < target`).
+    pub(crate) fn is_degenerate_vector_index(partitions: usize, rows: usize) -> bool {
+        let target = Self::target_vector_partitions(rows);
+        (partitions == 1 && target > 1) || (partitions * 2 < target)
+    }
+
+    /// Helper to count non-null vector rows in `column`. Fast metadata read for non-nullable
+    /// columns; filtered count for nullable columns.
+    pub(crate) async fn non_null_vector_count(ds: &Dataset, column: &str) -> Result<usize> {
+        let nullable = ds
+            .schema()
+            .field(column)
+            .map(|f| f.nullable)
+            .unwrap_or(true);
+        if !nullable {
+            ds.count_rows(None).await.map_err(OmniError::storage)
+        } else {
+            ds.count_rows(Some(format!("`{column}` IS NOT NULL")))
+                .await
+                .map_err(OmniError::storage)
+        }
+    }
+
     pub(crate) fn with_external_blob_policy(mut self, policy: ExternalBlobPolicy) -> Result<Self> {
         let policy = policy.validated()?;
         policy
@@ -3301,8 +3340,7 @@ impl TableStore {
     /// `segments` covers a fragment holds no rows, and Lance reports no
     /// statistics for it (an empty object per segment): a column patch of
     /// the indexed column withdraws every fragment it touches. Its former
-    /// shape is not in its metadata, so it is rebuilt as a new declared
-    /// vector index is built, with [`ENGINE_VECTOR_PARTITIONS`].
+    /// shape is not in its metadata, so it is rebuilt with [`target_vector_partitions`].
     async fn vector_partition_count(
         ds: &Dataset,
         name: &str,
@@ -3313,7 +3351,8 @@ impl TableStore {
                 .iter()
                 .all(|segment| crate::dataset_index::covers_no_fragment(segment))
         {
-            return Ok(ENGINE_VECTOR_PARTITIONS);
+            let count = ds.count_rows(None).await.unwrap_or(0);
+            return Ok(Self::target_vector_partitions(count));
         }
         fn first_num_partitions(value: &serde_json::Value) -> Option<u64> {
             match value {
@@ -3348,6 +3387,7 @@ impl TableStore {
         }
         let current = crate::dataset_index::current_fragments(ds);
         let mut lag = Vec::new();
+        let mut total_rows: Option<usize> = None;
         for (name, segments) in by_name {
             let coverage =
                 crate::dataset_index::SegmentCoverage::of(segments.iter().copied(), &current);
@@ -3361,8 +3401,28 @@ impl TableStore {
             // A scalar index whose segments together cover every fragment
             // is current. A vector index split into segments (Lance's own
             // fold left deltas, or a partial rebuild) is collapsed into one.
-            if complete && !(vector && segments.len() > 1) {
-                continue;
+            if complete {
+                if !vector {
+                    continue;
+                }
+                if segments.len() <= 1 {
+                    // Check whether this complete vector index has a degenerate
+                    // partition count (e.g. 1 IVF partition over many rows).
+                    let partitions = Self::vector_partition_count(ds, &name, &segments)
+                        .await
+                        .ok();
+                    if let Some(partitions) = partitions {
+                        if total_rows.is_none() {
+                            total_rows = ds.count_rows(None).await.ok();
+                        }
+                        let rows = total_rows.unwrap_or(0);
+                        if !Self::is_degenerate_vector_index(partitions, rows) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
             }
             lag.push(IndexLag {
                 name,
@@ -3450,12 +3510,21 @@ impl TableStore {
             let mut ds_clone = ds.clone();
             let columns = [column.as_str()];
             let built = if item.vector {
-                // Keep the index's partition count: the engine builds one
-                // partition, but a partitioned index (Lance's split, or an
-                // explicit build) keeps its shape across folds.
+                // Keep the index's partition count or resize if undersized:
+                // a partitioned index (Lance's split, or an explicit build)
+                // keeps its shape across folds, but an undersized index
+                // is sized up to the target partition count for the table.
                 let partitions = Self::vector_partition_count(ds, &item.name, &segments).await?;
-                let params =
-                    lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
+                let non_null_rows = match Self::non_null_vector_count(ds, &column).await {
+                    Ok(count) => count,
+                    Err(_) => ds.count_rows(None).await.unwrap_or(0),
+                };
+                let target = Self::target_vector_partitions(non_null_rows);
+                let final_partitions = partitions.max(target);
+                let params = lance::index::vector::VectorIndexParams::ivf_flat(
+                    final_partitions,
+                    MetricType::L2,
+                );
                 ds_clone
                     .create_index_builder(&columns, IndexType::Vector, &params)
                     .name(item.name.clone())
@@ -6056,8 +6125,13 @@ impl TableStore {
                         .await
                 }
                 IndexBuildSpec::Vector { column } => {
+                    let non_null_rows = match Self::non_null_vector_count(&ds_clone, column).await {
+                        Ok(count) => count,
+                        Err(_) => ds_clone.count_rows(None).await.unwrap_or(0),
+                    };
+                    let partitions = Self::target_vector_partitions(non_null_rows);
                     let params = lance::index::vector::VectorIndexParams::ivf_flat(
-                        ENGINE_VECTOR_PARTITIONS,
+                        partitions,
                         MetricType::L2,
                     );
                     let new_idx = ds_clone
@@ -9337,7 +9411,7 @@ mod tests {
             TableStore::vector_partition_count(&ds, "embedding_idx", &[&emptied])
                 .await
                 .unwrap(),
-            ENGINE_VECTOR_PARTITIONS
+            1
         );
         assert_eq!(
             TableStore::vector_partition_count(&ds, "embedding_idx", &[&emptied, &indices[0]])
@@ -9346,6 +9420,36 @@ mod tests {
             2,
             "a segment that covers rows keeps the index's count"
         );
+    }
+
+    #[test]
+    fn target_vector_partitions_and_degeneracy_heuristics() {
+        use super::TableStore;
+
+        // Edge cases and boundaries
+        assert_eq!(TableStore::target_vector_partitions(0), 1);
+        assert_eq!(TableStore::target_vector_partitions(1), 1);
+        assert_eq!(TableStore::target_vector_partitions(2), 1);
+        assert_eq!(TableStore::target_vector_partitions(3), 1);
+        assert_eq!(TableStore::target_vector_partitions(4), 2);
+        assert_eq!(TableStore::target_vector_partitions(9), 3);
+        assert_eq!(TableStore::target_vector_partitions(100), 10);
+        assert_eq!(TableStore::target_vector_partitions(20_000), 141);
+        assert_eq!(TableStore::target_vector_partitions(1_000_000), 1000);
+        assert_eq!(TableStore::target_vector_partitions(16_777_216), 4096);
+        assert_eq!(TableStore::target_vector_partitions(100_000_000), 4096);
+
+        // Degeneracy detection
+        assert!(!TableStore::is_degenerate_vector_index(1, 0));
+        assert!(!TableStore::is_degenerate_vector_index(1, 1));
+        assert!(!TableStore::is_degenerate_vector_index(1, 3));
+        assert!(TableStore::is_degenerate_vector_index(1, 4)); // target 2, 1 partition is degenerate
+        assert!(TableStore::is_degenerate_vector_index(1, 100)); // target 10, 1 partition is degenerate
+        assert!(TableStore::is_degenerate_vector_index(1, 20_000)); // target 141, 1 partition is degenerate
+        assert!(TableStore::is_degenerate_vector_index(50, 20_000)); // target 141, 50 * 2 < 141 is degenerate
+        assert!(!TableStore::is_degenerate_vector_index(80, 20_000)); // target 141, 80 * 2 >= 141 is healthy
+        assert!(!TableStore::is_degenerate_vector_index(141, 20_000)); // target 141, exactly target is healthy
+        assert!(!TableStore::is_degenerate_vector_index(200, 20_000)); // above target is healthy
     }
 
     #[tokio::test]
