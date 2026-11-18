@@ -1030,10 +1030,13 @@ pub async fn assert_relocated_root_serves_every_branch(source: &str, copies: &[S
         .await
         .unwrap();
         let cleaned = db
-            .cleanup(omnigraph::db::CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: None,
-            })
+            .cleanup_as(
+                omnigraph::db::CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert!(cleaned.iter().all(|row| row.error.is_none()), "{cleaned:?}");

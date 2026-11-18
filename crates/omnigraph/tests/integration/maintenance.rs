@@ -6088,7 +6088,7 @@ async fn cleanup_on_a_relocated_root_keeps_retained_branches_and_tagged_snapshot
     std::fs::remove_dir_all(&original).unwrap();
 
     let db = Omnigraph::open(moved.to_str().unwrap()).await.unwrap();
-    let rows = db.cleanup(keep_one()).await.unwrap();
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     drop(db);
 
