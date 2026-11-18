@@ -44,8 +44,10 @@ accept local paths and `file://` URIs and, with the server stopped, an inline
 [S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
 Every direct writer on the root (`cluster apply`, maintenance) takes the
 cluster's admission lock. Maintenance keeps it after it finishes; `cluster
-apply` releases it when its deployment converges and every write it sent has
-settled, and keeps it otherwise. `cluster plan` and
+apply` releases it after convergence and settlement on local storage and S3.
+If release is unconfirmed, compare the apply's admission ID with the current
+holder before taking any recovery action. Reading a recorded deployment ID
+leaves the lock unchanged. `cluster plan` and
 `cluster status` only observe the lock, and `cluster status --json` reports the
 current holder's `lock_id`. Before the next writer or the server starts,
 establish that the holder has stopped and its I/O has settled, then release
@@ -61,7 +63,7 @@ mkdir -p ./company-data
 omnigraph cluster validate --config ./company-brain
 omnigraph cluster plan --target ./company-data --config ./company-brain --json
 omnigraph cluster apply --target ./company-data --config ./company-brain --as act-alice --json
-# A converged apply has released its lock; start the server.
+# Start the server after apply confirms success.
 omnigraph-server --cluster file:///absolute/company-data --bind 127.0.0.1:8080 --unauthenticated
 ```
 
@@ -72,8 +74,8 @@ The CLI prints the resolved target on stderr before execution. `.` in
 plan and apply default that source path to `.`.
 
 Direct apply creates graphs, not rows; use `load` or `mutate` for data. It
-releases its admission lock only when the deployment converges and its writes
-have settled, and never on Azure; otherwise it keeps that exact lock. Before an
+releases its admission lock after convergence and settlement on local storage
+and S3. An unconverged writable apply or a writable apply on Azure retains admission. Before an
 exact-ID unlock of a kept lock, exclude other writers and establish prior I/O
 settlement. A lock is cooperative exclusion,
 not fencing for older binaries or raw storage tools. Azure writers also require

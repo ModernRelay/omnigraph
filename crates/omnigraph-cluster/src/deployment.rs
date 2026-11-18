@@ -349,7 +349,10 @@ impl DeploymentId {
 }
 
 pub(crate) fn refusal(code: &str, message: impl Into<String>) -> Diagnostic {
-    let mut message = message.into();
+    Diagnostic::error(code, CLUSTER_STATE_FILE, bounded_message(message.into()))
+}
+
+fn bounded_message(mut message: String) -> String {
     const SUFFIX: &str = " [truncated]";
     if message.len() > MAX_DIAGNOSTIC_BYTES {
         let mut end = MAX_DIAGNOSTIC_BYTES - SUFFIX.len();
@@ -359,7 +362,7 @@ pub(crate) fn refusal(code: &str, message: impl Into<String>) -> Diagnostic {
         message.truncate(end);
         message.push_str(SUFFIX);
     }
-    Diagnostic::error(code, CLUSTER_STATE_FILE, message)
+    message
 }
 
 fn encoded_size(value: &impl Serialize) -> Result<usize, Diagnostic> {

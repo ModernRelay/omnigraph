@@ -73,13 +73,11 @@ Fresh apply creates the ledger and declared graphs in the selected root, capture
 source bytes before execution and prints the original `Deployment-ID` with exact
 outcomes. Use `load` or `mutate` for rows.
 
-A direct apply whose deployment converges releases its admission lock when it
-returns, after every write it sent has settled, so the server can start next.
-An apply that fails, does not converge or cannot prove its writes settled, and
-any apply on Azure, keeps the lock: `cluster status --json` then reports its
-`lock_id`. Establish that the owner and its accepted I/O have settled, then
-follow [ownership transfer](../deployment.md#writer-topology) with that exact
-ID before starting the server.
+A writable direct apply on local storage or S3 releases admission after convergence and write settlement.
+If release is unconfirmed, compare the diagnostic's admission ID with the current `lock_id`
+from `cluster status --json` on the same root. Only a matching ID belongs to that apply. Reading the receipt again leaves the lock unchanged.
+A writable apply retains admission on Azure, on failure to converge, or with unsettled writes.
+For a retained lock, follow [ownership transfer](../deployment.md#writer-topology) before starting the server.
 
 ```bash
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-alice":"secret"}' \

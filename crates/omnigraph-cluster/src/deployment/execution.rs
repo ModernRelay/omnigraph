@@ -1704,8 +1704,12 @@ async fn apply_direct_bundle(
             }
         };
     }
+    // A writable deployment can hand the root to a successor only after
+    // convergence on a backend with tracked I/O. Azure retains admission.
     match result {
-        Ok(DeploymentLookup::Complete { result }) if result.converged => {
+        Ok(DeploymentLookup::Complete { result })
+            if result.converged && admission.io_scope().is_some() =>
+        {
             release_converged_deployment(admission, &result.id).await?;
             Ok(DeploymentLookup::Complete { result })
         }
@@ -1713,27 +1717,17 @@ async fn apply_direct_bundle(
     }
 }
 
-/// A converged direct deployment hands its root to the next owner by the
-/// proof a clean server shutdown uses (#1359): its storage scope closes with
-/// every accepted request settled and none uncertain. Without a tracked scope
-/// (Azure keeps its stopped-process boundary) the lock stays held, as does a
-/// failed, outstanding or unconverged deployment, for exact-ID reconciliation.
-async fn release_converged_deployment(
+pub(super) async fn release_converged_deployment(
     admission: ClusterAdmission,
     deployment_id: &str,
 ) -> Result<(), Diagnostic> {
-    if admission.io_scope().is_none() {
-        return Ok(());
-    }
     let lock_id = admission.lock_id().to_owned();
-    admission.release_after_settlement().await.map_err(|error| {
-        refusal(
-            &error.code,
-            format!(
-                "deployment {deployment_id} converged, but admission {lock_id} remains held: {}",
-                error.message
-            ),
-        )
+    admission.release_after_settlement().await.map_err(|mut error| {
+        error.message = bounded_message(format!(
+            "deployment {deployment_id} converged. Could not confirm release of admission {lock_id}. Compare this ID with the current lock in cluster status --json. {}",
+            error.message
+        ));
+        error
     })
 }
 
@@ -1992,8 +1986,7 @@ pub(super) async fn execute_captured_deployment_in_store(
         cas = replace(store, &mut state, &cas).await?;
     }
     let result = finish(store, &mut state, &cas, bundle).await?;
-    // Exact publication is not a proof that all accepted native/control I/O
-    // has stopped. Retain admission until explicit operator quiescence/unlock.
+    // Admission still belongs to the caller, who owns storage settlement.
     Ok(DeploymentLookup::Complete { result })
 }
 

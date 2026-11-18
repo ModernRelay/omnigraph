@@ -604,7 +604,22 @@ async fn lost_release_acknowledgement_never_replays_over_the_successor() {
         adapter.arm(Point::Release, fault);
         match fault {
             Fault::LostResponse => {
-                assert!(owner.release_after_settlement().await.is_err());
+                let error = crate::deployment::execution::release_converged_deployment(
+                    owner,
+                    &receipt.deployment_id,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.code, "cluster_admission_release_failed");
+                assert!(error.message.contains(&receipt.deployment_id), "{error:?}");
+                assert!(error.message.contains(&old_id), "{error:?}");
+                assert!(
+                    error.message.contains("lost after backend commit"),
+                    "{error:?}"
+                );
+                assert!(error.message.contains("cluster status"), "{error:?}");
+                assert!(!error.message.contains("remains held"), "{error:?}");
+                assert_eq!(error.path, CLUSTER_LOCK_FILE);
             }
             Fault::CancelAfterCommit => {
                 let release = owner.release_after_settlement();

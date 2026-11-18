@@ -297,10 +297,10 @@ admits only reconciliation of its exact original ID.
 Keep older binaries, raw storage tools and embedded writers outside this
 cooperating boundary stopped; the lock cannot fence their native storage I/O.
 
-Admission remains held after an ordinary direct write command succeeds. A
-converged direct `cluster apply` and a clean server shutdown release it with the
-bounded proof described above; work without that proof, or on Azure, retains
-admission. A completed read-only preflight refusal during new deployment, conversion or admission construction
+Ordinary direct writes retain admission. A converged local or S3 direct `cluster apply` closes its storage scope
+and waits for accepted writes to settle before releasing admission. A clean server shutdown bounds that wait by its deadline.
+For an unconfirmed release, see [direct apply recovery](clusters/index.md#bootstrap-a-cluster). Writable Azure operations retain admission.
+A completed read-only preflight refusal during new deployment, conversion or admission construction
 releases its admission. Recovery of accepted work, cancellation and uncertain
 effects retain it. A finished response, zero active HTTP
 requests, lock age or a stopped PID alone does not prove that previously

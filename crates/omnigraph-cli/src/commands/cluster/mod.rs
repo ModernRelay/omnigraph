@@ -319,10 +319,14 @@ pub(crate) async fn apply_source(
     let mut custody = None;
     let mut custody_report = Ok(());
     let result = omnigraph_cluster::apply_deployment_with_binding(
-        config, binding, requested_id, caller,
+        config,
+        binding,
+        requested_id,
+        caller,
         |id, root, lock| {
             let root = omnigraph::storage::redacted_storage_uri(root);
-            let message = format!("Deployment-ID: {id}\nCluster-root: {root}\nAdmission lock: {lock}; released when the deployment converges and its writes settle (never on Azure), else retained: after prior work is quiescent, exact-ID force-unlock");
+            let message =
+                format!("Deployment-ID: {id}\nCluster-root: {root}\nAdmission lock: {lock}");
             custody_report = (|| -> Result<()> {
                 writeln!(stderr, "{message}")?;
                 stderr.flush()?;
@@ -330,7 +334,8 @@ pub(crate) async fn apply_source(
             })();
             custody = Some(message);
         },
-    ).await;
+    )
+    .await;
     let outcome_report = finish_core_deployment(result, json, stdout);
     let reports = finish_deployment_reports(outcome_report, custody_report);
     match custody {
