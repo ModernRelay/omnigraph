@@ -846,7 +846,7 @@ async fn optimize_rewrite_keeps_index_coverage_so_index_rows_count_only_a_laggin
                 .await
                 .unwrap();
             let doc = report
-                .tables
+                .datasets
                 .iter()
                 .find(|stat| stat.type_key == "node:Doc")
                 .unwrap();
@@ -865,7 +865,7 @@ async fn optimize_rewrite_keeps_index_coverage_so_index_rows_count_only_a_laggin
             .unwrap();
         assert!(
             report
-                .tables
+                .datasets
                 .iter()
                 .any(|stat| stat.type_key == "node:Doc" && stat.committed()),
             "a run without the ceiling optimizes it after the {write}: {report:?}"
@@ -938,7 +938,7 @@ async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
             .await
             .unwrap();
         let mut checked = 0;
-        for stat in &report.tables {
+        for stat in &report.datasets {
             if !["node:Company", "node:Person"].contains(&stat.type_key.as_str()) {
                 continue;
             }
@@ -3268,7 +3268,7 @@ query patch($v: Vector(4)?) {
         .optimize_as(None, OptimizeRequest::default())
         .await
         .unwrap();
-    for table in &optimized.tables {
+    for table in &optimized.datasets {
         assert_ne!(
             table.outcome,
             TableOptimizeOutcome::Failed,
