@@ -19,10 +19,12 @@ judged by it, so `--as` names an actor the policy grants the command
 (`maintain` for `optimize`, `reclaim` for `cleanup`); see
 [direct writes](policy.md#actor-identity).
 
-Every direct writer on a root takes the cluster's admission lock and keeps it
-after it finishes, as a direct `cluster apply` does. A stopped server's lock
-blocks the first direct command, and each command's lock blocks the next one
-and the server's boot. Read the held `lock_id` from `cluster status --json`,
+Every direct writer on a root takes the cluster's admission lock. A
+maintenance command keeps it after it finishes. A `cluster apply` releases it
+after convergence and settlement. If release is unconfirmed, follow
+[direct apply recovery](../clusters/index.md#bootstrap-a-cluster).
+A stopped server's lock blocks the first direct command,
+and each kept lock blocks the next command and the server's boot. Read the held `lock_id` from `cluster status --json`,
 establish that its owner has settled, and release that exact ID with
 `cluster force-unlock` before the next writer or the server starts.
 
