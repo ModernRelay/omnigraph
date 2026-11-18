@@ -157,7 +157,7 @@ query prolific($least: I64) {
   (`$x.number in ["A-1", "A-2"]`); the right side is a list of the value's type (`T7`).
   A list literal holds literals (`[-1, 2]`) and non-null scalar parameters of one declared type, its element type (`[$a, $b, "A-3"]`); no element is cast (`T53`), a list or nullable parameter, a binding or a `let` name is `T7`, and `[-$a]` does not parse.
   On a matched binding's property either list filters that binding's scan.
-  An empty list has no member: `in` keeps no row, `not (... in [])` keeps the rows whose value is not null.
+  An empty list has no member: `in` keeps no row, `not (... in [])` keeps the rows whose value is not null. `[]` takes its element type from its context (the property it is assigned to, the other operand, `coalesce`'s other argument); where nothing fixes it, it is `T7`.
 - `contains($x.title, "graph")` tests exact, case-sensitive substring
   containment when `title` is a String.
 - `starts_with($x.title, "Omni")` tests an exact, case-sensitive prefix.

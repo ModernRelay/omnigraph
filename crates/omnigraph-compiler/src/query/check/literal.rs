@@ -38,6 +38,12 @@ pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
             Literal::List(items) => {
                 let mut scalar = None;
                 for item in items {
+                    if matches!(item, Literal::List(_)) {
+                        return Err(CompilerError::typed(
+                            T52,
+                            "nested list literals are not supported".to_string(),
+                        ));
+                    }
                     let item_type = literal_type(item)?;
                     if matches!(item, Literal::Null) {
                         continue;
@@ -65,10 +71,16 @@ pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
                         }
                     });
                 }
-                Ok(PropType::list_of(
-                    scalar.unwrap_or(ScalarType::String),
-                    false,
-                ))
+                // A list with no non-null element has no element type of
+                // its own: its context fixes one, and the checker types it
+                // there before it reaches this function.
+                let Some(scalar) = scalar else {
+                    return Err(CompilerError::typed(
+                        T7,
+                        "nothing fixes the element type of this empty list".to_string(),
+                    ));
+                };
+                Ok(PropType::list_of(scalar, false))
             }
         }
     })

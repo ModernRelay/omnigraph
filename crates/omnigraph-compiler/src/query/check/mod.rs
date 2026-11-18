@@ -1697,9 +1697,13 @@ fn param_types(decl: &str, params: &[Param]) -> R<Vec<(String, PropType)>> {
                     }
                 };
             }
-            // A default is a value of the declared type, in its range.
-            let lt = literal_type(&lit)?;
-            check_literal_type(&lit, &lt, &ty, &p.name)?;
+            // A default is a value of the declared type, in its range; a
+            // `[]` takes the declared list type.
+            let untyped_list = matches!(&lit, Literal::List(items) if items.iter().all(|i| matches!(i, Literal::Null)));
+            if !(untyped_list && ty.list) {
+                let lt = literal_type(&lit)?;
+                check_literal_type(&lit, &lt, &ty, &p.name)?;
+            }
         }
         out.push((p.name.clone(), ty));
     }
@@ -5266,6 +5270,21 @@ impl Ctx<'_> {
             }
             return Ok(AssignValue::Null);
         }
+        if is_untyped_list(value) {
+            // The property fixes the element type of a `[]`.
+            if !pt.list {
+                return Err(err(
+                    T3,
+                    format!(
+                        "property `{prop}` has type {} but got a list",
+                        pt.display_name()
+                    ),
+                ));
+            }
+            return Ok(AssignValue::Expr(
+                untyped_list_as(value, &Ty::Value(pt.clone()))?.to_ir(),
+            ));
+        }
         if let Expr::Literal(l) = value {
             let lt = literal_type(l)?;
             check_literal_type(l, &lt, pt, prop)?;
@@ -5610,6 +5629,7 @@ impl Ctx<'_> {
                     )));
                 }
                 Expr::Literal(Literal::Null) => return Err(untyped_null_refusal()),
+                e if is_untyped_list(e) => return Err(untyped_list_refusal()),
                 Expr::Literal(l) => SExpr::new(SKind::Lit(l.clone()), Ty::Value(literal_type(l)?)),
                 Expr::List {
                     elements,
@@ -5847,6 +5867,31 @@ impl Ctx<'_> {
                     left,
                     right,
                     at: written,
+                } if is_untyped_list(left) != is_untyped_list(right) => {
+                    // A `[]` takes the other operand's type.
+                    let list_is_left = is_untyped_list(left);
+                    let (list, other) = if list_is_left {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    let other = self
+                        .expr(sc, other, sub)
+                        .map_err(|e| at_operand(e, other, written))?;
+                    let list =
+                        untyped_list_as(list, &other.ty).map_err(|e| at_written(e, written))?;
+                    let compared = if list_is_left {
+                        compare(*op, list, other)
+                    } else {
+                        compare(*op, other, list)
+                    };
+                    compared.map_err(|e| at_written(e, written))?
+                }
+                Expr::Compare {
+                    op,
+                    left,
+                    right,
+                    at: written,
                 } => {
                     // A refusal inside a comparison is placed at it.
                     let l = self
@@ -5904,9 +5949,27 @@ impl Ctx<'_> {
                     let n = self
                         .expr(sc, needle, sub)
                         .map_err(|e| at_operand(e, needle, written));
-                    let l = self
-                        .expr(sc, list, sub)
-                        .map_err(|e| at_operand(e, list, written));
+                    let l = if is_untyped_list(list) {
+                        // A `[]` takes the needle's type as its element type.
+                        match &n {
+                            Ok(SExpr {
+                                ty: Ty::Value(t), ..
+                            }) if !t.list => untyped_list_as(
+                                list,
+                                &Ty::Value(PropType::list_of(t.scalar, false)),
+                            ),
+                            Ok(_) => Err(untyped_list_refusal()),
+                            // The needle's own refusal is reported; this
+                            // stand-in is never read.
+                            Err(_) => Ok(SExpr::new(
+                                SKind::Lit(untyped_list_literal(list)),
+                                Ty::Value(PropType::list_of(ScalarType::String, false)),
+                            )),
+                        }
+                    } else {
+                        self.expr(sc, list, sub)
+                            .map_err(|e| at_operand(e, list, written))
+                    };
                     let (n, l) = self.both(sc, n, l)?;
                     literal_in_against_property(&n, &l, written)?;
                     let l = match &n.ty {
@@ -6134,7 +6197,7 @@ impl Ctx<'_> {
                 .iter()
                 .enumerate()
                 .filter(|(position, a)| {
-                    matches!(a, Arg::Expr(e) if is_untyped_null(e))
+                    matches!(a, Arg::Expr(e) if is_untyped_null(e) || is_untyped_list(e))
                         && match name {
                             "if" => *position > 0,
                             "coalesce" => true,
@@ -6245,7 +6308,11 @@ impl Ctx<'_> {
                     let Some(Arg::Expr(e)) = c.args.get(position) else {
                         unreachable!("a deferred argument is an expression")
                     };
-                    let typed = self.null_as(sc, e, &want)?;
+                    let typed = if is_untyped_list(e) {
+                        untyped_list_as(e, &Ty::Value(want.clone()))?
+                    } else {
+                        self.null_as(sc, e, &want)?
+                    };
                     args.insert(position.min(args.len()), typed);
                 }
             }
@@ -8011,6 +8078,58 @@ fn is_untyped_null(e: &Expr) -> bool {
             _ => false,
         }
     })
+}
+
+/// Whether `e` is a list literal with no non-null element, `[]`, whose
+/// element type only its context can fix, as a list literal's elements fix
+/// theirs: the property it is assigned to, the other operand of a
+/// comparison, the needle of `in`, the other branch of `if` or another
+/// argument of `coalesce`.
+fn is_untyped_list(e: &Expr) -> bool {
+    match e {
+        Expr::List { elements, .. } => elements
+            .iter()
+            .all(|x| matches!(x, Expr::Literal(Literal::Null))),
+        Expr::Literal(Literal::List(items)) => items.iter().all(|x| matches!(x, Literal::Null)),
+        _ => false,
+    }
+}
+
+/// The literal an [`is_untyped_list`] expression writes.
+fn untyped_list_literal(e: &Expr) -> Literal {
+    match e {
+        Expr::List { elements, .. } => Literal::List(vec![Literal::Null; elements.len()]),
+        Expr::Literal(l) => l.clone(),
+        _ => unreachable!("`is_untyped_list` admits list literals only"),
+    }
+}
+
+/// `e`, an [`is_untyped_list`] literal, as a value of the list type `want`
+/// its context fixes; a context that is not a list refuses it.
+fn untyped_list_as(e: &Expr, want: &Ty) -> R<SExpr> {
+    match want {
+        Ty::Value(t) if t.list => Ok(SExpr::new(
+            SKind::Lit(untyped_list_literal(e)),
+            Ty::Value(PropType::list_of(t.scalar, false)),
+        )),
+        other => Err(err(
+            T7,
+            format!(
+                "an empty list is not a value of {}, the type its context reads",
+                other.display()
+            ),
+        )),
+    }
+}
+
+/// An empty list whose element type nothing fixes (the GQ 3 RFC, section 5,
+/// and section 7's list rule).
+fn untyped_list_refusal() -> E {
+    err_fix(
+        T7,
+        "nothing fixes the element type of this empty list: `[]` is a value where the property it is assigned to, the other operand of a comparison or `in`, the other branch of `if` or another argument of `coalesce` gives it a type",
+        "a list parameter of the intended type, `$xs: [<Type>]`, bound to `[]`",
+    )
 }
 
 /// A `null` whose type nothing fixes (the GQ 3 RFC, section 5).

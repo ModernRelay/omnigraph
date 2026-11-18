@@ -451,7 +451,10 @@ and non-null scalar parameters of one declared type, the list's element type:
 is cast, so `[$a, $b]` with `$a: I32` and `$b: I64`, or a literal of another
 type, is `T53`; a list or nullable parameter, a binding or a `let` name as an
 element is `T7`, and `[-$a]` does not parse. The same list may be a `nearest`
-or `distance` query vector, `[$x, $y, 0.0]`.
+or `distance` query vector, `[$x, $y, 0.0]`. An empty `[]` takes its element
+type from its context: the property it is assigned to (`set { tags: [] }` on
+any list property), the other operand of `in`, or `coalesce`'s other
+argument; with no such context it is `T7`.
 
 ```gq fragment
 match { $p: Person }

@@ -61,14 +61,7 @@ query empty_list_literal() {
     return { [] as empty }
 }
 
---- expect unordered
-{"empty":[]}
-
---- expect shape
-empty: [String]
-
---- expect plan
-result columns [empty: [String]]
+--- expect error: T7: nothing fixes the element type of this empty list
 
 --- query
 query incompatible_list_literal() {
