@@ -86,6 +86,18 @@ Optional fields:
 | `queries` | Stored-query files, directories, or explicit name mappings |
 | `embedding_provider` | Name under `providers.embedding` |
 | `external_blobs` | Allow-list for new external Blob references |
+| `restore_from` | SHA-256 of a sealed full-history restore receipt for this graph's first creation |
+
+A configuration manager can register a prepared history as the first graph
+after an empty cluster's bootstrap. The storage owner first reserves the
+destination, stages the stopped graph copy and seals the exact receipt.
+Set `restore_from` to the 64-character lowercase hash of those receipt bytes
+and declare the matching schema. The seal records offline verification of the
+commits and historical table versions. Plan and apply check the destination
+ledger, schema identity and every current branch head against that seal. A successful
+deployment records a `restored` outcome with the receipt hash. Later deployments
+can omit `restore_from`. A registered graph keeps its current history during
+configuration updates. Ordinary creation still refuses occupied storage.
 
 Query declarations support three forms:
 

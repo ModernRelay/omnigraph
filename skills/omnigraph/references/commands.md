@@ -49,7 +49,7 @@ prints the exact flags of the installed binary.
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
-| `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
+| `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `verify-restore` `prepare-restore` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
 | `organization` | `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
@@ -224,8 +224,9 @@ written format. `schema upgrade-system-columns` is a separate step on a graph
 this binary serves: it respells the legacy
 `id`/`src`/`dst` system columns and requires only `main` and no user property
 starting with `_`. Both are standalone, offline operations: stop every process
-using the graph and keep a verified whole-root backup; cluster-managed roots
-refuse. Read
+using the graph and keep a verified whole-root backup. Older builds can still
+read branch files from their original path. Verify any relocated copy with
+access to the original disabled. Cluster-managed roots refuse conversion. Read
 [converting a graph](migrations.md#convert-a-v8-v9-or-v13-graph) before
 executing.
 
@@ -518,6 +519,10 @@ are mutually exclusive. Managed targets use their pinned profile; global/default
 profiles cannot override it. Standalone targets own one auth provider; different
 identities use different targets. There is no `--auth` selector or last-used identity.
 `--config DIR` supplies deployment source and never routes a command.
+
+For a full-history restore, storage owners use `cluster verify-restore GRAPH`
+and `cluster prepare-restore --descriptor FILE` with an explicit cluster root.
+See [Restore a graph with its history](../../../docs/user/operations/restore-history.md).
 
 Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and

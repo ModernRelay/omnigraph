@@ -909,6 +909,17 @@ fn load_desired_captured(
     }
 
     for (graph_id, graph) in &raw.graphs {
+        if graph
+            .restore_from
+            .as_deref()
+            .is_some_and(|digest| !authorization::valid_digest(digest))
+        {
+            diagnostics.push(Diagnostic::error(
+                "restore_receipt_invalid",
+                format!("graphs.{graph_id}.restore_from"),
+                "expected a lowercase SHA-256 receipt digest",
+            ));
+        }
         validate_id(
             "graph id",
             &format!("graphs.{graph_id}"),

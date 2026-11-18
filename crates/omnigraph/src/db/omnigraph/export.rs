@@ -5,6 +5,9 @@ use lance_core::is_system_column;
 use omnigraph_compiler::SYSTEM_COLUMNS_META;
 use std::future::Future;
 
+mod restore_blobs;
+pub(super) use restore_blobs::RestoreBlobCache;
+
 /// Initial row estimate used by Lance's byte-targeted export scanner.
 pub(super) const EXPORT_SCAN_TARGET_ROWS: usize = 8_192;
 /// Approximate decoded Arrow byte target for one export scanner batch.
@@ -458,6 +461,87 @@ where
     chunks.flush().await
 }
 
+/// Hash stable-ID-ordered logical rows. Every managed Blob contributes its length and
+/// the SHA-256 of its complete verified payload at that exact position in the row.
+pub(super) async fn restored_table_digest(
+    dataset: &Dataset,
+    catalog: &Catalog,
+    table: &crate::db::DatasetEntry,
+    blobs: &mut RestoreBlobCache,
+    total_bytes: &mut u64,
+    max_bytes: u64,
+) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    let mut rows = 0_u64;
+    let mut hash_chunk = |chunk: Vec<u8>| {
+        *total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+        rows += chunk.iter().filter(|&&b| b == b'\n').count() as u64;
+        digest.update(&chunk);
+        std::future::ready(if *total_bytes > max_bytes {
+            Err(OmniError::resource_limit(
+                "restore_export_bytes",
+                max_bytes,
+                *total_bytes,
+            ))
+        } else {
+            Ok(())
+        })
+    };
+    let mut chunks = ExportChunks {
+        emit: &mut hash_chunk,
+        pending: Vec::new(),
+    };
+    let properties = blob_properties_for_table_key(catalog, &table.type_key)?;
+    let mut ordered = ordered_export_cursor(dataset, &table.type_key, catalog).await?;
+    while let Some(batch) = ordered.next_ordered_batch().await? {
+        let values = if properties.is_empty() {
+            None
+        } else {
+            Some(blobs.verified_values(dataset, &batch, properties).await?)
+        };
+        emit_export_rows_from_batch(
+            catalog,
+            &table.type_key,
+            &batch,
+            values.as_ref(),
+            &mut chunks,
+        )
+        .await?;
+    }
+    chunks.flush().await?;
+    if rows != table.entity_count {
+        return Err(OmniError::manifest(
+            "restored table row count differs from its snapshot",
+        ));
+    }
+    Ok(digest.finalize().into())
+}
+
+async fn ordered_export_cursor(
+    dataset: &Dataset,
+    table_key: &str,
+    catalog: &Catalog,
+) -> Result<OrderedRowCursor> {
+    OrderedRowCursor::open(
+        Some(dataset.clone()),
+        KeyOrder {
+            key_batch_rows: EXPORT_SCAN_TARGET_ROWS,
+            key_batch_bytes: EXPORT_SCAN_TARGET_BYTES,
+            chunk_rows: EXPORT_SCAN_TARGET_ROWS,
+            chunk_bytes: EXPORT_SCAN_TARGET_BYTES,
+            ..KeyOrder::full()
+        },
+        WalkSubject {
+            operation: "export",
+            table: table_key.to_string(),
+            role: "export",
+        },
+        catalog.system_columns.id,
+    )
+    .await
+}
+
 fn export_type_keys(snapshot: &Snapshot, type_names: &[String]) -> Result<Vec<String>> {
     let available = snapshot
         .datasets()
@@ -522,23 +606,7 @@ where
         // complete-row sort fails on a row wider than the ordered-scan sort
         // cap, and on an ordinary row arriving as a slice of a larger decoded
         // batch.
-        let mut rows = OrderedRowCursor::open(
-            Some(source_ds.clone()),
-            KeyOrder {
-                key_batch_rows: EXPORT_SCAN_TARGET_ROWS,
-                key_batch_bytes: EXPORT_SCAN_TARGET_BYTES,
-                chunk_rows: EXPORT_SCAN_TARGET_ROWS,
-                chunk_bytes: EXPORT_SCAN_TARGET_BYTES,
-                ..KeyOrder::full()
-            },
-            WalkSubject {
-                operation: "export",
-                table: table_key.to_string(),
-                role: "export",
-            },
-            catalog.system_columns.id,
-        )
-        .await?;
+        let mut rows = ordered_export_cursor(source_ds, table_key, catalog).await?;
         while let Some(batch) = rows.next_ordered_batch().await? {
             emit_export_batch(
                 source_ds,
@@ -680,6 +748,8 @@ pub(crate) enum RangedExternalBlobs {
     /// Return the exact reference as [`LogicalBlobValue::RangedExternal`],
     /// which the row renderers describe as `{"uri", "offset", "length"}`.
     Describe,
+    /// Full-history restoration requires every Blob to be owned by this graph.
+    RequireManaged,
 }
 
 /// The ranged external Blob cells of row `row` of `blob_values`, by property.
@@ -1214,6 +1284,9 @@ fn classify_blob_cells(
                     length,
                 };
                 ClassifiedBlobCell::Decided(Some(match (reference.whole_object_uri(), ranged) {
+                    (_, RangedExternalBlobs::RequireManaged) => {
+                        return Err(OmniError::manifest("full-history restore requires self-contained Blob data"));
+                    }
                     (Ok(_), _) => LogicalBlobValue::Text(reference.uri),
                     (Err(_), RangedExternalBlobs::Describe) => {
                         LogicalBlobValue::RangedExternal(reference)

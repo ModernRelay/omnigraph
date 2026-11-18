@@ -253,8 +253,9 @@ refuses to open it and names the required release line. Follow the qualified
 explicit routes in [Upgrading](upgrade.md) to preserve graph identity and history;
 normal open does not migrate or reset the graph.
 
-Do not edit internal metadata or copy files from individual backing datasets
-between graph roots.
+If a copied root reports a missing object or refers to an outside dataset,
+restore the whole root from a verified backup. Individual dataset files and
+internal metadata must stay together. See [copying a graph root](../concepts/storage.md#copying-a-graph-root).
 
 ## Cluster failures
 

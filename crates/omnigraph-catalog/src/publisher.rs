@@ -1984,7 +1984,7 @@ impl GraphNamespacePublisher {
                             readback_err,
                         ));
                     }
-                    match dataset.checkout_version(new_manifest_version).await {
+                    match crate::layout::checkout_manifest(&dataset, new_manifest_version).await {
                         Ok(reloaded) => match read_manifest_rows(&reloaded).await {
                             Ok(rows) => {
                                 // Read the attempted immutable version on the captured
@@ -2208,13 +2208,11 @@ impl GraphNamespacePublisher {
         if let Err(readback_err) = fail(&PUBLISH_READ_BACK) {
             return in_doubt(&readback_err);
         }
-        let attempted = match dataset
-            .checkout_version(dataset.version().version + 1)
-            .await
-        {
-            Ok(attempted) => attempted,
-            Err(readback_err) => return in_doubt(&readback_err),
-        };
+        let attempted =
+            match crate::layout::checkout_manifest(dataset, dataset.version().version + 1).await {
+                Ok(attempted) => attempted,
+                Err(readback_err) => return in_doubt(&readback_err),
+            };
         let rows = match read_manifest_rows(&attempted).await {
             Ok(rows) => rows,
             Err(scan_err) => return in_doubt(&scan_err),
@@ -2366,10 +2364,12 @@ impl GraphNamespacePublisher {
                          '{captured_head_commit_id}'"
                     )));
                 }
-                let detached = dataset
-                    .checkout_version(Ref::Version(native_branch.clone(), Some(*detached_version)))
-                    .await
-                    .map_err(OmniError::storage)?;
+                let detached = crate::layout::checkout_manifest(
+                    &dataset,
+                    Ref::Version(native_branch.clone(), Some(*detached_version)),
+                )
+                .await
+                .map_err(OmniError::storage)?;
                 let rows = read_manifest_rows(&detached).await?;
                 if rows.head.graph_commit_id != *base_commit_id {
                     return Err(OmniError::manifest_internal(format!(
@@ -2506,13 +2506,12 @@ impl GraphNamespacePublisher {
             if latest.version == captured_manifest_version {
                 return Ok(());
             }
-            let current = dataset
-                .checkout_version(Ref::Version(
-                    property.native_branch.clone(),
-                    Some(latest.version),
-                ))
-                .await
-                .map_err(OmniError::storage)?;
+            let current = crate::layout::checkout_manifest(
+                &dataset,
+                Ref::Version(property.native_branch.clone(), Some(latest.version)),
+            )
+            .await
+            .map_err(OmniError::storage)?;
             let head = read_manifest_rows_projected(&current).await?.head;
             if head.graph_commit_id != captured_head_commit_id {
                 return Err(OmniError::manifest_read_set_changed(

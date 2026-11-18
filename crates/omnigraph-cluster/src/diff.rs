@@ -21,6 +21,7 @@ pub(crate) fn diff_resources(
                 metadata_change: None,
                 migration: None,
                 delete_root: None,
+                restore_from: None,
             }),
             Some(before) if before != after => changes.push(PlanChange {
                 resource: address.clone(),
@@ -33,6 +34,7 @@ pub(crate) fn diff_resources(
                 metadata_change: None,
                 migration: None,
                 delete_root: None,
+                restore_from: None,
             }),
             Some(_) => {}
         }
@@ -50,6 +52,7 @@ pub(crate) fn diff_resources(
                 metadata_change: None,
                 migration: None,
                 delete_root: None,
+                restore_from: None,
             });
         }
     }
@@ -99,6 +102,7 @@ pub(crate) fn diff_state_resources(
                 metadata_change: Some(metadata_change),
                 migration: None,
                 delete_root: None,
+                restore_from: None,
             });
         }
     }

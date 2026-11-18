@@ -161,8 +161,8 @@ impl SnapshotDataset {
         self.inner.has_raw_index_section()
     }
 
-    /// Whether this pinned table version depends on files outside its dataset
-    /// root through Lance's `base_paths` relocation mechanism.
+    /// Whether this pinned table version carries a Lance base outside the
+    /// graph root: a base that is not a graph-internal branch base.
     ///
     /// The actual paths remain private so this read-only metadata surface
     /// cannot disclose source locations or expose a writable Lance handle.

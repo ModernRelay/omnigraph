@@ -11,7 +11,7 @@
 
 pub(crate) use omnigraph_core::dst_ids;
 pub(crate) use omnigraph_core::{
-    branch_control, branch_names, dataset_index, error, handle_cache, instrumentation,
+    branch_base, branch_control, branch_names, dataset_index, error, handle_cache, instrumentation,
     lance_access, lance_clone, lance_commit, manifest_request, metadata, seams, staging, storage,
 };
 pub mod branch_detail;
@@ -236,11 +236,15 @@ pub async fn read_supported_internal_schema_version(root_uri: &str) -> Result<u3
     migrations::guard_stamp(&dataset)
 }
 
-/// Whether the selected graph-manifest dataset depends on files outside its
-/// own dataset root.
+/// Whether the selected graph-manifest dataset depends on files outside the
+/// graph root.
 ///
-/// A directory copy is self-contained only when both this manifest dataset
-/// and every user dataset have no Lance `base_paths`. Keep the paths private:
+/// A whole-root copy is self-contained when neither this manifest dataset nor
+/// any user dataset carries a base that is not a graph-internal branch base
+/// (`branch_base::has_external_bases`, the relocated graph roots RFC). A
+/// branch base inside the root follows the root the copy is opened at, and the
+/// open door refuses any other base, so an openable graph answers `false`.
+/// Keep the paths private:
 /// callers need a relocation eligibility bit, not access to storage
 /// locations that may contain credentials or deployment details.
 /// Test-only: production reads pass the reading handle's control session.
@@ -263,7 +267,7 @@ pub async fn manifest_has_external_base_paths_with_session(
     session: &Arc<lance::session::Session>,
 ) -> Result<bool> {
     let dataset = open_manifest_dataset_with_session(root_uri, branch, session).await?;
-    Ok(!dataset.manifest().base_paths.is_empty())
+    Ok(crate::branch_base::has_external_bases(&dataset))
 }
 
 /// Where the text of a snapshot's schema contract is read.
@@ -532,13 +536,15 @@ impl SnapshotDataset {
         self.dataset.manifest().index_section.is_some()
     }
 
-    /// Whether this pinned table version depends on files outside its dataset
-    /// root through Lance's `base_paths` relocation mechanism.
+    /// Whether this pinned table version carries a Lance base that is not a
+    /// graph-internal branch base (`branch_base::has_external_bases`). A
+    /// pre-v11 fork's bases lie inside the graph root and follow a whole-root
+    /// copy; the open door refuses any other base.
     ///
     /// The actual paths remain private so this read-only metadata surface
     /// cannot disclose source locations or expose a writable Lance handle.
     pub fn has_external_base_paths(&self) -> bool {
-        !self.dataset.manifest().base_paths.is_empty()
+        crate::branch_base::has_external_bases(&self.dataset)
     }
 
     /// Whether `column` has complete usable BTREE coverage.
@@ -1064,8 +1070,7 @@ async fn probe_dataset_latest_incarnation(
         Err(error) => return Err(error),
     }
     let native = resolve_native_manifest_branch(dataset, branch).await?;
-    let replacement = dataset
-        .checkout_branch(&native)
+    let replacement = crate::layout::checkout_manifest_branch(dataset, &native)
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
     let branch_identifier = crate::branch_control::dataset_branch_identifier(&replacement)
@@ -1241,9 +1246,7 @@ impl CollectorBranch {
             .io_parallelism();
         futures::stream::iter(versions.iter().copied())
             .map(|version| async move {
-                let read = self
-                    .dataset
-                    .checkout_version(version)
+                let read = crate::layout::checkout_manifest(&self.dataset, version)
                     .await
                     .map_err(OmniError::storage)?
                     .version();
@@ -1288,9 +1291,7 @@ impl CollectorBranch {
         let branch = self.branch.as_deref();
         // The opened branch checks the version out itself: no reopen from the
         // root, and the version belongs to the incarnation this run holds.
-        let dataset = self
-            .dataset
-            .checkout_version(version)
+        let dataset = crate::layout::checkout_manifest(&self.dataset, version)
             .await
             .map_err(OmniError::storage)?;
         let state = graph::version_state(
@@ -2500,11 +2501,13 @@ impl ManifestCoordinator {
         for native in natives {
             let branch = match &native {
                 None => main.clone(),
-                Some(native) => match main.checkout_branch(native).await {
-                    Ok(branch) => branch,
-                    Err(lance::Error::RefNotFound { .. }) => continue,
-                    Err(error) => return Err(OmniError::storage(error)),
-                },
+                Some(native) => {
+                    match crate::layout::checkout_manifest_branch(&main, native).await {
+                        Ok(branch) => branch,
+                        Err(lance::Error::RefNotFound { .. }) => continue,
+                        Err(error) => return Err(OmniError::storage(error)),
+                    }
+                }
             };
             let rows = state::read_manifest_rows_projected(&branch).await?;
             if let Some(record) = rows.record(graph_commit_id) {
@@ -2555,7 +2558,7 @@ impl ManifestCoordinator {
         let main = open_manifest_dataset_with_session(&self.root_uri, None, &session).await?;
         let branch = match &native {
             None => main,
-            Some(native) => match main.checkout_branch(native).await {
+            Some(native) => match crate::layout::checkout_manifest_branch(&main, native).await {
                 Ok(branch) => branch,
                 // `NotFound`: the tree has no `_versions` listing, as after
                 // `cleanup` reclaims a retired tree. The checkout does not
@@ -2757,8 +2760,7 @@ impl ManifestCoordinator {
         let dataset = if version == self.version() {
             self.dataset.clone()
         } else {
-            self.dataset
-                .checkout_version(version)
+            crate::layout::checkout_manifest(&self.dataset, version)
                 .await
                 .map_err(|error| OmniError::storage(error).before_effect())?
         };
@@ -2828,8 +2830,7 @@ impl ManifestCoordinator {
         let records = match self.native_branch.as_deref() == Some(native) {
             true => self.branch_records(),
             false => {
-                let branch = control
-                    .checkout_branch(native)
+                let branch = crate::layout::checkout_manifest_branch(control, native)
                     .await
                     .map_err(|error| branch_ref_error(error, logical))?;
                 state::read_manifest_rows_projected(&branch)

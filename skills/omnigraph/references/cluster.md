@@ -42,6 +42,9 @@ accept local paths and `file://` URIs and, with the server stopped, an inline
 `upgrade-ledger` and for direct maintenance with `--graph` (region from
 `AWS_REGION` or `AWS_DEFAULT_REGION`; see
 [S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
+Storage owners can also use an explicit local or S3 cluster root for
+`cluster verify-restore` on an isolated backup and `cluster prepare-restore`
+for a fresh destination. See [Restore a graph with its history](../../../docs/user/operations/restore-history.md).
 Every direct writer on the root (`cluster apply`, maintenance) takes the
 cluster's admission lock and keeps it after it finishes; `cluster plan` and
 `cluster status` only observe the lock, and `cluster status --json` reports the

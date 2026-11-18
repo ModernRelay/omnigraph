@@ -37,6 +37,23 @@ pub fn history_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), HISTORY_DIR)
 }
 
+/// The one checkout of a `__manifest` handle: `target` of `dataset`, its
+/// graph-internal branch bases rebound to the opened root and any other base
+/// refused (`omnigraph_core::branch_base`, the relocated graph roots RFC).
+/// `forbidden_apis.rs` refuses a bare Lance checkout in catalog and engine
+/// sources.
+pub async fn checkout_manifest(
+    dataset: &Dataset,
+    target: impl Into<lance::dataset::refs::Ref>,
+) -> lance::Result<Dataset> {
+    crate::branch_base::checkout(dataset, target).await
+}
+
+/// [`checkout_manifest`] at the latest version of native `branch`.
+pub async fn checkout_manifest_branch(dataset: &Dataset, branch: &str) -> lance::Result<Dataset> {
+    crate::branch_base::checkout_native_branch(dataset, branch).await
+}
+
 /// Resolve a logical graph branch to its live native manifest ref.
 ///
 /// The manifest dataset's ref list is the branch registry: a logical branch is
@@ -132,7 +149,7 @@ async fn open_manifest_branch(
     };
     let main = open_main_manifest(root_uri, VersionResolution::Latest, control_session).await?;
     let native = resolve_native_manifest_branch(&main, branch).await?;
-    checkout_manifest_branch(&main, &native, resolution)
+    checkout_manifest_branch_at(&main, &native, resolution)
         .await
         .map_err(|error| branch_ref_error(error, branch))
 }
@@ -149,7 +166,7 @@ async fn open_manifest_native(
         return open_main_manifest(root_uri, resolution, control_session).await;
     };
     let main = open_main_manifest(root_uri, VersionResolution::Latest, control_session).await?;
-    checkout_manifest_branch(&main, native, resolution)
+    checkout_manifest_branch_at(&main, native, resolution)
         .await
         .map_err(|error| branch_ref_error(error, crate::branch_names::logical_branch_name(native)))
 }
@@ -182,14 +199,14 @@ async fn open_main_manifest(
 }
 
 /// A native branch of the opened `main`, at its latest or at a known version.
-async fn checkout_manifest_branch(
+async fn checkout_manifest_branch_at(
     main: &Dataset,
     native: &str,
     resolution: VersionResolution,
 ) -> lance::Result<Dataset> {
     match resolution {
-        VersionResolution::Latest => main.checkout_branch(native).await,
-        VersionResolution::At(version) => main.checkout_version((native, version)).await,
+        VersionResolution::Latest => checkout_manifest_branch(main, native).await,
+        VersionResolution::At(version) => checkout_manifest(main, (native, version)).await,
     }
 }
 
@@ -225,8 +242,7 @@ pub(crate) async fn open_manifest_branch_with_identifier(
         let before = crate::branch_control::get_branch_identifier(&dataset, &native)
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
-        let branch_dataset = dataset
-            .checkout_branch(&native)
+        let branch_dataset = crate::layout::checkout_manifest_branch(&dataset, &native)
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
         let after = crate::branch_control::get_branch_identifier(&dataset, &native)

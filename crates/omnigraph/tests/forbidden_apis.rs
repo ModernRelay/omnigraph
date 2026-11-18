@@ -245,6 +245,7 @@ macro_rules! write_surfaces {
 }
 
 write_surfaces! {
+    "db/omnigraph/restore_birth.rs" => WriteProtocol::Exact("reserve an empty graph using its one native conditional birth claim") => ["reserve_restore_birth"],
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options", "init_with_storage"],
     "db/omnigraph/prepared_create.rs" => WriteProtocol::Bootstrap => ["apply_prepared_graph_create", "apply_prepared_graph_create_with_io_scope", "apply_prepared_graph_create_with_storage"],
     "db/omnigraph/prepared_create.rs" => WriteProtocol::Exact("quiesced birth settlement: exact init claim, bounded original empty tables, no published manifest or refs") => ["settle_prepared_graph_create_after_quiescence", "settle_prepared_graph_create_after_quiescence_with_storage"],
@@ -278,6 +279,7 @@ write_surfaces! {
 // name-independent: a newly named `transact`, `publish`, or `vacuum` method
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
+    ("db/omnigraph/restore_birth.rs", "check_restore_birth_claim"),
     ("db/omnigraph/prepared_create.rs", "prepare_graph_create"),
     (
         "db/omnigraph/prepared_create.rs",
@@ -304,6 +306,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "exists"),
     ("db/omnigraph.rs", "exists_with_storage"),
     ("db/omnigraph.rs", "manifest_has_external_base_paths"),
+    ("db/omnigraph/restore.rs", "verify_restored_history"),
     ("db/omnigraph/export.rs", "capture_served_export_cut"),
     (
         "db/omnigraph/export.rs",
@@ -1168,6 +1171,7 @@ durable_calls! {
     ("omnigraph-catalog/lib.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/unpublished.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("publication of an unpublished commit: its recorded changes through the ordinary publisher under the captured authority, required to allocate the candidate's own id")),
     ("db/omnigraph/table_ops.rs", ".commit_updates_with_actor_with_expected(", 2, WriteProtocol::TestOnly),
+    ("db/omnigraph/restore_birth.rs", ".write_text_if_absent(", 1, WriteProtocol::Exact("empty graph restore competes with ordinary initialization for one conditional birth claim")),
     ("db/omnigraph.rs", ".write_text_if_absent(", 2, WriteProtocol::Composed("bootstrap init claim + owned local-root create-if-absent probe")),
     ("db/omnigraph.rs", ".delete(", 2, WriteProtocol::Composed("bootstrap init claim release + owned local-root probe removal")),
     ("db/omnigraph.rs", "GraphCoordinator::init_commit_with_session(", 1, WriteProtocol::Bootstrap),
@@ -4515,8 +4519,9 @@ fn lance_ordering_stays_behind_bounded_scan_executor() {
 /// `with_io_buffer_size_bytes`, and of `managed_blob_payloads`, the one batched
 /// managed read, in the production sources of the engine crate and the
 /// `GUARDED_CRATES`. A bulk Blob reader calls the helper and adds its row here;
-/// a second raw `read_blobs` call, or `take_blobs` and one `BlobFile::read` per
-/// row, fails.
+/// a second raw `read_blobs` or `take_blobs` site fails. The single-cell
+/// facade and frozen-restore verifier share managed-only handle selection.
+/// Restore streams a bounded range once per immutable object and byte range.
 #[test]
 fn lance_batched_blob_read_call_counts_are_pinned() {
     let src = engine_src_root();
@@ -4556,9 +4561,151 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
             ("with_io_buffer_size_bytes", "table_store.rs".to_string(), 1),
         ],
         "the per-file call counts of the Blob read APIs changed: a bulk Blob \
-         read goes through managed_blob_payloads, and only the single-cell \
-         read facade keeps take_blobs"
+         read goes through managed_blob_payloads, and managed handle selection \
+         stays centralized in blob.rs"
     );
+}
+
+/// Every checkout of a graph dataset goes through `branch_base::checkout`,
+/// which rebinds graph-internal branch bases to the opened root and refuses
+/// any other base (the relocated graph roots RFC, issue 1233); the catalog's
+/// `layout::checkout_manifest` is that door for `__manifest`. No writer adds a
+/// Lance base except the one shallow clone `lance_clone::create_branch` makes,
+/// so a base never names a location outside the graph. A bare checkout here
+/// would read inherited files at the location a branch was created at.
+#[test]
+fn graph_dataset_checkouts_and_bases_have_one_door_issue_1233() {
+    let src = engine_src_root();
+    let mut sites = Vec::new();
+    let mut fields = Vec::new();
+    for (relative, file) in labeled_scan_files(&src, true) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let inventory = call_inventory(&ast);
+        for method in [
+            "checkout_branch",
+            "checkout_version",
+            "checkout_latest",
+            "checkout_tag",
+            "add_bases",
+            "shallow_clone",
+        ] {
+            let count = inventory.counts.get(method).copied().unwrap_or(0);
+            if count > 0 {
+                sites.push((method, relative.clone(), count));
+            }
+        }
+        for (number, line) in contents.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            for field in [
+                "initial_bases",
+                "target_bases",
+                "target_base_names_or_paths",
+            ] {
+                if code.contains(field) && !code.contains(&format!("{field}: None")) {
+                    fields.push(format!("{relative}:{}: {}", number + 1, line.trim()));
+                }
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![(
+            "checkout_version",
+            "omnigraph-core/branch_base.rs".to_string(),
+            1
+        )],
+        "a graph dataset is checked out only through branch_base::checkout \
+         (layout::checkout_manifest for __manifest), and no writer adds a base"
+    );
+    assert!(
+        fields.is_empty(),
+        "a write may not name Lance bases; the shallow clone is the only source: {fields:#?}"
+    );
+
+    // branch_base alone reads `base_paths` and replaces `Dataset::manifest`: a
+    // map swapped elsewhere would leave a base store opened at the recorded URI
+    // in Lance's shared cache, and a second reader of the map would be a second
+    // definition of where a base lives.
+    let mut readers = Vec::new();
+    for (relative, file) in labeled_scan_files(&src, true) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let mut visitor = BaseMapAccess::default();
+        visitor.visit_file(&parse_rust_source(&contents, &relative));
+        if visitor.base_paths > 0 {
+            readers.push((relative.clone(), "base_paths", visitor.base_paths));
+        }
+        if visitor.manifest_assignments > 0 {
+            readers.push((relative, "manifest =", visitor.manifest_assignments));
+        }
+    }
+    readers.sort();
+    let owner = "omnigraph-core/branch_base.rs".to_string();
+    assert!(
+        readers.iter().all(|(file, _, _)| *file == owner),
+        "only branch_base reads Lance bases or replaces a handle's manifest: {readers:#?}"
+    );
+}
+
+/// Production reads of a `.base_paths` field and assignments to a
+/// `.manifest` field, test code excluded.
+#[derive(Default)]
+struct BaseMapAccess {
+    base_paths: usize,
+    manifest_assignments: usize,
+}
+
+impl<'ast> Visit<'ast> for BaseMapAccess {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if !cfg_requires_test(&node.attrs) {
+            visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if !cfg_requires_test(&node.attrs) {
+            visit::visit_item_fn(self, node);
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if !cfg_requires_test(&node.attrs) {
+            visit::visit_item_impl(self, node);
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if !cfg_requires_test(&node.attrs) {
+            visit::visit_impl_item_fn(self, node);
+        }
+    }
+
+    fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+        if matches!(&node.member, syn::Member::Named(name) if name == "base_paths") {
+            self.base_paths += 1;
+        }
+        visit::visit_expr_field(self, node);
+    }
+
+    fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+        // A Lance handle's `manifest` is an `Arc<Manifest>`; Omnigraph's own
+        // `manifest` fields are options, assigned `Some(..)` or `None`.
+        let optional = match node.right.as_ref() {
+            Expr::Call(call) => final_path_ident(&call.func).is_some_and(|name| name == "Some"),
+            Expr::Path(path) => path.path.is_ident("None"),
+            _ => false,
+        };
+        if let Expr::Field(field) = node.left.as_ref()
+            && matches!(&field.member, syn::Member::Named(name) if name == "manifest")
+            && !optional
+        {
+            self.manifest_assignments += 1;
+        }
+        visit::visit_expr_assign(self, node);
+    }
 }
 
 /// Pins the vector index the engine builds to IVF_FLAT, which scores every

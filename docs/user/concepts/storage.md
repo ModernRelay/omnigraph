@@ -47,6 +47,29 @@ versions of a live branch, so its storage grows with the number of commits;
 plan storage for it on write-heavy graphs. A deleted branch's catalog can be
 collected by `cleanup` once nothing else depends on it.
 
+## Copying a graph root
+
+A verified, complete copy of a quiescent graph can be restored at its own
+location or opened at a new location on the same kind of storage: another
+local directory, another S3 prefix or bucket, or another Azure prefix or
+container. The copy serves every branch, tag and retained snapshot, and it
+reads and writes only objects under the root you opened.
+
+- Copy every object under the root while no process writes the graph.
+- If the copy is missing an object, the read that needs it fails and names the
+  root you opened. It never reads that object from the original location.
+- A graph whose storage names a location outside its root is refused when it
+  is opened. Omnigraph never writes such a graph; a table branched or cloned
+  by another Lance tool can.
+- To move a graph between kinds of storage (local, S3, Azure), export it and
+  load it into a new graph instead.
+- For a new cluster, follow [Restore a graph with its history](../operations/restore-history.md)
+  to register an independently verified copy in the first deployment.
+- External Blob URIs still point where they pointed before the copy.
+- Older builds can still read branch files from their original location.
+  Before relying on a relocated backup, verify it with the intended binary
+  while access to the original root is disabled.
+
 ## Local filesystem requirement
 
 Local read-write graphs require filesystem hard-link support. Read-only access

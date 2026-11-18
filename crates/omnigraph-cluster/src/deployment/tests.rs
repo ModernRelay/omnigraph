@@ -691,6 +691,9 @@ fn identity(actor: &str) -> DeploymentCaller {
     DeploymentCaller::AuthenticatedIdentity(IdentityAuthorization::authenticated(actor).unwrap())
 }
 
+#[path = "restore_tests.rs"]
+mod restore_tests;
+
 #[tokio::test]
 async fn authenticated_deployment_checks_current_policy_before_every_effect() {
     let dir = crate::tests::identity_fixture();

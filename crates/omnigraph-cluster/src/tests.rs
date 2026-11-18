@@ -2825,6 +2825,7 @@ fn offline_deployment_reserves_partial_projection_resource_count() {
                 (
                     graph.to_string(),
                     GraphDeployment {
+                        restore: None,
                         intent: None,
                         create: None,
                         delete: None,
@@ -2929,6 +2930,7 @@ fn offline_deployment_graph_completion_reserve_covers_maximum_serialized_engine_
     }))
     .unwrap();
     let before = GraphDeployment {
+        restore: None,
         // Prepared intent bytes are already charged at acceptance and never
         // change. Null cancels that same term in both sides of this comparison.
         intent: None,

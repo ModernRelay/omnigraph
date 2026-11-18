@@ -74,6 +74,22 @@ impl fmt::Debug for FrozenDirectory {
 }
 
 impl FrozenDirectory {
+    /// Validate the file tree of an independent, stopped local graph copy.
+    /// Reads must never follow a link back out of the restored directory.
+    pub fn verify_local_tree(root: &std::path::Path) -> Result<()> {
+        let metadata = root.symlink_metadata().map_err(|err| Error::Generic {
+            store: "FrozenDirectory",
+            source: Box::new(err),
+        })?;
+        if !metadata.is_dir() {
+            return Err(Error::Generic {
+                store: "FrozenDirectory",
+                source: "the frozen root must be a plain directory".into(),
+            });
+        }
+        refuse_symlinks(root)
+    }
+
     /// Open `root` for reading and index its objects; it must exist and hold
     /// plain files and directories only, so a symlink anywhere under it is
     /// refused by name before anything is read through.

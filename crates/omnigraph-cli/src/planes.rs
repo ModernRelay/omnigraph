@@ -130,6 +130,8 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
             | ClusterCommand::Apply { .. }
             | ClusterCommand::Status { .. } => Deployment,
             ClusterCommand::Observe { .. }
+            | ClusterCommand::PrepareRestore { .. }
+            | ClusterCommand::VerifyRestore { .. }
             | ClusterCommand::ForceUnlock { .. }
             | ClusterCommand::UpgradeLedger { .. } => Root,
             ClusterCommand::Create { .. } | ClusterCommand::List { .. } => ManagedAccount,
@@ -192,6 +194,8 @@ pub(crate) fn admits_inline_s3_root(command: &Command) -> bool {
             command: ClusterCommand::Plan { .. }
                 | ClusterCommand::Apply { .. }
                 | ClusterCommand::Status { .. }
+                | ClusterCommand::PrepareRestore { .. }
+                | ClusterCommand::VerifyRestore { .. }
                 | ClusterCommand::ForceUnlock { .. }
                 | ClusterCommand::UpgradeLedger { .. },
         } | Command::Optimize(_)
@@ -364,6 +368,8 @@ fn accepts_actor(command: &Command) -> bool {
             | ClusterCommand::Apply { .. }
             | ClusterCommand::UpgradeLedger { .. } => true,
             ClusterCommand::Validate { .. }
+            | ClusterCommand::PrepareRestore { .. }
+            | ClusterCommand::VerifyRestore { .. }
             | ClusterCommand::Status { .. }
             | ClusterCommand::Observe { .. }
             | ClusterCommand::ForceUnlock { .. }
@@ -624,7 +630,10 @@ pub(crate) fn validate_target(
                     bail!("--wait requires a server or managed target");
                 }
             }
-            ClusterCommand::ForceUnlock { .. } | ClusterCommand::UpgradeLedger { .. }
+            ClusterCommand::ForceUnlock { .. }
+            | ClusterCommand::UpgradeLedger { .. }
+            | ClusterCommand::PrepareRestore { .. }
+            | ClusterCommand::VerifyRestore { .. }
                 if !target.is_explicit() =>
             {
                 bail!("recovery effects require explicit --target")

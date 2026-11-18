@@ -497,6 +497,9 @@ pub(crate) fn write_cluster_plan_human(output: &PlanOutput, stdout: &mut dyn Wri
                 "  {:?} {}{bindings}",
                 change.operation, change.resource
             )?;
+            if let Some(digest) = &change.restore_from {
+                writeln!(stdout, "      Restore original graph history from {digest}")?;
+            }
             if let Some(migration) = &change.migration {
                 if !migration.supported {
                     writeln!(stdout, "      migration UNSUPPORTED:")?;

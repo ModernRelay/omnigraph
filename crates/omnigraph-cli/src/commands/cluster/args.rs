@@ -5,6 +5,23 @@ use std::path::PathBuf;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClusterCommand {
+    /// Read the selected graph's retained history from a direct backup root.
+    VerifyRestore {
+        /// Graph name beneath the explicit cluster root.
+        graph_id: String,
+        /// Emit machine-readable history evidence.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reserve a fresh destination for one full-history graph restore.
+    PrepareRestore {
+        /// Exact JSON descriptor binding the backup, new cluster ledger and graph.
+        #[arg(long)]
+        descriptor: PathBuf,
+        /// Emit the digest of the confirmed reservation.
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate cluster.yaml and referenced schemas, queries, and policy files.
     Validate {
         /// Directory containing cluster.yaml.

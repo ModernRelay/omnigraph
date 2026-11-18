@@ -77,8 +77,9 @@ accepts 17 only. The same command is the only way a v14, v15 or v16 graph
 reaches 17: no publication stamps a branch 17, and a graph the current
 binary creates is born there. The upgrade is offline and cannot verify that itself: stop
 every server, reader, writer and maintenance process, take and verify a
-backup of the whole graph root (rollback is restoring that backup), then
-with the current binary:
+backup of the whole graph root. For rollback, restore it at the graph's own
+path. Older builds can still resolve branch files there. To convert with
+the current binary:
 
 ```bash
 omnigraph upgrade --target ./graph.omni --check --json
