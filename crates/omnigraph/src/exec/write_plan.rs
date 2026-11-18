@@ -27,6 +27,9 @@ pub(crate) struct WritePlan {
     /// The groups' selection reads, each run once against the write's
     /// snapshot.
     pub selections: Vec<CompiledQuery>,
+    /// [`CoreWrite::selects_stored_rows`]: the write needs `read` on its
+    /// branch as well as `change`.
+    pub selects_stored_rows: bool,
 }
 
 impl WritePlan {
@@ -34,6 +37,7 @@ impl WritePlan {
         let shape = WriteShape::of(write, catalog)
             .map_err(|e| super::plan_refusal(omnigraph_planner::PlanError::from(e)))?;
         Ok(Self {
+            selects_stored_rows: write.selects_stored_rows(),
             name: shape.name,
             write_mode: shape.write_mode,
             params: shape.params,

@@ -14,7 +14,7 @@ Graph-scoped actions:
 |---|---|
 | `read` | Queries, snapshots, branches, and commits |
 | `export` | Snapshot export |
-| `change` | Mutations, the read of their `match` selection on the same branch included, loads, and source metadata probes for `explain load csv` |
+| `change` | Mutations, loads, and source metadata probes for `explain load csv`; a mutation with a `match` also needs `read` on its branch |
 | `schema_apply` | Schema changes |
 | `branch_create` | Branch creation |
 | `branch_delete` | Branch deletion |
@@ -42,8 +42,15 @@ graph's schema requires that graph's `schema_apply` permission;
 reading its remote schema or migration preview requires `read` on `main`.
 The reserved graph `admin` action does not grant cluster management.
 
-A stored mutation requires both `invoke_query` and `change`. A stored read
-requires `invoke_query` and `read`.
+A stored mutation requires both `invoke_query` and `change`, and `read` too
+when it has a `match`. A stored read requires `invoke_query` and `read`.
+
+A mutation with a `match` needs `read` on its branch as well as `change`:
+its selection reads stored data, and its affected counts and data-dependent
+failures would otherwise show that data to an actor who may only change it.
+An `insert` with no `match` reads nothing and needs `change` alone. Every
+writer is held to it, embedded, CLI, HTTP and MCP alike, and the refusal is
+the same `403 forbidden` as a missing `change`, before any effect.
 
 `maintain` and `reclaim` are separate from `change`, so an automation account
 can compact a graph without the right to write data, and can hold `maintain`

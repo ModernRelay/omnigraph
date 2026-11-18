@@ -248,8 +248,8 @@ The server's `initialize` instructions tell a model to call `graphs`, then
 
 | Tool | Arguments | Runs | Policy action |
 |---|---|---|---|
-| `mutate` | `graph`, `query`, optional `name`, `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph_id}/mutate`, or `/mutate/if-graph-commit` with `if_graph_commit` | `change`; a branch statement takes its branch action |
-| `mutate`, stored | `graph`, `name`, optional `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph_id}/queries/{query_name}`, or `/queries/{query_name}/if-graph-commit` with `if_graph_commit` | `invoke_query`, then `change` |
+| `mutate` | `graph`, `query`, optional `name`, `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph_id}/mutate`, or `/mutate/if-graph-commit` with `if_graph_commit` | `change`, and `read` when the write has a `match`; a branch statement takes its branch action |
+| `mutate`, stored | `graph`, `name`, optional `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph_id}/queries/{query_name}`, or `/queries/{query_name}/if-graph-commit` with `if_graph_commit` | `invoke_query`, then `change` (and `read` when the write has a `match`) |
 | `load` | `graph`, `mode`, `data`, optional `branch`, `from` | `POST /graphs/{graph_id}/load` | `change`, plus `branch_create` when `from` creates the branch |
 | `blobs_clear` | `graph`, `entity`, `type`, `id`, `property`, optional `branch`, `if_match` | `DELETE /graphs/{graph_id}/blob` | `change` |
 | `branches_create` | `graph`, `name`, optional `from`, `from_commit` | `POST /graphs/{graph_id}/branches` | `branch_create` |

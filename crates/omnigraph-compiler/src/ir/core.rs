@@ -727,6 +727,19 @@ pub struct CoreWrite {
     pub work: crate::budget::WorkSoFar,
 }
 
+impl CoreWrite {
+    /// Whether a group selects its rows from stored data: any group with a
+    /// `match`, whose input is more than `Unit`. Such a write reveals what
+    /// it read through its affected counts and data-dependent failures, so
+    /// policy asks for `read` on the branch as well as `change`; an
+    /// `insert` with no `match` runs once over `Unit` and reads nothing.
+    pub fn selects_stored_rows(&self) -> bool {
+        self.groups
+            .iter()
+            .any(|group| !matches!(group.input, Term::Unit))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoreDecl {
     Read(Box<CoreRead>),

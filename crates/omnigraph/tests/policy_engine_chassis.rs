@@ -399,6 +399,97 @@ async fn mutate_as_allows_when_policy_permits_actor() {
     .expect("act-allowed should be able to Change on main");
 }
 
+/// `act-allowed` holds `change` alone; `act-reader-writer` holds `read` and
+/// `change` on every branch.
+const READ_GATE_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  writers: [act-allowed, act-reader-writer]
+  readers: [act-reader-writer]
+rules:
+  - id: writers-data
+    allow:
+      actors: { group: writers }
+      actions: [change]
+      branch_scope: any
+  - id: readers-data
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+"#;
+
+/// A write with a `match` reads stored data to select its rows, and its
+/// affected counts and data-dependent failures would reveal that data, so it
+/// needs `read` on the branch as well as `change`; an `insert` with no
+/// `match` reads nothing and needs `change` alone. The refusal comes before
+/// any effect: the head and every table version stay put.
+#[tokio::test]
+async fn a_write_with_a_match_needs_read_as_well_as_change() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(init_and_load(&dir).await);
+    let db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    let (db, _engine) = install_policy_source(db, dir.path(), READ_GATE_POLICY_YAML);
+
+    let before_head = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let before_version = version_main(&db).await.unwrap();
+    let before_tree = physical_tree(dir.path());
+    let set_age = mixed_params(&[("$name", "Alice")], &[("$age", 99)]);
+    for (query, params) in [
+        ("set_age", set_age.clone()),
+        ("remove_person", mixed_params(&[("$name", "Alice")], &[])),
+    ] {
+        let result = db
+            .mutate_as(
+                "main",
+                MUTATION_QUERIES,
+                query,
+                &params,
+                Some("act-allowed"),
+            )
+            .await;
+        match result {
+            Err(OmniError::Policy(msg)) => assert!(
+                msg.contains("denied") && msg.contains("read"),
+                "{query}: the refusal names the missing read: {msg}"
+            ),
+            other => panic!("{query}: expected a read denial, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        db.list_commits(None).await.unwrap()[0].graph_commit_id,
+        before_head,
+        "a refused match write publishes nothing"
+    );
+    assert_eq!(version_main(&db).await.unwrap(), before_version);
+    assert_eq!(
+        physical_tree(dir.path()),
+        before_tree,
+        "a refused match write writes nothing: no table version, no staged file"
+    );
+
+    db.mutate_as(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        Some("act-allowed"),
+    )
+    .await
+    .expect("an insert with no match needs change alone");
+    db.mutate_as(
+        "main",
+        MUTATION_QUERIES,
+        "set_age",
+        &set_age,
+        Some("act-reader-writer"),
+    )
+    .await
+    .expect("read and change admit a match write");
+}
+
 /// A Blob put or clear enforces `change` on its branch for the supplied actor
 /// before it opens anything, like every other Mutation-protocol writer.
 #[tokio::test]

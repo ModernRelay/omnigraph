@@ -2853,6 +2853,116 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     }
 }
 
+/// `act-writer` holds `change` alone; `act-editor` holds `read` and `change`.
+const READ_GATE_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  writers: [act-writer, act-editor]
+  editors: [act-editor]
+rules:
+  - id: writers-change
+    allow:
+      actors: { group: writers }
+      actions: [change]
+      branch_scope: any
+  - id: editors-read
+    allow:
+      actors: { group: editors }
+      actions: [read]
+      branch_scope: any
+"#;
+
+/// A write with a `match` selects its rows from stored data, so over HTTP as
+/// in the engine it needs `read` on the branch as well as `change`: an actor
+/// holding `change` alone is refused with the route's 403 and nothing is
+/// published, while its `match`-less insert is admitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_a_match_write_needs_read_as_well_as_change() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, READ_GATE_POLICY_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![
+            ("act-writer".to_string(), "writer-token".to_string()),
+            ("act-editor".to_string(), "editor-token".to_string()),
+        ],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+    let change = |token: &str, name: &str, params: Value| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/mutate"))
+            .method(Method::POST)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&ChangeRequest {
+                    query: MUTATION_QUERIES.to_string(),
+                    name: Some(name.to_string()),
+                    params: Some(params),
+                    branch: Some("main".to_string()),
+                    settings: None,
+                })
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+
+    let before = manifest_dataset_version(&graph).await;
+    let (status, body) = json_response(
+        &app,
+        change(
+            "writer-token",
+            "set_age",
+            json!({"name": "Alice", "age": 99}),
+        ),
+    )
+    .await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("read")
+            || body.to_string().contains("`read`"),
+        "the refusal names the missing read: {body}"
+    );
+    assert_forbidden(status, body, "a match write with change alone");
+    assert_eq!(
+        manifest_dataset_version(&graph).await,
+        before,
+        "a refused match write publishes nothing"
+    );
+
+    let (status, body) = json_response(
+        &app,
+        change(
+            "writer-token",
+            "insert_person",
+            json!({"name": "Mina", "age": 28}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "an insert with no match: {body}");
+    assert_eq!(body["affected_nodes"], 1);
+
+    let (status, body) = json_response(
+        &app,
+        change(
+            "editor-token",
+            "set_age",
+            json!({"name": "Alice", "age": 99}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read and change admit it: {body}");
+    assert_eq!(body["affected_nodes"], 1);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     let temp = init_loaded_graph().await;

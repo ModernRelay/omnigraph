@@ -1883,6 +1883,22 @@ impl Omnigraph {
         Ok(plans)
     }
 
+    /// The `read` gate of a write with a `match`, on the branch it writes.
+    fn enforce_read_for_selection(&self, branch: &str, actor_id: Option<&str>) -> Result<()> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::Read,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )
+        .map_err(|error| match error {
+            OmniError::Policy(message) => OmniError::Policy(format!(
+                "{message}; a write with a `match` reads branch '{branch}' to select its rows, \
+                 so it needs `read` there as well as `change`"
+            )),
+            other => other,
+        })
+    }
+
     async fn mutate_with_current_actor(
         &self,
         branch: &str,
@@ -2008,6 +2024,14 @@ impl Omnigraph {
                 .iter()
                 .all(|op| matches!(op, WriteOp::Insert { .. }) && !op.reads_a_selection())
         });
+        // A write with a `match` reads the branch to select its rows, so it
+        // needs `read` there as well as the `change` its route checked,
+        // before any effect.
+        if let Ok(ir) = &lowered
+            && ir.selects_stored_rows
+        {
+            self.enforce_read_for_selection(&addressed, actor_id)?;
+        }
         attempt.admit(&txn, selects_rows)?;
         let ir = lowered?;
         debug_assert!(
@@ -3463,6 +3487,7 @@ edge Shared: Endpoint -> Endpoint { label: String }
             ops: vec![op],
             write_mode: omnigraph_compiler::query::file::MutationWriteMode::Publish,
             selections: Vec::new(),
+            selects_stored_rows: false,
         };
         let settings = SessionSettings::default();
         let reader = SelectionReader {
