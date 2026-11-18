@@ -233,12 +233,14 @@ impl RangeMemoWrapper {
         if let Some(store_prefix) = prefix(dataset.uri()) {
             memo.register_root(&store_prefix, dataset.refs.base(), true);
         }
-        for base in dataset.manifest().base_paths.values() {
-            let Ok(path) = base.extract_path(Arc::clone(&registry)) else {
+        for (uri, is_dataset_root) in crate::branch_base::bases(dataset) {
+            let Ok(path) =
+                lance::io::ObjectStore::extract_path_from_uri(Arc::clone(&registry), uri)
+            else {
                 continue;
             };
-            if let Some(store_prefix) = prefix(&base.path) {
-                memo.register_root(&store_prefix, &path, base.is_dataset_root);
+            if let Some(store_prefix) = prefix(uri) {
+                memo.register_root(&store_prefix, &path, is_dataset_root);
             }
         }
     }

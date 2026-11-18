@@ -53,7 +53,7 @@ async fn rebind(
 pub async fn retain_control_dataset(dataset: &Dataset, budget: usize) -> Option<Dataset> {
     let manifest = dataset.manifest();
     if manifest.branch.is_some()
-        || !manifest.base_paths.is_empty()
+        || crate::branch_base::has_bases(dataset)
         || manifest
             .schema
             .fields_pre_order()
@@ -73,7 +73,7 @@ pub async fn current_control_dataset(
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Option<Dataset>> {
     if dataset.manifest().branch.is_some()
-        || !dataset.manifest().base_paths.is_empty()
+        || crate::branch_base::has_bases(dataset)
         || dataset
             .manifest_location()
             .e_tag

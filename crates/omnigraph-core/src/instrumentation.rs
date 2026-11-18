@@ -2251,6 +2251,9 @@ async fn load_recorded(
         Ok(dataset) => dataset,
         Err(error) => return Ok(Err(error)),
     };
+    let dataset = crate::branch_base::follow_opened_root(dataset)
+        .await
+        .map_err(OmniError::storage)?;
     if let Some(wrapper) = &wrapper {
         let store = dataset
             .object_store(None)

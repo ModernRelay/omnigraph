@@ -128,7 +128,7 @@ impl StagedTableNamespace {
         if ds.version().version == version {
             Ok(ds)
         } else {
-            ds.checkout_version(version)
+            crate::layout::checkout_manifest(&ds, version)
                 .await
                 .map_err(OmniError::storage)
         }
@@ -407,7 +407,7 @@ impl LanceNamespace for StagedTableNamespace {
             let dataset = if version.version == head.version().version {
                 head.clone()
             } else {
-                head.checkout_version(version.version)
+                crate::layout::checkout_manifest(&head, version.version)
                     .await
                     .map_err(|e| namespace_internal_error(e.to_string()))?
             };

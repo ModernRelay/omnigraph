@@ -77,7 +77,10 @@ accepts 17 only. The same command is the only way a v14, v15 or v16 graph
 reaches 17: no publication stamps a branch 17, and a graph the current
 binary creates is born there. The upgrade is offline and cannot verify that itself: stop
 every server, reader, writer and maintenance process, take and verify a
-backup of the whole graph root (rollback is restoring that backup), then
+backup of the whole graph root (rollback is restoring that backup at the
+graph's own path; a whole-root copy also opens at a new path on the same kind
+of storage, but Omnigraph 0.14.0 and earlier read some branch files at the
+path the branch was created at), then
 with the current binary:
 
 ```bash

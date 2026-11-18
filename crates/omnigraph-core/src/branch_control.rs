@@ -965,7 +965,7 @@ pub async fn create_branch_recoverably(
                     Some(encode_identifier(&contents.identifier)?),
                 ));
             }
-            source.checkout_branch(branch).await.map_err(|error| {
+            crate::branch_base::checkout_native_branch(source, branch).await.map_err(|error| {
                 OmniError::manifest_internal(format!(
                     "branch '{}' has matching authoritative metadata after an ambiguous create, \
                      but its branch dataset cannot be opened: {}; original native error: {}",
