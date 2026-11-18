@@ -300,7 +300,7 @@ a later release lowers it.
 | A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope; an inline read returning an outer name under another name; a called read's `limit $k` bound to a computed argument |
 | A node an `optional` introduces, or an edge reference, returned whole; a `let` inside an `optional` that binds no node of its own |
 | A full-text call (`match_terms`) read as a value in `return`, `order` or a block's aggregate |
-| A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment |
+| A `Blob` read from a row in an assignment (a write group whose selection reads a type an earlier group changes is `T91`: every group selects on the write's snapshot) |
 | A read that calls itself (`Fix`) |
 
 ```text

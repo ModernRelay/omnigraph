@@ -27,13 +27,16 @@ delete $x
 ```
 
 A write body is one or more groups. A group selects its rows with a read's
-`match { ... }` and `where`, and its statements run once per row:
-`update $x set { ... }` and `delete $x` name a bound node or edge variable
-(another is `T77`), and `insert T { ... }` writes one entity per row, once
-with no `match`. A later group opens with its own `match` and sees the effects
-of the groups before it. A statement takes no `where`: `delete T where ...`
-is refused (`Q008`) with the group form as the fix, and elements written
-without `match { }` are refused (`Q013`).
+`match { ... }` and `where`, and its statements run once per row: `update $x
+set { ... }` and `delete $x` name a bound node or edge variable (another is
+`T77`), and `insert T { ... }` writes one entity per row, once with no `match`.
+A later group opens with its own `match`, and every group selects on the graph
+the write started from, never on an earlier group's effects, so a group whose
+selection reads a type an earlier group of the write changes is refused
+(`T91`): write it as a second write, or as statements after one `match`, which
+each see the statements before them. A statement takes no `where`: `delete T
+where ...` is refused (`Q008`) with the group form as the fix, and elements
+written without `match { }` are refused (`Q013`).
 
 ```gq
 query relocate_staff($slug: String) {
@@ -44,12 +47,9 @@ query relocate_staff($slug: String) {
 
 The selection takes everything a [read's match](../queries/index.md#match-patterns)
 does: traversals and edge bindings (`$p $k:worksAt $c` then `delete $k`),
-`exists`, `not exists` and `count { ... }` blocks, `let` and `from`. One
-binding of the written type with a filter over it is evaluated together with
-the statements before it; any other selection runs once as a read of the
-graph the write started from. Such a selection may not read a type an earlier
-group of the same write changes, and `optional` is not supported yet (both
-`T86`). An unbound variable is `T6` and an aggregate `T8`; a filter on one
+`exists`, `not exists` and `count { ... }` blocks, `let` and `from`, and runs
+once, before its group's first statement; `optional` is not supported yet
+(`T86`). An unbound variable is `T6` and an aggregate `T8`; a filter on one
 binding testing over four properties twice each with `=`, `!=` or `in` fails.
 
 Assignment values are literals, parameters, `now()`, expressions over them,

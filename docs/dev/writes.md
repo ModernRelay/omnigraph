@@ -318,10 +318,14 @@ identity and value maps an `update` or `delete` builds from them and the value
 map an `insert` builds per row are charged to that pool, and each statement's
 pass over the rows charges one unit of `read_work_limit` per row, so a
 selection whose derived state outgrows `query_memory_bytes` or
-`read_work_limit` is refused as the read itself would be. A selection read sees the
-snapshot, not the statements staged before it, so a group whose selection
-reads a table an earlier group of the write changes, and an assignment that
-reads a Blob from a row, are refused at type check (`T86`).
+`read_work_limit` is refused as the read itself would be. Every group selects
+on the write's snapshot, never on the effects earlier groups staged (the GQ 3
+RFC, section 2), so a group whose selection reads a table an earlier group of
+the write changes is refused at type check (`T91`,
+`shape::write::earlier_group_change`); a staged scan and a selection read
+therefore select the same rows. An assignment that reads a Blob from a row is
+refused too (`T86`). Statements of one group see the keyed effects of the
+statements before them: the pending rows hold one current version per id.
 
 `MutationStaging` accumulates read-your-writes batches and delete predicates
 in memory. It performs all type, value, uniqueness, endpoint, cardinality, and

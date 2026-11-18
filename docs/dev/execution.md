@@ -288,12 +288,12 @@ bound: it returns per row the `@id` of each `update` or `delete` variable and
 each assignment value that reads the row. The statement then stages the
 typed membership `id in [ids]` with those values per entity, and an `insert`
 runs once per row; two values for one entity and property through one
-statement's rows are `E4`. Because that read sees the snapshot, not the
-staged statements, a group whose selection reads a table an earlier group
-writes is not lowered, nor are a selection the read shaper refuses and a
-`Blob` read from a row; the write shaper is the compiler's too, so the type
-checker refuses each with `T86`. Such a write publishes once, through the
-same staging.
+statement's rows are `E4`. Every group selects on the write's snapshot, so
+the type checker refuses a group whose selection reads a table an earlier
+group writes (`T91`); a selection the read shaper refuses and a `Blob` read
+from a row are not lowered, and since the write shaper is the compiler's too,
+the type checker refuses each with `T86`. Such a write publishes once,
+through the same staging.
 
 The executor never refreshes a mutable branch head midway through a query.
 Historical reads build from the requested immutable table versions; current

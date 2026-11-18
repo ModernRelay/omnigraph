@@ -480,7 +480,10 @@ A write body is one or more groups. A group selects its rows with the same
 `match { … }` and `where` a read writes, `match { $x: Signal } where $x.slug = $slug`,
 and its statements follow and run once per row: `update $x set { … }`,
 `delete $x`. An `insert T { … }` with no `match` runs once; a later group opens
-with its own `match` and sees the groups before it. The `where` always names
+with its own `match`. Every group selects on the graph the write started from,
+never on an earlier group's effects, so a group whose selection reads a type an
+earlier group changes is refused (`T91`): use a second write, or several
+statements after one `match`, each seeing the statements before it. The `where` always names
 properties through the binding (`$x.slug`, `$x.@src`). A statement takes no
 `where`: `update T set { … } where …` and `delete T where …` are refused
 (`Q008`), and a write's elements written without `match { }` are refused
@@ -489,8 +492,7 @@ traversals, edge bindings, blocks, `let` and `from`, and runs as a read of the
 graph the write started from:
 `match { $c: Company, $p $k:worksAt $c } where $c.slug = $slug  delete $k`.
 Assignments may read the row (`city: $c.city`; an endpoint as `to: $c`), and
-an `insert` runs once per row. A `Blob` read from a row and a selection that
-reads a type an earlier group of the write changes are refused
+an `insert` runs once per row. A `Blob` read from a row is refused
 (`T86`); rows of one statement giving one entity's property two values are
 refused (`E4`).
 
