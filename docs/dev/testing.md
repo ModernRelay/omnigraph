@@ -728,8 +728,11 @@ With `--measure`, each side also runs under `--measure`, and an aligned
 step whose store requests (seed 0, deterministic under the simulation) rose
 is a difference of aspect `requests`, which a row passes by naming the
 reason (`COSTS` in the script, or an `open:` key); CI runs it as its own
-pass, since the measure ledger moves a concurrent block's park points. The
-report lists every changed step's requests and class deltas under `costs`.
+pass, since the measure ledger moves a concurrent block's park points. A
+case whose two simulation runs of seed 0 measure different requests
+(`replay_mismatch`, seen on 4-CPU runners for a CSV load and a concurrent
+block) is a warning, and its requests are not compared. The report lists
+every changed step's requests and class deltas under `costs`.
 `--case <path>` (repeatable) selects cases; `--reuse` compares the traces an
 earlier run left under `--work`.
 

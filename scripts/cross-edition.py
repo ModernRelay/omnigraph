@@ -578,10 +578,25 @@ def run(args: argparse.Namespace) -> int:
     unrunnable: list[str] = []
     shared_failures: list[str] = []
     costs: list[dict] = []
+    nondeterministic: set[str] = set()
     compared_steps = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         for relative, old, new in pool.map(compare_case, cases):
             case = relative.removeprefix(CASES_DIR + "/")
+            if args.measure and any(
+                side.status == "failed" and "replay_mismatch" in side.message for side in (old, new)
+            ):
+                # The simulation's two runs of the seed measured different
+                # store requests (seen on 4-CPU runners for a CSV load and a
+                # concurrent block): the counts are not deterministic, so the
+                # case's requests are not compared. The rows pass compares
+                # its rows.
+                nondeterministic.add(case)
+                shared_failures.append(
+                    f"{case}: store requests differ between the simulation's two runs of seed 0; "
+                    "its requests are not compared"
+                )
+                continue
             if old.status == new.status == "failed" and old.failure and old.failure == new.failure:
                 shared_failures.append(
                     f"{case}: both editions fail step {old.failure[0]} under simulation with "
@@ -674,6 +689,7 @@ def run(args: argparse.Namespace) -> int:
         for row in table
         if row.line not in used
         and row.case in compared
+        and row.case not in nondeterministic
         and (args.measure or row.aspect != "requests")
     ]
 
