@@ -82,7 +82,7 @@ impl CloneContext {
 /// life. A wrong size still opens: Lance finds no trailing magic and reads
 /// again without the size.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordedManifest {
+pub(crate) struct RecordedManifest {
     path: String,
     size: u64,
     e_tag: String,
@@ -185,8 +185,12 @@ pub async fn configured_commit_handler(
 /// manifest path, so the open reads the manifest without asking the store for
 /// its size. Lance caches a manifest whose size it knows in the open's
 /// session, so only an open whose session caches nothing passes `recorded`
-/// (`instrumentation::open_pinned_dataset_uncached`).
-pub async fn pinned_commit_handler(
+/// (`instrumentation::open_pinned_dataset_at_recorded_manifest`). Lance keeps
+/// the resolved location on the dataset, so the dataset reports the recorded
+/// size and ETag, never the store's: it is not a witness
+/// (`TableVersionMetadata::witnesses`). Crate-private, so that opener is the
+/// one way to install it.
+pub(crate) async fn pinned_commit_handler(
     uri: &str,
     params: &Option<lance::io::ObjectStoreParams>,
     recorded: RecordedManifest,
@@ -1361,7 +1365,8 @@ mod tests {
     /// without a HEAD. The opens that take the recorded location own a
     /// session that caches nothing, so a repeat costs the same and a removed
     /// manifest is read from the store again. A stale size, a row from before
-    /// the size was recorded and another version resolve through Lance.
+    /// the size was recorded and another version resolve through Lance. The
+    /// opened dataset reports the recorded ETag, so it is never a witness.
     #[tokio::test]
     async fn pinned_open_resolves_the_recorded_manifest_issue_1250() {
         use crate::logical_calls::LogicalCallCounter;
@@ -1407,7 +1412,7 @@ mod tests {
             .recorded_manifest()
             .expect("a detached commit records both");
 
-        // The open `instrumentation::open_pinned_dataset_uncached` makes: a
+        // The open `instrumentation::open_pinned_dataset_at_recorded_manifest` makes: a
         // session that caches nothing and the configured handler, given the
         // row's recorded manifest when it has one. (The engine opener admits
         // graph storage schemes only; the DST storage-cost golden counts the
@@ -1492,6 +1497,28 @@ mod tests {
             &recorded.e_tag,
         );
         assert!(elsewhere.location(&base_path, version).is_none());
+
+        // Whose identity a recorded open reports: the recorded one. A row whose
+        // ETag is not the store's still opens at the recorded location and
+        // reports that ETag, so it passes the row's own witness check; Lance's
+        // resolution reports the store's identity and fails it. This is why the
+        // witness opens never take the recorded location.
+        let foreign_tag = "\"not-the-store-token\"";
+        let foreign = row(location.size, Some(foreign_tag));
+        let at_recorded = open(foreign.clone()).await.unwrap();
+        assert_eq!(at_recorded.manifest(), detached.manifest());
+        assert_eq!(
+            at_recorded.manifest_location().e_tag.as_deref(),
+            Some(foreign_tag)
+        );
+        assert!(foreign.witnesses(&at_recorded));
+        let through_lance = open(legacy.clone()).await.unwrap();
+        assert_ne!(
+            through_lance.manifest_location().e_tag.as_deref(),
+            Some(foreign_tag)
+        );
+        assert!(!foreign.witnesses(&through_lance));
+        counter.take();
 
         // A reclaimed manifest: nothing answers for it from a cache. Read at
         // its recorded size, Lance reports the missing object as an IO error,

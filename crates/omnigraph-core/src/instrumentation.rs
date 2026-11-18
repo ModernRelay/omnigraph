@@ -2082,17 +2082,19 @@ pub async fn open_pinned_dataset(
     open_pin(uri, target_version, pin, None, session, wrapper).await
 }
 
-/// [`open_pinned_dataset`] on a statement session of its own that caches
-/// nothing, for an open that keeps no read cache (a read pinned to a commit).
-/// The version the pin's writer recorded resolves to
-/// its recorded manifest object (`TableVersionMetadata::recorded_manifest`),
-/// so the open reads the manifest without first asking the store for its
-/// size. No manifest outlives the open, so a version `cleanup` reclaims is
+/// [`open_pinned_dataset`] at the manifest object the pin's writer recorded
+/// (`TableVersionMetadata::recorded_manifest`), on a statement session of its
+/// own that caches nothing, for an open that keeps no read cache (a read
+/// pinned to a commit). The open reads the manifest without first asking the
+/// store for its size. The dataset reports the recorded identity (size and
+/// ETag), not the store's, so it is never a witness
+/// (`TableVersionMetadata::witnesses`); an open that checks a pin's identity
+/// goes through [`open_pinned_dataset`]. No manifest outlives the open, so a version `cleanup` reclaims is
 /// read from the store again and fails as
 /// [`OmniError::HistoricalVersionReclaimed`]: an open on a session that
 /// caches metadata must not take the recorded location, because Lance keeps
 /// a manifest whose size it knows, and no public call evicts it.
-pub async fn open_pinned_dataset_uncached(
+pub async fn open_pinned_dataset_at_recorded_manifest(
     uri: &str,
     target_version: u64,
     pin: &crate::metadata::TableVersionMetadata,
@@ -2227,6 +2229,9 @@ async fn open_dataset_with(
         // (`Dataset::load_manifest`), so a failed open through the recorded
         // location is repeated through Lance's own resolution: every failure
         // keeps the class an open without it gets, reclaimed history included.
+        // A failure the recorded location cannot cause (throttling, a timeout,
+        // auth) therefore costs a second full open, with the store's own
+        // retries, and `record_open` counts both.
         Err(_) if recorded.is_some() => load_recorded(uri, version, None, session, wrapper).await?,
         loaded => loaded,
     };

@@ -189,6 +189,11 @@ impl TableVersionMetadata {
     /// witnesses. The e_tag identifies the exact manifest object; a pin that
     /// carries a transaction uuid also accepts a v10 pin's linear twin, whose
     /// manifest differs but whose transaction is the same.
+    ///
+    /// `dataset` must report the store's identity: open it through Lance's
+    /// own resolution (`open_dataset_entry`), never at the recorded manifest
+    /// (`instrumentation::open_pinned_dataset_at_recorded_manifest`), whose
+    /// dataset reports this pin's own ETag and so always passes.
     pub fn witnesses(&self, dataset: &Dataset) -> bool {
         match self.e_tag.as_deref() {
             None => return true,
@@ -270,7 +275,7 @@ impl TableVersionMetadata {
 
     /// The manifest object this pin's writer recorded, when the row holds both
     /// its size and its token; a row from before either was recorded has none.
-    pub fn recorded_manifest(&self) -> Option<crate::lance_clone::RecordedManifest> {
+    pub(crate) fn recorded_manifest(&self) -> Option<crate::lance_clone::RecordedManifest> {
         Some(crate::lance_clone::RecordedManifest::new(
             &self.manifest_path,
             self.manifest_size?,
