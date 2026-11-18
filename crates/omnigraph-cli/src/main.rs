@@ -6,24 +6,15 @@ use color_eyre::eyre::Result;
 use tokio::runtime::Runtime;
 
 fn main() -> Result<std::process::ExitCode> {
-    // A query compiles and runs on these threads; each gets the stack a
-    // query at the depth bounds needs.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(omnigraph_compiler::query::depth::QUERY_THREAD_STACK_BYTES)
-        .build()?;
+    // A query compiles and runs on the runtime's threads, with their default
+    // stacks: every walk over a deep query grows its own.
+    let runtime = Runtime::new()?;
     // A refusal explains its fix without environment or source-location footers.
     color_eyre::config::HookBuilder::default()
         .display_env_section(false)
         .display_location_section(false)
         .install()?;
-    // The future `block_on` drives runs on the calling thread: it gets the
-    // query stack too, since the CLI compiles its query there.
-    let (runtime, outcome) = omnigraph_compiler::query::depth::on_query_stack(move || {
-        let outcome = runtime.block_on(omnigraph_cli::app::run_from(std::env::args_os()));
-        (runtime, outcome)
-    });
-    let code = match outcome {
+    let code = match runtime.block_on(omnigraph_cli::app::run_from(std::env::args_os())) {
         Ok(completion) => completion.code(),
         Err(error) => {
             // Reported as returning it from `main` would, but with the exit

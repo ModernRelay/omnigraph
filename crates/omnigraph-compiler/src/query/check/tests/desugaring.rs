@@ -173,12 +173,12 @@ fn int(n: i128, s: ScalarType) -> IRExpr {
 /// A comparison in the bound form the checker stores: each numeric literal at
 /// its own type, the casts [`coerce`](crate::ir::coerce)'s.
 fn cmp(op: CompOp, l: IRExpr, r: IRExpr) -> IRExpr {
-    let own = |e: IRExpr| match e {
+    let own = |e: IRExpr| match &e {
         IRExpr::Literal(lit @ (Literal::Integer(_) | Literal::Float(_)), _) => {
-            let ty = crate::query::check::literal::literal_type(&lit).unwrap();
-            IRExpr::Literal(lit, crate::types::ExprType::from_prop(&ty))
+            let ty = crate::query::check::literal::literal_type(lit).unwrap();
+            IRExpr::Literal(lit.clone(), crate::types::ExprType::from_prop(&ty))
         }
-        other => other,
+        _ => e,
     };
     crate::ir::coerce::binary(own(l), crate::query::value::BinaryOp::Compare(op), own(r)).unwrap()
 }

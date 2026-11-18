@@ -309,12 +309,12 @@ fn bounded_rows(spec: &ScanSpec, source: &dyn PlanSource) -> Option<u64> {
 }
 
 fn predicate_reads(predicate: &Predicate, out: &mut Vec<ColumnRef>) {
-    match predicate {
+    omnigraph_compiler::stack::deep(|| match predicate {
         Predicate::Gq { reads, .. } => out.extend(reads.iter().cloned()),
         Predicate::And { left, right } => {
             predicate_reads(left, out);
             predicate_reads(right, out);
         }
         Predicate::IdAfter { .. } | Predicate::VersionWindow { .. } => {}
-    }
+    })
 }

@@ -338,25 +338,27 @@ fn scan(input: &str) -> Vec<Habit> {
 /// The span of the braced block that starts after `from` (whitespace
 /// first), through its matching `}`.
 fn braced_block(input: &str, from: usize) -> Option<usize> {
-    let rest = &input[from..];
-    let open = from + (rest.len() - rest.trim_start().len());
-    if !input[open..].starts_with('{') {
-        return None;
-    }
-    let mut depth = 0;
-    for (k, c) in input[open..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + k + 1);
-                }
-            }
-            _ => {}
+    crate::stack::deep(|| {
+        let rest = &input[from..];
+        let open = from + (rest.len() - rest.trim_start().len());
+        if !input[open..].starts_with('{') {
+            return None;
         }
-    }
-    None
+        let mut depth = 0;
+        for (k, c) in input[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(open + k + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    })
 }
 
 /// A form a later stage adds, refused naming the form; the message never
@@ -574,7 +576,10 @@ impl Tracked {
 /// The innermost element, `where`, item, key, statement or assignment of `text` that
 /// holds byte `pos`.
 fn construct_at(text: &str, pos: usize) -> Option<(usize, usize)> {
-    let pairs = QueryParser::parse(Rule::query_file, text).ok()?;
+    let room = crate::query::depth::nesting(text)
+        .saturating_mul(crate::query::depth::GRAMMAR_BYTES_PER_LEVEL);
+    let pairs =
+        crate::stack::with_room(room, || QueryParser::parse(Rule::query_file, text)).ok()?;
     let mut best: Option<(usize, usize)> = None;
     for p in pairs.flatten() {
         if !matches!(

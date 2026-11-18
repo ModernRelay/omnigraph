@@ -137,7 +137,7 @@ impl Fragment<'_> {
 
     /// Whether `expr` is an admitted eligibility predicate.
     fn predicate(&self, expr: &IRExpr) -> bool {
-        match expr {
+        omnigraph_compiler::stack::deep(|| match expr {
             IRExpr::Binary {
                 left,
                 op: BinaryOp::And | BinaryOp::Or,
@@ -166,7 +166,7 @@ impl Fragment<'_> {
                     }
             }
             other => self.operand(other) == Some(Operand::Scalar(ScalarType::Bool)),
-        }
+        })
     }
 }
 
@@ -187,6 +187,20 @@ pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
         return None;
     };
     let node_type = input.catalog.node_types.get(type_name)?;
+    // A predicate too deep to hand to the scan's filter planning is not a
+    // member: it is evaluated above the scan, and its derivation would hold
+    // mirrors no deeper walk may take apart.
+    let deep = |filter: &IRExpr| filter.depth() > omnigraph_compiler::stack::MAX_HANDED_OFF_DEPTH;
+    if filters
+        .iter()
+        .chain(ir.pipeline.iter().filter_map(|op| match op {
+            PatternStep::Filter { pred, .. } => Some(pred),
+            _ => None,
+        }))
+        .any(deep)
+    {
+        return None;
+    }
     let fragment = Fragment {
         binding: variable,
         node_type,
@@ -1028,52 +1042,54 @@ fn apply(
 /// properties, literals and bound parameters, a constant cast included (the
 /// scan translates a cast as the filter evaluates it).
 fn translatable(conjunct: &IRExpr, member: &Member, input: &AcceptInput<'_>) -> bool {
-    let Some(node_type) = input.catalog.node_types.get(&member.type_name) else {
-        return false;
-    };
-    fn operand(expr: &IRExpr, member: &Member, node_type: &NodeType) -> bool {
-        match expr {
-            IRExpr::PropAccess {
-                variable, property, ..
-            } => {
-                *variable == member.binding
-                    && node_type.properties.get(property).is_some_and(admitted)
+    omnigraph_compiler::stack::deep(|| {
+        let Some(node_type) = input.catalog.node_types.get(&member.type_name) else {
+            return false;
+        };
+        fn operand(expr: &IRExpr, member: &Member, node_type: &NodeType) -> bool {
+            match expr {
+                IRExpr::PropAccess {
+                    variable, property, ..
+                } => {
+                    *variable == member.binding
+                        && node_type.properties.get(property).is_some_and(admitted)
+                }
+                IRExpr::Literal(
+                    Literal::Bool(_) | Literal::String(_) | Literal::Integer(_) | Literal::Null,
+                    _,
+                )
+                | IRExpr::Param(_, _) => true,
+                IRExpr::Cast { expr, ty } => {
+                    admitted_type(ty).is_some()
+                        && matches!(
+                            expr.as_ref(),
+                            IRExpr::Literal(Literal::Integer(_), _) | IRExpr::Param(_, _)
+                        )
+                }
+                _ => false,
             }
-            IRExpr::Literal(
-                Literal::Bool(_) | Literal::String(_) | Literal::Integer(_) | Literal::Null,
-                _,
-            )
-            | IRExpr::Param(_, _) => true,
-            IRExpr::Cast { expr, ty } => {
-                admitted_type(ty).is_some()
-                    && matches!(
-                        expr.as_ref(),
-                        IRExpr::Literal(Literal::Integer(_), _) | IRExpr::Param(_, _)
-                    )
-            }
-            _ => false,
         }
-    }
-    match conjunct {
-        IRExpr::Binary {
-            left,
-            op: BinaryOp::And | BinaryOp::Or,
-            right,
-            ..
-        } => translatable(left, member, input) && translatable(right, member, input),
-        IRExpr::Not(inner, _) => translatable(inner, member, input),
-        IRExpr::IsNull { expr, .. } => operand(expr, member, node_type),
-        IRExpr::Binary {
-            left,
-            op:
-                BinaryOp::Compare(
-                    CompOp::Eq | CompOp::Ne | CompOp::Lt | CompOp::Le | CompOp::Gt | CompOp::Ge,
-                ),
-            right,
-            ..
-        } => operand(left, member, node_type) && operand(right, member, node_type),
-        other => operand(other, member, node_type),
-    }
+        match conjunct {
+            IRExpr::Binary {
+                left,
+                op: BinaryOp::And | BinaryOp::Or,
+                right,
+                ..
+            } => translatable(left, member, input) && translatable(right, member, input),
+            IRExpr::Not(inner, _) => translatable(inner, member, input),
+            IRExpr::IsNull { expr, .. } => operand(expr, member, node_type),
+            IRExpr::Binary {
+                left,
+                op:
+                    BinaryOp::Compare(
+                        CompOp::Eq | CompOp::Ne | CompOp::Lt | CompOp::Le | CompOp::Gt | CompOp::Ge,
+                    ),
+                right,
+                ..
+            } => operand(left, member, node_type) && operand(right, member, node_type),
+            other => operand(other, member, node_type),
+        }
+    })
 }
 
 /// The candidate plan as a chain, root first, or why it is none.

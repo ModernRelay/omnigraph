@@ -7,16 +7,22 @@ use serde_json::{Value, json};
 
 use crate::logical::Predicate;
 
+/// The typed tree of `root`, each node with its operator, its text and its
+/// type. A node [`MAX_HANDED_OFF_DEPTH`] levels down is written without its
+/// arguments, marked `elided`: every node carries its subtree's text, so a
+/// deeper tree would render in space quadratic in its depth.
+///
+/// [`MAX_HANDED_OFF_DEPTH`]: omnigraph_compiler::stack::MAX_HANDED_OFF_DEPTH
 pub(crate) fn expr(root: &IRExpr) -> Value {
     enum Step<'a> {
-        Visit(&'a IRExpr),
-        Finish(&'a IRExpr, &'static str, usize),
+        Visit(&'a IRExpr, usize),
+        Finish(&'a IRExpr, &'static str, usize, bool),
     }
-    let mut pending = vec![Step::Visit(root)];
+    let mut pending = vec![Step::Visit(root, 1)];
     let mut completed = Vec::new();
     while let Some(step) = pending.pop() {
         match step {
-            Step::Visit(expr) => {
+            Step::Visit(expr, depth) => {
                 let (op, children): (&'static str, Vec<&IRExpr>) = match expr {
                     IRExpr::PropAccess { .. } => ("property", vec![]),
                     IRExpr::Nearest { query, .. } => ("nearest", vec![query]),
@@ -43,12 +49,26 @@ pub(crate) fn expr(root: &IRExpr) -> Value {
                     IRExpr::Call { func, args, .. } => (func.name(), args.iter().collect()),
                 };
 
-                pending.push(Step::Finish(expr, op, children.len()));
-                pending.extend(children.into_iter().rev().map(Step::Visit));
+                let elided = depth >= omnigraph_compiler::stack::MAX_HANDED_OFF_DEPTH
+                    && !children.is_empty();
+                if elided {
+                    pending.push(Step::Finish(expr, op, 0, true));
+                } else {
+                    pending.push(Step::Finish(expr, op, children.len(), false));
+                    pending.extend(
+                        children
+                            .into_iter()
+                            .rev()
+                            .map(|child| Step::Visit(child, depth + 1)),
+                    );
+                }
             }
-            Step::Finish(expr, op, count) => {
+            Step::Finish(expr, op, count, elided) => {
                 let children = completed.split_off(completed.len() - count);
-                let tree = json!({ "op": op, "gq": expr.to_string(), "type": expr.ty().spelling(), "args": children });
+                let mut tree = json!({ "op": op, "gq": expr.to_string(), "type": expr.ty().spelling(), "args": children });
+                if elided {
+                    tree["elided"] = Value::Bool(true);
+                }
                 if pending.is_empty() {
                     return tree;
                 }

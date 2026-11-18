@@ -366,68 +366,70 @@ impl IRExpr {
         &self,
         mut f: impl FnMut(&Self) -> std::result::Result<Self, E>,
     ) -> std::result::Result<Self, E> {
-        let mut b = |x: &Self| f(x).map(Box::new);
-        Ok(match self {
-            Self::PropAccess { .. }
-            | Self::Variable(_, _)
-            | Self::Param(_, _)
-            | Self::Literal(_, _)
-            | Self::AliasRef(_, _) => self.clone(),
-            Self::Nearest {
-                variable,
-                property,
-                query,
-                ty,
-            } => Self::Nearest {
-                variable: variable.clone(),
-                property: property.clone(),
-                query: b(query)?,
-                ty: ty.clone(),
-            },
-            Self::Aggregate {
-                func,
-                distinct,
-                arg,
-                signature,
-            } => Self::Aggregate {
-                func: *func,
-                distinct: *distinct,
-                arg: b(arg)?,
-                signature: signature.clone(),
-            },
-            Self::Binary {
-                left,
-                op,
-                right,
-                ty,
-            } => Self::Binary {
-                left: b(left)?,
-                op: *op,
-                right: b(right)?,
-                ty: ty.clone(),
-            },
-            Self::Not(inner, ty) => Self::Not(b(inner)?, ty.clone()),
-            Self::Cast { expr, ty } => Self::Cast {
-                expr: b(expr)?,
-                ty: ty.clone(),
-            },
-            Self::IsNull { expr, negated, ty } => Self::IsNull {
-                expr: b(expr)?,
-                negated: *negated,
-                ty: ty.clone(),
-            },
-            Self::Neg { expr, ty } => Self::Neg {
-                expr: b(expr)?,
-                ty: ty.clone(),
-            },
-            Self::Call { func, args, ty } => Self::Call {
-                func: *func,
-                args: args
-                    .iter()
-                    .map(&mut f)
-                    .collect::<std::result::Result<_, E>>()?,
-                ty: ty.clone(),
-            },
+        crate::stack::deep(|| {
+            let mut b = |x: &Self| f(x).map(Box::new);
+            Ok(match self {
+                Self::PropAccess { .. }
+                | Self::Variable(_, _)
+                | Self::Param(_, _)
+                | Self::Literal(_, _)
+                | Self::AliasRef(_, _) => self.clone(),
+                Self::Nearest {
+                    variable,
+                    property,
+                    query,
+                    ty,
+                } => Self::Nearest {
+                    variable: variable.clone(),
+                    property: property.clone(),
+                    query: b(query)?,
+                    ty: ty.clone(),
+                },
+                Self::Aggregate {
+                    func,
+                    distinct,
+                    arg,
+                    signature,
+                } => Self::Aggregate {
+                    func: *func,
+                    distinct: *distinct,
+                    arg: b(arg)?,
+                    signature: signature.clone(),
+                },
+                Self::Binary {
+                    left,
+                    op,
+                    right,
+                    ty,
+                } => Self::Binary {
+                    left: b(left)?,
+                    op: *op,
+                    right: b(right)?,
+                    ty: ty.clone(),
+                },
+                Self::Not(inner, ty) => Self::Not(b(inner)?, ty.clone()),
+                Self::Cast { expr, ty } => Self::Cast {
+                    expr: b(expr)?,
+                    ty: ty.clone(),
+                },
+                Self::IsNull { expr, negated, ty } => Self::IsNull {
+                    expr: b(expr)?,
+                    negated: *negated,
+                    ty: ty.clone(),
+                },
+                Self::Neg { expr, ty } => Self::Neg {
+                    expr: b(expr)?,
+                    ty: ty.clone(),
+                },
+                Self::Call { func, args, ty } => Self::Call {
+                    func: *func,
+                    args: args
+                        .iter()
+                        .map(&mut f)
+                        .collect::<std::result::Result<_, E>>()?,
+                    ty: ty.clone(),
+                },
+            })
         })
     }
 
@@ -779,20 +781,20 @@ impl IRExpr {
 
     /// The top-level `and` chain split into its conjuncts, in written order;
     /// an `or`, a `not` or a comparison is one conjunct.
-    pub fn into_conjuncts(self) -> Vec<IRExpr> {
-        match self {
+    pub fn into_conjuncts(mut self) -> Vec<IRExpr> {
+        crate::stack::deep(|| match &mut self {
             IRExpr::Binary {
                 left,
                 op: BinaryOp::And,
                 right,
                 ty: _,
             } => {
-                let mut conjuncts = left.into_conjuncts();
-                conjuncts.extend(right.into_conjuncts());
+                let mut conjuncts = Self::take(left).into_conjuncts();
+                conjuncts.extend(Self::take(right).into_conjuncts());
                 conjuncts
             }
-            other => vec![other],
-        }
+            _ => vec![self],
+        })
     }
 
     /// The conjunction of `conjuncts`, left-nested; `None` when empty.
@@ -855,119 +857,121 @@ impl IRExpr {
 /// ones (`fmt_operand`), never the user's.
 impl std::fmt::Display for IRExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IRExpr::Cast { expr, .. } => expr.fmt(f),
-            IRExpr::Binary {
-                left,
-                op,
-                right,
-                ty: _,
-            } => {
-                let precedence = self.precedence();
-                left.fmt_operand(f, precedence, false)?;
-                write!(f, " {op} ")?;
-                right.fmt_operand(f, precedence, true)
-            }
-            IRExpr::Not(operand, _) => {
-                f.write_str("not ")?;
-                operand.fmt_operand(f, Precedence::Not, false)
-            }
-            IRExpr::IsNull {
-                expr,
-                negated,
-                ty: _,
-            } => {
-                expr.fmt_operand(f, Precedence::Comparison, false)?;
-                f.write_str(if *negated { " is not null" } else { " is null" })
-            }
-            IRExpr::PropAccess {
-                variable,
-                property,
-                ty: _,
-            } => write!(f, "${variable}.{property}"),
-            IRExpr::Nearest {
-                variable,
-                property,
-                query,
-                ty: _,
-            } => write!(f, "nearest(${variable}.{property}, {query})"),
-            IRExpr::Variable(name, _) => write!(f, "${name}"),
-            IRExpr::Param(name, _) if name == NOW_PARAM_NAME => f.write_str("now()"),
-            IRExpr::Param(name, _) => write!(f, "${name}"),
-            IRExpr::Literal(literal, _) => write!(f, "{literal}"),
-            IRExpr::Aggregate {
-                func,
-                distinct: true,
-                arg,
-                ..
-            } => write!(f, "{func}(distinct {arg})"),
-            IRExpr::Aggregate {
-                func,
-                distinct: false,
-                arg,
-                ..
-            } => write!(f, "{func}({arg})"),
-            IRExpr::AliasRef(alias, _) => f.write_str(alias),
-            IRExpr::Neg { expr, .. } => {
-                f.write_str("-")?;
-                // `--` would read as a comment, and `-` before a negative
-                // literal as one; both keep their parentheses.
-                let negative_literal = matches!(
-                    expr.as_ref(),
-                    IRExpr::Literal(Literal::Integer(n), _) if *n < 0
-                ) || matches!(
-                    expr.as_ref(),
-                    IRExpr::Literal(Literal::Float(x), _) if x.is_sign_negative()
-                );
-                if negative_literal || matches!(expr.as_ref(), IRExpr::Neg { .. }) {
-                    write!(f, "({expr})")
-                } else {
-                    expr.fmt_operand(f, Precedence::Negation, false)
+        crate::stack::deep(|| {
+            match self {
+                IRExpr::Cast { expr, .. } => expr.fmt(f),
+                IRExpr::Binary {
+                    left,
+                    op,
+                    right,
+                    ty: _,
+                } => {
+                    let precedence = self.precedence();
+                    left.fmt_operand(f, precedence, false)?;
+                    write!(f, " {op} ")?;
+                    right.fmt_operand(f, precedence, true)
                 }
-            }
-            IRExpr::Call {
-                func: ScalarFunc::MatchTerms { mode },
-                args,
-                ..
-            } => {
-                let mode = match mode {
-                    TermsMode::All => "all",
-                    TermsMode::Any => "any",
-                };
-                match args.as_slice() {
-                    [field, text, max_edits] => write!(
-                        f,
-                        "match_terms({field}, terms({text}, mode: {mode}, max_edits: {max_edits}))"
-                    ),
-                    _ => write!(f, "match_terms(…)"),
+                IRExpr::Not(operand, _) => {
+                    f.write_str("not ")?;
+                    operand.fmt_operand(f, Precedence::Not, false)
                 }
-            }
-            // A list prints as the list literal it was written as.
-            IRExpr::Call {
-                func: ScalarFunc::List,
-                args,
-                ..
-            } => {
-                f.write_str("[")?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
+                IRExpr::IsNull {
+                    expr,
+                    negated,
+                    ty: _,
+                } => {
+                    expr.fmt_operand(f, Precedence::Comparison, false)?;
+                    f.write_str(if *negated { " is not null" } else { " is null" })
+                }
+                IRExpr::PropAccess {
+                    variable,
+                    property,
+                    ty: _,
+                } => write!(f, "${variable}.{property}"),
+                IRExpr::Nearest {
+                    variable,
+                    property,
+                    query,
+                    ty: _,
+                } => write!(f, "nearest(${variable}.{property}, {query})"),
+                IRExpr::Variable(name, _) => write!(f, "${name}"),
+                IRExpr::Param(name, _) if name == NOW_PARAM_NAME => f.write_str("now()"),
+                IRExpr::Param(name, _) => write!(f, "${name}"),
+                IRExpr::Literal(literal, _) => write!(f, "{literal}"),
+                IRExpr::Aggregate {
+                    func,
+                    distinct: true,
+                    arg,
+                    ..
+                } => write!(f, "{func}(distinct {arg})"),
+                IRExpr::Aggregate {
+                    func,
+                    distinct: false,
+                    arg,
+                    ..
+                } => write!(f, "{func}({arg})"),
+                IRExpr::AliasRef(alias, _) => f.write_str(alias),
+                IRExpr::Neg { expr, .. } => {
+                    f.write_str("-")?;
+                    // `--` would read as a comment, and `-` before a negative
+                    // literal as one; both keep their parentheses.
+                    let negative_literal = matches!(
+                        expr.as_ref(),
+                        IRExpr::Literal(Literal::Integer(n), _) if *n < 0
+                    ) || matches!(
+                        expr.as_ref(),
+                        IRExpr::Literal(Literal::Float(x), _) if x.is_sign_negative()
+                    );
+                    if negative_literal || matches!(expr.as_ref(), IRExpr::Neg { .. }) {
+                        write!(f, "({expr})")
+                    } else {
+                        expr.fmt_operand(f, Precedence::Negation, false)
                     }
-                    write!(f, "{arg}")?;
                 }
-                f.write_str("]")
-            }
-            IRExpr::Call { func, args, .. } => {
-                write!(f, "{}(", func.name())?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
+                IRExpr::Call {
+                    func: ScalarFunc::MatchTerms { mode },
+                    args,
+                    ..
+                } => {
+                    let mode = match mode {
+                        TermsMode::All => "all",
+                        TermsMode::Any => "any",
+                    };
+                    match args.as_slice() {
+                        [field, text, max_edits] => write!(
+                            f,
+                            "match_terms({field}, terms({text}, mode: {mode}, max_edits: {max_edits}))"
+                        ),
+                        _ => write!(f, "match_terms(…)"),
                     }
-                    write!(f, "{arg}")?;
                 }
-                f.write_str(")")
+                // A list prints as the list literal it was written as.
+                IRExpr::Call {
+                    func: ScalarFunc::List,
+                    args,
+                    ..
+                } => {
+                    f.write_str("[")?;
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{arg}")?;
+                    }
+                    f.write_str("]")
+                }
+                IRExpr::Call { func, args, .. } => {
+                    write!(f, "{}(", func.name())?;
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{arg}")?;
+                    }
+                    f.write_str(")")
+                }
             }
-        }
+        })
     }
 }
 
@@ -1671,7 +1675,10 @@ fn check_call(func: ScalarFunc, args: &[IRExpr], ty: &ExprType) -> Result<()> {
 /// assignments and mutation predicates. Equal when the trees are equal node
 /// by node (`Literal::Float` by bits), the equality the planner's filter
 /// deduplication and the `Predicate` hash rely on.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// `Clone`, `PartialEq`, `Hash` and `Debug` are written out rather than
+/// derived only so that each enters a level through [`crate::stack::deep`]:
+/// they mean what the derived ones would.
 pub enum IRExpr {
     PropAccess {
         variable: String,
@@ -1721,6 +1728,333 @@ pub enum IRExpr {
         args: Vec<IRExpr>,
         ty: ExprType,
     },
+}
+
+impl Clone for IRExpr {
+    fn clone(&self) -> Self {
+        crate::stack::deep(|| match self {
+            Self::PropAccess {
+                variable,
+                property,
+                ty,
+            } => Self::PropAccess {
+                variable: variable.clone(),
+                property: property.clone(),
+                ty: ty.clone(),
+            },
+            Self::Nearest {
+                variable,
+                property,
+                query,
+                ty,
+            } => Self::Nearest {
+                variable: variable.clone(),
+                property: property.clone(),
+                query: query.clone(),
+                ty: ty.clone(),
+            },
+            Self::Variable(name, ty) => Self::Variable(name.clone(), ty.clone()),
+            Self::Param(name, ty) => Self::Param(name.clone(), ty.clone()),
+            Self::Literal(value, ty) => Self::Literal(value.clone(), ty.clone()),
+            Self::Aggregate {
+                func,
+                distinct,
+                arg,
+                signature,
+            } => Self::Aggregate {
+                func: *func,
+                distinct: *distinct,
+                arg: arg.clone(),
+                signature: signature.clone(),
+            },
+            Self::AliasRef(name, ty) => Self::AliasRef(name.clone(), ty.clone()),
+            Self::Binary {
+                left,
+                op,
+                right,
+                ty,
+            } => Self::Binary {
+                left: left.clone(),
+                op: *op,
+                right: right.clone(),
+                ty: ty.clone(),
+            },
+            Self::Not(inner, ty) => Self::Not(inner.clone(), ty.clone()),
+            Self::Cast { expr, ty } => Self::Cast {
+                expr: expr.clone(),
+                ty: ty.clone(),
+            },
+            Self::IsNull { expr, negated, ty } => Self::IsNull {
+                expr: expr.clone(),
+                negated: *negated,
+                ty: ty.clone(),
+            },
+            Self::Neg { expr, ty } => Self::Neg {
+                expr: expr.clone(),
+                ty: ty.clone(),
+            },
+            Self::Call { func, args, ty } => Self::Call {
+                func: *func,
+                args: args.clone(),
+                ty: ty.clone(),
+            },
+        })
+    }
+}
+
+impl PartialEq for IRExpr {
+    fn eq(&self, other: &Self) -> bool {
+        crate::stack::deep(|| match (self, other) {
+            (
+                Self::PropAccess {
+                    variable: v1,
+                    property: p1,
+                    ty: t1,
+                },
+                Self::PropAccess {
+                    variable: v2,
+                    property: p2,
+                    ty: t2,
+                },
+            ) => v1 == v2 && p1 == p2 && t1 == t2,
+            (
+                Self::Nearest {
+                    variable: v1,
+                    property: p1,
+                    query: q1,
+                    ty: t1,
+                },
+                Self::Nearest {
+                    variable: v2,
+                    property: p2,
+                    query: q2,
+                    ty: t2,
+                },
+            ) => v1 == v2 && p1 == p2 && q1 == q2 && t1 == t2,
+            (Self::Variable(n1, t1), Self::Variable(n2, t2))
+            | (Self::Param(n1, t1), Self::Param(n2, t2))
+            | (Self::AliasRef(n1, t1), Self::AliasRef(n2, t2)) => n1 == n2 && t1 == t2,
+            (Self::Literal(l1, t1), Self::Literal(l2, t2)) => l1 == l2 && t1 == t2,
+            (
+                Self::Aggregate {
+                    func: f1,
+                    distinct: d1,
+                    arg: a1,
+                    signature: s1,
+                },
+                Self::Aggregate {
+                    func: f2,
+                    distinct: d2,
+                    arg: a2,
+                    signature: s2,
+                },
+            ) => f1 == f2 && d1 == d2 && a1 == a2 && s1 == s2,
+            (
+                Self::Binary {
+                    left: l1,
+                    op: o1,
+                    right: r1,
+                    ty: t1,
+                },
+                Self::Binary {
+                    left: l2,
+                    op: o2,
+                    right: r2,
+                    ty: t2,
+                },
+            ) => l1 == l2 && o1 == o2 && r1 == r2 && t1 == t2,
+            (Self::Not(e1, t1), Self::Not(e2, t2)) => e1 == e2 && t1 == t2,
+            (Self::Cast { expr: e1, ty: t1 }, Self::Cast { expr: e2, ty: t2 })
+            | (Self::Neg { expr: e1, ty: t1 }, Self::Neg { expr: e2, ty: t2 }) => {
+                e1 == e2 && t1 == t2
+            }
+            (
+                Self::IsNull {
+                    expr: e1,
+                    negated: n1,
+                    ty: t1,
+                },
+                Self::IsNull {
+                    expr: e2,
+                    negated: n2,
+                    ty: t2,
+                },
+            ) => e1 == e2 && n1 == n2 && t1 == t2,
+            (
+                Self::Call {
+                    func: f1,
+                    args: a1,
+                    ty: t1,
+                },
+                Self::Call {
+                    func: f2,
+                    args: a2,
+                    ty: t2,
+                },
+            ) => f1 == f2 && a1 == a2 && t1 == t2,
+            _ => false,
+        })
+    }
+}
+
+impl Eq for IRExpr {}
+
+impl std::hash::Hash for IRExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        crate::stack::deep(|| {
+            std::mem::discriminant(self).hash(state);
+            match self {
+                Self::PropAccess {
+                    variable,
+                    property,
+                    ty,
+                } => {
+                    variable.hash(state);
+                    property.hash(state);
+                    ty.hash(state);
+                }
+                Self::Nearest {
+                    variable,
+                    property,
+                    query,
+                    ty,
+                } => {
+                    variable.hash(state);
+                    property.hash(state);
+                    query.hash(state);
+                    ty.hash(state);
+                }
+                Self::Variable(name, ty) | Self::Param(name, ty) | Self::AliasRef(name, ty) => {
+                    name.hash(state);
+                    ty.hash(state);
+                }
+                Self::Literal(value, ty) => {
+                    value.hash(state);
+                    ty.hash(state);
+                }
+                Self::Aggregate {
+                    func,
+                    distinct,
+                    arg,
+                    signature,
+                } => {
+                    func.hash(state);
+                    distinct.hash(state);
+                    arg.hash(state);
+                    signature.hash(state);
+                }
+                Self::Binary {
+                    left,
+                    op,
+                    right,
+                    ty,
+                } => {
+                    left.hash(state);
+                    op.hash(state);
+                    right.hash(state);
+                    ty.hash(state);
+                }
+                Self::Not(inner, ty) => {
+                    inner.hash(state);
+                    ty.hash(state);
+                }
+                Self::Cast { expr, ty } | Self::Neg { expr, ty } => {
+                    expr.hash(state);
+                    ty.hash(state);
+                }
+                Self::IsNull { expr, negated, ty } => {
+                    expr.hash(state);
+                    negated.hash(state);
+                    ty.hash(state);
+                }
+                Self::Call { func, args, ty } => {
+                    func.hash(state);
+                    args.hash(state);
+                    ty.hash(state);
+                }
+            }
+        })
+    }
+}
+
+impl std::fmt::Debug for IRExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::stack::deep(|| match self {
+            Self::PropAccess {
+                variable,
+                property,
+                ty,
+            } => f
+                .debug_struct("PropAccess")
+                .field("variable", variable)
+                .field("property", property)
+                .field("ty", ty)
+                .finish(),
+            Self::Nearest {
+                variable,
+                property,
+                query,
+                ty,
+            } => f
+                .debug_struct("Nearest")
+                .field("variable", variable)
+                .field("property", property)
+                .field("query", query)
+                .field("ty", ty)
+                .finish(),
+            Self::Variable(name, ty) => f.debug_tuple("Variable").field(name).field(ty).finish(),
+            Self::Param(name, ty) => f.debug_tuple("Param").field(name).field(ty).finish(),
+            Self::Literal(value, ty) => f.debug_tuple("Literal").field(value).field(ty).finish(),
+            Self::Aggregate {
+                func,
+                distinct,
+                arg,
+                signature,
+            } => f
+                .debug_struct("Aggregate")
+                .field("func", func)
+                .field("distinct", distinct)
+                .field("arg", arg)
+                .field("signature", signature)
+                .finish(),
+            Self::AliasRef(name, ty) => f.debug_tuple("AliasRef").field(name).field(ty).finish(),
+            Self::Binary {
+                left,
+                op,
+                right,
+                ty,
+            } => f
+                .debug_struct("Binary")
+                .field("left", left)
+                .field("op", op)
+                .field("right", right)
+                .field("ty", ty)
+                .finish(),
+            Self::Not(inner, ty) => f.debug_tuple("Not").field(inner).field(ty).finish(),
+            Self::Cast { expr, ty } => f
+                .debug_struct("Cast")
+                .field("expr", expr)
+                .field("ty", ty)
+                .finish(),
+            Self::IsNull { expr, negated, ty } => f
+                .debug_struct("IsNull")
+                .field("expr", expr)
+                .field("negated", negated)
+                .field("ty", ty)
+                .finish(),
+            Self::Neg { expr, ty } => f
+                .debug_struct("Neg")
+                .field("expr", expr)
+                .field("ty", ty)
+                .finish(),
+            Self::Call { func, args, ty } => f
+                .debug_struct("Call")
+                .field("func", func)
+                .field("args", args)
+                .field("ty", ty)
+                .finish(),
+        })
+    }
 }
 
 /// The scalar registry rows an expression calls (the GQ 3 RFC,
@@ -2001,5 +2335,73 @@ mod block_type_tests {
             },
         };
         assert!(forged.check_types().is_err());
+    }
+}
+
+/// A deep tree is taken apart child by child onto a heap stack, so dropping
+/// it never recurses once per level: a dropped node with children moves
+/// them out, leaving a leaf in each child's place, and drops them in turn.
+impl Drop for IRExpr {
+    fn drop(&mut self) {
+        if self
+            .children()
+            .iter()
+            .all(|child| child.children().is_empty())
+        {
+            return;
+        }
+        let mut pending = Vec::new();
+        self.take_children(&mut pending);
+        while let Some(mut child) = pending.pop() {
+            child.take_children(&mut pending);
+        }
+    }
+}
+
+impl IRExpr {
+    /// The levels of the expression's deepest path, counted without
+    /// recursing.
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut pending = vec![(self, 1)];
+        while let Some((node, depth)) = pending.pop() {
+            deepest = deepest.max(depth);
+            pending.extend(node.children().into_iter().map(|child| (child, depth + 1)));
+        }
+        deepest
+    }
+
+    /// A leaf that owns nothing: what [`IRExpr::take`] leaves behind.
+    pub fn placeholder() -> Self {
+        Self::Literal(Literal::Null, boolean_type(true))
+    }
+
+    /// The expression in `slot`, a [`IRExpr::placeholder`] left there. A
+    /// node is not moved out of field by field, since dropping one takes its
+    /// children apart.
+    pub fn take(slot: &mut IRExpr) -> IRExpr {
+        std::mem::replace(slot, Self::placeholder())
+    }
+
+    /// Every child of the node moved into `out`, a placeholder in its place.
+    fn take_children(&mut self, out: &mut Vec<IRExpr>) {
+        match self {
+            Self::PropAccess { .. }
+            | Self::Variable(_, _)
+            | Self::Param(_, _)
+            | Self::Literal(_, _)
+            | Self::AliasRef(_, _) => {}
+            Self::Nearest { query: child, .. }
+            | Self::Aggregate { arg: child, .. }
+            | Self::Not(child, _)
+            | Self::IsNull { expr: child, .. }
+            | Self::Neg { expr: child, .. }
+            | Self::Cast { expr: child, .. } => out.push(Self::take(child)),
+            Self::Binary { left, right, .. } => {
+                out.push(Self::take(left));
+                out.push(Self::take(right));
+            }
+            Self::Call { args, .. } => out.append(args),
+        }
     }
 }

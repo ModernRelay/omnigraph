@@ -127,7 +127,7 @@ fn pattern(p: &Pattern, out: &mut Vec<CanonicalForm>) {
 }
 
 fn element(e: &Element, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
-    match e {
+    crate::stack::deep(|| match e {
         Element::Let { value, .. } => match value {
             LetValue::Relation(body) => read_body(body, out),
             LetValue::Expr(e) => expr(e, at, out),
@@ -158,116 +158,120 @@ fn element(e: &Element, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
                 );
             }
         }
-    }
+    })
 }
 
 fn expr(e: &Expr, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
-    // A block's own position is more exact than its enclosing clause's.
-    if let Expr::Compare {
-        op, left, right, ..
-    } = e
-        && let (Expr::Block(b), Expr::Literal(Literal::Integer(n))) =
-            (left.as_ref(), right.as_ref())
-        && b.func == BlockFunc::Agg(AggFunc::Count)
-        && b.arg.is_none()
-    {
-        let exists = || {
-            let mut block: Block = b.as_ref().clone();
-            block.func = BlockFunc::Exists;
-            print::expr(&Expr::Block(Box::new(block)))
-        };
-        let found = match (op, n) {
-            (CompOp::Gt, 0) => Some(("L203", exists(), true)),
-            (CompOp::Ge, 1) => Some(("L204", exists(), false)),
-            (CompOp::Eq, 0) => Some(("L205", format!("not {}", exists()), false)),
-            _ => None,
-        };
-        if let Some((code, fix, same_ir)) = found {
-            push(out, code, Some(b.at.position), print::expr(e), fix, same_ir);
-        }
-    }
-    match e {
-        Expr::Literal(_)
-        | Expr::Variable(_)
-        | Expr::List { .. }
-        | Expr::Prop { .. }
-        | Expr::Meta(_)
-        | Expr::Ident(_) => {}
-        Expr::Call(c) => call(c, at, out),
-        Expr::AggDistinct { arg, .. } => expr(arg, at, out),
-        Expr::Block(b) => {
-            if let Some(a) = &b.arg {
-                expr(a, Some(b.at.position), out);
+    crate::stack::deep(|| {
+        // A block's own position is more exact than its enclosing clause's.
+        if let Expr::Compare {
+            op, left, right, ..
+        } = e
+            && let (Expr::Block(b), Expr::Literal(Literal::Integer(n))) =
+                (left.as_ref(), right.as_ref())
+            && b.func == BlockFunc::Agg(AggFunc::Count)
+            && b.arg.is_none()
+        {
+            let exists = || {
+                let mut block: Block = b.as_ref().clone();
+                block.func = BlockFunc::Exists;
+                print::expr(&Expr::Block(Box::new(block)))
+            };
+            let found = match (op, n) {
+                (CompOp::Gt, 0) => Some(("L203", exists(), true)),
+                (CompOp::Ge, 1) => Some(("L204", exists(), false)),
+                (CompOp::Eq, 0) => Some(("L205", format!("not {}", exists()), false)),
+                _ => None,
+            };
+            if let Some((code, fix, same_ir)) = found {
+                push(out, code, Some(b.at.position), print::expr(e), fix, same_ir);
             }
-            pattern(&b.pattern, out);
         }
-        Expr::Neg(inner) | Expr::Not(inner) => expr(inner, at, out),
-        Expr::IsNull { expr: inner, .. } => expr(inner, at, out),
-        Expr::Arith { left, right, .. }
-        | Expr::Compare { left, right, .. }
-        | Expr::InfixString { left, right, .. } => {
-            expr(left, at, out);
-            expr(right, at, out);
+        match e {
+            Expr::Literal(_)
+            | Expr::Variable(_)
+            | Expr::List { .. }
+            | Expr::Prop { .. }
+            | Expr::Meta(_)
+            | Expr::Ident(_) => {}
+            Expr::Call(c) => call(c, at, out),
+            Expr::AggDistinct { arg, .. } => expr(arg, at, out),
+            Expr::Block(b) => {
+                if let Some(a) = &b.arg {
+                    expr(a, Some(b.at.position), out);
+                }
+                pattern(&b.pattern, out);
+            }
+            Expr::Neg(inner) | Expr::Not(inner) => expr(inner, at, out),
+            Expr::IsNull { expr: inner, .. } => expr(inner, at, out),
+            Expr::Arith { left, right, .. }
+            | Expr::Compare { left, right, .. }
+            | Expr::InfixString { left, right, .. } => {
+                expr(left, at, out);
+                expr(right, at, out);
+            }
+            Expr::In { needle, list, .. } => {
+                expr(needle, at, out);
+                expr(list, at, out);
+            }
+            Expr::And(l, r) | Expr::Or(l, r) => {
+                expr(l, at, out);
+                expr(r, at, out);
+            }
         }
-        Expr::In { needle, list, .. } => {
-            expr(needle, at, out);
-            expr(list, at, out);
-        }
-        Expr::And(l, r) | Expr::Or(l, r) => {
-            expr(l, at, out);
-            expr(r, at, out);
-        }
-    }
+    })
 }
 
 fn call(c: &Call, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
-    // `union` folds its arms from the left, so a `union` nested as its first
-    // argument is the flat one.
-    if c.name == "union"
-        && c.options.is_empty()
-        && matches!(c.args.first(), Some(Arg::Expr(Expr::Call(inner))) if inner.name == "union" && inner.options.is_empty())
-    {
-        let mut flat = c.clone();
-        while let Some(Arg::Expr(Expr::Call(inner))) = flat.args.first()
-            && inner.name == "union"
-            && inner.options.is_empty()
+    crate::stack::deep(|| {
+        // `union` folds its arms from the left, so a `union` nested as its first
+        // argument is the flat one.
+        if c.name == "union"
+            && c.options.is_empty()
+            && matches!(c.args.first(), Some(Arg::Expr(Expr::Call(inner))) if inner.name == "union" && inner.options.is_empty())
         {
-            let inner_args = inner.args.clone();
-            flat.args.splice(0..1, inner_args);
+            let mut flat = c.clone();
+            while let Some(Arg::Expr(Expr::Call(inner))) = flat.args.first()
+                && inner.name == "union"
+                && inner.options.is_empty()
+            {
+                let inner_args = inner.args.clone();
+                flat.args.splice(0..1, inner_args);
+            }
+            push(out, "L206", at, print::call(c), print::call(&flat), true);
         }
-        push(out, "L206", at, print::call(c), print::call(&flat), true);
-    }
-    let ordered = canonical_options(c);
-    if ordered.options != c.options {
-        push(out, "L210", at, print::call(c), print::call(&ordered), true);
-    }
-    // `bm25` over `terms(q, mode: any)` is `bm25` over the String `q`.
-    if c.name == "bm25"
-        && let Some(Arg::Expr(Expr::Call(t))) = c.args.get(2)
-        && t.name == "terms"
-        && let [Arg::Expr(text)] = t.args.as_slice()
-        && matches!(t.options.as_slice(), [(o, Expr::Ident(m))] if o == "mode" && m == "any")
-    {
-        let mut over_string = c.clone();
-        over_string.args[2] = Arg::Expr(text.clone());
-        push(
-            out,
-            "L211",
-            at,
-            print::call(c),
-            print::call(&over_string),
-            true,
-        );
-    }
-    for a in &c.args {
-        match a {
-            Arg::Expr(e) => expr(e, at, out),
-            Arg::Inline(body) => read_body(body, out),
+        let ordered = canonical_options(c);
+        if ordered.options != c.options {
+            push(out, "L210", at, print::call(c), print::call(&ordered), true);
         }
-    }
-    for (_, v) in &c.options {
-        expr(v, at, out);
-    }
+        // `bm25` over `terms(q, mode: any)` is `bm25` over the String `q`.
+        if c.name == "bm25"
+            && let Some(Arg::Expr(Expr::Call(t))) = c.args.get(2)
+            && t.name == "terms"
+            && let [Arg::Expr(text)] = t.args.as_slice()
+            && matches!(t.options.as_slice(), [(o, Expr::Ident(m))] if o == "mode" && m == "any")
+        {
+            let mut over_string = c.clone();
+            over_string.args[2] = Arg::Expr(text.clone());
+            push(
+                out,
+                "L211",
+                at,
+                print::call(c),
+                print::call(&over_string),
+                true,
+            );
+        }
+        for a in &c.args {
+            match a {
+                Arg::Expr(e) => expr(e, at, out),
+                Arg::Inline(body) => read_body(body, out),
+            }
+        }
+        for (_, v) in &c.options {
+            expr(v, at, out);
+        }
+    })
 }
 
 /// `c` with its options in the registry's order and those equal to their

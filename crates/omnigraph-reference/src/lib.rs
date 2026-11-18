@@ -493,119 +493,185 @@ impl<'a> Interpreter<'a> {
     // Operators (section 2's table).
 
     fn term(&mut self, t: &Term, env: &Row) -> R<Rel> {
-        Ok(match t {
-            Term::Unit => Rel {
-                rows: vec![Vec::new()],
-                ordered: false,
-            },
-            Term::Env(cols) => Rel {
-                rows: vec![
-                    cols.iter()
-                        .map(|c| {
-                            (
-                                c.name.clone(),
-                                get(env, &c.name).cloned().unwrap_or(Value::Null),
-                            )
-                        })
-                        .collect(),
-                ],
-                ordered: false,
-            },
-            Term::Scan { var, ty } => {
-                let (edge, type_name) = match ty {
-                    Ty::Node { type_name, .. } => (false, type_name),
-                    Ty::Edge { type_name, .. } => (true, type_name),
-                    Ty::Value(_) => return unsupported("a scan of a value column"),
-                };
-                let mut rows = Vec::new();
-                for t in type_name.split('|') {
-                    let declared = if edge {
-                        self.catalog.edge_types.contains_key(t)
-                    } else {
-                        self.catalog.node_types.contains_key(t)
-                    };
-                    if !declared {
-                        // A catalogue type (`@Operator`) is served by the
-                        // engine, not stored, so the export carries no row;
-                        // an interface's polymorphic scan is not evaluated.
-                        return unsupported(format!(
-                            "a scan of `{t}`, which the export does not carry"
-                        ));
-                    }
-                    let entities = if edge {
-                        self.graph.edges.get(t)
-                    } else {
-                        self.graph.nodes.get(t)
-                    };
-                    for e in entities.into_iter().flatten() {
-                        rows.push(vec![(
-                            var.clone(),
-                            Value::Ref {
-                                edge,
-                                type_name: t.to_string(),
-                                id: e.id.clone(),
-                            },
-                        )]);
-                    }
-                }
-                Rel {
-                    rows,
+        omnigraph_compiler::stack::deep(|| {
+            Ok(match t {
+                Term::Unit => Rel {
+                    rows: vec![Vec::new()],
                     ordered: false,
-                }
-            }
-            Term::Expand {
-                input,
-                src,
-                dst,
-                edges,
-                min_hops,
-                max_hops,
-                edge_var,
-                ..
-            } => {
-                let input = self.term(input, env)?;
-                let mut rows = Vec::new();
-                for row in input.rows {
-                    let Some(Value::Ref { id, .. }) = get(&row, src).cloned() else {
-                        continue;
+                },
+                Term::Env(cols) => Rel {
+                    rows: vec![
+                        cols.iter()
+                            .map(|c| {
+                                (
+                                    c.name.clone(),
+                                    get(env, &c.name).cloned().unwrap_or(Value::Null),
+                                )
+                            })
+                            .collect(),
+                    ],
+                    ordered: false,
+                },
+                Term::Scan { var, ty } => {
+                    let (edge, type_name) = match ty {
+                        Ty::Node { type_name, .. } => (false, type_name),
+                        Ty::Edge { type_name, .. } => (true, type_name),
+                        Ty::Value(_) => return unsupported("a scan of a value column"),
                     };
-                    let steps = |from: &str| -> Vec<(String, String, String, String)> {
-                        // (edge type, edge id, neighbour type, neighbour id)
-                        let mut out = Vec::new();
-                        for m in edges.members() {
-                            let Some(et) = self.catalog.edge_types.get(&m.edge_type) else {
-                                continue;
-                            };
-                            for e in self.graph.edges.get(&m.edge_type).into_iter().flatten() {
-                                let (a, b) = e.ends.as_ref().unwrap();
-                                let out_ok = a == from
-                                    && matches!(m.direction, Direction::Out | Direction::Both);
-                                let in_ok = b == from
-                                    && matches!(m.direction, Direction::In | Direction::Both);
-                                if out_ok {
-                                    out.push((
-                                        et.name.clone(),
-                                        e.id.clone(),
-                                        et.to_type.clone(),
-                                        b.clone(),
-                                    ));
-                                }
-                                if in_ok && !(out_ok && a == b) {
-                                    out.push((
-                                        et.name.clone(),
-                                        e.id.clone(),
-                                        et.from_type.clone(),
-                                        a.clone(),
-                                    ));
+                    let mut rows = Vec::new();
+                    for t in type_name.split('|') {
+                        let declared = if edge {
+                            self.catalog.edge_types.contains_key(t)
+                        } else {
+                            self.catalog.node_types.contains_key(t)
+                        };
+                        if !declared {
+                            // A catalogue type (`@Operator`) is served by the
+                            // engine, not stored, so the export carries no row;
+                            // an interface's polymorphic scan is not evaluated.
+                            return unsupported(format!(
+                                "a scan of `{t}`, which the export does not carry"
+                            ));
+                        }
+                        let entities = if edge {
+                            self.graph.edges.get(t)
+                        } else {
+                            self.graph.nodes.get(t)
+                        };
+                        for e in entities.into_iter().flatten() {
+                            rows.push(vec![(
+                                var.clone(),
+                                Value::Ref {
+                                    edge,
+                                    type_name: t.to_string(),
+                                    id: e.id.clone(),
+                                },
+                            )]);
+                        }
+                    }
+                    Rel {
+                        rows,
+                        ordered: false,
+                    }
+                }
+                Term::Expand {
+                    input,
+                    src,
+                    dst,
+                    edges,
+                    min_hops,
+                    max_hops,
+                    edge_var,
+                    ..
+                } => {
+                    let input = self.term(input, env)?;
+                    let mut rows = Vec::new();
+                    for row in input.rows {
+                        let Some(Value::Ref { id, .. }) = get(&row, src).cloned() else {
+                            continue;
+                        };
+                        let steps = |from: &str| -> Vec<(String, String, String, String)> {
+                            // (edge type, edge id, neighbour type, neighbour id)
+                            let mut out = Vec::new();
+                            for m in edges.members() {
+                                let Some(et) = self.catalog.edge_types.get(&m.edge_type) else {
+                                    continue;
+                                };
+                                for e in self.graph.edges.get(&m.edge_type).into_iter().flatten() {
+                                    let (a, b) = e.ends.as_ref().unwrap();
+                                    let out_ok = a == from
+                                        && matches!(m.direction, Direction::Out | Direction::Both);
+                                    let in_ok = b == from
+                                        && matches!(m.direction, Direction::In | Direction::Both);
+                                    if out_ok {
+                                        out.push((
+                                            et.name.clone(),
+                                            e.id.clone(),
+                                            et.to_type.clone(),
+                                            b.clone(),
+                                        ));
+                                    }
+                                    if in_ok && !(out_ok && a == b) {
+                                        out.push((
+                                            et.name.clone(),
+                                            e.id.clone(),
+                                            et.from_type.clone(),
+                                            a.clone(),
+                                        ));
+                                    }
                                 }
                             }
+                            out
+                        };
+                        if let Some(k) = edge_var {
+                            for (et, eid, nt, nid) in steps(&id) {
+                                // `R + [$y] + [$k]`: the column order the
+                                // tie rule reads.
+                                let mut r = row.clone();
+                                r.push((
+                                    dst.clone(),
+                                    Value::Ref {
+                                        edge: false,
+                                        type_name: nt,
+                                        id: nid,
+                                    },
+                                ));
+                                r.push((
+                                    k.clone(),
+                                    Value::Ref {
+                                        edge: true,
+                                        type_name: et,
+                                        id: eid,
+                                    },
+                                ));
+                                rows.push(r);
+                            }
+                            continue;
                         }
-                        out
-                    };
-                    if let Some(k) = edge_var {
-                        for (et, eid, nt, nid) in steps(&id) {
-                            // `R + [$y] + [$k]`: the column order the
-                            // tie rule reads.
+                        // Set semantics over endpoint pairs: each node at its
+                        // shortest distance, kept when that distance is in
+                        // `min..=max`. The source sits at distance 0, so a
+                        // cycle never returns it; a self-loop edge returns it
+                        // only to the single hop, and the walk does not
+                        // continue from it.
+                        let src_type = match get(&row, src) {
+                            Some(Value::Ref { type_name, .. }) => type_name.clone(),
+                            _ => String::new(),
+                        };
+                        let mut distance: BTreeMap<(String, String), u32> = BTreeMap::new();
+                        distance.insert((src_type.clone(), id.clone()), 0);
+                        let mut self_loop = false;
+                        let mut frontier = vec![id.clone()];
+                        let mut hop = 0u32;
+                        while !frontier.is_empty() && max_hops.is_none_or(|m| hop < m) {
+                            hop += 1;
+                            let mut next = Vec::new();
+                            for at in &frontier {
+                                for (_, _, nt, nid) in steps(at) {
+                                    if hop == 1 && nt == src_type && nid == id {
+                                        self_loop = true;
+                                        continue;
+                                    }
+                                    if let std::collections::btree_map::Entry::Vacant(slot) =
+                                        distance.entry((nt, nid.clone()))
+                                    {
+                                        slot.insert(hop);
+                                        next.push(nid);
+                                    }
+                                }
+                            }
+                            frontier = next;
+                        }
+                        if self_loop && *min_hops <= 1 && *max_hops == Some(1) {
+                            distance.insert((src_type, id.clone()), 1);
+                        }
+                        let seen: BTreeMap<(String, String), u32> = distance
+                            .into_iter()
+                            .filter(|(_, d)| {
+                                *d >= (*min_hops).max(1) && max_hops.is_none_or(|m| *d <= m)
+                            })
+                            .collect();
+                        for (nt, nid) in seen.into_keys() {
                             let mut r = row.clone();
                             r.push((
                                 dst.clone(),
@@ -615,395 +681,333 @@ impl<'a> Interpreter<'a> {
                                     id: nid,
                                 },
                             ));
-                            r.push((
-                                k.clone(),
-                                Value::Ref {
-                                    edge: true,
-                                    type_name: et,
-                                    id: eid,
-                                },
-                            ));
                             rows.push(r);
                         }
-                        continue;
                     }
-                    // Set semantics over endpoint pairs: each node at its
-                    // shortest distance, kept when that distance is in
-                    // `min..=max`. The source sits at distance 0, so a
-                    // cycle never returns it; a self-loop edge returns it
-                    // only to the single hop, and the walk does not
-                    // continue from it.
-                    let src_type = match get(&row, src) {
-                        Some(Value::Ref { type_name, .. }) => type_name.clone(),
-                        _ => String::new(),
-                    };
-                    let mut distance: BTreeMap<(String, String), u32> = BTreeMap::new();
-                    distance.insert((src_type.clone(), id.clone()), 0);
-                    let mut self_loop = false;
-                    let mut frontier = vec![id.clone()];
-                    let mut hop = 0u32;
-                    while !frontier.is_empty() && max_hops.is_none_or(|m| hop < m) {
-                        hop += 1;
-                        let mut next = Vec::new();
-                        for at in &frontier {
-                            for (_, _, nt, nid) in steps(at) {
-                                if hop == 1 && nt == src_type && nid == id {
-                                    self_loop = true;
-                                    continue;
-                                }
-                                if let std::collections::btree_map::Entry::Vacant(slot) =
-                                    distance.entry((nt, nid.clone()))
-                                {
-                                    slot.insert(hop);
-                                    next.push(nid);
-                                }
-                            }
-                        }
-                        frontier = next;
-                    }
-                    if self_loop && *min_hops <= 1 && *max_hops == Some(1) {
-                        distance.insert((src_type, id.clone()), 1);
-                    }
-                    let seen: BTreeMap<(String, String), u32> = distance
-                        .into_iter()
-                        .filter(|(_, d)| {
-                            *d >= (*min_hops).max(1) && max_hops.is_none_or(|m| *d <= m)
-                        })
-                        .collect();
-                    for (nt, nid) in seen.into_keys() {
-                        let mut r = row.clone();
-                        r.push((
-                            dst.clone(),
-                            Value::Ref {
-                                edge: false,
-                                type_name: nt,
-                                id: nid,
-                            },
-                        ));
-                        rows.push(r);
+                    Rel {
+                        rows,
+                        ordered: false,
                     }
                 }
-                Rel {
-                    rows,
-                    ordered: false,
-                }
-            }
-            Term::Filter {
-                input,
-                pred,
-                fails: false,
-            } if let Some(sunk) = sink(input, pred) => self.term(&sunk, env)?,
-            Term::Filter { input, pred, .. } => {
-                let input = self.term(input, env)?;
-                let mut rows = Vec::new();
-                for row in input.rows {
-                    if self.expr(pred, &row, env)?.truthy() {
-                        rows.push(row);
-                    }
-                }
-                Rel {
-                    rows,
-                    ordered: input.ordered,
-                }
-            }
-            Term::Project {
-                input, items, keep, ..
-            } => {
-                let input = self.term(input, env)?;
-                let mut rows = Vec::new();
-                for row in input.rows {
-                    let mut out = if *keep { row.clone() } else { Vec::new() };
-                    for (name, e) in items {
-                        let v = self.expr(e, &row, env)?;
-                        set(&mut out, name, v);
-                    }
-                    rows.push(out);
-                }
-                Rel {
-                    rows,
-                    ordered: input.ordered,
-                }
-            }
-            Term::Group { input, keys, aggs } => {
-                let input = self.term(input, env)?;
-                let mut groups: Vec<(Vec<Value>, Vec<Row>)> = Vec::new();
-                for row in input.rows {
-                    let key = keys
-                        .iter()
-                        .map(|(_, e)| self.expr(e, &row, env))
-                        .collect::<R<Vec<_>>>()?;
-                    match groups.iter_mut().find(|(k, _)| {
-                        k.len() == key.len() && k.iter().zip(&key).all(|(p, q)| identical(p, q))
-                    }) {
-                        Some((_, members)) => members.push(row),
-                        None => groups.push((key, vec![row])),
-                    }
-                }
-                if keys.is_empty() && groups.is_empty() {
-                    groups.push((Vec::new(), Vec::new()));
-                }
-                let mut rows = Vec::new();
-                for (key, members) in groups {
-                    let mut out: Row = keys.iter().map(|(n, _)| n.clone()).zip(key).collect();
-                    for (name, agg) in aggs {
-                        let v = self.aggregate(agg, &members, env)?;
-                        out.push((name.clone(), v));
-                    }
-                    rows.push(out);
-                }
-                Rel {
-                    rows,
-                    ordered: false,
-                }
-            }
-            Term::Correlate { outer, inner, .. } => {
-                let outer = self.term(outer, env)?;
-                let mut rows = Vec::new();
-                for row in outer.rows {
-                    let mut inner_env = env.clone();
-                    for (n, v) in &row {
-                        set(&mut inner_env, n, v.clone());
-                    }
-                    for r in self.term(inner, &inner_env)?.rows {
-                        let mut out = row.clone();
-                        for (n, v) in r {
-                            if get(&row, &n).is_none() {
-                                out.push((n, v));
-                            }
-                        }
-                        rows.push(out);
-                    }
-                }
-                Rel {
-                    rows,
-                    ordered: false,
-                }
-            }
-            Term::Union { left, right } => {
-                // The arms match by column name, in the left arm's column
-                // order.
-                let names = columns(left);
-                let mut l = self.term(left, env)?;
-                let r = self.term(right, env)?;
-                for row in r.rows {
-                    let aligned = names
-                        .iter()
-                        .map(|name| match get(&row, name) {
-                            Some(v) => Ok((name.clone(), v.clone())),
-                            None => Err(Refusal::Unsupported(format!(
-                                "a union arm has no column `{name}`"
-                            ))),
-                        })
-                        .collect::<R<Row>>()?;
-                    l.rows.push(aligned);
-                }
-                l.ordered = false;
-                l
-            }
-            Term::Order { input, keys } => {
-                let input = self.term(input, env)?;
-                let mut keyed = Vec::new();
-                for row in input.rows {
-                    let k = keys
-                        .iter()
-                        .map(|(e, desc)| Ok((self.expr(e, &row, env)?, *desc)))
-                        .collect::<R<Vec<_>>>()?;
-                    keyed.push((k, row));
-                }
-                keyed.sort_by(|(ka, ra), (kb, rb)| {
-                    for ((a, desc), (b, _)) in ka.iter().zip(kb) {
-                        let o = cmp_values(a, b);
-                        let o = if *desc { o.reverse() } else { o };
-                        if o != Ordering::Equal {
-                            return o;
-                        }
-                    }
-                    tie(ra, rb)
-                });
-                Rel {
-                    rows: keyed.into_iter().map(|(_, r)| r).collect(),
-                    ordered: true,
-                }
-            }
-            Term::Cut { input, k } => {
-                let mut input = self.term(input, env)?;
-                if !input.ordered {
-                    input.rows.sort_by(tie);
-                }
-                input.rows.truncate(self.count(k)?);
-                Rel {
-                    rows: input.rows,
-                    ordered: true,
-                }
-            }
-            Term::Score {
-                input,
-                column,
-                property,
-                kind,
-                query,
-                out,
-            } => {
-                let input = self.term(input, env)?;
-                let mut rows = Vec::new();
-                match (kind, query) {
-                    (ScoreKind::Distance, ScoreQuery::Vector(q)) => {
-                        let q = self.vector(q, env)?;
-                        for mut row in input.rows {
-                            let Some(d) = self.field_distance(&row, column, property, &q)? else {
-                                continue;
-                            };
-                            row.push((out.clone(), Value::Float(finite_distance(d)?)));
+                Term::Filter {
+                    input,
+                    pred,
+                    fails: false,
+                } if let Some(sunk) = sink(input, pred) => self.term(&sunk, env)?,
+                Term::Filter { input, pred, .. } => {
+                    let input = self.term(input, env)?;
+                    let mut rows = Vec::new();
+                    for row in input.rows {
+                        if self.expr(pred, &row, env)?.truthy() {
                             rows.push(row);
                         }
                     }
-                    // An empty population scores nothing, whatever the field's
-                    // analysis.
-                    (ScoreKind::Bm25, ScoreQuery::Lexical(_)) if input.rows.is_empty() => {}
-                    (ScoreKind::Bm25, ScoreQuery::Lexical(lex)) => {
-                        let scorer = self.bm25(&input.rows, column, property, lex, env)?;
-                        for mut row in input.rows {
-                            if let Some(s) = scorer.score(self, &row, column, property)? {
-                                row.push((out.clone(), Value::Float(s)));
+                    Rel {
+                        rows,
+                        ordered: input.ordered,
+                    }
+                }
+                Term::Project {
+                    input, items, keep, ..
+                } => {
+                    let input = self.term(input, env)?;
+                    let mut rows = Vec::new();
+                    for row in input.rows {
+                        let mut out = if *keep { row.clone() } else { Vec::new() };
+                        for (name, e) in items {
+                            let v = self.expr(e, &row, env)?;
+                            set(&mut out, name, v);
+                        }
+                        rows.push(out);
+                    }
+                    Rel {
+                        rows,
+                        ordered: input.ordered,
+                    }
+                }
+                Term::Group { input, keys, aggs } => {
+                    let input = self.term(input, env)?;
+                    let mut groups: Vec<(Vec<Value>, Vec<Row>)> = Vec::new();
+                    for row in input.rows {
+                        let key = keys
+                            .iter()
+                            .map(|(_, e)| self.expr(e, &row, env))
+                            .collect::<R<Vec<_>>>()?;
+                        match groups.iter_mut().find(|(k, _)| {
+                            k.len() == key.len() && k.iter().zip(&key).all(|(p, q)| identical(p, q))
+                        }) {
+                            Some((_, members)) => members.push(row),
+                            None => groups.push((key, vec![row])),
+                        }
+                    }
+                    if keys.is_empty() && groups.is_empty() {
+                        groups.push((Vec::new(), Vec::new()));
+                    }
+                    let mut rows = Vec::new();
+                    for (key, members) in groups {
+                        let mut out: Row = keys.iter().map(|(n, _)| n.clone()).zip(key).collect();
+                        for (name, agg) in aggs {
+                            let v = self.aggregate(agg, &members, env)?;
+                            out.push((name.clone(), v));
+                        }
+                        rows.push(out);
+                    }
+                    Rel {
+                        rows,
+                        ordered: false,
+                    }
+                }
+                Term::Correlate { outer, inner, .. } => {
+                    let outer = self.term(outer, env)?;
+                    let mut rows = Vec::new();
+                    for row in outer.rows {
+                        let mut inner_env = env.clone();
+                        for (n, v) in &row {
+                            set(&mut inner_env, n, v.clone());
+                        }
+                        for r in self.term(inner, &inner_env)?.rows {
+                            let mut out = row.clone();
+                            for (n, v) in r {
+                                if get(&row, &n).is_none() {
+                                    out.push((n, v));
+                                }
+                            }
+                            rows.push(out);
+                        }
+                    }
+                    Rel {
+                        rows,
+                        ordered: false,
+                    }
+                }
+                Term::Union { left, right } => {
+                    // The arms match by column name, in the left arm's column
+                    // order.
+                    let names = columns(left);
+                    let mut l = self.term(left, env)?;
+                    let r = self.term(right, env)?;
+                    for row in r.rows {
+                        let aligned = names
+                            .iter()
+                            .map(|name| match get(&row, name) {
+                                Some(v) => Ok((name.clone(), v.clone())),
+                                None => Err(Refusal::Unsupported(format!(
+                                    "a union arm has no column `{name}`"
+                                ))),
+                            })
+                            .collect::<R<Row>>()?;
+                        l.rows.push(aligned);
+                    }
+                    l.ordered = false;
+                    l
+                }
+                Term::Order { input, keys } => {
+                    let input = self.term(input, env)?;
+                    let mut keyed = Vec::new();
+                    for row in input.rows {
+                        let k = keys
+                            .iter()
+                            .map(|(e, desc)| Ok((self.expr(e, &row, env)?, *desc)))
+                            .collect::<R<Vec<_>>>()?;
+                        keyed.push((k, row));
+                    }
+                    keyed.sort_by(|(ka, ra), (kb, rb)| {
+                        for ((a, desc), (b, _)) in ka.iter().zip(kb) {
+                            let o = cmp_values(a, b);
+                            let o = if *desc { o.reverse() } else { o };
+                            if o != Ordering::Equal {
+                                return o;
+                            }
+                        }
+                        tie(ra, rb)
+                    });
+                    Rel {
+                        rows: keyed.into_iter().map(|(_, r)| r).collect(),
+                        ordered: true,
+                    }
+                }
+                Term::Cut { input, k } => {
+                    let mut input = self.term(input, env)?;
+                    if !input.ordered {
+                        input.rows.sort_by(tie);
+                    }
+                    input.rows.truncate(self.count(k)?);
+                    Rel {
+                        rows: input.rows,
+                        ordered: true,
+                    }
+                }
+                Term::Score {
+                    input,
+                    column,
+                    property,
+                    kind,
+                    query,
+                    out,
+                } => {
+                    let input = self.term(input, env)?;
+                    let mut rows = Vec::new();
+                    match (kind, query) {
+                        (ScoreKind::Distance, ScoreQuery::Vector(q)) => {
+                            let q = self.vector(q, env)?;
+                            for mut row in input.rows {
+                                let Some(d) = self.field_distance(&row, column, property, &q)?
+                                else {
+                                    continue;
+                                };
+                                row.push((out.clone(), Value::Float(finite_distance(d)?)));
                                 rows.push(row);
                             }
                         }
+                        // An empty population scores nothing, whatever the field's
+                        // analysis.
+                        (ScoreKind::Bm25, ScoreQuery::Lexical(_)) if input.rows.is_empty() => {}
+                        (ScoreKind::Bm25, ScoreQuery::Lexical(lex)) => {
+                            let scorer = self.bm25(&input.rows, column, property, lex, env)?;
+                            for mut row in input.rows {
+                                if let Some(s) = scorer.score(self, &row, column, property)? {
+                                    row.push((out.clone(), Value::Float(s)));
+                                    rows.push(row);
+                                }
+                            }
+                        }
+                        _ => return unsupported("a score whose query does not match its kind"),
                     }
-                    _ => return unsupported("a score whose query does not match its kind"),
-                }
-                Rel {
-                    rows,
-                    ordered: false,
-                }
-            }
-            Term::ApproxTopK {
-                input,
-                column,
-                property,
-                query,
-                k,
-                out,
-                ..
-            } => {
-                // Exact: every target's distance, the `k` nearest kept.
-                let input = self.term(input, env)?;
-                let q = self.vector(query, env)?;
-                let k = self.count_within(k, 1, u64::MAX)?;
-                let mut best: Vec<(f64, Value)> = Vec::new();
-                for row in &input.rows {
-                    let Some(target) = get(row, column).cloned() else {
-                        continue;
-                    };
-                    if best.iter().any(|(_, t)| t == &target) {
-                        continue;
-                    }
-                    if let Some(d) = self.field_distance(row, column, property, &q)? {
-                        best.push((d, target));
+                    Rel {
+                        rows,
+                        ordered: false,
                     }
                 }
-                best.sort_by(|a, b| {
-                    a.0.partial_cmp(&b.0)
-                        .unwrap_or(Ordering::Equal)
-                        .then(cmp_values(&a.1, &b.1))
-                });
-                best.truncate(k);
-                // A kept target's distance must be finite; an overflowing
-                // one past the window was never selected.
-                for (d, _) in &best {
-                    finite_distance(*d)?;
-                }
-                let mut rows = Vec::new();
-                for mut row in input.rows {
-                    let target = get(&row, column).cloned();
-                    if let Some((d, _)) = best.iter().find(|(_, t)| Some(t) == target.as_ref()) {
-                        row.push((out.clone(), Value::Float(*d)));
-                        rows.push(row);
-                    }
-                }
-                Rel {
-                    rows,
-                    ordered: false,
-                }
-            }
-            Term::Fuse {
-                arms,
-                target,
-                k,
-                weights,
-                out,
-            } => {
-                let k = self.count_within(k, 1, RRF_MAX_K)? as f64;
-                let mut fused: Vec<(Value, f64)> = Vec::new();
-                for (i, arm) in arms.iter().enumerate() {
-                    let best = self.ranked_targets(arm, target, env)?;
-                    let w = weights.get(i).copied().unwrap_or(1.0);
-                    for (rank, t) in best.into_iter().enumerate() {
-                        let add = w / (k + (rank + 1) as f64);
-                        match fused.iter_mut().find(|(f, _)| *f == t) {
-                            Some((_, s)) => *s += add,
-                            None => fused.push((t, add)),
+                Term::ApproxTopK {
+                    input,
+                    column,
+                    property,
+                    query,
+                    k,
+                    out,
+                    ..
+                } => {
+                    // Exact: every target's distance, the `k` nearest kept.
+                    let input = self.term(input, env)?;
+                    let q = self.vector(query, env)?;
+                    let k = self.count_within(k, 1, u64::MAX)?;
+                    let mut best: Vec<(f64, Value)> = Vec::new();
+                    for row in &input.rows {
+                        let Some(target) = get(row, column).cloned() else {
+                            continue;
+                        };
+                        if best.iter().any(|(_, t)| t == &target) {
+                            continue;
+                        }
+                        if let Some(d) = self.field_distance(row, column, property, &q)? {
+                            best.push((d, target));
                         }
                     }
-                }
-                Rel {
-                    rows: fused
-                        .into_iter()
-                        .map(|(t, s)| vec![(target.clone(), t), (out.clone(), Value::Float(s))])
-                        .collect(),
-                    ordered: false,
-                }
-            }
-            Term::Fix {
-                name, body, rounds, ..
-            } => {
-                let mut current: Vec<Row> = Vec::new();
-                let limit = rounds.unwrap_or(1_000);
-                for _ in 0..limit {
-                    self.rec.insert(name.clone(), current.clone());
-                    let next = self.term(body, env)?.rows;
-                    let mut merged = current.clone();
-                    for r in next {
-                        if !merged.iter().any(|m| same_row(m, &r)) {
-                            merged.push(r);
+                    best.sort_by(|a, b| {
+                        a.0.partial_cmp(&b.0)
+                            .unwrap_or(Ordering::Equal)
+                            .then(cmp_values(&a.1, &b.1))
+                    });
+                    best.truncate(k);
+                    // A kept target's distance must be finite; an overflowing
+                    // one past the window was never selected.
+                    for (d, _) in &best {
+                        finite_distance(*d)?;
+                    }
+                    let mut rows = Vec::new();
+                    for mut row in input.rows {
+                        let target = get(&row, column).cloned();
+                        if let Some((d, _)) = best.iter().find(|(_, t)| Some(t) == target.as_ref())
+                        {
+                            row.push((out.clone(), Value::Float(*d)));
+                            rows.push(row);
                         }
                     }
-                    if merged.len() == current.len() {
-                        break;
+                    Rel {
+                        rows,
+                        ordered: false,
                     }
-                    current = merged;
                 }
-                self.rec.remove(name);
-                Rel {
-                    rows: current,
+                Term::Fuse {
+                    arms,
+                    target,
+                    k,
+                    weights,
+                    out,
+                } => {
+                    let k = self.count_within(k, 1, RRF_MAX_K)? as f64;
+                    let mut fused: Vec<(Value, f64)> = Vec::new();
+                    for (i, arm) in arms.iter().enumerate() {
+                        let best = self.ranked_targets(arm, target, env)?;
+                        let w = weights.get(i).copied().unwrap_or(1.0);
+                        for (rank, t) in best.into_iter().enumerate() {
+                            let add = w / (k + (rank + 1) as f64);
+                            match fused.iter_mut().find(|(f, _)| *f == t) {
+                                Some((_, s)) => *s += add,
+                                None => fused.push((t, add)),
+                            }
+                        }
+                    }
+                    Rel {
+                        rows: fused
+                            .into_iter()
+                            .map(|(t, s)| vec![(target.clone(), t), (out.clone(), Value::Float(s))])
+                            .collect(),
+                        ordered: false,
+                    }
+                }
+                Term::Fix {
+                    name, body, rounds, ..
+                } => {
+                    let mut current: Vec<Row> = Vec::new();
+                    let limit = rounds.unwrap_or(1_000);
+                    for _ in 0..limit {
+                        self.rec.insert(name.clone(), current.clone());
+                        let next = self.term(body, env)?.rows;
+                        let mut merged = current.clone();
+                        for r in next {
+                            if !merged.iter().any(|m| same_row(m, &r)) {
+                                merged.push(r);
+                            }
+                        }
+                        if merged.len() == current.len() {
+                            break;
+                        }
+                        current = merged;
+                    }
+                    self.rec.remove(name);
+                    Rel {
+                        rows: current,
+                        ordered: false,
+                    }
+                }
+                Term::RecRef { name, .. } => Rel {
+                    rows: self.rec.get(name).cloned().unwrap_or_default(),
                     ordered: false,
+                },
+                Term::Call { bindings, body, .. } => {
+                    // Every argument is evaluated in the caller's scope, the
+                    // enclosing row included, before any is bound: binding, not
+                    // substitution.
+                    let values = bindings
+                        .iter()
+                        .map(|(name, e)| Ok((name.clone(), self.expr(e, &Vec::new(), env)?)))
+                        .collect::<R<Vec<_>>>()?;
+                    let mut saved = Vec::new();
+                    for (name, v) in values {
+                        saved.push((name.clone(), self.params.insert(name, v)));
+                    }
+                    // The body is closed: it reads no column of the caller.
+                    let out = self.term(body, &Vec::new());
+                    for (name, old) in saved {
+                        match old {
+                            Some(v) => self.params.insert(name, v),
+                            None => self.params.remove(&name),
+                        };
+                    }
+                    out?
                 }
-            }
-            Term::RecRef { name, .. } => Rel {
-                rows: self.rec.get(name).cloned().unwrap_or_default(),
-                ordered: false,
-            },
-            Term::Call { bindings, body, .. } => {
-                // Every argument is evaluated in the caller's scope, the
-                // enclosing row included, before any is bound: binding, not
-                // substitution.
-                let values = bindings
-                    .iter()
-                    .map(|(name, e)| Ok((name.clone(), self.expr(e, &Vec::new(), env)?)))
-                    .collect::<R<Vec<_>>>()?;
-                let mut saved = Vec::new();
-                for (name, v) in values {
-                    saved.push((name.clone(), self.params.insert(name, v)));
-                }
-                // The body is closed: it reads no column of the caller.
-                let out = self.term(body, &Vec::new());
-                for (name, old) in saved {
-                    match old {
-                        Some(v) => self.params.insert(name, v),
-                        None => self.params.remove(&name),
-                    };
-                }
-                out?
-            }
+            })
         })
     }
 
@@ -1273,176 +1277,180 @@ impl<'a> Interpreter<'a> {
     // Expressions.
 
     fn expr(&self, e: &IRExpr, row: &Row, env: &Row) -> R<Value> {
-        let column = |name: &str| get(row, name).or_else(|| get(env, name)).cloned();
-        Ok(match e {
-            IRExpr::Literal(l, _) => Value::from_literal(l),
-            IRExpr::Param(p, _) => self.params.get(p).cloned().unwrap_or(Value::Null),
-            IRExpr::Variable(v, _) | IRExpr::AliasRef(v, _) => column(v).unwrap_or(Value::Null),
-            IRExpr::PropAccess {
-                variable, property, ..
-            } => {
-                let Some(r @ Value::Ref { .. }) = column(variable) else {
-                    return Ok(Value::Null);
-                };
-                let Value::Ref { type_name, id, .. } = &r else {
-                    unreachable!()
-                };
-                let sys = self.catalog.system_columns;
-                if property == sys.id {
-                    return Ok(Value::Str(id.clone()));
-                }
-                if property == EDGE_TYPE_COLUMN {
-                    return Ok(Value::Str(type_name.clone()));
-                }
-                let probe = vec![("__probe".to_string(), r.clone())];
-                let Some(entity) = self.entity(&probe, "__probe") else {
-                    return Ok(Value::Null);
-                };
-                if let Some((src, dst)) = &entity.ends {
-                    if property == sys.src {
-                        return Ok(Value::Str(src.clone()));
+        omnigraph_compiler::stack::deep(|| {
+            let column = |name: &str| get(row, name).or_else(|| get(env, name)).cloned();
+            Ok(match e {
+                IRExpr::Literal(l, _) => Value::from_literal(l),
+                IRExpr::Param(p, _) => self.params.get(p).cloned().unwrap_or(Value::Null),
+                IRExpr::Variable(v, _) | IRExpr::AliasRef(v, _) => column(v).unwrap_or(Value::Null),
+                IRExpr::PropAccess {
+                    variable, property, ..
+                } => {
+                    let Some(r @ Value::Ref { .. }) = column(variable) else {
+                        return Ok(Value::Null);
+                    };
+                    let Value::Ref { type_name, id, .. } = &r else {
+                        unreachable!()
+                    };
+                    let sys = self.catalog.system_columns;
+                    if property == sys.id {
+                        return Ok(Value::Str(id.clone()));
                     }
-                    if property == sys.dst {
-                        return Ok(Value::Str(dst.clone()));
+                    if property == EDGE_TYPE_COLUMN {
+                        return Ok(Value::Str(type_name.clone()));
                     }
-                }
-                let declared = if let Some((_, _)) = &entity.ends {
-                    self.catalog
-                        .edge_types
-                        .get(type_name)
-                        .and_then(|t| t.properties.get(property))
-                } else {
-                    self.catalog
-                        .node_types
-                        .get(type_name)
-                        .and_then(|t| t.properties.get(property))
-                };
-                entity.props.get(property).map_or(Value::Null, |json| {
-                    typed(Value::from_json(json), declared.map(|p| p.scalar))
-                })
-            }
-            IRExpr::Not(inner, _) => match self.expr(inner, row, env)? {
-                Value::Bool(b) => Value::Bool(!b),
-                _ => Value::Null,
-            },
-            IRExpr::IsNull { expr, negated, .. } => {
-                Value::Bool((self.expr(expr, row, env)? == Value::Null) != *negated)
-            }
-            IRExpr::Cast { expr, ty } => cast(self.expr(expr, row, env)?, ty)?,
-            // Negation is `0 - x` in the operand's type: it overflows where
-            // the negated value leaves the type (`-i64::MIN`), `E1`.
-            IRExpr::Neg { expr, ty } => match self.expr(expr, row, env)? {
-                Value::Int(i) => arith(ArithOp::Sub, Value::Int(0), Value::Int(i), ty)?,
-                Value::Float(f) => Value::Float(-f),
-                _ => Value::Null,
-            },
-            IRExpr::Binary {
-                left,
-                op,
-                right,
-                ty,
-            } => {
-                let l = self.expr(left, row, env)?;
-                // `and` and `or` are guards, left to right (section 2,
-                // scalar expressions): `a and b` evaluates `b` only where `a`
-                // is not false, `a or b` only where `a` is not true, so a
-                // right side that can fail never runs on a decided row.
-                match op {
-                    BinaryOp::And => {
-                        if l == Value::Bool(false) {
-                            return Ok(Value::Bool(false));
+                    let probe = vec![("__probe".to_string(), r.clone())];
+                    let Some(entity) = self.entity(&probe, "__probe") else {
+                        return Ok(Value::Null);
+                    };
+                    if let Some((src, dst)) = &entity.ends {
+                        if property == sys.src {
+                            return Ok(Value::Str(src.clone()));
                         }
-                        match (l, self.expr(right, row, env)?) {
-                            (_, Value::Bool(false)) => Value::Bool(false),
-                            (Value::Bool(true), Value::Bool(true)) => Value::Bool(true),
-                            _ => Value::Null,
+                        if property == sys.dst {
+                            return Ok(Value::Str(dst.clone()));
                         }
                     }
-                    BinaryOp::Or => {
-                        if l == Value::Bool(true) {
-                            return Ok(Value::Bool(true));
-                        }
-                        match (l, self.expr(right, row, env)?) {
-                            (_, Value::Bool(true)) => Value::Bool(true),
-                            (Value::Bool(false), Value::Bool(false)) => Value::Bool(false),
-                            _ => Value::Null,
-                        }
-                    }
-                    BinaryOp::Compare(op) => compare(*op, l, self.expr(right, row, env)?),
-                    BinaryOp::Arith(op) => arith(*op, l, self.expr(right, row, env)?, ty)?,
+                    let declared = if let Some((_, _)) = &entity.ends {
+                        self.catalog
+                            .edge_types
+                            .get(type_name)
+                            .and_then(|t| t.properties.get(property))
+                    } else {
+                        self.catalog
+                            .node_types
+                            .get(type_name)
+                            .and_then(|t| t.properties.get(property))
+                    };
+                    entity.props.get(property).map_or(Value::Null, |json| {
+                        typed(Value::from_json(json), declared.map(|p| p.scalar))
+                    })
                 }
-            }
-            // The registry's two lazy rows: `if` evaluates its condition and
-            // then only the branch it selects, `coalesce` its arguments left
-            // to right up to the first non-null, so a branch not taken never
-            // fails.
-            IRExpr::Call {
-                func: ScalarFunc::If,
-                args,
-                ..
-            } => match self.expr(&args[0], row, env)? {
-                Value::Bool(true) => self.expr(&args[1], row, env)?,
-                _ => self.expr(&args[2], row, env)?,
-            },
-            IRExpr::Call {
-                func: ScalarFunc::Coalesce,
-                args,
-                ..
-            } => {
-                for a in args {
-                    let v = self.expr(a, row, env)?;
-                    if v != Value::Null {
-                        return Ok(v);
-                    }
+                IRExpr::Not(inner, _) => match self.expr(inner, row, env)? {
+                    Value::Bool(b) => Value::Bool(!b),
+                    _ => Value::Null,
+                },
+                IRExpr::IsNull { expr, negated, .. } => {
+                    Value::Bool((self.expr(expr, row, env)? == Value::Null) != *negated)
                 }
-                Value::Null
-            }
-            IRExpr::Call { func, args, .. } => {
-                let vals = args
-                    .iter()
-                    .map(|a| self.expr(a, row, env))
-                    .collect::<R<Vec<_>>>()?;
-                match func {
-                    ScalarFunc::If | ScalarFunc::Coalesce => unreachable!("evaluated lazily above"),
-                    ScalarFunc::Concat => {
-                        let mut out = String::new();
-                        for v in vals {
-                            match v {
-                                Value::Str(s) => out.push_str(&s),
-                                Value::Null => return Ok(Value::Null),
-                                other => out.push_str(&format!("{other:?}")),
+                IRExpr::Cast { expr, ty } => cast(self.expr(expr, row, env)?, ty)?,
+                // Negation is `0 - x` in the operand's type: it overflows where
+                // the negated value leaves the type (`-i64::MIN`), `E1`.
+                IRExpr::Neg { expr, ty } => match self.expr(expr, row, env)? {
+                    Value::Int(i) => arith(ArithOp::Sub, Value::Int(0), Value::Int(i), ty)?,
+                    Value::Float(f) => Value::Float(-f),
+                    _ => Value::Null,
+                },
+                IRExpr::Binary {
+                    left,
+                    op,
+                    right,
+                    ty,
+                } => {
+                    let l = self.expr(left, row, env)?;
+                    // `and` and `or` are guards, left to right (section 2,
+                    // scalar expressions): `a and b` evaluates `b` only where `a`
+                    // is not false, `a or b` only where `a` is not true, so a
+                    // right side that can fail never runs on a decided row.
+                    match op {
+                        BinaryOp::And => {
+                            if l == Value::Bool(false) {
+                                return Ok(Value::Bool(false));
+                            }
+                            match (l, self.expr(right, row, env)?) {
+                                (_, Value::Bool(false)) => Value::Bool(false),
+                                (Value::Bool(true), Value::Bool(true)) => Value::Bool(true),
+                                _ => Value::Null,
                             }
                         }
-                        Value::Str(out)
-                    }
-                    // A list holding parameters: its elements' values, in
-                    // order, at the list's element type.
-                    ScalarFunc::List => typed(
-                        Value::List(vals),
-                        match e.ty() {
-                            ExprType::Value { scalar, .. } => Some(*scalar),
-                            _ => None,
-                        },
-                    ),
-                    ScalarFunc::MatchTerms { mode } => {
-                        let max_edits = self.max_edits(args.get(2), 0, row, env)?;
-                        self.lexical(
-                            &args[0],
-                            &args[1],
-                            matches!(mode, TermsMode::All),
-                            max_edits,
-                            row,
-                            env,
-                        )?
+                        BinaryOp::Or => {
+                            if l == Value::Bool(true) {
+                                return Ok(Value::Bool(true));
+                            }
+                            match (l, self.expr(right, row, env)?) {
+                                (_, Value::Bool(true)) => Value::Bool(true),
+                                (Value::Bool(false), Value::Bool(false)) => Value::Bool(false),
+                                _ => Value::Null,
+                            }
+                        }
+                        BinaryOp::Compare(op) => compare(*op, l, self.expr(right, row, env)?),
+                        BinaryOp::Arith(op) => arith(*op, l, self.expr(right, row, env)?, ty)?,
                     }
                 }
-            }
-            // `search` and `match_text` are `terms(q, mode: any)`; `fuzzy`
-            // adds an edit budget, two when unwritten (section 4, Migration).
-            IRExpr::Nearest { .. } => {
-                return unsupported("a ranking as a scalar");
-            }
-            IRExpr::Aggregate { .. } => return unsupported("an aggregate outside a group"),
+                // The registry's two lazy rows: `if` evaluates its condition and
+                // then only the branch it selects, `coalesce` its arguments left
+                // to right up to the first non-null, so a branch not taken never
+                // fails.
+                IRExpr::Call {
+                    func: ScalarFunc::If,
+                    args,
+                    ..
+                } => match self.expr(&args[0], row, env)? {
+                    Value::Bool(true) => self.expr(&args[1], row, env)?,
+                    _ => self.expr(&args[2], row, env)?,
+                },
+                IRExpr::Call {
+                    func: ScalarFunc::Coalesce,
+                    args,
+                    ..
+                } => {
+                    for a in args {
+                        let v = self.expr(a, row, env)?;
+                        if v != Value::Null {
+                            return Ok(v);
+                        }
+                    }
+                    Value::Null
+                }
+                IRExpr::Call { func, args, .. } => {
+                    let vals = args
+                        .iter()
+                        .map(|a| self.expr(a, row, env))
+                        .collect::<R<Vec<_>>>()?;
+                    match func {
+                        ScalarFunc::If | ScalarFunc::Coalesce => {
+                            unreachable!("evaluated lazily above")
+                        }
+                        ScalarFunc::Concat => {
+                            let mut out = String::new();
+                            for v in vals {
+                                match v {
+                                    Value::Str(s) => out.push_str(&s),
+                                    Value::Null => return Ok(Value::Null),
+                                    other => out.push_str(&format!("{other:?}")),
+                                }
+                            }
+                            Value::Str(out)
+                        }
+                        // A list holding parameters: its elements' values, in
+                        // order, at the list's element type.
+                        ScalarFunc::List => typed(
+                            Value::List(vals),
+                            match e.ty() {
+                                ExprType::Value { scalar, .. } => Some(*scalar),
+                                _ => None,
+                            },
+                        ),
+                        ScalarFunc::MatchTerms { mode } => {
+                            let max_edits = self.max_edits(args.get(2), 0, row, env)?;
+                            self.lexical(
+                                &args[0],
+                                &args[1],
+                                matches!(mode, TermsMode::All),
+                                max_edits,
+                                row,
+                                env,
+                            )?
+                        }
+                    }
+                }
+                // `search` and `match_text` are `terms(q, mode: any)`; `fuzzy`
+                // adds an edit budget, two when unwritten (section 4, Migration).
+                IRExpr::Nearest { .. } => {
+                    return unsupported("a ranking as a scalar");
+                }
+                IRExpr::Aggregate { .. } => return unsupported("an aggregate outside a group"),
+            })
         })
     }
 }
@@ -1571,87 +1579,89 @@ fn typed(v: Value, scalar: Option<ScalarType>) -> Value {
 /// whole before its key equalities filter it. Nothing moves below a term
 /// that can fail.
 fn sink(input: &Term, pred: &IRExpr) -> Option<Term> {
-    let mut read = Vec::new();
-    pred.columns(&mut read);
-    let within = |cols: &[String]| read.iter().all(|c| cols.contains(c));
-    let filter = |input: Term| Term::Filter {
-        input: input.boxed(),
-        pred: pred.clone(),
-        fails: false,
-    };
-    let sunk = |input: &Term| sink(input, pred).unwrap_or_else(|| filter(input.clone()));
-    match input {
-        Term::Correlate {
-            outer,
-            inner,
+    omnigraph_compiler::stack::deep(|| {
+        let mut read = Vec::new();
+        pred.columns(&mut read);
+        let within = |cols: &[String]| read.iter().all(|c| cols.contains(c));
+        let filter = |input: Term| Term::Filter {
+            input: input.boxed(),
+            pred: pred.clone(),
             fails: false,
-        } => {
-            let outer_cols = columns(outer);
-            if within(&outer_cols) {
-                return Some(Term::Correlate {
-                    outer: sunk(outer).boxed(),
-                    inner: inner.clone(),
-                    fails: false,
-                });
-            }
-            let added: Vec<String> = columns(inner)
-                .into_iter()
-                .filter(|c| !outer_cols.contains(c))
-                .collect();
-            (!read.is_empty() && within(&added)).then(|| Term::Correlate {
-                outer: outer.clone(),
-                inner: sunk(inner).boxed(),
+        };
+        let sunk = |input: &Term| sink(input, pred).unwrap_or_else(|| filter(input.clone()));
+        match input {
+            Term::Correlate {
+                outer,
+                inner,
                 fails: false,
-            })
+            } => {
+                let outer_cols = columns(outer);
+                if within(&outer_cols) {
+                    return Some(Term::Correlate {
+                        outer: sunk(outer).boxed(),
+                        inner: inner.clone(),
+                        fails: false,
+                    });
+                }
+                let added: Vec<String> = columns(inner)
+                    .into_iter()
+                    .filter(|c| !outer_cols.contains(c))
+                    .collect();
+                (!read.is_empty() && within(&added)).then(|| Term::Correlate {
+                    outer: outer.clone(),
+                    inner: sunk(inner).boxed(),
+                    fails: false,
+                })
+            }
+            // Past another conjunct that cannot fail only to sink further.
+            Term::Filter {
+                input: below,
+                pred: other,
+                fails: false,
+            } => sink(below, pred).map(|below| Term::Filter {
+                input: below.boxed(),
+                pred: other.clone(),
+                fails: false,
+            }),
+            Term::Expand {
+                input: below,
+                src,
+                dst,
+                src_type,
+                dst_type,
+                edges,
+                min_hops,
+                max_hops,
+                edge_var,
+            } if within(&columns(below)) => Some(Term::Expand {
+                input: sunk(below).boxed(),
+                src: src.clone(),
+                dst: dst.clone(),
+                src_type: src_type.clone(),
+                dst_type: dst_type.clone(),
+                edges: edges.clone(),
+                min_hops: *min_hops,
+                max_hops: *max_hops,
+                edge_var: edge_var.clone(),
+            }),
+            Term::Project {
+                input: below,
+                items,
+                keep: true,
+                fails: false,
+            } if !items.iter().any(|(name, _)| read.contains(name)) => Some(Term::Project {
+                input: sunk(below).boxed(),
+                items: items.clone(),
+                keep: true,
+                fails: false,
+            }),
+            _ => None,
         }
-        // Past another conjunct that cannot fail only to sink further.
-        Term::Filter {
-            input: below,
-            pred: other,
-            fails: false,
-        } => sink(below, pred).map(|below| Term::Filter {
-            input: below.boxed(),
-            pred: other.clone(),
-            fails: false,
-        }),
-        Term::Expand {
-            input: below,
-            src,
-            dst,
-            src_type,
-            dst_type,
-            edges,
-            min_hops,
-            max_hops,
-            edge_var,
-        } if within(&columns(below)) => Some(Term::Expand {
-            input: sunk(below).boxed(),
-            src: src.clone(),
-            dst: dst.clone(),
-            src_type: src_type.clone(),
-            dst_type: dst_type.clone(),
-            edges: edges.clone(),
-            min_hops: *min_hops,
-            max_hops: *max_hops,
-            edge_var: edge_var.clone(),
-        }),
-        Term::Project {
-            input: below,
-            items,
-            keep: true,
-            fails: false,
-        } if !items.iter().any(|(name, _)| read.contains(name)) => Some(Term::Project {
-            input: sunk(below).boxed(),
-            items: items.clone(),
-            keep: true,
-            fails: false,
-        }),
-        _ => None,
-    }
+    })
 }
 
 fn columns(t: &Term) -> Vec<String> {
-    match t {
+    omnigraph_compiler::stack::deep(|| match t {
         Term::Unit => Vec::new(),
         Term::Env(cols) => cols.iter().map(|c| c.name.clone()).collect(),
         Term::Scan { var, .. } => vec![var.clone()],
@@ -1703,7 +1713,7 @@ fn columns(t: &Term) -> Vec<String> {
         Term::Fuse { target, out, .. } => vec![target.clone(), out.clone()],
         Term::Fix { body, .. } | Term::Call { body, .. } => columns(body),
         Term::RecRef { ty, .. } => ty.names(),
-    }
+    })
 }
 
 /// The tie rule (section 2, `Order`): every reference column's identity in

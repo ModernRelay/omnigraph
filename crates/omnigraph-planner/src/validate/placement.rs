@@ -321,44 +321,107 @@ fn parents(plan: &PhysicalPlan) -> HashMap<NodeId, NodeId> {
 /// `e` with its constant parts erased: what stays of a conjunct whatever
 /// value its parameters bind and whatever the engine folded.
 fn skeleton(e: &IRExpr) -> String {
-    let mut read = Vec::new();
-    e.columns(&mut read);
-    if read.is_empty() {
-        return "_".to_string();
-    }
-    let all = |args: &[&IRExpr]| {
-        args.iter()
-            .map(|a| skeleton(a))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    match e {
-        IRExpr::PropAccess {
-            variable, property, ..
-        } => format!("{variable}.{property}"),
-        IRExpr::Variable(name, _) | IRExpr::AliasRef(name, _) => name.clone(),
-        IRExpr::Param(..) | IRExpr::Literal(..) => "_".to_string(),
-        IRExpr::Nearest {
-            variable,
-            property,
-            query,
-            ..
-        } => format!("nearest({variable}.{property},{})", skeleton(query)),
-        IRExpr::Aggregate {
-            func,
-            distinct,
-            arg,
-            ..
-        } => format!("{func:?}({distinct},{})", skeleton(arg)),
-        IRExpr::Binary {
-            left, op, right, ..
-        } => format!("({} {op:?} {})", skeleton(left), skeleton(right)),
-        IRExpr::Not(inner, _) => format!("not({})", skeleton(inner)),
-        IRExpr::Cast { expr, .. } => skeleton(expr),
-        IRExpr::IsNull { expr, negated, .. } => format!("isnull({negated},{})", skeleton(expr)),
-        IRExpr::Neg { expr, .. } => format!("neg({})", skeleton(expr)),
-        IRExpr::Call { func, args, .. } => {
-            format!("{func:?}({})", all(&args.iter().collect::<Vec<_>>()))
+    // Which subtrees read a column, bottom up: one that reads none is a
+    // constant, written `_`.
+    let mut reads: HashMap<*const IRExpr, bool> = HashMap::new();
+    let mut pending = vec![(e, false)];
+    while let Some((node, children_done)) = pending.pop() {
+        if children_done {
+            let own = matches!(
+                node,
+                IRExpr::PropAccess { .. }
+                    | IRExpr::Variable(..)
+                    | IRExpr::AliasRef(..)
+                    | IRExpr::Nearest { .. }
+            );
+            let read = own
+                || node
+                    .children()
+                    .iter()
+                    .any(|c| reads[&(*c as *const IRExpr)]);
+            reads.insert(node as *const IRExpr, read);
+        } else {
+            pending.push((node, true));
+            pending.extend(node.children().into_iter().map(|c| (c, false)));
         }
     }
+    let mut out = String::new();
+    write_skeleton(e, &reads, &mut out);
+    out
+}
+
+/// `e`'s skeleton appended to `out`, each level entered through the stack
+/// guard.
+fn write_skeleton(e: &IRExpr, reads: &HashMap<*const IRExpr, bool>, out: &mut String) {
+    use std::fmt::Write;
+    omnigraph_compiler::stack::deep(|| {
+        if !reads[&(e as *const IRExpr)] {
+            out.push('_');
+            return;
+        }
+        match e {
+            IRExpr::PropAccess {
+                variable, property, ..
+            } => {
+                let _ = write!(out, "{variable}.{property}");
+            }
+            IRExpr::Variable(name, _) | IRExpr::AliasRef(name, _) => out.push_str(name),
+            IRExpr::Param(..) | IRExpr::Literal(..) => out.push('_'),
+            IRExpr::Nearest {
+                variable,
+                property,
+                query,
+                ..
+            } => {
+                let _ = write!(out, "nearest({variable}.{property},");
+                write_skeleton(query, reads, out);
+                out.push(')');
+            }
+            IRExpr::Aggregate {
+                func,
+                distinct,
+                arg,
+                ..
+            } => {
+                let _ = write!(out, "{func:?}({distinct},");
+                write_skeleton(arg, reads, out);
+                out.push(')');
+            }
+            IRExpr::Binary {
+                left, op, right, ..
+            } => {
+                out.push('(');
+                write_skeleton(left, reads, out);
+                let _ = write!(out, " {op:?} ");
+                write_skeleton(right, reads, out);
+                out.push(')');
+            }
+            IRExpr::Not(inner, _) => {
+                out.push_str("not(");
+                write_skeleton(inner, reads, out);
+                out.push(')');
+            }
+            IRExpr::Cast { expr, .. } => write_skeleton(expr, reads, out),
+            IRExpr::IsNull { expr, negated, .. } => {
+                let _ = write!(out, "isnull({negated},");
+                write_skeleton(expr, reads, out);
+                out.push(')');
+            }
+            IRExpr::Neg { expr, .. } => {
+                out.push_str("neg(");
+                write_skeleton(expr, reads, out);
+                out.push(')');
+            }
+            IRExpr::Call { func, args, .. } => {
+                let _ = write!(out, "{func:?}(");
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_skeleton(arg, reads, out);
+                }
+                out.push(')');
+            }
+        }
+    })
 }

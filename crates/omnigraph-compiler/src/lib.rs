@@ -11,6 +11,7 @@ pub mod result;
 pub mod schema;
 pub mod settings;
 pub mod shape;
+pub mod stack;
 pub mod traversal;
 pub mod types;
 

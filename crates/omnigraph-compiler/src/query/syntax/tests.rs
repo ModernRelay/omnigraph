@@ -130,11 +130,13 @@ fn match_holds_the_elements_and_where_the_predicate() {
     assert_eq!(match_elements("\n  $p: Person,\n  $p knows $q,\n").len(), 2);
     // A block holds elements and its own `where` inside its braces, and so
     // does `optional`.
-    let Expr::Compare { left, .. } = where_expr("count { $x knows $q where $q.age > 30 } > 2")
-    else {
+    let compared = where_expr("count { $x knows $q where $q.age > 30 } > 2");
+    let Expr::Compare { left, .. } = &compared else {
         panic!()
     };
-    let Expr::Block(b) = *left else { panic!() };
+    let Expr::Block(b) = left.as_ref() else {
+        panic!()
+    };
     assert_eq!(b.pattern.elements.len(), 1);
     assert!(b.pattern.predicate.is_some());
     let Element::Optional(o) = one_element("optional { $p worksAt $c where $c.name = \"x\" }")
@@ -366,10 +368,10 @@ fn let_and_from_in_every_element_position() {
                 }
             } else {
                 let suffix = if block == "count" { " > 0" } else { "" };
-                match where_expr(&format!("{block} {{ $p: Person, {text} }}{suffix}")) {
-                    Expr::Block(b) => b.pattern,
-                    Expr::Compare { left, .. } => match *left {
-                        Expr::Block(b) => b.pattern,
+                match &where_expr(&format!("{block} {{ $p: Person, {text} }}{suffix}")) {
+                    Expr::Block(b) => b.pattern.clone(),
+                    Expr::Compare { left, .. } => match left.as_ref() {
+                        Expr::Block(b) => b.pattern.clone(),
                         other => panic!("{block}: {other:?}"),
                     },
                     other => panic!("{block}: {other:?}"),
@@ -627,8 +629,8 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
         )
     );
     assert!(matches!(
-        where_expr("not $a + 1 > 2 and $b"),
-        Expr::And(l, _) if matches!(*l, Expr::Not(_))
+        &where_expr("not $a + 1 > 2 and $b"),
+        Expr::And(l, _) if matches!(**l, Expr::Not(_))
     ));
     // Comparison stays non-associative.
     assert!(parse_text("query q() { match { $x: X } where $a < $b < $c return { $a } }").is_err());
@@ -669,8 +671,8 @@ fn float_literals_take_an_exponent() {
     }
     // A negative exponent float is unary minus over the literal.
     assert!(matches!(
-        where_expr("$x.f > -1.0e-3"),
-        Expr::Compare { right, .. } if matches!(*right, Expr::Neg(_))
+        &where_expr("$x.f > -1.0e-3"),
+        Expr::Compare { right, .. } if matches!(**right, Expr::Neg(_))
     ));
     // `1e3` without a fraction is not a float. The RFC's `float_lit` admits
     // only `d.d[e…]`; with an unbounded integer rule, `1e3` would read as
@@ -1069,9 +1071,8 @@ fn one_keyword_and_the_body_shape_is_the_kind() {
 
 #[test]
 fn calls_take_positionals_then_options_and_one_distinct_form() {
-    let Expr::Call(c) = where_expr("nearest($pop, $x.embedding, $q, k: 2)") else {
-        panic!()
-    };
+    let called = where_expr("nearest($pop, $x.embedding, $q, k: 2)");
+    let Expr::Call(c) = &called else { panic!() };
     assert_eq!((c.args.len(), c.options.len()), (3, 1));
     // An option before a positional is refused with the reordered arguments.
     let e = refusal_of("query q() { match { $x: X } where f(k: 1, $x) return { 1 } }");
@@ -1095,7 +1096,7 @@ fn calls_take_positionals_then_options_and_one_distinct_form() {
     );
     // A block value as an operand, compared with another binding's value.
     let e = where_expr("count { $d in $x } + 1 >= $x.min_docs");
-    assert!(matches!(e, Expr::Compare { left, .. } if matches!(*left, Expr::Arith { .. })));
+    assert!(matches!(&e, Expr::Compare { left, .. } if matches!(**left, Expr::Arith { .. })));
 }
 
 #[test]
@@ -1177,8 +1178,8 @@ fn a_date_call_is_the_date_literal() {
     }
     // With another argument shape it is a call.
     assert!(matches!(
-        where_expr("$x.d = date($s)"),
-        Expr::Compare { right, .. } if matches!(*right, Expr::Call(_))
+        &where_expr("$x.d = date($s)"),
+        Expr::Compare { right, .. } if matches!(**right, Expr::Call(_))
     ));
 }
 
@@ -1211,8 +1212,8 @@ fn recognizers_shadow_only_ill_typed_text() {
 /// holding a parameter are refused.
 #[test]
 fn a_list_literal_holds_literals_and_parameters_only() {
-    let list = |text: &str| match where_expr(text) {
-        Expr::In { list, .. } => *list,
+    let list = |text: &str| match &where_expr(text) {
+        Expr::In { list, .. } => list.as_ref().clone(),
         other => panic!("{text}: {other:?}"),
     };
     assert_eq!(

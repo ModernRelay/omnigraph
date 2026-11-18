@@ -1125,31 +1125,33 @@ fn split_aggregate_return(
 }
 
 fn hoist_aggregates(expr: &IRExpr, grouped: &mut Vec<IRProjection>) -> IRExpr {
-    match expr {
-        IRExpr::Aggregate { .. } => {
-            let ty = expr.ty().clone();
-            let column = match grouped.iter().find(|p| p.expr == *expr) {
-                Some(projection) => projection.column.clone(),
-                None => {
-                    let column = expr.to_string();
-                    grouped.push(IRProjection {
-                        expr: expr.clone(),
-                        alias: None,
-                        column: column.clone(),
-                        ty: ty.clone(),
-                    });
-                    column
-                }
-            };
-            IRExpr::AliasRef(column, ty)
+    omnigraph_compiler::stack::deep(|| {
+        match expr {
+            IRExpr::Aggregate { .. } => {
+                let ty = expr.ty().clone();
+                let column = match grouped.iter().find(|p| p.expr == *expr) {
+                    Some(projection) => projection.column.clone(),
+                    None => {
+                        let column = expr.to_string();
+                        grouped.push(IRProjection {
+                            expr: expr.clone(),
+                            alias: None,
+                            column: column.clone(),
+                            ty: ty.clone(),
+                        });
+                        column
+                    }
+                };
+                IRExpr::AliasRef(column, ty)
+            }
+            // Under any operator: unary `-`, a call and arithmetic alike.
+            other => other
+                .try_map_children(|child| {
+                    Ok::<_, std::convert::Infallible>(hoist_aggregates(child, grouped))
+                })
+                .unwrap_or_else(|never| match never {}),
         }
-        // Under any operator: unary `-`, a call and arithmetic alike.
-        other => other
-            .try_map_children(|child| {
-                Ok::<_, std::convert::Infallible>(hoist_aggregates(child, grouped))
-            })
-            .unwrap_or_else(|never| match never {}),
-    }
+    })
 }
 
 /// The user's keys, then the tie rule over group rows: every group key the
@@ -1597,60 +1599,62 @@ fn sort_tiebreak(
 /// Every column an expression reads. `count($v)` reads the identity alone;
 /// an alias, a parameter and a literal read nothing.
 pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
-    // A lexical predicate reads its binding's identity: the exact lexical
-    // scan reads the field from the table itself and answers each row by its
-    // identity, so its input never carries the field for it.
-    if let IRExpr::Call {
-        func: omnigraph_compiler::ir::expr::ScalarFunc::MatchTerms { .. },
-        args,
-        ..
-    } = expr
-        && let Some(IRExpr::PropAccess { variable, .. }) = args.first()
-    {
-        out.push(ColumnRef::property(variable, IDENTITY_MEMBER));
-        args[1..].iter().for_each(|arg| reads_of_expr(arg, out));
-        return;
-    }
-    match expr {
-        IRExpr::Binary { left, right, .. } => {
-            reads_of_expr(left, out);
-            reads_of_expr(right, out);
-        }
-        IRExpr::Not(inner, _)
-        | IRExpr::IsNull { expr: inner, .. }
-        | IRExpr::Neg { expr: inner, .. }
-        | IRExpr::Cast { expr: inner, .. } => reads_of_expr(inner, out),
-        IRExpr::Call { args, .. } => args.iter().for_each(|arg| reads_of_expr(arg, out)),
-        IRExpr::PropAccess {
-            variable,
-            property,
-            ty: _,
-        } => {
-            out.push(ColumnRef::property(variable, property));
-        }
-        IRExpr::Variable(variable, _) => out.push(ColumnRef::entity(variable)),
-        IRExpr::Nearest {
-            variable,
-            property,
-            query,
+    omnigraph_compiler::stack::deep(|| {
+        // A lexical predicate reads its binding's identity: the exact lexical
+        // scan reads the field from the table itself and answers each row by its
+        // identity, so its input never carries the field for it.
+        if let IRExpr::Call {
+            func: omnigraph_compiler::ir::expr::ScalarFunc::MatchTerms { .. },
+            args,
             ..
-        } => {
-            out.push(ColumnRef::property(variable, property));
-            reads_of_expr(query, out);
+        } = expr
+            && let Some(IRExpr::PropAccess { variable, .. }) = args.first()
+        {
+            out.push(ColumnRef::property(variable, IDENTITY_MEMBER));
+            args[1..].iter().for_each(|arg| reads_of_expr(arg, out));
+            return;
         }
-        IRExpr::Aggregate { func, arg, .. } => match (func, arg.as_ref()) {
-            (AggFunc::Count, IRExpr::Variable(variable, ty)) => {
-                // An edge over several types is identified by its type and
-                // its id together.
-                if matches!(ty, ExprType::Edge { type_name } if type_name.contains('|')) {
-                    out.push(ColumnRef::property(variable, EDGE_TYPE_MEMBER));
-                }
-                out.push(ColumnRef::property(variable, IDENTITY_MEMBER));
+        match expr {
+            IRExpr::Binary { left, right, .. } => {
+                reads_of_expr(left, out);
+                reads_of_expr(right, out);
             }
-            _ => reads_of_expr(arg, out),
-        },
-        IRExpr::AliasRef(_, _) | IRExpr::Param(_, _) | IRExpr::Literal(_, _) => {}
-    }
+            IRExpr::Not(inner, _)
+            | IRExpr::IsNull { expr: inner, .. }
+            | IRExpr::Neg { expr: inner, .. }
+            | IRExpr::Cast { expr: inner, .. } => reads_of_expr(inner, out),
+            IRExpr::Call { args, .. } => args.iter().for_each(|arg| reads_of_expr(arg, out)),
+            IRExpr::PropAccess {
+                variable,
+                property,
+                ty: _,
+            } => {
+                out.push(ColumnRef::property(variable, property));
+            }
+            IRExpr::Variable(variable, _) => out.push(ColumnRef::entity(variable)),
+            IRExpr::Nearest {
+                variable,
+                property,
+                query,
+                ..
+            } => {
+                out.push(ColumnRef::property(variable, property));
+                reads_of_expr(query, out);
+            }
+            IRExpr::Aggregate { func, arg, .. } => match (func, arg.as_ref()) {
+                (AggFunc::Count, IRExpr::Variable(variable, ty)) => {
+                    // An edge over several types is identified by its type and
+                    // its id together.
+                    if matches!(ty, ExprType::Edge { type_name } if type_name.contains('|')) {
+                        out.push(ColumnRef::property(variable, EDGE_TYPE_MEMBER));
+                    }
+                    out.push(ColumnRef::property(variable, IDENTITY_MEMBER));
+                }
+                _ => reads_of_expr(arg, out),
+            },
+            IRExpr::AliasRef(_, _) | IRExpr::Param(_, _) | IRExpr::Literal(_, _) => {}
+        }
+    })
 }
 
 fn scan(
@@ -2356,33 +2360,35 @@ pub(crate) fn has_lexical_call(expr: &IRExpr) -> bool {
 /// The binding of every full-text call (`search`, `fuzzy`, `match_text`,
 /// `match_terms`) in `expr`, whose field is that binding's property.
 fn lexical_bindings(expr: &IRExpr, out: &mut Vec<String>) {
-    if let Some(field) = expr.lexical_predicate_field() {
-        if let IRExpr::PropAccess { variable, .. } = field
-            && !out.contains(variable)
-        {
-            out.push(variable.clone());
+    omnigraph_compiler::stack::deep(|| {
+        if let Some(field) = expr.lexical_predicate_field() {
+            if let IRExpr::PropAccess { variable, .. } = field
+                && !out.contains(variable)
+            {
+                out.push(variable.clone());
+            }
+            return;
         }
-        return;
-    }
-    match expr {
-        IRExpr::Binary { left, right, .. } => {
-            lexical_bindings(left, out);
-            lexical_bindings(right, out);
+        match expr {
+            IRExpr::Binary { left, right, .. } => {
+                lexical_bindings(left, out);
+                lexical_bindings(right, out);
+            }
+            IRExpr::Not(inner, _)
+            | IRExpr::Cast { expr: inner, .. }
+            | IRExpr::Neg { expr: inner, .. }
+            | IRExpr::IsNull { expr: inner, .. } => lexical_bindings(inner, out),
+            IRExpr::Call { args, .. } => args.iter().for_each(|arg| lexical_bindings(arg, out)),
+            // The predicates themselves were taken above.
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Variable(..)
+            | IRExpr::Param(..)
+            | IRExpr::Literal(..)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(..) => {}
         }
-        IRExpr::Not(inner, _)
-        | IRExpr::Cast { expr: inner, .. }
-        | IRExpr::Neg { expr: inner, .. }
-        | IRExpr::IsNull { expr: inner, .. } => lexical_bindings(inner, out),
-        IRExpr::Call { args, .. } => args.iter().for_each(|arg| lexical_bindings(arg, out)),
-        // The predicates themselves were taken above.
-        IRExpr::PropAccess { .. }
-        | IRExpr::Nearest { .. }
-        | IRExpr::Variable(..)
-        | IRExpr::Param(..)
-        | IRExpr::Literal(..)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(..) => {}
-    }
+    })
 }
 
 /// The columns one node reads through query bindings. A `Fuse` reads its
@@ -2573,7 +2579,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
 }
 
 fn predicate_reads(predicate: &Predicate, out: &mut Vec<ColumnRef>) {
-    match predicate {
+    omnigraph_compiler::stack::deep(|| match predicate {
         Predicate::Gq {
             reads,
             text: _,
@@ -2584,7 +2590,7 @@ fn predicate_reads(predicate: &Predicate, out: &mut Vec<ColumnRef>) {
             predicate_reads(right, out);
         }
         Predicate::IdAfter { .. } | Predicate::VersionWindow { .. } => {}
-    }
+    })
 }
 
 /// Pass 6: a return column only the output reads leaves its binding's scan

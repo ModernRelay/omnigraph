@@ -1295,3 +1295,53 @@ edge Likes: Person -> Doc
         assert_eq!(diagnostic.code.as_str(), "P004", "{refusal}");
     }
 }
+
+/// A query far deeper than the corpus's deepest compiles, plans and runs on
+/// threads with the platform's default stacks (2 MiB for a spawned thread
+/// and a Tokio worker): every walk over its expressions grows its own stack
+/// as it goes deep, so no thread is sized for the deepest query. The `or`
+/// chain is a left-deep tree 10,000 levels deep; the parentheses nest 1,000
+/// levels of arithmetic.
+#[test]
+fn deep_expressions_compile_and_run_on_default_thread_stacks() {
+    const DEFAULT_STACK: usize = 2 * 1024 * 1024;
+    let chain = (0..10_000)
+        .map(|i| format!("$p.name = \"n{i}\""))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let mut nested = "$p.age".to_string();
+    for _ in 0..1_000 {
+        nested = format!("({nested} + 0)");
+    }
+    let queries = format!(
+        "query chain() {{ match {{ $p: Person }} where {chain} or $p.name = \"Alice\" return {{ $p.name }} }}\n\
+         query nested() {{ match {{ $p: Person }} where {nested} > 29 return {{ $p.name }} order {{ $p.name }} }}"
+    );
+    let run = std::thread::Builder::new()
+        .stack_size(DEFAULT_STACK)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(DEFAULT_STACK)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let dir = tempfile::tempdir().unwrap();
+                let db = init_and_load(&dir).await;
+                let params = omnigraph_compiler::ir::ParamMap::new();
+                let chain = query_main(&db, &queries, "chain", &params).await.unwrap();
+                let nested = query_main(&db, &queries, "nested", &params).await.unwrap();
+                (
+                    collect_column_strings(chain.batches(), "p.name"),
+                    collect_column_strings(nested.batches(), "p.name"),
+                )
+            })
+        })
+        .unwrap();
+    let (chain, nested) = run
+        .join()
+        .expect("the deep queries ran without overflowing a stack");
+    assert_eq!(chain, ["Alice"]);
+    assert_eq!(nested, ["Alice", "Charlie"]);
+}

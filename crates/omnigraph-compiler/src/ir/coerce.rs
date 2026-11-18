@@ -275,18 +275,20 @@ pub(super) fn boolean(expr: IRExpr) -> IRExpr {
 
 /// Coerce operands before folding, retaining Cast nodes for typed execution.
 pub fn binary(left: IRExpr, op: BinaryOp, right: IRExpr) -> Result<IRExpr> {
-    let (left, op, right) = match op {
-        BinaryOp::And | BinaryOp::Or => (boolean(left), op, boolean(right)),
-        // The checker widens arithmetic operands with explicit casts.
-        BinaryOp::Arith(_) => (left, op, right),
-        BinaryOp::Compare(op) => {
-            let op = resolved_operator(op, left.ty(), literal(&left), right.ty());
-            let (lt, rt) =
-                comparison_types(op, left.ty(), literal(&left), right.ty(), literal(&right))?;
-            (cast(left, lt)?, BinaryOp::Compare(op), cast(right, rt)?)
-        }
-    };
-    Ok(fold::binary(left, op, right))
+    crate::stack::deep(|| {
+        let (left, op, right) = match op {
+            BinaryOp::And | BinaryOp::Or => (boolean(left), op, boolean(right)),
+            // The checker widens arithmetic operands with explicit casts.
+            BinaryOp::Arith(_) => (left, op, right),
+            BinaryOp::Compare(op) => {
+                let op = resolved_operator(op, left.ty(), literal(&left), right.ty());
+                let (lt, rt) =
+                    comparison_types(op, left.ty(), literal(&left), right.ty(), literal(&right))?;
+                (cast(left, lt)?, BinaryOp::Compare(op), cast(right, rt)?)
+            }
+        };
+        Ok(fold::binary(left, op, right))
+    })
 }
 
 /// Apply the same comparison decision to a block's restricted aggregate side.
@@ -318,7 +320,7 @@ pub fn block(left: BlockAggregateExpr, op: CompOp, right: IRExpr) -> Result<Subq
 /// Round trips use the literal's already unified source domain. In particular,
 /// an Integer element inside an F64 list is an F64 value before narrowing.
 fn literal_round_trips(value: &Literal, source: Domain, target: Domain) -> bool {
-    match value {
+    crate::stack::deep(|| match value {
         Literal::Null => true,
         Literal::List(items) => items.iter().all(|item| {
             !matches!(item, Literal::List(_)) && literal_round_trips(item, source, target)
@@ -344,7 +346,7 @@ fn literal_round_trips(value: &Literal, source: Domain, target: Domain) -> bool 
             float_round_trips(value, target)
         }
         _ => false,
-    }
+    })
 }
 
 fn integer_round_trips(value: i128, target: Domain) -> bool {
@@ -733,7 +735,7 @@ mod tests {
         )
         .unwrap();
         expression.check_types().unwrap();
-        let IRExpr::Cast { expr, .. } = expression else {
+        let IRExpr::Cast { expr, .. } = &expression else {
             panic!("expected Cast")
         };
         assert_eq!(expr.ty(), &ty(ScalarType::I64, false, true));

@@ -446,29 +446,38 @@ query ordered_person($name: String) {
     assert_eq!(lines.next().unwrap(), "30,Alice");
 }
 
-/// A read at the expression depth bound compiles and runs on the server's
-/// runtime threads: an `or` chain of 200 terms overflowed Tokio's default
-/// worker stack in a debug server and aborted the process.
+/// Reads far deeper than the corpus's deepest compile and run on the
+/// server's and the CLI's runtime threads with the stacks those binaries
+/// choose, Tokio's defaults: an `or` chain of 10,000 terms and arithmetic
+/// nested in 1,000 brackets. Every walk over them grows its own stack (an
+/// `or` chain of 200 terms once overflowed a debug server's worker and
+/// aborted the process).
 #[test]
-fn remote_read_at_the_expression_depth_bound_keeps_the_server_serving() {
+fn remote_read_deep_past_the_corpus_keeps_the_server_serving() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster_default_stack(cluster.path());
     let temp = tempfile::tempdir().unwrap();
-    let chain = (0..200)
+    let chain = (0..10_000)
         .map(|i| format!("$p.name = \"n{i}\""))
         .collect::<Vec<_>>()
         .join(" or ");
+    let mut nested = "$p.age".to_string();
+    for _ in 0..1_000 {
+        nested = format!("({nested} + 0)");
+    }
     let deep = temp.path().join("deep.gq");
     fs::write(
         &deep,
         format!(
-            "query deep() {{ match {{ $p: Person }} where {chain} or $p.name = \"Alice\" return {{ count($p) as n }} }}"
+            "query chain() {{ match {{ $p: Person }} where {chain} or $p.name = \"Alice\" return {{ count($p) as n }} }}\n\
+             query nested() {{ match {{ $p: Person }} where {nested} > 29 return {{ count($p) as n }} }}"
         ),
     )
     .unwrap();
-    for _ in 0..2 {
+    for (name, rows) in [("chain", 1), ("nested", 2), ("chain", 1)] {
         let payload = parse_stdout_json(&output_success(
             cli()
+                .env_remove("RUST_MIN_STACK")
                 .arg("query")
                 .arg("--target")
                 .fixture_target(&server.base_url)
@@ -476,10 +485,10 @@ fn remote_read_at_the_expression_depth_bound_keeps_the_server_serving() {
                 .arg(GRAPH_ID)
                 .arg("--query")
                 .arg(&deep)
-                .arg("deep")
+                .arg(name)
                 .arg("--json"),
         ));
-        assert_eq!(payload["rows"][0]["n"], 1, "{payload}");
+        assert_eq!(payload["rows"][0]["n"], rows, "{name}: {payload}");
     }
 }
 

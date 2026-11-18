@@ -1,10 +1,12 @@
 //! The nesting bound a query source meets before the grammar runs (`Q006`).
 //!
 //! The parser, the typechecker and every later stage recurse once per level
-//! of an expression tree, so an unbounded source can exhaust the stack of the
-//! thread compiling it, which aborts the process instead of refusing the
-//! request. A chain `a or b or c` is a left-deep tree as deep as it is long,
-//! so its operators are levels too. This module bounds the depth with one
+//! of an expression tree, each level entering through [`crate::stack::deep`],
+//! which grows the thread's stack on the heap as the walk goes deep: a deep
+//! source costs memory and time in proportion to its depth, never the
+//! process. A chain `a or b or c` is a left-deep tree as deep as it is long,
+//! so its operators are levels too. This module bounds the depth, and so
+//! that cost, with one
 //! linear scan over the bytes, before any recursion: it skips string
 //! literals and comments as the grammar does, opens a level at `(`, `{` and
 //! `[`, charges a level for each prefix operator in a run of adjacent ones
@@ -27,40 +29,17 @@ use super::codes::Q006;
 use super::diagnostic::{Position, QueryDiagnostic};
 
 /// The deepest nesting of brackets, `case`s and adjacent prefix operators a
-/// query source may hold. Each such level costs several frames in the grammar alone.
-pub const MAX_QUERY_NESTING: usize = 64;
+/// query source may hold. The grammar's generated parser recurses several
+/// frames per level on a stack sized for the source's nesting
+/// ([`GRAMMAR_BYTES_PER_LEVEL`] each).
+pub const MAX_QUERY_NESTING: usize = 2048;
 
 /// The deepest expression a query source may build, counting every
 /// `and`/`or` of a chain and every operator of an arithmetic or comparison
 /// chain as one level on top of the nesting. A long `or`
 /// chain over one property is written `$p.name in [...]`, which is one level
 /// whatever its length.
-pub const MAX_QUERY_EXPRESSION_DEPTH: usize = 256;
-
-/// The stack of a thread that compiles, plans or runs a query. The bounds
-/// above keep the recursion finite; this keeps a source at them within the
-/// thread, in a debug build too, where each level's frames are largest. The
-/// server's and the CLI's runtimes give every worker and blocking thread
-/// this stack: Tokio's default (2 MiB) is too small for an `or` chain of
-/// sixty terms.
-pub const QUERY_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
-
-/// Run `f` on a thread with [`QUERY_THREAD_STACK_BYTES`] of stack and return
-/// its result, a panic in it resumed on the caller. A binary's `main` runs
-/// its runtime's `block_on` through this: the future `block_on` drives runs
-/// on the calling thread, whose stack the runtime's `thread_stack_size` does
-/// not set, and a CLI compiles its query there.
-pub fn on_query_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    let spawned = std::thread::Builder::new()
-        .name("omnigraph-main".into())
-        .stack_size(QUERY_THREAD_STACK_BYTES)
-        .spawn(f);
-    let handle =
-        spawned.unwrap_or_else(|error| panic!("the query thread could not be spawned: {error}"));
-    handle
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-}
+pub const MAX_QUERY_EXPRESSION_DEPTH: usize = 16384;
 
 #[derive(Default)]
 struct Level {
@@ -119,6 +98,17 @@ pub(crate) fn check_query_nesting(input: &str) -> Result<(), QueryDiagnostic> {
         ),
     )
 }
+
+/// The nesting [`check_query_nesting`] estimates for `input`: the levels of
+/// brackets, `case`s and prefix-operator runs the grammar recurses through.
+pub(crate) fn nesting(input: &str) -> usize {
+    measure(input, usize::MAX, usize::MAX).map_or(MAX_QUERY_NESTING, |(nesting, _)| nesting)
+}
+
+/// The stack the grammar uses per level of nesting, in a debug build, where
+/// its frames are largest (about half of this measured), so a parse runs
+/// within [`crate::stack::with_room`] of this per level.
+pub(crate) const GRAMMAR_BYTES_PER_LEVEL: usize = 16 * 1024;
 
 /// The estimated `(nesting, total)` depth of `input`, or where it first
 /// passed a bound.
@@ -444,25 +434,23 @@ mod tests {
         assert!(depth(&filter(&vec!["$p.age > 1"; 20].join(" or "))).1 > depth(&arguments(500)).1);
     }
 
-    /// A source at the bounds compiles on the stack [`on_query_stack`]
-    /// gives, from a caller whose own stack is far smaller, as a binary's
-    /// main thread can be.
+    /// A source at the bounds parses on a thread whose stack is far smaller
+    /// than the default: the grammar runs on a stack sized for the source's
+    /// nesting, and every walk after it grows its own.
     #[test]
-    fn a_source_at_the_bounds_compiles_on_the_query_stack() {
+    fn a_source_at_the_bounds_parses_on_a_small_stack() {
         let source = filter(&format!(
             "{} or {}",
             nested(MAX_QUERY_NESTING - 8),
-            vec!["$p.age > 1"; 180].join(" or ")
+            vec!["$p.age > 1"; MAX_QUERY_EXPRESSION_DEPTH - MAX_QUERY_NESTING].join(" or ")
         ));
         assert!(check_query_nesting(&source).is_ok());
         let parsed = std::thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(move || {
-                on_query_stack(move || {
-                    crate::query::syntax::parse::parse_source_all(&source)
-                        .1
-                        .is_empty()
-                })
+                crate::query::syntax::parse::parse_source_all(&source)
+                    .1
+                    .is_empty()
             })
             .unwrap()
             .join()
@@ -500,7 +488,7 @@ mod tests {
         ));
         assert!(matches!(
             measure(
-                &filter(&vec!["$p.age > 1"; 300].join(" or ")),
+                &filter(&vec!["$p.age > 1"; MAX_QUERY_EXPRESSION_DEPTH + 100].join(" or ")),
                 usize::MAX,
                 MAX_QUERY_EXPRESSION_DEPTH
             ),

@@ -830,8 +830,17 @@ pub(crate) fn ir_expr_to_df_expr(
     params: &ParamMap,
     schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
-    expr.check_types().ok()?;
-    split_on_repeatedly_tested_columns(typed_expr_to_df_expr(expr, params)?, schema)
+    // DataFusion and Lance recurse once per level of a pushed filter on
+    // whatever stack plans the scan, entering no level through a stack guard:
+    // a deeper predicate is not pushed, and the engine's own filter, which
+    // grows its stack as it goes deep, evaluates it.
+    if expr.depth() > omnigraph_compiler::stack::MAX_HANDED_OFF_DEPTH {
+        return None;
+    }
+    omnigraph_compiler::stack::deep(|| {
+        expr.check_types().ok()?;
+        split_on_repeatedly_tested_columns(typed_expr_to_df_expr(expr, params)?, schema)
+    })
 }
 
 /// The most columns one pushed predicate is split on. Each split doubles the
@@ -998,77 +1007,84 @@ pub(crate) fn exceeds_null_split_columns(expr: &IRExpr, params: &ParamMap) -> bo
 }
 
 fn typed_expr_to_df_expr(expr: &IRExpr, params: &ParamMap) -> Option<datafusion::prelude::Expr> {
-    match expr {
-        IRExpr::Binary {
-            left,
-            op: BinaryOp::Compare(op),
-            right,
-            ty: _,
-        } => comparison_to_df_expr(left, *op, right, params),
-        IRExpr::Binary {
-            left,
-            op: BinaryOp::And,
-            right,
-            ty: _,
-        } => Some(typed_expr_to_df_expr(left, params)?.and(typed_expr_to_df_expr(right, params)?)),
-        IRExpr::Binary {
-            left,
-            op: BinaryOp::Or,
-            right,
-            ty: _,
-        } => Some(typed_expr_to_df_expr(left, params)?.or(typed_expr_to_df_expr(right, params)?)),
-        IRExpr::Not(inner, _) => Some(datafusion::logical_expr::not(typed_expr_to_df_expr(
-            inner, params,
-        )?)),
-        IRExpr::IsNull {
-            expr,
-            negated,
-            ty: _,
-        } => {
-            let operand = typed_expr_to_df_expr(expr, params)?;
-            Some(if *negated {
-                operand.is_not_null()
-            } else {
-                operand.is_null()
-            })
-        }
-        IRExpr::Cast { expr: child, ty } => {
-            if super::constant::is_constant(expr) {
+    omnigraph_compiler::stack::deep(|| {
+        match expr {
+            IRExpr::Binary {
+                left,
+                op: BinaryOp::Compare(op),
+                right,
+                ty: _,
+            } => comparison_to_df_expr(left, *op, right, params),
+            IRExpr::Binary {
+                left,
+                op: BinaryOp::And,
+                right,
+                ty: _,
+            } => Some(
+                typed_expr_to_df_expr(left, params)?.and(typed_expr_to_df_expr(right, params)?),
+            ),
+            IRExpr::Binary {
+                left,
+                op: BinaryOp::Or,
+                right,
+                ty: _,
+            } => {
+                Some(typed_expr_to_df_expr(left, params)?.or(typed_expr_to_df_expr(right, params)?))
+            }
+            IRExpr::Not(inner, _) => Some(datafusion::logical_expr::not(typed_expr_to_df_expr(
+                inner, params,
+            )?)),
+            IRExpr::IsNull {
+                expr,
+                negated,
+                ty: _,
+            } => {
+                let operand = typed_expr_to_df_expr(expr, params)?;
+                Some(if *negated {
+                    operand.is_not_null()
+                } else {
+                    operand.is_null()
+                })
+            }
+            IRExpr::Cast { expr: child, ty } => {
+                if super::constant::is_constant(expr) {
+                    let array = super::constant::evaluate_constant_array(expr, params).ok()?;
+                    let value =
+                        datafusion::scalar::ScalarValue::try_from_array(array.as_ref(), 0).ok()?;
+                    return Some(datafusion::prelude::lit(value));
+                }
+                Some(datafusion::logical_expr::cast(
+                    typed_expr_to_df_expr(child, params)?,
+                    ty.to_arrow()?,
+                ))
+            }
+            IRExpr::PropAccess { property, .. } => Some(datafusion::prelude::ident(property)),
+            IRExpr::Literal(literal, ty) => literal_to_expr(literal, ty),
+            IRExpr::Param(name, ty) => literal_to_expr(params.get(name)?, ty),
+            // A list holding parameters is a constant once they are bound.
+            IRExpr::Call {
+                func: omnigraph_compiler::ir::expr::ScalarFunc::List,
+                ..
+            } if super::constant::is_constant(expr) => {
                 let array = super::constant::evaluate_constant_array(expr, params).ok()?;
                 let value =
                     datafusion::scalar::ScalarValue::try_from_array(array.as_ref(), 0).ok()?;
-                return Some(datafusion::prelude::lit(value));
+                Some(datafusion::prelude::lit(value))
             }
-            Some(datafusion::logical_expr::cast(
-                typed_expr_to_df_expr(child, params)?,
-                ty.to_arrow()?,
-            ))
+            IRExpr::Nearest { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(_, _) => None,
+            // Arithmetic and registry calls stay in memory: a pushed term would
+            // trade the typed refusal of an overflow for the scanner's semantics.
+            IRExpr::Binary {
+                op: BinaryOp::Arith(_),
+                ..
+            }
+            | IRExpr::Neg { .. }
+            | IRExpr::Call { .. } => None,
         }
-        IRExpr::PropAccess { property, .. } => Some(datafusion::prelude::ident(property)),
-        IRExpr::Literal(literal, ty) => literal_to_expr(literal, ty),
-        IRExpr::Param(name, ty) => literal_to_expr(params.get(name)?, ty),
-        // A list holding parameters is a constant once they are bound.
-        IRExpr::Call {
-            func: omnigraph_compiler::ir::expr::ScalarFunc::List,
-            ..
-        } if super::constant::is_constant(expr) => {
-            let array = super::constant::evaluate_constant_array(expr, params).ok()?;
-            let value = datafusion::scalar::ScalarValue::try_from_array(array.as_ref(), 0).ok()?;
-            Some(datafusion::prelude::lit(value))
-        }
-        IRExpr::Nearest { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(_, _) => None,
-        // Arithmetic and registry calls stay in memory: a pushed term would
-        // trade the typed refusal of an overflow for the scanner's semantics.
-        IRExpr::Binary {
-            op: BinaryOp::Arith(_),
-            ..
-        }
-        | IRExpr::Neg { .. }
-        | IRExpr::Call { .. } => None,
-    }
+    })
 }
 
 fn comparison_to_df_expr(

@@ -341,12 +341,23 @@ fn check_cast_values(before: &ArrayRef, after: &ArrayRef) -> Result<()> {
 }
 
 pub(super) fn check_array_type(array: &ArrayRef, ty: &ExprType, name: &str) -> Result<()> {
+    check_array_type_of(array, ty, || name.to_string())
+}
+
+/// [`check_array_type`] naming the column only when it is violated: an
+/// expression's name is its rendering, which costs as much as its subtree.
+pub(super) fn check_array_type_of(
+    array: &ArrayRef,
+    ty: &ExprType,
+    name: impl FnOnce() -> String,
+) -> Result<()> {
     let expected = ty
         .to_arrow()
         .ok_or_else(|| OmniError::manifest_internal("value has no Arrow type"))?;
     if array.data_type() != &expected || !ty.nullable() && array.null_count() != 0 {
         return Err(OmniError::manifest_internal(format!(
-            "column '{name}' violates compiler type {}: Arrow {:?}, {} nulls",
+            "column '{}' violates compiler type {}: Arrow {:?}, {} nulls",
+            name(),
             ty.spelling(),
             array.data_type(),
             array.null_count()

@@ -1560,37 +1560,26 @@ fn alias_for(written: &str) -> String {
 /// `e` with every subexpression a group key computes read as that key's
 /// column.
 fn key_columns(e: IRExpr, keys: &[(String, IRExpr)]) -> IRExpr {
-    if let Some((name, key)) = keys.iter().find(|(_, k)| *k == e) {
-        return IRExpr::AliasRef(name.clone(), key.ty().clone());
-    }
-    let b = |x: Box<IRExpr>| Box::new(key_columns(*x, keys));
-    match e {
-        IRExpr::Binary {
-            left,
-            op,
-            right,
-            ty,
-        } => IRExpr::Binary {
-            left: b(left),
-            op,
-            right: b(right),
-            ty,
-        },
-        IRExpr::Not(inner, ty) => IRExpr::Not(b(inner), ty),
-        IRExpr::IsNull { expr, negated, ty } => IRExpr::IsNull {
-            expr: b(expr),
-            negated,
-            ty,
-        },
-        IRExpr::Cast { expr, ty } => IRExpr::Cast { expr: b(expr), ty },
-        IRExpr::Neg { expr, ty } => IRExpr::Neg { expr: b(expr), ty },
-        IRExpr::Call { func, args, ty } => IRExpr::Call {
-            func,
-            args: args.into_iter().map(|a| key_columns(a, keys)).collect(),
-            ty,
-        },
-        other => other,
-    }
+    crate::stack::deep(|| {
+        if let Some((name, key)) = keys.iter().find(|(_, k)| *k == e) {
+            return IRExpr::AliasRef(name.clone(), key.ty().clone());
+        }
+        let mut e = e;
+        let b = |x: &mut IRExpr| *x = key_columns(IRExpr::take(x), keys);
+        match &mut e {
+            IRExpr::Binary { left, right, .. } => {
+                b(left);
+                b(right);
+            }
+            IRExpr::Not(inner, _)
+            | IRExpr::IsNull { expr: inner, .. }
+            | IRExpr::Cast { expr: inner, .. }
+            | IRExpr::Neg { expr: inner, .. } => b(inner),
+            IRExpr::Call { args, .. } => args.iter_mut().for_each(b),
+            _ => {}
+        }
+        e
+    })
 }
 
 /// The reason an assignment cannot name a system column.
@@ -2638,56 +2627,58 @@ impl Ctx<'_> {
         e: &Expr,
         hidden: &mut Vec<(String, Agg)>,
     ) -> R<Expr> {
-        if let Some(a) = self.aggregate(sc, e)? {
-            let n = self.fresh(FreshRole::Item);
-            hidden.push((n.clone(), a));
-            return Ok(Expr::Variable(n));
-        }
-        let b = |x: &Expr,
-                 this: &mut Self,
-                 sc: &mut Scope,
-                 h: &mut Vec<(String, Agg)>|
-         -> R<Box<Expr>> { Ok(Box::new(this.extract_aggs(sc, x, h)?)) };
-        Ok(match e {
-            Expr::Compare {
-                op,
-                left,
-                right,
-                at,
-            } => Expr::Compare {
-                op: *op,
-                left: b(left, self, sc, hidden)?,
-                right: b(right, self, sc, hidden)?,
-                at: at.clone(),
-            },
-            Expr::Arith { op, left, right } => Expr::Arith {
-                op: *op,
-                left: b(left, self, sc, hidden)?,
-                right: b(right, self, sc, hidden)?,
-            },
-            Expr::And(l, r) => Expr::And(b(l, self, sc, hidden)?, b(r, self, sc, hidden)?),
-            Expr::Or(l, r) => Expr::Or(b(l, self, sc, hidden)?, b(r, self, sc, hidden)?),
-            Expr::Not(x) => Expr::Not(b(x, self, sc, hidden)?),
-            Expr::Neg(x) => Expr::Neg(b(x, self, sc, hidden)?),
-            Expr::IsNull { expr, negated } => Expr::IsNull {
-                expr: b(expr, self, sc, hidden)?,
-                negated: *negated,
-            },
-            Expr::In { needle, list, at } => Expr::In {
-                needle: b(needle, self, sc, hidden)?,
-                list: b(list, self, sc, hidden)?,
-                at: at.clone(),
-            },
-            Expr::Call(c) => {
-                let mut c = c.clone();
-                for a in &mut c.args {
-                    if let Arg::Expr(x) = a {
-                        *x = self.extract_aggs(sc, x, hidden)?;
-                    }
-                }
-                Expr::Call(c)
+        crate::stack::deep(|| {
+            if let Some(a) = self.aggregate(sc, e)? {
+                let n = self.fresh(FreshRole::Item);
+                hidden.push((n.clone(), a));
+                return Ok(Expr::Variable(n));
             }
-            other => other.clone(),
+            let b = |x: &Expr,
+                     this: &mut Self,
+                     sc: &mut Scope,
+                     h: &mut Vec<(String, Agg)>|
+             -> R<Box<Expr>> { Ok(Box::new(this.extract_aggs(sc, x, h)?)) };
+            Ok(match e {
+                Expr::Compare {
+                    op,
+                    left,
+                    right,
+                    at,
+                } => Expr::Compare {
+                    op: *op,
+                    left: b(left, self, sc, hidden)?,
+                    right: b(right, self, sc, hidden)?,
+                    at: at.clone(),
+                },
+                Expr::Arith { op, left, right } => Expr::Arith {
+                    op: *op,
+                    left: b(left, self, sc, hidden)?,
+                    right: b(right, self, sc, hidden)?,
+                },
+                Expr::And(l, r) => Expr::And(b(l, self, sc, hidden)?, b(r, self, sc, hidden)?),
+                Expr::Or(l, r) => Expr::Or(b(l, self, sc, hidden)?, b(r, self, sc, hidden)?),
+                Expr::Not(x) => Expr::Not(b(x, self, sc, hidden)?),
+                Expr::Neg(x) => Expr::Neg(b(x, self, sc, hidden)?),
+                Expr::IsNull { expr, negated } => Expr::IsNull {
+                    expr: b(expr, self, sc, hidden)?,
+                    negated: *negated,
+                },
+                Expr::In { needle, list, at } => Expr::In {
+                    needle: b(needle, self, sc, hidden)?,
+                    list: b(list, self, sc, hidden)?,
+                    at: at.clone(),
+                },
+                Expr::Call(c) => {
+                    let mut c = c.clone();
+                    for a in &mut c.args {
+                        if let Arg::Expr(x) = a {
+                            *x = self.extract_aggs(sc, x, hidden)?;
+                        }
+                    }
+                    Expr::Call(c)
+                }
+                other => other.clone(),
+            })
         })
     }
 
@@ -4289,17 +4280,19 @@ impl Ctx<'_> {
 
     /// A String query (`terms(q, mode: any)`) or a `terms(…)` value.
     fn lexical(&mut self, sc: &mut Scope, e: &Expr) -> R<LexicalQuery> {
-        if let Expr::Call(c) = e
-            && c.name == "terms"
-        {
-            return Ok(self.terms(sc, c)?.lexical());
-        }
-        let text = self.expr(sc, e, At::Value)?;
-        lexical_text(&text)?;
-        Ok(LexicalQuery {
-            text: text.to_ir(),
-            mode_all: false,
-            max_edits: int_lit(0).to_ir(),
+        crate::stack::deep(|| {
+            if let Expr::Call(c) = e
+                && c.name == "terms"
+            {
+                return Ok(self.terms(sc, c)?.lexical());
+            }
+            let text = self.expr(sc, e, At::Value)?;
+            lexical_text(&text)?;
+            Ok(LexicalQuery {
+                text: text.to_ir(),
+                mode_all: false,
+                max_edits: int_lit(0).to_ir(),
+            })
         })
     }
 
@@ -5348,293 +5341,301 @@ impl Ctx<'_> {
     }
 
     fn expr(&mut self, sc: &mut Scope, e: &Expr, at: At) -> R<SExpr> {
-        self.typed_exprs += 1;
-        let sub = at;
-        let boolean = Ty::scalar(ScalarType::Bool, false);
-        Ok(match e {
-            Expr::InfixString {
-                op,
-                left,
-                right: _,
-                at: written,
-            } => {
-                return Err(E::D(infix_string(
-                    *op,
-                    written,
-                    self.expr(sc, left, sub)?
-                        .ty
-                        .as_value()
-                        .is_some_and(|p| p.list),
-                )));
-            }
-            Expr::Literal(Literal::Null) => return Err(untyped_null_refusal()),
-            Expr::Literal(l) => SExpr::new(SKind::Lit(l.clone()), Ty::Value(literal_type(l)?)),
-            Expr::List {
-                elements,
-                at: written,
-            } => self.list_value(sc, elements, written, sub)?,
-            Expr::Variable(v) => {
-                if let Some(ty) = sc.col(v) {
-                    SExpr::new(SKind::Col(v.clone()), ty)
-                } else if let Some(t) = sc.params.get(v) {
-                    SExpr::new(SKind::Param(v.clone()), Ty::Value(t.clone()))
-                } else if sc.is_error(v) {
-                    return Err(E::Recorded);
-                } else if sc.rels.contains_key(v) {
-                    return Err(err_fix(
-                        T69,
-                        format!("`${v}` is a relation; a scalar is read here"),
-                        format!(
-                            "draw it with `from ${v}`, or aggregate over it: `count {{ from ${v} }}`"
-                        ),
-                    ));
-                } else {
-                    return Err(err(
-                        T6,
-                        format!(
-                            "variable `${v}` is not bound{}",
-                            nearest::listing(&format!("${v}"), sc.names_in_scope(&self.made_up))
-                        ),
-                    ));
+        crate::stack::deep(|| {
+            self.typed_exprs += 1;
+            let sub = at;
+            let boolean = Ty::scalar(ScalarType::Bool, false);
+            Ok(match e {
+                Expr::InfixString {
+                    op,
+                    left,
+                    right: _,
+                    at: written,
+                } => {
+                    return Err(E::D(infix_string(
+                        *op,
+                        written,
+                        self.expr(sc, left, sub)?
+                            .ty
+                            .as_value()
+                            .is_some_and(|p| p.list),
+                    )));
                 }
-            }
-            Expr::Prop { variable, property } => {
-                let Some(ty) = sc.col(variable) else {
-                    if sc.is_error(variable) {
+                Expr::Literal(Literal::Null) => return Err(untyped_null_refusal()),
+                Expr::Literal(l) => SExpr::new(SKind::Lit(l.clone()), Ty::Value(literal_type(l)?)),
+                Expr::List {
+                    elements,
+                    at: written,
+                } => self.list_value(sc, elements, written, sub)?,
+                Expr::Variable(v) => {
+                    if let Some(ty) = sc.col(v) {
+                        SExpr::new(SKind::Col(v.clone()), ty)
+                    } else if let Some(t) = sc.params.get(v) {
+                        SExpr::new(SKind::Param(v.clone()), Ty::Value(t.clone()))
+                    } else if sc.is_error(v) {
                         return Err(E::Recorded);
-                    }
-                    if sc.params.contains_key(variable) {
-                        return Err(err(
-                            T6,
-                            format!("`${variable}` is a parameter and has no properties"),
+                    } else if sc.rels.contains_key(v) {
+                        return Err(err_fix(
+                            T69,
+                            format!("`${v}` is a relation; a scalar is read here"),
+                            format!(
+                                "draw it with `from ${v}`, or aggregate over it: `count {{ from ${v} }}`"
+                            ),
                         ));
-                    }
-                    return Err(err(
-                        T6,
-                        format!(
-                            "variable `${variable}` is not bound{}",
-                            nearest::listing(
-                                &format!("${variable}"),
-                                sc.names_in_scope(&self.made_up)
-                            )
-                        ),
-                    ));
-                };
-                if let Some(field) = property.strip_prefix('@') {
-                    let admitted = match &ty {
-                        Ty::Node { .. } => field == "id",
-                        Ty::Edge { .. } => matches!(field, "id" | "src" | "dst" | "type"),
-                        Ty::Value(_) => false,
-                    };
-                    if !admitted {
-                        let fields = match &ty {
-                            Ty::Node { .. } => "its meta-fields are `@id`",
-                            Ty::Edge { .. } => {
-                                "its meta-fields are `@id`, `@src`, `@dst` and `@type`"
-                            }
-                            Ty::Value(_) => "a value has no meta-fields",
-                        };
+                    } else {
                         return Err(err(
                             T6,
                             format!(
-                                "binding `${variable}` has no meta-field `{property}`; {fields}"
+                                "variable `${v}` is not bound{}",
+                                nearest::listing(
+                                    &format!("${v}"),
+                                    sc.names_in_scope(&self.made_up)
+                                )
                             ),
                         ));
                     }
-                    SExpr::new(
-                        SKind::Meta {
-                            col: variable.clone(),
-                            field: property.clone(),
-                        },
-                        Ty::scalar(ScalarType::String, ty.nullable()),
-                    )
-                } else {
-                    let (p, _) = self.property(&ty, property, variable)?;
-                    if p.scalar == ScalarType::Blob && !matches!(at, At::Value) {
+                }
+                Expr::Prop { variable, property } => {
+                    let Some(ty) = sc.col(variable) else {
+                        if sc.is_error(variable) {
+                            return Err(E::Recorded);
+                        }
+                        if sc.params.contains_key(variable) {
+                            return Err(err(
+                                T6,
+                                format!("`${variable}` is a parameter and has no properties"),
+                            ));
+                        }
                         return Err(err(
-                            T24,
-                            format!("Blob property `{variable}.{property}` is not a read value"),
+                            T6,
+                            format!(
+                                "variable `${variable}` is not bound{}",
+                                nearest::listing(
+                                    &format!("${variable}"),
+                                    sc.names_in_scope(&self.made_up)
+                                )
+                            ),
+                        ));
+                    };
+                    if let Some(field) = property.strip_prefix('@') {
+                        let admitted = match &ty {
+                            Ty::Node { .. } => field == "id",
+                            Ty::Edge { .. } => matches!(field, "id" | "src" | "dst" | "type"),
+                            Ty::Value(_) => false,
+                        };
+                        if !admitted {
+                            let fields = match &ty {
+                                Ty::Node { .. } => "its meta-fields are `@id`",
+                                Ty::Edge { .. } => {
+                                    "its meta-fields are `@id`, `@src`, `@dst` and `@type`"
+                                }
+                                Ty::Value(_) => "a value has no meta-fields",
+                            };
+                            return Err(err(
+                                T6,
+                                format!(
+                                    "binding `${variable}` has no meta-field `{property}`; {fields}"
+                                ),
+                            ));
+                        }
+                        SExpr::new(
+                            SKind::Meta {
+                                col: variable.clone(),
+                                field: property.clone(),
+                            },
+                            Ty::scalar(ScalarType::String, ty.nullable()),
+                        )
+                    } else {
+                        let (p, _) = self.property(&ty, property, variable)?;
+                        if p.scalar == ScalarType::Blob && !matches!(at, At::Value) {
+                            return Err(err(
+                                T24,
+                                format!(
+                                    "Blob property `{variable}.{property}` is not a read value"
+                                ),
+                            ));
+                        }
+                        SExpr::new(
+                            SKind::Prop {
+                                col: variable.clone(),
+                                prop: property.clone(),
+                            },
+                            Ty::Value(p),
+                        )
+                    }
+                }
+                Expr::Meta(m) => {
+                    return Err(err(
+                        T6,
+                        format!("a bare meta-field `@{m}` names no binding; write `$x.@{m}`"),
+                    ));
+                }
+                Expr::Ident(i) => {
+                    return Err(err(
+                        T6,
+                        format!("a bare identifier `{i}` is not a value in a read"),
+                    ));
+                }
+                Expr::Call(c) => return self.call_scalar(sc, c, at),
+                Expr::AggDistinct { func, .. } => {
+                    return Err(err(
+                        T8,
+                        format!("`{func}(distinct …)` is an aggregate; it belongs in `return`"),
+                    ));
+                }
+                Expr::Block(b) => {
+                    let (term, free, arg) = self.block_scope_arg(sc, b)?;
+                    if free.is_empty() {
+                        return Err(err(
+                            T39,
+                            "an exists or aggregate block must reference an outer-bound variable",
                         ));
                     }
-                    SExpr::new(
-                        SKind::Prop {
-                            col: variable.clone(),
-                            prop: property.clone(),
-                        },
-                        Ty::Value(p),
-                    )
-                }
-            }
-            Expr::Meta(m) => {
-                return Err(err(
-                    T6,
-                    format!("a bare meta-field `@{m}` names no binding; write `$x.@{m}`"),
-                ));
-            }
-            Expr::Ident(i) => {
-                return Err(err(
-                    T6,
-                    format!("a bare identifier `{i}` is not a value in a read"),
-                ));
-            }
-            Expr::Call(c) => return self.call_scalar(sc, c, at),
-            Expr::AggDistinct { func, .. } => {
-                return Err(err(
-                    T8,
-                    format!("`{func}(distinct …)` is an aggregate; it belongs in `return`"),
-                ));
-            }
-            Expr::Block(b) => {
-                let (term, free, arg) = self.block_scope_arg(sc, b)?;
-                if free.is_empty() {
-                    return Err(err(
-                        T39,
-                        "an exists or aggregate block must reference an outer-bound variable",
-                    ));
-                }
-                let col = self.fresh(FreshRole::Block);
-                // The block evaluates its inner term and, over its rows, its
-                // aggregate's argument; either can fail.
-                let can_fail = term.can_fail() || arg.as_ref().is_some_and(|a| a.can_fail);
-                let (agg, value) = match b.func {
-                    BlockFunc::Exists => (count_rows(), exists_col(&col)),
-                    BlockFunc::Agg(func) => {
-                        let agg = match (arg, func) {
-                            (None, AggFunc::Count) => count_rows(),
-                            (None, f) => {
-                                return Err(err(
-                                    T40,
-                                    format!("`{f} {{ }}` needs its argument: `{f}($x.p) {{ … }}`"),
-                                ));
-                            }
-                            (Some(arg), f) => {
-                                let ty = agg_type(f, &arg.ty)?;
-                                let ty = ty.with_nullable(f != AggFunc::Count);
-                                Agg {
-                                    func: f,
-                                    distinct: false,
-                                    arg: Some(arg.to_ir()),
-                                    ty,
+                    let col = self.fresh(FreshRole::Block);
+                    // The block evaluates its inner term and, over its rows, its
+                    // aggregate's argument; either can fail.
+                    let can_fail = term.can_fail() || arg.as_ref().is_some_and(|a| a.can_fail);
+                    let (agg, value) = match b.func {
+                        BlockFunc::Exists => (count_rows(), exists_col(&col)),
+                        BlockFunc::Agg(func) => {
+                            let agg = match (arg, func) {
+                                (None, AggFunc::Count) => count_rows(),
+                                (None, f) => {
+                                    return Err(err(
+                                        T40,
+                                        format!(
+                                            "`{f} {{ }}` needs its argument: `{f}($x.p) {{ … }}`"
+                                        ),
+                                    ));
                                 }
-                            }
-                        };
-                        let ty = agg.ty.clone();
-                        (agg, SExpr::new(SKind::Col(col.clone()), ty))
+                                (Some(arg), f) => {
+                                    let ty = agg_type(f, &arg.ty)?;
+                                    let ty = ty.with_nullable(f != AggFunc::Count);
+                                    Agg {
+                                        func: f,
+                                        distinct: false,
+                                        arg: Some(arg.to_ir()),
+                                        ty,
+                                    }
+                                }
+                            };
+                            let ty = agg.ty.clone();
+                            (agg, SExpr::new(SKind::Col(col.clone()), ty))
+                        }
+                    };
+                    // A block that can fail, written under a guard, runs only on
+                    // the outer rows the guard selects (A3): the guard, typed
+                    // once where it was written, is computed as a column of the
+                    // outer row and the block's input keeps the rows where it
+                    // holds.
+                    let guard = if can_fail { self.block_guard(sc) } else { None };
+                    sc.block_buf.push(BlockAgg {
+                        inner: term,
+                        col: col.clone(),
+                        agg,
+                        guard,
+                    });
+                    // The block's column is visible to the expression that reads it.
+                    value
+                }
+                Expr::Neg(inner) => {
+                    let v = self.expr(sc, inner, sub)?;
+                    let ty = numeric(&v, "unary `-`")?;
+                    if matches!(&ty, Ty::Value(t) if matches!(t.scalar, ScalarType::U32 | ScalarType::U64))
+                    {
+                        return Err(err(
+                            T72,
+                            format!(
+                                "unary `-` needs a signed integer or a float, got {}",
+                                ty.display()
+                            ),
+                        ));
                     }
-                };
-                // A block that can fail, written under a guard, runs only on
-                // the outer rows the guard selects (A3): the guard, typed
-                // once where it was written, is computed as a column of the
-                // outer row and the block's input keeps the rows where it
-                // holds.
-                let guard = if can_fail { self.block_guard(sc) } else { None };
-                sc.block_buf.push(BlockAgg {
-                    inner: term,
-                    col: col.clone(),
-                    agg,
-                    guard,
-                });
-                // The block's column is visible to the expression that reads it.
-                value
-            }
-            Expr::Neg(inner) => {
-                let v = self.expr(sc, inner, sub)?;
-                let ty = numeric(&v, "unary `-`")?;
-                if matches!(&ty, Ty::Value(t) if matches!(t.scalar, ScalarType::U32 | ScalarType::U64))
+                    SExpr::new(SKind::Neg(v.boxed()), ty)
+                }
+                Expr::Arith { op, left, right } => {
+                    let l = self.expr(sc, left, sub);
+                    let r = self.expr(sc, right, sub);
+                    let (l, r) = self.both(sc, l, r)?;
+                    arith(*op, l, r)?
+                }
+                Expr::Compare {
+                    op,
+                    left,
+                    right,
+                    at: written,
+                } if (is_null_literal(left) || is_null_literal(right))
+                    && soundness::refuses(soundness::Claim::NullComparison) =>
                 {
-                    return Err(err(
-                        T72,
-                        format!(
-                            "unary `-` needs a signed integer or a float, got {}",
-                            ty.display()
-                        ),
-                    ));
+                    return Err(null_comparison(*op, left, right, written));
                 }
-                SExpr::new(SKind::Neg(v.boxed()), ty)
-            }
-            Expr::Arith { op, left, right } => {
-                let l = self.expr(sc, left, sub);
-                let r = self.expr(sc, right, sub);
-                let (l, r) = self.both(sc, l, r)?;
-                arith(*op, l, r)?
-            }
-            Expr::Compare {
-                op,
-                left,
-                right,
-                at: written,
-            } if (is_null_literal(left) || is_null_literal(right))
-                && soundness::refuses(soundness::Claim::NullComparison) =>
-            {
-                return Err(null_comparison(*op, left, right, written));
-            }
-            Expr::Compare {
-                op, left, right, ..
-            } if is_null_literal(left) || is_null_literal(right) => {
-                // The refusal let through (a test-only switch): the `null`
-                // takes the other operand's type, as the refusal's claim
-                // reads it.
-                let other_is_left = !is_null_literal(left);
-                let other = if other_is_left { left } else { right };
-                let other = self.expr(sc, other, sub)?;
-                let Ty::Value(t) = &other.ty else {
-                    return Err(err(T7, "a comparison with `null` over a reference"));
-                };
-                let null = SExpr::new(
-                    SKind::Null,
-                    Ty::Value(PropType {
-                        nullable: true,
-                        ..t.clone()
-                    }),
-                );
-                if other_is_left {
-                    compare(*op, other, null)?
-                } else {
-                    compare(*op, null, other)?
+                Expr::Compare {
+                    op, left, right, ..
+                } if is_null_literal(left) || is_null_literal(right) => {
+                    // The refusal let through (a test-only switch): the `null`
+                    // takes the other operand's type, as the refusal's claim
+                    // reads it.
+                    let other_is_left = !is_null_literal(left);
+                    let other = if other_is_left { left } else { right };
+                    let other = self.expr(sc, other, sub)?;
+                    let Ty::Value(t) = &other.ty else {
+                        return Err(err(T7, "a comparison with `null` over a reference"));
+                    };
+                    let null = SExpr::new(
+                        SKind::Null,
+                        Ty::Value(PropType {
+                            nullable: true,
+                            ..t.clone()
+                        }),
+                    );
+                    if other_is_left {
+                        compare(*op, other, null)?
+                    } else {
+                        compare(*op, null, other)?
+                    }
                 }
-            }
-            Expr::Compare {
-                op,
-                left,
-                right,
-                at: written,
-            } => {
-                // A refusal inside a comparison is placed at it.
-                let l = self
-                    .expr(sc, left, sub)
-                    .map_err(|e| at_operand(e, left, written));
-                let r = self
-                    .expr(sc, right, sub)
-                    .map_err(|e| at_operand(e, right, written));
-                let (l, r) = self.both(sc, l, r)?;
-                if let Some(d) = list_equality_membership(*op, &l, &r, left, right, written) {
-                    return Err(E::D(d));
+                Expr::Compare {
+                    op,
+                    left,
+                    right,
+                    at: written,
+                } => {
+                    // A refusal inside a comparison is placed at it.
+                    let l = self
+                        .expr(sc, left, sub)
+                        .map_err(|e| at_operand(e, left, written));
+                    let r = self
+                        .expr(sc, right, sub)
+                        .map_err(|e| at_operand(e, right, written));
+                    let (l, r) = self.both(sc, l, r)?;
+                    if let Some(d) = list_equality_membership(*op, &l, &r, left, right, written) {
+                        return Err(E::D(d));
+                    }
+                    let compared = literal_against_property(&l, &r, written, 1)
+                        .and_then(|()| literal_against_property(&r, &l, written, 0))
+                        .and_then(|()| compare(*op, l, r));
+                    compared.map_err(|e| at_written(e, written))?
                 }
-                let compared = literal_against_property(&l, &r, written, 1)
-                    .and_then(|()| literal_against_property(&r, &l, written, 0))
-                    .and_then(|()| compare(*op, l, r));
-                compared.map_err(|e| at_written(e, written))?
-            }
-            Expr::In {
-                needle,
-                list,
-                at: written,
-            } => {
-                // `$d in $x` over a node is a triple over the edge named
-                // `in`, which is written in `match`; refused before the
-                // needle is typed, since only a triple would bind it.
-                if let (Expr::Variable(a), Expr::Variable(b)) = (needle.as_ref(), list.as_ref())
-                    && !sc.is_error(a)
-                    && !sc.is_error(b)
-                {
-                    // A node on the right, or an unbound name beside a node
-                    // when the schema has an edge named `in`.
-                    let node = matches!(sc.col(b), Some(Ty::Node { .. }));
-                    let unbound_edge = sc.col(b).is_none()
-                        && matches!(sc.col(a), Some(Ty::Node { .. }))
-                        && self.catalog.lookup_edge_by_name("in").is_some();
-                    if node || unbound_edge {
-                        let mut d = QueryDiagnostic::typecheck(
+                Expr::In {
+                    needle,
+                    list,
+                    at: written,
+                } => {
+                    // `$d in $x` over a node is a triple over the edge named
+                    // `in`, which is written in `match`; refused before the
+                    // needle is typed, since only a triple would bind it.
+                    if let (Expr::Variable(a), Expr::Variable(b)) = (needle.as_ref(), list.as_ref())
+                        && !sc.is_error(a)
+                        && !sc.is_error(b)
+                    {
+                        // A node on the right, or an unbound name beside a node
+                        // when the schema has an edge named `in`.
+                        let node = matches!(sc.col(b), Some(Ty::Node { .. }));
+                        let unbound_edge = sc.col(b).is_none()
+                            && matches!(sc.col(a), Some(Ty::Node { .. }))
+                            && self.catalog.lookup_edge_by_name("in").is_some();
+                        if node || unbound_edge {
+                            let mut d = QueryDiagnostic::typecheck(
                             T7,
                             if node {
                                 format!(
@@ -5647,84 +5648,84 @@ impl Ctx<'_> {
                             },
                         )
                         .with_fix(format!("match {{ …, ${a} in ${b} }}"));
-                        d.position = Some(written.position);
-                        d.end = Some(written.end_position);
-                        return Err(E::D(d));
-                    }
-                }
-                let n = self
-                    .expr(sc, needle, sub)
-                    .map_err(|e| at_operand(e, needle, written));
-                let l = self
-                    .expr(sc, list, sub)
-                    .map_err(|e| at_operand(e, list, written));
-                let (n, l) = self.both(sc, n, l)?;
-                literal_in_against_property(&n, &l, written)?;
-                let l = match &n.ty {
-                    Ty::Value(t) if !t.list => {
-                        adapt(l, &Ty::Value(PropType::list_of(t.scalar, false)))
-                    }
-                    _ => l,
-                };
-                let n = adapt(n, &l.ty.clone());
-                match &l.ty {
-                    Ty::Node { .. } => {
-                        return Err(err(T7, "`in` needs a list on the right, not a node"));
-                    }
-                    Ty::Value(t) if !t.list => {
-                        return Err(err_fix(
-                            T7,
-                            format!(
-                                "`in` needs a list on the right; the right side is {}",
-                                t.display_name()
-                            ),
-                            "contains(<string>, <substring>) for a substring test",
-                        ));
-                    }
-                    Ty::Value(t) => {
-                        let mut elem = t.clone();
-                        elem.list = false;
-                        let n = adapt(n, &Ty::Value(elem.clone()));
-                        match &n.ty {
-                            Ty::Value(nt) if !nt.list && types_compatible(nt, &elem) => {}
-                            other => {
-                                return Err(err(
-                                    T7,
-                                    format!(
-                                        "`in` tests membership in {}: the needle must be {}, got {}",
-                                        t.display_name(),
-                                        elem.display_name(),
-                                        other.display()
-                                    ),
-                                ));
-                            }
+                            d.position = Some(written.position);
+                            d.end = Some(written.end_position);
+                            return Err(E::D(d));
                         }
-                        let nullable = n.ty.nullable() || l.ty.nullable();
-                        SExpr::new(
-                            SKind::In {
-                                needle: n.boxed(),
-                                list: l.boxed(),
-                            },
-                            Ty::scalar(ScalarType::Bool, nullable),
-                        )
                     }
-                    Ty::Edge { .. } => return Err(err(T7, "`in` reads a list, not an edge")),
+                    let n = self
+                        .expr(sc, needle, sub)
+                        .map_err(|e| at_operand(e, needle, written));
+                    let l = self
+                        .expr(sc, list, sub)
+                        .map_err(|e| at_operand(e, list, written));
+                    let (n, l) = self.both(sc, n, l)?;
+                    literal_in_against_property(&n, &l, written)?;
+                    let l = match &n.ty {
+                        Ty::Value(t) if !t.list => {
+                            adapt(l, &Ty::Value(PropType::list_of(t.scalar, false)))
+                        }
+                        _ => l,
+                    };
+                    let n = adapt(n, &l.ty.clone());
+                    match &l.ty {
+                        Ty::Node { .. } => {
+                            return Err(err(T7, "`in` needs a list on the right, not a node"));
+                        }
+                        Ty::Value(t) if !t.list => {
+                            return Err(err_fix(
+                                T7,
+                                format!(
+                                    "`in` needs a list on the right; the right side is {}",
+                                    t.display_name()
+                                ),
+                                "contains(<string>, <substring>) for a substring test",
+                            ));
+                        }
+                        Ty::Value(t) => {
+                            let mut elem = t.clone();
+                            elem.list = false;
+                            let n = adapt(n, &Ty::Value(elem.clone()));
+                            match &n.ty {
+                                Ty::Value(nt) if !nt.list && types_compatible(nt, &elem) => {}
+                                other => {
+                                    return Err(err(
+                                        T7,
+                                        format!(
+                                            "`in` tests membership in {}: the needle must be {}, got {}",
+                                            t.display_name(),
+                                            elem.display_name(),
+                                            other.display()
+                                        ),
+                                    ));
+                                }
+                            }
+                            let nullable = n.ty.nullable() || l.ty.nullable();
+                            SExpr::new(
+                                SKind::In {
+                                    needle: n.boxed(),
+                                    list: l.boxed(),
+                                },
+                                Ty::scalar(ScalarType::Bool, nullable),
+                            )
+                        }
+                        Ty::Edge { .. } => return Err(err(T7, "`in` reads a list, not an edge")),
+                    }
                 }
-            }
-            Expr::IsNull { expr, negated } => {
-                let v = self.expr(sc, expr, sub)?;
-                SExpr::new(
-                    SKind::IsNull {
-                        expr: v.boxed(),
-                        negated: *negated,
-                    },
-                    boolean,
-                )
-            }
-            Expr::Not(inner) => {
-                // `not exists { … }` that reads no outer name excludes every
-                // row or none.
-                let v = match inner.as_ref() {
+                Expr::IsNull { expr, negated } => {
+                    let v = self.expr(sc, expr, sub)?;
+                    SExpr::new(
+                        SKind::IsNull {
+                            expr: v.boxed(),
+                            negated: *negated,
+                        },
+                        boolean,
+                    )
+                }
+                Expr::Not(inner) => {
+                    // `not exists { … }` that reads no outer name excludes every
+                    // row or none.
+                    let v = match inner.as_ref() {
                     Expr::Block(b) if b.func == BlockFunc::Exists => {
                         self.expr(sc, inner, sub).map_err(|e| match e {
                             E::D(d) if d.code == T39 => err(
@@ -5736,71 +5737,76 @@ impl Ctx<'_> {
                     }
                     _ => self.expr(sc, inner, sub)?,
                 };
-                require_bool(&v, "`not`")?;
-                let ty = v.ty.clone();
-                SExpr::new(SKind::Not(v.boxed()), ty)
-            }
-            Expr::And(..) | Expr::Or(..) => {
-                let and = matches!(e, Expr::And(..));
-                // The chain of this connective as written, `((d1 op d2) op
-                // d3) …`: its operands in written order.
-                let mut operands = Vec::new();
-                let mut at = e;
-                loop {
-                    match (at, and) {
-                        (Expr::And(l, r), true) | (Expr::Or(l, r), false) => {
-                            operands.push(r.as_ref());
-                            at = l;
-                        }
-                        _ => {
-                            operands.push(at);
-                            break;
+                    require_bool(&v, "`not`")?;
+                    let ty = v.ty.clone();
+                    SExpr::new(SKind::Not(v.boxed()), ty)
+                }
+                Expr::And(..) | Expr::Or(..) => {
+                    let and = matches!(e, Expr::And(..));
+                    // The chain of this connective as written, `((d1 op d2) op
+                    // d3) …`: its operands in written order.
+                    let mut operands = Vec::new();
+                    let mut at = e;
+                    loop {
+                        match (at, and) {
+                            (Expr::And(l, r), true) | (Expr::Or(l, r), false) => {
+                                operands.push(r.as_ref());
+                                at = l;
+                            }
+                            _ => {
+                                operands.push(at);
+                                break;
+                            }
                         }
                     }
-                }
-                operands.reverse();
-                // Each node of the chain is an expression typed.
-                self.typed_exprs += operands.len().saturating_sub(2);
-                let what = if and { "`and`" } else { "`or`" };
-                // `a and b` evaluates `b` only where `a` is not false, `a or
-                // b` only where `a` is not true: each operand guards every
-                // operand after it, as one guard of its own, so a later
-                // operand's guard copies no earlier one. A chain that
-                // failed to type guards nothing after the failure.
-                let depth = sc.guards.len();
-                let mut chain: Option<R<SExpr>> = None;
-                for (i, operand) in operands.iter().enumerate() {
-                    let typed = self.expr(sc, operand, sub);
-                    let guard = typed.as_ref().ok().map(|t| lazy_guard(t, and, true));
-                    chain = Some(match chain {
-                        None => typed,
-                        Some(left) => match self.both(sc, left, typed) {
-                            Err(e) => Err(e),
-                            Ok((a, b)) => match (require_bool(&a, what), require_bool(&b, what)) {
-                                (Err(e), _) | (_, Err(e)) => Err(e),
-                                (Ok(()), Ok(())) => {
-                                    let ty = Ty::scalar(
-                                        ScalarType::Bool,
-                                        a.ty.nullable() || b.ty.nullable(),
-                                    );
-                                    Ok(if and {
-                                        SExpr::new(SKind::And(a.boxed(), b.boxed()), ty)
-                                    } else {
-                                        SExpr::new(SKind::Or(a.boxed(), b.boxed()), ty)
-                                    })
+                    operands.reverse();
+                    // Each node of the chain is an expression typed.
+                    self.typed_exprs += operands.len().saturating_sub(2);
+                    let what = if and { "`and`" } else { "`or`" };
+                    // `a and b` evaluates `b` only where `a` is not false, `a or
+                    // b` only where `a` is not true: each operand guards every
+                    // operand after it, as one guard of its own, so a later
+                    // operand's guard copies no earlier one. A chain that
+                    // failed to type guards nothing after the failure.
+                    let depth = sc.guards.len();
+                    let mut chain: Option<R<SExpr>> = None;
+                    for (i, operand) in operands.iter().enumerate() {
+                        let typed = self.expr(sc, operand, sub);
+                        let guard = typed.as_ref().ok().map(|t| lazy_guard(t, and, true));
+                        chain = Some(match chain {
+                            None => typed,
+                            Some(left) => match self.both(sc, left, typed) {
+                                Err(e) => Err(e),
+                                Ok((a, b)) => {
+                                    match (require_bool(&a, what), require_bool(&b, what)) {
+                                        (Err(e), _) | (_, Err(e)) => Err(e),
+                                        (Ok(()), Ok(())) => {
+                                            let ty = Ty::scalar(
+                                                ScalarType::Bool,
+                                                a.ty.nullable() || b.ty.nullable(),
+                                            );
+                                            Ok(if and {
+                                                SExpr::new(SKind::And(a.boxed(), b.boxed()), ty)
+                                            } else {
+                                                SExpr::new(SKind::Or(a.boxed(), b.boxed()), ty)
+                                            })
+                                        }
+                                    }
                                 }
                             },
-                        },
-                    });
-                    let chained = matches!(chain, Some(Ok(_)));
-                    match guard {
-                        Some(guard) if chained && i + 1 < operands.len() => sc.push_guard(guard),
-                        _ => sc.truncate_guards(depth),
+                        });
+                        let chained = matches!(chain, Some(Ok(_)));
+                        match guard {
+                            Some(guard) if chained && i + 1 < operands.len() => {
+                                sc.push_guard(guard)
+                            }
+                            _ => sc.truncate_guards(depth),
+                        }
                     }
+                    sc.truncate_guards(depth);
+                    chain.expect("a chain has two operands")?
                 }
-                sc.truncate_guards(depth);
-                chain.expect("a chain has two operands")?
-            }
+            })
         })
     }
 
@@ -5808,397 +5814,401 @@ impl Ctx<'_> {
     /// as `want`, nullable: the literal, or an `if` whose branches or a
     /// `coalesce` whose arguments are all such, each typed the same way.
     fn null_as(&mut self, sc: &mut Scope, e: &Expr, want: &PropType) -> R<SExpr> {
-        let mut want = want.clone();
-        want.nullable = true;
-        let ty = Ty::Value(want.clone());
-        let Expr::Call(c) = e else {
-            return Ok(SExpr::new(SKind::Null, ty));
-        };
-        let mut args = Vec::with_capacity(c.args.len());
-        for (position, a) in c.args.iter().enumerate() {
-            let Arg::Expr(arg) = a else {
-                unreachable!("`is_untyped_null` admits expression arguments only")
+        crate::stack::deep(|| {
+            let mut want = want.clone();
+            want.nullable = true;
+            let ty = Ty::Value(want.clone());
+            let Expr::Call(c) = e else {
+                return Ok(SExpr::new(SKind::Null, ty));
             };
-            args.push(if c.name == "if" && position == 0 {
-                let cnd = self.expr(sc, arg, At::Value)?;
-                require_bool(&cnd, "`if`'s condition")?;
-                cnd
-            } else {
-                self.null_as(sc, arg, &want)?
-            });
-        }
-        Ok(SExpr::new(
-            SKind::Call {
-                func: c.name.clone(),
-                args,
-                options: Vec::new(),
-            },
-            ty,
-        ))
+            let mut args = Vec::with_capacity(c.args.len());
+            for (position, a) in c.args.iter().enumerate() {
+                let Arg::Expr(arg) = a else {
+                    unreachable!("`is_untyped_null` admits expression arguments only")
+                };
+                args.push(if c.name == "if" && position == 0 {
+                    let cnd = self.expr(sc, arg, At::Value)?;
+                    require_bool(&cnd, "`if`'s condition")?;
+                    cnd
+                } else {
+                    self.null_as(sc, arg, &want)?
+                });
+            }
+            Ok(SExpr::new(
+                SKind::Call {
+                    func: c.name.clone(),
+                    args,
+                    options: Vec::new(),
+                },
+                ty,
+            ))
+        })
     }
 
     fn call_scalar(&mut self, sc: &mut Scope, c: &Call, at: At) -> R<SExpr> {
-        let name = c.name.as_str();
-        if matches!(name, "nearest" | "bm25" | "rrf" | "distance") {
-            return Err(E::D(ranking_as_scalar(name)));
-        }
-        if name == "union" || self.unit.contains_key(name) {
-            return Err(err_fix(
-                T69,
-                format!("`{name}(…)` is a relation; a scalar is read here"),
-                format!("draw it with `from {name}(…)`, or aggregate over it in a block"),
-            ));
-        }
-        if matches!(name, "search" | "match_text" | "fuzzy") {
-            return Err(E::D(removed_lexical_call(c)));
-        }
-        if AGGREGATES.contains(&name) {
-            return Err(err(
-                T8,
-                format!(
-                    "`{name}(…)` is an aggregate; it belongs in `return`, or as a block `{name}($x.p) {{ … }}`"
-                ),
-            ));
-        }
-        let mut args = Vec::new();
-        // Each argument as typed, by position, for the guards of the ones
-        // after it.
-        let mut typed_at: Vec<Option<SExpr>> = Vec::new();
-        // Every argument is typed, so a refusal in one does not hide an
-        // independent refusal in another.
-        let mut failed: Option<E> = None;
-        // A `null` takes the type its context fixes (the GQ 3 RFC,
-        // section 5): an argument of `if`'s branches or of `coalesce` that
-        // is a `null` whatever it is typed as is typed after the others, as
-        // their common type.
-        let deferred: Vec<usize> = c
-            .args
-            .iter()
-            .enumerate()
-            .filter(|(position, a)| {
-                matches!(a, Arg::Expr(e) if is_untyped_null(e))
-                    && match name {
-                        "if" => *position > 0,
-                        "coalesce" => true,
-                        _ => false,
-                    }
-            })
-            .map(|(position, _)| position)
-            .collect();
-        let coalesce_depth = sc.guards.len();
-        let (mut coalesce_guarding, mut coalesce_guarded) = (true, 0);
-        for (position, a) in c.args.iter().enumerate() {
-            match a {
-                Arg::Expr(_) if deferred.contains(&position) => typed_at.push(None),
-                Arg::Expr(e) => {
-                    if matches!(e, Expr::Call(t) if t.name == "terms")
-                        && matches!(name, "match_terms")
-                    {
-                        continue;
-                    }
-                    // The lazy rows evaluate an argument only where the ones
-                    // before it select it: `if`'s branches under their
-                    // condition, `coalesce`'s later arguments where every
-                    // earlier one is null. Each guard reads the arguments as
-                    // they were typed; nothing is typed again.
-                    let earlier = |i: usize| typed_at.get(i).cloned().flatten();
-                    let guard = match (name, position) {
-                        ("if", 1) => earlier(0).map(|cnd| lazy_guard(&cnd, true, false)),
-                        ("if", 2) => earlier(0).map(|cnd| lazy_guard(&cnd, false, true)),
-                        _ => None,
-                    };
-                    // `coalesce`'s argument is evaluated where every earlier
-                    // one is null: one guard per earlier argument, kept for
-                    // the arguments after it. An earlier argument that is a
-                    // `null` is null on every row: it guards nothing; one
-                    // that failed to type leaves the rest unguarded.
-                    if name == "coalesce" && coalesce_guarding {
-                        for i in coalesce_guarded..position {
-                            if deferred.contains(&i) {
-                                continue;
-                            }
-                            match earlier(i) {
-                                Some(before) => sc.push_guard(SExpr::new(
-                                    SKind::IsNull {
-                                        expr: before.boxed(),
-                                        negated: false,
-                                    },
-                                    Ty::scalar(ScalarType::Bool, false),
-                                )),
-                                None => {
-                                    sc.truncate_guards(coalesce_depth);
-                                    coalesce_guarding = false;
-                                    break;
+        crate::stack::deep(|| {
+            let name = c.name.as_str();
+            if matches!(name, "nearest" | "bm25" | "rrf" | "distance") {
+                return Err(E::D(ranking_as_scalar(name)));
+            }
+            if name == "union" || self.unit.contains_key(name) {
+                return Err(err_fix(
+                    T69,
+                    format!("`{name}(…)` is a relation; a scalar is read here"),
+                    format!("draw it with `from {name}(…)`, or aggregate over it in a block"),
+                ));
+            }
+            if matches!(name, "search" | "match_text" | "fuzzy") {
+                return Err(E::D(removed_lexical_call(c)));
+            }
+            if AGGREGATES.contains(&name) {
+                return Err(err(
+                    T8,
+                    format!(
+                        "`{name}(…)` is an aggregate; it belongs in `return`, or as a block `{name}($x.p) {{ … }}`"
+                    ),
+                ));
+            }
+            let mut args = Vec::new();
+            // Each argument as typed, by position, for the guards of the ones
+            // after it.
+            let mut typed_at: Vec<Option<SExpr>> = Vec::new();
+            // Every argument is typed, so a refusal in one does not hide an
+            // independent refusal in another.
+            let mut failed: Option<E> = None;
+            // A `null` takes the type its context fixes (the GQ 3 RFC,
+            // section 5): an argument of `if`'s branches or of `coalesce` that
+            // is a `null` whatever it is typed as is typed after the others, as
+            // their common type.
+            let deferred: Vec<usize> = c
+                .args
+                .iter()
+                .enumerate()
+                .filter(|(position, a)| {
+                    matches!(a, Arg::Expr(e) if is_untyped_null(e))
+                        && match name {
+                            "if" => *position > 0,
+                            "coalesce" => true,
+                            _ => false,
+                        }
+                })
+                .map(|(position, _)| position)
+                .collect();
+            let coalesce_depth = sc.guards.len();
+            let (mut coalesce_guarding, mut coalesce_guarded) = (true, 0);
+            for (position, a) in c.args.iter().enumerate() {
+                match a {
+                    Arg::Expr(_) if deferred.contains(&position) => typed_at.push(None),
+                    Arg::Expr(e) => {
+                        if matches!(e, Expr::Call(t) if t.name == "terms")
+                            && matches!(name, "match_terms")
+                        {
+                            continue;
+                        }
+                        // The lazy rows evaluate an argument only where the ones
+                        // before it select it: `if`'s branches under their
+                        // condition, `coalesce`'s later arguments where every
+                        // earlier one is null. Each guard reads the arguments as
+                        // they were typed; nothing is typed again.
+                        let earlier = |i: usize| typed_at.get(i).cloned().flatten();
+                        let guard = match (name, position) {
+                            ("if", 1) => earlier(0).map(|cnd| lazy_guard(&cnd, true, false)),
+                            ("if", 2) => earlier(0).map(|cnd| lazy_guard(&cnd, false, true)),
+                            _ => None,
+                        };
+                        // `coalesce`'s argument is evaluated where every earlier
+                        // one is null: one guard per earlier argument, kept for
+                        // the arguments after it. An earlier argument that is a
+                        // `null` is null on every row: it guards nothing; one
+                        // that failed to type leaves the rest unguarded.
+                        if name == "coalesce" && coalesce_guarding {
+                            for i in coalesce_guarded..position {
+                                if deferred.contains(&i) {
+                                    continue;
+                                }
+                                match earlier(i) {
+                                    Some(before) => sc.push_guard(SExpr::new(
+                                        SKind::IsNull {
+                                            expr: before.boxed(),
+                                            negated: false,
+                                        },
+                                        Ty::scalar(ScalarType::Bool, false),
+                                    )),
+                                    None => {
+                                        sc.truncate_guards(coalesce_depth);
+                                        coalesce_guarding = false;
+                                        break;
+                                    }
                                 }
                             }
+                            coalesce_guarded = position;
                         }
-                        coalesce_guarded = position;
-                    }
-                    let depth = sc.guards.len();
-                    if let Some(guard) = guard {
-                        sc.push_guard(guard);
-                    }
-                    let typed = self.expr(sc, e, At::Value);
-                    sc.truncate_guards(depth);
-                    typed_at.push(typed.as_ref().ok().cloned());
-                    match typed {
-                        Ok(v) => args.push(v),
-                        Err(e) => {
-                            failed = Some(match failed.take() {
-                                None => e,
-                                Some(earlier) => self.join(sc, earlier, e),
-                            })
+                        let depth = sc.guards.len();
+                        if let Some(guard) = guard {
+                            sc.push_guard(guard);
+                        }
+                        let typed = self.expr(sc, e, At::Value);
+                        sc.truncate_guards(depth);
+                        typed_at.push(typed.as_ref().ok().cloned());
+                        match typed {
+                            Ok(v) => args.push(v),
+                            Err(e) => {
+                                failed = Some(match failed.take() {
+                                    None => e,
+                                    Some(earlier) => self.join(sc, earlier, e),
+                                })
+                            }
                         }
                     }
-                }
-                Arg::Inline(_) => {
-                    sc.truncate_guards(coalesce_depth);
-                    return Err(err(
-                        T69,
-                        format!("`{name}` reads scalars; an inline read is a relation"),
-                    ));
-                }
-            }
-        }
-        sc.truncate_guards(coalesce_depth);
-        if let Some(e) = failed {
-            return Err(e);
-        }
-        if !deferred.is_empty() {
-            // The type the other branch or arguments fix: the first of them,
-            // which the row's own typing below joins with the rest.
-            let fixed = match name {
-                "if" => args.get(1).map(|other| other.ty.clone()),
-                _ => args.first().map(|other| other.ty.clone()),
-            };
-            let Some(Ty::Value(want)) = fixed else {
-                return Err(untyped_null_refusal());
-            };
-            for &position in &deferred {
-                let Some(Arg::Expr(e)) = c.args.get(position) else {
-                    unreachable!("a deferred argument is an expression")
-                };
-                let typed = self.null_as(sc, e, &want)?;
-                args.insert(position.min(args.len()), typed);
-            }
-        }
-        let bool_ty = |nullable| Ty::scalar(ScalarType::Bool, nullable);
-        let string =
-            |t: &Ty| matches!(t, Ty::Value(p) if p.scalar == ScalarType::String && !p.list);
-        let no_options = |c: &Call| -> R<()> {
-            match c.options.first() {
-                Some((o, _)) => Err(err(
-                    T71,
-                    format!("`{}` has no option `{o}`; it admits none", c.name),
-                )),
-                None => Ok(()),
-            }
-        };
-        let search_field = |this: &Self, args: &[SExpr]| -> R<()> {
-            let Some(SExpr {
-                kind: SKind::Prop { col, prop },
-                ..
-            }) = args.first()
-            else {
-                return Err(err(
-                    T19,
-                    format!("`{name}`'s first argument is a property of a node binding"),
-                ));
-            };
-            let ty = sc
-                .local(col)
-                .or_else(|| sc.outer_col(col))
-                .map(|c| c.ty.clone());
-            match ty {
-                Some(Ty::Node { type_name, .. }) => {
-                    if !this
-                        .catalog
-                        .query_node_type(&type_name)
-                        .is_some_and(|n| n.is_lexical_field(prop))
-                    {
+                    Arg::Inline(_) => {
+                        sc.truncate_guards(coalesce_depth);
                         return Err(err(
-                            T27,
-                            format!("`{name}` needs a full-text index on `{type_name}.{prop}`"),
+                            T69,
+                            format!("`{name}` reads scalars; an inline read is a relation"),
                         ));
                     }
-                    Ok(())
                 }
-                _ => Err(err(T19, format!("`{name}` searches a node property"))),
             }
-        };
-        let out = match name {
-            "contains" | "starts_with" => {
-                no_options(c)?;
-                let [a, b] = args.as_slice() else {
-                    return Err(err(T7, format!("`{name}` takes two Strings")));
+            sc.truncate_guards(coalesce_depth);
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            if !deferred.is_empty() {
+                // The type the other branch or arguments fix: the first of them,
+                // which the row's own typing below joins with the rest.
+                let fixed = match name {
+                    "if" => args.get(1).map(|other| other.ty.clone()),
+                    _ => args.first().map(|other| other.ty.clone()),
                 };
-                if let Ty::Value(t) = &a.ty
-                    && t.list
-                    && name == "contains"
-                {
-                    return Err(err_fix(
-                        T7,
-                        "`contains` tests a substring of a String; a list is matched with `in`",
-                        "<value> in <list>",
-                    ));
-                }
-                if !string(&a.ty) || !string(&b.ty) {
-                    return Err(err(
-                        T7,
-                        format!(
-                            "`{name}` takes two Strings, got {} and {}",
-                            a.ty.display(),
-                            b.ty.display()
-                        ),
-                    ));
-                }
-                if let (
-                    SKind::Prop { prop, .. },
-                    Ty::Value(expected),
-                    SKind::Lit(Literal::String(value)),
-                ) = (&a.kind, &a.ty, &b.kind)
-                    && let Some(mismatch) =
-                        literal::tested_enum_literal(name, value, expected, prop)
-                {
-                    return Err(literal_refusal(mismatch, None, None));
-                }
-                let ty = bool_ty(a.ty.nullable() || b.ty.nullable());
-                SExpr::new(
-                    SKind::Call {
-                        func: name.into(),
-                        args,
-                        options: Vec::new(),
-                    },
-                    ty,
-                )
-            }
-            "match_terms" => {
-                no_options(c)?;
-                search_field(self, &args)?;
-                let Some(Arg::Expr(Expr::Call(t))) = c.args.get(1) else {
-                    return Err(err(
-                        T19,
-                        "`match_terms(field, terms(…))` takes a `terms` value",
-                    ));
+                let Some(Ty::Value(want)) = fixed else {
+                    return Err(untyped_null_refusal());
                 };
-                if t.name != "terms" {
-                    return Err(err(
-                        T19,
-                        "`match_terms(field, terms(…))` takes a `terms` value",
-                    ));
-                }
-                let q = self.terms(sc, t)?;
-                let mut args = args;
-                args.push(q.text);
-                SExpr::new(
-                    SKind::Call {
-                        func: "match_terms".into(),
-                        args,
-                        options: vec![
-                            (
-                                "mode".into(),
-                                SExpr::new(
-                                    SKind::Lit(Literal::String(
-                                        if q.mode_all { "all" } else { "any" }.into(),
-                                    )),
-                                    Ty::scalar(ScalarType::String, false),
-                                ),
-                            ),
-                            ("max_edits".into(), q.max_edits),
-                        ],
-                    },
-                    bool_ty(false),
-                )
-            }
-            "terms" => {
-                return Err(err(
-                    T19,
-                    "`terms(…)` is a lexical query; it is read by `match_terms` and `bm25` only",
-                ));
-            }
-            "now" => {
-                no_options(c)?;
-                if !args.is_empty() {
-                    return Err(err(T7, "`now()` takes no argument"));
-                }
-                SExpr::new(
-                    SKind::Call {
-                        func: "now".into(),
-                        args,
-                        options: Vec::new(),
-                    },
-                    Ty::scalar(ScalarType::DateTime, false),
-                )
-            }
-            "if" => {
-                no_options(c)?;
-                let [cnd, a, b] = args.as_slice() else {
-                    return Err(err(T7, "`if(c, a, b)` takes three arguments"));
-                };
-                require_bool(cnd, "`if`'s condition")?;
-                let ty = common(a, b, "if")?;
-                let (a, b) = (fit(a.clone(), &ty), fit(b.clone(), &ty));
-                SExpr::new(
-                    SKind::Call {
-                        func: "if".into(),
-                        args: vec![cnd.clone(), a, b],
-                        options: Vec::new(),
-                    },
-                    ty,
-                )
-            }
-            "coalesce" => {
-                no_options(c)?;
-                let Some(first) = args.first() else {
-                    return Err(err(T7, "`coalesce` takes one or more arguments"));
-                };
-                // The first argument meets the second as itself, so a literal
-                // there takes the other argument's type.
-                let mut ty = first.ty.clone();
-                for (i, a) in args.iter().enumerate().skip(1) {
-                    let so_far = if i == 1 {
-                        first.clone()
-                    } else {
-                        SExpr::new(SKind::Null, ty.clone())
+                for &position in &deferred {
+                    let Some(Arg::Expr(e)) = c.args.get(position) else {
+                        unreachable!("a deferred argument is an expression")
                     };
-                    ty = common(&so_far, a, "coalesce")?;
+                    let typed = self.null_as(sc, e, &want)?;
+                    args.insert(position.min(args.len()), typed);
                 }
-                let all_null = args.iter().all(|a| a.ty.nullable());
-                let ty = ty.with_nullable(all_null);
-                let args = args.into_iter().map(|a| fit(a, &ty)).collect();
-                SExpr::new(
-                    SKind::Call {
-                        func: "coalesce".into(),
-                        args,
-                        options: Vec::new(),
-                    },
-                    ty,
-                )
             }
-            "concat" => {
-                no_options(c)?;
-                if args.is_empty() || !args.iter().all(|a| string(&a.ty)) {
-                    return Err(err(T7, "`concat` takes one or more Strings"));
+            let bool_ty = |nullable| Ty::scalar(ScalarType::Bool, nullable);
+            let string =
+                |t: &Ty| matches!(t, Ty::Value(p) if p.scalar == ScalarType::String && !p.list);
+            let no_options = |c: &Call| -> R<()> {
+                match c.options.first() {
+                    Some((o, _)) => Err(err(
+                        T71,
+                        format!("`{}` has no option `{o}`; it admits none", c.name),
+                    )),
+                    None => Ok(()),
                 }
-                let nullable = args.iter().any(|a| a.ty.nullable());
-                SExpr::new(
-                    SKind::Call {
-                        func: "concat".into(),
-                        args,
-                        options: Vec::new(),
-                    },
-                    Ty::scalar(ScalarType::String, nullable),
-                )
-            }
-            other => {
-                return Err(err(
-                    T6,
-                    format!("`{other}` is not a registry row or a declared read"),
-                ));
-            }
-        };
-        let _ = at;
-        Ok(out)
+            };
+            let search_field = |this: &Self, args: &[SExpr]| -> R<()> {
+                let Some(SExpr {
+                    kind: SKind::Prop { col, prop },
+                    ..
+                }) = args.first()
+                else {
+                    return Err(err(
+                        T19,
+                        format!("`{name}`'s first argument is a property of a node binding"),
+                    ));
+                };
+                let ty = sc
+                    .local(col)
+                    .or_else(|| sc.outer_col(col))
+                    .map(|c| c.ty.clone());
+                match ty {
+                    Some(Ty::Node { type_name, .. }) => {
+                        if !this
+                            .catalog
+                            .query_node_type(&type_name)
+                            .is_some_and(|n| n.is_lexical_field(prop))
+                        {
+                            return Err(err(
+                                T27,
+                                format!("`{name}` needs a full-text index on `{type_name}.{prop}`"),
+                            ));
+                        }
+                        Ok(())
+                    }
+                    _ => Err(err(T19, format!("`{name}` searches a node property"))),
+                }
+            };
+            let out = match name {
+                "contains" | "starts_with" => {
+                    no_options(c)?;
+                    let [a, b] = args.as_slice() else {
+                        return Err(err(T7, format!("`{name}` takes two Strings")));
+                    };
+                    if let Ty::Value(t) = &a.ty
+                        && t.list
+                        && name == "contains"
+                    {
+                        return Err(err_fix(
+                            T7,
+                            "`contains` tests a substring of a String; a list is matched with `in`",
+                            "<value> in <list>",
+                        ));
+                    }
+                    if !string(&a.ty) || !string(&b.ty) {
+                        return Err(err(
+                            T7,
+                            format!(
+                                "`{name}` takes two Strings, got {} and {}",
+                                a.ty.display(),
+                                b.ty.display()
+                            ),
+                        ));
+                    }
+                    if let (
+                        SKind::Prop { prop, .. },
+                        Ty::Value(expected),
+                        SKind::Lit(Literal::String(value)),
+                    ) = (&a.kind, &a.ty, &b.kind)
+                        && let Some(mismatch) =
+                            literal::tested_enum_literal(name, value, expected, prop)
+                    {
+                        return Err(literal_refusal(mismatch, None, None));
+                    }
+                    let ty = bool_ty(a.ty.nullable() || b.ty.nullable());
+                    SExpr::new(
+                        SKind::Call {
+                            func: name.into(),
+                            args,
+                            options: Vec::new(),
+                        },
+                        ty,
+                    )
+                }
+                "match_terms" => {
+                    no_options(c)?;
+                    search_field(self, &args)?;
+                    let Some(Arg::Expr(Expr::Call(t))) = c.args.get(1) else {
+                        return Err(err(
+                            T19,
+                            "`match_terms(field, terms(…))` takes a `terms` value",
+                        ));
+                    };
+                    if t.name != "terms" {
+                        return Err(err(
+                            T19,
+                            "`match_terms(field, terms(…))` takes a `terms` value",
+                        ));
+                    }
+                    let q = self.terms(sc, t)?;
+                    let mut args = args;
+                    args.push(q.text);
+                    SExpr::new(
+                        SKind::Call {
+                            func: "match_terms".into(),
+                            args,
+                            options: vec![
+                                (
+                                    "mode".into(),
+                                    SExpr::new(
+                                        SKind::Lit(Literal::String(
+                                            if q.mode_all { "all" } else { "any" }.into(),
+                                        )),
+                                        Ty::scalar(ScalarType::String, false),
+                                    ),
+                                ),
+                                ("max_edits".into(), q.max_edits),
+                            ],
+                        },
+                        bool_ty(false),
+                    )
+                }
+                "terms" => {
+                    return Err(err(
+                        T19,
+                        "`terms(…)` is a lexical query; it is read by `match_terms` and `bm25` only",
+                    ));
+                }
+                "now" => {
+                    no_options(c)?;
+                    if !args.is_empty() {
+                        return Err(err(T7, "`now()` takes no argument"));
+                    }
+                    SExpr::new(
+                        SKind::Call {
+                            func: "now".into(),
+                            args,
+                            options: Vec::new(),
+                        },
+                        Ty::scalar(ScalarType::DateTime, false),
+                    )
+                }
+                "if" => {
+                    no_options(c)?;
+                    let [cnd, a, b] = args.as_slice() else {
+                        return Err(err(T7, "`if(c, a, b)` takes three arguments"));
+                    };
+                    require_bool(cnd, "`if`'s condition")?;
+                    let ty = common(a, b, "if")?;
+                    let (a, b) = (fit(a.clone(), &ty), fit(b.clone(), &ty));
+                    SExpr::new(
+                        SKind::Call {
+                            func: "if".into(),
+                            args: vec![cnd.clone(), a, b],
+                            options: Vec::new(),
+                        },
+                        ty,
+                    )
+                }
+                "coalesce" => {
+                    no_options(c)?;
+                    let Some(first) = args.first() else {
+                        return Err(err(T7, "`coalesce` takes one or more arguments"));
+                    };
+                    // The first argument meets the second as itself, so a literal
+                    // there takes the other argument's type.
+                    let mut ty = first.ty.clone();
+                    for (i, a) in args.iter().enumerate().skip(1) {
+                        let so_far = if i == 1 {
+                            first.clone()
+                        } else {
+                            SExpr::new(SKind::Null, ty.clone())
+                        };
+                        ty = common(&so_far, a, "coalesce")?;
+                    }
+                    let all_null = args.iter().all(|a| a.ty.nullable());
+                    let ty = ty.with_nullable(all_null);
+                    let args = args.into_iter().map(|a| fit(a, &ty)).collect();
+                    SExpr::new(
+                        SKind::Call {
+                            func: "coalesce".into(),
+                            args,
+                            options: Vec::new(),
+                        },
+                        ty,
+                    )
+                }
+                "concat" => {
+                    no_options(c)?;
+                    if args.is_empty() || !args.iter().all(|a| string(&a.ty)) {
+                        return Err(err(T7, "`concat` takes one or more Strings"));
+                    }
+                    let nullable = args.iter().any(|a| a.ty.nullable());
+                    SExpr::new(
+                        SKind::Call {
+                            func: "concat".into(),
+                            args,
+                            options: Vec::new(),
+                        },
+                        Ty::scalar(ScalarType::String, nullable),
+                    )
+                }
+                other => {
+                    return Err(err(
+                        T6,
+                        format!("`{other}` is not a registry row or a declared read"),
+                    ));
+                }
+            };
+            let _ = at;
+            Ok(out)
+        })
     }
 }
 
@@ -6459,81 +6469,83 @@ fn with_blocks(mut t: Term, blocks: Vec<BlockAgg>) -> Term {
 /// where the outer Boolean column `guard` holds; the `Env` exposes `guard`
 /// beside the columns it already read.
 fn condition_env(t: Term, guard: &str) -> Term {
-    let boolean = Ty::scalar(ScalarType::Bool, false);
-    let step = |input: Arc<Term>| Arc::new(condition_env(Arc::unwrap_or_clone(input), guard));
-    match t {
-        Term::Env(mut cols) => {
-            cols.push(Col {
-                name: guard.to_string(),
-                ty: boolean.clone(),
-            });
-            Term::Filter {
-                input: Term::Env(cols).boxed(),
-                pred: SExpr::new(SKind::Col(guard.to_string()), boolean).to_ir(),
-                fails: false,
+    crate::stack::deep(|| {
+        let boolean = Ty::scalar(ScalarType::Bool, false);
+        let step = |input: Arc<Term>| Arc::new(condition_env(Arc::unwrap_or_clone(input), guard));
+        match t {
+            Term::Env(mut cols) => {
+                cols.push(Col {
+                    name: guard.to_string(),
+                    ty: boolean.clone(),
+                });
+                Term::Filter {
+                    input: Term::Env(cols).boxed(),
+                    pred: SExpr::new(SKind::Col(guard.to_string()), boolean).to_ir(),
+                    fails: false,
+                }
             }
+            Term::Expand {
+                input,
+                src,
+                dst,
+                src_type,
+                dst_type,
+                edges,
+                min_hops,
+                max_hops,
+                edge_var,
+            } => Term::Expand {
+                input: step(input),
+                src,
+                dst,
+                src_type,
+                dst_type,
+                edges,
+                min_hops,
+                max_hops,
+                edge_var,
+            },
+            Term::Filter { input, pred, fails } => Term::Filter {
+                input: step(input),
+                pred,
+                fails,
+            },
+            Term::Project {
+                input,
+                items,
+                keep,
+                fails,
+            } => Term::Project {
+                input: step(input),
+                items,
+                keep,
+                fails,
+            },
+            Term::Group { input, keys, aggs } => Term::Group {
+                input: step(input),
+                keys,
+                aggs,
+            },
+            Term::Correlate {
+                outer,
+                inner,
+                fails,
+            } => Term::Correlate {
+                outer: step(outer),
+                inner,
+                fails,
+            },
+            Term::Order { input, keys } => Term::Order {
+                input: step(input),
+                keys,
+            },
+            Term::Cut { input, k } => Term::Cut {
+                input: step(input),
+                k,
+            },
+            other => other,
         }
-        Term::Expand {
-            input,
-            src,
-            dst,
-            src_type,
-            dst_type,
-            edges,
-            min_hops,
-            max_hops,
-            edge_var,
-        } => Term::Expand {
-            input: step(input),
-            src,
-            dst,
-            src_type,
-            dst_type,
-            edges,
-            min_hops,
-            max_hops,
-            edge_var,
-        },
-        Term::Filter { input, pred, fails } => Term::Filter {
-            input: step(input),
-            pred,
-            fails,
-        },
-        Term::Project {
-            input,
-            items,
-            keep,
-            fails,
-        } => Term::Project {
-            input: step(input),
-            items,
-            keep,
-            fails,
-        },
-        Term::Group { input, keys, aggs } => Term::Group {
-            input: step(input),
-            keys,
-            aggs,
-        },
-        Term::Correlate {
-            outer,
-            inner,
-            fails,
-        } => Term::Correlate {
-            outer: step(outer),
-            inner,
-            fails,
-        },
-        Term::Order { input, keys } => Term::Order {
-            input: step(input),
-            keys,
-        },
-        Term::Cut { input, k } => Term::Cut {
-            input: step(input),
-            k,
-        },
-        other => other,
-    }
+    })
 }
 
 impl Step {
@@ -6589,7 +6601,7 @@ fn reaches_recursion(t: &Term) -> bool {
 /// The type of the column `name` that `t` outputs, from the node that
 /// adds it.
 fn column_type(t: &Term, name: &str) -> Option<ExprType> {
-    match t {
+    crate::stack::deep(|| match t {
         Term::Unit => None,
         Term::Env(cols) => cols
             .iter()
@@ -6688,7 +6700,7 @@ fn column_type(t: &Term, name: &str) -> Option<ExprType> {
         }
         Term::Fix { body, .. } | Term::Call { body, .. } => column_type(body, name),
         Term::RecRef { ty, .. } => ty.get(name).map(|c| c.ty.expr_type()),
-    }
+    })
 }
 
 /// `ty`, admitting null: a value type's nullable form; a reference column
@@ -6709,7 +6721,7 @@ fn nullable_type(ty: ExprType) -> ExprType {
 }
 
 fn output_columns(t: &Term) -> Vec<String> {
-    match t {
+    crate::stack::deep(|| match t {
         Term::Unit => Vec::new(),
         Term::Env(cols) => cols.iter().map(|c| c.name.clone()).collect(),
         Term::Scan { var, .. } => vec![var.clone()],
@@ -6763,7 +6775,7 @@ fn output_columns(t: &Term) -> Vec<String> {
         Term::Fuse { target, out, .. } => vec![target.clone(), out.clone()],
         Term::Fix { body, .. } | Term::Call { body, .. } => output_columns(body),
         Term::RecRef { ty, .. } => ty.names(),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -6894,159 +6906,161 @@ impl Walk<'_> {
     /// reads), refusing a non-monotone construct over the recursive rows.
     /// Lattice-derived columns are tracked by name through `Project`.
     fn term(&mut self, t: &Term) -> R<HashSet<String>> {
-        Ok(match t {
-            Term::RecRef { .. } => HashSet::new(),
-            Term::Unit | Term::Env(_) | Term::Scan { .. } => HashSet::new(),
-            Term::Expand { input, .. } => self.term(input)?,
-            Term::Filter { input, pred, .. } => {
-                let c = self.term(input)?;
-                if depends(input, self.name) {
-                    let mut cols = Vec::new();
-                    pred.columns(&mut cols);
-                    if let Some(l) = cols.iter().find(|c| self.lattice.contains(c)) {
-                        return Err(t70(
-                            self.name,
-                            &format!(
-                                "a filter reads the `min`/`max` column `{l}` inside the cycle"
-                            ),
-                        ));
-                    }
-                    if let Some(b) = cols.iter().find(|c| self.blocks.contains(c)) {
-                        if !is_exists_of(pred, b) {
+        crate::stack::deep(|| {
+            Ok(match t {
+                Term::RecRef { .. } => HashSet::new(),
+                Term::Unit | Term::Env(_) | Term::Scan { .. } => HashSet::new(),
+                Term::Expand { input, .. } => self.term(input)?,
+                Term::Filter { input, pred, .. } => {
+                    let c = self.term(input)?;
+                    if depends(input, self.name) {
+                        let mut cols = Vec::new();
+                        pred.columns(&mut cols);
+                        if let Some(l) = cols.iter().find(|c| self.lattice.contains(c)) {
                             return Err(t70(
                                 self.name,
-                                "a `not` or a `count` over the recursive rows; only `exists { }` over them is monotone",
+                                &format!(
+                                    "a filter reads the `min`/`max` column `{l}` inside the cycle"
+                                ),
                             ));
                         }
+                        if let Some(b) = cols.iter().find(|c| self.blocks.contains(c)) {
+                            if !is_exists_of(pred, b) {
+                                return Err(t70(
+                                    self.name,
+                                    "a `not` or a `count` over the recursive rows; only `exists { }` over them is monotone",
+                                ));
+                            }
+                        }
                     }
+                    c
                 }
-                c
-            }
-            Term::Project { input, items, .. } => {
-                let mut c = self.term(input)?;
-                for (_, e) in items {
-                    let mut cols = Vec::new();
-                    e.columns(&mut cols);
-                    if cols.iter().any(|x| self.blocks.contains(x)) {
-                        return Err(t70(
-                            self.name,
-                            "a block value over the recursive rows; only `exists { }` as a filter is monotone",
-                        ));
-                    }
-                }
-                let derived: Vec<String> = items
-                    .iter()
-                    .filter(|(_, e)| {
+                Term::Project { input, items, .. } => {
+                    let mut c = self.term(input)?;
+                    for (_, e) in items {
                         let mut cols = Vec::new();
                         e.columns(&mut cols);
-                        cols.iter().any(|x| self.lattice.contains(x))
-                    })
-                    .map(|(n, _)| n.trim_start_matches('^').to_string())
-                    .collect();
-                for (n, e) in items {
-                    let n = n.trim_start_matches('^').to_string();
-                    let computed =
-                        !(e.is_column_read() || matches!(e, IRExpr::Param(..))) || reads_any(e, &c);
-                    if computed {
-                        c.insert(n.clone());
-                        c.insert(format!("^{n}"));
-                    } else {
-                        c.remove(&n);
-                    }
-                }
-                for d in derived {
-                    if !self.lattice.contains(&d) {
-                        self.lattice.push(d);
-                    }
-                }
-                c
-            }
-            Term::Group { input, keys, aggs } => {
-                let dep = depends(input, self.name);
-                let c = self.term(input)?;
-                if dep {
-                    // A block over the recursive rows: only `exists`, a
-                    // count compared `> 0` or `>= 1`, is monotone; the walk
-                    // over the enclosing filter decides (see `Correlate`).
-                    // `distinct` (a Group with no aggregate) is a projection
-                    // over sets and monotone.
-                    let block = keys.is_empty()
-                        && aggs.len() == 1
-                        && aggs[0].1.func == AggFunc::Count
-                        && aggs[0].1.arg.is_none();
-                    if !aggs.is_empty() && !block {
-                        return Err(t70(
-                            self.name,
-                            "an aggregate over the recursive rows below its own return",
-                        ));
-                    }
-                    for (_, k) in keys {
-                        let mut cols = Vec::new();
-                        k.columns(&mut cols);
-                        if cols.iter().any(|x| self.lattice.contains(x)) {
+                        if cols.iter().any(|x| self.blocks.contains(x)) {
                             return Err(t70(
                                 self.name,
-                                "a group key reads a `min`/`max` column inside the cycle",
+                                "a block value over the recursive rows; only `exists { }` as a filter is monotone",
                             ));
                         }
                     }
-                }
-                c
-            }
-            Term::Correlate { outer, inner, .. } => {
-                let mut c = self.term(outer)?;
-                if let Term::Group { input, keys, aggs } = inner.as_ref()
-                    && depends(input, self.name)
-                    && keys.is_empty()
-                    && aggs.len() == 1
-                {
-                    // Recorded; the filter above decides whether it is an
-                    // `exists` (admitted) or a count or `not` (refused).
-                    self.blocks.push(aggs[0].0.clone());
-                }
-                c.extend(self.term(inner)?);
-                c
-            }
-            Term::Union { left, right } => {
-                let mut c = self.term(left)?;
-                let r = self.term(right)?;
-                // The arms match by name: a column the right arm computes is
-                // the union's column of that name.
-                let ln = output_columns(left);
-                for n in output_columns(right) {
-                    if r.contains(&n) && ln.contains(&n) {
-                        c.insert(n);
+                    let derived: Vec<String> = items
+                        .iter()
+                        .filter(|(_, e)| {
+                            let mut cols = Vec::new();
+                            e.columns(&mut cols);
+                            cols.iter().any(|x| self.lattice.contains(x))
+                        })
+                        .map(|(n, _)| n.trim_start_matches('^').to_string())
+                        .collect();
+                    for (n, e) in items {
+                        let n = n.trim_start_matches('^').to_string();
+                        let computed = !(e.is_column_read() || matches!(e, IRExpr::Param(..)))
+                            || reads_any(e, &c);
+                        if computed {
+                            c.insert(n.clone());
+                            c.insert(format!("^{n}"));
+                        } else {
+                            c.remove(&n);
+                        }
                     }
+                    for d in derived {
+                        if !self.lattice.contains(&d) {
+                            self.lattice.push(d);
+                        }
+                    }
+                    c
                 }
-                c
-            }
-            Term::Order { input, keys } => {
-                if depends(input, self.name) {
-                    return Err(t70(self.name, "an `order` over the recursive rows"));
+                Term::Group { input, keys, aggs } => {
+                    let dep = depends(input, self.name);
+                    let c = self.term(input)?;
+                    if dep {
+                        // A block over the recursive rows: only `exists`, a
+                        // count compared `> 0` or `>= 1`, is monotone; the walk
+                        // over the enclosing filter decides (see `Correlate`).
+                        // `distinct` (a Group with no aggregate) is a projection
+                        // over sets and monotone.
+                        let block = keys.is_empty()
+                            && aggs.len() == 1
+                            && aggs[0].1.func == AggFunc::Count
+                            && aggs[0].1.arg.is_none();
+                        if !aggs.is_empty() && !block {
+                            return Err(t70(
+                                self.name,
+                                "an aggregate over the recursive rows below its own return",
+                            ));
+                        }
+                        for (_, k) in keys {
+                            let mut cols = Vec::new();
+                            k.columns(&mut cols);
+                            if cols.iter().any(|x| self.lattice.contains(x)) {
+                                return Err(t70(
+                                    self.name,
+                                    "a group key reads a `min`/`max` column inside the cycle",
+                                ));
+                            }
+                        }
+                    }
+                    c
                 }
-                let _ = keys;
-                self.term(input)?
-            }
-            Term::Cut { input, .. } => {
-                if depends(input, self.name) {
-                    return Err(t70(self.name, "a `limit` over the recursive rows"));
+                Term::Correlate { outer, inner, .. } => {
+                    let mut c = self.term(outer)?;
+                    if let Term::Group { input, keys, aggs } = inner.as_ref()
+                        && depends(input, self.name)
+                        && keys.is_empty()
+                        && aggs.len() == 1
+                    {
+                        // Recorded; the filter above decides whether it is an
+                        // `exists` (admitted) or a count or `not` (refused).
+                        self.blocks.push(aggs[0].0.clone());
+                    }
+                    c.extend(self.term(inner)?);
+                    c
                 }
-                self.term(input)?
-            }
-            Term::ApproxTopK { input, .. } => {
-                if depends(input, self.name) {
-                    return Err(t70(self.name, "a `nearest` window over the recursive rows"));
+                Term::Union { left, right } => {
+                    let mut c = self.term(left)?;
+                    let r = self.term(right)?;
+                    // The arms match by name: a column the right arm computes is
+                    // the union's column of that name.
+                    let ln = output_columns(left);
+                    for n in output_columns(right) {
+                        if r.contains(&n) && ln.contains(&n) {
+                            c.insert(n);
+                        }
+                    }
+                    c
                 }
-                self.term(input)?
-            }
-            Term::Fuse { arms, .. } => {
-                if arms.iter().any(|a| depends(a, self.name)) {
-                    return Err(t70(self.name, "an `rrf` over the recursive rows"));
+                Term::Order { input, keys } => {
+                    if depends(input, self.name) {
+                        return Err(t70(self.name, "an `order` over the recursive rows"));
+                    }
+                    let _ = keys;
+                    self.term(input)?
                 }
-                HashSet::new()
-            }
-            Term::Score { input, .. } => self.term(input)?,
-            Term::Fix { body, .. } | Term::Call { body, .. } => self.term(body)?,
+                Term::Cut { input, .. } => {
+                    if depends(input, self.name) {
+                        return Err(t70(self.name, "a `limit` over the recursive rows"));
+                    }
+                    self.term(input)?
+                }
+                Term::ApproxTopK { input, .. } => {
+                    if depends(input, self.name) {
+                        return Err(t70(self.name, "a `nearest` window over the recursive rows"));
+                    }
+                    self.term(input)?
+                }
+                Term::Fuse { arms, .. } => {
+                    if arms.iter().any(|a| depends(a, self.name)) {
+                        return Err(t70(self.name, "an `rrf` over the recursive rows"));
+                    }
+                    HashSet::new()
+                }
+                Term::Score { input, .. } => self.term(input)?,
+                Term::Fix { body, .. } | Term::Call { body, .. } => self.term(body)?,
+            })
         })
     }
 }
@@ -7607,20 +7621,22 @@ fn is_null_literal(e: &Expr) -> bool {
 /// context can fix its type: the `null` literal, an `if` whose branches
 /// and a `coalesce` whose arguments are all such.
 fn is_untyped_null(e: &Expr) -> bool {
-    let all = |args: &[Arg]| {
-        args.iter()
-            .all(|a| matches!(a, Arg::Expr(x) if is_untyped_null(x)))
-    };
-    match e {
-        Expr::Literal(Literal::Null) => true,
-        Expr::Call(c) if c.options.is_empty() && c.name == "if" && c.args.len() == 3 => {
-            all(&c.args[1..])
+    crate::stack::deep(|| {
+        let all = |args: &[Arg]| {
+            args.iter()
+                .all(|a| matches!(a, Arg::Expr(x) if is_untyped_null(x)))
+        };
+        match e {
+            Expr::Literal(Literal::Null) => true,
+            Expr::Call(c) if c.options.is_empty() && c.name == "if" && c.args.len() == 3 => {
+                all(&c.args[1..])
+            }
+            Expr::Call(c) if c.options.is_empty() && c.name == "coalesce" && !c.args.is_empty() => {
+                all(&c.args)
+            }
+            _ => false,
         }
-        Expr::Call(c) if c.options.is_empty() && c.name == "coalesce" && !c.args.is_empty() => {
-            all(&c.args)
-        }
-        _ => false,
-    }
+    })
 }
 
 /// A `null` whose type nothing fixes (the GQ 3 RFC, section 5).
@@ -7776,7 +7792,7 @@ fn lexical_text(text: &SExpr) -> R<()> {
 }
 
 fn contains_agg(e: &Expr) -> bool {
-    match e {
+    crate::stack::deep(|| match e {
         Expr::Call(c) if AGGREGATES.contains(&c.name.as_str()) => true,
         Expr::AggDistinct { .. } => true,
         Expr::Call(c) => c
@@ -7796,7 +7812,7 @@ fn contains_agg(e: &Expr) -> bool {
         Expr::Not(x) | Expr::Neg(x) => contains_agg(x),
         Expr::IsNull { expr, .. } => contains_agg(expr),
         _ => false,
-    }
+    })
 }
 
 /// `T8` for an aggregate call in a `where`, with the block form as the fix:
@@ -8283,7 +8299,7 @@ fn membership_triple(pattern: &Pattern, sc: &Scope) -> Option<QueryDiagnostic> {
 }
 
 fn first_aggregate_call(e: &Expr) -> Option<&Call> {
-    match e {
+    crate::stack::deep(|| match e {
         Expr::Call(c) if AGGREGATES.contains(&c.name.as_str()) => Some(c),
         Expr::Compare { left, right, .. }
         | Expr::Arith { left, right, .. }
@@ -8293,70 +8309,74 @@ fn first_aggregate_call(e: &Expr) -> Option<&Call> {
         }
         Expr::Not(x) | Expr::Neg(x) => first_aggregate_call(x),
         _ => None,
-    }
+    })
 }
 
 /// `e` with the call `call` replaced by `with`.
 fn replace_call(e: &Expr, call: &Call, with: &Expr) -> Expr {
-    let r = |x: &Expr| Box::new(replace_call(x, call, with));
-    match e {
-        Expr::Call(c) if c == call => with.clone(),
-        Expr::Compare {
-            op,
-            left,
-            right,
-            at,
-        } => Expr::Compare {
-            op: *op,
-            left: r(left),
-            right: r(right),
-            at: at.clone(),
-        },
-        Expr::Arith { op, left, right } => Expr::Arith {
-            op: *op,
-            left: r(left),
-            right: r(right),
-        },
-        Expr::And(a, b) => Expr::And(r(a), r(b)),
-        Expr::Or(a, b) => Expr::Or(r(a), r(b)),
-        Expr::Not(x) => Expr::Not(r(x)),
-        Expr::Neg(x) => Expr::Neg(r(x)),
-        other => other.clone(),
-    }
+    crate::stack::deep(|| {
+        let r = |x: &Expr| Box::new(replace_call(x, call, with));
+        match e {
+            Expr::Call(c) if c == call => with.clone(),
+            Expr::Compare {
+                op,
+                left,
+                right,
+                at,
+            } => Expr::Compare {
+                op: *op,
+                left: r(left),
+                right: r(right),
+                at: at.clone(),
+            },
+            Expr::Arith { op, left, right } => Expr::Arith {
+                op: *op,
+                left: r(left),
+                right: r(right),
+            },
+            Expr::And(a, b) => Expr::And(r(a), r(b)),
+            Expr::Or(a, b) => Expr::Or(r(a), r(b)),
+            Expr::Not(x) => Expr::Not(r(x)),
+            Expr::Neg(x) => Expr::Neg(r(x)),
+            other => other.clone(),
+        }
+    })
 }
 
 /// The conjuncts of a top-level `and`: each is placed after the last binder
 /// it reads, so a conjunct is pushed down as far as its own names allow.
 fn conjuncts(e: &Expr) -> Vec<&Expr> {
-    match e {
+    crate::stack::deep(|| match e {
         Expr::And(l, r) => {
             let mut v = conjuncts(l);
             v.extend(conjuncts(r));
             v
         }
         other => vec![other],
-    }
+    })
 }
 
 /// The name a return item produces: its alias, `var.prop` for a property,
 /// the variable for a reference.
 pub(crate) fn item_name(e: &Expr, alias: Option<&str>) -> String {
-    if let Some(a) = alias {
-        return a.to_string();
-    }
-    match e {
-        Expr::Prop { variable, property } => format!("{variable}.{property}"),
-        Expr::Variable(v) => v.clone(),
-        Expr::Literal(_) => "literal".into(),
-        Expr::Call(c) if AGGREGATES.contains(&c.name.as_str()) => match c.args.first() {
-            Some(Arg::Expr(a)) => item_name(a, None),
-            _ => c.name.clone(),
-        },
-        Expr::AggDistinct { arg, .. } => item_name(arg, None),
-        Expr::Call(c) if c.name == "now" => crate::query::value::NOW_PARAM_NAME.to_string(),
-        Expr::Call(c) => c.name.clone(),
-        _ => "expression".into(),
-    }
+    crate::stack::deep(|| {
+        if let Some(a) = alias {
+            return a.to_string();
+        }
+        match e {
+            Expr::Prop { variable, property } => format!("{variable}.{property}"),
+            Expr::Variable(v) => v.clone(),
+            Expr::Literal(_) => "literal".into(),
+            Expr::Call(c) if AGGREGATES.contains(&c.name.as_str()) => match c.args.first() {
+                Some(Arg::Expr(a)) => item_name(a, None),
+                _ => c.name.clone(),
+            },
+            Expr::AggDistinct { arg, .. } => item_name(arg, None),
+            Expr::Call(c) if c.name == "now" => crate::query::value::NOW_PARAM_NAME.to_string(),
+            Expr::Call(c) => c.name.clone(),
+            _ => "expression".into(),
+        }
+    })
 }
 
 fn is_relation_expr(e: &Expr, sc: &Scope, unit: &HashMap<String, &Decl>) -> bool {
@@ -8370,55 +8390,57 @@ fn is_relation_expr(e: &Expr, sc: &Scope, unit: &HashMap<String, &Decl>) -> bool
 /// Lookahead over a scope's elements: the type each binding declares, and
 /// every name the scope will bind.
 fn lookahead(elements: &[Element], sc: &mut Scope) {
-    for c in elements {
-        match c {
-            Element::Binding {
-                variable,
-                type_name,
-            } => {
-                sc.declared.insert(
-                    variable.clone(),
-                    BoundVariable::Node {
-                        type_name: type_name.clone(),
-                    },
-                );
-                sc.declared_nodes.insert(variable.clone());
-                sc.future.insert(variable.clone());
-            }
-            Element::Traversal(t) => {
-                sc.future.insert(t.src.clone());
-                sc.future.insert(t.dst.clone());
-                if let Some(k) = &t.edge_binding {
-                    sc.future.insert(k.clone());
+    crate::stack::deep(|| {
+        for c in elements {
+            match c {
+                Element::Binding {
+                    variable,
+                    type_name,
+                } => {
+                    sc.declared.insert(
+                        variable.clone(),
+                        BoundVariable::Node {
+                            type_name: type_name.clone(),
+                        },
+                    );
+                    sc.declared_nodes.insert(variable.clone());
+                    sc.future.insert(variable.clone());
                 }
-            }
-            Element::Let { name, .. } => {
-                sc.future.insert(name.clone());
-            }
-            Element::From {
-                rel: RelExpr::Inline(body),
-                ..
-            } => {
-                for p in &body.projections {
-                    match (&p.alias, &p.expr) {
-                        (Some(a), _) => {
-                            sc.future.insert(a.clone());
-                        }
-                        (None, Expr::Variable(v)) => {
-                            sc.future.insert(v.clone());
-                        }
-                        _ => {}
+                Element::Traversal(t) => {
+                    sc.future.insert(t.src.clone());
+                    sc.future.insert(t.dst.clone());
+                    if let Some(k) = &t.edge_binding {
+                        sc.future.insert(k.clone());
                     }
                 }
+                Element::Let { name, .. } => {
+                    sc.future.insert(name.clone());
+                }
+                Element::From {
+                    rel: RelExpr::Inline(body),
+                    ..
+                } => {
+                    for p in &body.projections {
+                        match (&p.alias, &p.expr) {
+                            (Some(a), _) => {
+                                sc.future.insert(a.clone());
+                            }
+                            (None, Expr::Variable(v)) => {
+                                sc.future.insert(v.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Element::Optional(inner) => {
+                    let mut tmp = Scope::new(HashMap::new(), Vec::new(), HashMap::new());
+                    lookahead(&inner.elements, &mut tmp);
+                    sc.future.extend(tmp.future);
+                }
+                Element::From { .. } => {}
             }
-            Element::Optional(inner) => {
-                let mut tmp = Scope::new(HashMap::new(), Vec::new(), HashMap::new());
-                lookahead(&inner.elements, &mut tmp);
-                sc.future.extend(tmp.future);
-            }
-            Element::From { .. } => {}
         }
-    }
+    })
 }
 
 /// The scope variables a pending filter names: the variables it mentions
@@ -8455,7 +8477,7 @@ fn filter_vars(e: &Expr, before: &[String], out: &mut Vec<String>) {
 
 /// The variables named inside the blocks of `e`.
 fn block_vars(e: &Expr, out: &mut Vec<String>) {
-    match e {
+    crate::stack::deep(|| match e {
         Expr::Block(b) => {
             pattern_vars(&b.pattern, out);
             if let Some(a) = &b.arg {
@@ -8463,16 +8485,16 @@ fn block_vars(e: &Expr, out: &mut Vec<String>) {
             }
         }
         other => for_each_child(other, &mut |child| block_vars(child, out)),
-    }
+    })
 }
 
 /// The variables `e` names outside its blocks.
 fn expr_vars_outside_blocks(e: &Expr, out: &mut Vec<String>) {
-    match e {
+    crate::stack::deep(|| match e {
         Expr::Block(_) => {}
         Expr::Variable(v) | Expr::Prop { variable: v, .. } => out.push(v.clone()),
         other => for_each_child(other, &mut |child| expr_vars_outside_blocks(child, out)),
-    }
+    })
 }
 
 /// Every direct operand of an expression that is not a block.
@@ -8591,44 +8613,50 @@ fn element_binds(c: &Element) -> Vec<String> {
 }
 
 fn pattern_vars(pattern: &Pattern, out: &mut Vec<String>) {
-    for c in &pattern.elements {
-        match c {
-            Element::Binding { variable, .. } => out.push(variable.clone()),
-            Element::Traversal(t) => {
-                out.push(t.src.clone());
-                out.push(t.dst.clone());
-            }
-            Element::Optional(p) => pattern_vars(p, out),
-            Element::Let { value, .. } => {
-                if let LetValue::Expr(e) = value {
-                    expr_vars(e, out)
+    crate::stack::deep(|| {
+        for c in &pattern.elements {
+            match c {
+                Element::Binding { variable, .. } => out.push(variable.clone()),
+                Element::Traversal(t) => {
+                    out.push(t.src.clone());
+                    out.push(t.dst.clone());
                 }
+                Element::Optional(p) => pattern_vars(p, out),
+                Element::Let { value, .. } => {
+                    if let LetValue::Expr(e) = value {
+                        expr_vars(e, out)
+                    }
+                }
+                Element::From { score, .. } => out.extend(score.iter().cloned()),
             }
-            Element::From { score, .. } => out.extend(score.iter().cloned()),
         }
-    }
-    if let Some(p) = &pattern.predicate {
-        expr_vars(p, out);
-    }
+        if let Some(p) = &pattern.predicate {
+            expr_vars(p, out);
+        }
+    })
 }
 
 /// The first span written inside `e`, in source order: where a conjunct of
 /// a `where` is placed.
 fn first_span(e: &Expr) -> Option<SourceSpan> {
-    let own = match e {
-        Expr::Compare { at, .. } | Expr::In { at, .. } | Expr::InfixString { at, .. } => Some(at),
-        Expr::Block(b) => Some(&b.at),
-        _ => None,
-    };
-    let mut found = own.filter(|at| at.end > at.start).cloned();
-    for_each_child(e, &mut |child| {
-        if let Some(span) = first_span(child)
-            && found.as_ref().is_none_or(|f| span.start < f.start)
-        {
-            found = Some(span);
-        }
-    });
-    found
+    crate::stack::deep(|| {
+        let own = match e {
+            Expr::Compare { at, .. } | Expr::In { at, .. } | Expr::InfixString { at, .. } => {
+                Some(at)
+            }
+            Expr::Block(b) => Some(&b.at),
+            _ => None,
+        };
+        let mut found = own.filter(|at| at.end > at.start).cloned();
+        for_each_child(e, &mut |child| {
+            if let Some(span) = first_span(child)
+                && found.as_ref().is_none_or(|f| span.start < f.start)
+            {
+                found = Some(span);
+            }
+        });
+        found
+    })
 }
 
 /// Every variable `e` names, inside its blocks too.
@@ -8639,7 +8667,7 @@ fn expr_names(e: &Expr) -> Vec<String> {
 }
 
 fn expr_vars(e: &Expr, out: &mut Vec<String>) {
-    match e {
+    crate::stack::deep(|| match e {
         Expr::Variable(v) | Expr::Prop { variable: v, .. } => out.push(v.clone()),
         Expr::Literal(_) | Expr::Meta(_) | Expr::Ident(_) => {}
         Expr::Call(c) => {
@@ -8673,7 +8701,7 @@ fn expr_vars(e: &Expr, out: &mut Vec<String>) {
             expr_vars(list, out);
         }
         Expr::List { elements, .. } => elements.iter().for_each(|e| expr_vars(e, out)),
-    }
+    })
 }
 
 mod bind;

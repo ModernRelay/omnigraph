@@ -303,7 +303,7 @@ fn evaluate_boolean(
     filter: &IRExpr,
     params: &ParamMap,
 ) -> Result<BooleanArray> {
-    match filter {
+    omnigraph_compiler::stack::deep(|| match filter {
         IRExpr::Binary {
             left,
             op: BinaryOp::Compare(op),
@@ -361,7 +361,7 @@ fn evaluate_boolean(
             op: BinaryOp::Arith(_),
             ..
         } => Err(OmniError::manifest_internal("expected a Boolean operator")),
-    }
+    })
 }
 
 fn boolean_mask(values: ArrayRef, expr: &IRExpr) -> Result<BooleanArray> {
@@ -460,93 +460,95 @@ pub(super) fn evaluate_expr(
     expr: &IRExpr,
     params: &ParamMap,
 ) -> Result<ArrayRef> {
-    let values: ArrayRef = match expr {
-        IRExpr::Binary {
-            left,
-            op: BinaryOp::Arith(op),
-            right,
-            ty: _,
-        } => {
-            let left = evaluate_expr(batch, left, params)?;
-            let right = evaluate_expr(batch, right, params)?;
-            super::arith::binary(*op, &left, &right)?
-        }
-        IRExpr::Neg { expr: child, .. } => {
-            let values = evaluate_expr(batch, child, params)?;
-            super::arith::negate(&values)?
-        }
-        // `if` evaluates its condition, then each branch only on the rows
-        // that select it, and `coalesce` each argument only on the rows still
-        // null: a branch not taken never fails (A3).
-        IRExpr::Call {
-            func: ScalarFunc::If,
-            args,
-            ty,
-        } if args.len() == 3 => {
-            let cond = evaluate_expr(batch, &args[0], params)?;
-            let taken: BooleanArray = cond
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| OmniError::manifest_internal("`if` condition is not Boolean"))?
-                .iter()
-                .map(|value| Some(value == Some(true)))
-                .collect();
-            let other = boolean::not(&taken).map_err(OmniError::arrow_internal)?;
-            let then = evaluate_selected(batch, &args[1], params, &taken)?;
-            let otherwise = evaluate_selected(batch, &args[2], params, &other)?;
-            super::arith::call(ScalarFunc::If, &[cond, then, otherwise], ty)?
-        }
-        IRExpr::Call {
-            func: ScalarFunc::Coalesce,
-            args,
-            ty,
-        } if !args.is_empty() => {
-            let mut values = evaluate_expr(batch, &args[0], params)?;
-            for next in &args[1..] {
-                let missing = boolean::is_null(&values).map_err(OmniError::arrow_internal)?;
-                let next = evaluate_selected(batch, next, params, &missing)?;
-                values = super::arith::call(ScalarFunc::Coalesce, &[values, next], ty)?;
+    omnigraph_compiler::stack::deep(|| {
+        let values: ArrayRef = match expr {
+            IRExpr::Binary {
+                left,
+                op: BinaryOp::Arith(op),
+                right,
+                ty: _,
+            } => {
+                let left = evaluate_expr(batch, left, params)?;
+                let right = evaluate_expr(batch, right, params)?;
+                super::arith::binary(*op, &left, &right)?
             }
-            values
-        }
-        IRExpr::Call { func, args, ty } => {
-            let args = args
-                .iter()
-                .map(|arg| evaluate_expr(batch, arg, params))
-                .collect::<Result<Vec<_>>>()?;
-            super::arith::call(*func, &args, ty)?
-        }
-        IRExpr::Binary { .. } | IRExpr::Not(_, _) | IRExpr::IsNull { .. } => {
-            Arc::new(evaluate_boolean(batch, expr, params)?)
-        }
-        IRExpr::Cast { expr: child, ty } => {
-            let values = evaluate_expr(batch, child, params)?;
-            super::typed_value::cast_array(&values, child, ty)?
-        }
-        IRExpr::PropAccess {
-            variable, property, ..
-        } => {
-            let col_name = property_column(variable, property);
-            Arc::clone(batch.column_by_name(&col_name).ok_or_else(|| {
-                OmniError::manifest(format!("column '{col_name}' not found in wide batch"))
-            })?)
-        }
-        IRExpr::Literal(lit, ty) => typed_literal_to_array(lit, ty, batch.num_rows())?,
-        IRExpr::Param(name, ty) => {
-            let lit = params
-                .get(name)
-                .ok_or_else(|| OmniError::manifest(format!("parameter '{name}' not provided")))?;
-            typed_literal_to_array(lit, ty, batch.num_rows())?
-        }
-        IRExpr::AliasRef(name, _) => alias_column(batch, name)?,
-        IRExpr::Nearest { .. } | IRExpr::Variable(_, _) | IRExpr::Aggregate { .. } => {
-            return Err(OmniError::manifest(format!(
-                "unsupported expression in filter: {expr}"
-            )));
-        }
-    };
-    check_array_type(&values, expr.ty(), &expr.to_string())?;
-    Ok(values)
+            IRExpr::Neg { expr: child, .. } => {
+                let values = evaluate_expr(batch, child, params)?;
+                super::arith::negate(&values)?
+            }
+            // `if` evaluates its condition, then each branch only on the rows
+            // that select it, and `coalesce` each argument only on the rows still
+            // null: a branch not taken never fails (A3).
+            IRExpr::Call {
+                func: ScalarFunc::If,
+                args,
+                ty,
+            } if args.len() == 3 => {
+                let cond = evaluate_expr(batch, &args[0], params)?;
+                let taken: BooleanArray = cond
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| OmniError::manifest_internal("`if` condition is not Boolean"))?
+                    .iter()
+                    .map(|value| Some(value == Some(true)))
+                    .collect();
+                let other = boolean::not(&taken).map_err(OmniError::arrow_internal)?;
+                let then = evaluate_selected(batch, &args[1], params, &taken)?;
+                let otherwise = evaluate_selected(batch, &args[2], params, &other)?;
+                super::arith::call(ScalarFunc::If, &[cond, then, otherwise], ty)?
+            }
+            IRExpr::Call {
+                func: ScalarFunc::Coalesce,
+                args,
+                ty,
+            } if !args.is_empty() => {
+                let mut values = evaluate_expr(batch, &args[0], params)?;
+                for next in &args[1..] {
+                    let missing = boolean::is_null(&values).map_err(OmniError::arrow_internal)?;
+                    let next = evaluate_selected(batch, next, params, &missing)?;
+                    values = super::arith::call(ScalarFunc::Coalesce, &[values, next], ty)?;
+                }
+                values
+            }
+            IRExpr::Call { func, args, ty } => {
+                let args = args
+                    .iter()
+                    .map(|arg| evaluate_expr(batch, arg, params))
+                    .collect::<Result<Vec<_>>>()?;
+                super::arith::call(*func, &args, ty)?
+            }
+            IRExpr::Binary { .. } | IRExpr::Not(_, _) | IRExpr::IsNull { .. } => {
+                Arc::new(evaluate_boolean(batch, expr, params)?)
+            }
+            IRExpr::Cast { expr: child, ty } => {
+                let values = evaluate_expr(batch, child, params)?;
+                super::typed_value::cast_array(&values, child, ty)?
+            }
+            IRExpr::PropAccess {
+                variable, property, ..
+            } => {
+                let col_name = property_column(variable, property);
+                Arc::clone(batch.column_by_name(&col_name).ok_or_else(|| {
+                    OmniError::manifest(format!("column '{col_name}' not found in wide batch"))
+                })?)
+            }
+            IRExpr::Literal(lit, ty) => typed_literal_to_array(lit, ty, batch.num_rows())?,
+            IRExpr::Param(name, ty) => {
+                let lit = params.get(name).ok_or_else(|| {
+                    OmniError::manifest(format!("parameter '{name}' not provided"))
+                })?;
+                typed_literal_to_array(lit, ty, batch.num_rows())?
+            }
+            IRExpr::AliasRef(name, _) => alias_column(batch, name)?,
+            IRExpr::Nearest { .. } | IRExpr::Variable(_, _) | IRExpr::Aggregate { .. } => {
+                return Err(OmniError::manifest(format!(
+                    "unsupported expression in filter: {expr}"
+                )));
+            }
+        };
+        super::typed_value::check_array_type_of(&values, expr.ty(), || expr.to_string())?;
+        Ok(values)
+    })
 }
 
 /// `expr` evaluated on the rows `selected` keeps alone, null on the others;
@@ -557,14 +559,16 @@ fn evaluate_selected(
     params: &ParamMap,
     selected: &BooleanArray,
 ) -> Result<ArrayRef> {
-    if selected.true_count() == batch.num_rows() {
-        return evaluate_expr(batch, expr, params);
-    }
-    let rows = arrow_select::filter::filter_record_batch(batch, selected)
-        .map_err(OmniError::arrow_internal)?;
-    let values = evaluate_expr(&rows, expr, params)?;
-    datafusion::physical_expr_common::utils::scatter(selected, &values)
-        .map_err(|err| OmniError::manifest_internal(err.to_string()))
+    omnigraph_compiler::stack::deep(|| {
+        if selected.true_count() == batch.num_rows() {
+            return evaluate_expr(batch, expr, params);
+        }
+        let rows = arrow_select::filter::filter_record_batch(batch, selected)
+            .map_err(OmniError::arrow_internal)?;
+        let values = evaluate_expr(&rows, expr, params)?;
+        datafusion::physical_expr_common::utils::scatter(selected, &values)
+            .map_err(|err| OmniError::manifest_internal(err.to_string()))
+    })
 }
 
 /// The wide-batch column that holds `variable.property`. Evaluation and

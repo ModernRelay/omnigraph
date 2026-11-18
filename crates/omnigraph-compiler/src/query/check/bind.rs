@@ -39,8 +39,12 @@ struct Binder<'a> {
     /// runs), the node bound, and its scope. A subterm two parents share (an
     /// `optional`'s pattern) is bound once, and both parents keep sharing
     /// the bound node; its binding reads only its own leaves.
-    bound: std::cell::RefCell<HashMap<*const Term, (Arc<Term>, Arc<Term>, Scope)>>,
+    bound: std::cell::RefCell<HashMap<*const Term, BoundOnce>>,
 }
+
+/// A shared subterm bound once: the node it was, kept alive; the node bound;
+/// its scope.
+type BoundOnce = (Arc<Term>, Arc<Term>, Scope);
 
 /// Bind every expression of `decl` in place.
 pub(super) fn bind_decl(catalog: &Catalog, decl: &mut CoreDecl) -> Result<()> {
@@ -144,108 +148,110 @@ impl Binder<'_> {
 
     /// The scope `term` binds, its expressions bound in place.
     fn term(&self, term: &mut Term, outer: &Scope) -> Result<Scope> {
-        Ok(match term {
-            Term::Unit => Scope::new(),
-            Term::Env(cols) => scope_of(cols),
-            Term::RecRef { ty, .. } => scope_of(&ty.cols),
-            Term::Scan { var, ty } => bound_of(ty)
-                .map(|b| Scope::from([(var.clone(), b)]))
-                .unwrap_or_default(),
-            Term::Expand {
-                input,
-                dst,
-                edges,
-                edge_var,
-                ..
-            } => {
-                let mut scope = self.child(input, outer)?;
-                scope.insert(dst.clone(), Bound::Node);
-                if let Some(e) = edge_var {
-                    scope.insert(e.clone(), Bound::Edge(edge_types(edges)));
-                }
-                scope
-            }
-            Term::Filter { input, pred, .. } => {
-                let scope = self.child(input, outer)?;
-                *pred = self.expr(pred, &scope)?;
-                scope
-            }
-            Term::Project {
-                input, items, keep, ..
-            } => {
-                let scope = self.child(input, outer)?;
-                for (_, e) in items.iter_mut() {
-                    *e = self.expr(e, &scope)?;
-                }
-                let out = projected(&scope, items);
-                if *keep { merge(scope, out) } else { out }
-            }
-            Term::Group { input, keys, aggs } => {
-                let scope = self.child(input, outer)?;
-                for (_, e) in keys.iter_mut() {
-                    *e = self.expr(e, &scope)?;
-                }
-                for (_, agg) in aggs {
-                    if let Some(arg) = &mut agg.arg {
-                        *arg = self.expr(arg, &scope)?;
+        crate::stack::deep(|| {
+            Ok(match term {
+                Term::Unit => Scope::new(),
+                Term::Env(cols) => scope_of(cols),
+                Term::RecRef { ty, .. } => scope_of(&ty.cols),
+                Term::Scan { var, ty } => bound_of(ty)
+                    .map(|b| Scope::from([(var.clone(), b)]))
+                    .unwrap_or_default(),
+                Term::Expand {
+                    input,
+                    dst,
+                    edges,
+                    edge_var,
+                    ..
+                } => {
+                    let mut scope = self.child(input, outer)?;
+                    scope.insert(dst.clone(), Bound::Node);
+                    if let Some(e) = edge_var {
+                        scope.insert(e.clone(), Bound::Edge(edge_types(edges)));
                     }
+                    scope
                 }
-                projected(&scope, keys)
-            }
-            Term::Order { input, keys } => {
-                let scope = self.child(input, outer)?;
-                for (e, _) in keys {
-                    *e = self.expr(e, &scope)?;
+                Term::Filter { input, pred, .. } => {
+                    let scope = self.child(input, outer)?;
+                    *pred = self.expr(pred, &scope)?;
+                    scope
                 }
-                scope
-            }
-            Term::Cut { input, .. } => self.child(input, outer)?,
-            Term::Score { input, query, .. } => {
-                let scope = self.child(input, outer)?;
-                match query {
-                    ScoreQuery::Vector(e) => *e = self.expr(e, &scope)?,
-                    ScoreQuery::Lexical(LexicalQuery {
-                        text, max_edits, ..
-                    }) => {
-                        *text = self.expr(text, &scope)?;
-                        *max_edits = self.expr(max_edits, &scope)?;
+                Term::Project {
+                    input, items, keep, ..
+                } => {
+                    let scope = self.child(input, outer)?;
+                    for (_, e) in items.iter_mut() {
+                        *e = self.expr(e, &scope)?;
                     }
+                    let out = projected(&scope, items);
+                    if *keep { merge(scope, out) } else { out }
                 }
-                scope
-            }
-            Term::ApproxTopK { input, query, .. } => {
-                let scope = self.child(input, outer)?;
-                *query = self.expr(query, &scope)?;
-                scope
-            }
-            Term::Correlate {
-                outer: left, inner, ..
-            } => {
-                let scope = self.child(left, outer)?;
-                let joined = self.child(inner, &scope)?;
-                merge(scope, joined)
-            }
-            Term::Union { left, right } => {
-                let l = self.child(left, outer)?;
-                let r = self.child(right, outer)?;
-                merge(l, r)
-            }
-            Term::Fuse { arms, .. } => {
-                let mut scope = Scope::new();
-                for arm in arms {
-                    let arm_scope = self.term(arm, outer)?;
-                    scope = merge(scope, arm_scope);
+                Term::Group { input, keys, aggs } => {
+                    let scope = self.child(input, outer)?;
+                    for (_, e) in keys.iter_mut() {
+                        *e = self.expr(e, &scope)?;
+                    }
+                    for (_, agg) in aggs {
+                        if let Some(arg) = &mut agg.arg {
+                            *arg = self.expr(arg, &scope)?;
+                        }
+                    }
+                    projected(&scope, keys)
                 }
-                scope
-            }
-            Term::Call { bindings, body, .. } => {
-                // The arguments are the caller's; the body is its own scope.
-                for (_, e) in bindings {
-                    *e = self.expr(e, outer)?;
+                Term::Order { input, keys } => {
+                    let scope = self.child(input, outer)?;
+                    for (e, _) in keys {
+                        *e = self.expr(e, &scope)?;
+                    }
+                    scope
                 }
-                self.child(body, &Scope::new())?
-            }
-            Term::Fix { body, .. } => self.child(body, outer)?,
+                Term::Cut { input, .. } => self.child(input, outer)?,
+                Term::Score { input, query, .. } => {
+                    let scope = self.child(input, outer)?;
+                    match query {
+                        ScoreQuery::Vector(e) => *e = self.expr(e, &scope)?,
+                        ScoreQuery::Lexical(LexicalQuery {
+                            text, max_edits, ..
+                        }) => {
+                            *text = self.expr(text, &scope)?;
+                            *max_edits = self.expr(max_edits, &scope)?;
+                        }
+                    }
+                    scope
+                }
+                Term::ApproxTopK { input, query, .. } => {
+                    let scope = self.child(input, outer)?;
+                    *query = self.expr(query, &scope)?;
+                    scope
+                }
+                Term::Correlate {
+                    outer: left, inner, ..
+                } => {
+                    let scope = self.child(left, outer)?;
+                    let joined = self.child(inner, &scope)?;
+                    merge(scope, joined)
+                }
+                Term::Union { left, right } => {
+                    let l = self.child(left, outer)?;
+                    let r = self.child(right, outer)?;
+                    merge(l, r)
+                }
+                Term::Fuse { arms, .. } => {
+                    let mut scope = Scope::new();
+                    for arm in arms {
+                        let arm_scope = self.term(arm, outer)?;
+                        scope = merge(scope, arm_scope);
+                    }
+                    scope
+                }
+                Term::Call { bindings, body, .. } => {
+                    // The arguments are the caller's; the body is its own scope.
+                    for (_, e) in bindings {
+                        *e = self.expr(e, outer)?;
+                    }
+                    self.child(body, &Scope::new())?
+                }
+                Term::Fix { body, .. } => self.child(body, outer)?,
+            })
         })
     }
 
@@ -283,136 +289,139 @@ impl Binder<'_> {
             IRExpr::Cast { expr, .. } => expr,
             other => other,
         };
-        Ok(match self.expr(e, scope)? {
+        let bound = self.expr(e, scope)?;
+        Ok(match &bound {
             IRExpr::Literal(lit, ty) => {
-                let own = match &lit {
-                    Literal::Integer(_) | Literal::Float(_) => literal_type(&lit).ok(),
-                    Literal::List(items) if !items.is_empty() => literal_type(&lit).ok(),
+                let own = match lit {
+                    Literal::Integer(_) | Literal::Float(_) => literal_type(lit).ok(),
+                    Literal::List(items) if !items.is_empty() => literal_type(lit).ok(),
                     _ => None,
                 };
-                let ty = own.map(|t| ExprType::from_prop(&t)).unwrap_or(ty);
-                IRExpr::Literal(lit, ty)
+                let ty = own.map_or_else(|| ty.clone(), |t| ExprType::from_prop(&t));
+                IRExpr::Literal(lit.clone(), ty)
             }
-            other => other,
+            _ => bound,
         })
     }
 
     fn expr(&self, e: &IRExpr, scope: &Scope) -> Result<IRExpr> {
-        let b = |x: &IRExpr| self.expr(x, scope).map(Box::new);
-        Ok(match e {
-            IRExpr::PropAccess {
-                variable,
-                property,
-                ty,
-            } => {
-                if property == EDGE_TYPE_META
-                    && let Some(Bound::Edge(types)) = scope.get(variable)
-                    && let [name] = types.as_slice()
-                {
-                    // A single-type edge's rows carry no type column: its
-                    // type is its name, and null on a row where the edge is
-                    // null (an `optional` with no match).
-                    let name = IRExpr::Literal(Literal::String(name.clone()), ty.clone());
-                    if !ty.nullable() {
-                        return Ok(name);
-                    }
-                    let present = IRExpr::IsNull {
-                        expr: Box::new(IRExpr::PropAccess {
-                            variable: variable.clone(),
-                            property: self.catalog.system_columns.id.to_string(),
-                            ty: ExprType::from_prop(&crate::types::PropType::scalar(
-                                crate::types::ScalarType::String,
-                                true,
-                            )),
-                        }),
-                        negated: true,
-                        ty: ExprType::from_prop(&crate::types::PropType::scalar(
-                            crate::types::ScalarType::Bool,
-                            false,
-                        )),
-                    };
-                    return Ok(IRExpr::Call {
-                        func: ScalarFunc::If,
-                        args: vec![present, name, IRExpr::Literal(Literal::Null, ty.clone())],
-                        ty: ty.clone(),
-                    });
-                }
+        crate::stack::deep(|| {
+            let b = |x: &IRExpr| self.expr(x, scope).map(Box::new);
+            Ok(match e {
                 IRExpr::PropAccess {
-                    variable: variable.clone(),
-                    property: self.physical(property),
-                    ty: ty.clone(),
+                    variable,
+                    property,
+                    ty,
+                } => {
+                    if property == EDGE_TYPE_META
+                        && let Some(Bound::Edge(types)) = scope.get(variable)
+                        && let [name] = types.as_slice()
+                    {
+                        // A single-type edge's rows carry no type column: its
+                        // type is its name, and null on a row where the edge is
+                        // null (an `optional` with no match).
+                        let name = IRExpr::Literal(Literal::String(name.clone()), ty.clone());
+                        if !ty.nullable() {
+                            return Ok(name);
+                        }
+                        let present = IRExpr::IsNull {
+                            expr: Box::new(IRExpr::PropAccess {
+                                variable: variable.clone(),
+                                property: self.catalog.system_columns.id.to_string(),
+                                ty: ExprType::from_prop(&crate::types::PropType::scalar(
+                                    crate::types::ScalarType::String,
+                                    true,
+                                )),
+                            }),
+                            negated: true,
+                            ty: ExprType::from_prop(&crate::types::PropType::scalar(
+                                crate::types::ScalarType::Bool,
+                                false,
+                            )),
+                        };
+                        return Ok(IRExpr::Call {
+                            func: ScalarFunc::If,
+                            args: vec![present, name, IRExpr::Literal(Literal::Null, ty.clone())],
+                            ty: ty.clone(),
+                        });
+                    }
+                    IRExpr::PropAccess {
+                        variable: variable.clone(),
+                        property: self.physical(property),
+                        ty: ty.clone(),
+                    }
                 }
-            }
-            IRExpr::Binary {
-                left,
-                op: BinaryOp::Compare(CompOp::Contains),
-                right,
-                ..
-            } => coerce::in_list(self.operand(left, scope)?, self.operand(right, scope)?)?,
-            // Two references compare by identity: their `@id` columns.
-            IRExpr::Binary {
-                left,
-                op: op @ BinaryOp::Compare(CompOp::Eq | CompOp::Ne),
-                right,
-                ..
-            } if is_reference(left) && is_reference(right) => {
-                coerce::binary(self.identity(left), *op, self.identity(right))?
-            }
-            IRExpr::Binary {
-                left,
-                op: op @ BinaryOp::Compare(_),
-                right,
-                ..
-            } => coerce::binary(self.operand(left, scope)?, *op, self.operand(right, scope)?)?,
-            IRExpr::Binary {
-                left,
-                op: op @ (BinaryOp::And | BinaryOp::Or),
-                right,
-                ..
-            } => coerce::binary(self.expr(left, scope)?, *op, self.expr(right, scope)?)?,
-            IRExpr::Binary {
-                left,
-                op,
-                right,
-                ty,
-            } => IRExpr::Binary {
-                left: b(left)?,
-                op: *op,
-                right: b(right)?,
-                ty: ty.clone(),
-            },
-            IRExpr::Not(inner, _) => fold::not(self.expr(inner, scope)?),
-            IRExpr::IsNull { expr, negated, .. } => {
-                fold::is_null(self.expr(expr, scope)?, *negated)
-            }
-            IRExpr::Neg { expr, ty } => IRExpr::Neg {
-                expr: b(expr)?,
-                ty: ty.clone(),
-            },
-            IRExpr::Cast { expr, ty } => IRExpr::Cast {
-                expr: b(expr)?,
-                ty: ty.clone(),
-            },
-            IRExpr::Call { func, args, ty } => IRExpr::Call {
-                func: *func,
-                args: args
-                    .iter()
-                    .map(|a| self.expr(a, scope))
-                    .collect::<Result<_>>()?,
-                ty: ty.clone(),
-            },
-            IRExpr::Aggregate {
-                func,
-                distinct,
-                arg,
-                signature,
-            } => IRExpr::Aggregate {
-                func: *func,
-                distinct: *distinct,
-                arg: b(arg)?,
-                signature: signature.clone(),
-            },
-            other => other.clone(),
+                IRExpr::Binary {
+                    left,
+                    op: BinaryOp::Compare(CompOp::Contains),
+                    right,
+                    ..
+                } => coerce::in_list(self.operand(left, scope)?, self.operand(right, scope)?)?,
+                // Two references compare by identity: their `@id` columns.
+                IRExpr::Binary {
+                    left,
+                    op: op @ BinaryOp::Compare(CompOp::Eq | CompOp::Ne),
+                    right,
+                    ..
+                } if is_reference(left) && is_reference(right) => {
+                    coerce::binary(self.identity(left), *op, self.identity(right))?
+                }
+                IRExpr::Binary {
+                    left,
+                    op: op @ BinaryOp::Compare(_),
+                    right,
+                    ..
+                } => coerce::binary(self.operand(left, scope)?, *op, self.operand(right, scope)?)?,
+                IRExpr::Binary {
+                    left,
+                    op: op @ (BinaryOp::And | BinaryOp::Or),
+                    right,
+                    ..
+                } => coerce::binary(self.expr(left, scope)?, *op, self.expr(right, scope)?)?,
+                IRExpr::Binary {
+                    left,
+                    op,
+                    right,
+                    ty,
+                } => IRExpr::Binary {
+                    left: b(left)?,
+                    op: *op,
+                    right: b(right)?,
+                    ty: ty.clone(),
+                },
+                IRExpr::Not(inner, _) => fold::not(self.expr(inner, scope)?),
+                IRExpr::IsNull { expr, negated, .. } => {
+                    fold::is_null(self.expr(expr, scope)?, *negated)
+                }
+                IRExpr::Neg { expr, ty } => IRExpr::Neg {
+                    expr: b(expr)?,
+                    ty: ty.clone(),
+                },
+                IRExpr::Cast { expr, ty } => IRExpr::Cast {
+                    expr: b(expr)?,
+                    ty: ty.clone(),
+                },
+                IRExpr::Call { func, args, ty } => IRExpr::Call {
+                    func: *func,
+                    args: args
+                        .iter()
+                        .map(|a| self.expr(a, scope))
+                        .collect::<Result<_>>()?,
+                    ty: ty.clone(),
+                },
+                IRExpr::Aggregate {
+                    func,
+                    distinct,
+                    arg,
+                    signature,
+                } => IRExpr::Aggregate {
+                    func: *func,
+                    distinct: *distinct,
+                    arg: b(arg)?,
+                    signature: signature.clone(),
+                },
+                other => other.clone(),
+            })
         })
     }
 }

@@ -433,12 +433,11 @@ fn non_ascii_mutations_never_panic_and_position_at_characters() {
 /// recurses: a long chain of unary minus, arithmetic, concatenation, a
 /// comparison chain, `not` in any spelling, `NOT`/`!` and `AND`/`OR`/`&&`
 /// (which the habit rewrite reparses as `not`, `and` and `or`) and nested
-/// `case` is refused `Q006`, on the stack a query thread has, where the
-/// unbounded recursion of the parse, the check or the drop of the tree would
-/// abort the process. A chain under the bound still compiles there.
+/// `case` is refused `Q006`; a chain well under the bound, hundreds of levels
+/// deep, compiles on a thread with the platform's default stack, where every
+/// walk of the parse, the check and the drop of the tree grows its own.
 #[test]
 fn every_recursive_production_is_bounded_before_it_recurses() {
-    use crate::query::depth::QUERY_THREAD_STACK_BYTES;
     fn filter(expr: &str) -> String {
         format!("query q() {{ match {{ $p: Person }} where {expr} return {{ $p.name }} }}")
     }
@@ -493,7 +492,7 @@ fn every_recursive_production_is_bounded_before_it_recurses() {
         }),
     ];
     let outcome = std::thread::Builder::new()
-        .stack_size(QUERY_THREAD_STACK_BYTES)
+        .stack_size(2 * 1024 * 1024)
         .spawn(move || {
             let mut wrong = Vec::new();
             for (shape, build) in shapes {
@@ -502,9 +501,11 @@ fn every_recursive_production_is_bounded_before_it_recurses() {
                     wrong.push(format!("{shape} at 100000: {refused:?}"));
                 }
                 // Under the bound, the same shape is not refused Q006.
-                let accepted = pass(&build(10));
-                if accepted.iter().any(|d| d.code.as_str() == "Q006") {
-                    wrong.push(format!("{shape} at 10: {accepted:?}"));
+                for n in [10, 300] {
+                    let accepted = pass(&build(n));
+                    if accepted.iter().any(|d| d.code.as_str() == "Q006") {
+                        wrong.push(format!("{shape} at {n}: {accepted:?}"));
+                    }
                 }
             }
             wrong

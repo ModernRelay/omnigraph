@@ -1238,7 +1238,7 @@ pub enum PredicateMirror {
 
 impl From<&Predicate> for PredicateMirror {
     fn from(predicate: &Predicate) -> Self {
-        match predicate {
+        omnigraph_compiler::stack::deep(|| match predicate {
             Predicate::IdAfter { id } => Self::IdAfter { id: id.clone() },
             Predicate::VersionWindow { from, to } => Self::VersionWindow {
                 from: *from,
@@ -1257,13 +1257,13 @@ impl From<&Predicate> for PredicateMirror {
                 text: text.clone(),
                 filter: ExprMirror::from(&filter.0),
             },
-        }
+        })
     }
 }
 
 impl From<PredicateMirror> for Predicate {
     fn from(mirror: PredicateMirror) -> Self {
-        match mirror {
+        omnigraph_compiler::stack::deep(|| match mirror {
             PredicateMirror::IdAfter { id } => Self::IdAfter { id },
             PredicateMirror::VersionWindow { from, to } => Self::VersionWindow { from, to },
             PredicateMirror::And { left, right } => Self::And {
@@ -1279,7 +1279,7 @@ impl From<PredicateMirror> for Predicate {
                 text,
                 filter: GqFilter(IRExpr::from(filter)),
             },
-        }
+        })
     }
 }
 
@@ -1432,69 +1432,75 @@ pub enum BlockAggregateExprMirror {
 
 impl From<&BlockAggregateExpr> for BlockAggregateExprMirror {
     fn from(expr: &BlockAggregateExpr) -> Self {
-        let mut current = expr;
-        let mut casts = Vec::new();
-        let mut mirror = loop {
-            match current {
-                BlockAggregateExpr::CountRows { ty } => break Self::CountRows { ty: ty.clone() },
-                BlockAggregateExpr::Aggregate {
-                    func,
-                    arg,
-                    signature,
-                } => {
-                    break Self::Aggregate {
-                        func: (*func).into(),
-                        arg: Box::new(ExprMirror::from(arg.as_ref())),
-                        signature: signature.clone(),
-                    };
+        omnigraph_compiler::stack::deep(|| {
+            let mut current = expr;
+            let mut casts = Vec::new();
+            let mut mirror = loop {
+                match current {
+                    BlockAggregateExpr::CountRows { ty } => {
+                        break Self::CountRows { ty: ty.clone() };
+                    }
+                    BlockAggregateExpr::Aggregate {
+                        func,
+                        arg,
+                        signature,
+                    } => {
+                        break Self::Aggregate {
+                            func: (*func).into(),
+                            arg: Box::new(ExprMirror::from(arg.as_ref())),
+                            signature: signature.clone(),
+                        };
+                    }
+                    BlockAggregateExpr::Cast { expr, ty } => {
+                        casts.push(ty);
+                        current = expr;
+                    }
                 }
-                BlockAggregateExpr::Cast { expr, ty } => {
-                    casts.push(ty);
-                    current = expr;
-                }
-            }
-        };
-        for ty in casts.into_iter().rev() {
-            mirror = Self::Cast {
-                expr: Box::new(mirror),
-                ty: ty.clone(),
             };
-        }
-        mirror
+            for ty in casts.into_iter().rev() {
+                mirror = Self::Cast {
+                    expr: Box::new(mirror),
+                    ty: ty.clone(),
+                };
+            }
+            mirror
+        })
     }
 }
 
 impl From<BlockAggregateExprMirror> for BlockAggregateExpr {
     fn from(mirror: BlockAggregateExprMirror) -> Self {
-        let mut current = mirror;
-        let mut casts = Vec::new();
-        let mut expr = loop {
-            match current {
-                BlockAggregateExprMirror::CountRows { ty } => break Self::CountRows { ty },
-                BlockAggregateExprMirror::Aggregate {
-                    func,
-                    arg,
-                    signature,
-                } => {
-                    break Self::Aggregate {
-                        func: func.into(),
-                        arg: Box::new(IRExpr::from(*arg)),
+        omnigraph_compiler::stack::deep(|| {
+            let mut current = mirror;
+            let mut casts = Vec::new();
+            let mut expr = loop {
+                match current {
+                    BlockAggregateExprMirror::CountRows { ty } => break Self::CountRows { ty },
+                    BlockAggregateExprMirror::Aggregate {
+                        func,
+                        arg,
                         signature,
-                    };
+                    } => {
+                        break Self::Aggregate {
+                            func: func.into(),
+                            arg: Box::new(IRExpr::from(*arg)),
+                            signature,
+                        };
+                    }
+                    BlockAggregateExprMirror::Cast { expr, ty } => {
+                        casts.push(ty);
+                        current = *expr;
+                    }
                 }
-                BlockAggregateExprMirror::Cast { expr, ty } => {
-                    casts.push(ty);
-                    current = *expr;
-                }
-            }
-        };
-        for ty in casts.into_iter().rev() {
-            expr = Self::Cast {
-                expr: Box::new(expr),
-                ty,
             };
-        }
-        expr
+            for ty in casts.into_iter().rev() {
+                expr = Self::Cast {
+                    expr: Box::new(expr),
+                    ty,
+                };
+            }
+            expr
+        })
     }
 }
 
@@ -1507,11 +1513,11 @@ pub struct SubqueryPredicateMirror {
 
 impl From<&SubqueryPredicate> for SubqueryPredicateMirror {
     fn from(predicate: &SubqueryPredicate) -> Self {
-        Self {
+        omnigraph_compiler::stack::deep(|| Self {
             left: BlockAggregateExprMirror::from(&predicate.left),
             op: CompOpMirror::from(predicate.op),
             right: ExprMirror::from(&predicate.right),
-        }
+        })
     }
 }
 
@@ -1691,7 +1697,7 @@ impl From<&Literal> for LiteralMirror {
 
 impl From<LiteralMirror> for Literal {
     fn from(mirror: LiteralMirror) -> Self {
-        match mirror {
+        omnigraph_compiler::stack::deep(|| match mirror {
             LiteralMirror::Null => Self::Null,
             LiteralMirror::String(text) => Self::String(text),
             LiteralMirror::Integer(value) => Self::Integer(i128::from(value)),
@@ -1701,7 +1707,7 @@ impl From<LiteralMirror> for Literal {
             LiteralMirror::Date(text) => Self::Date(text),
             LiteralMirror::DateTime(text) => Self::DateTime(text),
             LiteralMirror::List(items) => Self::List(items.into_iter().map(Self::from).collect()),
-        }
+        })
     }
 }
 
@@ -1780,7 +1786,7 @@ fn unboxed(mirror: ExprMirror) -> Box<IRExpr> {
 
 impl From<&IRExpr> for ExprMirror {
     fn from(expr: &IRExpr) -> Self {
-        match expr {
+        omnigraph_compiler::stack::deep(|| match expr {
             IRExpr::PropAccess {
                 variable,
                 property,
@@ -1861,13 +1867,13 @@ impl From<&IRExpr> for ExprMirror {
                 args: args.iter().map(ExprMirror::from).collect(),
                 ty: ty.clone(),
             },
-        }
+        })
     }
 }
 
 impl From<ExprMirror> for IRExpr {
     fn from(mirror: ExprMirror) -> Self {
-        match mirror {
+        omnigraph_compiler::stack::deep(|| match mirror {
             ExprMirror::PropAccess {
                 variable,
                 property,
@@ -1937,7 +1943,7 @@ impl From<ExprMirror> for IRExpr {
                 args: args.into_iter().map(IRExpr::from).collect(),
                 ty,
             },
-        }
+        })
     }
 }
 

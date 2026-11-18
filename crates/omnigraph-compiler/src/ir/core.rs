@@ -398,7 +398,7 @@ impl Term {
             let mut at = chain;
             let mut charged = false;
             while let Some(i) = at {
-                if shared[i].0 == node as *const Term {
+                if std::ptr::eq(shared[i].0, node) {
                     charged = true;
                     break;
                 }

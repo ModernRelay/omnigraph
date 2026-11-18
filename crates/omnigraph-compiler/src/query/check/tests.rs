@@ -1149,44 +1149,47 @@ fn arithmetic_stores_widening_casts_and_typed_literals() {
         list: false,
         nullable,
     };
+    let sum = value("$p.age + $l");
     let IRExpr::Binary {
         left, op, right, ..
-    } = value("$p.age + $l")
+    } = &sum
     else {
         panic!("arithmetic")
     };
-    assert_eq!(op, BinaryOp::Arith(crate::query::syntax::ArithOp::Add));
-    let IRExpr::Cast { expr, ty: cast } = *left else {
+    assert_eq!(*op, BinaryOp::Arith(crate::query::syntax::ArithOp::Add));
+    let IRExpr::Cast { expr, ty: cast } = left.as_ref() else {
         panic!("the I32 operand is cast: {left:?}")
     };
     assert_eq!(
-        cast,
+        *cast,
         ty(ScalarType::I64, true),
         "the cast keeps `age`'s null"
     );
     assert_eq!(expr.ty(), &ty(ScalarType::I32, true));
-    assert!(matches!(*right, IRExpr::Param(..)));
-    let IRExpr::Binary { left, right, .. } = value("$p.age - -3") else {
+    assert!(matches!(**right, IRExpr::Param(..)));
+    let difference = value("$p.age - -3");
+    let IRExpr::Binary { left, right, .. } = &difference else {
         panic!("arithmetic")
     };
-    assert!(matches!(*left, IRExpr::PropAccess { .. }));
-    let IRExpr::Neg { expr, ty: negated } = *right else {
+    assert!(matches!(**left, IRExpr::PropAccess { .. }));
+    let IRExpr::Neg { expr, ty: negated } = right.as_ref() else {
         panic!("a negated literal: {right:?}")
     };
-    assert_eq!(negated, ty(ScalarType::I32, false));
+    assert_eq!(*negated, ty(ScalarType::I32, false));
     assert_eq!(
-        *expr,
+        **expr,
         IRExpr::Literal(Literal::Integer(3), ty(ScalarType::I32, false))
     );
+    let coalesced = value("coalesce($p.age, $l)");
     let IRExpr::Call {
         func: ScalarFunc::Coalesce,
         args,
         ty: result,
-    } = value("coalesce($p.age, $l)")
+    } = &coalesced
     else {
         panic!("coalesce")
     };
-    assert_eq!(result, ty(ScalarType::I64, false));
+    assert_eq!(*result, ty(ScalarType::I64, false));
     assert!(
         matches!(&args[0], IRExpr::Cast { ty, .. } if *ty == ExprType::Value { scalar: ScalarType::I64, list: false, nullable: true })
     );

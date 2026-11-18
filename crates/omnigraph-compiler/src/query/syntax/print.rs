@@ -209,11 +209,13 @@ pub(crate) fn braced(p: &Pattern) -> String {
 }
 
 pub(crate) fn elements(p: &Pattern) -> String {
-    p.elements
-        .iter()
-        .map(element)
-        .collect::<Vec<_>>()
-        .join(", ")
+    crate::stack::deep(|| {
+        p.elements
+            .iter()
+            .map(element)
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
 }
 
 pub(crate) fn inline(body: &ReadBody) -> String {
@@ -221,7 +223,7 @@ pub(crate) fn inline(body: &ReadBody) -> String {
 }
 
 pub fn element(c: &Element) -> String {
-    match c {
+    crate::stack::deep(|| match c {
         Element::Let { name, value } => match value {
             LetValue::Relation(body) => format!("let ${name} = {}", inline(body)),
             LetValue::Expr(e) => format!("let ${name} = {}", expr(e)),
@@ -264,7 +266,7 @@ pub fn element(c: &Element) -> String {
             let _ = write!(out, " ${}", t.dst);
             out
         }
-    }
+    })
 }
 
 pub(crate) fn relation(rel: &RelExpr) -> String {
@@ -308,16 +310,18 @@ pub(crate) fn comp(op: CompOp) -> &'static str {
 }
 
 pub(crate) fn call(c: &Call) -> String {
-    let mut parts: Vec<String> = c
-        .args
-        .iter()
-        .map(|a| match a {
-            Arg::Expr(e) => expr(e),
-            Arg::Inline(body) => inline(body),
-        })
-        .collect();
-    parts.extend(c.options.iter().map(|(k, v)| format!("{k}: {}", expr(v))));
-    format!("{}({})", c.name, parts.join(", "))
+    crate::stack::deep(|| {
+        let mut parts: Vec<String> = c
+            .args
+            .iter()
+            .map(|a| match a {
+                Arg::Expr(e) => expr(e),
+                Arg::Inline(body) => inline(body),
+            })
+            .collect();
+        parts.extend(c.options.iter().map(|(k, v)| format!("{k}: {}", expr(v))));
+        format!("{}({})", c.name, parts.join(", "))
+    })
 }
 
 /// Precedence, lowest first, following the grammar's ladder.
@@ -334,7 +338,7 @@ pub(crate) enum Prec {
 }
 
 pub(crate) fn prec(e: &Expr) -> Prec {
-    match e {
+    crate::stack::deep(|| match e {
         Expr::Or(..) => Prec::Or,
         Expr::And(..) => Prec::And,
         Expr::Not(_) => Prec::Not,
@@ -348,20 +352,22 @@ pub(crate) fn prec(e: &Expr) -> Prec {
         Expr::Arith { .. } => Prec::Product,
         Expr::Neg(_) => Prec::Unary,
         _ => Prec::Atom,
-    }
+    })
 }
 
 /// `e` printed where the grammar requires at least `min`.
 fn at(e: &Expr, min: Prec) -> String {
-    if prec(e) < min {
-        format!("({})", expr(e))
-    } else {
-        expr(e)
-    }
+    crate::stack::deep(|| {
+        if prec(e) < min {
+            format!("({})", expr(e))
+        } else {
+            expr(e)
+        }
+    })
 }
 
 pub fn expr(e: &Expr) -> String {
-    match e {
+    crate::stack::deep(|| match e {
         Expr::Literal(l) => literal(l),
         Expr::Variable(v) => format!("${v}"),
         Expr::List { elements, .. } => format!(
@@ -414,7 +420,7 @@ pub fn expr(e: &Expr) -> String {
             op.name(),
             at(right, Prec::Sum)
         ),
-    }
+    })
 }
 
 pub fn literal(l: &Literal) -> String {

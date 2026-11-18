@@ -14,24 +14,26 @@ use crate::types::{ExprType, PropType, ScalarType};
 
 /// `left <op> right`, folded when both operands are literals.
 pub(super) fn binary(left: IRExpr, op: BinaryOp, right: IRExpr) -> IRExpr {
-    if let (IRExpr::Literal(l, _), IRExpr::Literal(r, _)) = (&left, &right)
-        && !matches!(op, BinaryOp::Arith(_))
-        && let Some(value) = evaluate(op, l, r)
-    {
-        return IRExpr::Literal(
-            value,
-            ExprType::from_prop(&PropType::scalar(
-                ScalarType::Bool,
-                left.ty().nullable() || right.ty().nullable(),
-            )),
-        );
-    }
-    IRExpr::binary(left, op, right)
+    crate::stack::deep(|| {
+        if let (IRExpr::Literal(l, _), IRExpr::Literal(r, _)) = (&left, &right)
+            && !matches!(op, BinaryOp::Arith(_))
+            && let Some(value) = evaluate(op, l, r)
+        {
+            return IRExpr::Literal(
+                value,
+                ExprType::from_prop(&PropType::scalar(
+                    ScalarType::Bool,
+                    left.ty().nullable() || right.ty().nullable(),
+                )),
+            );
+        }
+        IRExpr::binary(left, op, right)
+    })
 }
 
 /// `not <inner>`, folded over a Boolean or null literal.
 pub(crate) fn not(inner: IRExpr) -> IRExpr {
-    match inner {
+    match &inner {
         IRExpr::Literal(Literal::Bool(value), ty) => IRExpr::Literal(
             Literal::Bool(!value),
             ExprType::from_prop(&PropType::scalar(ScalarType::Bool, ty.nullable())),
@@ -40,18 +42,18 @@ pub(crate) fn not(inner: IRExpr) -> IRExpr {
             Literal::Null,
             ExprType::from_prop(&PropType::scalar(ScalarType::Bool, true)),
         ),
-        other => IRExpr::logical_not(other),
+        _ => IRExpr::logical_not(inner),
     }
 }
 
 /// `<expr> is null` / `is not null`, folded over any literal.
 pub(crate) fn is_null(expr: IRExpr, negated: bool) -> IRExpr {
-    match expr {
+    match &expr {
         IRExpr::Literal(literal, _) => IRExpr::Literal(
             Literal::Bool(matches!(literal, Literal::Null) != negated),
             ExprType::from_prop(&PropType::scalar(ScalarType::Bool, false)),
         ),
-        other => IRExpr::null_test(other, negated),
+        _ => IRExpr::null_test(expr, negated),
     }
 }
 
@@ -290,10 +292,10 @@ mod tests {
                 t,
             ),
         ] {
-            let IRExpr::Literal(actual, _) = expression else {
+            let IRExpr::Literal(actual, _) = &expression else {
                 panic!("expected a folded literal")
             };
-            assert_eq!(actual, expected);
+            assert_eq!(actual, &expected);
         }
     }
 

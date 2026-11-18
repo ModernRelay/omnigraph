@@ -145,18 +145,20 @@ fn element_span<'p>(
     kinds: &[ElementKind],
     name: Option<&str>,
 ) -> Option<&'p SourceSpan> {
-    for (i, element) in pattern.elements.iter().enumerate() {
-        if element_matches(element, kinds, name) {
-            return pattern.spans.elements.get(i);
+    crate::stack::deep(|| {
+        for (i, element) in pattern.elements.iter().enumerate() {
+            if element_matches(element, kinds, name) {
+                return pattern.spans.elements.get(i);
+            }
+            if let Some(span) = nested(element)
+                .into_iter()
+                .find_map(|p| element_span(p, kinds, name))
+            {
+                return Some(span);
+            }
         }
-        if let Some(span) = nested(element)
-            .into_iter()
-            .find_map(|p| element_span(p, kinds, name))
-        {
-            return Some(span);
-        }
-    }
-    None
+        None
+    })
 }
 
 /// The comparison a block is an operand of, in `pattern`'s `where` or a
@@ -175,7 +177,7 @@ fn block_span(pattern: &Pattern) -> Option<&SourceSpan> {
 }
 
 fn compared_block(e: &Expr) -> Option<&SourceSpan> {
-    match e {
+    crate::stack::deep(|| match e {
         Expr::Compare {
             left, right, at, ..
         } => {
@@ -192,5 +194,5 @@ fn compared_block(e: &Expr) -> Option<&SourceSpan> {
             left: l, right: r, ..
         } => compared_block(l).or_else(|| compared_block(r)),
         _ => None,
-    }
+    })
 }

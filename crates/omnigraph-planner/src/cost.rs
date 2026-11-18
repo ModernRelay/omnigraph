@@ -365,19 +365,19 @@ fn bounded_property<'a>(
 ) -> Option<(&'a str, u64)> {
     let (left, op, right) = filter.comparison_parts()?;
     fn constant(expr: &IRExpr) -> bool {
-        match expr {
+        omnigraph_compiler::stack::deep(|| match expr {
             IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
             IRExpr::Cast { expr, .. } => constant(expr),
             _ => false,
-        }
+        })
     }
     fn list_len(expr: &IRExpr, source: &dyn PlanSource) -> Option<usize> {
-        match expr {
+        omnigraph_compiler::stack::deep(|| match expr {
             IRExpr::Literal(Literal::List(items), _) => Some(items.len()),
             IRExpr::Param(name, _) => source.list_parameter_len(name),
             IRExpr::Cast { expr, .. } => list_len(expr, source),
             _ => None,
-        }
+        })
     }
     let of_binding = |expr: &'a IRExpr| match expr {
         IRExpr::PropAccess {

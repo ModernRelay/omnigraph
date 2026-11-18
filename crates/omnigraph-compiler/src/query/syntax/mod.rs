@@ -367,7 +367,9 @@ impl ArithOp {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// `Clone`, `PartialEq` and `Debug` are written out rather than derived only
+/// so that each level of a deep expression enters through
+/// [`crate::stack::deep`]; they mean what the derived ones would.
 pub enum Expr {
     Literal(Literal),
     Variable(String),
@@ -435,6 +437,310 @@ pub enum Expr {
         right: Box<Expr>,
         at: SourceSpan,
     },
+}
+
+/// A deep tree is taken apart child by child onto a heap stack, so dropping
+/// it never recurses once per level (see [`crate::ir::IRExpr`]'s `Drop`).
+impl Drop for Expr {
+    fn drop(&mut self) {
+        let mut pending: Vec<Expr> = Vec::new();
+        self.take_children(&mut pending);
+        while let Some(mut child) = pending.pop() {
+            child.take_children(&mut pending);
+        }
+    }
+}
+
+impl Expr {
+    /// Every boxed child expression of the node moved into `out`, a leaf in
+    /// its place. A block's or a call's own expressions stay: they are a
+    /// scope of their own, whose drop enters each level through the stack
+    /// guard of [`Expr`]'s parts.
+    fn take_children(&mut self, out: &mut Vec<Expr>) {
+        let mut take = |child: &mut Box<Expr>| {
+            if !matches!(child.as_ref(), Expr::Literal(_) | Expr::Variable(_)) {
+                out.push(std::mem::replace(
+                    child.as_mut(),
+                    Expr::Variable(String::new()),
+                ));
+            }
+        };
+        match self {
+            Self::AggDistinct { arg: child, .. }
+            | Self::Neg(child)
+            | Self::IsNull { expr: child, .. }
+            | Self::Not(child) => take(child),
+            Self::Arith { left, right, .. }
+            | Self::Compare { left, right, .. }
+            | Self::In {
+                needle: left,
+                list: right,
+                ..
+            }
+            | Self::And(left, right)
+            | Self::Or(left, right)
+            | Self::InfixString { left, right, .. } => {
+                take(left);
+                take(right);
+            }
+            Self::Literal(_)
+            | Self::Variable(_)
+            | Self::List { .. }
+            | Self::Prop { .. }
+            | Self::Meta(_)
+            | Self::Ident(_)
+            | Self::Call(_)
+            | Self::Block(_) => {}
+        }
+    }
+}
+
+impl Clone for Expr {
+    fn clone(&self) -> Self {
+        crate::stack::deep(|| match self {
+            Self::Literal(f0) => Self::Literal(f0.clone()),
+            Self::Variable(f0) => Self::Variable(f0.clone()),
+            Self::List { elements, at } => Self::List {
+                elements: elements.clone(),
+                at: at.clone(),
+            },
+            Self::Prop { variable, property } => Self::Prop {
+                variable: variable.clone(),
+                property: property.clone(),
+            },
+            Self::Meta(f0) => Self::Meta(f0.clone()),
+            Self::Ident(f0) => Self::Ident(f0.clone()),
+            Self::Call(f0) => Self::Call(f0.clone()),
+            Self::AggDistinct { func, arg } => Self::AggDistinct {
+                func: *func,
+                arg: arg.clone(),
+            },
+            Self::Block(f0) => Self::Block(f0.clone()),
+            Self::Neg(f0) => Self::Neg(f0.clone()),
+            Self::Arith { op, left, right } => Self::Arith {
+                op: *op,
+                left: left.clone(),
+                right: right.clone(),
+            },
+            Self::Compare {
+                op,
+                left,
+                right,
+                at,
+            } => Self::Compare {
+                op: *op,
+                left: left.clone(),
+                right: right.clone(),
+                at: at.clone(),
+            },
+            Self::In { needle, list, at } => Self::In {
+                needle: needle.clone(),
+                list: list.clone(),
+                at: at.clone(),
+            },
+            Self::IsNull { expr, negated } => Self::IsNull {
+                expr: expr.clone(),
+                negated: *negated,
+            },
+            Self::Not(f0) => Self::Not(f0.clone()),
+            Self::And(f0, f1) => Self::And(f0.clone(), f1.clone()),
+            Self::Or(f0, f1) => Self::Or(f0.clone(), f1.clone()),
+            Self::InfixString {
+                op,
+                left,
+                right,
+                at,
+            } => Self::InfixString {
+                op: *op,
+                left: left.clone(),
+                right: right.clone(),
+                at: at.clone(),
+            },
+        })
+    }
+}
+
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        crate::stack::deep(|| match (self, other) {
+            (Self::Literal(f01), Self::Literal(f02)) => f01 == f02,
+            (Self::Variable(f01), Self::Variable(f02)) => f01 == f02,
+            (
+                Self::List {
+                    elements: elements1,
+                    at: at1,
+                },
+                Self::List {
+                    elements: elements2,
+                    at: at2,
+                },
+            ) => elements1 == elements2 && at1 == at2,
+            (
+                Self::Prop {
+                    variable: variable1,
+                    property: property1,
+                },
+                Self::Prop {
+                    variable: variable2,
+                    property: property2,
+                },
+            ) => variable1 == variable2 && property1 == property2,
+            (Self::Meta(f01), Self::Meta(f02)) => f01 == f02,
+            (Self::Ident(f01), Self::Ident(f02)) => f01 == f02,
+            (Self::Call(f01), Self::Call(f02)) => f01 == f02,
+            (
+                Self::AggDistinct {
+                    func: func1,
+                    arg: arg1,
+                },
+                Self::AggDistinct {
+                    func: func2,
+                    arg: arg2,
+                },
+            ) => func1 == func2 && arg1 == arg2,
+            (Self::Block(f01), Self::Block(f02)) => f01 == f02,
+            (Self::Neg(f01), Self::Neg(f02)) => f01 == f02,
+            (
+                Self::Arith {
+                    op: op1,
+                    left: left1,
+                    right: right1,
+                },
+                Self::Arith {
+                    op: op2,
+                    left: left2,
+                    right: right2,
+                },
+            ) => op1 == op2 && left1 == left2 && right1 == right2,
+            (
+                Self::Compare {
+                    op: op1,
+                    left: left1,
+                    right: right1,
+                    at: at1,
+                },
+                Self::Compare {
+                    op: op2,
+                    left: left2,
+                    right: right2,
+                    at: at2,
+                },
+            ) => op1 == op2 && left1 == left2 && right1 == right2 && at1 == at2,
+            (
+                Self::In {
+                    needle: needle1,
+                    list: list1,
+                    at: at1,
+                },
+                Self::In {
+                    needle: needle2,
+                    list: list2,
+                    at: at2,
+                },
+            ) => needle1 == needle2 && list1 == list2 && at1 == at2,
+            (
+                Self::IsNull {
+                    expr: expr1,
+                    negated: negated1,
+                },
+                Self::IsNull {
+                    expr: expr2,
+                    negated: negated2,
+                },
+            ) => expr1 == expr2 && negated1 == negated2,
+            (Self::Not(f01), Self::Not(f02)) => f01 == f02,
+            (Self::And(f01, f11), Self::And(f02, f12)) => f01 == f02 && f11 == f12,
+            (Self::Or(f01, f11), Self::Or(f02, f12)) => f01 == f02 && f11 == f12,
+            (
+                Self::InfixString {
+                    op: op1,
+                    left: left1,
+                    right: right1,
+                    at: at1,
+                },
+                Self::InfixString {
+                    op: op2,
+                    left: left2,
+                    right: right2,
+                    at: at2,
+                },
+            ) => op1 == op2 && left1 == left2 && right1 == right2 && at1 == at2,
+            _ => false,
+        })
+    }
+}
+
+impl std::fmt::Debug for Expr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::stack::deep(|| match self {
+            Self::Literal(f0) => f.debug_tuple("Literal").field(f0).finish(),
+            Self::Variable(f0) => f.debug_tuple("Variable").field(f0).finish(),
+            Self::List { elements, at } => f
+                .debug_struct("List")
+                .field("elements", elements)
+                .field("at", at)
+                .finish(),
+            Self::Prop { variable, property } => f
+                .debug_struct("Prop")
+                .field("variable", variable)
+                .field("property", property)
+                .finish(),
+            Self::Meta(f0) => f.debug_tuple("Meta").field(f0).finish(),
+            Self::Ident(f0) => f.debug_tuple("Ident").field(f0).finish(),
+            Self::Call(f0) => f.debug_tuple("Call").field(f0).finish(),
+            Self::AggDistinct { func, arg } => f
+                .debug_struct("AggDistinct")
+                .field("func", func)
+                .field("arg", arg)
+                .finish(),
+            Self::Block(f0) => f.debug_tuple("Block").field(f0).finish(),
+            Self::Neg(f0) => f.debug_tuple("Neg").field(f0).finish(),
+            Self::Arith { op, left, right } => f
+                .debug_struct("Arith")
+                .field("op", op)
+                .field("left", left)
+                .field("right", right)
+                .finish(),
+            Self::Compare {
+                op,
+                left,
+                right,
+                at,
+            } => f
+                .debug_struct("Compare")
+                .field("op", op)
+                .field("left", left)
+                .field("right", right)
+                .field("at", at)
+                .finish(),
+            Self::In { needle, list, at } => f
+                .debug_struct("In")
+                .field("needle", needle)
+                .field("list", list)
+                .field("at", at)
+                .finish(),
+            Self::IsNull { expr, negated } => f
+                .debug_struct("IsNull")
+                .field("expr", expr)
+                .field("negated", negated)
+                .finish(),
+            Self::Not(f0) => f.debug_tuple("Not").field(f0).finish(),
+            Self::And(f0, f1) => f.debug_tuple("And").field(f0).field(f1).finish(),
+            Self::Or(f0, f1) => f.debug_tuple("Or").field(f0).field(f1).finish(),
+            Self::InfixString {
+                op,
+                left,
+                right,
+                at,
+            } => f
+                .debug_struct("InfixString")
+                .field("op", op)
+                .field("left", left)
+                .field("right", right)
+                .field("at", at)
+                .finish(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

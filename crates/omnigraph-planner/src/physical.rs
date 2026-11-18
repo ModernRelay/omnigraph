@@ -1398,315 +1398,317 @@ impl PhysicalPlan {
     }
 
     fn node_json(&self, id: NodeId, query: bool) -> Value {
-        let Some(node) = self.node(id) else {
-            return json!({ "node": "tombstone", "id": id });
-        };
-        let mut value = match node {
-            PhysicalNode::MetadataCount { spec, return_exprs } => {
-                metadata_count_json(spec, return_exprs)
-            }
-            PhysicalNode::Scan {
-                source,
-                spec,
-                ordered,
-                keys_only,
-                ranked,
-            } => {
-                let mut value = scan_json("Scan", spec);
-                if let Some(access) = &spec.access {
-                    access.explain(&mut value);
+        omnigraph_compiler::stack::deep(|| {
+            let Some(node) = self.node(id) else {
+                return json!({ "node": "tombstone", "id": id });
+            };
+            let mut value = match node {
+                PhysicalNode::MetadataCount { spec, return_exprs } => {
+                    metadata_count_json(spec, return_exprs)
                 }
-                if let ScanInput::Dependent { .. } = source {
-                    value["id_restriction"] = json!("input");
-                    value["access"] = json!(AccessPath::IdLookup);
-                }
-                value["ordered"] = json!(ordered);
-                value["keys_only"] = json!(keys_only);
-                if let Some(ranked) = ranked {
-                    value["ranked"] = ranked.to_json();
-                }
-                value
-            }
-            PhysicalNode::SortMergeJoin {
-                kind,
-                on,
-                build,
-                drop_equal_addresses,
-                ..
-            } => json!({
-                "node": "SortMergeJoin",
-                "kind": kind,
-                "on": on,
-                "build": build,
-                "drop_equal_addresses": drop_equal_addresses,
-            }),
-            PhysicalNode::HydrateByAddress { side, .. } => json!({
-                "node": "HydrateByAddress",
-                "side": side,
-            }),
-            PhysicalNode::HydrateColumns { bindings, .. } => json!({
-                "node": "HydrateColumns",
-                "bindings": bindings
-                    .iter()
-                    .map(|binding| json!({
-                        "binding": binding.binding,
-                        "table": binding.table.type_key,
-                        "columns": binding
-                            .columns
-                            .iter()
-                            .map(|column| column.property.as_str())
-                            .collect::<Vec<&str>>(),
-                    }))
-                    .collect::<Vec<Value>>(),
-            }),
-            PhysicalNode::HashJoin {
-                binding, fallback, ..
-            } => json!({
-                "node": "HashJoin",
-                "binding": binding,
-                "fallback": fallback,
-            }),
-            PhysicalNode::Limit { rows, .. } => json!({
-                "node": "Page", "rows": rows, "bytes": 0, "resume": null,
-            }),
-            PhysicalNode::TargetCut {
-                binding, targets, ..
-            } => json!({
-                "node": "TargetCut", "binding": binding, "targets": targets,
-            }),
-            PhysicalNode::Score {
-                binding,
-                type_name,
-                property,
-                kind,
-                query,
-                ..
-            } => json!({
-                "node": node.name(),
-                "binding": binding,
-                "type_name": type_name,
-                "property": property,
-                "kind": score_kind_name(*kind),
-                "typed_query": crate::typed::expr(query),
-            }),
-            PhysicalNode::Let { name, value, .. } => json!({
-                "node": node.name(),
-                "name": name,
-                "typed_value": crate::typed::expr(value),
-            }),
-            PhysicalNode::Page {
-                rows,
-                bytes,
-                resume,
-                ..
-            } => json!({
-                "node": "Page",
-                "rows": rows,
-                "bytes": bytes,
-                "resume": resume,
-            }),
-            PhysicalNode::Filter { filters, .. } => json!({
-                "node": "Filter",
-                "filters": filters_json(filters),
-                "typed_filters": crate::typed::exprs(filters),
-            }),
-            PhysicalNode::Expand {
-                src,
-                dst,
-                edges,
-                src_type,
-                dst_type,
-                min_hops,
-                max_hops,
-                edge_binding,
-                mode,
-                frontier_estimate,
-                policy,
-                versions,
-                ..
-            } => json!({
-                "node": "Expand",
-                "src": src,
-                "dst": dst,
-                "edges": EdgeSelectionMirror::from(edges),
-                "src_type": src_type,
-                "dst_type": dst_type,
-                "min_hops": min_hops,
-                "max_hops": max_hops,
-                "edge_binding": edge_binding,
-                "mode": mode,
-                "alternatives": policy.alternatives(*mode),
-                "frontier_estimate": frontier_estimate,
-                "versions": versions,
-            }),
-            PhysicalNode::AntiJoin {
-                outer_var,
-                predicate,
-                aggregate,
-                strategy,
-                ..
-            } => json!({
-                "node": node.name(),
-                "outer_var": outer_var,
-                "strategy": strategy,
-                "predicate": predicate.to_string(),
-                "aggregate": crate::typed::block_aggregate(&predicate.left, *aggregate),
-                "typed_left": crate::typed::block(&predicate.left),
-                "typed_right": crate::typed::expr(&predicate.right),
-            }),
-            PhysicalNode::Union { bindings, .. } => json!({
-                "node": node.name(),
-                "bindings": bindings,
-            }),
-            PhysicalNode::OptionalJoin { outer_var, .. } => json!({
-                "node": node.name(),
-                "outer_var": outer_var,
-            }),
-            PhysicalNode::Correlate {
-                outer_var,
-                read,
-                tiebreak,
-                ..
-            } => {
-                let mut value = inner_read_json(read, tiebreak);
-                value["node"] = json!(node.name());
-                value["outer_var"] = json!(outer_var);
-                value
-            }
-            PhysicalNode::OuterReference { outer_var } => json!({
-                "node": node.name(),
-                "outer_var": outer_var,
-            }),
-            PhysicalNode::Fuse {
-                arms,
-                target,
-                k,
-                weights,
-            } => json!({
-                "node": "Fuse",
-                "target": target,
-                "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
-                "k": k.as_ref().map(ToString::to_string),
-                "typed_k": k.as_ref().map(crate::typed::expr),
-                "weights": weights.as_ref().map(ToString::to_string),
-                "typed_weights": weights.as_ref().map(crate::typed::expr),
-            }),
-            PhysicalNode::Aggregate {
-                return_exprs,
-                aggregates,
-                ..
-            } => json!({
-                "node": node.name(),
-                "exprs": return_exprs.iter().map(|projection| projection.expr.to_string()).collect::<Vec<_>>(),
-                "columns": crate::output::return_columns(return_exprs),
-                "typed_exprs": crate::typed::returns(return_exprs),
-                "aggregates": return_exprs.iter().zip(aggregates).map(|(projection, spec)| {
-                    match (&projection.expr, spec) {
-                        (IRExpr::Aggregate { func, distinct, signature, .. }, Some(spec)) => json!({
-                            "column": crate::optimizer::result_column(projection),
-                            "func": func.to_string(),
-                            "distinct": distinct,
-                            "input": signature.arg.spelling(),
-                            "accumulator": spec.accumulator,
-                            "overflow": spec.overflow,
-                            "result": signature.result.spelling(),
-                        }),
-                        _ => Value::Null,
+                PhysicalNode::Scan {
+                    source,
+                    spec,
+                    ordered,
+                    keys_only,
+                    ranked,
+                } => {
+                    let mut value = scan_json("Scan", spec);
+                    if let Some(access) = &spec.access {
+                        access.explain(&mut value);
                     }
-                }).collect::<Vec<_>>(),
-            }),
-            PhysicalNode::Projection { return_exprs, .. } => json!({
-                "node": node.name(),
-                "columns": crate::output::return_columns(return_exprs),
-                "typed_exprs": crate::typed::returns(return_exprs),
-                "exprs": return_exprs
-                    .iter()
-                    .map(|projection| projection.expr.to_string())
-                    .collect::<Vec<String>>(),
-            }),
-            PhysicalNode::Sort {
-                order_by,
-                fetch,
-                tiebreak,
-                ..
-            } => json!({
-                "node": "Sort",
-                "keys": order_by.iter().map(ordering_text).collect::<Vec<String>>(),
-                "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
-                "fetch": fetch,
-                "tiebreak": tiebreak_text(tiebreak),
-            }),
-            PhysicalNode::CrossJoin { filters, .. } if !filters.is_empty() => json!({
-                "node": "CrossJoin",
-                "filters": filters_json(filters),
-                "typed_filters": crate::typed::exprs(filters),
-            }),
-            PhysicalNode::ContainsJoin {
-                haystack,
-                needle,
-                conjunct,
-                residual,
-                ..
-            } => json!({
-                "node": "ContainsJoin",
-                "haystack": column_text(haystack),
-                "needle": column_text(needle),
-                "residual": filters_json(residual),
-                "typed_residual": crate::typed::exprs(residual),
-                "typed_conjunct": crate::typed::expr(conjunct),
-            }),
-            PhysicalNode::DeltaSource { spec } => delta_source_json(spec),
-            PhysicalNode::CsvSource {
-                spec,
-                max_partitions,
-                max_workers,
-            } => {
-                let mut value = csv_source_json(spec);
-                value["max_partitions"] = json!(max_partitions);
-                value["max_workers"] = json!(max_workers);
-                value["fallback"] = json!("single_scan");
-                value
+                    if let ScanInput::Dependent { .. } = source {
+                        value["id_restriction"] = json!("input");
+                        value["access"] = json!(AccessPath::IdLookup);
+                    }
+                    value["ordered"] = json!(ordered);
+                    value["keys_only"] = json!(keys_only);
+                    if let Some(ranked) = ranked {
+                        value["ranked"] = ranked.to_json();
+                    }
+                    value
+                }
+                PhysicalNode::SortMergeJoin {
+                    kind,
+                    on,
+                    build,
+                    drop_equal_addresses,
+                    ..
+                } => json!({
+                    "node": "SortMergeJoin",
+                    "kind": kind,
+                    "on": on,
+                    "build": build,
+                    "drop_equal_addresses": drop_equal_addresses,
+                }),
+                PhysicalNode::HydrateByAddress { side, .. } => json!({
+                    "node": "HydrateByAddress",
+                    "side": side,
+                }),
+                PhysicalNode::HydrateColumns { bindings, .. } => json!({
+                    "node": "HydrateColumns",
+                    "bindings": bindings
+                        .iter()
+                        .map(|binding| json!({
+                            "binding": binding.binding,
+                            "table": binding.table.type_key,
+                            "columns": binding
+                                .columns
+                                .iter()
+                                .map(|column| column.property.as_str())
+                                .collect::<Vec<&str>>(),
+                        }))
+                        .collect::<Vec<Value>>(),
+                }),
+                PhysicalNode::HashJoin {
+                    binding, fallback, ..
+                } => json!({
+                    "node": "HashJoin",
+                    "binding": binding,
+                    "fallback": fallback,
+                }),
+                PhysicalNode::Limit { rows, .. } => json!({
+                    "node": "Page", "rows": rows, "bytes": 0, "resume": null,
+                }),
+                PhysicalNode::TargetCut {
+                    binding, targets, ..
+                } => json!({
+                    "node": "TargetCut", "binding": binding, "targets": targets,
+                }),
+                PhysicalNode::Score {
+                    binding,
+                    type_name,
+                    property,
+                    kind,
+                    query,
+                    ..
+                } => json!({
+                    "node": node.name(),
+                    "binding": binding,
+                    "type_name": type_name,
+                    "property": property,
+                    "kind": score_kind_name(*kind),
+                    "typed_query": crate::typed::expr(query),
+                }),
+                PhysicalNode::Let { name, value, .. } => json!({
+                    "node": node.name(),
+                    "name": name,
+                    "typed_value": crate::typed::expr(value),
+                }),
+                PhysicalNode::Page {
+                    rows,
+                    bytes,
+                    resume,
+                    ..
+                } => json!({
+                    "node": "Page",
+                    "rows": rows,
+                    "bytes": bytes,
+                    "resume": resume,
+                }),
+                PhysicalNode::Filter { filters, .. } => json!({
+                    "node": "Filter",
+                    "filters": filters_json(filters),
+                    "typed_filters": crate::typed::exprs(filters),
+                }),
+                PhysicalNode::Expand {
+                    src,
+                    dst,
+                    edges,
+                    src_type,
+                    dst_type,
+                    min_hops,
+                    max_hops,
+                    edge_binding,
+                    mode,
+                    frontier_estimate,
+                    policy,
+                    versions,
+                    ..
+                } => json!({
+                    "node": "Expand",
+                    "src": src,
+                    "dst": dst,
+                    "edges": EdgeSelectionMirror::from(edges),
+                    "src_type": src_type,
+                    "dst_type": dst_type,
+                    "min_hops": min_hops,
+                    "max_hops": max_hops,
+                    "edge_binding": edge_binding,
+                    "mode": mode,
+                    "alternatives": policy.alternatives(*mode),
+                    "frontier_estimate": frontier_estimate,
+                    "versions": versions,
+                }),
+                PhysicalNode::AntiJoin {
+                    outer_var,
+                    predicate,
+                    aggregate,
+                    strategy,
+                    ..
+                } => json!({
+                    "node": node.name(),
+                    "outer_var": outer_var,
+                    "strategy": strategy,
+                    "predicate": predicate.to_string(),
+                    "aggregate": crate::typed::block_aggregate(&predicate.left, *aggregate),
+                    "typed_left": crate::typed::block(&predicate.left),
+                    "typed_right": crate::typed::expr(&predicate.right),
+                }),
+                PhysicalNode::Union { bindings, .. } => json!({
+                    "node": node.name(),
+                    "bindings": bindings,
+                }),
+                PhysicalNode::OptionalJoin { outer_var, .. } => json!({
+                    "node": node.name(),
+                    "outer_var": outer_var,
+                }),
+                PhysicalNode::Correlate {
+                    outer_var,
+                    read,
+                    tiebreak,
+                    ..
+                } => {
+                    let mut value = inner_read_json(read, tiebreak);
+                    value["node"] = json!(node.name());
+                    value["outer_var"] = json!(outer_var);
+                    value
+                }
+                PhysicalNode::OuterReference { outer_var } => json!({
+                    "node": node.name(),
+                    "outer_var": outer_var,
+                }),
+                PhysicalNode::Fuse {
+                    arms,
+                    target,
+                    k,
+                    weights,
+                } => json!({
+                    "node": "Fuse",
+                    "target": target,
+                    "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
+                    "k": k.as_ref().map(ToString::to_string),
+                    "typed_k": k.as_ref().map(crate::typed::expr),
+                    "weights": weights.as_ref().map(ToString::to_string),
+                    "typed_weights": weights.as_ref().map(crate::typed::expr),
+                }),
+                PhysicalNode::Aggregate {
+                    return_exprs,
+                    aggregates,
+                    ..
+                } => json!({
+                    "node": node.name(),
+                    "exprs": return_exprs.iter().map(|projection| projection.expr.to_string()).collect::<Vec<_>>(),
+                    "columns": crate::output::return_columns(return_exprs),
+                    "typed_exprs": crate::typed::returns(return_exprs),
+                    "aggregates": return_exprs.iter().zip(aggregates).map(|(projection, spec)| {
+                        match (&projection.expr, spec) {
+                            (IRExpr::Aggregate { func, distinct, signature, .. }, Some(spec)) => json!({
+                                "column": crate::optimizer::result_column(projection),
+                                "func": func.to_string(),
+                                "distinct": distinct,
+                                "input": signature.arg.spelling(),
+                                "accumulator": spec.accumulator,
+                                "overflow": spec.overflow,
+                                "result": signature.result.spelling(),
+                            }),
+                            _ => Value::Null,
+                        }
+                    }).collect::<Vec<_>>(),
+                }),
+                PhysicalNode::Projection { return_exprs, .. } => json!({
+                    "node": node.name(),
+                    "columns": crate::output::return_columns(return_exprs),
+                    "typed_exprs": crate::typed::returns(return_exprs),
+                    "exprs": return_exprs
+                        .iter()
+                        .map(|projection| projection.expr.to_string())
+                        .collect::<Vec<String>>(),
+                }),
+                PhysicalNode::Sort {
+                    order_by,
+                    fetch,
+                    tiebreak,
+                    ..
+                } => json!({
+                    "node": "Sort",
+                    "keys": order_by.iter().map(ordering_text).collect::<Vec<String>>(),
+                    "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
+                    "fetch": fetch,
+                    "tiebreak": tiebreak_text(tiebreak),
+                }),
+                PhysicalNode::CrossJoin { filters, .. } if !filters.is_empty() => json!({
+                    "node": "CrossJoin",
+                    "filters": filters_json(filters),
+                    "typed_filters": crate::typed::exprs(filters),
+                }),
+                PhysicalNode::ContainsJoin {
+                    haystack,
+                    needle,
+                    conjunct,
+                    residual,
+                    ..
+                } => json!({
+                    "node": "ContainsJoin",
+                    "haystack": column_text(haystack),
+                    "needle": column_text(needle),
+                    "residual": filters_json(residual),
+                    "typed_residual": crate::typed::exprs(residual),
+                    "typed_conjunct": crate::typed::expr(conjunct),
+                }),
+                PhysicalNode::DeltaSource { spec } => delta_source_json(spec),
+                PhysicalNode::CsvSource {
+                    spec,
+                    max_partitions,
+                    max_workers,
+                } => {
+                    let mut value = csv_source_json(spec);
+                    value["max_partitions"] = json!(max_partitions);
+                    value["max_workers"] = json!(max_workers);
+                    value["fallback"] = json!("single_scan");
+                    value
+                }
+                PhysicalNode::Validate {
+                    table,
+                    checks,
+                    removal,
+                    max_workers,
+                    ..
+                } => {
+                    let mut value = validate_json(table, checks);
+                    value["removal"] = json!(removal);
+                    value["max_workers"] = json!(max_workers);
+                    value
+                }
+                PhysicalNode::FragmentWrite {
+                    spec,
+                    max_input_bytes,
+                    max_workers,
+                    ..
+                } => {
+                    let mut value = fragment_write_json(spec);
+                    value["max_input_bytes"] = json!(max_input_bytes);
+                    value["max_workers"] = json!(max_workers);
+                    value
+                }
+                PhysicalNode::RowCompare { .. }
+                | PhysicalNode::ClassifyThreeWay { .. }
+                | PhysicalNode::CrossJoin { .. } => json!({ "node": node.name() }),
+            };
+            value["id"] = json!(id);
+            if let Some(properties) = self.properties(id) {
+                value["properties"] = properties.to_json(query);
             }
-            PhysicalNode::Validate {
-                table,
-                checks,
-                removal,
-                max_workers,
-                ..
-            } => {
-                let mut value = validate_json(table, checks);
-                value["removal"] = json!(removal);
-                value["max_workers"] = json!(max_workers);
-                value
+            let inputs: Vec<Value> = node
+                .inputs()
+                .into_iter()
+                .map(|input| self.node_json(input, query))
+                .collect();
+            if !inputs.is_empty() {
+                value["inputs"] = Value::Array(inputs);
             }
-            PhysicalNode::FragmentWrite {
-                spec,
-                max_input_bytes,
-                max_workers,
-                ..
-            } => {
-                let mut value = fragment_write_json(spec);
-                value["max_input_bytes"] = json!(max_input_bytes);
-                value["max_workers"] = json!(max_workers);
-                value
-            }
-            PhysicalNode::RowCompare { .. }
-            | PhysicalNode::ClassifyThreeWay { .. }
-            | PhysicalNode::CrossJoin { .. } => json!({ "node": node.name() }),
-        };
-        value["id"] = json!(id);
-        if let Some(properties) = self.properties(id) {
-            value["properties"] = properties.to_json(query);
-        }
-        let inputs: Vec<Value> = node
-            .inputs()
-            .into_iter()
-            .map(|input| self.node_json(input, query))
-            .collect();
-        if !inputs.is_empty() {
-            value["inputs"] = Value::Array(inputs);
-        }
-        value
+            value
+        })
     }
 
     /// The plan cut into pipelines: walking from the root, every side a node

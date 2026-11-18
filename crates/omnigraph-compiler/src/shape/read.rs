@@ -77,71 +77,73 @@ pub struct ReadShape {
 /// The columns `term` adds to its rows, in the order the core term adds
 /// them, each once (the reference interpreter's row order).
 pub fn written_columns(term: &Term, out: &mut Vec<String>) {
-    fn push(out: &mut Vec<String>, name: &str) {
-        if !out.iter().any(|n| n == name) {
-            out.push(name.to_string());
-        }
-    }
-    match term {
-        Term::Unit => {}
-        Term::Env(cols) => cols.iter().for_each(|c| push(out, &c.name)),
-        Term::Scan { var, .. } => push(out, var),
-        Term::Expand {
-            input,
-            dst,
-            edge_var,
-            ..
-        } => {
-            written_columns(input, out);
-            push(out, dst);
-            if let Some(edge) = edge_var {
-                push(out, edge);
+    crate::stack::deep(|| {
+        fn push(out: &mut Vec<String>, name: &str) {
+            if !out.iter().any(|n| n == name) {
+                out.push(name.to_string());
             }
         }
-        Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
-            written_columns(input, out)
-        }
-        Term::Project {
-            input, items, keep, ..
-        } => {
-            if *keep {
+        match term {
+            Term::Unit => {}
+            Term::Env(cols) => cols.iter().for_each(|c| push(out, &c.name)),
+            Term::Scan { var, .. } => push(out, var),
+            Term::Expand {
+                input,
+                dst,
+                edge_var,
+                ..
+            } => {
                 written_columns(input, out);
-            } else {
-                out.clear();
+                push(out, dst);
+                if let Some(edge) = edge_var {
+                    push(out, edge);
+                }
             }
-            items.iter().for_each(|(name, _)| push(out, name));
+            Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
+                written_columns(input, out)
+            }
+            Term::Project {
+                input, items, keep, ..
+            } => {
+                if *keep {
+                    written_columns(input, out);
+                } else {
+                    out.clear();
+                }
+                items.iter().for_each(|(name, _)| push(out, name));
+            }
+            Term::Group { keys, aggs, .. } => {
+                out.clear();
+                keys.iter().for_each(|(name, _)| push(out, name));
+                aggs.iter().for_each(|(name, _)| push(out, name));
+            }
+            Term::Correlate { outer, inner, .. } => {
+                written_columns(outer, out);
+                let mut own = Vec::new();
+                written_columns(inner, &mut own);
+                own.iter().for_each(|name| push(out, name));
+            }
+            Term::Union { left, .. } => written_columns(left, out),
+            Term::Score {
+                input, out: score, ..
+            }
+            | Term::ApproxTopK {
+                input, out: score, ..
+            } => {
+                written_columns(input, out);
+                push(out, score);
+            }
+            Term::Fuse {
+                target, out: score, ..
+            } => {
+                out.clear();
+                push(out, target);
+                push(out, score);
+            }
+            Term::Fix { body, .. } | Term::Call { body, .. } => written_columns(body, out),
+            Term::RecRef { ty, .. } => ty.cols.iter().for_each(|c| push(out, &c.name)),
         }
-        Term::Group { keys, aggs, .. } => {
-            out.clear();
-            keys.iter().for_each(|(name, _)| push(out, name));
-            aggs.iter().for_each(|(name, _)| push(out, name));
-        }
-        Term::Correlate { outer, inner, .. } => {
-            written_columns(outer, out);
-            let mut own = Vec::new();
-            written_columns(inner, &mut own);
-            own.iter().for_each(|name| push(out, name));
-        }
-        Term::Union { left, .. } => written_columns(left, out),
-        Term::Score {
-            input, out: score, ..
-        }
-        | Term::ApproxTopK {
-            input, out: score, ..
-        } => {
-            written_columns(input, out);
-            push(out, score);
-        }
-        Term::Fuse {
-            target, out: score, ..
-        } => {
-            out.clear();
-            push(out, target);
-            push(out, score);
-        }
-        Term::Fix { body, .. } | Term::Call { body, .. } => written_columns(body, out),
-        Term::RecRef { ty, .. } => ty.cols.iter().for_each(|c| push(out, &c.name)),
-    }
+    })
 }
 
 /// One step of a pattern.
@@ -545,95 +547,99 @@ fn ranked_input(node: &Term) -> &Term {
 /// `term` with the node `leaf` (found by identity on its input chain)
 /// replaced by an empty leaf.
 fn without_leaf(term: &Term, leaf: &Term) -> Term {
-    if std::ptr::eq(term, leaf) {
-        return Term::Env(Vec::new());
-    }
-    match term {
-        Term::Filter { input, pred, fails } => Term::Filter {
-            input: without_leaf(input, leaf).boxed(),
-            pred: pred.clone(),
-            fails: *fails,
-        },
-        Term::Expand {
-            input,
-            src,
-            dst,
-            src_type,
-            dst_type,
-            edges,
-            min_hops,
-            max_hops,
-            edge_var,
-        } => Term::Expand {
-            input: without_leaf(input, leaf).boxed(),
-            src: src.clone(),
-            dst: dst.clone(),
-            src_type: src_type.clone(),
-            dst_type: dst_type.clone(),
-            edges: edges.clone(),
-            min_hops: *min_hops,
-            max_hops: *max_hops,
-            edge_var: edge_var.clone(),
-        },
-        Term::Project {
-            input,
-            items,
-            keep,
-            fails,
-        } => Term::Project {
-            input: without_leaf(input, leaf).boxed(),
-            items: items.clone(),
-            keep: *keep,
-            fails: *fails,
-        },
-        Term::Correlate {
-            outer,
-            inner,
-            fails,
-        } => Term::Correlate {
-            outer: without_leaf(outer, leaf).boxed(),
-            inner: inner.clone(),
-            fails: *fails,
-        },
-        other => other.clone(),
-    }
+    crate::stack::deep(|| {
+        if std::ptr::eq(term, leaf) {
+            return Term::Env(Vec::new());
+        }
+        match term {
+            Term::Filter { input, pred, fails } => Term::Filter {
+                input: without_leaf(input, leaf).boxed(),
+                pred: pred.clone(),
+                fails: *fails,
+            },
+            Term::Expand {
+                input,
+                src,
+                dst,
+                src_type,
+                dst_type,
+                edges,
+                min_hops,
+                max_hops,
+                edge_var,
+            } => Term::Expand {
+                input: without_leaf(input, leaf).boxed(),
+                src: src.clone(),
+                dst: dst.clone(),
+                src_type: src_type.clone(),
+                dst_type: dst_type.clone(),
+                edges: edges.clone(),
+                min_hops: *min_hops,
+                max_hops: *max_hops,
+                edge_var: edge_var.clone(),
+            },
+            Term::Project {
+                input,
+                items,
+                keep,
+                fails,
+            } => Term::Project {
+                input: without_leaf(input, leaf).boxed(),
+                items: items.clone(),
+                keep: *keep,
+                fails: *fails,
+            },
+            Term::Correlate {
+                outer,
+                inner,
+                fails,
+            } => Term::Correlate {
+                outer: without_leaf(outer, leaf).boxed(),
+                inner: inner.clone(),
+                fails: *fails,
+            },
+            other => other.clone(),
+        }
+    })
 }
 
 /// The names a placed pipeline binds physically: its scans, expansion
 /// destinations and edge bindings.
 fn physical_names(pipeline: &[PatternStep]) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for step in pipeline {
-        match step {
-            PatternStep::NodeScan { variable, .. } => {
-                names.insert(variable.clone());
+    crate::stack::deep(|| {
+        let mut names = HashSet::new();
+        for step in pipeline {
+            match step {
+                PatternStep::NodeScan { variable, .. } => {
+                    names.insert(variable.clone());
+                }
+                PatternStep::Expand {
+                    dst_var,
+                    edge_binding,
+                    ..
+                } => {
+                    names.insert(dst_var.clone());
+                    names.extend(edge_binding.iter().cloned());
+                }
+                PatternStep::Optional { inner, .. } => names.extend(physical_names(inner)),
+                PatternStep::Union { arms, .. } => arms
+                    .iter()
+                    .for_each(|arm| names.extend(physical_names(arm))),
+                PatternStep::Correlate { read, .. } => {
+                    names.extend(read.references().map(str::to_string));
+                }
+                PatternStep::Fuse { target, .. } => {
+                    names.insert(target.clone());
+                }
+                PatternStep::Filter { .. }
+                | PatternStep::AntiJoin { .. }
+                | PatternStep::Rank { .. }
+                | PatternStep::Score { .. }
+                | PatternStep::Let { .. } => {}
             }
-            PatternStep::Expand {
-                dst_var,
-                edge_binding,
-                ..
-            } => {
-                names.insert(dst_var.clone());
-                names.extend(edge_binding.iter().cloned());
-            }
-            PatternStep::Optional { inner, .. } => names.extend(physical_names(inner)),
-            PatternStep::Union { arms, .. } => arms
-                .iter()
-                .for_each(|arm| names.extend(physical_names(arm))),
-            PatternStep::Correlate { read, .. } => {
-                names.extend(read.references().map(str::to_string));
-            }
-            PatternStep::Fuse { target, .. } => {
-                names.insert(target.clone());
-            }
-            PatternStep::Filter { .. }
-            | PatternStep::AntiJoin { .. }
-            | PatternStep::Rank { .. }
-            | PatternStep::Score { .. }
-            | PatternStep::Let { .. } => {}
         }
-    }
-    names
+        names
+    })
 }
 
 struct Shaper<'a> {
@@ -823,206 +829,216 @@ impl Facts {
 
     /// Every name the facts bind or read as a node or edge variable.
     fn names(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.types.keys().cloned().collect();
-        out.extend(self.bindings.iter().map(|b| b.variable.clone()));
-        for t in &self.traversals {
-            out.extend([t.src.clone(), t.dst.clone()]);
-            out.extend(t.edge_binding.iter().cloned());
-        }
-        for optional in &self.optionals {
-            out.extend(optional.inner.names());
-        }
-        for union in &self.unions {
-            out.extend(union.bindings.iter().map(|(name, _)| name.clone()));
-            union.arms.iter().for_each(|arm| out.extend(arm.names()));
-        }
-        for correlate in &self.correlates {
-            out.extend(correlate.read.references().map(str::to_string));
-        }
-        out.retain(|name| name != "_");
-        out
+        crate::stack::deep(|| {
+            let mut out: Vec<String> = self.types.keys().cloned().collect();
+            out.extend(self.bindings.iter().map(|b| b.variable.clone()));
+            for t in &self.traversals {
+                out.extend([t.src.clone(), t.dst.clone()]);
+                out.extend(t.edge_binding.iter().cloned());
+            }
+            for optional in &self.optionals {
+                out.extend(optional.inner.names());
+            }
+            for union in &self.unions {
+                out.extend(union.bindings.iter().map(|(name, _)| name.clone()));
+                union.arms.iter().for_each(|arm| out.extend(arm.names()));
+            }
+            for correlate in &self.correlates {
+                out.extend(correlate.read.references().map(str::to_string));
+            }
+            out.retain(|name| name != "_");
+            out
+        })
     }
 
     /// The facts with every variable `renames` names renamed, a block's
     /// included.
     fn rename(&mut self, renames: &HashMap<String, String>) {
-        if renames.is_empty() {
-            return;
-        }
-        let rename = |variable: &mut String| {
-            if let Some(name) = renames.get(variable) {
-                *variable = name.clone();
+        crate::stack::deep(|| {
+            if renames.is_empty() {
+                return;
             }
-        };
-        for binding in &mut self.bindings {
-            rename(&mut binding.variable);
-        }
-        for t in &mut self.traversals {
-            rename(&mut t.src);
-            rename(&mut t.dst);
-            if let Some(edge) = &mut t.edge_binding {
-                rename(edge);
-            }
-        }
-        self.checks
-            .iter_mut()
-            .for_each(|c| rename_expr(&mut c.value, &rename));
-        self.types = std::mem::take(&mut self.types)
-            .into_iter()
-            .map(|(mut name, ty)| {
-                rename(&mut name);
-                (name, ty)
-            })
-            .collect();
-        for conjunct in &mut self.conjuncts {
-            match conjunct {
-                ConjunctFact::Filter { pred, values, .. } => {
-                    rename_expr(pred, &rename);
-                    values
-                        .iter_mut()
-                        .for_each(|correlate| correlate.rename(renames));
+            let rename = |variable: &mut String| {
+                if let Some(name) = renames.get(variable) {
+                    *variable = name.clone();
                 }
-                ConjunctFact::Block { block, .. } => {
-                    block.inner.rename(renames);
-                    block.outer = std::mem::take(&mut block.outer)
-                        .into_iter()
-                        .map(|mut name| {
-                            rename(&mut name);
-                            name
-                        })
-                        .collect();
-                    if let Some(arg) = block.left.arg_mut() {
-                        rename_expr(arg, &rename);
+            };
+            for binding in &mut self.bindings {
+                rename(&mut binding.variable);
+            }
+            for t in &mut self.traversals {
+                rename(&mut t.src);
+                rename(&mut t.dst);
+                if let Some(edge) = &mut t.edge_binding {
+                    rename(edge);
+                }
+            }
+            self.checks
+                .iter_mut()
+                .for_each(|c| rename_expr(&mut c.value, &rename));
+            self.types = std::mem::take(&mut self.types)
+                .into_iter()
+                .map(|(mut name, ty)| {
+                    rename(&mut name);
+                    (name, ty)
+                })
+                .collect();
+            for conjunct in &mut self.conjuncts {
+                match conjunct {
+                    ConjunctFact::Filter { pred, values, .. } => {
+                        rename_expr(pred, &rename);
+                        values
+                            .iter_mut()
+                            .for_each(|correlate| correlate.rename(renames));
                     }
-                    rename_expr(&mut block.right, &rename);
+                    ConjunctFact::Block { block, .. } => {
+                        block.inner.rename(renames);
+                        block.outer = std::mem::take(&mut block.outer)
+                            .into_iter()
+                            .map(|mut name| {
+                                rename(&mut name);
+                                name
+                            })
+                            .collect();
+                        if let Some(arg) = block.left.arg_mut() {
+                            rename_expr(arg, &rename);
+                        }
+                        rename_expr(&mut block.right, &rename);
+                    }
                 }
             }
-        }
-        for optional in &mut self.optionals {
-            optional.inner.rename(renames);
-        }
-        for union in &mut self.unions {
-            union.arms.iter_mut().for_each(|arm| arm.rename(renames));
-            union.bindings.iter_mut().for_each(|(name, _)| rename(name));
-            union.outer = std::mem::take(&mut union.outer)
+            for optional in &mut self.optionals {
+                optional.inner.rename(renames);
+            }
+            for union in &mut self.unions {
+                union.arms.iter_mut().for_each(|arm| arm.rename(renames));
+                union.bindings.iter_mut().for_each(|(name, _)| rename(name));
+                union.outer = std::mem::take(&mut union.outer)
+                    .into_iter()
+                    .map(|mut name| {
+                        rename(&mut name);
+                        name
+                    })
+                    .collect();
+            }
+            for correlate in &mut self.correlates {
+                correlate.rename(renames);
+            }
+            self.optional_names = std::mem::take(&mut self.optional_names)
                 .into_iter()
                 .map(|mut name| {
                     rename(&mut name);
                     name
                 })
                 .collect();
-        }
-        for correlate in &mut self.correlates {
-            correlate.rename(renames);
-        }
-        self.optional_names = std::mem::take(&mut self.optional_names)
-            .into_iter()
-            .map(|mut name| {
-                rename(&mut name);
-                name
-            })
-            .collect();
+        })
     }
 
     /// Every name an `optional` of the facts introduces, nested ones and
     /// those of a block's or an optional's own included.
     fn optional_names_into(&self, out: &mut HashSet<String>) {
-        out.extend(self.optional_names.iter().cloned());
-        for optional in &self.optionals {
-            optional.inner.optional_names_into(out);
-        }
-        for conjunct in &self.conjuncts {
-            match conjunct {
-                ConjunctFact::Filter { values, .. } => values
-                    .iter()
-                    .for_each(|correlate| correlate.inner.optional_names_into(out)),
-                ConjunctFact::Block { block, .. } => block.inner.optional_names_into(out),
+        crate::stack::deep(|| {
+            out.extend(self.optional_names.iter().cloned());
+            for optional in &self.optionals {
+                optional.inner.optional_names_into(out);
             }
-        }
-        for union in &self.unions {
-            union
-                .arms
-                .iter()
-                .for_each(|arm| arm.optional_names_into(out));
-        }
-        for correlate in &self.correlates {
-            correlate.inner.optional_names_into(out);
-        }
+            for conjunct in &self.conjuncts {
+                match conjunct {
+                    ConjunctFact::Filter { values, .. } => values
+                        .iter()
+                        .for_each(|correlate| correlate.inner.optional_names_into(out)),
+                    ConjunctFact::Block { block, .. } => block.inner.optional_names_into(out),
+                }
+            }
+            for union in &self.unions {
+                union
+                    .arms
+                    .iter()
+                    .for_each(|arm| arm.optional_names_into(out));
+            }
+            for correlate in &self.correlates {
+                correlate.inner.optional_names_into(out);
+            }
+        })
     }
 
     /// `f` over every expression the facts hold, a block's and an
     /// optional's included.
     fn each_expr(&mut self, f: &mut dyn FnMut(&mut IRExpr)) {
-        self.lets.values_mut().for_each(&mut *f);
-        self.checks.iter_mut().for_each(|c| f(&mut c.value));
-        for conjunct in &mut self.conjuncts {
-            match conjunct {
-                ConjunctFact::Filter { pred, values, .. } => {
-                    f(pred);
-                    for correlate in values {
-                        correlate.inner.each_expr(f);
-                        correlate.read.exprs_mut().for_each(&mut *f);
+        crate::stack::deep(|| {
+            self.lets.values_mut().for_each(&mut *f);
+            self.checks.iter_mut().for_each(|c| f(&mut c.value));
+            for conjunct in &mut self.conjuncts {
+                match conjunct {
+                    ConjunctFact::Filter { pred, values, .. } => {
+                        f(pred);
+                        for correlate in values {
+                            correlate.inner.each_expr(f);
+                            correlate.read.exprs_mut().for_each(&mut *f);
+                        }
                     }
-                }
-                ConjunctFact::Block { block, .. } => {
-                    block.inner.each_expr(f);
-                    if let Some(arg) = block.left.arg_mut() {
-                        f(arg);
+                    ConjunctFact::Block { block, .. } => {
+                        block.inner.each_expr(f);
+                        if let Some(arg) = block.left.arg_mut() {
+                            f(arg);
+                        }
+                        f(&mut block.right);
                     }
-                    f(&mut block.right);
                 }
             }
-        }
-        for optional in &mut self.optionals {
-            optional.inner.each_expr(f);
-        }
-        for union in &mut self.unions {
-            union.arms.iter_mut().for_each(|arm| arm.each_expr(f));
-        }
-        for correlate in &mut self.correlates {
-            correlate.inner.each_expr(f);
-            correlate.read.exprs_mut().for_each(&mut *f);
-        }
+            for optional in &mut self.optionals {
+                optional.inner.each_expr(f);
+            }
+            for union in &mut self.unions {
+                union.arms.iter_mut().for_each(|arm| arm.each_expr(f));
+            }
+            for correlate in &mut self.correlates {
+                correlate.inner.each_expr(f);
+                correlate.read.exprs_mut().for_each(&mut *f);
+            }
+        })
     }
 
     /// Every expression the facts hold, a block's included, with each name
     /// `lets` maps read as the column it maps to.
     fn resolve(&mut self, lets: &HashMap<String, IRExpr>) {
-        if lets.is_empty() {
-            return;
-        }
-        self.checks
-            .iter_mut()
-            .for_each(|c| resolve(&mut c.value, lets));
-        for conjunct in &mut self.conjuncts {
-            match conjunct {
-                ConjunctFact::Filter { pred, values, .. } => {
-                    resolve(pred, lets);
-                    for correlate in values {
-                        correlate.inner.resolve(lets);
-                        correlate.read.exprs_mut().for_each(|e| resolve(e, lets));
+        crate::stack::deep(|| {
+            if lets.is_empty() {
+                return;
+            }
+            self.checks
+                .iter_mut()
+                .for_each(|c| resolve(&mut c.value, lets));
+            for conjunct in &mut self.conjuncts {
+                match conjunct {
+                    ConjunctFact::Filter { pred, values, .. } => {
+                        resolve(pred, lets);
+                        for correlate in values {
+                            correlate.inner.resolve(lets);
+                            correlate.read.exprs_mut().for_each(|e| resolve(e, lets));
+                        }
                     }
-                }
-                ConjunctFact::Block { block, .. } => {
-                    block.inner.resolve(lets);
-                    if let Some(arg) = block.left.arg_mut() {
-                        resolve(arg, lets);
+                    ConjunctFact::Block { block, .. } => {
+                        block.inner.resolve(lets);
+                        if let Some(arg) = block.left.arg_mut() {
+                            resolve(arg, lets);
+                        }
+                        resolve(&mut block.right, lets);
                     }
-                    resolve(&mut block.right, lets);
                 }
             }
-        }
-        for optional in &mut self.optionals {
-            optional.inner.resolve(lets);
-        }
-        // A union's arms read the scope's `let`s and value columns in place.
-        for union in &mut self.unions {
-            union.arms.iter_mut().for_each(|arm| arm.resolve(lets));
-        }
-        for correlate in &mut self.correlates {
-            correlate.inner.resolve(lets);
-            correlate.read.exprs_mut().for_each(|e| resolve(e, lets));
-        }
+            for optional in &mut self.optionals {
+                optional.inner.resolve(lets);
+            }
+            // A union's arms read the scope's `let`s and value columns in place.
+            for union in &mut self.unions {
+                union.arms.iter_mut().for_each(|arm| arm.resolve(lets));
+            }
+            for correlate in &mut self.correlates {
+                correlate.inner.resolve(lets);
+                correlate.read.exprs_mut().for_each(|e| resolve(e, lets));
+            }
+        })
     }
 }
 
@@ -1082,25 +1098,27 @@ struct CorrelateFact {
 impl CorrelateFact {
     /// The read with every variable `renames` names renamed.
     fn rename(&mut self, renames: &HashMap<String, String>) {
-        let rename = |variable: &mut String| {
-            if let Some(name) = renames.get(variable) {
-                *variable = name.clone();
+        crate::stack::deep(|| {
+            let rename = |variable: &mut String| {
+                if let Some(name) = renames.get(variable) {
+                    *variable = name.clone();
+                }
+            };
+            self.inner.rename(renames);
+            self.outer = std::mem::take(&mut self.outer)
+                .into_iter()
+                .map(|mut name| {
+                    rename(&mut name);
+                    name
+                })
+                .collect();
+            for column in &mut self.read.columns {
+                if is_reference(&column.expr) {
+                    rename(&mut column.column);
+                }
             }
-        };
-        self.inner.rename(renames);
-        self.outer = std::mem::take(&mut self.outer)
-            .into_iter()
-            .map(|mut name| {
-                rename(&mut name);
-                name
-            })
-            .collect();
-        for column in &mut self.read.columns {
-            if is_reference(&column.expr) {
-                rename(&mut column.column);
-            }
-        }
-        self.read.exprs_mut().for_each(|e| rename_expr(e, &rename));
+            self.read.exprs_mut().for_each(|e| rename_expr(e, &rename));
+        })
     }
 }
 
@@ -1681,21 +1699,23 @@ impl<'a> Shaper<'a> {
         aggs: &HashMap<String, Agg>,
         ranking: Option<&Ranking>,
     ) -> Result<IRExpr, ShapeError> {
-        Ok(match e {
-            IRExpr::AliasRef(name, _) if aggs.contains_key(name) => {
-                self.aggregate(&aggs[name], ranking)?
-            }
-            IRExpr::AliasRef(name, _) if ranking.is_some_and(|r| r.out == *name) => {
-                let r = ranking.unwrap();
-                IRExpr::PropAccess {
-                    variable: r.column.clone(),
-                    property: r.score.0.to_string(),
-                    ty: r.score.1.clone(),
+        crate::stack::deep(|| {
+            Ok(match e {
+                IRExpr::AliasRef(name, _) if aggs.contains_key(name) => {
+                    self.aggregate(&aggs[name], ranking)?
                 }
-            }
-            // An aggregate reaches a return item under any operator: unary
-            // `-`, a call (`coalesce(sum(…), 0)`) and arithmetic alike.
-            other => other.try_map_children(|child| self.item(child, aggs, ranking))?,
+                IRExpr::AliasRef(name, _) if ranking.is_some_and(|r| r.out == *name) => {
+                    let r = ranking.unwrap();
+                    IRExpr::PropAccess {
+                        variable: r.column.clone(),
+                        property: r.score.0.to_string(),
+                        ty: r.score.1.clone(),
+                    }
+                }
+                // An aggregate reaches a return item under any operator: unary
+                // `-`, a call (`coalesce(sum(…), 0)`) and arithmetic alike.
+                other => other.try_map_children(|child| self.item(child, aggs, ranking))?,
+            })
         })
     }
 
@@ -2060,95 +2080,97 @@ impl<'a> Shaper<'a> {
         inlined: &mut usize,
         fresh: &mut FreshNames,
     ) -> Result<PatternStep, ShapeError> {
-        let Term::Fuse {
-            arms,
-            target,
-            k,
-            weights,
-            ..
-        } = fuse
-        else {
-            return Err(ShapeError::Internal("a fusion that is not a `Fuse`".into()));
-        };
-        let mut shaped = Vec::with_capacity(arms.len());
-        for arm in arms {
-            let mut steps = Vec::new();
-            let mut bound = HashSet::new();
-            let rank = match self.ranking(arm)? {
-                (_, Some(ranking)) if ranking.fused => {
-                    steps.push(self.fuse_step(arm, inlined, fresh)?);
-                    ArmRank::Fused
-                }
-                (population, Some(ranking)) => {
-                    self.ranking_steps(
-                        Some(arm),
-                        population,
-                        &ranking,
-                        inlined,
-                        &mut steps,
-                        &mut bound,
-                        fresh,
-                    )?;
-                    match ranking.exact {
-                        None => ArmRank::Nearest,
-                        Some((_, ScoreKind::Distance, _)) => ArmRank::Distance,
-                        Some((_, ScoreKind::Bm25, _)) => ArmRank::Bm25,
+        crate::stack::deep(|| {
+            let Term::Fuse {
+                arms,
+                target,
+                k,
+                weights,
+                ..
+            } = fuse
+            else {
+                return Err(ShapeError::Internal("a fusion that is not a `Fuse`".into()));
+            };
+            let mut shaped = Vec::with_capacity(arms.len());
+            for arm in arms {
+                let mut steps = Vec::new();
+                let mut bound = HashSet::new();
+                let rank = match self.ranking(arm)? {
+                    (_, Some(ranking)) if ranking.fused => {
+                        steps.push(self.fuse_step(arm, inlined, fresh)?);
+                        ArmRank::Fused
                     }
-                }
-                // An inline read whose own `order` ranks its targets (the
-                // type checker refuses any other arm, `T75`).
-                (_, None) => {
-                    let (input, items, bindings) = read_parts(arm)
+                    (population, Some(ranking)) => {
+                        self.ranking_steps(
+                            Some(arm),
+                            population,
+                            &ranking,
+                            inlined,
+                            &mut steps,
+                            &mut bound,
+                            fresh,
+                        )?;
+                        match ranking.exact {
+                            None => ArmRank::Nearest,
+                            Some((_, ScoreKind::Distance, _)) => ArmRank::Distance,
+                            Some((_, ScoreKind::Bm25, _)) => ArmRank::Bm25,
+                        }
+                    }
+                    // An inline read whose own `order` ranks its targets (the
+                    // type checker refuses any other arm, `T75`).
+                    (_, None) => {
+                        let (input, items, bindings) = read_parts(arm)
                         .filter(|(input, ..)| orders(input))
                         .ok_or_else(|| {
                             ShapeError::Internal(
                                 "an `rrf` arm that is neither a ranking nor an inline read with an `order`, which the type checker refuses (T75)".into(),
                             )
                         })?;
-                    let mut facts = Facts {
-                        inlined: *inlined,
-                        ..Facts::default()
-                    };
-                    self.inline_read(input, items, bindings, &mut facts)?;
-                    *inlined = facts.inlined;
-                    self.place(&facts, &[], &mut steps, &mut bound, &HashSet::new(), fresh)?;
-                    if !matches!(
-                        steps.as_slice(),
-                        [PatternStep::Correlate {
-                            outer_var: None,
-                            ..
-                        }]
-                    ) {
-                        return Err(ShapeError::Internal(
-                            "an ordered `rrf` arm that is not one uncorrelated read".into(),
-                        ));
+                        let mut facts = Facts {
+                            inlined: *inlined,
+                            ..Facts::default()
+                        };
+                        self.inline_read(input, items, bindings, &mut facts)?;
+                        *inlined = facts.inlined;
+                        self.place(&facts, &[], &mut steps, &mut bound, &HashSet::new(), fresh)?;
+                        if !matches!(
+                            steps.as_slice(),
+                            [PatternStep::Correlate {
+                                outer_var: None,
+                                ..
+                            }]
+                        ) {
+                            return Err(ShapeError::Internal(
+                                "an ordered `rrf` arm that is not one uncorrelated read".into(),
+                            ));
+                        }
+                        ArmRank::Ordered
                     }
-                    ArmRank::Ordered
-                }
+                };
+                shaped.push(FuseArm { steps, rank });
+            }
+            let target_type = arms
+                .first()
+                .and_then(|arm| node_type_in(arm, target))
+                .ok_or_else(|| {
+                    ShapeError::Internal(format!("the `rrf` target `{target}` binds no node type"))
+                })?;
+            // The default constant is the unwritten one.
+            let k = match k {
+                Count::Literal(n) if *n == RRF_DEFAULT_K => None,
+                Count::Literal(n) => Some(IRExpr::Literal(
+                    Literal::Integer(i128::from(*n)),
+                    scalar(ScalarType::I64),
+                )),
+                Count::Param(p) => Some(IRExpr::Param(p.clone(), self.param_type(p))),
             };
-            shaped.push(FuseArm { steps, rank });
-        }
-        let target_type = arms
-            .first()
-            .and_then(|arm| node_type_in(arm, target))
-            .ok_or_else(|| {
-                ShapeError::Internal(format!("the `rrf` target `{target}` binds no node type"))
-            })?;
-        // The default constant is the unwritten one.
-        let k = match k {
-            Count::Literal(n) if *n == RRF_DEFAULT_K => None,
-            Count::Literal(n) => Some(IRExpr::Literal(
-                Literal::Integer(i128::from(*n)),
-                scalar(ScalarType::I64),
-            )),
-            Count::Param(p) => Some(IRExpr::Param(p.clone(), self.param_type(p))),
-        };
-        Ok(PatternStep::Fuse {
-            arms: shaped,
-            target: target.clone(),
-            target_type,
-            k,
-            weights: rrf_weights_expr(weights),
+            Ok(PatternStep::Fuse {
+                arms: shaped,
+                target: target.clone(),
+                target_type,
+                k,
+                weights: rrf_weights_expr(weights),
+            })
         })
     }
 
@@ -2164,163 +2186,165 @@ impl<'a> Shaper<'a> {
 
     /// The facts of `term` into `facts`.
     fn facts(&self, term: &Term, facts: &mut Facts) -> Result<(), ShapeError> {
-        self.visited.set(self.visited.get() + 1);
-        match term {
-            Term::Unit | Term::Env(_) => Ok(()),
-            Term::Scan {
-                var,
-                ty: Ty::Node { type_name, .. },
-            } => {
-                facts.types.insert(var.clone(), type_name.clone());
-                facts.bindings.push(BindingFact {
-                    variable: var.clone(),
-                    type_name: type_name.clone(),
-                });
-                Ok(())
-            }
-            // `$k: E`, the `Scan` of an edge type: every edge of `E` once,
-            // which is the single hop over `E` from a scan of its source type
-            // with the edge bound, its two ends fresh names nothing reads.
-            Term::Scan {
-                var,
-                ty: Ty::Edge { type_name, .. },
-            } => {
-                let edge = self.catalog.lookup_edge_by_name(type_name).ok_or_else(|| {
-                    ShapeError::Internal(format!("`${var}` scans `{type_name}`, no edge type"))
-                })?;
-                let src = self.shaped(format_args!("e{}_{var}_src", facts.inlined));
-                let dst = self.shaped(format_args!("e{}_{var}_dst", facts.inlined));
-                facts.inlined += 1;
-                facts.types.insert(src.clone(), edge.from_type.clone());
-                facts.bindings.push(BindingFact {
-                    variable: src.clone(),
-                    type_name: edge.from_type.clone(),
-                });
-                self.traversal(
-                    facts,
-                    TraversalFact {
-                        src,
-                        dst,
-                        edges: EdgeSelection::Named(EdgeMember {
-                            edge_type: edge.name.clone(),
-                            direction: Direction::Out,
-                        }),
-                        src_type: edge.from_type.clone(),
-                        dst_type: edge.to_type.clone(),
-                        min_hops: 1,
-                        max_hops: Some(1),
-                        edge_binding: Some(var.clone()),
-                    },
-                );
-                Ok(())
-            }
-            Term::Scan { var, .. } => Err(ShapeError::Internal(format!(
-                "`${var}` scans a value type, which the type checker never writes"
-            ))),
-            Term::Expand {
-                input,
-                src,
-                dst,
-                src_type,
-                dst_type,
-                edges,
-                min_hops,
-                max_hops,
-                edge_var,
-            } => {
-                self.facts(input, facts)?;
-                self.traversal(
-                    facts,
-                    TraversalFact {
-                        src: src.clone(),
-                        dst: dst.clone(),
-                        edges: edges.clone(),
-                        src_type: src_type.clone(),
-                        dst_type: dst_type.clone(),
-                        min_hops: *min_hops,
-                        max_hops: *max_hops,
-                        edge_binding: edge_var.clone(),
-                    },
-                );
-                Ok(())
-            }
-            Term::Filter { input, pred, fails } => self.filter(input, pred, *fails, facts),
-            // `let $v = e`: a value column, computed once where it was
-            // written, on every row the elements before it produce (A3),
-            // and read wherever its name is. A value that can fail keeps its
-            // place: the type checker placed no `where` conjunct below it.
-            Term::Project {
-                input,
-                items,
-                keep: true,
-                ..
-            } => {
-                self.facts(input, facts)?;
-                for (name, value) in items {
-                    let mut value = value.clone();
-                    resolve(&mut value, &facts.lets);
-                    let column = self.let_column(facts, name, value);
-                    facts.lets.insert(name.clone(), column);
+        crate::stack::deep(|| {
+            self.visited.set(self.visited.get() + 1);
+            match term {
+                Term::Unit | Term::Env(_) => Ok(()),
+                Term::Scan {
+                    var,
+                    ty: Ty::Node { type_name, .. },
+                } => {
+                    facts.types.insert(var.clone(), type_name.clone());
+                    facts.bindings.push(BindingFact {
+                        variable: var.clone(),
+                        type_name: type_name.clone(),
+                    });
+                    Ok(())
                 }
-                Ok(())
-            }
-            // A `from` that opens the pattern: the inline read alone.
-            Term::Project {
-                input,
-                items,
-                keep: false,
-                ..
-            } => self.inline_read(input, items, &[], facts),
-            // `from name(args)`: the declared read's body, read as an inline
-            // read with its parameters bound to the arguments.
-            Term::Call { name, .. } => {
-                let (input, items, bindings) = read_parts(term).ok_or_else(|| {
+                // `$k: E`, the `Scan` of an edge type: every edge of `E` once,
+                // which is the single hop over `E` from a scan of its source type
+                // with the edge bound, its two ends fresh names nothing reads.
+                Term::Scan {
+                    var,
+                    ty: Ty::Edge { type_name, .. },
+                } => {
+                    let edge = self.catalog.lookup_edge_by_name(type_name).ok_or_else(|| {
+                        ShapeError::Internal(format!("`${var}` scans `{type_name}`, no edge type"))
+                    })?;
+                    let src = self.shaped(format_args!("e{}_{var}_src", facts.inlined));
+                    let dst = self.shaped(format_args!("e{}_{var}_dst", facts.inlined));
+                    facts.inlined += 1;
+                    facts.types.insert(src.clone(), edge.from_type.clone());
+                    facts.bindings.push(BindingFact {
+                        variable: src.clone(),
+                        type_name: edge.from_type.clone(),
+                    });
+                    self.traversal(
+                        facts,
+                        TraversalFact {
+                            src,
+                            dst,
+                            edges: EdgeSelection::Named(EdgeMember {
+                                edge_type: edge.name.clone(),
+                                direction: Direction::Out,
+                            }),
+                            src_type: edge.from_type.clone(),
+                            dst_type: edge.to_type.clone(),
+                            min_hops: 1,
+                            max_hops: Some(1),
+                            edge_binding: Some(var.clone()),
+                        },
+                    );
+                    Ok(())
+                }
+                Term::Scan { var, .. } => Err(ShapeError::Internal(format!(
+                    "`${var}` scans a value type, which the type checker never writes"
+                ))),
+                Term::Expand {
+                    input,
+                    src,
+                    dst,
+                    src_type,
+                    dst_type,
+                    edges,
+                    min_hops,
+                    max_hops,
+                    edge_var,
+                } => {
+                    self.facts(input, facts)?;
+                    self.traversal(
+                        facts,
+                        TraversalFact {
+                            src: src.clone(),
+                            dst: dst.clone(),
+                            edges: edges.clone(),
+                            src_type: src_type.clone(),
+                            dst_type: dst_type.clone(),
+                            min_hops: *min_hops,
+                            max_hops: *max_hops,
+                            edge_binding: edge_var.clone(),
+                        },
+                    );
+                    Ok(())
+                }
+                Term::Filter { input, pred, fails } => self.filter(input, pred, *fails, facts),
+                // `let $v = e`: a value column, computed once where it was
+                // written, on every row the elements before it produce (A3),
+                // and read wherever its name is. A value that can fail keeps its
+                // place: the type checker placed no `where` conjunct below it.
+                Term::Project {
+                    input,
+                    items,
+                    keep: true,
+                    ..
+                } => {
+                    self.facts(input, facts)?;
+                    for (name, value) in items {
+                        let mut value = value.clone();
+                        resolve(&mut value, &facts.lets);
+                        let column = self.let_column(facts, name, value);
+                        facts.lets.insert(name.clone(), column);
+                    }
+                    Ok(())
+                }
+                // A `from` that opens the pattern: the inline read alone.
+                Term::Project {
+                    input,
+                    items,
+                    keep: false,
+                    ..
+                } => self.inline_read(input, items, &[], facts),
+                // `from name(args)`: the declared read's body, read as an inline
+                // read with its parameters bound to the arguments.
+                Term::Call { name, .. } => {
+                    let (input, items, bindings) = read_parts(term).ok_or_else(|| {
                     ShapeError::Internal(format!(
                         "the body of `{name}` is not a read's final projection, which the type checker always writes"
                     ))
                 })?;
-                self.inline_read(input, items, bindings, facts)
-            }
-            Term::Correlate {
-                outer,
-                inner,
-                fails,
-            } => {
-                if let Some(pattern) = optional_pattern(inner) {
-                    self.optional(outer, pattern, facts)?;
-                    if let Some(optional) = facts.optionals.last_mut() {
-                        optional.fails = *fails;
+                    self.inline_read(input, items, bindings, facts)
+                }
+                Term::Correlate {
+                    outer,
+                    inner,
+                    fails,
+                } => {
+                    if let Some(pattern) = optional_pattern(inner) {
+                        self.optional(outer, pattern, facts)?;
+                        if let Some(optional) = facts.optionals.last_mut() {
+                            optional.fails = *fails;
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
+                    self.facts(outer, facts)?;
+                    // The correlated reads this element states run on every row
+                    // the elements before it produce: the type checker's flag
+                    // says whether one can fail there, and then nothing moves
+                    // below it.
+                    let mark = facts.correlates.len();
+                    // A block read as a value in a `let` or a return item.
+                    if let Term::Group { input, keys, aggs } = inner.as_ref() {
+                        let ([(column, agg)], []) = (aggs.as_slice(), keys.as_slice()) else {
+                            return Err(ShapeError::Internal(
+                                "a block that is not one aggregate without keys".into(),
+                            ));
+                        };
+                        let value = self.block_value(input, column, agg, *fails, facts)?;
+                        facts.correlates.push(value);
+                    } else if let Some((input, items, bindings)) = read_parts(inner) {
+                        self.inline_read(input, items, bindings, facts)?;
+                    } else {
+                        self.facts(inner, facts)?;
+                    }
+                    for correlate in &mut facts.correlates[mark..] {
+                        correlate.fails |= *fails;
+                    }
+                    Ok(())
                 }
-                self.facts(outer, facts)?;
-                // The correlated reads this element states run on every row
-                // the elements before it produce: the type checker's flag
-                // says whether one can fail there, and then nothing moves
-                // below it.
-                let mark = facts.correlates.len();
-                // A block read as a value in a `let` or a return item.
-                if let Term::Group { input, keys, aggs } = inner.as_ref() {
-                    let ([(column, agg)], []) = (aggs.as_slice(), keys.as_slice()) else {
-                        return Err(ShapeError::Internal(
-                            "a block that is not one aggregate without keys".into(),
-                        ));
-                    };
-                    let value = self.block_value(input, column, agg, *fails, facts)?;
-                    facts.correlates.push(value);
-                } else if let Some((input, items, bindings)) = read_parts(inner) {
-                    self.inline_read(input, items, bindings, facts)?;
-                } else {
-                    self.facts(inner, facts)?;
-                }
-                for correlate in &mut facts.correlates[mark..] {
-                    correlate.fails |= *fails;
-                }
-                Ok(())
+                Term::Union { .. } => self.union(term, facts),
+                other => Err(self.unlowered_node(other)),
             }
-            Term::Union { .. } => self.union(term, facts),
-            other => Err(self.unlowered_node(other)),
-        }
+        })
     }
 
     /// `optional { p }` over the elements before it (`outer`): their facts,
@@ -2402,14 +2426,14 @@ impl<'a> Shaper<'a> {
                     )));
                 }
             };
-            let read = match value {
+            let read = match &value {
                 // A column the optional's own steps compute, which the
                 // optional pads null where nothing matches.
                 IRExpr::PropAccess {
                     variable, property, ..
-                } if columns.contains(&variable) => IRExpr::PropAccess {
-                    variable,
-                    property,
+                } if columns.contains(variable) => IRExpr::PropAccess {
+                    variable: variable.clone(),
+                    property: property.clone(),
                     ty,
                 },
                 // A value read in place (an outer column, a parameter, a
@@ -2423,7 +2447,7 @@ impl<'a> Shaper<'a> {
                         func: crate::ir::expr::ScalarFunc::If,
                         args: vec![
                             matched.clone(),
-                            value,
+                            value.clone(),
                             IRExpr::Literal(Literal::Null, ty.clone()),
                         ],
                         ty,
@@ -4186,7 +4210,7 @@ fn match_terms_call(field: IRExpr, lexical: &LexicalQuery) -> IRExpr {
 /// that relation alone, so a name another scope reuses for another type is
 /// not read.
 fn node_type_in(term: &Term, variable: &str) -> Option<String> {
-    match term {
+    crate::stack::deep(|| match term {
         Term::Unit | Term::RecRef { .. } => None,
         Term::Env(cols) => cols.iter().find_map(|col| match &col.ty {
             Ty::Node { type_name, .. } if col.name == variable => Some(type_name.clone()),
@@ -4225,7 +4249,7 @@ fn node_type_in(term: &Term, variable: &str) -> Option<String> {
         Term::Union { left, .. } => node_type_in(left, variable),
         Term::Fuse { arms, .. } => arms.first().and_then(|arm| node_type_in(arm, variable)),
         Term::Fix { body, .. } | Term::Call { body, .. } => node_type_in(body, variable),
-    }
+    })
 }
 
 fn scan_root(inner_bindings: &[&str], reaches_outer: bool) -> Option<usize> {
@@ -4507,37 +4531,39 @@ fn rename_inner_bindings(
 /// reference's identity column: nullable where an `optional` introduces the
 /// name, else never null.
 fn reference_null_tests(expr: &mut IRExpr, id: &str, optional: &HashSet<String>) {
-    if let IRExpr::IsNull { expr: inner, .. } = expr
-        && let IRExpr::Variable(variable, ExprType::Node { .. } | ExprType::Edge { .. }) =
-            inner.as_ref()
-    {
-        let nullable = optional.contains(variable);
-        **inner = IRExpr::PropAccess {
-            variable: variable.clone(),
-            property: id.to_string(),
-            ty: ExprType::from_prop(&PropType::scalar(ScalarType::String, nullable)),
-        };
-        return;
-    }
-    let recurse = |e: &mut IRExpr| reference_null_tests(e, id, optional);
-    match expr {
-        IRExpr::Nearest { query, .. } => recurse(query),
-        IRExpr::Aggregate { arg, .. }
-        | IRExpr::Not(arg, _)
-        | IRExpr::IsNull { expr: arg, .. }
-        | IRExpr::Neg { expr: arg, .. }
-        | IRExpr::Cast { expr: arg, .. } => recurse(arg),
-        IRExpr::Binary { left, right, .. } => {
-            recurse(left);
-            recurse(right);
+    crate::stack::deep(|| {
+        if let IRExpr::IsNull { expr: inner, .. } = expr
+            && let IRExpr::Variable(variable, ExprType::Node { .. } | ExprType::Edge { .. }) =
+                inner.as_ref()
+        {
+            let nullable = optional.contains(variable);
+            **inner = IRExpr::PropAccess {
+                variable: variable.clone(),
+                property: id.to_string(),
+                ty: ExprType::from_prop(&PropType::scalar(ScalarType::String, nullable)),
+            };
+            return;
         }
-        IRExpr::Call { args, .. } => args.iter_mut().for_each(recurse),
-        IRExpr::AliasRef(_, _)
-        | IRExpr::Variable(_, _)
-        | IRExpr::Literal(_, _)
-        | IRExpr::Param(_, _)
-        | IRExpr::PropAccess { .. } => {}
-    }
+        let recurse = |e: &mut IRExpr| reference_null_tests(e, id, optional);
+        match expr {
+            IRExpr::Nearest { query, .. } => recurse(query),
+            IRExpr::Aggregate { arg, .. }
+            | IRExpr::Not(arg, _)
+            | IRExpr::IsNull { expr: arg, .. }
+            | IRExpr::Neg { expr: arg, .. }
+            | IRExpr::Cast { expr: arg, .. } => recurse(arg),
+            IRExpr::Binary { left, right, .. } => {
+                recurse(left);
+                recurse(right);
+            }
+            IRExpr::Call { args, .. } => args.iter_mut().for_each(recurse),
+            IRExpr::AliasRef(_, _)
+            | IRExpr::Variable(_, _)
+            | IRExpr::Literal(_, _)
+            | IRExpr::Param(_, _)
+            | IRExpr::PropAccess { .. } => {}
+        }
+    })
 }
 
 /// A named expression: a returned item, or a parameter and its argument.
@@ -4578,66 +4604,70 @@ fn bind_arguments(facts: &mut Facts, bindings: &[(String, IRExpr)]) {
 
 /// `expr` with every parameter `bindings` names read as its argument.
 fn bind_params(expr: &mut IRExpr, bindings: &[(String, IRExpr)]) {
-    if bindings.is_empty() {
-        return;
-    }
-    if let IRExpr::Param(name, _) = expr {
-        if let Some((_, arg)) = bindings.iter().find(|(param, _)| param == name) {
-            *expr = arg.clone();
+    crate::stack::deep(|| {
+        if bindings.is_empty() {
+            return;
         }
-        return;
-    }
-    let recurse = |e: &mut IRExpr| bind_params(e, bindings);
-    match expr {
-        IRExpr::Nearest { query, .. } => recurse(query),
-        IRExpr::Aggregate { arg, .. }
-        | IRExpr::Not(arg, _)
-        | IRExpr::IsNull { expr: arg, .. }
-        | IRExpr::Neg { expr: arg, .. }
-        | IRExpr::Cast { expr: arg, .. } => recurse(arg),
-        IRExpr::Binary { left, right, .. } => {
-            recurse(left);
-            recurse(right);
+        if let IRExpr::Param(name, _) = expr {
+            if let Some((_, arg)) = bindings.iter().find(|(param, _)| param == name) {
+                *expr = arg.clone();
+            }
+            return;
         }
-        IRExpr::Call { args, .. } => args.iter_mut().for_each(recurse),
-        IRExpr::AliasRef(_, _)
-        | IRExpr::Variable(_, _)
-        | IRExpr::Literal(_, _)
-        | IRExpr::Param(_, _)
-        | IRExpr::PropAccess { .. } => {}
-    }
+        let recurse = |e: &mut IRExpr| bind_params(e, bindings);
+        match expr {
+            IRExpr::Nearest { query, .. } => recurse(query),
+            IRExpr::Aggregate { arg, .. }
+            | IRExpr::Not(arg, _)
+            | IRExpr::IsNull { expr: arg, .. }
+            | IRExpr::Neg { expr: arg, .. }
+            | IRExpr::Cast { expr: arg, .. } => recurse(arg),
+            IRExpr::Binary { left, right, .. } => {
+                recurse(left);
+                recurse(right);
+            }
+            IRExpr::Call { args, .. } => args.iter_mut().for_each(recurse),
+            IRExpr::AliasRef(_, _)
+            | IRExpr::Variable(_, _)
+            | IRExpr::Literal(_, _)
+            | IRExpr::Param(_, _)
+            | IRExpr::PropAccess { .. } => {}
+        }
+    })
 }
 
 /// `expr` with every name `lets` maps read as the column it maps to: a
 /// `let`'s column, a ranking's score, a read's value column. Each is a read
 /// of one column, so resolving a name never copies a computed value.
 fn resolve(expr: &mut IRExpr, lets: &HashMap<String, IRExpr>) {
-    if lets.is_empty() {
-        return;
-    }
-    match expr {
-        IRExpr::AliasRef(name, _) | IRExpr::Variable(name, _) => {
-            if let Some(value) = lets.get(name.as_str()) {
-                *expr = value.clone();
+    crate::stack::deep(|| {
+        if lets.is_empty() {
+            return;
+        }
+        match expr {
+            IRExpr::AliasRef(name, _) | IRExpr::Variable(name, _) => {
+                if let Some(value) = lets.get(name.as_str()) {
+                    *expr = value.clone();
+                }
             }
+            IRExpr::Nearest { query, .. } => resolve(query, lets),
+            IRExpr::Aggregate { arg, .. }
+            | IRExpr::Not(arg, _)
+            | IRExpr::IsNull { expr: arg, .. }
+            | IRExpr::Neg { expr: arg, .. }
+            | IRExpr::Cast { expr: arg, .. } => resolve(arg, lets),
+            IRExpr::Binary { left, right, .. } => {
+                resolve(left, lets);
+                resolve(right, lets);
+            }
+            IRExpr::Call { args, .. } => args.iter_mut().for_each(|a| resolve(a, lets)),
+            IRExpr::Literal(_, _) | IRExpr::Param(_, _) | IRExpr::PropAccess { .. } => {}
         }
-        IRExpr::Nearest { query, .. } => resolve(query, lets),
-        IRExpr::Aggregate { arg, .. }
-        | IRExpr::Not(arg, _)
-        | IRExpr::IsNull { expr: arg, .. }
-        | IRExpr::Neg { expr: arg, .. }
-        | IRExpr::Cast { expr: arg, .. } => resolve(arg, lets),
-        IRExpr::Binary { left, right, .. } => {
-            resolve(left, lets);
-            resolve(right, lets);
-        }
-        IRExpr::Call { args, .. } => args.iter_mut().for_each(|a| resolve(a, lets)),
-        IRExpr::Literal(_, _) | IRExpr::Param(_, _) | IRExpr::PropAccess { .. } => {}
-    }
+    })
 }
 
 fn rename_expr(expr: &mut IRExpr, rename: &impl Fn(&mut String)) {
-    match expr {
+    crate::stack::deep(|| match expr {
         IRExpr::PropAccess { variable, .. } | IRExpr::Variable(variable, _) => rename(variable),
         IRExpr::Nearest {
             variable, query, ..
@@ -4656,5 +4686,5 @@ fn rename_expr(expr: &mut IRExpr, rename: &impl Fn(&mut String)) {
         }
         IRExpr::Call { args, .. } => args.iter_mut().for_each(|a| rename_expr(a, rename)),
         IRExpr::Literal(_, _) | IRExpr::Param(_, _) | IRExpr::AliasRef(_, _) => {}
-    }
+    })
 }

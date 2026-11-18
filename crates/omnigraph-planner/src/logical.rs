@@ -136,14 +136,14 @@ impl Predicate {
     }
 
     fn collect_gq_filters(&self, out: &mut Vec<IRExpr>) {
-        match self {
+        omnigraph_compiler::stack::deep(|| match self {
             Self::Gq { filter, .. } => out.push(filter.0.clone()),
             Self::And { left, right } => {
                 left.collect_gq_filters(out);
                 right.collect_gq_filters(out);
             }
             Self::IdAfter { .. } | Self::VersionWindow { .. } => {}
-        }
+        })
     }
 
     /// The one GQ conjunct this predicate is, when it is no conjunction.
@@ -1137,226 +1137,228 @@ impl LogicalPlan {
     }
 
     fn node_json(&self, id: LogicalId) -> Value {
-        let Some(node) = self.node(id) else {
-            return json!({ "node": "tombstone" });
-        };
-        let mut value = match node {
-            LogicalNode::TableScan { input, spec } => {
-                let mut value = scan_json("TableScan", spec);
-                if input.is_some() {
-                    value["id_restriction"] = json!("input");
+        omnigraph_compiler::stack::deep(|| {
+            let Some(node) = self.node(id) else {
+                return json!({ "node": "tombstone" });
+            };
+            let mut value = match node {
+                LogicalNode::TableScan { input, spec } => {
+                    let mut value = scan_json("TableScan", spec);
+                    if input.is_some() {
+                        value["id_restriction"] = json!("input");
+                    }
+                    value
                 }
-                value
-            }
-            LogicalNode::MetadataCount { spec, return_exprs } => {
-                metadata_count_json(spec, return_exprs)
-            }
-            LogicalNode::Filter { conjuncts, .. } => json!({
-                "node": "Filter",
-                "conjuncts": conjuncts.iter().map(gq_conjunct).collect::<Vec<_>>(),
-                "typed_filters": crate::typed::exprs(conjuncts),
-            }),
-            LogicalNode::Projection {
-                reads,
-                return_exprs,
-                ..
-            } => json!({
-                "node": "Projection",
-                "columns": rendered(reads),
-                "typed_exprs": crate::typed::returns(return_exprs),
-            }),
-            LogicalNode::Sort {
-                keys,
-                order_by,
-                fetch,
-                tiebreak,
-                ..
-            } => json!({
-                "node": "Sort",
-                "keys": keys,
-                "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
-                "fetch": fetch,
-                "tiebreak": tiebreak_text(tiebreak),
-            }),
-            LogicalNode::Ordered { keys, .. } => json!({
-                "node": "Sort", "keys": keys, "fetch": null,
-            }),
-            LogicalNode::Limit { rows, .. } => json!({
-                "node": "Limit", "rows": rows, "bytes": 0, "resume": null,
-            }),
-            LogicalNode::TargetCut {
-                binding, targets, ..
-            } => json!({
-                "node": "TargetCut", "binding": binding, "targets": targets,
-            }),
-            LogicalNode::Page {
-                rows,
-                bytes,
-                resume,
-                ..
-            } => json!({
-                "node": "Limit",
-                "rows": rows,
-                "bytes": bytes,
-                "resume": resume,
-            }),
-            LogicalNode::Join { kind, on, .. } => json!({
-                "node": "Join",
-                "kind": kind,
-                "on": on,
-            }),
-            LogicalNode::CrossJoin { .. } => json!({
-                "node": "Join", "kind": "Cross", "on": LOGICAL_ID,
-            }),
-            LogicalNode::RowDiff {
-                address_short_circuit,
-                ..
-            } => json!({
-                "node": "RowDiff",
-                "address_short_circuit": address_short_circuit,
-            }),
-            LogicalNode::MergeClassify { .. } => json!({ "node": "MergeClassify" }),
-            LogicalNode::Expand {
-                src,
-                dst,
-                edges,
-                src_type,
-                dst_type,
-                min_hops,
-                max_hops,
-                edge_binding,
-                ..
-            } => json!({
-                "node": "Expand",
-                "src": src,
-                "dst": dst,
-                "edges": EdgeSelectionMirror::from(edges),
-                "src_type": src_type,
-                "dst_type": dst_type,
-                "min_hops": min_hops,
-                "max_hops": max_hops,
-                "edge_binding": edge_binding,
-            }),
-            LogicalNode::AntiJoin {
-                outer_var,
-                predicate,
-                ..
-            } => json!({
-                "node": "AntiJoin",
-                "outer_var": outer_var,
-                "predicate": predicate.to_string(),
-                "typed_left": crate::typed::block(&predicate.left),
-                "typed_right": crate::typed::expr(&predicate.right),
-            }),
-            LogicalNode::Union { bindings, .. } => json!({
-                "node": "Union",
-                "bindings": bindings,
-            }),
-            LogicalNode::OptionalJoin { outer_var, .. } => json!({
-                "node": "OptionalJoin",
-                "outer_var": outer_var,
-            }),
-            LogicalNode::Correlate {
-                outer_var,
-                read,
-                tiebreak,
-                reads,
-                ..
-            } => {
-                let mut value = crate::physical::inner_read_json(read, tiebreak);
-                value["node"] = json!("Correlate");
-                value["outer_var"] = json!(outer_var);
-                value["reads"] = json!(rendered(reads));
-                value
-            }
-            LogicalNode::OuterReference { outer_var } => json!({
-                "node": "OuterReference",
-                "outer_var": outer_var,
-            }),
-            LogicalNode::Score {
-                binding,
-                type_name,
-                property,
-                kind,
-                query,
-                reads,
-                ..
-            } => json!({
-                "node": "Score",
-                "binding": binding,
-                "type_name": type_name,
-                "property": property,
-                "kind": crate::physical::score_kind_name(*kind),
-                "typed_query": crate::typed::expr(query),
-                "reads": rendered(reads),
-            }),
-            LogicalNode::Let {
-                name, value, reads, ..
-            } => json!({
-                "node": "Let",
-                "name": name,
-                "typed_value": crate::typed::expr(value),
-                "reads": rendered(reads),
-            }),
-            LogicalNode::Nearest {
-                query,
-                binding,
-                property,
-                k,
-                reads,
-                recall,
-                ..
-            } => {
-                let mut value = json!({
-                    "node": "Nearest",
+                LogicalNode::MetadataCount { spec, return_exprs } => {
+                    metadata_count_json(spec, return_exprs)
+                }
+                LogicalNode::Filter { conjuncts, .. } => json!({
+                    "node": "Filter",
+                    "conjuncts": conjuncts.iter().map(gq_conjunct).collect::<Vec<_>>(),
+                    "typed_filters": crate::typed::exprs(conjuncts),
+                }),
+                LogicalNode::Projection {
+                    reads,
+                    return_exprs,
+                    ..
+                } => json!({
+                    "node": "Projection",
+                    "columns": rendered(reads),
+                    "typed_exprs": crate::typed::returns(return_exprs),
+                }),
+                LogicalNode::Sort {
+                    keys,
+                    order_by,
+                    fetch,
+                    tiebreak,
+                    ..
+                } => json!({
+                    "node": "Sort",
+                    "keys": keys,
+                    "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
+                    "fetch": fetch,
+                    "tiebreak": tiebreak_text(tiebreak),
+                }),
+                LogicalNode::Ordered { keys, .. } => json!({
+                    "node": "Sort", "keys": keys, "fetch": null,
+                }),
+                LogicalNode::Limit { rows, .. } => json!({
+                    "node": "Limit", "rows": rows, "bytes": 0, "resume": null,
+                }),
+                LogicalNode::TargetCut {
+                    binding, targets, ..
+                } => json!({
+                    "node": "TargetCut", "binding": binding, "targets": targets,
+                }),
+                LogicalNode::Page {
+                    rows,
+                    bytes,
+                    resume,
+                    ..
+                } => json!({
+                    "node": "Limit",
+                    "rows": rows,
+                    "bytes": bytes,
+                    "resume": resume,
+                }),
+                LogicalNode::Join { kind, on, .. } => json!({
+                    "node": "Join",
+                    "kind": kind,
+                    "on": on,
+                }),
+                LogicalNode::CrossJoin { .. } => json!({
+                    "node": "Join", "kind": "Cross", "on": LOGICAL_ID,
+                }),
+                LogicalNode::RowDiff {
+                    address_short_circuit,
+                    ..
+                } => json!({
+                    "node": "RowDiff",
+                    "address_short_circuit": address_short_circuit,
+                }),
+                LogicalNode::MergeClassify { .. } => json!({ "node": "MergeClassify" }),
+                LogicalNode::Expand {
+                    src,
+                    dst,
+                    edges,
+                    src_type,
+                    dst_type,
+                    min_hops,
+                    max_hops,
+                    edge_binding,
+                    ..
+                } => json!({
+                    "node": "Expand",
+                    "src": src,
+                    "dst": dst,
+                    "edges": EdgeSelectionMirror::from(edges),
+                    "src_type": src_type,
+                    "dst_type": dst_type,
+                    "min_hops": min_hops,
+                    "max_hops": max_hops,
+                    "edge_binding": edge_binding,
+                }),
+                LogicalNode::AntiJoin {
+                    outer_var,
+                    predicate,
+                    ..
+                } => json!({
+                    "node": "AntiJoin",
+                    "outer_var": outer_var,
+                    "predicate": predicate.to_string(),
+                    "typed_left": crate::typed::block(&predicate.left),
+                    "typed_right": crate::typed::expr(&predicate.right),
+                }),
+                LogicalNode::Union { bindings, .. } => json!({
+                    "node": "Union",
+                    "bindings": bindings,
+                }),
+                LogicalNode::OptionalJoin { outer_var, .. } => json!({
+                    "node": "OptionalJoin",
+                    "outer_var": outer_var,
+                }),
+                LogicalNode::Correlate {
+                    outer_var,
+                    read,
+                    tiebreak,
+                    reads,
+                    ..
+                } => {
+                    let mut value = crate::physical::inner_read_json(read, tiebreak);
+                    value["node"] = json!("Correlate");
+                    value["outer_var"] = json!(outer_var);
+                    value["reads"] = json!(rendered(reads));
+                    value
+                }
+                LogicalNode::OuterReference { outer_var } => json!({
+                    "node": "OuterReference",
+                    "outer_var": outer_var,
+                }),
+                LogicalNode::Score {
+                    binding,
+                    type_name,
+                    property,
+                    kind,
+                    query,
+                    reads,
+                    ..
+                } => json!({
+                    "node": "Score",
                     "binding": binding,
+                    "type_name": type_name,
                     "property": property,
+                    "kind": crate::physical::score_kind_name(*kind),
                     "typed_query": crate::typed::expr(query),
-                    "k": k,
                     "reads": rendered(reads),
-                });
-                if let Some(recall) = recall {
-                    value["recall"] = json!(recall);
+                }),
+                LogicalNode::Let {
+                    name, value, reads, ..
+                } => json!({
+                    "node": "Let",
+                    "name": name,
+                    "typed_value": crate::typed::expr(value),
+                    "reads": rendered(reads),
+                }),
+                LogicalNode::Nearest {
+                    query,
+                    binding,
+                    property,
+                    k,
+                    reads,
+                    recall,
+                    ..
+                } => {
+                    let mut value = json!({
+                        "node": "Nearest",
+                        "binding": binding,
+                        "property": property,
+                        "typed_query": crate::typed::expr(query),
+                        "k": k,
+                        "reads": rendered(reads),
+                    });
+                    if let Some(recall) = recall {
+                        value["recall"] = json!(recall);
+                    }
+                    value
                 }
-                value
+                LogicalNode::Fuse {
+                    arms,
+                    target,
+                    k,
+                    weights,
+                    reads,
+                } => json!({
+                    "node": "Fuse",
+                    "target": target,
+                    "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
+                    "typed_k": k.as_ref().map(crate::typed::expr),
+                    "typed_weights": weights.as_ref().map(crate::typed::expr),
+                    "reads": rendered(reads),
+                }),
+                LogicalNode::Aggregate {
+                    reads,
+                    return_exprs,
+                    ..
+                } => json!({
+                    "node": "Aggregate",
+                    "reads": rendered(reads),
+                    "typed_exprs": crate::typed::returns(return_exprs),
+                }),
+                LogicalNode::CsvSource { spec } => csv_source_json(spec),
+                LogicalNode::DeltaSource { spec } => delta_source_json(spec),
+                LogicalNode::Validate { table, checks, .. } => validate_json(table, checks),
+                LogicalNode::FragmentWrite { spec, .. } => fragment_write_json(spec),
+            };
+            let inputs: Vec<Value> = node
+                .inputs()
+                .into_iter()
+                .map(|input| self.node_json(input))
+                .collect();
+            if !inputs.is_empty() {
+                value["inputs"] = Value::Array(inputs);
             }
-            LogicalNode::Fuse {
-                arms,
-                target,
-                k,
-                weights,
-                reads,
-            } => json!({
-                "node": "Fuse",
-                "target": target,
-                "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
-                "typed_k": k.as_ref().map(crate::typed::expr),
-                "typed_weights": weights.as_ref().map(crate::typed::expr),
-                "reads": rendered(reads),
-            }),
-            LogicalNode::Aggregate {
-                reads,
-                return_exprs,
-                ..
-            } => json!({
-                "node": "Aggregate",
-                "reads": rendered(reads),
-                "typed_exprs": crate::typed::returns(return_exprs),
-            }),
-            LogicalNode::CsvSource { spec } => csv_source_json(spec),
-            LogicalNode::DeltaSource { spec } => delta_source_json(spec),
-            LogicalNode::Validate { table, checks, .. } => validate_json(table, checks),
-            LogicalNode::FragmentWrite { spec, .. } => fragment_write_json(spec),
-        };
-        let inputs: Vec<Value> = node
-            .inputs()
-            .into_iter()
-            .map(|input| self.node_json(input))
-            .collect();
-        if !inputs.is_empty() {
-            value["inputs"] = Value::Array(inputs);
-        }
-        value
+            value
+        })
     }
 }
 

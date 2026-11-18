@@ -224,44 +224,61 @@ fn input_of<'i>(p: &Pair<'i, Rule>) -> &'i str {
 /// last of those that is not trivia ends the construct.
 fn token_end(p: &Pair<Rule>) -> usize {
     let span = p.as_span();
-    // A pair with no inner pair is one token (a string literal, a keyword, a
-    // name): its text, whatever it holds, is not trivia.
-    if p.clone().into_inner().next().is_none() {
-        return span.start() + p.as_str().trim_end().len();
+    // Each pair's end is found once per parse: the spans at every level of a
+    // nested construct ask for the ends of the pairs inside them again.
+    let key = (input_of(p).as_ptr() as usize, span.start(), span.end());
+    if let Some(end) = TOKEN_ENDS.with(|ends| ends.borrow().get(&key).copied()) {
+        return end;
     }
-    // An inner pair's span can run on over trivia too: its own last token
-    // is found the same way.
-    let after = p
-        .clone()
-        .into_inner()
-        .map(|inner| token_end(&inner))
-        .max()
-        .unwrap_or(span.start());
-    let tail = &input_of(p).as_bytes()[after..span.end()];
-    let mut end = 0;
-    let mut i = 0;
-    while i < tail.len() {
-        match (tail[i], tail.get(i + 1)) {
-            (b' ' | b'\t' | b'\r' | b'\n', _) => i += 1,
-            (b'/', Some(b'/')) => {
-                i = tail[i..]
-                    .iter()
-                    .position(|b| *b == b'\n')
-                    .map_or(tail.len(), |n| i + n);
-            }
-            (b'/', Some(b'*')) => {
-                i = tail[i + 2..]
-                    .windows(2)
-                    .position(|w| w == b"*/")
-                    .map_or(tail.len(), |n| i + 2 + n + 2);
-            }
-            _ => {
-                i += 1;
-                end = i;
+    let end = crate::stack::deep(|| {
+        // A pair with no inner pair is one token (a string literal, a keyword, a
+        // name): its text, whatever it holds, is not trivia.
+        if p.clone().into_inner().next().is_none() {
+            return span.start() + p.as_str().trim_end().len();
+        }
+        // An inner pair's span can run on over trivia too: its own last token
+        // is found the same way.
+        let after = p
+            .clone()
+            .into_inner()
+            .map(|inner| token_end(&inner))
+            .max()
+            .unwrap_or(span.start());
+        let tail = &input_of(p).as_bytes()[after..span.end()];
+        let mut end = 0;
+        let mut i = 0;
+        while i < tail.len() {
+            match (tail[i], tail.get(i + 1)) {
+                (b' ' | b'\t' | b'\r' | b'\n', _) => i += 1,
+                (b'/', Some(b'/')) => {
+                    i = tail[i..]
+                        .iter()
+                        .position(|b| *b == b'\n')
+                        .map_or(tail.len(), |n| i + n);
+                }
+                (b'/', Some(b'*')) => {
+                    i = tail[i + 2..]
+                        .windows(2)
+                        .position(|w| w == b"*/")
+                        .map_or(tail.len(), |n| i + 2 + n + 2);
+                }
+                _ => {
+                    i += 1;
+                    end = i;
+                }
             }
         }
-    }
-    after + end
+        after + end
+    });
+    TOKEN_ENDS.with(|ends| ends.borrow_mut().insert(key, end));
+    end
+}
+
+thread_local! {
+    /// [`token_end`] of each pair of the parse in progress, by its input and
+    /// span; [`structural_scoped`] clears it around each parse.
+    static TOKEN_ENDS: std::cell::RefCell<HashMap<(usize, usize, usize), usize>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 /// A parsed construct's text, from its first token to its last
@@ -516,19 +533,21 @@ pub fn parse_source_all(input: &str) -> (Option<SourceFile>, Vec<QueryDiagnostic
 
 /// `d`'s positions counted again in `input` from their byte offsets.
 fn reposition(input: &str, d: &mut QueryDiagnostic) {
-    let again = |p: &mut Position| *p = Position::at(input, p.byte as usize);
-    for p in d.position.iter_mut().chain(d.end.iter_mut()) {
-        again(p);
-    }
-    if let Some(extra) = d.extra.as_mut() {
-        for r in &mut extra.related {
-            again(&mut r.position);
-            again(&mut r.end);
+    crate::stack::deep(|| {
+        let again = |p: &mut Position| *p = Position::at(input, p.byte as usize);
+        for p in d.position.iter_mut().chain(d.end.iter_mut()) {
+            again(p);
         }
-        for f in &mut extra.further {
-            reposition(input, f);
+        if let Some(extra) = d.extra.as_mut() {
+            for r in &mut extra.related {
+                again(&mut r.position);
+                again(&mut r.end);
+            }
+            for f in &mut extra.further {
+                reposition(input, f);
+            }
         }
-    }
+    })
 }
 
 /// A refusal's diagnostic with the end of its construct's span.
@@ -623,13 +642,19 @@ fn structural(input: &str) -> std::result::Result<(SourceFile, Vec<DeclName>), R
 }
 
 fn structural_scoped(input: &str) -> std::result::Result<(SourceFile, Vec<DeclName>), Refused> {
-    let pairs = QueryParser::parse(Rule::query_file, input)
+    // The generated parser recurses once per level of nesting, on whatever
+    // stack it runs on: it gets the room the source's nesting needs.
+    let room = crate::query::depth::nesting(input)
+        .saturating_mul(crate::query::depth::GRAMMAR_BYTES_PER_LEVEL);
+    let pairs = crate::stack::with_room(room, || QueryParser::parse(Rule::query_file, input))
         .map_err(|error| Refused::Grammar(grammar_error(input, error)))?;
     let file = pairs.into_iter().next().expect("grammar: one query_file");
+    let outer_ends = TOKEN_ENDS.with(|ends| std::mem::take(&mut *ends.borrow_mut()));
     // The habit pass reparses inside a parse: each parse records its own.
     let outer = RECOVERED.with(|r| std::mem::take(&mut *r.borrow_mut()));
     let built = build_file(input, file);
     let mut refusals = RECOVERED.with(|r| std::mem::replace(&mut *r.borrow_mut(), outer));
+    TOKEN_ENDS.with(|ends| *ends.borrow_mut() = outer_ends);
     match built {
         Ok(file) if refusals.is_empty() => Ok(file),
         built => {
@@ -3079,235 +3104,238 @@ fn compose_inner(outer: Vec<TextEdit>, inner: Result<Element, Refusal>) -> R<Vec
 /// A recognizer is refused with its fix; a predicate never reaches here
 /// (its list is refused first).
 fn element(pair: Pair<Rule>, before: &[Pair<Rule>]) -> R<Element> {
-    let input = input_of(&pair);
-    let c = kind(&pair);
-    let span = span_of(&c);
-    match c.as_rule() {
-        Rule::let_clause => {
-            let mut inner = c.into_inner().filter(|p| p.as_rule() != Rule::kw_let);
-            let name = inner.next().unwrap().as_str()[1..].to_string();
-            let value = inner.next().unwrap();
-            let value = match value.as_rule() {
-                Rule::inline_read => LetValue::Relation(Box::new(inline_read(value)?)),
-                _ => LetValue::Expr(expr(value)?),
-            };
-            Ok(Element::Let { name, value })
-        }
-        Rule::from_clause => {
-            let mut inner = c.into_inner();
-            let rel = inner.find(|p| p.as_rule() == Rule::relation_expr).unwrap();
-            let score = inner
-                .find(|p| p.as_rule() == Rule::variable)
-                .map(|v| v.as_str()[1..].to_string());
-            Ok(Element::From {
-                rel: relation(rel)?,
-                score,
-            })
-        }
-        Rule::from_paren_rec => {
-            let rel = c
-                .clone()
-                .into_inner()
-                .find(|p| p.as_rule() == Rule::relation_expr)
-                .unwrap();
-            Err(refusal(
-                input,
-                Q019,
-                "`from` takes the relation itself, not in parentheses",
-                span,
-                vec![edit(
-                    span.0,
-                    span.1,
-                    format!("from {}", rel.as_str().trim()),
-                )],
-                MACHINE,
-            ))
-        }
-        Rule::optional_block => {
-            let body = child(&c, Rule::block_body).unwrap();
-            Ok(Element::Optional(block_pattern(&body)?))
-        }
-        Rule::binding => {
-            let mut inner = c.into_inner();
-            let variable = inner.next().unwrap().as_str()[1..].to_string();
-            let type_name = inner.next().unwrap().as_str().to_string();
-            Ok(Element::Binding {
-                variable,
-                type_name,
-            })
-        }
-        Rule::binding_brace_filter => {
-            let mut inner = c.clone().into_inner();
-            let var = inner.next().unwrap().as_str();
-            let ty = inner.next().unwrap().as_str();
-            Err(refusal_note(
+    crate::stack::deep(|| {
+        let input = input_of(&pair);
+        let c = kind(&pair);
+        let span = span_of(&c);
+        match c.as_rule() {
+            Rule::let_clause => {
+                let mut inner = c.into_inner().filter(|p| p.as_rule() != Rule::kw_let);
+                let name = inner.next().unwrap().as_str()[1..].to_string();
+                let value = inner.next().unwrap();
+                let value = match value.as_rule() {
+                    Rule::inline_read => LetValue::Relation(Box::new(inline_read(value)?)),
+                    _ => LetValue::Expr(expr(value)?),
+                };
+                Ok(Element::Let { name, value })
+            }
+            Rule::from_clause => {
+                let mut inner = c.into_inner();
+                let rel = inner.find(|p| p.as_rule() == Rule::relation_expr).unwrap();
+                let score = inner
+                    .find(|p| p.as_rule() == Rule::variable)
+                    .map(|v| v.as_str()[1..].to_string());
+                Ok(Element::From {
+                    rel: relation(rel)?,
+                    score,
+                })
+            }
+            Rule::from_paren_rec => {
+                let rel = c
+                    .clone()
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::relation_expr)
+                    .unwrap();
+                Err(refusal(
+                    input,
+                    Q019,
+                    "`from` takes the relation itself, not in parentheses",
+                    span,
+                    vec![edit(
+                        span.0,
+                        span.1,
+                        format!("from {}", rel.as_str().trim()),
+                    )],
+                    MACHINE,
+                ))
+            }
+            Rule::optional_block => {
+                let body = child(&c, Rule::block_body).unwrap();
+                Ok(Element::Optional(block_pattern(&body)?))
+            }
+            Rule::binding => {
+                let mut inner = c.into_inner();
+                let variable = inner.next().unwrap().as_str()[1..].to_string();
+                let type_name = inner.next().unwrap().as_str().to_string();
+                Ok(Element::Binding {
+                    variable,
+                    type_name,
+                })
+            }
+            Rule::binding_brace_filter => {
+                let mut inner = c.clone().into_inner();
+                let var = inner.next().unwrap().as_str();
+                let ty = inner.next().unwrap().as_str();
+                Err(refusal_note(
+                    input,
+                    Q010,
+                    "a binding takes no braces; a test of its properties is a comparison in `where`",
+                    span,
+                    format!("match {{ {var}: {ty} }} where {var}.<property> = <value>"),
+                ))
+            }
+            Rule::binding_paren_rec => {
+                let mut inner = c.clone().into_inner();
+                let head = inner.nth(1).unwrap();
+                let ty = head.as_str().trim_end_matches('(').trim();
+                let args = inner.find(|a| a.as_rule() == Rule::call_args);
+                let name = lower_first(ty);
+                Err(refusal(
+                    input,
+                    Q014,
+                    "the view binding `$x: View(args)` was withdrawn: a declared read is drawn with `from name(args)`",
+                    span,
+                    vec![edit(
+                        span.0,
+                        span.1,
+                        format!(
+                            "from {name}({})",
+                            args.map(|a| a.as_str().trim().to_string())
+                                .unwrap_or_default()
+                        ),
+                    )],
+                    REVIEW,
+                ))
+            }
+            Rule::binding_lower_rec => {
+                let ident = c.clone().into_inner().nth(1).unwrap();
+                let (s, e) = span_of(&ident);
+                Err(refusal(
+                    input,
+                    Q014,
+                    format!(
+                        "a type name starts with an uppercase letter; `{}` is a property or edge name",
+                        ident.as_str()
+                    ),
+                    span,
+                    vec![edit(s, e, upper_first(ident.as_str()))],
+                    REVIEW,
+                ))
+            }
+            Rule::traversal => Ok(Element::Traversal(traversal(c)?)),
+            Rule::arrow_traversal => Err(arrow(c)),
+            Rule::cypher_pattern => Err(cypher_pattern(c)),
+            Rule::list_to_rows => Err(list_to_rows(c)),
+            Rule::match_prefix_rec => {
+                let word = c.clone().into_inner().next().unwrap();
+                let inner = c.clone().into_inner().nth(1).unwrap();
+                let (ws, we) =
+                    with_trailing_ws(input, word.as_span().start(), word.as_span().end());
+                let edits = compose_inner(vec![edit(ws, we, "")], element(inner, &[]))?;
+                Err(refusal(
+                    input,
+                    Q014,
+                    "`match` wraps a read's elements once, in braces",
+                    span,
+                    edits,
+                    MACHINE,
+                ))
+            }
+            Rule::with_rec => Err(with_clause(input, before, &c)),
+            Rule::star_range_rec => Err(star_range(input, &c)),
+            Rule::call_block_rec => {
+                let word = c.clone().into_inner().next().unwrap();
+                let (s, e) = span_of(&word);
+                Err(refusal(
+                    input,
+                    Q014,
+                    "`call { … }` is Cypher's; GQ draws the rows of an inline read with `from { … }`",
+                    span,
+                    vec![edit(s, e, "from")],
+                    MACHINE,
+                ))
+            }
+            Rule::optional_rec => {
+                let mut edits = Vec::new();
+                let mut parts = c.clone().into_inner().peekable();
+                let word = parts.next().unwrap();
+                if word.as_str() != "optional" {
+                    edits.push(edit(
+                        word.as_span().start(),
+                        word.as_span().end(),
+                        "optional",
+                    ));
+                }
+                let rest: Vec<Pair<Rule>> = parts.collect();
+                if let Some(m) = rest.iter().find(|p| p.as_rule() == Rule::fw_match) {
+                    let (s, e) = with_trailing_ws(input, m.as_span().start(), m.as_span().end());
+                    edits.push(edit(s, e, ""));
+                }
+                let elements: Vec<Pair<Rule>> = rest
+                    .iter()
+                    .flat_map(|p| match p.as_rule() {
+                        Rule::element => vec![p.clone()],
+                        Rule::elements => p
+                            .clone()
+                            .into_inner()
+                            .filter(|e| e.as_rule() == Rule::element)
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                let braced = rest.iter().any(|p| p.as_rule() == Rule::elements);
+                if !braced {
+                    if let Some(cl) = elements.first() {
+                        let (s, e) = span_of(cl);
+                        let e = input[..e].trim_end().len();
+                        edits.push(edit(s, s, "{ "));
+                        edits.push(edit(e, e, " }"));
+                    }
+                }
+                let mut all = edits;
+                for cl in elements {
+                    all = compose_inner(all, element(cl, &[]))?;
+                }
+                Err(refusal(
+                    input,
+                    Q014,
+                    "`optional` takes its elements in braces: `optional { … }`",
+                    span,
+                    all,
+                    MACHINE,
+                ))
+            }
+            Rule::detach_rec => {
+                let (s, e) = with_trailing_ws(input, span.0, span.1);
+                Err(refusal(
+                    input,
+                    Q014,
+                    "`detach` is Cypher's; GQ's `delete` of a node removes its edges",
+                    span,
+                    vec![edit(s, e, "")],
+                    MACHINE,
+                ))
+            }
+            Rule::filter_rec => {
+                if let Some(r) = keyword_filter(&c) {
+                    return Err(r);
+                }
+                expr(c.clone().into_inner().next().unwrap())?;
+                Err(refusal_note(
+                    input,
+                    Q017,
+                    "a filter is not an element of `match { … }`: a predicate belongs in the `where` after the braces",
+                    span,
+                    "match { … } where <predicate>",
+                ))
+            }
+            Rule::stray_braces_rec => Err(refusal_note(
                 input,
                 Q010,
-                "a binding takes no braces; a test of its properties is a comparison in `where`",
+                "an element does not start with `{`; a test of a binding's properties is a comparison in `where`",
                 span,
-                format!("match {{ {var}: {ty} }} where {var}.<property> = <value>"),
-            ))
-        }
-        Rule::binding_paren_rec => {
-            let mut inner = c.clone().into_inner();
-            let head = inner.nth(1).unwrap();
-            let ty = head.as_str().trim_end_matches('(').trim();
-            let args = inner.find(|a| a.as_rule() == Rule::call_args);
-            let name = lower_first(ty);
-            Err(refusal(
-                input,
-                Q014,
-                "the view binding `$x: View(args)` was withdrawn: a declared read is drawn with `from name(args)`",
-                span,
-                vec![edit(
-                    span.0,
-                    span.1,
-                    format!(
-                        "from {name}({})",
-                        args.map(|a| a.as_str().trim().to_string())
-                            .unwrap_or_default()
-                    ),
-                )],
-                REVIEW,
-            ))
-        }
-        Rule::binding_lower_rec => {
-            let ident = c.clone().into_inner().nth(1).unwrap();
-            let (s, e) = span_of(&ident);
-            Err(refusal(
-                input,
-                Q014,
-                format!(
-                    "a type name starts with an uppercase letter; `{}` is a property or edge name",
-                    ident.as_str()
-                ),
-                span,
-                vec![edit(s, e, upper_first(ident.as_str()))],
-                REVIEW,
-            ))
-        }
-        Rule::traversal => Ok(Element::Traversal(traversal(c)?)),
-        Rule::arrow_traversal => Err(arrow(c)),
-        Rule::cypher_pattern => Err(cypher_pattern(c)),
-        Rule::list_to_rows => Err(list_to_rows(c)),
-        Rule::match_prefix_rec => {
-            let word = c.clone().into_inner().next().unwrap();
-            let inner = c.clone().into_inner().nth(1).unwrap();
-            let (ws, we) = with_trailing_ws(input, word.as_span().start(), word.as_span().end());
-            let edits = compose_inner(vec![edit(ws, we, "")], element(inner, &[]))?;
-            Err(refusal(
-                input,
-                Q014,
-                "`match` wraps a read's elements once, in braces",
-                span,
-                edits,
-                MACHINE,
-            ))
-        }
-        Rule::with_rec => Err(with_clause(input, before, &c)),
-        Rule::star_range_rec => Err(star_range(input, &c)),
-        Rule::call_block_rec => {
-            let word = c.clone().into_inner().next().unwrap();
-            let (s, e) = span_of(&word);
-            Err(refusal(
-                input,
-                Q014,
-                "`call { … }` is Cypher's; GQ draws the rows of an inline read with `from { … }`",
-                span,
-                vec![edit(s, e, "from")],
-                MACHINE,
-            ))
-        }
-        Rule::optional_rec => {
-            let mut edits = Vec::new();
-            let mut parts = c.clone().into_inner().peekable();
-            let word = parts.next().unwrap();
-            if word.as_str() != "optional" {
-                edits.push(edit(
-                    word.as_span().start(),
-                    word.as_span().end(),
-                    "optional",
-                ));
-            }
-            let rest: Vec<Pair<Rule>> = parts.collect();
-            if let Some(m) = rest.iter().find(|p| p.as_rule() == Rule::fw_match) {
-                let (s, e) = with_trailing_ws(input, m.as_span().start(), m.as_span().end());
-                edits.push(edit(s, e, ""));
-            }
-            let elements: Vec<Pair<Rule>> = rest
-                .iter()
-                .flat_map(|p| match p.as_rule() {
-                    Rule::element => vec![p.clone()],
-                    Rule::elements => p
-                        .clone()
-                        .into_inner()
-                        .filter(|e| e.as_rule() == Rule::element)
-                        .collect(),
-                    _ => Vec::new(),
-                })
-                .collect();
-            let braced = rest.iter().any(|p| p.as_rule() == Rule::elements);
-            if !braced {
-                if let Some(cl) = elements.first() {
-                    let (s, e) = span_of(cl);
-                    let e = input[..e].trim_end().len();
-                    edits.push(edit(s, s, "{ "));
-                    edits.push(edit(e, e, " }"));
-                }
-            }
-            let mut all = edits;
-            for cl in elements {
-                all = compose_inner(all, element(cl, &[]))?;
-            }
-            Err(refusal(
-                input,
-                Q014,
-                "`optional` takes its elements in braces: `optional { … }`",
-                span,
-                all,
-                MACHINE,
-            ))
-        }
-        Rule::detach_rec => {
-            let (s, e) = with_trailing_ws(input, span.0, span.1);
-            Err(refusal(
-                input,
-                Q014,
-                "`detach` is Cypher's; GQ's `delete` of a node removes its edges",
-                span,
-                vec![edit(s, e, "")],
-                MACHINE,
-            ))
-        }
-        Rule::filter_rec => {
-            if let Some(r) = keyword_filter(&c) {
-                return Err(r);
-            }
-            expr(c.clone().into_inner().next().unwrap())?;
-            Err(refusal_note(
+                "match { $x: Type } where $x.<property> = <value>",
+            )),
+            // A predicate inside a recognizer's own elements.
+            _ => Err(refusal_note(
                 input,
                 Q017,
-                "a filter is not an element of `match { … }`: a predicate belongs in the `where` after the braces",
+                "a predicate is not an element of `match { … }`: it belongs in the `where` after the braces",
                 span,
                 "match { … } where <predicate>",
-            ))
+            )),
         }
-        Rule::stray_braces_rec => Err(refusal_note(
-            input,
-            Q010,
-            "an element does not start with `{`; a test of a binding's properties is a comparison in `where`",
-            span,
-            "match { $x: Type } where $x.<property> = <value>",
-        )),
-        // A predicate inside a recognizer's own elements.
-        _ => Err(refusal_note(
-            input,
-            Q017,
-            "a predicate is not an element of `match { … }`: it belongs in the `where` after the braces",
-            span,
-            "match { … } where <predicate>",
-        )),
-    }
+    })
 }
 
 fn lower_first(s: &str) -> String {
@@ -3582,7 +3610,7 @@ fn traversal(pair: Pair<Rule>) -> R<Traversal> {
 }
 
 fn edge_selector(pair: Pair<Rule>) -> R<EdgeSelector> {
-    match pair.as_rule() {
+    crate::stack::deep(|| match pair.as_rule() {
         Rule::edge_group_rec => {
             let input = input_of(&pair);
             let name = pair.clone().into_inner().next().unwrap();
@@ -3605,7 +3633,7 @@ fn edge_selector(pair: Pair<Rule>) -> R<EdgeSelector> {
             pair.into_inner().map(edge_name).collect::<R<Vec<_>>>()?,
         )),
         _ => Ok(EdgeSelector::Named(edge_name(pair)?)),
-    }
+    })
 }
 
 fn edge_name(pair: Pair<Rule>) -> R<String> {
@@ -3756,313 +3784,319 @@ fn comp_op(op: &str) -> CompOp {
 }
 
 fn expr(pair: Pair<Rule>) -> R<Expr> {
-    let input = input_of(&pair);
-    match pair.as_rule() {
-        Rule::expr => expr(pair.into_inner().next().unwrap()),
-        Rule::or_expr | Rule::and_expr => {
-            let is_or = pair.as_rule() == Rule::or_expr;
-            let mut operands = pair
-                .into_inner()
-                .filter(|p| !matches!(p.as_rule(), Rule::kw_and | Rule::kw_or));
-            let first = expr(operands.next().unwrap())?;
-            operands.try_fold(first, |left, right| {
-                let right = Box::new(expr(right)?);
-                Ok(if is_or {
-                    Expr::Or(Box::new(left), right)
-                } else {
-                    Expr::And(Box::new(left), right)
+    crate::stack::deep(|| {
+        let input = input_of(&pair);
+        match pair.as_rule() {
+            Rule::expr => expr(pair.into_inner().next().unwrap()),
+            Rule::or_expr | Rule::and_expr => {
+                let is_or = pair.as_rule() == Rule::or_expr;
+                let mut operands = pair
+                    .into_inner()
+                    .filter(|p| !matches!(p.as_rule(), Rule::kw_and | Rule::kw_or));
+                let first = expr(operands.next().unwrap())?;
+                operands.try_fold(first, |left, right| {
+                    let right = Box::new(expr(right)?);
+                    Ok(if is_or {
+                        Expr::Or(Box::new(left), right)
+                    } else {
+                        Expr::And(Box::new(left), right)
+                    })
                 })
-            })
-        }
-        Rule::not_expr => {
-            let mut parts = pair.into_inner();
-            let first = parts.next().unwrap();
-            if first.as_rule() == Rule::not_block_rec {
-                let kw = first.clone().into_inner().next().unwrap();
-                let end = kw.as_span().end();
-                return Err(refusal(
-                    input,
-                    Q012,
-                    "`not { … }` is written `not exists { … }`",
-                    span_of(&first),
-                    vec![edit(end, end, " exists")],
-                    MACHINE,
-                ));
             }
-            if first.as_rule() == Rule::kw_not {
-                Ok(Expr::Not(Box::new(expr(parts.next().unwrap())?)))
-            } else {
-                expr(first)
+            Rule::not_expr => {
+                let mut parts = pair.into_inner();
+                let first = parts.next().unwrap();
+                if first.as_rule() == Rule::not_block_rec {
+                    let kw = first.clone().into_inner().next().unwrap();
+                    let end = kw.as_span().end();
+                    return Err(refusal(
+                        input,
+                        Q012,
+                        "`not { … }` is written `not exists { … }`",
+                        span_of(&first),
+                        vec![edit(end, end, " exists")],
+                        MACHINE,
+                    ));
+                }
+                if first.as_rule() == Rule::kw_not {
+                    Ok(Expr::Not(Box::new(expr(parts.next().unwrap())?)))
+                } else {
+                    expr(first)
+                }
             }
-        }
-        Rule::comparison => comparison(pair),
-        Rule::sum | Rule::product => arithmetic(input, pair),
-        Rule::unary => {
-            let mut parts = pair.into_inner();
-            let first = parts.next().unwrap();
-            if first.as_rule() == Rule::unary_minus {
-                Ok(Expr::Neg(Box::new(expr(parts.next().unwrap())?)))
-            } else {
-                expr(first)
+            Rule::comparison => comparison(pair),
+            Rule::sum | Rule::product => arithmetic(input, pair),
+            Rule::unary => {
+                let mut parts = pair.into_inner();
+                let first = parts.next().unwrap();
+                if first.as_rule() == Rule::unary_minus {
+                    Ok(Expr::Neg(Box::new(expr(parts.next().unwrap())?)))
+                } else {
+                    expr(first)
+                }
             }
+            Rule::operand => operand(pair),
+            other => unreachable!("grammar: no expression rule {other:?}"),
         }
-        Rule::operand => operand(pair),
-        other => unreachable!("grammar: no expression rule {other:?}"),
-    }
+    })
 }
 
 fn comparison(pair: Pair<Rule>) -> R<Expr> {
-    let input = input_of(&pair);
-    let span = (pair.as_span().start(), tend(input, &pair));
-    let parts: Vec<Pair<Rule>> = pair.into_inner().collect();
-    let left_pair = parts[0].clone();
-    let left_source = left_pair.as_str().trim().to_string();
-    let Some(op) = parts.get(1).cloned() else {
-        return expr(left_pair);
-    };
-    let whole = |text: String, message: &str, code: QueryCode, app: Applicability| -> R<Expr> {
-        Err(refusal(
-            input,
-            code,
-            message.to_string(),
-            span,
-            vec![edit(span.0, span.1, text)],
-            app,
-        ))
-    };
-    match op.as_rule() {
-        Rule::comp_op => {
-            let right_pair = parts[2].clone();
-            if let Some(chain) = parts.get(3).filter(|p| p.as_rule() == Rule::chained_rec) {
-                let mut terms = vec![format!(
-                    "{left_source} {} {}",
-                    op.as_str(),
-                    right_pair.as_str().trim()
-                )];
-                let mut prev = right_pair.as_str().trim().to_string();
-                let items: Vec<Pair<Rule>> = chain.clone().into_inner().collect();
-                for pair in items.chunks(2) {
-                    let r = pair[1].as_str().trim().to_string();
-                    terms.push(format!("{prev} {} {r}", pair[0].as_str()));
-                    prev = r;
+    crate::stack::deep(|| {
+        let input = input_of(&pair);
+        let span = (pair.as_span().start(), tend(input, &pair));
+        let parts: Vec<Pair<Rule>> = pair.into_inner().collect();
+        let left_pair = parts[0].clone();
+        let left_source = left_pair.as_str().trim().to_string();
+        let Some(op) = parts.get(1).cloned() else {
+            return expr(left_pair);
+        };
+        let whole = |text: String, message: &str, code: QueryCode, app: Applicability| -> R<Expr> {
+            Err(refusal(
+                input,
+                code,
+                message.to_string(),
+                span,
+                vec![edit(span.0, span.1, text)],
+                app,
+            ))
+        };
+        match op.as_rule() {
+            Rule::comp_op => {
+                let right_pair = parts[2].clone();
+                if let Some(chain) = parts.get(3).filter(|p| p.as_rule() == Rule::chained_rec) {
+                    let mut terms = vec![format!(
+                        "{left_source} {} {}",
+                        op.as_str(),
+                        right_pair.as_str().trim()
+                    )];
+                    let mut prev = right_pair.as_str().trim().to_string();
+                    let items: Vec<Pair<Rule>> = chain.clone().into_inner().collect();
+                    for pair in items.chunks(2) {
+                        let r = pair[1].as_str().trim().to_string();
+                        terms.push(format!("{prev} {} {r}", pair[0].as_str()));
+                        prev = r;
+                    }
+                    // Parenthesized: the comparison may be the operand of a
+                    // `not`, which binds tighter than `and`.
+                    return whole(
+                        format!("({})", terms.join(" and ")),
+                        "a comparison is not chained; write each with `and` (a chained `<` … `>` would read as an undirected traversal)",
+                        Q012,
+                        MACHINE,
+                    );
                 }
-                // Parenthesized: the comparison may be the operand of a
-                // `not`, which binds tighter than `and`.
-                return whole(
-                    format!("({})", terms.join(" and ")),
-                    "a comparison is not chained; write each with `and` (a chained `<` … `>` would read as an undirected traversal)",
-                    Q012,
-                    MACHINE,
-                );
+                let right_source = right_pair.as_str().trim().to_string();
+                let ranges = vec![written_range(&left_pair), written_range(&right_pair)];
+                Ok(Expr::Compare {
+                    op: comp_op(op.as_str()),
+                    left: Box::new(expr(left_pair)?),
+                    right: Box::new(expr(right_pair)?),
+                    at: SourceSpan {
+                        operands: vec![left_source.clone(), right_source],
+                        ranges,
+                        ..SourceSpan::of(input, span.0, span.1)
+                    },
+                })
             }
-            let right_source = right_pair.as_str().trim().to_string();
-            let ranges = vec![written_range(&left_pair), written_range(&right_pair)];
-            Ok(Expr::Compare {
-                op: comp_op(op.as_str()),
-                left: Box::new(expr(left_pair)?),
-                right: Box::new(expr(right_pair)?),
-                at: SourceSpan {
-                    operands: vec![left_source.clone(), right_source],
-                    ranges,
-                    ..SourceSpan::of(input, span.0, span.1)
-                },
-            })
-        }
-        Rule::kw_in => {
-            let list = parts[2].clone();
-            if list.as_rule() == Rule::in_paren_rec {
-                let items: Vec<&str> = list
+            Rule::kw_in => {
+                let list = parts[2].clone();
+                if list.as_rule() == Rule::in_paren_rec {
+                    let items: Vec<&str> = list
+                        .clone()
+                        .into_inner()
+                        .map(|p| p.as_str().trim())
+                        .collect();
+                    let (s, e) = span_of(&list);
+                    return Err(refusal(
+                        input,
+                        Q014,
+                        "a list is written in brackets, `[a, b]`",
+                        span,
+                        vec![edit(s, e, format!("[{}]", items.join(", ")))],
+                        MACHINE,
+                    ));
+                }
+                let list_source = list.as_str().trim().to_string();
+                let mut ranges = vec![written_range(&left_pair), written_range(&list)];
+                // A written list's elements, each a range of its own; the checker
+                // reads them only when the list operand is that literal.
+                if let Some(items) = list
                     .clone()
                     .into_inner()
-                    .map(|p| p.as_str().trim())
-                    .collect();
-                let (s, e) = span_of(&list);
-                return Err(refusal(
-                    input,
+                    .flatten()
+                    .find(|p| matches!(p.as_rule(), Rule::list_lit | Rule::value_list))
+                {
+                    ranges.extend(items.into_inner().map(|item| written_range(&item)));
+                }
+                Ok(Expr::In {
+                    needle: Box::new(expr(left_pair)?),
+                    list: Box::new(expr(list)?),
+                    at: SourceSpan {
+                        operands: vec![left_source.clone(), list_source],
+                        ranges,
+                        ..SourceSpan::of(
+                            input,
+                            span.0,
+                            span.0 + input[span.0..span.1].trim_end().len(),
+                        )
+                    },
+                })
+            }
+            Rule::regex_rec => Err(refusal_note(
+                input,
+                Q014,
+                "`=~` is not GQ; the string registry rows are `contains`, `starts_with` and `match_text`",
+                span,
+                format!("contains({left_source}, \"…\")"),
+            )),
+            Rule::not_in_rec => {
+                let right = op.clone().into_inner().nth(2).unwrap();
+                whole(
+                    format!("not {left_source} in {}", right.as_str().trim()),
+                    "`not` comes before the comparison: `not x in list`",
                     Q014,
-                    "a list is written in brackets, `[a, b]`",
-                    span,
-                    vec![edit(s, e, format!("[{}]", items.join(", ")))],
                     MACHINE,
-                ));
+                )
             }
-            let list_source = list.as_str().trim().to_string();
-            let mut ranges = vec![written_range(&left_pair), written_range(&list)];
-            // A written list's elements, each a range of its own; the checker
-            // reads them only when the list operand is that literal.
-            if let Some(items) = list
-                .clone()
-                .into_inner()
-                .flatten()
-                .find(|p| matches!(p.as_rule(), Rule::list_lit | Rule::value_list))
-            {
-                ranges.extend(items.into_inner().map(|item| written_range(&item)));
+            Rule::between_rec => {
+                let mut b = op.clone().into_inner();
+                let lo = b.nth(1).unwrap().as_str().trim().to_string();
+                let hi = b.nth(1).unwrap().as_str().trim().to_string();
+                // Parenthesized: the comparison may be the operand of a `not`.
+                whole(
+                    format!("({left_source} >= {lo} and {left_source} <= {hi})"),
+                    "`between` is SQL's; GQ writes the two comparisons",
+                    Q014,
+                    MACHINE,
+                )
             }
-            Ok(Expr::In {
-                needle: Box::new(expr(left_pair)?),
-                list: Box::new(expr(list)?),
+            Rule::like_rec => {
+                let pat = op.clone().into_inner().nth(1).unwrap();
+                let text = pat.as_str().trim();
+                let inner = text.strip_prefix('"').and_then(|t| t.strip_suffix('"'));
+                let fix = inner.and_then(|t| {
+                    let body = t.trim_start_matches('%').trim_end_matches('%');
+                    if body.contains('%') || body.contains('_') {
+                        return None;
+                    }
+                    match (t.starts_with('%'), t.ends_with('%')) {
+                        (true, true) => Some(format!("contains({left_source}, \"{body}\")")),
+                        (false, true) => Some(format!("starts_with({left_source}, \"{body}\")")),
+                        _ => None,
+                    }
+                });
+                match fix {
+                    Some(f) => whole(
+                        f,
+                        "`like` is SQL's; the string registry rows are `contains` and `starts_with`",
+                        Q014,
+                        MACHINE,
+                    ),
+                    None => Err(refusal_note(
+                        input,
+                        Q014,
+                        "`like` is SQL's; the string registry rows are `contains` and `starts_with`",
+                        span,
+                        format!("contains({left_source}, \"…\")"),
+                    )),
+                }
+            }
+            Rule::starts_with_words_rec => {
+                let mut w = op.clone().into_inner();
+                let word = w.next().unwrap().as_str().to_ascii_lowercase();
+                let right = w.nth(1).unwrap().as_str().trim().to_string();
+                let func = if word == "ends" {
+                    "ends_with"
+                } else {
+                    "starts_with"
+                };
+                whole(
+                    format!("{func}({left_source}, {right})"),
+                    &format!("`{word} with` is Cypher's; GQ calls `{func}`"),
+                    Q014,
+                    if func == "ends_with" { REVIEW } else { MACHINE },
+                )
+            }
+            Rule::infix_string_op => Ok(Expr::InfixString {
+                op: if op.as_str() == "contains" {
+                    InfixStringOp::Contains
+                } else {
+                    InfixStringOp::StartsWith
+                },
+                left: Box::new(expr(left_pair)?),
+                right: Box::new(expr(parts[2].clone())?),
                 at: SourceSpan {
-                    operands: vec![left_source.clone(), list_source],
-                    ranges,
+                    operands: vec![
+                        left_source.to_string(),
+                        parts[2].as_str().trim().to_string(),
+                    ],
                     ..SourceSpan::of(
                         input,
                         span.0,
                         span.0 + input[span.0..span.1].trim_end().len(),
                     )
                 },
-            })
+            }),
+            _ => Ok(Expr::IsNull {
+                expr: Box::new(expr(left_pair)?),
+                negated: op.into_inner().any(|k| k.as_rule() == Rule::kw_not),
+            }),
         }
-        Rule::regex_rec => Err(refusal_note(
-            input,
-            Q014,
-            "`=~` is not GQ; the string registry rows are `contains`, `starts_with` and `match_text`",
-            span,
-            format!("contains({left_source}, \"…\")"),
-        )),
-        Rule::not_in_rec => {
-            let right = op.clone().into_inner().nth(2).unwrap();
-            whole(
-                format!("not {left_source} in {}", right.as_str().trim()),
-                "`not` comes before the comparison: `not x in list`",
-                Q014,
-                MACHINE,
-            )
-        }
-        Rule::between_rec => {
-            let mut b = op.clone().into_inner();
-            let lo = b.nth(1).unwrap().as_str().trim().to_string();
-            let hi = b.nth(1).unwrap().as_str().trim().to_string();
-            // Parenthesized: the comparison may be the operand of a `not`.
-            whole(
-                format!("({left_source} >= {lo} and {left_source} <= {hi})"),
-                "`between` is SQL's; GQ writes the two comparisons",
-                Q014,
-                MACHINE,
-            )
-        }
-        Rule::like_rec => {
-            let pat = op.clone().into_inner().nth(1).unwrap();
-            let text = pat.as_str().trim();
-            let inner = text.strip_prefix('"').and_then(|t| t.strip_suffix('"'));
-            let fix = inner.and_then(|t| {
-                let body = t.trim_start_matches('%').trim_end_matches('%');
-                if body.contains('%') || body.contains('_') {
-                    return None;
-                }
-                match (t.starts_with('%'), t.ends_with('%')) {
-                    (true, true) => Some(format!("contains({left_source}, \"{body}\")")),
-                    (false, true) => Some(format!("starts_with({left_source}, \"{body}\")")),
-                    _ => None,
-                }
-            });
-            match fix {
-                Some(f) => whole(
-                    f,
-                    "`like` is SQL's; the string registry rows are `contains` and `starts_with`",
-                    Q014,
-                    MACHINE,
-                ),
-                None => Err(refusal_note(
-                    input,
-                    Q014,
-                    "`like` is SQL's; the string registry rows are `contains` and `starts_with`",
-                    span,
-                    format!("contains({left_source}, \"…\")"),
-                )),
-            }
-        }
-        Rule::starts_with_words_rec => {
-            let mut w = op.clone().into_inner();
-            let word = w.next().unwrap().as_str().to_ascii_lowercase();
-            let right = w.nth(1).unwrap().as_str().trim().to_string();
-            let func = if word == "ends" {
-                "ends_with"
-            } else {
-                "starts_with"
-            };
-            whole(
-                format!("{func}({left_source}, {right})"),
-                &format!("`{word} with` is Cypher's; GQ calls `{func}`"),
-                Q014,
-                if func == "ends_with" { REVIEW } else { MACHINE },
-            )
-        }
-        Rule::infix_string_op => Ok(Expr::InfixString {
-            op: if op.as_str() == "contains" {
-                InfixStringOp::Contains
-            } else {
-                InfixStringOp::StartsWith
-            },
-            left: Box::new(expr(left_pair)?),
-            right: Box::new(expr(parts[2].clone())?),
-            at: SourceSpan {
-                operands: vec![
-                    left_source.to_string(),
-                    parts[2].as_str().trim().to_string(),
-                ],
-                ..SourceSpan::of(
-                    input,
-                    span.0,
-                    span.0 + input[span.0..span.1].trim_end().len(),
-                )
-            },
-        }),
-        _ => Ok(Expr::IsNull {
-            expr: Box::new(expr(left_pair)?),
-            negated: op.into_inner().any(|k| k.as_rule() == Rule::kw_not),
-        }),
-    }
+    })
 }
 
 fn arithmetic(input: &str, pair: Pair<Rule>) -> R<Expr> {
-    let span = (pair.as_span().start(), tend(input, &pair));
-    let parts: Vec<Pair<Rule>> = pair.into_inner().collect();
-    // `a || b || c`: one concat call over the flattened chain.
-    if parts.iter().any(|p| p.as_str() == "||") {
-        let ops_all_bars = parts.iter().skip(1).step_by(2).all(|p| p.as_str() == "||");
-        let operands: Vec<&str> = parts.iter().step_by(2).map(|p| p.as_str().trim()).collect();
-        return Err(if ops_all_bars {
-            refusal(
-                input,
-                Q012,
-                "`||` is not an operator: concatenation is the registry call `concat`",
-                span,
-                vec![edit(
-                    span.0,
-                    span.1,
-                    format!("concat({})", operands.join(", ")),
-                )],
-                MACHINE,
-            )
-        } else {
-            refusal_note(
-                input,
-                Q012,
-                "`||` is not an operator: concatenation is the registry call `concat`",
-                span,
-                "concat(a, b, …)",
-            )
-        });
-    }
-    let mut it = parts.into_iter();
-    let first = it.next().unwrap();
-    let mut left = expr(first)?;
-    while let Some(op) = it.next() {
-        let right = expr(it.next().unwrap())?;
-        let op = match op.as_str() {
-            "+" => ArithOp::Add,
-            "-" => ArithOp::Sub,
-            "*" => ArithOp::Mul,
-            "/" => ArithOp::Div,
-            _ => ArithOp::Rem,
-        };
-        left = Expr::Arith {
-            op,
-            left: Box::new(left),
-            right: Box::new(right),
-        };
-    }
-    Ok(left)
+    crate::stack::deep(|| {
+        let span = (pair.as_span().start(), tend(input, &pair));
+        let parts: Vec<Pair<Rule>> = pair.into_inner().collect();
+        // `a || b || c`: one concat call over the flattened chain.
+        if parts.iter().any(|p| p.as_str() == "||") {
+            let ops_all_bars = parts.iter().skip(1).step_by(2).all(|p| p.as_str() == "||");
+            let operands: Vec<&str> = parts.iter().step_by(2).map(|p| p.as_str().trim()).collect();
+            return Err(if ops_all_bars {
+                refusal(
+                    input,
+                    Q012,
+                    "`||` is not an operator: concatenation is the registry call `concat`",
+                    span,
+                    vec![edit(
+                        span.0,
+                        span.1,
+                        format!("concat({})", operands.join(", ")),
+                    )],
+                    MACHINE,
+                )
+            } else {
+                refusal_note(
+                    input,
+                    Q012,
+                    "`||` is not an operator: concatenation is the registry call `concat`",
+                    span,
+                    "concat(a, b, …)",
+                )
+            });
+        }
+        let mut it = parts.into_iter();
+        let first = it.next().unwrap();
+        let mut left = expr(first)?;
+        while let Some(op) = it.next() {
+            let right = expr(it.next().unwrap())?;
+            let op = match op.as_str() {
+                "+" => ArithOp::Add,
+                "-" => ArithOp::Sub,
+                "*" => ArithOp::Mul,
+                "/" => ArithOp::Div,
+                _ => ArithOp::Rem,
+            };
+            left = Expr::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    })
 }
 
 /// A bare name in operand position: refused at the word, with a guess at
@@ -4148,289 +4182,293 @@ fn bare_name(word: Pair<Rule>) -> Refusal {
 }
 
 fn operand(pair: Pair<Rule>) -> R<Expr> {
-    let input = input_of(&pair);
-    let inner = pair.into_inner().next().unwrap();
-    let span = span_of(&inner);
-    match inner.as_rule() {
-        Rule::expr => expr(inner),
-        Rule::block_value => {
-            let at = source_span(&inner);
-            let mut func = None;
-            let mut arg = None;
-            let mut pattern = Pattern::default();
-            for part in inner.into_inner() {
-                match part.as_rule() {
-                    Rule::agg_name => func = Some(BlockFunc::Agg(agg_func(part.as_str()))),
-                    Rule::kw_exists => func = Some(BlockFunc::Exists),
-                    Rule::expr => arg = Some(Box::new(expr(part)?)),
-                    Rule::block_body => pattern = block_pattern(&part)?,
-                    _ => {}
+    crate::stack::deep(|| {
+        let input = input_of(&pair);
+        let inner = pair.into_inner().next().unwrap();
+        let span = span_of(&inner);
+        match inner.as_rule() {
+            Rule::expr => expr(inner),
+            Rule::block_value => {
+                let at = source_span(&inner);
+                let mut func = None;
+                let mut arg = None;
+                let mut pattern = Pattern::default();
+                for part in inner.into_inner() {
+                    match part.as_rule() {
+                        Rule::agg_name => func = Some(BlockFunc::Agg(agg_func(part.as_str()))),
+                        Rule::kw_exists => func = Some(BlockFunc::Exists),
+                        Rule::expr => arg = Some(Box::new(expr(part)?)),
+                        Rule::block_body => pattern = block_pattern(&part)?,
+                        _ => {}
+                    }
                 }
+                Ok(Expr::Block(Box::new(Block {
+                    func: func.unwrap(),
+                    arg,
+                    pattern,
+                    at,
+                })))
             }
-            Ok(Expr::Block(Box::new(Block {
-                func: func.unwrap(),
-                arg,
-                pattern,
-                at,
-            })))
-        }
-        Rule::agg_distinct => {
-            let mut parts = inner.into_inner();
-            let func = agg_func(parts.next().unwrap().as_str());
-            let arg = parts.find(|p| p.as_rule() == Rule::expr).unwrap();
-            Ok(Expr::AggDistinct {
-                func,
-                arg: Box::new(expr(arg)?),
-            })
-        }
-        Rule::count_star_rec => {
-            let name = inner.clone().into_inner().next().unwrap();
-            Err(match first_binding() {
-                Some(v) => refusal(
-                    input,
-                    Q014,
-                    format!(
-                        "`{}(*)` is SQL's; an aggregate names what it counts",
-                        name.as_str()
+            Rule::agg_distinct => {
+                let mut parts = inner.into_inner();
+                let func = agg_func(parts.next().unwrap().as_str());
+                let arg = parts.find(|p| p.as_rule() == Rule::expr).unwrap();
+                Ok(Expr::AggDistinct {
+                    func,
+                    arg: Box::new(expr(arg)?),
+                })
+            }
+            Rule::count_star_rec => {
+                let name = inner.clone().into_inner().next().unwrap();
+                Err(match first_binding() {
+                    Some(v) => refusal(
+                        input,
+                        Q014,
+                        format!(
+                            "`{}(*)` is SQL's; an aggregate names what it counts",
+                            name.as_str()
+                        ),
+                        span,
+                        vec![edit(span.0, span.1, format!("{}(${v})", name.as_str()))],
+                        REVIEW,
                     ),
-                    span,
-                    vec![edit(span.0, span.1, format!("{}(${v})", name.as_str()))],
-                    REVIEW,
-                ),
-                None => refusal_note(
-                    input,
-                    Q014,
-                    "`count(*)` is SQL's; an aggregate names what it counts",
-                    span,
-                    "count($x)",
-                ),
-            })
-        }
-        Rule::case_rec => {
-            let mut whens: Vec<(String, String)> = Vec::new();
-            let mut otherwise = None;
-            let parts: Vec<Pair<Rule>> = inner.clone().into_inner().collect();
-            let mut i = 0;
-            while i < parts.len() {
-                match parts[i].as_rule() {
-                    Rule::fw_when => {
-                        whens.push((
-                            parts[i + 1].as_str().trim().to_string(),
-                            parts[i + 3].as_str().trim().to_string(),
-                        ));
-                        i += 4;
-                    }
-                    Rule::fw_else => {
-                        otherwise = Some(parts[i + 1].as_str().trim().to_string());
-                        i += 2;
-                    }
-                    _ => i += 1,
-                }
+                    None => refusal_note(
+                        input,
+                        Q014,
+                        "`count(*)` is SQL's; an aggregate names what it counts",
+                        span,
+                        "count($x)",
+                    ),
+                })
             }
-            let message =
-                "`CASE` is not GQ: a conditional is the registry call `if(condition, then, else)`";
-            match otherwise {
-                Some(e) => {
-                    let text = whens
-                        .iter()
-                        .rev()
-                        .fold(e, |acc, (c, t)| format!("if({c}, {t}, {acc})"));
-                    Err(refusal(
+            Rule::case_rec => {
+                let mut whens: Vec<(String, String)> = Vec::new();
+                let mut otherwise = None;
+                let parts: Vec<Pair<Rule>> = inner.clone().into_inner().collect();
+                let mut i = 0;
+                while i < parts.len() {
+                    match parts[i].as_rule() {
+                        Rule::fw_when => {
+                            whens.push((
+                                parts[i + 1].as_str().trim().to_string(),
+                                parts[i + 3].as_str().trim().to_string(),
+                            ));
+                            i += 4;
+                        }
+                        Rule::fw_else => {
+                            otherwise = Some(parts[i + 1].as_str().trim().to_string());
+                            i += 2;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                let message = "`CASE` is not GQ: a conditional is the registry call `if(condition, then, else)`";
+                match otherwise {
+                    Some(e) => {
+                        let text = whens
+                            .iter()
+                            .rev()
+                            .fold(e, |acc, (c, t)| format!("if({c}, {t}, {acc})"));
+                        Err(refusal(
+                            input,
+                            Q012,
+                            message,
+                            span,
+                            vec![edit(span.0, span.1, text)],
+                            MACHINE,
+                        ))
+                    }
+                    None => Err(refusal_note(
                         input,
                         Q012,
                         message,
                         span,
-                        vec![edit(span.0, span.1, text)],
-                        MACHINE,
-                    ))
+                        "if(<condition>, <then>, <else>)",
+                    )),
                 }
-                None => Err(refusal_note(
-                    input,
-                    Q012,
-                    message,
-                    span,
-                    "if(<condition>, <then>, <else>)",
-                )),
             }
-        }
-        Rule::literal => Ok(Expr::Literal(literal(inner)?)),
-        Rule::value_list => {
-            let mut at = source_span(&inner);
-            let mut elements = Vec::new();
-            for item in inner.into_inner() {
-                at.ranges.push(written_range(&item));
-                let element = item.into_inner().next().expect("grammar: a list item");
-                elements.push(match element.as_rule() {
-                    Rule::variable => Expr::Variable(element.as_str()[1..].to_string()),
-                    _ => Expr::Literal(list_value(element)?),
-                });
+            Rule::literal => Ok(Expr::Literal(literal(inner)?)),
+            Rule::value_list => {
+                let mut at = source_span(&inner);
+                let mut elements = Vec::new();
+                for item in inner.into_inner() {
+                    at.ranges.push(written_range(&item));
+                    let element = item.into_inner().next().expect("grammar: a list item");
+                    elements.push(match element.as_rule() {
+                        Rule::variable => Expr::Variable(element.as_str()[1..].to_string()),
+                        _ => Expr::Literal(list_value(element)?),
+                    });
+                }
+                Ok(Expr::List { elements, at })
             }
-            Ok(Expr::List { elements, at })
-        }
-        Rule::type_prop_rec => {
-            let mut parts = inner.clone().into_inner();
-            let ty = parts.next().unwrap().as_str();
-            let prop = parts.next().unwrap().as_str();
-            let message = format!(
-                "`{ty}.{prop}` reads a property through a type; GQ reads it through the bound variable"
-            );
-            Err(match binding_of_type(ty) {
-                Some(v) => refusal(
-                    input,
-                    Q014,
-                    message,
-                    span,
-                    vec![edit(span.0, span.1, format!("${v}.{prop}"))],
-                    MACHINE,
-                ),
-                None => refusal_note(input, Q014, message, span, format!("$x: {ty} … $x.{prop}")),
-            })
-        }
-        Rule::call => Ok(Expr::Call(call(inner)?)),
-        Rule::keyword_call_rec => {
-            let head = inner.clone().into_inner().next().unwrap();
-            let word = head.as_str();
-            let args: Vec<Pair<Rule>> = inner
-                .clone()
-                .into_inner()
-                .filter(|p| p.as_rule() == Rule::call_args)
-                .flat_map(|a| a.into_inner())
-                .collect();
-            if word == "exists" && args.len() == 1 && args[0].as_rule() == Rule::positional {
-                return Err(refusal(
-                    input,
-                    Q019,
-                    "`exists(x)` is Cypher's property test; a registry row is never named `exists`, and the test is `x is not null`",
-                    span,
-                    vec![edit(
-                        span.0,
-                        span.1,
-                        format!("{} is not null", args[0].as_str().trim()),
-                    )],
-                    MACHINE,
-                ));
-            }
-            let positional: Vec<&str> = args
-                .iter()
-                .filter(|a| a.as_rule() == Rule::positional)
-                .map(|a| a.as_str().trim())
-                .collect();
-            // An infix operator written as a call: the fix writes it infix.
-            if matches!(word, "and" | "or" | "in")
-                && let [left, right] = positional.as_slice()
-                && args.len() == 2
-            {
-                return Err(refusal(
-                    input,
-                    Q019,
-                    format!(
-                        "`{word}` is a reserved word, and a call is never named one; `{word}` is written between its operands"
+            Rule::type_prop_rec => {
+                let mut parts = inner.clone().into_inner();
+                let ty = parts.next().unwrap().as_str();
+                let prop = parts.next().unwrap().as_str();
+                let message = format!(
+                    "`{ty}.{prop}` reads a property through a type; GQ reads it through the bound variable"
+                );
+                Err(match binding_of_type(ty) {
+                    Some(v) => refusal(
+                        input,
+                        Q014,
+                        message,
+                        span,
+                        vec![edit(span.0, span.1, format!("${v}.{prop}"))],
+                        MACHINE,
                     ),
-                    span,
-                    vec![edit(span.0, span.1, format!("{left} {word} {right}"))],
-                    MACHINE,
-                ));
+                    None => {
+                        refusal_note(input, Q014, message, span, format!("$x: {ty} … $x.{prop}"))
+                    }
+                })
             }
-            Err(refusal_note(
-                input,
-                Q019,
-                format!("`{word}` is a keyword, and a call is never named one"),
-                span,
-                keyword_form(word),
-            ))
-        }
-        Rule::prop_method_rec => {
-            let head = inner.clone().into_inner().next().unwrap();
-            let mut hp = head.clone().into_inner();
-            let var = hp.next().unwrap().as_str();
-            let method = hp.next().unwrap().as_str();
-            let edge = inner
-                .clone()
-                .into_inner()
-                .filter(|p| p.as_rule() == Rule::call_args)
-                .flat_map(|a| a.into_inner())
-                .collect::<Vec<_>>();
-            let message = "a traversal is a triple, `$a edge $b`, not a method call on a variable";
-            let edge_name = match edge.as_slice() {
-                [one] => lone(
-                    &one.clone().into_inner().next().unwrap(),
-                    Rule::bare_name_rec,
-                )
-                .map(|w| w.as_str().to_string())
-                .or_else(|| {
-                    let t = one.as_str().trim();
-                    (t.starts_with('"') && t.ends_with('"') && t.len() > 2)
-                        .then(|| gq_edge_name(&t[1..t.len() - 1]))
-                }),
-                _ => None,
-            };
-            let to = fresh_name("x");
-            let triple = edge_name.and_then(|e| match method {
-                "out" | "outE" => Some(format!("{var} {e} ${to}")),
-                "in" | "inE" => Some(format!("${to} {e} {var}")),
-                "both" | "bothE" => Some(format!("{var} <{e}> ${to}")),
-                _ => None,
-            });
-            Err(match triple {
-                Some(t) => refusal(
+            Rule::call => Ok(Expr::Call(call(inner)?)),
+            Rule::keyword_call_rec => {
+                let head = inner.clone().into_inner().next().unwrap();
+                let word = head.as_str();
+                let args: Vec<Pair<Rule>> = inner
+                    .clone()
+                    .into_inner()
+                    .filter(|p| p.as_rule() == Rule::call_args)
+                    .flat_map(|a| a.into_inner())
+                    .collect();
+                if word == "exists" && args.len() == 1 && args[0].as_rule() == Rule::positional {
+                    return Err(refusal(
+                        input,
+                        Q019,
+                        "`exists(x)` is Cypher's property test; a registry row is never named `exists`, and the test is `x is not null`",
+                        span,
+                        vec![edit(
+                            span.0,
+                            span.1,
+                            format!("{} is not null", args[0].as_str().trim()),
+                        )],
+                        MACHINE,
+                    ));
+                }
+                let positional: Vec<&str> = args
+                    .iter()
+                    .filter(|a| a.as_rule() == Rule::positional)
+                    .map(|a| a.as_str().trim())
+                    .collect();
+                // An infix operator written as a call: the fix writes it infix.
+                if matches!(word, "and" | "or" | "in")
+                    && let [left, right] = positional.as_slice()
+                    && args.len() == 2
+                {
+                    return Err(refusal(
+                        input,
+                        Q019,
+                        format!(
+                            "`{word}` is a reserved word, and a call is never named one; `{word}` is written between its operands"
+                        ),
+                        span,
+                        vec![edit(span.0, span.1, format!("{left} {word} {right}"))],
+                        MACHINE,
+                    ));
+                }
+                Err(refusal_note(
                     input,
-                    Q014,
-                    message,
+                    Q019,
+                    format!("`{word}` is a keyword, and a call is never named one"),
                     span,
-                    vec![edit(span.0, span.1, t)],
-                    REVIEW,
-                ),
-                None => refusal_note(input, Q014, message, span, "$a <edge> $b"),
-            })
-        }
-        Rule::prop_chain_rec => Err(refusal_note(
-            input,
-            Q014,
-            "a property path through an edge is a triple in `match`, then a property of its target",
-            span,
-            "match { …, $p <edge> $q } return { $q.<property> }",
-        )),
-        Rule::prop_star_rec => {
-            let var = inner.clone().into_inner().next().unwrap();
-            Err(refusal(
+                    keyword_form(word),
+                ))
+            }
+            Rule::prop_method_rec => {
+                let head = inner.clone().into_inner().next().unwrap();
+                let mut hp = head.clone().into_inner();
+                let var = hp.next().unwrap().as_str();
+                let method = hp.next().unwrap().as_str();
+                let edge = inner
+                    .clone()
+                    .into_inner()
+                    .filter(|p| p.as_rule() == Rule::call_args)
+                    .flat_map(|a| a.into_inner())
+                    .collect::<Vec<_>>();
+                let message =
+                    "a traversal is a triple, `$a edge $b`, not a method call on a variable";
+                let edge_name = match edge.as_slice() {
+                    [one] => lone(
+                        &one.clone().into_inner().next().unwrap(),
+                        Rule::bare_name_rec,
+                    )
+                    .map(|w| w.as_str().to_string())
+                    .or_else(|| {
+                        let t = one.as_str().trim();
+                        (t.starts_with('"') && t.ends_with('"') && t.len() > 2)
+                            .then(|| gq_edge_name(&t[1..t.len() - 1]))
+                    }),
+                    _ => None,
+                };
+                let to = fresh_name("x");
+                let triple = edge_name.and_then(|e| match method {
+                    "out" | "outE" => Some(format!("{var} {e} ${to}")),
+                    "in" | "inE" => Some(format!("${to} {e} {var}")),
+                    "both" | "bothE" => Some(format!("{var} <{e}> ${to}")),
+                    _ => None,
+                });
+                Err(match triple {
+                    Some(t) => refusal(
+                        input,
+                        Q014,
+                        message,
+                        span,
+                        vec![edit(span.0, span.1, t)],
+                        REVIEW,
+                    ),
+                    None => refusal_note(input, Q014, message, span, "$a <edge> $b"),
+                })
+            }
+            Rule::prop_chain_rec => Err(refusal_note(
                 input,
                 Q014,
-                "`$x.*` is not GQ; returning the node returns its properties",
+                "a property path through an edge is a triple in `match`, then a property of its target",
                 span,
-                vec![edit(span.0, span.1, var.as_str())],
-                MACHINE,
-            ))
-        }
-        Rule::prop_access => {
-            let mut parts = inner.into_inner();
-            let variable = parts.next().unwrap().as_str()[1..].to_string();
-            let property = parts.next().unwrap().as_str().to_string();
-            Ok(Expr::Prop { variable, property })
-        }
-        Rule::meta_field => Ok(Expr::Meta(inner.as_str()[1..].to_string())),
-        Rule::variable => Ok(Expr::Variable(inner.as_str()[1..].to_string())),
-        // `null` is a literal wherever its context fixes its type; the type
-        // checker refuses it where nothing does, and a comparison with it.
-        Rule::reserved_property if inner.as_str() == "null" => Ok(Expr::Literal(Literal::Null)),
-        Rule::reserved_property => Err(diagnostic_at(
-            Q005,
-            format!(
-                "`{}` is a reserved word; a property of that name is written `$p.{}`",
-                inner.as_str(),
-                inner.as_str()
-            ),
-            &inner,
-        )
-        .into()),
-        Rule::bare_name_rec => {
-            if with_ctx(|c| c.allow_bare) {
-                Ok(Expr::Ident(inner.as_str().to_string()))
-            } else {
-                Err(bare_name(inner))
+                "match { …, $p <edge> $q } return { $q.<property> }",
+            )),
+            Rule::prop_star_rec => {
+                let var = inner.clone().into_inner().next().unwrap();
+                Err(refusal(
+                    input,
+                    Q014,
+                    "`$x.*` is not GQ; returning the node returns its properties",
+                    span,
+                    vec![edit(span.0, span.1, var.as_str())],
+                    MACHINE,
+                ))
             }
+            Rule::prop_access => {
+                let mut parts = inner.into_inner();
+                let variable = parts.next().unwrap().as_str()[1..].to_string();
+                let property = parts.next().unwrap().as_str().to_string();
+                Ok(Expr::Prop { variable, property })
+            }
+            Rule::meta_field => Ok(Expr::Meta(inner.as_str()[1..].to_string())),
+            Rule::variable => Ok(Expr::Variable(inner.as_str()[1..].to_string())),
+            // `null` is a literal wherever its context fixes its type; the type
+            // checker refuses it where nothing does, and a comparison with it.
+            Rule::reserved_property if inner.as_str() == "null" => Ok(Expr::Literal(Literal::Null)),
+            Rule::reserved_property => Err(diagnostic_at(
+                Q005,
+                format!(
+                    "`{}` is a reserved word; a property of that name is written `$p.{}`",
+                    inner.as_str(),
+                    inner.as_str()
+                ),
+                &inner,
+            )
+            .into()),
+            Rule::bare_name_rec => {
+                if with_ctx(|c| c.allow_bare) {
+                    Ok(Expr::Ident(inner.as_str().to_string()))
+                } else {
+                    Err(bare_name(inner))
+                }
+            }
+            other => unreachable!("grammar: operand holds no {other:?}"),
         }
-        other => unreachable!("grammar: operand holds no {other:?}"),
-    }
+    })
 }
 
 /// The form a keyword written as a call's name is used in, the fix a

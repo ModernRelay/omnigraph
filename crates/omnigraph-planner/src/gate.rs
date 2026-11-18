@@ -218,7 +218,7 @@ impl PlanSource for Recorded<'_> {
 
 /// Every parameter name `expr` names.
 fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
-    match expr {
+    omnigraph_compiler::stack::deep(|| match expr {
         IRExpr::Param(name, _) => {
             out.insert(name.clone());
         }
@@ -241,7 +241,7 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
         | IRExpr::Variable(_, _)
         | IRExpr::Literal(_, _)
         | IRExpr::AliasRef(_, _) => {}
-    }
+    })
 }
 
 /// Why the gate built no routed plan. A change-feed or merge operation then

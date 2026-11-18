@@ -13,62 +13,65 @@ use crate::types::{
 /// The type of a literal payload, computed once per occurrence (list
 /// elements included) and retained on the typed node.
 pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
-    match lit {
-        // Null is compatible with any nullable type; default to String for inference.
-        Literal::Null => Ok(PropType::scalar(ScalarType::String, true)),
-        Literal::String(_) => Ok(PropType::scalar(ScalarType::String, false)),
-        Literal::Integer(_) => Ok(PropType::scalar(ScalarType::I64, false)),
-        Literal::Float(value) if value.is_infinite() => Err(CompilerError::typed(
-            T3,
-            "float literal is outside the F64 range".to_string(),
-        )),
-        Literal::Float(_) => Ok(PropType::scalar(ScalarType::F64, false)),
-        Literal::Bool(_) => Ok(PropType::scalar(ScalarType::Bool, false)),
-        Literal::Date(value) => {
-            check_date_literal(value)
-                .map_err(|reason| CompilerError::typed(T3, reason.to_string()))?;
-            Ok(PropType::scalar(ScalarType::Date, false))
-        }
-        Literal::DateTime(value) => {
-            check_datetime_literal(value)
-                .map_err(|reason| CompilerError::typed(T3, reason.to_string()))?;
-            Ok(PropType::scalar(ScalarType::DateTime, false))
-        }
-        Literal::List(items) => {
-            let mut scalar = None;
-            for item in items {
-                let item_type = literal_type(item)?;
-                if matches!(item, Literal::Null) {
-                    continue;
-                }
-                if item_type.list {
-                    return Err(CompilerError::typed(
-                        T52,
-                        "nested list literals are not supported".to_string(),
-                    ));
-                }
-                scalar = Some(match scalar {
-                    None => item_type.scalar,
-                    Some(previous) if previous == item_type.scalar => previous,
-                    Some(ScalarType::I64 | ScalarType::F64)
-                        if matches!(item_type.scalar, ScalarType::I64 | ScalarType::F64) =>
-                    {
-                        ScalarType::F64
+    crate::stack::deep(|| {
+        match lit {
+            // Null is compatible with any nullable type; default to String for inference.
+            Literal::Null => Ok(PropType::scalar(ScalarType::String, true)),
+            Literal::String(_) => Ok(PropType::scalar(ScalarType::String, false)),
+            Literal::Integer(_) => Ok(PropType::scalar(ScalarType::I64, false)),
+            Literal::Float(value) if value.is_infinite() => Err(CompilerError::typed(
+                T3,
+                "float literal is outside the F64 range".to_string(),
+            )),
+            Literal::Float(_) => Ok(PropType::scalar(ScalarType::F64, false)),
+            Literal::Bool(_) => Ok(PropType::scalar(ScalarType::Bool, false)),
+            Literal::Date(value) => {
+                check_date_literal(value)
+                    .map_err(|reason| CompilerError::typed(T3, reason.to_string()))?;
+                Ok(PropType::scalar(ScalarType::Date, false))
+            }
+            Literal::DateTime(value) => {
+                check_datetime_literal(value)
+                    .map_err(|reason| CompilerError::typed(T3, reason.to_string()))?;
+                Ok(PropType::scalar(ScalarType::DateTime, false))
+            }
+            Literal::List(items) => {
+                let mut scalar = None;
+                for item in items {
+                    let item_type = literal_type(item)?;
+                    if matches!(item, Literal::Null) {
+                        continue;
                     }
-                    Some(_) => {
+                    if item_type.list {
                         return Err(CompilerError::typed(
-                            T53,
-                            "list literal elements must share a compatible scalar type".to_string(),
+                            T52,
+                            "nested list literals are not supported".to_string(),
                         ));
                     }
-                });
+                    scalar = Some(match scalar {
+                        None => item_type.scalar,
+                        Some(previous) if previous == item_type.scalar => previous,
+                        Some(ScalarType::I64 | ScalarType::F64)
+                            if matches!(item_type.scalar, ScalarType::I64 | ScalarType::F64) =>
+                        {
+                            ScalarType::F64
+                        }
+                        Some(_) => {
+                            return Err(CompilerError::typed(
+                                T53,
+                                "list literal elements must share a compatible scalar type"
+                                    .to_string(),
+                            ));
+                        }
+                    });
+                }
+                Ok(PropType::list_of(
+                    scalar.unwrap_or(ScalarType::String),
+                    false,
+                ))
             }
-            Ok(PropType::list_of(
-                scalar.unwrap_or(ScalarType::String),
-                false,
-            ))
         }
-    }
+    })
 }
 
 /// A literal against the property it is assigned to or matched with;

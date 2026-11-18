@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+stacker = { workspace = true }
 ulid = { workspace = true }
 # The shared generators of the generated laws (`src/arbitrary.rs`).
 proptest = { version = "1", optional = true }

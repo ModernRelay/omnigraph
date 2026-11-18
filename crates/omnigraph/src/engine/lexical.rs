@@ -323,51 +323,53 @@ fn membership_type() -> ExprType {
 
 /// `expr` with every full-text call `rewrite` answers replaced by its answer.
 fn substitute(expr: &IRExpr, rewrite: &mut impl FnMut(&IRExpr) -> Option<IRExpr>) -> IRExpr {
-    if expr.lexical_predicate_field().is_some() {
-        return rewrite(expr).unwrap_or_else(|| expr.clone());
-    }
-    let mut sub = |e: &IRExpr| Box::new(substitute(e, rewrite));
-    match expr {
-        IRExpr::Binary {
-            left,
-            op,
-            right,
-            ty,
-        } => {
-            let left = sub(left);
-            let right = sub(right);
+    omnigraph_compiler::stack::deep(|| {
+        if expr.lexical_predicate_field().is_some() {
+            return rewrite(expr).unwrap_or_else(|| expr.clone());
+        }
+        let mut sub = |e: &IRExpr| Box::new(substitute(e, rewrite));
+        match expr {
             IRExpr::Binary {
                 left,
-                op: *op,
+                op,
                 right,
-                ty: ty.clone(),
+                ty,
+            } => {
+                let left = sub(left);
+                let right = sub(right);
+                IRExpr::Binary {
+                    left,
+                    op: *op,
+                    right,
+                    ty: ty.clone(),
+                }
             }
+            IRExpr::Not(inner, ty) => IRExpr::Not(sub(inner), ty.clone()),
+            IRExpr::Cast { expr: inner, ty } => IRExpr::Cast {
+                expr: sub(inner),
+                ty: ty.clone(),
+            },
+            IRExpr::Neg { expr: inner, ty } => IRExpr::Neg {
+                expr: sub(inner),
+                ty: ty.clone(),
+            },
+            IRExpr::IsNull {
+                expr: inner,
+                negated,
+                ty,
+            } => IRExpr::IsNull {
+                expr: sub(inner),
+                negated: *negated,
+                ty: ty.clone(),
+            },
+            IRExpr::Call { func, args, ty } => IRExpr::Call {
+                func: *func,
+                args: args.iter().map(|arg| substitute(arg, rewrite)).collect(),
+                ty: ty.clone(),
+            },
+            other => other.clone(),
         }
-        IRExpr::Not(inner, ty) => IRExpr::Not(sub(inner), ty.clone()),
-        IRExpr::Cast { expr: inner, ty } => IRExpr::Cast {
-            expr: sub(inner),
-            ty: ty.clone(),
-        },
-        IRExpr::Neg { expr: inner, ty } => IRExpr::Neg {
-            expr: sub(inner),
-            ty: ty.clone(),
-        },
-        IRExpr::IsNull {
-            expr: inner,
-            negated,
-            ty,
-        } => IRExpr::IsNull {
-            expr: sub(inner),
-            negated: *negated,
-            ty: ty.clone(),
-        },
-        IRExpr::Call { func, args, ty } => IRExpr::Call {
-            func: *func,
-            args: args.iter().map(|arg| substitute(arg, rewrite)).collect(),
-            ty: ty.clone(),
-        },
-        other => other.clone(),
-    }
+    })
 }
 
 /// The binding whose property a full-text call searches.

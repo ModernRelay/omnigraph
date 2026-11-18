@@ -212,60 +212,62 @@ pub(crate) fn conjunct_regions(
     path: &[Region],
     out: &mut Vec<(IRExpr, Vec<Region>)>,
 ) {
-    // The steps before a `nearest` ranking step are its population, which
-    // the plan tests below the window's cut, whether the window searches a
-    // scan or ranks rows by their exact distance.
-    let window = steps
-        .iter()
-        .rposition(|step| matches!(step, PatternStep::Rank { .. }));
-    let mut ordinals = RegionOrdinals::default();
-    for (index, step) in steps.iter().enumerate() {
-        let mut here = path.to_vec();
-        if window.is_some_and(|window| index < window) {
-            here.push(Region::Window);
-        }
-        let within = |region: Region| {
-            let mut nested = here.clone();
-            nested.push(region);
-            nested
-        };
-        match step {
-            PatternStep::NodeScan { filters, .. }
-            | PatternStep::Expand {
-                dst_filters: filters,
-                ..
-            } => {
-                let mut own = Vec::new();
-                push_conjuncts(&mut own, filters);
-                out.extend(own.into_iter().map(|conjunct| (conjunct, here.clone())));
+    omnigraph_compiler::stack::deep(|| {
+        // The steps before a `nearest` ranking step are its population, which
+        // the plan tests below the window's cut, whether the window searches a
+        // scan or ranks rows by their exact distance.
+        let window = steps
+            .iter()
+            .rposition(|step| matches!(step, PatternStep::Rank { .. }));
+        let mut ordinals = RegionOrdinals::default();
+        for (index, step) in steps.iter().enumerate() {
+            let mut here = path.to_vec();
+            if window.is_some_and(|window| index < window) {
+                here.push(Region::Window);
             }
-            PatternStep::Filter { pred: filter, .. } => {
-                let mut own = Vec::new();
-                push_conjuncts(&mut own, std::slice::from_ref(filter));
-                out.extend(own.into_iter().map(|conjunct| (conjunct, here.clone())));
-            }
-            PatternStep::Optional {
-                outer_var, inner, ..
-            } => conjunct_regions(inner, &within(ordinals.optional(&here, outer_var)), out),
-            PatternStep::Union { arms, bindings, .. } => {
-                for (position, arm) in arms.iter().enumerate() {
-                    conjunct_regions(
-                        arm,
-                        &within(Region::UnionArm(bindings.clone(), position)),
-                        out,
-                    );
+            let within = |region: Region| {
+                let mut nested = here.clone();
+                nested.push(region);
+                nested
+            };
+            match step {
+                PatternStep::NodeScan { filters, .. }
+                | PatternStep::Expand {
+                    dst_filters: filters,
+                    ..
+                } => {
+                    let mut own = Vec::new();
+                    push_conjuncts(&mut own, filters);
+                    out.extend(own.into_iter().map(|conjunct| (conjunct, here.clone())));
                 }
+                PatternStep::Filter { pred: filter, .. } => {
+                    let mut own = Vec::new();
+                    push_conjuncts(&mut own, std::slice::from_ref(filter));
+                    out.extend(own.into_iter().map(|conjunct| (conjunct, here.clone())));
+                }
+                PatternStep::Optional {
+                    outer_var, inner, ..
+                } => conjunct_regions(inner, &within(ordinals.optional(&here, outer_var)), out),
+                PatternStep::Union { arms, bindings, .. } => {
+                    for (position, arm) in arms.iter().enumerate() {
+                        conjunct_regions(
+                            arm,
+                            &within(Region::UnionArm(bindings.clone(), position)),
+                            out,
+                        );
+                    }
+                }
+                PatternStep::Correlate {
+                    outer_var, inner, ..
+                } => conjunct_regions(inner, &within(ordinals.correlate(&here, outer_var)), out),
+                PatternStep::Rank { .. }
+                | PatternStep::Score { .. }
+                | PatternStep::Let { .. }
+                | PatternStep::AntiJoin { .. }
+                | PatternStep::Fuse { .. } => {}
             }
-            PatternStep::Correlate {
-                outer_var, inner, ..
-            } => conjunct_regions(inner, &within(ordinals.correlate(&here, outer_var)), out),
-            PatternStep::Rank { .. }
-            | PatternStep::Score { .. }
-            | PatternStep::Let { .. }
-            | PatternStep::AntiJoin { .. }
-            | PatternStep::Fuse { .. } => {}
         }
-    }
+    })
 }
 
 /// The steps of `steps` with each `optional`'s own steps in its place: the

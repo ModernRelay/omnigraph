@@ -311,7 +311,7 @@ fn staged(group: &WriteGroup) -> Option<Staged> {
 /// table scan, which evaluates no search predicate, arithmetic or registry
 /// call.
 fn stageable(e: &IRExpr) -> bool {
-    match e {
+    crate::stack::deep(|| match e {
         IRExpr::Neg { .. }
         | IRExpr::Call { .. }
         | IRExpr::Binary {
@@ -322,7 +322,7 @@ fn stageable(e: &IRExpr) -> bool {
         IRExpr::Not(inner, _) | IRExpr::Cast { expr: inner, .. } => stageable(inner),
         IRExpr::IsNull { expr, .. } => stageable(expr),
         _ => true,
-    }
+    })
 }
 
 fn reads_row(value: &AssignValue) -> bool {

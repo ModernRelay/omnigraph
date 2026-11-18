@@ -240,59 +240,113 @@ fn fold_pipeline(
 }
 
 fn fold_expr(expr: &IRExpr, params: &ParamMap) -> Result<IRExpr> {
-    if matches!(expr, IRExpr::Cast { .. }) {
-        return Ok(expr.clone());
+    fold_with(expr, params, &constant_nodes(expr))
+}
+
+/// [`is_constant`] of every node of `expr`, by address, computed once
+/// bottom up rather than once per level.
+fn constant_nodes(expr: &IRExpr) -> std::collections::HashMap<*const IRExpr, bool> {
+    let mut constant = std::collections::HashMap::new();
+    let mut pending = vec![(expr, false)];
+    while let Some((node, children_done)) = pending.pop() {
+        if !children_done {
+            pending.push((node, true));
+            pending.extend(node.children().into_iter().map(|child| (child, false)));
+            continue;
+        }
+        let of = |child: &IRExpr| constant[&(child as *const IRExpr)];
+        let value = match node {
+            IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
+            IRExpr::Call {
+                func: ScalarFunc::List,
+                args,
+                ..
+            } => args.iter().all(of),
+            IRExpr::Binary {
+                op: BinaryOp::Arith(_),
+                ..
+            }
+            | IRExpr::Neg { .. }
+            | IRExpr::Call { .. } => false,
+            IRExpr::Binary { left, right, .. } => of(left) && of(right),
+            IRExpr::Not(inner, _) => of(inner),
+            IRExpr::IsNull { expr, .. } | IRExpr::Cast { expr, .. } => of(expr),
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(_, _) => false,
+        };
+        constant.insert(node as *const IRExpr, value);
     }
-    if is_constant(expr) && !matches!(expr, IRExpr::Literal(_, _) | IRExpr::Param(_, _)) {
-        if matches!(expr.ty(), ExprType::ExactInteger { .. }) {
+    constant
+}
+
+/// [`fold_expr`] reading each node's constancy from `constant`.
+fn fold_with(
+    expr: &IRExpr,
+    params: &ParamMap,
+    constant: &std::collections::HashMap<*const IRExpr, bool>,
+) -> Result<IRExpr> {
+    omnigraph_compiler::stack::deep(|| {
+        if matches!(expr, IRExpr::Cast { .. }) {
             return Ok(expr.clone());
         }
-        return Ok(IRExpr::Literal(
-            evaluate_constant(expr, params)?,
-            expr.ty().clone(),
-        ));
-    }
-    Ok(match expr {
-        IRExpr::Binary {
-            left,
-            op,
-            right,
-            ty,
-        } => IRExpr::Binary {
-            left: Box::new(fold_expr(left, params)?),
-            op: *op,
-            right: Box::new(fold_expr(right, params)?),
-            ty: ty.clone(),
-        },
-        IRExpr::Not(inner, ty) => IRExpr::Not(Box::new(fold_expr(inner, params)?), ty.clone()),
-        IRExpr::IsNull { expr, negated, ty } => IRExpr::IsNull {
-            expr: Box::new(fold_expr(expr, params)?),
-            negated: *negated,
-            ty: ty.clone(),
-        },
-        IRExpr::Cast { expr, ty } => IRExpr::Cast {
-            expr: Box::new(fold_expr(expr, params)?),
-            ty: ty.clone(),
-        },
-        IRExpr::Neg { expr, ty } => IRExpr::Neg {
-            expr: Box::new(fold_expr(expr, params)?),
-            ty: ty.clone(),
-        },
-        IRExpr::Call { func, args, ty } => IRExpr::Call {
-            func: *func,
-            args: args
-                .iter()
-                .map(|arg| fold_expr(arg, params))
-                .collect::<Result<_>>()?,
-            ty: ty.clone(),
-        },
-        IRExpr::PropAccess { .. }
-        | IRExpr::Nearest { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::Param(_, _)
-        | IRExpr::Literal(_, _)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(_, _) => expr.clone(),
+        if constant[&(expr as *const IRExpr)]
+            && !matches!(expr, IRExpr::Literal(_, _) | IRExpr::Param(_, _))
+        {
+            if matches!(expr.ty(), ExprType::ExactInteger { .. }) {
+                return Ok(expr.clone());
+            }
+            return Ok(IRExpr::Literal(
+                evaluate_constant(expr, params)?,
+                expr.ty().clone(),
+            ));
+        }
+        Ok(match expr {
+            IRExpr::Binary {
+                left,
+                op,
+                right,
+                ty,
+            } => IRExpr::Binary {
+                left: Box::new(fold_with(left, params, constant)?),
+                op: *op,
+                right: Box::new(fold_with(right, params, constant)?),
+                ty: ty.clone(),
+            },
+            IRExpr::Not(inner, ty) => {
+                IRExpr::Not(Box::new(fold_with(inner, params, constant)?), ty.clone())
+            }
+            IRExpr::IsNull { expr, negated, ty } => IRExpr::IsNull {
+                expr: Box::new(fold_with(expr, params, constant)?),
+                negated: *negated,
+                ty: ty.clone(),
+            },
+            IRExpr::Cast { expr, ty } => IRExpr::Cast {
+                expr: Box::new(fold_with(expr, params, constant)?),
+                ty: ty.clone(),
+            },
+            IRExpr::Neg { expr, ty } => IRExpr::Neg {
+                expr: Box::new(fold_with(expr, params, constant)?),
+                ty: ty.clone(),
+            },
+            IRExpr::Call { func, args, ty } => IRExpr::Call {
+                func: *func,
+                args: args
+                    .iter()
+                    .map(|arg| fold_with(arg, params, constant))
+                    .collect::<Result<_>>()?,
+                ty: ty.clone(),
+            },
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::Param(_, _)
+            | IRExpr::Literal(_, _)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(_, _) => expr.clone(),
+        })
     })
 }
 
@@ -301,29 +355,31 @@ fn fold_expr(expr: &IRExpr, params: &ParamMap) -> Result<IRExpr> {
 /// filter above may exclude every row (A3); registry calls are evaluated
 /// per batch like any other operator.
 pub(super) fn is_constant(expr: &IRExpr) -> bool {
-    match expr {
-        IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
-        // A list holding parameters is fixed once they are bound.
-        IRExpr::Call {
-            func: ScalarFunc::List,
-            args,
-            ..
-        } => args.iter().all(is_constant),
-        IRExpr::Binary {
-            op: BinaryOp::Arith(_),
-            ..
+    omnigraph_compiler::stack::deep(|| {
+        match expr {
+            IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
+            // A list holding parameters is fixed once they are bound.
+            IRExpr::Call {
+                func: ScalarFunc::List,
+                args,
+                ..
+            } => args.iter().all(is_constant),
+            IRExpr::Binary {
+                op: BinaryOp::Arith(_),
+                ..
+            }
+            | IRExpr::Neg { .. }
+            | IRExpr::Call { .. } => false,
+            IRExpr::Binary { left, right, .. } => is_constant(left) && is_constant(right),
+            IRExpr::Not(inner, _) => is_constant(inner),
+            IRExpr::IsNull { expr, .. } | IRExpr::Cast { expr, .. } => is_constant(expr),
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(_, _) => false,
         }
-        | IRExpr::Neg { .. }
-        | IRExpr::Call { .. } => false,
-        IRExpr::Binary { left, right, .. } => is_constant(left) && is_constant(right),
-        IRExpr::Not(inner, _) => is_constant(inner),
-        IRExpr::IsNull { expr, .. } | IRExpr::Cast { expr, .. } => is_constant(expr),
-        IRExpr::PropAccess { .. }
-        | IRExpr::Nearest { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(_, _) => false,
-    }
+    })
 }
 
 #[cfg(test)]
