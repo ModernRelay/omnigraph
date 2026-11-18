@@ -246,6 +246,9 @@ pub struct IoCounts {
     /// `.manifest`). This is the **opener** term step 3a flattened — isolated from
     /// the scan, so it can be gated directly without compacting the fixture.
     pub data_opener_reads: u64,
+    /// The HEADs among `data_opener_reads`: on an object store, asking a
+    /// manifest's size before reading it.
+    pub data_opener_heads: u64,
     /// DATA-table reads attributed to data fragments (`data/`, `*.lance`) — the
     /// merge-insert/RI **scan**, which grows with fragment count (compaction's
     /// domain, not the opener).
@@ -348,6 +351,7 @@ struct PrefixCounts {
     reads: u64,
     writes: u64,
     opener_reads: u64,
+    opener_heads: u64,
     scan_reads: u64,
 }
 
@@ -358,11 +362,14 @@ struct PrefixCounts {
 struct PrefixCounter(Arc<Mutex<PrefixCounts>>);
 
 impl PrefixCounter {
-    fn record_read(&self, location: &Path) {
+    fn record_read(&self, location: &Path, head: bool) {
         let mut c = self.0.lock().unwrap();
         c.reads += 1;
         match classify(location) {
-            ReadClass::Opener => c.opener_reads += 1,
+            ReadClass::Opener => {
+                c.opener_reads += 1;
+                c.opener_heads += u64::from(head);
+            }
             ReadClass::Scan => c.scan_reads += 1,
             ReadClass::Other => {}
         }
@@ -435,7 +442,7 @@ impl ObjectStore for PrefixCountingStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
-        self.counter.record_read(location);
+        self.counter.record_read(location, options.head);
         self.target.get_opts(location, options).await
     }
 
@@ -448,7 +455,7 @@ impl ObjectStore for PrefixCountingStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
         self.counter
-            .record_read(&prefix.cloned().unwrap_or_default());
+            .record_read(&prefix.cloned().unwrap_or_default(), false);
         self.target.list(prefix)
     }
 
@@ -458,13 +465,13 @@ impl ObjectStore for PrefixCountingStore {
         offset: &Path,
     ) -> BoxStream<'static, OSResult<ObjectMeta>> {
         self.counter
-            .record_read(&prefix.cloned().unwrap_or_default());
+            .record_read(&prefix.cloned().unwrap_or_default(), false);
         self.target.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
         self.counter
-            .record_read(&prefix.cloned().unwrap_or_default());
+            .record_read(&prefix.cloned().unwrap_or_default(), false);
         self.target.list_with_delimiter(prefix).await
     }
 
@@ -668,6 +675,7 @@ impl OpProbes {
             data_reads: t.reads,
             data_writes: t.writes,
             data_opener_reads: t.opener_reads,
+            data_opener_heads: t.opener_heads,
             data_scan_reads: t.scan_reads,
             manifest_reads: manifest.read_iops,
             manifest_writes: manifest.write_iops,
