@@ -1155,7 +1155,7 @@ const SCALAR_ROWS: &[&str] = &[
     "coalesce",
     "concat",
 ];
-const AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max"];
+const AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max", "collect"];
 /// The default an omitted option of a registry row takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OptionDefault {
@@ -2844,8 +2844,8 @@ impl Ctx<'_> {
             Expr::AggDistinct { func, arg } => (*func, true, arg.as_ref()),
             _ => return Ok(None),
         };
-        if distinct && func != AggFunc::Count {
-            return Err(err(T57, "distinct applies only to count"));
+        if distinct && !matches!(func, AggFunc::Count | AggFunc::Collect) {
+            return Err(err(T57, "distinct applies only to count and collect"));
         }
         if contains_agg(arg) {
             return Err(err(T8, format!("{func} cannot take an aggregate")));
@@ -5800,7 +5800,7 @@ impl Ctx<'_> {
                                 }
                                 (Some(arg), f) => {
                                     let ty = agg_type(f, &arg.ty)?;
-                                    let ty = ty.with_nullable(f != AggFunc::Count);
+                                    let ty = ty.with_nullable(!f.defined_on_empty());
                                     Agg {
                                         func: f,
                                         distinct: false,
@@ -7639,13 +7639,15 @@ fn agg_func(name: &str) -> AggFunc {
         "sum" => AggFunc::Sum,
         "avg" => AggFunc::Avg,
         "min" => AggFunc::Min,
+        "collect" => AggFunc::Collect,
         _ => AggFunc::Max,
     }
 }
 
 /// An aggregate's result type: `count` is a non-null `I64`; `sum` and `avg`
 /// are `F64` as today; `min` and `max` keep the argument's type; all but
-/// `count` are nullable over an empty input.
+/// `count` and `collect` are nullable over an empty input. `collect` is a
+/// list of its argument's type, the empty list over empty input.
 fn agg_type(func: AggFunc, arg: &Ty) -> R<Ty> {
     match (func, arg) {
         // An aggregate's value is nullable in its position, `count`'s too
@@ -7655,6 +7657,26 @@ fn agg_type(func: AggFunc, arg: &Ty) -> R<Ty> {
             T24,
             format!("a Blob is not a read value, so {func} cannot take it"),
         )),
+        // A list of references waits for stage Path, which admits reference
+        // elements in a `List`; a property of the reference is the lowered
+        // form.
+        (AggFunc::Collect, Ty::Node { .. } | Ty::Edge { .. }) => Err(err(
+            T86,
+            "`collect` of a reference: this release does not support a list of references yet; collect one of its properties",
+        )),
+        (AggFunc::Collect, Ty::Value(t)) if t.list || !t.scalar.is_list_element() => Err(err(
+            T8,
+            format!(
+                "collect gathers values a list can hold, got {}",
+                t.display_name()
+            ),
+        )),
+        (AggFunc::Collect, Ty::Value(t)) => Ok(Ty::Value(PropType {
+            scalar: t.scalar,
+            nullable: true,
+            list: true,
+            enum_values: None,
+        })),
         (_, Ty::Node { .. } | Ty::Edge { .. }) => Err(err(
             T8,
             format!("{func} cannot take a reference bare; access one of its properties"),

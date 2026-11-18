@@ -13,6 +13,9 @@ pub enum Accumulator {
     ExactInteger,
     Float64,
     Extremum,
+    /// A group's non-null values in the fixed value order, held in the
+    /// query's memory pool as they arrive (`collect`).
+    List,
 }
 
 /// Conversion of the accumulated total to the declared result type.
@@ -32,17 +35,12 @@ pub struct AggregateSpec {
 
 /// Select an implementation for the declared aggregate signature.
 pub fn plan_aggregate(func: AggFunc, signature: &AggSignature) -> Result<AggregateSpec, PlanError> {
-    let scalar = func.result_type(&signature.arg).ok_or_else(|| {
+    let expected = func.result_type(&signature.arg).ok_or_else(|| {
         PlanError::Internal(format!(
             "invalid {func} argument {}",
             signature.arg.spelling()
         ))
     })?;
-    let expected = ExprType::Value {
-        scalar,
-        list: false,
-        nullable: true,
-    };
     if signature.result != expected {
         return Err(PlanError::Internal(format!(
             "{func} result must be {}, got {}",
@@ -87,6 +85,7 @@ pub fn plan_aggregate(func: AggFunc, signature: &AggSignature) -> Result<Aggrega
             _ => (Accumulator::Float64, Overflow::RoundToNearest),
         },
         AggFunc::Min | AggFunc::Max => (Accumulator::Extremum, Overflow::Error),
+        AggFunc::Collect => (Accumulator::List, Overflow::Error),
     };
     Ok(AggregateSpec {
         accumulator,

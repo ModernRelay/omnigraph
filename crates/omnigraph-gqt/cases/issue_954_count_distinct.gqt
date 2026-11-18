@@ -192,7 +192,7 @@ query distinct_under_sum() {
     return { sum(distinct $p.age) as total }
 }
 
---- expect error: T57: distinct applies only to count
+--- expect error: T57: distinct applies only to count and collect
 
 --- query
 query distinct_return_over_distinct_count() {

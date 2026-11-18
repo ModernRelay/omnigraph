@@ -82,7 +82,7 @@ codes! {
     T53 = "list literal elements must share one scalar type";
     T55 = "an unattached base parameter is undeclared or not a String";
     T56 = "distinct does not apply to an aggregated return";
-    T57 = "distinct applies only to count";
+    T57 = "distinct applies only to count and collect";
     // The GQ 3 RFC, section 5. T60 to T64, T66 and T67 are
     // unallocated.
     T65 = "a ranking is written as a call in order or return; it is a relation function";

@@ -106,7 +106,7 @@ impl Open {
 /// A word token: its text and start.
 type Word<'a> = (&'a str, usize);
 
-const AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max"];
+const AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max", "collect"];
 
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'

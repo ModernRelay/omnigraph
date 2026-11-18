@@ -36,8 +36,9 @@ use crate::physical::{NodeId, PhysicalPlan};
 /// the one ranking a scan computes. Version 16 adds to version 15 the
 /// assumptions' `plan_work`, the read's plan budget and the work typing,
 /// shaping and planning charged to it, which a replay's compile must
-/// charge again.
-pub const BOUND_PLAN_VERSION: u32 = 16;
+/// charge again. Version 17 adds to version 16 the `collect` aggregate and
+/// its `list` accumulator.
+pub const BOUND_PLAN_VERSION: u32 = 17;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

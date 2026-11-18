@@ -293,6 +293,7 @@ pub(crate) fn agg(f: AggFunc) -> &'static str {
         AggFunc::Avg => "avg",
         AggFunc::Min => "min",
         AggFunc::Max => "max",
+        AggFunc::Collect => "collect",
     }
 }
 

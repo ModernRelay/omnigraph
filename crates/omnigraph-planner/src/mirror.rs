@@ -1585,6 +1585,7 @@ pub enum AggFuncMirror {
     Avg,
     Min,
     Max,
+    Collect,
 }
 
 impl From<AggFunc> for AggFuncMirror {
@@ -1595,6 +1596,7 @@ impl From<AggFunc> for AggFuncMirror {
             AggFunc::Avg => Self::Avg,
             AggFunc::Min => Self::Min,
             AggFunc::Max => Self::Max,
+            AggFunc::Collect => Self::Collect,
         }
     }
 }
@@ -1607,6 +1609,7 @@ impl From<AggFuncMirror> for AggFunc {
             AggFuncMirror::Avg => Self::Avg,
             AggFuncMirror::Min => Self::Min,
             AggFuncMirror::Max => Self::Max,
+            AggFuncMirror::Collect => Self::Collect,
         }
     }
 }

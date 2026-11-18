@@ -1308,6 +1308,8 @@ impl ReadGen<'_, '_, '_> {
     }
 
     /// `return`: plain items, `distinct` items, or groups and aggregates.
+    /// The aliases it returns are the items an `order` may read: a list,
+    /// a `collect`'s, is not one.
     fn return_clause(&mut self, scope: &[Var]) -> (String, Vec<String>) {
         let mut items = Vec::new();
         let mut aliases = Vec::new();
@@ -1316,7 +1318,22 @@ impl ReadGen<'_, '_, '_> {
         for i in 0..n {
             let alias = format!("c{i}");
             let item = if aggregate && (i > 0 || self.c.flag(30)) {
-                self.aggregate(scope)
+                let item = self.aggregate(scope);
+                if item.starts_with("collect(") {
+                    items.push(format!("{item} as {alias}"));
+                    continue;
+                }
+                item
+            } else if !aggregate
+                && self.options.nesting
+                && self.options.aggregates
+                && self.c.flag(8)
+                && let Some(block) = self.collect_block(scope)
+            {
+                // A list per row is no group key and no `distinct` item, so
+                // the read stays a plain projection.
+                items.push(format!("{block} as {alias}"));
+                continue;
             } else if self.c.flag(15) {
                 // A node or edge reference.
                 // A node reference; an edge returned whole is refused
@@ -1338,7 +1355,11 @@ impl ReadGen<'_, '_, '_> {
             items.push(format!("{item} as {alias}"));
             aliases.push(alias);
         }
-        let distinct = !aggregate && self.c.flag(15);
+        let distinct = !aggregate
+            && !items
+                .iter()
+                .any(|item: &String| item.starts_with("(collect("))
+            && self.c.flag(15);
         (
             format!(
                 "return {}{{ {} }}",
@@ -1349,8 +1370,25 @@ impl ReadGen<'_, '_, '_> {
         )
     }
 
+    /// `collect(x) { … }`, a block value: the list of a correlated
+    /// pattern's values per outer row.
+    fn collect_block(&mut self, scope: &[Var]) -> Option<String> {
+        let (t, new) = self.traversal(scope, false, true, true)?;
+        let mut inner = scope.to_vec();
+        inner.extend(new);
+        let w = if self.c.flag(40) {
+            format!(" where {}", self.expr(Class::Bool, &inner, 0))
+        } else {
+            String::new()
+        };
+        let arg = self.any_expr(&inner, 1);
+        Some(format!("(collect({arg}) {{ {t}{w} }})"))
+    }
+
     fn aggregate(&mut self, scope: &[Var]) -> String {
-        match self.c.below(7) {
+        match self.c.below(9) {
+            7 => format!("collect({})", self.any_expr(scope, 1)),
+            8 => format!("collect(distinct {})", self.any_expr(scope, 1)),
             0 | 1 => {
                 let refs: Vec<&Var> = scope
                     .iter()

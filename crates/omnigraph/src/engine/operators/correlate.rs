@@ -55,7 +55,9 @@ pub(crate) struct CorrelateGroup {
     /// the plan's output name and the column it becomes.
     pub(crate) outputs: Vec<(String, String)>,
     /// Grouped by no key: one row per outer row (once uncorrelated) over
-    /// no inner row too, its `count` columns 0 and every other null.
+    /// no inner row too, the columns named here (a `count`'s and a
+    /// `collect`'s, defined over empty input) their empty-input value, 0 or
+    /// the empty list, and every other null.
     pub(crate) keyless: Option<Vec<String>>,
 }
 
@@ -413,7 +415,7 @@ async fn grouped(
                     if tag == Some(field.name().as_str()) {
                         Ok(Arc::new(UInt32Array::from(missing.clone())) as ArrayRef)
                     } else if counts.contains(field.name()) {
-                        Ok(Arc::new(Int64Array::from(vec![0i64; missing.len()])) as ArrayRef)
+                        empty_input_value(field.data_type(), missing.len())
                     } else {
                         Ok(arrow_array::new_null_array(
                             field.data_type(),
@@ -428,6 +430,23 @@ async fn grouped(
     }
     reservation.hold(&result)?;
     Ok(result)
+}
+
+/// `n` copies of an aggregate's value over empty input: a `count`'s 0 or a
+/// `collect`'s empty list.
+fn empty_input_value(data_type: &DataType, n: usize) -> DfResult<ArrayRef> {
+    match data_type {
+        DataType::Int64 => Ok(Arc::new(Int64Array::from(vec![0i64; n]))),
+        DataType::List(item) => Ok(Arc::new(arrow_array::ListArray::new(
+            Arc::clone(item),
+            datafusion::arrow::buffer::OffsetBuffer::new_zeroed(n),
+            arrow_array::new_empty_array(item.data_type()),
+            None,
+        ))),
+        other => Err(external(OmniError::manifest_internal(format!(
+            "an aggregate of type {other} has no value over empty input"
+        )))),
+    }
 }
 
 /// The indices of the rows the read keeps, in its order: sorted by the tag

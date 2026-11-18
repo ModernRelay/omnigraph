@@ -26,9 +26,9 @@ const KEYWORDS: &[&str] = &[
     "match", "return", "order", "by", "limit", "as", "asc", "desc", "distinct", "is", "not",
     "null", "and", "or", "in", "let", "from", "optional", "exists", "delete", "insert", "update",
     "set", "where", "filter", "with", "call", "detach", "case", "when", "then", "else", "end",
-    "coalesce", "count", "sum", "avg", "min", "max", "starts", "ends", "between", "like", "create",
-    "merge", "having", "group", "offset", "skip", "true", "false", "union", "unwind", "for",
-    "query", "contains", "if", "concat",
+    "coalesce", "count", "sum", "avg", "min", "max", "collect", "starts", "ends", "between",
+    "like", "create", "merge", "having", "group", "offset", "skip", "true", "false", "union",
+    "unwind", "for", "query", "contains", "if", "concat",
 ];
 
 /// Registry names, so `!name(…)` is `not name(…)` and not a Datalog atom.

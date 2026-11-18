@@ -211,6 +211,12 @@ impl ScalarType {
                 Self::String | Self::Bool | Self::Date | Self::DateTime
             )
     }
+
+    /// A type a `List` may hold: every scalar but `Vector` and `Blob`, as
+    /// the schema's list types admit.
+    pub(crate) fn is_list_element(&self) -> bool {
+        self.is_orderable()
+    }
 }
 
 impl std::fmt::Display for ScalarType {

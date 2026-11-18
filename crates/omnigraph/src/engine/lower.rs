@@ -36,6 +36,7 @@ use omnigraph_planner::{
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
+use super::collect_aggregate::CollectUdaf;
 use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerAvgUdaf, ExactIntegerUdaf};
 use super::operators::{
     AntiJoinMaskExec, CatalogueExec, ContainsJoinExec, CorrelateExec, CorrelateGroup,
@@ -541,6 +542,11 @@ impl<'l, 'a> Walk<'l, 'a> {
             }
             (AggFunc::Min, Accumulator::Extremum) => min_udaf(),
             (AggFunc::Max, Accumulator::Extremum) => max_udaf(),
+            (AggFunc::Collect, Accumulator::List) => {
+                Arc::new(datafusion::logical_expr::AggregateUDF::from(
+                    CollectUdaf::new(data_type.clone(), result.clone()),
+                ))
+            }
             (
                 AggFunc::Count,
                 Accumulator::ExactInteger | Accumulator::Float64 | Accumulator::Extremum,
@@ -550,6 +556,17 @@ impl<'l, 'a> Walk<'l, 'a> {
             | (
                 AggFunc::Min | AggFunc::Max,
                 Accumulator::Count | Accumulator::ExactInteger | Accumulator::Float64,
+            )
+            | (
+                AggFunc::Count | AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
+                Accumulator::List,
+            )
+            | (
+                AggFunc::Collect,
+                Accumulator::Count
+                | Accumulator::ExactInteger
+                | Accumulator::Float64
+                | Accumulator::Extremum,
             ) => {
                 return Err(OmniError::manifest_internal(
                     "aggregate function disagrees with declared accumulator",
@@ -1191,7 +1208,7 @@ impl Lower for Walk<'_, '_> {
                                 &rows_schema,
                                 name.clone(),
                             )?);
-                            if *func == AggFunc::Count {
+                            if func.defined_on_empty() {
                                 counts.push(column.clone());
                             }
                             outputs.push((name, column));

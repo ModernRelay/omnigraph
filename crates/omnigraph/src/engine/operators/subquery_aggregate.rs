@@ -82,9 +82,20 @@ impl ValueAccumulator {
             | (
                 AggFunc::Min | AggFunc::Max,
                 Accumulator::Count | Accumulator::ExactInteger | Accumulator::Float64,
+            )
+            | (
+                AggFunc::Count | AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
+                Accumulator::List,
             ) => {
                 return Err(OmniError::manifest_internal(
                     "block function differs from its aggregate specification",
+                ));
+            }
+            // A `collect` block is read as a value, through the plan's
+            // aggregate, never folded by a semi-join.
+            (AggFunc::Collect, _) => {
+                return Err(OmniError::manifest_internal(
+                    "a collect block reached a semi-join comparison",
                 ));
             }
         })
@@ -535,6 +546,11 @@ impl Column {
                     "count needs no value accumulator",
                 ));
             }
+            Accumulator::List => {
+                return Err(OmniError::manifest_internal(
+                    "a collect block reached a semi-join comparison",
+                ));
+            }
         };
         let converted = arrow_cast::cast::cast_with_options(
             values,
@@ -558,9 +574,9 @@ impl Column {
                 .cloned()
                 .map(Self::Float)
                 .ok_or_else(|| OmniError::manifest_internal("floating block input is not Float64")),
-            Accumulator::Count | Accumulator::Extremum => Err(OmniError::manifest_internal(
-                "unexpected block accumulator conversion",
-            )),
+            Accumulator::Count | Accumulator::Extremum | Accumulator::List => Err(
+                OmniError::manifest_internal("unexpected block accumulator conversion"),
+            ),
         }
     }
 }
@@ -579,7 +595,7 @@ mod tests {
 
     fn column_predicate(func: AggFunc, kind: ScalarType, right: IRExpr) -> SubqueryPredicate {
         let arg = scalar(kind, true);
-        let result = scalar(func.result_type(&arg).unwrap(), true);
+        let result = func.result_type(&arg).unwrap();
         SubqueryPredicate {
             left: BlockAggregateExpr::Aggregate {
                 func,

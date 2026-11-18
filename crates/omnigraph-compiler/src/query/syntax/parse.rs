@@ -3768,6 +3768,7 @@ fn agg_func(name: &str) -> AggFunc {
         "sum" => AggFunc::Sum,
         "avg" => AggFunc::Avg,
         "min" => AggFunc::Min,
+        "collect" => AggFunc::Collect,
         _ => AggFunc::Max,
     }
 }

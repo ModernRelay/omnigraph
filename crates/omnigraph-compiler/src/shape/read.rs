@@ -3419,10 +3419,15 @@ impl<'a> Shaper<'a> {
         groups.reverse();
         // One semi-join per comparison; `not (c > 0)` is the row-count zero
         // test. The right side is evaluated over the outer rows: it reads
-        // their columns, not another block's value nor a full-text call.
+        // their columns, not another block's value nor a full-text call. A
+        // `collect` block is read as a value: its list is a group's, not a
+        // running scalar a semi-join folds.
         let comparisons: Option<Vec<(CompOp, IRExpr)>> = groups
             .iter()
-            .map(|(_, column, _, _, _)| {
+            .map(|(_, column, agg, _, _)| {
+                if agg.func == AggFunc::Collect {
+                    return None;
+                }
                 block_comparison(pred, column).filter(|(_, right)| {
                     let mut read = Vec::new();
                     right.columns(&mut read);

@@ -182,6 +182,51 @@ fn group_counts_per_key_and_once_over_no_keys() {
     );
 }
 
+/// `collect` gathers a group's non-null values in the fixed value order,
+/// drops repeats under `distinct`, and is the empty list over empty input,
+/// as a group's aggregate and as a block value.
+#[test]
+fn group_collects_non_null_values_in_the_fixed_order() {
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $p: Person } return { $p.age, collect($p.city) as cities } }"
+        )),
+        vec![
+            json!({"cities": ["Oslo", "Rome"], "p.age": 30}),
+            json!({"cities": [], "p.age": 40})
+        ]
+    );
+    assert_eq!(
+        rows("query q() { match { $p: Person } return { collect(distinct $p.age) as ages } }"),
+        vec![json!({"ages": [30, 40]})]
+    );
+    assert_eq!(
+        rows(
+            "query q() { match { $p: Person } where $p.age > 99 return { collect($p.name) as names } }"
+        ),
+        vec![json!({"names": []})]
+    );
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $p: Person } return { $p.name, collect($d.year) { $d: Doc, $p wrote $d } as years } }"
+        )),
+        vec![
+            json!({"p.name": "ann", "years": [2020, 2021]}),
+            json!({"p.name": "bob", "years": []}),
+            json!({"p.name": "cyd", "years": [2022]})
+        ]
+    );
+    // The total order on floats puts -0.0 before 0.0, and keeps both.
+    let xs = rows("query q() { match { $r: Reading } return { collect(distinct $r.x) as xs } }");
+    let xs = xs[0]["xs"].as_array().unwrap();
+    let signs: Vec<bool> = xs
+        .iter()
+        .map(|x| x.as_f64().unwrap().is_sign_negative())
+        .collect();
+    assert_eq!(signs, vec![true, false, false]);
+    assert_eq!(xs.len(), 3);
+}
+
 #[test]
 fn correlate_evaluates_a_block_per_outer_row() {
     assert_eq!(

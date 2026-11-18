@@ -407,7 +407,7 @@ operand    = { "(" ~ expr ~ ")" | block_value | agg_distinct | count_star_rec | 
 // A block is an operand and nothing else: its elements and its own `where`
 // inside its braces.
 block_value = { (agg_name ~ ("(" ~ expr ~ ")")? | kw_exists) ~ "{" ~ block_body ~ "}" }
-agg_name    = @{ ("count" | "sum" | "avg" | "min" | "max") ~ !(ASCII_ALPHANUMERIC | "_") }
+agg_name    = @{ ("count" | "sum" | "avg" | "min" | "max" | "collect") ~ !(ASCII_ALPHANUMERIC | "_") }
 agg_distinct = { agg_name ~ "(" ~ kw_distinct ~ expr ~ ")" }
 count_star_rec = { agg_name ~ "(" ~ "*" ~ ")" }
 // A call's name is never a reserved word or a keyword of a declaration

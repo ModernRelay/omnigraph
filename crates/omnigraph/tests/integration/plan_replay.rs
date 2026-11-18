@@ -475,6 +475,10 @@ query sum_ages() {
     match { $p: Person }
     return { sum($p.age) as total }
 }
+query collected_ages() {
+    match { $p: Person }
+    return { collect(distinct $p.age) as ages, collect($p.name) as names }
+}
 query old_or_liking() {
     match {
         from union(
@@ -1825,6 +1829,18 @@ async fn the_skip_shapes_and_the_aggregate_replay() {
         serde_json::json!({
             "column": "total", "func": "sum", "distinct": false, "input": "I64", "accumulator": "exact_integer",
             "overflow": "round_to_nearest", "result": "F64?"
+        })
+    );
+    let collected = replayed(&db, PEOPLE_QUERIES, "collected_ages", &ParamMap::new()).await;
+    let names = collected.result[0]["names"].as_array().unwrap().clone();
+    let mut in_order = names.clone();
+    in_order.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    assert_eq!(names, in_order, "a list replays in the fixed value order");
+    assert_eq!(
+        collected.plan.plan.to_json()["aggregates"][0],
+        serde_json::json!({
+            "column": "ages", "func": "collect", "distinct": true, "input": "I64", "accumulator": "list",
+            "overflow": "error", "result": "[I64]?"
         })
     );
     let encoded = serde_json::to_value(plan).unwrap();

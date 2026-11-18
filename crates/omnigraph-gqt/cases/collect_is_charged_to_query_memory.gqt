@@ -1,0 +1,70 @@
+# issue: none
+# notes: `collect` holds its list in the query's memory pool as it grows, so a list beyond
+# notes: `query_memory_bytes` refuses the read naming the setting, while `max` and `count` over the
+# notes: same rows, which hold one value each, fit the same budget. 512 rows with a 1 KiB key:
+# notes: collecting the keys holds about 512 KiB, refused at 262144 bytes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item {
+    id: String @key
+    v: I64
+}
+
+--- seed
+{"type":"Item","data":{"id":"a","v":-100}}
+
+--- load generate: v1 seed: 3 mode: append
+tables:
+  - kind: node
+    name: Item
+    rows: 512
+    commits: 4
+    batch_rows: 128
+    columns:
+      id: {kind: key, prefix: kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk, width: 6}
+      v: {kind: ordinal, start: 0, step: 1}
+--- expect ok
+
+--- query
+set query_memory_bytes = 262144;
+query collected_keys_refused() {
+    match { $i: Item }
+    return { collect($i.id) as ids }
+}
+
+--- expect error: resource limit exceeded for query_memory_bytes
+
+--- query
+set query_memory_bytes = 262144;
+query largest_key_fits() {
+    match { $i: Item }
+    where $i.v >= 0
+    return { max($i.v) as top, count($i) as items }
+}
+
+--- expect unordered
+{"items":512,"top":511}
+
+--- expect shape
+top: I64?
+items: I64
+
+--- query
+set query_memory_bytes = 262144;
+query collected_values_fit() {
+    match { $i: Item }
+    where $i.v < 3
+    return { collect($i.v) as vs }
+}
+
+--- expect unordered
+{"vs":[-100,0,1,2]}
+
+--- expect shape
+vs: [I64]

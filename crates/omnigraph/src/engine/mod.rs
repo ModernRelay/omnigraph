@@ -39,6 +39,7 @@ mod adapters;
 mod arith;
 mod bind;
 pub(crate) mod catalogue;
+mod collect_aggregate;
 mod constant;
 mod context;
 mod exact_aggregate;

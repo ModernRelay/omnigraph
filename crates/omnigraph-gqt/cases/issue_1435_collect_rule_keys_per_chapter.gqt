@@ -1,0 +1,99 @@
+# issue: 1435
+# red_on: b9e8d7e29e62c8c1c9d953b2f8f365aaf0c54cc4
+# notes: `collect` gathers a group's values into a list: one row per chapter with the keys of its
+# notes: rules, in the fixed value order, which is the same answer as grouping the per-pair rows of
+# notes: the first step on the client (c1: r1, r2, r3; c2: r4). A chapter with no rule has no pair,
+# notes: so it has no row in the grouped read; read as a block value it gets the empty list.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Book {
+    slug: String @key
+    title: String
+}
+node Chapter {
+    slug: String @key
+    n: I32
+}
+node Rule {
+    key: String @key
+    text: String
+}
+edge InBook: Chapter -> Book
+edge HasRule: Chapter -> Rule
+
+--- seed
+{"type":"Book","data":{"slug":"b1","title":"Statutes"}}
+{"type":"Chapter","data":{"slug":"c1","n":1}}
+{"type":"Chapter","data":{"slug":"c2","n":2}}
+{"type":"Chapter","data":{"slug":"c3","n":3}}
+{"type":"Rule","data":{"key":"r3","text":"third"}}
+{"type":"Rule","data":{"key":"r1","text":"first"}}
+{"type":"Rule","data":{"key":"r2","text":"second"}}
+{"type":"Rule","data":{"key":"r4","text":"fourth"}}
+{"edge":"InBook","from":"c1","to":"b1"}
+{"edge":"InBook","from":"c2","to":"b1"}
+{"edge":"InBook","from":"c3","to":"b1"}
+{"edge":"HasRule","from":"c1","to":"r3"}
+{"edge":"HasRule","from":"c1","to":"r1"}
+{"edge":"HasRule","from":"c1","to":"r2"}
+{"edge":"HasRule","from":"c2","to":"r4"}
+
+--- query
+query rule_pairs() {
+    match { $c: Chapter, $c hasRule $r }
+    return { $c.slug as chapter, $r.key as rule }
+    order { chapter, rule }
+}
+
+--- expect ordered
+{"chapter":"c1","rule":"r1"}
+{"chapter":"c1","rule":"r2"}
+{"chapter":"c1","rule":"r3"}
+{"chapter":"c2","rule":"r4"}
+
+--- expect shape
+chapter: String
+rule: String
+
+--- query
+query rules_per_chapter() {
+    match { $c: Chapter, $c hasRule $r }
+    return { $c.slug as chapter, collect($r.key) as rules }
+    order { chapter }
+}
+
+--- expect ordered
+{"chapter":"c1","rules":["r1","r2","r3"]}
+{"chapter":"c2","rules":["r4"]}
+
+--- expect shape
+chapter: String
+rules: [String]
+
+--- query
+query rules_per_chapter_of_a_book($b: String) {
+    match { $c: Chapter, $c inBook $k, $k: Book }
+    where $k.slug = $b
+    return { $c.slug as chapter, collect($r.key) { $r: Rule, $c hasRule $r } as rules }
+    order { chapter }
+}
+
+--- params
+{"b":"b1"}
+
+--- expect ordered
+{"chapter":"c1","rules":["r1","r2","r3"]}
+{"chapter":"c2","rules":["r4"]}
+{"chapter":"c3","rules":[]}
+
+--- expect shape
+chapter: String
+rules: [String]

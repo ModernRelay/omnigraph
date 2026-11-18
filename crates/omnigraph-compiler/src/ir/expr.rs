@@ -5,7 +5,7 @@
 use crate::error::{CompilerError, Result};
 use crate::query::syntax::ArithOp;
 use crate::query::value::{AggFunc, BinaryOp, CompOp, Literal, NOW_PARAM_NAME, Precedence};
-use crate::types::{AggSignature, ExprType, PropType, ScalarType};
+use crate::types::{AggSignature, ExprType, ScalarType};
 
 use super::coerce;
 
@@ -985,6 +985,7 @@ impl std::fmt::Display for IRExpr {
 #[cfg(test)]
 mod render_tests {
     use super::*;
+    use crate::types::PropType;
 
     fn prop(variable: &str, property: &str) -> IRExpr {
         IRExpr::PropAccess {
@@ -1536,15 +1537,12 @@ fn integer_type(ty: &ExprType) -> bool {
 }
 
 fn check_aggregate_types(func: AggFunc, arg: &IRExpr, signature: &AggSignature) -> Result<()> {
-    let expected = func
-        .result_type(&signature.arg)
-        .map(|scalar| ExprType::from_prop(&PropType::scalar(scalar, true)))
-        .ok_or_else(|| {
-            CompilerError::Plan(format!(
-                "invalid {func} aggregate argument {}",
-                signature.arg.spelling()
-            ))
-        })?;
+    let expected = func.result_type(&signature.arg).ok_or_else(|| {
+        CompilerError::Plan(format!(
+            "invalid {func} aggregate argument {}",
+            signature.arg.spelling()
+        ))
+    })?;
     if signature.result != expected {
         return Err(CompilerError::Plan(format!(
             "{func}({}) has invalid result type {}",
@@ -2140,6 +2138,7 @@ pub struct IROrdering {
 #[cfg(test)]
 mod block_type_tests {
     use super::*;
+    use crate::types::PropType;
     use crate::types::ScalarType;
 
     fn value(scalar: ScalarType, nullable: bool) -> ExprType {

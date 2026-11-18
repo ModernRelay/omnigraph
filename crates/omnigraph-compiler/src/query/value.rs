@@ -98,18 +98,29 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// The list aggregate: a group's non-null values in the fixed value
+    /// order. A reference argument waits for stage Path, which admits
+    /// references as list elements.
+    Collect,
 }
 
 impl AggFunc {
-    /// The result scalar for an accepted argument; position determines nullability.
-    pub fn result_type(self, arg: &ExprType) -> Option<ScalarType> {
+    /// The aggregate's signature result for an accepted argument: nullable,
+    /// since position determines nullability (`count` and `collect` are never
+    /// null where they are read).
+    pub fn result_type(self, arg: &ExprType) -> Option<ExprType> {
         if matches!(arg, ExprType::Value { scalar: ScalarType::Vector(dim), .. }
             if *dim == 0 || i32::try_from(*dim).is_err())
         {
             return None;
         }
+        let value = |scalar: ScalarType| ExprType::Value {
+            scalar,
+            list: false,
+            nullable: true,
+        };
         match (self, arg) {
-            (Self::Count, _) => Some(ScalarType::I64),
+            (Self::Count, _) => Some(value(ScalarType::I64)),
             (
                 Self::Sum | Self::Avg,
                 ExprType::Value {
@@ -117,7 +128,7 @@ impl AggFunc {
                     list: false,
                     nullable: _,
                 },
-            ) => scalar.is_numeric().then_some(ScalarType::F64),
+            ) => scalar.is_numeric().then_some(value(ScalarType::F64)),
             (
                 Self::Min | Self::Max,
                 ExprType::Value {
@@ -125,9 +136,21 @@ impl AggFunc {
                     list: false,
                     nullable: _,
                 },
-            ) => scalar.is_orderable().then_some(*scalar),
+            ) => scalar.is_orderable().then_some(value(*scalar)),
             (
-                Self::Sum | Self::Avg | Self::Min | Self::Max,
+                Self::Collect,
+                ExprType::Value {
+                    scalar,
+                    list: false,
+                    nullable: _,
+                },
+            ) => scalar.is_list_element().then_some(ExprType::Value {
+                scalar: *scalar,
+                list: true,
+                nullable: true,
+            }),
+            (
+                Self::Sum | Self::Avg | Self::Min | Self::Max | Self::Collect,
                 ExprType::Value {
                     scalar: _,
                     list: true,
@@ -139,6 +162,12 @@ impl AggFunc {
             ) => None,
         }
     }
+
+    /// Whether the aggregate's value over empty input is a value rather than
+    /// null: `count` is 0 and `collect` the empty list.
+    pub fn defined_on_empty(self) -> bool {
+        matches!(self, Self::Count | Self::Collect)
+    }
 }
 
 impl std::fmt::Display for AggFunc {
@@ -149,6 +178,7 @@ impl std::fmt::Display for AggFunc {
             Self::Avg => write!(f, "avg"),
             Self::Min => write!(f, "min"),
             Self::Max => write!(f, "max"),
+            Self::Collect => write!(f, "collect"),
         }
     }
 }

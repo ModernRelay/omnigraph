@@ -1070,6 +1070,12 @@ impl<'a> Interpreter<'a> {
         }
         Ok(match agg.func {
             AggFunc::Count => Value::Int(values.len() as i128),
+            // A group's non-null values in the fixed value order; empty
+            // input is the empty list.
+            AggFunc::Collect => {
+                values.sort_by(cmp_values);
+                Value::List(values)
+            }
             _ if values.is_empty() => Value::Null,
             // An integer sum is exact, rounded to `F64` once.
             AggFunc::Sum => Value::Float(exact_sum(&values)),
