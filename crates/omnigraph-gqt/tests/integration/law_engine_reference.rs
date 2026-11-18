@@ -481,12 +481,9 @@ fn engine_equals_reference_on_generated_reads_at_nightly_breadth() {
 /// beside every row before the cut (`Project(Cut(Order(Extend(R, items),
 /// keys), k), items)`, the RFC's derived forms), so a zero divisor in a
 /// return item refuses (`E2`) under `limit 0` too, as it does under
-/// `limit 1`; the engine's `LimitExec` and `SortExec` execute nothing below
-/// a zero limit, so the item never runs. The fix drains the input of a zero
-/// limit whose subtree holds a term that can fail; until then the generator
-/// draws no `limit 0`.
+/// `limit 1`. A cut of zero rows executes nothing below it only when no
+/// expression there can fail; otherwise it pulls its input to the end.
 #[test]
-#[ignore = "hunt: limit 0 skips a return item that can fail, which the reference evaluates"]
 fn limit_zero_evaluates_a_return_item_that_can_fail() {
     let schema = "node A {\n    k: String @key\n    p: I32?\n}\n";
     let seed = r#"{"type":"A","data":{"k":"a","p":0}}"#;

@@ -1,5 +1,8 @@
 //! `LimitExec`: the rows a `Limit` node admits. A limit of zero executes
-//! nothing below it, so the plan's `limit 0` is a run of one operator.
+//! nothing below it, so the plan's `limit 0` is a run of one operator,
+//! unless an expression below it can fail: then it pulls its input to the
+//! end and keeps no row, so a failing row refuses the read as it would
+//! under any other limit (A3).
 
 use std::fmt;
 use std::sync::Arc;
@@ -11,21 +14,25 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 
-use super::shape::{Mapped, Streaming, empty};
+use super::shape::{Mapped, Streaming, drained, empty};
 
 pub(crate) struct LimitExec {
     input: Arc<dyn ExecutionPlan>,
     rows: usize,
+    /// A limit of zero pulls its input to the end: an expression below it
+    /// can fail.
+    drains: bool,
     shape: Streaming,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl LimitExec {
-    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, rows: usize) -> Self {
+    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, rows: usize, drains: bool) -> Self {
         let shape = Streaming::new(input.schema());
         Self {
             input,
             rows,
+            drains,
             shape,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -36,13 +43,18 @@ impl fmt::Debug for LimitExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LimitExec")
             .field("rows", &self.rows)
+            .field("drains", &self.drains)
             .finish_non_exhaustive()
     }
 }
 
 impl DisplayAs for LimitExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LimitExec: rows={}", self.rows)
+        write!(f, "LimitExec: rows={}", self.rows)?;
+        if self.rows == 0 && self.drains {
+            f.write_str(", drains")?;
+        }
+        Ok(())
     }
 }
 
@@ -71,6 +83,7 @@ impl ExecutionPlan for LimitExec {
         Ok(Arc::new(Self::new(
             children.pop().expect("one child"),
             self.rows,
+            self.drains,
         )))
     }
 
@@ -89,6 +102,10 @@ impl ExecutionPlan for LimitExec {
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "LimitExec has one partition");
         if self.rows == 0 {
+            if self.drains {
+                let input = self.input.execute(0, ctx)?;
+                return Ok(drained(&self.metrics, self.schema(), input));
+            }
             return Ok(empty(&self.metrics, self.schema()));
         }
         let input = self.input.execute(0, ctx)?;

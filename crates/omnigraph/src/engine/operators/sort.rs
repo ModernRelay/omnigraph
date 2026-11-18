@@ -21,7 +21,7 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 
 use super::memory::WorkMemory;
-use super::shape::{Breaker, empty, work};
+use super::shape::{Breaker, drained, empty, work};
 use super::{drain, external};
 use crate::engine::lower::HIDDEN;
 use crate::error::{OmniError, Result};
@@ -39,6 +39,9 @@ pub(crate) struct SortExec {
     input: Arc<dyn ExecutionPlan>,
     keys: Vec<SortKey>,
     fetch: Option<usize>,
+    /// A fetch of zero pulls its input to the end: an expression below it
+    /// can fail, and a failing row refuses the read under any fetch (A3).
+    drains: bool,
     /// The input columns the output keeps, in input order.
     visible: Vec<usize>,
     shape: Breaker,
@@ -50,6 +53,7 @@ impl SortExec {
         input: Arc<dyn ExecutionPlan>,
         keys: Vec<SortKey>,
         fetch: Option<usize>,
+        drains: bool,
     ) -> Result<Self> {
         let input_schema = input.schema();
         for key in &keys {
@@ -77,6 +81,7 @@ impl SortExec {
             input,
             keys,
             fetch,
+            drains,
             visible,
             shape: Breaker::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -89,6 +94,7 @@ impl fmt::Debug for SortExec {
         f.debug_struct("SortExec")
             .field("keys", &self.keys)
             .field("fetch", &self.fetch)
+            .field("drains", &self.drains)
             .finish_non_exhaustive()
     }
 }
@@ -110,6 +116,9 @@ impl DisplayAs for SortExec {
         write!(f, "SortExec: [{}]", keys.join(", "))?;
         if let Some(fetch) = self.fetch {
             write!(f, ", fetch={fetch}")?;
+            if fetch == 0 && self.drains {
+                f.write_str(", drains")?;
+            }
         }
         Ok(())
     }
@@ -142,6 +151,7 @@ impl ExecutionPlan for SortExec {
                 children.pop().expect("one child"),
                 self.keys.clone(),
                 self.fetch,
+                self.drains,
             )
             .map_err(external)?,
         ))
@@ -158,6 +168,10 @@ impl ExecutionPlan for SortExec {
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "SortExec has one partition");
         if self.fetch == Some(0) {
+            if self.drains {
+                let input = self.input.execute(0, ctx)?;
+                return Ok(drained(&self.metrics, self.schema(), input));
+            }
             return Ok(empty(&self.metrics, self.schema()));
         }
         let input_schema = self.input.schema();

@@ -64,6 +64,11 @@ const BEHAVIOUR_SITES: &[(&str, &str, &str)] = &[
     ),
     (
         "physical.rs",
+        "node_can_fail",
+        "whether an expression a kind's fields hold can fail, for a cut of zero rows",
+    ),
+    (
+        "physical.rs",
         "PhysicalPlan::node_json",
         "the explain JSON of every kind's fields",
     ),

@@ -816,7 +816,8 @@ impl Lower for Walk<'_, '_> {
     }
 
     fn limit(&mut self, id: NodeId, rows: usize, input: Plan) -> Lowers<Plan> {
-        self.built(id, LimitExec::new(input, rows))
+        let drains = self.lowering.plan.can_fail_below(id);
+        self.built(id, LimitExec::new(input, rows, drains))
     }
 
     fn target_cut(
@@ -1580,7 +1581,8 @@ impl Lower for Walk<'_, '_> {
                 nulls_first: true,
             });
         }
-        let sort = SortExec::try_new(input, keys, fetch)?;
+        let drains = self.lowering.plan.can_fail_below(id);
+        let sort = SortExec::try_new(input, keys, fetch, drains)?;
         self.built(id, sort)
     }
 

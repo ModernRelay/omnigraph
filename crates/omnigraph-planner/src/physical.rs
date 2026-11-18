@@ -15,8 +15,9 @@ use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy, Valida
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
     ColumnRef, CsvSourceSpec, DeltaSourceSpec, FragmentWriteSpec, KeyJoinKind, LOGICAL_ID,
-    ScanSpec, ValidateSpec, csv_source_json, delta_source_json, filters_json, fragment_write_json,
-    metadata_count_json, ordering_text, scan_json, tiebreak_text, validate_json,
+    Predicate, ScanSpec, ValidateSpec, csv_source_json, delta_source_json, filters_json,
+    fragment_write_json, metadata_count_json, ordering_text, scan_json, tiebreak_text,
+    validate_json,
 };
 use crate::mirror::EdgeSelectionMirror;
 use crate::operation::TableRef;
@@ -1305,6 +1306,27 @@ impl PhysicalPlan {
         self.root
     }
 
+    /// Whether an expression in the subtree under `id`, the node included,
+    /// can refuse a row where it is evaluated (`IRExpr::can_fail`, A3). A
+    /// cut of zero rows (`Limit`, `Page`, a `Sort` with a fetch of zero)
+    /// skips its input only when this is false: the core computes every
+    /// expression below a cut on every row before the cut selects
+    /// (`Cut(Order(Extend(R, items), keys), k)`), so a term that can fail
+    /// refuses the read whatever the cut keeps.
+    pub fn can_fail_below(&self, id: NodeId) -> bool {
+        let mut pending = vec![id];
+        while let Some(id) = pending.pop() {
+            let Some(node) = self.node(id) else {
+                continue;
+            };
+            if node_can_fail(node) {
+                return true;
+            }
+            pending.extend(node.inputs());
+        }
+        false
+    }
+
     pub fn node(&self, id: NodeId) -> Option<&PhysicalNode> {
         self.slots.get(id).and_then(Option::as_ref)
     }
@@ -2111,4 +2133,60 @@ pub(crate) fn inner_read_json(
         value["typed_group"] = json!(crate::typed::returns(group));
     }
     value
+}
+
+/// Whether an expression the node itself evaluates can fail, its inputs
+/// apart: [`PhysicalPlan::can_fail_below`] walks the inputs.
+fn node_can_fail(node: &PhysicalNode) -> bool {
+    let projections = |items: &[IRProjection]| items.iter().any(|item| item.expr.can_fail());
+    let exprs = |items: &[IRExpr]| items.iter().any(IRExpr::can_fail);
+    match node {
+        PhysicalNode::MetadataCount { return_exprs, .. }
+        | PhysicalNode::Projection { return_exprs, .. } => projections(return_exprs),
+        PhysicalNode::Aggregate { return_exprs, .. } => projections(return_exprs),
+        PhysicalNode::Sort { order_by, .. } => order_by.iter().any(|key| key.expr.can_fail()),
+        PhysicalNode::Scan { spec, .. } => spec.filter.as_ref().is_some_and(predicate_can_fail),
+        PhysicalNode::Filter { filters, .. } | PhysicalNode::CrossJoin { filters, .. } => {
+            exprs(filters)
+        }
+        PhysicalNode::ContainsJoin {
+            conjunct, residual, ..
+        } => conjunct.can_fail() || exprs(residual),
+        PhysicalNode::Let { value, .. } => value.can_fail(),
+        PhysicalNode::Score { query, .. } => query.can_fail(),
+        PhysicalNode::AntiJoin { predicate, .. } => {
+            predicate.right.can_fail() || predicate.left.arg().is_some_and(IRExpr::can_fail)
+        }
+        PhysicalNode::Correlate { read, .. } => read.exprs().any(IRExpr::can_fail),
+        PhysicalNode::Fuse { k, weights, .. } => {
+            k.as_ref().is_some_and(IRExpr::can_fail)
+                || weights.as_ref().is_some_and(IRExpr::can_fail)
+        }
+        PhysicalNode::SortMergeJoin { .. }
+        | PhysicalNode::HashJoin { .. }
+        | PhysicalNode::HydrateByAddress { .. }
+        | PhysicalNode::HydrateColumns { .. }
+        | PhysicalNode::RowCompare { .. }
+        | PhysicalNode::ClassifyThreeWay { .. }
+        | PhysicalNode::Limit { .. }
+        | PhysicalNode::TargetCut { .. }
+        | PhysicalNode::Page { .. }
+        | PhysicalNode::Expand { .. }
+        | PhysicalNode::Union { .. }
+        | PhysicalNode::OptionalJoin { .. }
+        | PhysicalNode::OuterReference { .. }
+        | PhysicalNode::CsvSource { .. }
+        | PhysicalNode::Validate { .. }
+        | PhysicalNode::FragmentWrite { .. }
+        | PhysicalNode::DeltaSource { .. } => false,
+    }
+}
+
+/// Whether a scan's pushed predicate holds a conjunct that can fail.
+fn predicate_can_fail(predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::Gq { filter, .. } => filter.0.can_fail(),
+        Predicate::And { left, right } => predicate_can_fail(left) || predicate_can_fail(right),
+        Predicate::IdAfter { .. } | Predicate::VersionWindow { .. } => false,
+    }
 }

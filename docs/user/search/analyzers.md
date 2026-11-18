@@ -134,7 +134,7 @@ overflows `u64` fails the read (`E1`), and a score that is not finite and
 positive fails it too (`E3`).
 
 The scan runs inside its plan node's operator when that operator first runs,
-so a node below a `limit 0` scans nothing; the execution report's `lexical`
+so a node below a `limit 0` scans nothing unless an expression below that limit can fail; the execution report's `lexical`
 entry counts the rows it read and the terms they analyzed to. It bounds its
 work before it allocates: a query's text may hold 64 KiB and 1,024 distinct
 terms, and a stored value 16 MiB, each before and after NFC (normalization can

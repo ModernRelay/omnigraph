@@ -689,9 +689,9 @@ impl ReadGen<'_, '_, '_> {
             ordered = true;
         }
         if self.options.order_limit && self.c.flag(30) {
-            // `limit 0` skips the rows' return items, which a failing item
-            // would refuse: pinned as a hunt (law_engine_reference.rs).
-            let lim = 1 + self.c.below(4);
+            // `limit 0` included: the return items are computed on every
+            // row before the cut, so a failing item refuses under it too.
+            let lim = self.c.below(5);
             if self.c.flag(30) {
                 let name = self.var("lim");
                 self.params.push((

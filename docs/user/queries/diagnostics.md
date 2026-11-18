@@ -339,7 +339,8 @@ whatever its population declares first
 ## Execution codes
 
 An execution code refuses a row while the query or write runs
-(`execution error: E2: …`). A refused write publishes nothing.
+(`execution error: E2: …`). A refused write publishes nothing. A `limit`, `limit 0` included, hides
+no refusal: the return items and order keys are computed on every row before the cut.
 
 | Code | Meaning |
 |---|---|
