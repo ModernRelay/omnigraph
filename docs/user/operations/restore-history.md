@@ -27,7 +27,10 @@ original commit IDs. An ordinary graph creation still requires an empty path.
    Require the same history hash, schema identity, branch heads and commit
    count. Seal the exact descriptor as
    `__cluster/restores/<restore_from>.json` using create-if-absent.
-   Keep uncertain storage effects and incomplete copies unsealed.
+   Keep uncertain storage effects and incomplete copies unsealed. Resume using the
+   same descriptor and object inventory. If the attempt is abandoned, retain
+   its evidence and retire the unused destination through its normal
+   lifecycle. Keep the original birth claim with that attempt.
 5. Declare the graph and its effective schema, queries and policies in
    the destination configuration. Add `restore_from: <digest>` to that
    graph's entry. Run the normal preview and authorized deployment.
