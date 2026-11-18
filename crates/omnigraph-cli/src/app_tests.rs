@@ -125,6 +125,67 @@ async fn login_never_creates_or_overwrites_a_profile_implicitly() {
 }
 
 #[test]
+fn onboarding_only_reads_an_answer_for_human_terminal_output() {
+    for terminal in [false, true] {
+        for json in [false, true] {
+            let mut input = io::empty();
+            assert_eq!(
+                matches!(
+                    super::onboarding_choice(&mut input, terminal, json),
+                    crate::managed::OrganizationChoice::Ask(_)
+                ),
+                terminal && !json
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn profile_creation_emits_a_managed_refusal_through_the_cli() {
+    let home = tempfile::tempdir().unwrap();
+    for json in [false, true] {
+        let mut arguments = vec![
+            "omnigraph",
+            "login",
+            "--create-profile",
+            "work",
+            "--organization",
+            "bad id",
+        ];
+        if json {
+            arguments.push("--json");
+        }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = super::execute(
+            crate::invocation::parse_from(arguments).unwrap(),
+            crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+            &mut io::empty(),
+            true,
+            &mut stdout,
+            false,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completion.code(), 2);
+        if json {
+            let refusal: Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(refusal["type"], "organization_invalid");
+            assert!(refusal["detail"].is_string());
+        } else {
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains("organization_invalid:")
+            );
+        }
+        assert!(!home.path().join("config.yaml").exists());
+    }
+}
+
+#[test]
 fn profile_creation_has_one_explicit_non_overlapping_spelling() {
     for args in [
         vec!["login", "--create-profile", "work"],
