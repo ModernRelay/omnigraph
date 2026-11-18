@@ -702,12 +702,13 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedHandle>;
 
     /// RFC 0067: stage one detached-ready compaction rewrite of the pinned
-    /// base, or `None` when there is nothing to compact. Its tasks run within
+    /// base from `plan`, the plan `TableStore::plan_table_compaction` made
+    /// for that base, or `None` when it has no task. Its tasks run within
     /// `limit`, the run's shared budget of heavy steps.
     async fn stage_compaction(
         &self,
         snapshot: &SnapshotHandle,
-        options: &lance::dataset::optimize::CompactionOptions,
+        plan: lance::dataset::optimize::CompactionPlan,
         limit: &crate::table_store::MaintenanceBudget,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>>;
 
@@ -1326,11 +1327,11 @@ impl TableStorage for TableStore {
     async fn stage_compaction(
         &self,
         snapshot: &SnapshotHandle,
-        options: &lance::dataset::optimize::CompactionOptions,
+        plan: lance::dataset::optimize::CompactionPlan,
         limit: &crate::table_store::MaintenanceBudget,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>> {
         Ok(
-            TableStore::stage_compaction(self, snapshot.dataset(), options, limit)
+            TableStore::stage_compaction(self, snapshot.dataset(), plan, limit)
                 .await?
                 .map(|compaction| (StagedHandle::new(compaction.staged), compaction.metrics)),
         )

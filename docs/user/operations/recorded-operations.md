@@ -27,7 +27,11 @@ record, refuses them; direct `omnigraph optimize` stays available there.
 
 A value that does not parse, a default above its ceiling, or a table byte
 ceiling above the run budget stops the server at startup. The ceilings are the
-server's: a request names only its tables and how long writers wait. Every
+server's: a request names only its tables and how long writers wait. A table
+whose plan passes a ceiling is `deferred` with reason `resource_limit`, and
+nothing is written for it. A size the run could not read from storage while
+measuring is not a deferral: that table is `failed` with the storage error,
+and the run goes on to the next. Every
 route needs the [`maintain`](policy.md#actions) action on the graph's `main`
 branch, for the actor the bearer token resolves to.
 
@@ -56,7 +60,7 @@ The budget is also the table byte ceiling when
 more bytes than the budget is therefore never optimized by a served run. To
 optimize it, raise the budget, or stop the server and run `omnigraph optimize`
 on the cluster root directly, which applies neither. Give that run
-`--tables <type key>` (for example `--tables node:Document`) to optimize only
+`--datasets <type key>` (for example `--datasets node:Document`) to optimize only
 the oversized table, so the server restarts sooner. A direct run keeps the
 root's admission lock: release it with `cluster force-unlock`, as after a
 [direct apply](../clusters/index.md#bootstrap-a-cluster), before the server
@@ -75,15 +79,19 @@ curl -X POST "$SERVER/graphs/knowledge/operations/01JC0000000000000000000000/can
 ```
 
 `operation_id` is a canonical ULID the caller generates. The body also takes
-`tables` (run only those table keys, in that order) and `max_gate_hold_ms`,
+`datasets` (run only those table keys, in that order) and `max_gate_hold_ms`,
 at or below the server's ceiling; nothing else.
 
 A submission answers 202 with the record once it is durably accepted, and 200
 once the operation is terminal. Submitting the same id with the same request
-answers the existing record; it never starts the work again. A lookup answers
+returns the existing record without starting work again. A lookup answers
 200 with the record, or `"lookup": "unknown"` when the record does not hold
 the id. `unknown` does not prove the operation never ran, and it is never a
 reason to resubmit the same work under the same id.
+
+Earlier edge builds wrote `tables` and `more_tables`. If the cluster's
+operation record contains either field, submit, lookup and cancel return
+HTTP 409 with `operation_record_invalid` after upgrading.
 
 | Refusal | Status |
 |---|---|
@@ -100,8 +108,11 @@ reason to resubmit the same work under the same id.
 it minted before it sends, waits for the terminal record, and after a lost
 response looks the id up instead of submitting again. `--no-wait` returns
 once the run is accepted, `--operation <id>` observes an existing operation,
-and `--timeout` bounds the wait, not the operation. `--tables` and
-`--max-gate-hold` map to the request.
+and `--timeout` bounds the wait, not the operation. `--datasets` and
+`--max-gate-hold` map to the request of a new operation and are refused beside
+`--operation`, which observes what that operation was submitted with.
+`--start-at` is refused: the server keeps the resume position. Either refusal
+exits 1 before any request is sent.
 
 | Outcome | Exit |
 |---|---|
@@ -118,7 +129,12 @@ terminal state:
 
 - `succeeded`: it published a commit (`published_commit`), or found nothing to
   publish. A succeeded run may still have deferred or failed tables; read each
-  table's outcome under `outcome`.
+  table's outcome under `outcome.datasets`. An `optimized` table with
+  `reason: index_failed` published the compaction or index work it completed
+  before a later index step or coverage check failed. Its `detail` gives
+  the error. The next run checks the published version for remaining work. A
+  record lists at most 1,024 tables; `more_datasets` counts the rest per
+  outcome and reason (`optimized:index_failed`).
 - `failed`, `cancelled` and `interrupted`: nothing was published, and the
   staged work is reclaimed by a later `cleanup`.
 - `unsettled`: the graph was deleted while the publication was in doubt
@@ -142,7 +158,8 @@ per-table ceilings; a table over one never moves that position
 
 Cancellation stops the run at its next safe boundary. A run that already
 started its publication finishes it and reports that the cancellation arrived
-late. A shutdown and a deployment that affects the graph cancel the running
+late; a run that had finished its tables with nothing to publish reports that
+instead. A shutdown and a deployment that affects the graph cancel the running
 operation the same way, and the record names the reason.
 
 The record keeps the 32 newest terminal operations and the time of the newest

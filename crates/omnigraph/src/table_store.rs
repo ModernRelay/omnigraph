@@ -826,22 +826,36 @@ pub(crate) struct RowPreservingChain {
 /// Walk `current`'s chain of commits by `read_version` links down to
 /// `captured_version` and return it when every link preserves rows
 /// ([`RowPreservingChain`]). `None` when a link is any other operation,
-/// records no transaction, or the walk reaches neither the captured version
-/// nor a stop within [`ROW_PRESERVING_CHAIN_MAX_LINKS`]: the write must then
-/// treat the table as changed.
+/// records no transaction, is no longer in storage, or the walk reaches
+/// neither the captured version nor a stop within
+/// [`ROW_PRESERVING_CHAIN_MAX_LINKS`]: the write must then treat the table as
+/// changed.
+///
+/// A link below `current` is named by no `__manifest` version, so `cleanup`
+/// deletes it, and a run can do so between a write's capture and its gates.
+/// A link that is not found, at its checkout or when its transaction is read
+/// (Lance 13 reads it from the manifest's inline section, else from the
+/// transaction file the sweep deletes first), is therefore an unreadable
+/// chain, not a storage fault. `current` is the table's pin, which the
+/// collector keeps whole, so a failure to read its own transaction stays an
+/// error.
 pub(crate) async fn row_preserving_chain(
     current: &Dataset,
     captured_version: u64,
 ) -> Result<Option<RowPreservingChain>> {
+    let collected = |error: &OmniError| {
+        error
+            .storage_failure()
+            .is_some_and(|failure| failure.kind == crate::error::StorageFailureKind::NotFound)
+    };
     let mut links = Vec::new();
     let mut dataset = current.clone();
     for _ in 0..ROW_PRESERVING_CHAIN_MAX_LINKS {
-        let Some(transaction) = dataset
-            .read_transaction()
-            .await
-            .map_err(OmniError::storage)?
-        else {
-            return Ok(None);
+        let transaction = match dataset.read_transaction().await.map_err(OmniError::storage) {
+            Ok(Some(transaction)) => transaction,
+            Ok(None) => return Ok(None),
+            Err(error) if !links.is_empty() && collected(&error) => return Ok(None),
+            Err(error) => return Err(error),
         };
         if !matches!(
             transaction.operation,
@@ -858,10 +872,15 @@ pub(crate) async fn row_preserving_chain(
         if read_version == 0 {
             return Ok(None);
         }
-        dataset = dataset
+        dataset = match dataset
             .checkout_version(read_version)
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(OmniError::storage)
+        {
+            Ok(link) => link,
+            Err(error) if collected(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
     }
     Ok(None)
 }
@@ -3421,12 +3440,13 @@ impl TableStore {
     }
 
     /// RFC 0067: stage one `CreateIndex` that folds every lagging foldable
-    /// index, ready to commit detached. Lance's own fold (`optimize_indices`)
-    /// merges the delta and previous segments through a crate-private path
-    /// and commits linearly; this rebuilds each lagging index whole under its
+    /// index, ready to commit detached. Lance 13's own fold
+    /// (`optimize_indices`) merges the delta and previous segments through a
+    /// crate-private module (`index::append`) and commits linearly
+    /// (`apply_commit`); this rebuilds each lagging index whole under its
     /// name with the public builder, which leaves the same single segment
-    /// Lance's merge would. A vector index the builder cannot train (a column
-    /// with no non-null rows) is skipped and reported by column. The builds
+    /// Lance's merge would. A vector training refusal (Lance's `Unprocessable`)
+    /// is reported by column; any other build failure is an error. The builds
     /// count against `limit`, which the maintenance pass owns.
     pub async fn stage_index_fold(
         &self,
@@ -3503,45 +3523,48 @@ impl TableStore {
                 Some((item, column, segments))
             })
             .collect();
-        // A vector build's Lance error is a column that cannot train, kept as
-        // a value and reported as skipped; any other failure ends the stream,
-        // so no later build starts after it (#1385).
+        // Only Lance's typed vector training refusal is a pending column.
+        // Return any other failure through the stream so observing it in lag
+        // order drops outstanding builds before the batch can be staged.
         let builds = items.iter().map(|(item, column, segments)| async move {
             let mut ds_clone = ds.clone();
             let columns = [column.as_str()];
-            if item.vector {
-                let _permit = limit.permit_for(IndexType::Vector).await?;
-                // Keep the index's partition count: the engine builds one
-                // partition, but a partitioned index (Lance's split, or an
-                // explicit build) keeps its shape across folds.
+            let kind = if item.vector {
+                IndexType::Vector
+            } else {
+                IndexType::BTree
+            };
+            let _permit = limit.permit_for(kind).await?;
+            let built = if item.vector {
+                // Keep the index's partition count across folds.
                 let partitions = Self::vector_partition_count(ds, &item.name, segments).await?;
                 let params =
                     lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
-                Ok::<_, OmniError>(
-                    ds_clone
-                        .create_index_builder(&columns, IndexType::Vector, &params)
-                        .name(item.name.clone())
-                        .replace(true)
-                        .execute_uncommitted()
-                        .await,
-                )
-            } else {
-                let _permit = limit.permit_for(IndexType::BTree).await?;
-                let params = ScalarIndexParams::default();
-                let _probe = crate::instrumentation::enter_index_build_probe().await;
                 ds_clone
-                    .create_index_builder(&columns, IndexType::BTree, &params)
+                    .create_index_builder(&columns, kind, &params)
                     .name(item.name.clone())
                     .replace(true)
                     .execute_uncommitted()
                     .await
-                    .map(Ok)
-                    .map_err(|error| {
-                        OmniError::storage_context(
-                            format!("stage_index_fold: fold index '{}' on '{column}'", item.name),
-                            error,
-                        )
-                    })
+            } else {
+                let params = ScalarIndexParams::default();
+                let _probe = crate::instrumentation::enter_index_build_probe().await;
+                ds_clone
+                    .create_index_builder(&columns, kind, &params)
+                    .name(item.name.clone())
+                    .replace(true)
+                    .execute_uncommitted()
+                    .await
+            };
+            match built {
+                Ok(index) => Ok(Ok(index)),
+                Err(error @ lance::Error::Unprocessable { .. }) if item.vector => {
+                    Ok(Err(error.to_string()))
+                }
+                Err(error) => Err(OmniError::storage_context(
+                    format!("stage_index_fold: fold index '{}' on '{column}'", item.name),
+                    error,
+                )),
             }
         });
         let built: Vec<_> = futures::stream::iter(builds.collect::<Vec<_>>())
@@ -3556,14 +3579,14 @@ impl TableStore {
         for ((item, column, segments), built) in items.into_iter().zip(built) {
             let new_idx = match built {
                 Ok(index) => index,
-                Err(error) => {
+                Err(reason) => {
                     tracing::warn!(
                         index = item.name.as_str(),
                         column = column.as_str(),
-                        error = %error,
+                        error = %reason,
                         "vector index fold skipped: the column cannot train an index"
                     );
-                    skipped.push((column, error.to_string()));
+                    skipped.push((column, reason));
                     continue;
                 }
             };
@@ -5091,23 +5114,33 @@ impl TableStore {
         Ok(plan)
     }
 
-    /// RFC 0067: plan ([`Self::plan_table_compaction`]) and execute Lance
-    /// compaction against a pinned base and stage the result as one `Rewrite`
-    /// transaction. The new fragments take ids above the base's high-water
-    /// mark, so the commit needs no `ReserveFragments` (whose replay would
-    /// not conflict with its twin). A stable-row-id rewrite carries every
-    /// index's coverage over to the new fragments when Lance applies it.
-    /// `None` when the plan has no task. Every task of a Blob table is sized
-    /// before any executes, so a sizing refusal leaves no rewritten file
-    /// behind. The tasks run side by side, each holding one permit of `limit`
-    /// ([`MaintenanceBudget`]), the run's budget of heavy steps.
+    /// RFC 0067: execute `plan` ([`Self::plan_table_compaction`]'s for `ds`)
+    /// against a pinned base and stage the result as one `Rewrite`
+    /// transaction. The caller plans once and hands that plan here, so the
+    /// plan a run measured against its ceilings is the one it executes; a
+    /// plan of another version is refused. The new fragments take ids above
+    /// the base's high-water mark, so the commit needs no `ReserveFragments`
+    /// (whose replay would not conflict with its twin). A stable-row-id
+    /// rewrite carries every index's coverage over to the new fragments when
+    /// Lance applies it. `None` when the plan has no task. Every task of a
+    /// Blob table is sized before any executes, so a sizing refusal leaves no
+    /// rewritten file behind. The tasks run side by side, each holding one
+    /// permit of `limit` ([`MaintenanceBudget`]), the run's budget of heavy
+    /// steps.
     pub async fn stage_compaction(
         &self,
         ds: &Dataset,
-        options: &CompactionOptions,
+        plan: CompactionPlan,
         limit: &MaintenanceBudget,
     ) -> Result<Option<StagedCompaction>> {
-        let plan = Self::plan_table_compaction(ds, options).await?;
+        if plan.read_version != ds.manifest.version {
+            return Err(OmniError::manifest_internal(format!(
+                "compaction of {} was planned at version {} and cannot be staged against version {}",
+                ds.uri(),
+                plan.read_version,
+                ds.manifest.version
+            )));
+        }
         Self::stage_compaction_plan(ds, plan, limit).await
     }
 
@@ -6109,9 +6142,8 @@ impl TableStore {
         // #1385: independent BTREE builds overlap under `limit`; a full-text
         // or vector build runs alone. Each builds from the same snapshot and
         // the results join the batch in specification order, so the batch is
-        // the one a serial loop builds. The first failure in that order ends
-        // the stream: no later build starts, and the builds in flight are
-        // dropped, leaving only unreferenced files, as any failed build does.
+        // the one a serial loop builds. Observing a build error in that order
+        // drops outstanding builds. Files they wrote remain unreferenced.
         let builds = specs.iter().map(|spec| async move {
             let (column, index_type) = spec.column_and_kind();
             let mut ds_clone = ds.clone();
@@ -6124,7 +6156,9 @@ impl TableStore {
                         ds_clone.create_index_builder(&columns, IndexType::BTree, &params);
                     // Same-snapshot builders cannot see each other's new
                     // default names; companions need explicit distinct names
-                    // even with Lance 11's sequential collision avoidance.
+                    // even with Lance 13's sequential collision avoidance,
+                    // which suffixes a default name only against the
+                    // committed indexes (`index/create.rs`).
                     if let Some(name) = name {
                         builder = builder.name(name.clone());
                     }
@@ -8242,10 +8276,12 @@ fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &
     Ok(())
 }
 
-/// Managed Blob bytes one compaction scanner batch may materialize: Lance 11
-/// rewrites a Blob table through a scanner that reads every managed payload of
-/// a batch, so `stage_compaction` sizes each task's batches against this, per
-/// row (a row sums its Blob columns; one over the budget is a one-row batch).
+/// Managed Blob bytes one compaction scanner batch may materialize: Lance 13
+/// never binary-copies a table with a Blob column
+/// (`can_use_binary_copy_current`) and rewrites it through a scanner whose
+/// every batch has its managed payloads read (`transform_blob_v2_batch`), so
+/// `stage_compaction` sizes each task's batches against this, per row (a row
+/// sums its Blob columns; one over the budget is a one-row batch).
 const COMPACTION_BLOB_BATCH_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 /// Most rows a Blob table's compaction batch may hold: Lance's own fallback
 /// default. `stage_compaction` always sets the derived size on a Blob table,

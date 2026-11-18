@@ -931,8 +931,8 @@ struct StageWriteProbeState {
 }
 
 impl StageWriteProbes {
-    /// Create a probe that releases each group after `release_after` staged
-    /// tables have entered the storage-call boundary.
+    /// Release the first `release_after` staged tables together once they
+    /// enter the storage-call boundary. Later calls pass through.
     pub fn rendezvous(release_after: usize) -> Self {
         assert!(release_after > 0, "stage-write rendezvous must be non-zero");
         Self {

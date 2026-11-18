@@ -67,36 +67,33 @@ moved; none reports a conflict for it. Lance compacts neighbouring fragments onl
 same indexes cover them, so a table whose index coverage was uneven before a run
 may coalesce fully only on the next run, after the rebuilt coverage is in place.
 
-Compacting a table with Blob properties reads each managed Blob value into
-memory. Optimize sizes each compaction batch from its largest row, whatever
-`LANCE_DEFAULT_BATCH_SIZE` says, so one batch holds at most 32 MiB of managed
-Blob payload; a larger row is read whole, external references are not read,
-and the writer's own copies come on top. A Blob descriptor the decoder rejects
-refuses the compaction before that table is rewritten. Optimize plans up to
-`OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables ahead (default 8) and rewrites up to
-that many at once, so budget for that many Blob tables compacting together.
+Optimize sizes each Blob batch from the table task's largest row, overriding
+`LANCE_DEFAULT_BATCH_SIZE`. A batch holds up to 32 MiB of managed payload or one larger row, plus writer copies.
+External Blobs stay unread. An invalid descriptor stops the rewrite of its table.
 
-One budget of that width bounds the heavy steps of a run across its tables:
-compaction tasks take one slot each (a Blob table's run one at a time), and
-index builds share it too. A BTREE build takes a quarter of the width,
-rounded up, so four run at once at the default width of 8, and fewer when the
-width is not a multiple of four (two at 5; three at 6, 7 or 9). A full-text
-or vector build takes the whole budget, so nothing else in the run runs
-beside it. A served run rewrites one table at a time, so its steps run
-one after another.
+Direct optimize plans and rewrites up to `OMNIGRAPH_MAINTENANCE_CONCURRENCY`
+tables at once (default 8). The run shares that many slots. Each compaction task
+uses one slot, with one task at a time per Blob table. Each BTREE build uses a
+quarter of the slots rounded up (four builds at width 8, two at width 5).
+Full-text and vector builds use all slots. Served optimize uses one slot.
 
 ### Bounding a run
 
-Writes to `main` wait while optimize holds its writer gates. A run given
-`--max-gate-hold 30s` starts no table after that long except the first: the
-rest are `deferred`, finished tables publish, and a writer waits at most the
-bound plus the tables already rewriting, whose full-text and vector builds run
-one at a time. Tables run in type-key order; `resume_at` names the first
-deferred one, and `--tables` runs only the listed tables, in order. Each
-table's `outcome` is `optimized`, `unchanged`, `deferred` or `failed` (with
-its `error`; the other tables still publish). The report adds `input_commit`,
-`graph_commit_id`, `gate_hold_ms` and the `configuration_clear` and `artifact`
-outcomes, which never fail a published run.
+With `--max-gate-hold 30s`, the first table always runs. After the deadline, writers
+wait for tables already started, graph publication and configuration clear.
+Remaining tables are deferred. Direct runs visit tables in type-key order. Copy
+the printed `--start-at` argument to resume there and wrap around. JSON returns
+that key in `resume_at`. A [server](recorded-operations.md) remembers its position.
+Use `--datasets` to visit only the listed tables, in order.
+
+Check each table's `outcome` even on exit 0. It can be `optimized`, `unchanged`,
+`deferred` or `failed`. A failed table includes its `error`. Other tables still publish.
+If index maintenance or its coverage check fails after a rewrite or index build,
+completed work publishes as `optimized` with `reason: index_failed` and the error.
+The direct report keeps any indexes already identified as pending in `pending_indexes`.
+The next run checks coverage and plans remaining work. The report includes
+`input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
+and `artifact` outcomes. Neither of those last two can fail a published run.
 
 A served run also applies the server's
 [table ceilings and byte budget](recorded-operations.md#table-ceilings-and-the-byte-budget).
@@ -128,6 +125,7 @@ omnigraph index build --target ./cluster-root --graph knowledge \
   --branch review --json
 ```
 
+Up to four BTREEs build together across tables. A full-text or vector build runs alone.
 On any branch, `index build` builds every declared index a table lacks, such as
 those of a type whose first rows were loaded there, and rebuilds whole each
 BTREE or vector index that leaves rows uncovered. Every table publishes in one
@@ -137,7 +135,9 @@ As with optimize, a write that lands on a table while its batch is staged fails
 the run with a read-set conflict; run the command again. A vector property with
 no vectors yet and full-text coverage stay pending: only `index rebuild --kind
 full-text` refreshes a full-text index's coverage, and queries match uncovered
-rows with the index's analyzer meanwhile.
+rows with the index's analyzer meanwhile. Pending covers only a vector
+property with nothing to train on; a rebuild that fails for any other reason,
+a storage failure for one, fails the command.
 
 JSON reports `branch`, `graph_commit_id` (null for a no-op), `indexes` with each
 `type_key`, `property` (the indexed column, `__id` for the identity index),

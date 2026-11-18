@@ -469,8 +469,8 @@ async fn maintain_indices_for_branch(
             }
         }
     });
-    // The first failure in target order ends the stream, so no later table
-    // starts staging after it.
+    // Observe failures in target order. Dropping the stream on error cancels
+    // outstanding staging; no target has published.
     let staged_by_target: Vec<Option<StagedTarget>> =
         futures::stream::iter(staging.collect::<Vec<_>>())
             .buffered(limit.width())
@@ -750,6 +750,11 @@ fn full_text_columns(specs: &[crate::storage_layer::IndexBuildSpec]) -> Vec<&str
         .collect()
 }
 
+decide_seam! {
+    /// The metadata read used to report pending full-text coverage.
+    pub static FULL_TEXT_COVERAGE_READ = ("index.full_text_coverage_read", Unreachable, [Fail]);
+}
+
 /// Full-text coverage index maintenance leaves to the explicit rebuild: a
 /// full-text index whose segments leave a current fragment uncovered, or
 /// whose coverage is unknown. It is observable status, never folded
@@ -767,6 +772,7 @@ pub(super) async fn append_deferred_full_text_indexes(
 ) -> Result<()> {
     use lance::index::DatasetIndexInternalExt;
 
+    fail(&FULL_TEXT_COVERAGE_READ)?;
     let ds = snapshot.dataset();
     let indices = ds.load_indices().await.map_err(OmniError::storage)?;
     let full_text: std::collections::BTreeMap<_, _> = indices
