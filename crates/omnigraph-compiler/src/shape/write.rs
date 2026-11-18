@@ -137,6 +137,9 @@ pub struct WriteShape {
     /// The groups' selection reads, each run once against the write's
     /// snapshot.
     pub selections: Vec<ReadShape>,
+    /// The core read of each selection, at the same index: what plan
+    /// acceptance derives the placement of its conjuncts from.
+    pub selection_reads: Vec<CoreRead>,
 }
 
 /// A term of the break that this release does not lower, at `construct`.
@@ -150,6 +153,7 @@ impl WriteShape {
         let name = write.name.as_str();
         let mut ops = Vec::new();
         let mut selections = Vec::new();
+        let mut selection_reads = Vec::new();
         // The tables the groups before the current one write.
         let mut written = BTreeSet::new();
         for (g, group) in write.groups.iter().enumerate() {
@@ -169,8 +173,9 @@ impl WriteShape {
                         ));
                     }
                     let index = selections.len();
-                    let (query, group_ops) = lower_selected(write, g, group, index, catalog)?;
+                    let (core, query, group_ops) = lower_selected(write, g, group, index, catalog)?;
                     selections.push(query);
+                    selection_reads.push(core);
                     ops.extend(group_ops);
                 }
             }
@@ -200,6 +205,7 @@ impl WriteShape {
                 .collect(),
             ops,
             selections,
+            selection_reads,
         })
     }
 }
@@ -227,7 +233,7 @@ fn staged(group: &WriteGroup) -> Option<Staged> {
     let (var, conjuncts) = loop {
         match term {
             Term::Unit if conjuncts.is_empty() => return Some(Staged::Unit),
-            Term::Filter { input, pred } => {
+            Term::Filter { input, pred, .. } => {
                 conjuncts.push(pred.clone());
                 term = input;
             }
@@ -388,7 +394,7 @@ fn lower_selected(
     group: &WriteGroup,
     read: usize,
     catalog: &Catalog,
-) -> Result<(ReadShape, Vec<WriteOp>)> {
+) -> Result<(CoreRead, ReadShape, Vec<WriteOp>)> {
     let name = write.name.as_str();
     let mut items: Vec<IRExpr> = Vec::new();
     let mut column = |e: IRExpr| match items.iter().position(|item| *item == e) {
@@ -490,7 +496,9 @@ fn lower_selected(
         .map(|(i, e)| (format!("w{i}"), IRExpr::AliasRef(hidden(i), e.ty().clone())))
         .collect();
     let term = Term::Project {
+        fails: false,
         input: Term::Project {
+            fails: items.iter().any(IRExpr::can_fail),
             input: group.input.clone().boxed(),
             items: items
                 .into_iter()
@@ -521,7 +529,7 @@ fn lower_selected(
         }
         other => other,
     })?;
-    Ok((shape, ops))
+    Ok((core, shape, ops))
 }
 
 fn blob_property(catalog: &Catalog, target: &MutationTarget, property: &str) -> bool {

@@ -196,7 +196,7 @@ fn fold_pipeline(
                     *filter = fold_expr(filter, params)?;
                 }
             }
-            PatternStep::Filter(filter) => *filter = fold_expr(filter, params)?,
+            PatternStep::Filter { pred: filter, .. } => *filter = fold_expr(filter, params)?,
             PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
                 fold_pipeline(inner, declared, params)?
             }

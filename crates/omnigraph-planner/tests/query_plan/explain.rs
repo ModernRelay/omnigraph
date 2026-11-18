@@ -186,6 +186,7 @@ fn physical_anti_join_predicate_reads_back_equal() {
         vec![
             scan("a"),
             PatternStep::AntiJoin {
+                fails: false,
                 outer_var: "a".to_string(),
                 inner: vec![expand("a", "x", vec![])],
                 predicate: predicate.clone(),

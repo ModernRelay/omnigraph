@@ -538,6 +538,9 @@ pub enum LogicalNode {
     Filter {
         input: LogicalId,
         conjuncts: Vec<IRExpr>,
+        /// A conjunct can fail where it is evaluated (the type checker's
+        /// flag, A3): the node keeps its place and nothing moves below it.
+        fails: bool,
     },
     /// The query's return expressions and their typed column demand.
     Projection {
@@ -611,6 +614,8 @@ pub enum LogicalNode {
         inner: LogicalId,
         outer_var: String,
         predicate: SubqueryPredicate,
+        /// The block can fail where it is evaluated (A3).
+        fails: bool,
     },
     /// `optional { … }`: every input row with each of its matches in the
     /// inner tree, whose leaf is an `OuterReference` to those same rows, and
@@ -619,6 +624,8 @@ pub enum LogicalNode {
         input: LogicalId,
         inner: LogicalId,
         outer_var: String,
+        /// The pattern can fail where it is evaluated (A3).
+        fails: bool,
     },
     /// `from` an inline read with its own aggregate, `distinct`, `order` or
     /// `limit`: the read's pattern is the `inner` tree and `read` what it
@@ -636,6 +643,8 @@ pub enum LogicalNode {
         read: Box<crate::read_shape::InnerRead>,
         tiebreak: Vec<ColumnRef>,
         reads: Vec<ColumnRef>,
+        /// The read can fail where it is evaluated (A3).
+        fails: bool,
     },
     /// `from union(a, b)`: every row of `left` and every row of `right`, a
     /// bag; each arm binds the reference columns `bindings`, and only their
@@ -856,6 +865,82 @@ impl LogicalNode {
             | Self::OuterReference { .. }
             | Self::CsvSource { .. }
             | Self::DeltaSource { .. } => Vec::new(),
+        }
+    }
+}
+
+impl LogicalNode {
+    /// What the node declares to the placement law
+    /// ([`crate::placement`]): whether it can fail, the group key it
+    /// selects rows within, the inputs a conjunct may move into, and the
+    /// binding a scan absorbs a conjunct of. Every kind states its own; the
+    /// law reads only this, never the kind.
+    pub(crate) fn declares(&self) -> crate::placement::Declared<LogicalId> {
+        use crate::placement::Declared;
+        match self {
+            // A scan reads its binding's rows: a conjunct over that binding
+            // alone runs in it. A dependent scan finds one row for each of
+            // its input's, which a conjunct over the input may filter first.
+            Self::TableScan { input, spec } => Declared {
+                absorbs: spec.binding.clone(),
+                ..Declared::passing(input.iter().copied())
+            },
+            Self::Filter { input, fails, .. } => Declared {
+                fails: *fails,
+                ..Declared::passing([*input])
+            },
+            // A row of the input reaches the output with its columns, once
+            // or once per match.
+            Self::Expand { input, .. } | Self::Ordered { input, .. } => Declared::passing([*input]),
+            Self::CrossJoin { left, right } => Declared::passing([*left, *right]),
+            // A semi-join, an outer join and a correlated read each keep
+            // every column of an input row; their inner patterns are scopes
+            // of their own. One that can fail runs on every input row.
+            Self::AntiJoin { input, fails, .. } | Self::OptionalJoin { input, fails, .. } => {
+                Declared {
+                    fails: *fails,
+                    ..Declared::passing([*input])
+                }
+            }
+            Self::Correlate { input, fails, .. } => Declared {
+                fails: *fails,
+                ..Declared::passing(input.iter().copied())
+            },
+            // The plan holds a `let` only for a value that can fail.
+            Self::Let { input, .. } => Declared {
+                fails: true,
+                ..Declared::passing([*input])
+            },
+            // A sort only orders its rows; with a fetch it keeps the first
+            // ones of the whole relation.
+            Self::Sort { input, fetch, .. } => match fetch {
+                None => Declared::passing([*input]),
+                Some(_) => Declared::selecting_all(*input),
+            },
+            // Each selects rows over the whole relation: a `limit`, a page,
+            // a window's cut, a nearest-neighbour search and a score, whose
+            // rows are a ranking's population.
+            Self::Limit { input, .. }
+            | Self::Page { input, .. }
+            | Self::TargetCut { input, .. }
+            | Self::Nearest { input, .. }
+            | Self::Score { input, .. } => Declared::selecting_all(*input),
+            // Each makes rows of its own: groups, a projection, a union's or
+            // a fusion's arms, a scope's outer rows, a load's or a diff's
+            // rows. No conjunct moves into one.
+            Self::Projection { .. }
+            | Self::Aggregate { .. }
+            | Self::Union { .. }
+            | Self::Fuse { .. }
+            | Self::OuterReference { .. }
+            | Self::MetadataCount { .. }
+            | Self::Join { .. }
+            | Self::RowDiff { .. }
+            | Self::MergeClassify { .. }
+            | Self::CsvSource { .. }
+            | Self::DeltaSource { .. }
+            | Self::Validate { .. }
+            | Self::FragmentWrite { .. } => Declared::passing([]),
         }
     }
 }

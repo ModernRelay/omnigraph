@@ -678,6 +678,7 @@ fn unnamed_score(r: Rel) -> Rel {
                 })
                 .collect(),
             keep: false,
+            fails: false,
         },
         ty: RelTy { cols },
         shaped,
@@ -1310,10 +1311,6 @@ struct Scope {
     steps: Vec<(usize, Step)>,
     /// Binder count so far.
     binders: usize,
-    /// The binder position after the scope's last `let` whose value can
-    /// fail: no filter is placed below it, so `where` removes rows only after
-    /// the value ran on every row the elements before it produced (A3).
-    fence: usize,
     /// Lookahead: the type every binding of this scope declares.
     declared: HashMap<String, BoundVariable>,
     declared_nodes: HashSet<String>,
@@ -1322,9 +1319,6 @@ struct Scope {
     future: HashSet<String>,
     /// Block aggregates produced while typing the current expression.
     block_buf: Vec<BlockAgg>,
-    /// A conjunct of the scope's `where` that can fail was placed: it and
-    /// every conjunct after it run after the scope's elements (A3).
-    failing_where: bool,
     /// The guards around the expression being typed, each typed once where
     /// it is written: an operand of `and`, `or`, `if` or `coalesce` is
     /// evaluated only where these hold (A3), so a block under them that can
@@ -1394,12 +1388,10 @@ impl Scope {
             bound_at: HashMap::new(),
             steps: Vec::new(),
             binders: 0,
-            fence: 0,
             declared: HashMap::new(),
             declared_nodes: HashSet::new(),
             future: HashSet::new(),
             block_buf: Vec::new(),
-            failing_where: false,
             guards: Vec::new(),
             pending: Vec::new(),
             inner,
@@ -1512,17 +1504,6 @@ impl Scope {
     /// Any name in scope: a column, a parameter or a named relation.
     fn in_scope(&self, name: &str) -> bool {
         self.is_bound(name) || self.params.contains_key(name) || self.rels.contains_key(name)
-    }
-
-    /// The step index after which a value naming `vars` may be placed: the
-    /// last binder of a local variable, or before every binder, and never
-    /// below a `let` whose value can fail.
-    fn position(&self, vars: &[String]) -> usize {
-        vars.iter()
-            .filter_map(|v| self.bound_at.get(v).map(|i| i + 1))
-            .max()
-            .unwrap_or(0)
-            .max(self.fence)
     }
 
     fn push_binder(&mut self, step: Step, binds: &[Col]) {
@@ -2328,6 +2309,7 @@ impl Ctx<'_> {
             if !post_items.is_empty() {
                 term = Term::Project {
                     input: term.boxed(),
+                    fails: post_items.iter().any(|(_, e)| e.can_fail()),
                     items: post_items,
                     keep: true,
                 };
@@ -2381,6 +2363,7 @@ impl Ctx<'_> {
             }
             term = Term::Project {
                 input: term.boxed(),
+                fails: ext.iter().any(|(_, e)| e.can_fail),
                 items: ext.into_iter().map(|(n, e)| (n, e.to_ir())).collect(),
                 keep: true,
             };
@@ -2435,6 +2418,7 @@ impl Ctx<'_> {
                 })
                 .collect(),
             keep: false,
+            fails: false,
         };
         let ordered_ranked = if body.order.is_empty() {
             None
@@ -2474,7 +2458,7 @@ impl Ctx<'_> {
         post: &mut Vec<(String, SExpr)>,
     ) -> R<()> {
         if let Some(agg) = self.aggregate(sc, &p.expr)? {
-            aggs.push((self.item(&name), agg));
+            aggs.push((self.item(name), agg));
             items.push(None);
         } else if contains_agg(&p.expr) {
             // An expression over aggregates (`count($p) > 3 as big`): the
@@ -2496,7 +2480,7 @@ impl Ctx<'_> {
                 ));
             }
             aggs.extend(hidden);
-            post.push((self.item(&name), e));
+            post.push((self.item(name), e));
             items.push(None);
         } else {
             let e = self.expr(sc, &p.expr, At::Value)?;
@@ -2513,7 +2497,7 @@ impl Ctx<'_> {
                     "a comparison in return needs an alias; write `… as <name>`",
                 ));
             }
-            items.push(Some((self.item(&name), e)));
+            items.push(Some((self.item(name), e)));
         }
         Ok(())
     }
@@ -2875,7 +2859,10 @@ impl Ctx<'_> {
                 sc.pending.push(p);
                 continue;
             }
-            let at = sc.position(&vars);
+            // A conjunct is written after every element of its scope, and
+            // there it stays: the planner's placement law moves the ones
+            // that may move (A3).
+            let at = sc.binders;
             match p {
                 Pending::Filter(e, before, written) => {
                     // An error in a scope that does not recover abandons it, so
@@ -2899,19 +2886,6 @@ impl Ctx<'_> {
                             continue;
                         };
                         let blocks = std::mem::take(&mut sc.block_buf);
-                        // A3: the conjuncts before the first one that can
-                        // fail may be placed below later elements; that one
-                        // and every one after it run after the scope's
-                        // elements, in written order.
-                        let fails = pred.can_fail || blocks.iter().any(|b| b.inner.can_fail());
-                        if fails {
-                            sc.failing_where = true;
-                        }
-                        let at = if sc.failing_where {
-                            at.max(sc.binders)
-                        } else {
-                            at
-                        };
                         sc.push_filter(at, Step::Filter { blocks, pred });
                     }
                     sc.block_visible = None;
@@ -3337,9 +3311,6 @@ impl Ctx<'_> {
                 ty: c.ty.with_nullable(true),
             })
             .collect();
-        // An `optional` that can fail runs on every outer row: no conjunct of
-        // `where` is placed below it (A3).
-        let fails = term.can_fail();
         sc.push_binder(
             Step::Optional {
                 inner: term,
@@ -3348,9 +3319,6 @@ impl Ctx<'_> {
             },
             &nullable,
         );
-        if fails {
-            sc.fence = sc.binders;
-        }
         Ok(())
     }
 
@@ -3382,9 +3350,6 @@ impl Ctx<'_> {
         let v = self.expr(sc, e, At::Value)?;
         let blocks = std::mem::take(&mut sc.block_buf);
         let ty = v.ty.clone();
-        if v.can_fail {
-            sc.fence = sc.binders + 1;
-        }
         sc.push_binder(
             Step::Let {
                 blocks,
@@ -3430,13 +3395,7 @@ impl Ctx<'_> {
             sc.col(f);
         }
         let cols = r.ty.cols.clone();
-        // A drawn relation that can fail runs on every row the elements
-        // before it produce: no conjunct of `where` is placed below it (A3).
-        let fails = r.term.can_fail();
         sc.push_binder(Step::Leaf(r.term), &cols);
-        if fails {
-            sc.fence = sc.binders;
-        }
         Ok(())
     }
 
@@ -6020,6 +5979,7 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
         None => t,
         Some(a) => Term::Correlate {
             outer: a.boxed(),
+            fails: t.can_fail(),
             inner: t.boxed(),
         },
     };
@@ -6075,10 +6035,14 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
                         Ty::scalar(ScalarType::Bool, false),
                     )
                     .to_ir(),
+                    fails: false,
                 },
             }
         }
         Step::Filter { blocks, pred } => {
+            // The conjunct can fail where its predicate or a block it reads
+            // can: the one computation of it the planner reads (A3).
+            let fails = pred.can_fail || blocks.iter().any(BlockAgg::can_fail);
             let t = with_blocks(acc.unwrap_or(Term::Unit), blocks);
             if matches!(pred.kind, SKind::Lit(Literal::Bool(true))) {
                 return t;
@@ -6086,6 +6050,7 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
             Term::Filter {
                 input: t.boxed(),
                 pred: pred.to_ir(),
+                fails,
             }
         }
         Step::Let {
@@ -6096,6 +6061,7 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
             let t = with_blocks(acc.unwrap_or(Term::Unit), blocks);
             Term::Project {
                 input: t.boxed(),
+                fails: value.can_fail,
                 items: vec![(name, value.to_ir())],
                 keep: true,
             }
@@ -6119,6 +6085,7 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
             let unmatched = Term::Filter {
                 input: Term::Correlate {
                     outer: row.boxed(),
+                    fails: inner.can_fail(),
                     inner: Term::Group {
                         input: inner.clone().boxed(),
                         keys: Vec::new(),
@@ -6128,6 +6095,7 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
                 }
                 .boxed(),
                 pred: not_exists(&col).to_ir(),
+                fails: false,
             };
             // The arms of a `Union` match by name, so the unmatched row
             // holds every column `p` holds, in `p`'s order: the outer
@@ -6155,6 +6123,7 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
                         input: unmatched.boxed(),
                         items,
                         keep: false,
+                        fails: false,
                     }
                     .boxed(),
                 },
@@ -6175,6 +6144,12 @@ struct BlockAgg {
 }
 
 impl BlockAgg {
+    /// The block can fail where it is evaluated: its inner term or its
+    /// aggregate's argument.
+    fn can_fail(&self) -> bool {
+        self.inner.can_fail() || self.agg.arg.as_ref().is_some_and(IRExpr::can_fail)
+    }
+
     /// The nodes [`with_blocks`] adds for the block: `Correlate` and
     /// `Group` over its inner term, and for a guarded block the guard's
     /// `Project` and the inner `Filter` on it.
@@ -6201,20 +6176,22 @@ fn with_blocks(mut t: Term, blocks: Vec<BlockAgg>) -> Term {
             Some((name, guard)) => {
                 t = Term::Project {
                     input: t.boxed(),
+                    fails: guard.can_fail,
                     items: vec![(name.clone(), guard.to_ir())],
                     keep: true,
                 };
                 condition_env(inner, &name)
             }
         };
+        let inner = Term::Group {
+            input: inner.boxed(),
+            keys: Vec::new(),
+            aggs: vec![(col, agg)],
+        };
         t = Term::Correlate {
             outer: t.boxed(),
-            inner: Term::Group {
-                input: inner.boxed(),
-                keys: Vec::new(),
-                aggs: vec![(col, agg)],
-            }
-            .boxed(),
+            fails: inner.can_fail(),
+            inner: inner.boxed(),
         };
     }
     t
@@ -6235,6 +6212,7 @@ fn condition_env(t: Term, guard: &str) -> Term {
             Term::Filter {
                 input: Term::Env(cols).boxed(),
                 pred: SExpr::new(SKind::Col(guard.to_string()), boolean).to_ir(),
+                fails: false,
             }
         }
         Term::Expand {
@@ -6258,23 +6236,35 @@ fn condition_env(t: Term, guard: &str) -> Term {
             max_hops,
             edge_var,
         },
-        Term::Filter { input, pred } => Term::Filter {
+        Term::Filter { input, pred, fails } => Term::Filter {
             input: step(input),
             pred,
+            fails,
         },
-        Term::Project { input, items, keep } => Term::Project {
+        Term::Project {
+            input,
+            items,
+            keep,
+            fails,
+        } => Term::Project {
             input: step(input),
             items,
             keep,
+            fails,
         },
         Term::Group { input, keys, aggs } => Term::Group {
             input: step(input),
             keys,
             aggs,
         },
-        Term::Correlate { outer, inner } => Term::Correlate {
+        Term::Correlate {
+            outer,
+            inner,
+            fails,
+        } => Term::Correlate {
             outer: step(outer),
             inner,
+            fails,
         },
         Term::Order { input, keys } => Term::Order {
             input: step(input),
@@ -6377,7 +6367,9 @@ fn column_type(t: &Term, name: &str) -> Option<ExprType> {
         Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
             column_type(input, name)
         }
-        Term::Project { input, items, keep } => match items.iter().find(|(n, _)| n == name) {
+        Term::Project {
+            input, items, keep, ..
+        } => match items.iter().find(|(n, _)| n == name) {
             Some((_, e)) => Some(e.ty().clone()),
             None if *keep => column_type(input, name),
             None => None,
@@ -6391,7 +6383,7 @@ fn column_type(t: &Term, name: &str) -> Option<ExprType> {
                     .find(|(n, _)| n == name)
                     .map(|(_, a)| a.ty.expr_type())
             }),
-        Term::Correlate { outer, inner } => {
+        Term::Correlate { outer, inner, .. } => {
             column_type(outer, name).or_else(|| column_type(inner, name))
         }
         Term::Union { left, .. } => column_type(left, name),
@@ -6480,7 +6472,9 @@ fn output_columns(t: &Term) -> Vec<String> {
         Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
             output_columns(input)
         }
-        Term::Project { input, items, keep } => {
+        Term::Project {
+            input, items, keep, ..
+        } => {
             let mut v = if *keep {
                 output_columns(input)
             } else {
@@ -6494,7 +6488,7 @@ fn output_columns(t: &Term) -> Vec<String> {
             .map(|(n, _)| n.clone())
             .chain(aggs.iter().map(|(n, _)| n.clone()))
             .collect(),
-        Term::Correlate { outer, inner } => {
+        Term::Correlate { outer, inner, .. } => {
             let mut v = output_columns(outer);
             for c in output_columns(inner) {
                 if !v.contains(&c) {
@@ -6632,7 +6626,7 @@ fn depends(t: &Term, name: &str) -> bool {
         | Term::Cut { input, .. }
         | Term::Score { input, .. }
         | Term::ApproxTopK { input, .. } => depends(input, name),
-        Term::Correlate { outer, inner } => depends(outer, name) || depends(inner, name),
+        Term::Correlate { outer, inner, .. } => depends(outer, name) || depends(inner, name),
         Term::Union { left, right } => depends(left, name) || depends(right, name),
         Term::Fuse { arms, .. } => arms.iter().any(|a| depends(a, name)),
         Term::Fix { body, .. } | Term::Call { body, .. } => depends(body, name),
@@ -6662,7 +6656,7 @@ impl Walk<'_> {
             Term::RecRef { .. } => HashSet::new(),
             Term::Unit | Term::Env(_) | Term::Scan { .. } => HashSet::new(),
             Term::Expand { input, .. } => self.term(input)?,
-            Term::Filter { input, pred } => {
+            Term::Filter { input, pred, .. } => {
                 let c = self.term(input)?;
                 if depends(input, self.name) {
                     let mut cols = Vec::new();
@@ -6757,7 +6751,7 @@ impl Walk<'_> {
                 }
                 c
             }
-            Term::Correlate { outer, inner } => {
+            Term::Correlate { outer, inner, .. } => {
                 let mut c = self.term(outer)?;
                 if let Term::Group { input, keys, aggs } = inner.as_ref()
                     && depends(input, self.name)
@@ -6845,7 +6839,7 @@ fn call_chain(t: &Term, out: &mut Vec<String>) {
         | Term::Cut { input, .. }
         | Term::Score { input, .. }
         | Term::ApproxTopK { input, .. } => call_chain(input, out),
-        Term::Correlate { outer, inner } => {
+        Term::Correlate { outer, inner, .. } => {
             call_chain(outer, out);
             call_chain(inner, out);
         }

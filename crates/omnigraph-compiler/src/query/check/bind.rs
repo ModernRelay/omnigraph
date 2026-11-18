@@ -140,12 +140,14 @@ impl Binder<'_> {
                 }
                 scope
             }
-            Term::Filter { input, pred } => {
+            Term::Filter { input, pred, .. } => {
                 let scope = self.term(input, outer)?;
                 *pred = self.expr(pred, &scope)?;
                 scope
             }
-            Term::Project { input, items, keep } => {
+            Term::Project {
+                input, items, keep, ..
+            } => {
                 let scope = self.term(input, outer)?;
                 for (_, e) in items.iter_mut() {
                     *e = self.expr(e, &scope)?;
@@ -191,7 +193,9 @@ impl Binder<'_> {
                 *query = self.expr(query, &scope)?;
                 scope
             }
-            Term::Correlate { outer: left, inner } => {
+            Term::Correlate {
+                outer: left, inner, ..
+            } => {
                 let scope = self.term(left, outer)?;
                 let joined = self.term(inner, &scope)?;
                 merge(scope, joined)

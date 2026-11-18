@@ -501,7 +501,7 @@ fn resolve_pipeline(
                     },
                     schema.clone(),
                 );
-                let filtered = filter_over(plan, scan, filters, schema.clone());
+                let filtered = filter_over(plan, scan, filters, false, schema.clone());
                 match current {
                     None => filtered,
                     Some(left) => {
@@ -521,10 +521,13 @@ fn resolve_pipeline(
                     }
                 }
             }
-            PatternStep::Filter(filter) => {
+            PatternStep::Filter {
+                pred: filter,
+                fails,
+            } => {
                 let input = bound(current, "filter")?;
                 let schema = schema_of(plan, input)?;
-                filter_over(plan, input, std::slice::from_ref(filter), schema)
+                filter_over(plan, input, std::slice::from_ref(filter), *fails, schema)
             }
             PatternStep::Expand {
                 src_var,
@@ -579,7 +582,7 @@ fn resolve_pipeline(
                     },
                     schema.clone(),
                 );
-                filter_over(plan, destination, dst_filters, schema)
+                filter_over(plan, destination, dst_filters, false, schema)
             }
             PatternStep::Rank {
                 key,
@@ -676,6 +679,7 @@ fn resolve_pipeline(
                 outer_var,
                 inner,
                 predicate,
+                fails,
             } => {
                 let input = bound(current, "anti-join")?;
                 let schema = schema_of(plan, input)?;
@@ -692,6 +696,7 @@ fn resolve_pipeline(
                         inner,
                         outer_var: outer_var.clone(),
                         predicate: predicate.clone(),
+                        fails: *fails,
                     },
                     schema,
                 )
@@ -758,6 +763,7 @@ fn resolve_pipeline(
                 outer_var,
                 inner,
                 read,
+                fails,
             } => {
                 let seed = match outer_var {
                     Some(outer_var) => {
@@ -788,6 +794,7 @@ fn resolve_pipeline(
                         read: Box::new(read.clone()),
                         tiebreak,
                         reads,
+                        fails: *fails,
                     },
                     schema,
                 );
@@ -840,7 +847,11 @@ fn resolve_pipeline(
                     schema,
                 )
             }
-            PatternStep::Optional { outer_var, inner } => {
+            PatternStep::Optional {
+                outer_var,
+                inner,
+                fails,
+            } => {
                 let input = bound(current, "optional")?;
                 let schema = schema_of(plan, input)?;
                 let outer = plan.add(
@@ -856,6 +867,7 @@ fn resolve_pipeline(
                         input,
                         inner,
                         outer_var: outer_var.clone(),
+                        fails: *fails,
                     },
                     joined,
                 )
@@ -982,6 +994,7 @@ fn filter_over(
     plan: &mut LogicalPlan,
     input: LogicalId,
     filters: &[IRExpr],
+    fails: bool,
     schema: SchemaRef,
 ) -> LogicalId {
     let mut conjuncts: Vec<IRExpr> = Vec::new();
@@ -993,7 +1006,14 @@ fn filter_over(
     if conjuncts.is_empty() {
         input
     } else {
-        plan.add(LogicalNode::Filter { input, conjuncts }, schema)
+        plan.add(
+            LogicalNode::Filter {
+                input,
+                conjuncts,
+                fails,
+            },
+            schema,
+        )
     }
 }
 
@@ -1524,28 +1544,6 @@ impl TieColumns {
     }
 }
 
-/// Bindings visible to a filter, excluding correlated inner scopes.
-fn scope_bindings(plan: &LogicalPlan, id: LogicalId) -> Vec<String> {
-    let mut bindings = BTreeSet::new();
-    for node in visible_scope(plan, id) {
-        match node {
-            LogicalNode::TableScan { spec, .. } => bindings.extend(spec.binding.iter().cloned()),
-            LogicalNode::Expand {
-                dst, edge_binding, ..
-            } => {
-                bindings.insert(dst.clone());
-                bindings.extend(edge_binding.iter().cloned());
-            }
-            _ => {}
-        }
-    }
-    let hidden = correlated_hidden(plan, id);
-    bindings
-        .into_iter()
-        .filter(|binding| !hidden.contains(binding))
-        .collect()
-}
-
 /// The metadata columns a sort appends after `keys` so its order is total;
 /// none for group rows, when every returned expression is a key (equal rows
 /// are indistinguishable), or for an individual column already used as a key.
@@ -1872,7 +1870,7 @@ pub(crate) fn rewrite_with(
             PassId::Resolve => true,
             PassId::PredicatePushdown => {
                 if query {
-                    place_query_filters(plan, source, tracer)
+                    crate::placement::place_conjuncts(plan, source, tracer)
                 } else {
                     resume_pushdown(plan)
                 }
@@ -2033,10 +2031,13 @@ fn key_set_trees(
 ) -> Result<HashMap<LogicalId, KeySetTree>, PlanError> {
     let mut trees = HashMap::new();
     for (id, node) in plan.live() {
+        // A block that can fail stays correlated (`key_set_tree`); the
+        // type checker's flag says which.
         if let LogicalNode::AntiJoin {
             inner,
             outer_var,
             predicate,
+            fails: false,
             ..
         } = node
             && let Some(tree) = key_set_tree(plan, *inner, outer_var, predicate, source)?
@@ -2120,295 +2121,6 @@ fn and_filter(existing: Option<Predicate>, added: Predicate) -> Predicate {
         Some(existing) => existing.and(added),
         None => added,
     }
-}
-
-/// Stage 1, pass 2 on a query plan, per scope (the top-level tree and each
-/// `not { … }` inner tree): adjacent `Filter` nodes coalesce, each conjunct moves
-/// into its `placement_target` scan or onto its `join_target`, an emptied node goes.
-fn place_query_filters(
-    plan: &mut LogicalPlan,
-    source: &dyn PlanSource,
-    tracer: &mut Tracer,
-) -> bool {
-    let mut fired = false;
-    let mut scopes = vec![plan.root()];
-    while let Some(root) = scopes.pop() {
-        let mut filters = Vec::new();
-        let mut scans: HashMap<String, LogicalId> = HashMap::new();
-        let mut dependent_scans: HashMap<String, LogicalId> = HashMap::new();
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            match plan.node(id) {
-                Some(LogicalNode::Filter { input, .. }) => {
-                    filters.push(id);
-                    stack.push(*input);
-                }
-                Some(LogicalNode::TableScan { input, spec }) => {
-                    if let Some(binding) = &spec.binding
-                        && !spec.table.is_catalogue()
-                    {
-                        if input.is_some() {
-                            dependent_scans.insert(binding.clone(), id);
-                        } else {
-                            scans.insert(binding.clone(), id);
-                        }
-                    }
-                    stack.extend(*input);
-                }
-                // An `optional`'s inner tree is a scope of its own: a filter
-                // written after it never moves into it, where it would keep
-                // the outer row with nulls instead of dropping it.
-                // One whose inner tree can fail runs on every outer row: no
-                // filter written after it moves below it (A3).
-                Some(
-                    LogicalNode::AntiJoin { input, inner, .. }
-                    | LogicalNode::OptionalJoin { input, inner, .. },
-                ) => {
-                    scopes.push(*inner);
-                    if subtree_can_fail(plan, *inner) {
-                        scopes.push(*input);
-                    } else {
-                        stack.push(*input);
-                    }
-                }
-                // A correlated read's pattern is a scope of its own: a filter
-                // written after it never moves below its group or cut, nor
-                // below its input when its pattern can fail.
-                Some(LogicalNode::Correlate { input, inner, .. }) => {
-                    scopes.push(*inner);
-                    if subtree_can_fail(plan, *inner) {
-                        scopes.extend(*input);
-                    } else {
-                        stack.extend(*input);
-                    }
-                }
-                // Each arm of a union binds the union's names: a filter
-                // written after it stays above it, and each arm's own
-                // filters are its own scope's.
-                Some(LogicalNode::Union { left, right, .. }) => {
-                    scopes.push(*left);
-                    scopes.push(*right);
-                }
-                // A window is a cut: no filter written after it moves below
-                // it, where it would decide which targets the window selects
-                // (law 2). The window's population is a scope of its own.
-                Some(LogicalNode::TargetCut { input, .. }) => scopes.push(*input),
-                // A fusion ranks each arm's targets: a filter written after
-                // it moves into no arm, where it would change the arm's
-                // ranks, and each arm's own filters are its own scope's.
-                Some(LogicalNode::Fuse { arms, .. }) => {
-                    scopes.extend(arms.iter().map(|arm| arm.input));
-                }
-                // A score's column exists only above it: a filter written
-                // after it stays above it, and its population's own filters
-                // are a scope of their own.
-                Some(LogicalNode::Score { input, .. }) => scopes.push(*input),
-                // A `let` that can fail runs on every row the elements before
-                // it produce: no filter written after it moves below it (A3).
-                Some(LogicalNode::Let { input, .. }) => scopes.push(*input),
-                Some(node) => stack.extend(node.inputs()),
-                None => {}
-            }
-        }
-        filters.sort_unstable();
-        coalesce_filters(plan, &filters);
-        // A `where`'s conjuncts filter in written order, each on the rows the
-        // ones before it keep: a conjunct that can fail, and every conjunct
-        // after it, stays where it was written (A3).
-        let mut failing = false;
-        for filter_id in filters {
-            let Some(LogicalNode::Filter { input, conjuncts }) = plan.node(filter_id).cloned()
-            else {
-                continue;
-            };
-            let mut residual = Vec::with_capacity(conjuncts.len());
-            let mut moved: Vec<(LogicalId, Vec<IRExpr>)> = Vec::new();
-            for conjunct in conjuncts {
-                if failing || conjunct.can_fail() {
-                    failing = true;
-                    residual.push(conjunct);
-                    continue;
-                }
-                let target = placement_target(&conjunct, &scans, &dependent_scans, source);
-                match target.and_then(|target| plan.node_mut(target)) {
-                    Some(LogicalNode::TableScan { spec, .. }) => {
-                        spec.filter = Some(and_filter(spec.filter.take(), gq_conjunct(&conjunct)));
-                        tracer.absorb(&conjunct);
-                        fired = true;
-                    }
-                    _ => match join_target(plan, input, &conjunct) {
-                        Some(join) if join != input => {
-                            match moved.iter_mut().find(|(target, _)| *target == join) {
-                                Some((_, onto)) => onto.push(conjunct),
-                                None => moved.push((join, vec![conjunct])),
-                            }
-                        }
-                        _ => residual.push(conjunct),
-                    },
-                }
-            }
-            for (join, conjuncts) in moved {
-                if filter_onto_join(plan, join, &conjuncts) {
-                    fired = true;
-                } else {
-                    residual.extend(conjuncts);
-                }
-            }
-            if residual.is_empty() {
-                plan.splice_out(filter_id, input);
-            } else if let Some(LogicalNode::Filter { conjuncts, .. }) = plan.node_mut(filter_id) {
-                *conjuncts = residual;
-            }
-        }
-    }
-    fired
-}
-
-/// Whether a term of the subtree under `id` can fail where it is evaluated:
-/// a filter, a scan's pushed filter, or a `let` (which the plan holds only
-/// for a value that can fail).
-fn subtree_can_fail(plan: &LogicalPlan, id: LogicalId) -> bool {
-    let mut stack = vec![id];
-    while let Some(id) = stack.pop() {
-        let fails = match plan.node(id) {
-            Some(LogicalNode::Filter { conjuncts, .. }) => conjuncts.iter().any(IRExpr::can_fail),
-            Some(LogicalNode::TableScan { spec, .. }) => spec
-                .filter
-                .as_ref()
-                .is_some_and(|filter| filter.gq_filters().iter().any(IRExpr::can_fail)),
-            Some(LogicalNode::Let { .. }) => true,
-            _ => false,
-        };
-        if fails {
-            return true;
-        }
-        if let Some(node) = plan.node(id) {
-            stack.extend(node.inputs());
-        }
-    }
-    false
-}
-
-/// Adjacent `Filter` nodes of one scope become one node, the lower node's
-/// conjuncts first as the match block wrote them, a repeated conjunct kept
-/// once; `filters` is in ascending id order, so a chain collapses bottom-up.
-fn coalesce_filters(plan: &mut LogicalPlan, filters: &[LogicalId]) {
-    for &filter_id in filters {
-        while let Some(LogicalNode::Filter { input: child, .. }) = plan.node(filter_id) {
-            let child = *child;
-            let Some(LogicalNode::Filter {
-                input: grandchild,
-                conjuncts: lower,
-            }) = plan.node(child).cloned()
-            else {
-                break;
-            };
-            let Some(LogicalNode::Filter { conjuncts, .. }) = plan.node_mut(filter_id) else {
-                break;
-            };
-            let mut merged: Vec<IRExpr> = Vec::with_capacity(lower.len() + conjuncts.len());
-            for conjunct in lower.into_iter().chain(std::mem::take(conjuncts)) {
-                if !merged.contains(&conjunct) {
-                    merged.push(conjunct);
-                }
-            }
-            *conjuncts = merged;
-            plan.splice_out(child, grandchild);
-        }
-    }
-}
-
-/// Where one conjunct of a scope goes, if anywhere: a scalar conjunct on one
-/// binding to the read that can evaluate it.
-fn placement_target(
-    filter: &IRExpr,
-    scans: &HashMap<String, LogicalId>,
-    dependent_scans: &HashMap<String, LogicalId>,
-    source: &dyn PlanSource,
-) -> Option<LogicalId> {
-    let mut reads = Vec::new();
-    reads_of_expr(filter, &mut reads);
-    let mut bindings: Vec<&str> = reads.iter().map(|read| read.binding.as_str()).collect();
-    bindings.sort_unstable();
-    bindings.dedup();
-    let [binding] = bindings.as_slice() else {
-        return None;
-    };
-    if !source.filter_pushable(filter) {
-        return None;
-    }
-    scans
-        .get(*binding)
-        .or_else(|| dependent_scans.get(*binding))
-        .copied()
-}
-
-/// Only a `CrossJoin` whose two sides together, neither alone, bind every
-/// binding a scalar `conjunct` reads; `None` for any other conjunct, one that
-/// also reads an `Expand` destination above that join included.
-fn join_target(plan: &LogicalPlan, mut id: LogicalId, conjunct: &IRExpr) -> Option<LogicalId> {
-    if has_lexical_call(conjunct) {
-        return None;
-    }
-    let mut reads = Vec::new();
-    reads_of_expr(conjunct, &mut reads);
-    if reads.is_empty() {
-        return None;
-    }
-    let binds = |id: LogicalId| {
-        let bound = scope_bindings(plan, id);
-        reads.iter().all(|read| bound.contains(&read.binding))
-    };
-    loop {
-        id = match plan.node(id)? {
-            LogicalNode::CrossJoin { left, right } => {
-                if binds(*left) {
-                    *left
-                } else if binds(*right) {
-                    *right
-                } else {
-                    return binds(id).then_some(id);
-                }
-            }
-            LogicalNode::Filter { input, .. }
-            | LogicalNode::Expand { input, .. }
-            | LogicalNode::TableScan {
-                input: Some(input), ..
-            }
-            | LogicalNode::AntiJoin { input, .. }
-                if binds(*input) =>
-            {
-                *input
-            }
-            _ => return None,
-        };
-    }
-}
-
-/// `conjuncts` on `join` itself: into the `Filter` already there, else a new
-/// one between `join` and its one consumer; `false`, and the plan untouched,
-/// when `join` has no single consumer or no schema.
-fn filter_onto_join(plan: &mut LogicalPlan, join: LogicalId, conjuncts: &[IRExpr]) -> bool {
-    let Some(parent) = plan.parent_of(join) else {
-        return false;
-    };
-    if let Some(LogicalNode::Filter {
-        conjuncts: held, ..
-    }) = plan.node_mut(parent)
-    {
-        for conjunct in conjuncts {
-            if !held.contains(conjunct) {
-                held.push(conjunct.clone());
-            }
-        }
-        return true;
-    }
-    let Some(schema) = plan.schema(join).cloned() else {
-        return false;
-    };
-    let filter = filter_over(plan, join, conjuncts, schema);
-    plan.redirect_input(parent, join, filter);
-    true
 }
 
 /// A filtered `CrossJoin`'s sides, swapped when a `contains` searches only the
@@ -2635,7 +2347,7 @@ fn identity_reads(node: &LogicalNode) -> Vec<String> {
 
 /// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`,
 /// `match_terms`).
-fn has_lexical_call(expr: &IRExpr) -> bool {
+pub(crate) fn has_lexical_call(expr: &IRExpr) -> bool {
     let mut bindings = Vec::new();
     lexical_bindings(expr, &mut bindings);
     !bindings.is_empty()
@@ -2700,6 +2412,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
         LogicalNode::Filter {
             input: _,
             conjuncts,
+            ..
         } => {
             for conjunct in conjuncts {
                 reads_of_expr(conjunct, &mut out);
@@ -2756,6 +2469,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             inner: _,
             outer_var: _,
             predicate,
+            ..
         } => {
             if let Some(arg) = predicate.left.arg() {
                 reads_of_expr(arg, &mut out);
@@ -2789,6 +2503,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             read: _,
             tiebreak,
             reads,
+            ..
         } => {
             out.extend(reads.iter().cloned());
             out.extend(tiebreak.iter().cloned());
@@ -2813,6 +2528,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             input: _,
             inner: _,
             outer_var: _,
+            fails: _,
         }
         | LogicalNode::Union {
             left: _,
@@ -3596,8 +3312,18 @@ impl Lowering<'_> {
                     filters: Vec::new(),
                 }))
             }
-            LogicalNode::Filter { input, conjuncts } => {
-                if let Some(LogicalNode::CrossJoin { left, right }) = logical.node(*input) {
+            LogicalNode::Filter {
+                input,
+                conjuncts,
+                fails,
+            } => {
+                // Conjuncts that cannot fail commute, so they may run as the
+                // join's filters in any order. A node holding one that can
+                // fail filters above the join, left to right as written: a
+                // conjunct written after it must not narrow the rows it sees.
+                if !*fails
+                    && let Some(LogicalNode::CrossJoin { left, right }) = logical.node(*input)
+                {
                     // A conjunct holding a full-text operand stays in a
                     // `Filter` above the join, the one operator that reads
                     // full-text calls as membership.
@@ -3707,6 +3433,7 @@ impl Lowering<'_> {
                 inner,
                 outer_var,
                 predicate,
+                ..
             } => {
                 let lowered = self.lower(*input)?;
                 let key_set = self.key_sets.get(&id);
@@ -3762,6 +3489,7 @@ impl Lowering<'_> {
                 input,
                 inner,
                 outer_var,
+                ..
             } => {
                 let lowered = self.lower(*input)?;
                 let inner = self.lower(*inner)?;

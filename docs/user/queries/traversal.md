@@ -31,9 +31,9 @@ query colleagues($h: String) {
 The elements are bindings `$x: Type`, triples, `optional { ... }`, `let` and
 `from`, separated by commas with a trailing comma allowed; a newline is not a
 separator. `where` sees every variable the elements bind and is evaluated
-after all of them, `let` included, so a `let` whose expression can fail runs
-on rows `where` then removes; guard it with `if(...)` or compute it in
-`return`. `and` and `or` guard left to right: `where`'s conjuncts filter in
+after all of them, so a `let`, a `from` or an `optional` whose expression can
+fail runs on every row the elements before it produce, rows `where` then
+removes included; guard it with `if(...)` or compute it in `return`. `and` and `or` guard left to right: `where`'s conjuncts filter in
 written order, each on the rows the ones before it keep, so `$n != 0 and
 $t / $n > 1` never divides by zero. A block such as `exists { ... }` is a
 conjunct like any other: written first, it guards the conjuncts after it.

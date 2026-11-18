@@ -196,7 +196,7 @@ pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
     }
     for op in pipeline {
         match op {
-            PatternStep::Filter(filter) if fragment.predicate(filter) => {}
+            PatternStep::Filter { pred: filter, .. } if fragment.predicate(filter) => {}
             _ => return None,
         }
     }
@@ -415,6 +415,7 @@ impl Tracer {
                 Some(LogicalNode::Filter {
                     input,
                     conjuncts: held,
+                    ..
                 }) if projection => {
                     for conjunct in held {
                         if !conjuncts.contains(&conjunct) {
@@ -633,7 +634,7 @@ fn canonical(
     for op in &ir.pipeline {
         let filters: Vec<IRExpr> = match op {
             PatternStep::NodeScan { filters, .. } => filters.clone(),
-            PatternStep::Filter(filter) => vec![filter.clone()],
+            PatternStep::Filter { pred: filter, .. } => vec![filter.clone()],
             _ => Vec::new(),
         };
         for conjunct in filters.into_iter().flat_map(IRExpr::into_conjuncts) {

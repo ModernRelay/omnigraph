@@ -144,18 +144,22 @@ fn fusion_targets_read_the_node_object_in_every_arm() {
 #[test]
 fn sibling_negations_keep_destination_scan_filters_in_their_scopes() {
     let negation = |value: &str| PatternStep::AntiJoin {
+        fails: false,
         outer_var: "a".to_string(),
         predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
         inner: vec![
             expand("a", "x", vec![]),
-            PatternStep::Filter(IRExpr::comparison(
-                prop("x", "state"),
-                CompOp::Eq,
-                IRExpr::Literal(
-                    Literal::String(value.to_string()),
-                    value_type(ScalarType::String, false),
+            PatternStep::Filter {
+                pred: IRExpr::comparison(
+                    prop("x", "state"),
+                    CompOp::Eq,
+                    IRExpr::Literal(
+                        Literal::String(value.to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
                 ),
-            )),
+                fails: false,
+            },
         ],
     };
     let (plan, _) = planned(&ir(
@@ -198,17 +202,20 @@ fn a_lexical_filter_reading_a_second_binding_is_not_placed_on_a_root_scan() {
         vec![
             scan("a"),
             scan("b"),
-            PatternStep::Filter(IRExpr::Call {
-                func: ScalarFunc::MatchTerms {
-                    mode: TermsMode::Any,
+            PatternStep::Filter {
+                pred: IRExpr::Call {
+                    func: ScalarFunc::MatchTerms {
+                        mode: TermsMode::Any,
+                    },
+                    args: vec![
+                        prop("b", "text"),
+                        prop("a", "probe"),
+                        IRExpr::Literal(Literal::Integer(0), value_type(ScalarType::I64, false)),
+                    ],
+                    ty: value_type(ScalarType::Bool, false),
                 },
-                args: vec![
-                    prop("b", "text"),
-                    prop("a", "probe"),
-                    IRExpr::Literal(Literal::Integer(0), value_type(ScalarType::I64, false)),
-                ],
-                ty: value_type(ScalarType::Bool, false),
-            }),
+                fails: false,
+            },
         ],
         vec![prop("b", "slug")],
         vec![],
@@ -287,7 +294,10 @@ fn rejected_scalar_filters_stay_above_root_and_dependent_scans() {
                 }]
             };
             if !embedded {
-                pipeline.push(PatternStep::Filter(filter));
+                pipeline.push(PatternStep::Filter {
+                    pred: filter,
+                    fails: false,
+                });
             }
             let op = ir(pipeline, vec![prop(binding, "slug")], vec![]);
             let source = RefusingSource(source());

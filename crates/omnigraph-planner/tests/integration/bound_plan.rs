@@ -406,7 +406,7 @@ fn doc_scan(variable: &str) -> PatternStep {
 /// `$d` and `$e` over `Doc` under `filter`, returning `$d.slug`.
 fn two_docs(filter: Option<IRExpr>) -> PhysicalPlan {
     let mut pipeline = vec![doc_scan("d"), doc_scan("e")];
-    pipeline.extend(filter.map(PatternStep::Filter));
+    pipeline.extend(filter.map(|pred| PatternStep::Filter { pred, fails: false }));
     let query = ReadShape {
         name: "q".to_string(),
         params: vec![],

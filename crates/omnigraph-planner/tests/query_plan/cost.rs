@@ -692,7 +692,10 @@ fn a_contains_join_streams_the_searched_side_only_when_it_has_no_fewer_rows() {
             vec![
                 scan_of("m", "Matter"),
                 scan_of("w", "Word"),
-                PatternStep::Filter(filter),
+                PatternStep::Filter {
+                    pred: filter,
+                    fails: false,
+                },
             ],
             vec![prop("m", "slug"), prop("w", "slug")],
             vec![],
@@ -745,7 +748,10 @@ fn a_contains_join_marks_its_right_scan_and_keeps_the_other_conjunct() {
         vec![
             scan_of("m", "Matter"),
             scan_of("p", "Passage"),
-            PatternStep::Filter(IRExpr::and_all([contains.clone(), other.clone()]).expect("two")),
+            PatternStep::Filter {
+                pred: IRExpr::and_all([contains.clone(), other.clone()]).expect("two"),
+                fails: false,
+            },
         ],
         vec![prop("m", "slug"), prop("p", "slug")],
         vec![],
@@ -1112,6 +1118,7 @@ fn negated_two_hops(
         vec![
             outer,
             PatternStep::AntiJoin {
+                fails: false,
                 outer_var: "a".to_string(),
                 inner,
                 predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
@@ -1271,11 +1278,10 @@ fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
 fn unbounded_or_outer_reading_blocks_stay_correlated() {
     use omnigraph_planner::AntiJoinStrategy;
 
-    let reads_outer = PatternStep::Filter(IRExpr::comparison(
-        prop("m", "state"),
-        CompOp::Eq,
-        prop("a", "state"),
-    ));
+    let reads_outer = PatternStep::Filter {
+        pred: IRExpr::comparison(prop("m", "state"), CompOp::Eq, prop("a", "state")),
+        fails: false,
+    };
     for (what, op) in [
         (
             "a non-key filter bounds nothing",
@@ -1348,6 +1354,7 @@ fn key_set_starts_from_the_most_bounded_binding_and_the_first_on_a_tie() {
             vec![
                 scan("a"),
                 PatternStep::AntiJoin {
+                    fails: false,
                     outer_var: "a".to_string(),
                     inner: vec![expand("a", "m", m_filters), expand("m", "k", k_filters)],
                     predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),

@@ -384,7 +384,7 @@ fn scan_to_rec_ref(term: &mut Term, var: &str, name: &str) {
         | Term::Group { input, .. }
         | Term::Order { input, .. }
         | Term::Cut { input, .. } => scan_to_rec_ref(input, var, name),
-        Term::Correlate { outer, inner } => {
+        Term::Correlate { outer, inner, .. } => {
             scan_to_rec_ref(outer, var, name);
             scan_to_rec_ref(inner, var, name);
         }

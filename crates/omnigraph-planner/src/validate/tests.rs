@@ -54,6 +54,8 @@ impl KeyIds for Keys {
 struct Fixture {
     catalog: Catalog,
     ir: ReadShape,
+    /// The checked core read, which the placement check derives from.
+    core: omnigraph_compiler::ir::core::CoreRead,
     params: ParamMap,
     source: MemorySource,
 }
@@ -66,6 +68,12 @@ impl Fixture {
     fn with_schema(schema: &str, query: &str, params: &[(&str, Literal)]) -> Self {
         let catalog = build_catalog(&parse_schema(schema).unwrap()).unwrap();
         let ir = ReadShape::of_source(&catalog, query, "q").unwrap();
+        let decl = omnigraph_compiler::find_named_query(query, "q").unwrap();
+        let core =
+            match omnigraph_compiler::query::check::check_query_decl(&catalog, &decl).unwrap() {
+                omnigraph_compiler::ir::core::CoreDecl::Read(read) => *read,
+                omnigraph_compiler::ir::core::CoreDecl::Write(_) => panic!("`q` is a read"),
+            };
         let mut source = MemorySource::default().with_edge_version("Cites", 1);
         for (name, node_type) in &catalog.node_types {
             source = source.with_node_type(
@@ -90,6 +98,7 @@ impl Fixture {
         Self {
             catalog,
             ir,
+            core,
             params: params
                 .iter()
                 .map(|(name, value)| (name.to_string(), value.clone()))
@@ -116,6 +125,7 @@ impl Fixture {
 
     fn input(&self) -> AcceptInput<'_> {
         AcceptInput {
+            core: Some(&self.core),
             catalog: &self.catalog,
             ir: &self.ir,
             params: &self.params,
@@ -130,6 +140,7 @@ impl Fixture {
         derivation: Option<Derivation>,
     ) -> Result<AcceptedPlan, ValidationError> {
         let input = AcceptInput {
+            core: Some(&self.core),
             catalog: &self.catalog,
             ir: &self.ir,
             params: &self.params,
@@ -474,7 +485,7 @@ fn an_optional_tests_its_conjuncts_inside_its_inner_tree() {
     let conjunct = fixture.ir.pipeline.iter().find_map(|step| match step {
         crate::PatternStep::Optional { inner, .. } => inner.iter().find_map(|step| match step {
             crate::PatternStep::Expand { dst_filters, .. } => dst_filters.first().cloned(),
-            crate::PatternStep::Filter(filter) => Some(filter.clone()),
+            crate::PatternStep::Filter { pred: filter, .. } => Some(filter.clone()),
             _ => None,
         }),
         _ => None,
@@ -552,7 +563,7 @@ fn an_inline_read_with_its_own_cut_tests_its_conjuncts_under_the_cut() {
     let conjunct = fixture.ir.pipeline.iter().find_map(|step| match step {
         crate::PatternStep::Correlate { inner, .. } => inner.iter().find_map(|step| match step {
             crate::PatternStep::Expand { dst_filters, .. } => dst_filters.first().cloned(),
-            crate::PatternStep::Filter(filter) => Some(filter.clone()),
+            crate::PatternStep::Filter { pred: filter, .. } => Some(filter.clone()),
             _ => None,
         }),
         _ => None,
@@ -1676,6 +1687,7 @@ fn a_score_read_from_another_column_fails_the_projection() {
 fn an_exhausted_budget_is_a_resource_outcome() {
     let fixture = ranked();
     let input = AcceptInput {
+        core: None,
         catalog: &fixture.catalog,
         ir: &fixture.ir,
         params: &fixture.params,
@@ -1868,6 +1880,7 @@ fn both_acceptance_entries_agree_even_when_a_limit_runs_out() {
     ] {
         let fixture = ranked();
         let input = AcceptInput {
+            core: None,
             catalog: &fixture.catalog,
             ir: &fixture.ir,
             params: &fixture.params,
@@ -1921,6 +1934,7 @@ fn derivation_cost_grows_with_the_query() {
         let derivation = traced.derivation().unwrap();
         let bytes = serde_json::to_vec(&derivation).unwrap().len();
         let input = AcceptInput {
+            core: None,
             catalog: &fixture.catalog,
             ir: &fixture.ir,
             params: &fixture.params,
@@ -2100,4 +2114,86 @@ fn a_full_text_call_plans_without_an_index() {
             .accept(fixture.plan())
             .unwrap_or_else(|error| panic!("{query}: {error:?}"));
     }
+}
+
+/// A conjunct that can fail written first, then one that cannot: the
+/// planner keeps both in written order above the scan.
+const FAILING_FIRST: &str = r#"query q() {
+    match { $d: Doc } where 10 / $d.year > 1 and $d.open = true
+    return { $d.slug }
+}"#;
+
+/// The two conjuncts of [`FAILING_FIRST`], as its plan tests them.
+fn failing_first_conjuncts(plan: &PhysicalPlan) -> (IRExpr, IRExpr) {
+    let tested: Vec<IRExpr> = plan
+        .live()
+        .flat_map(|(_, node)| match node {
+            PhysicalNode::Filter { filters, .. } => filters.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let find = |text: &str| {
+        tested
+            .iter()
+            .find(|c| c.to_string().contains(text))
+            .cloned()
+            .unwrap_or_else(|| panic!("the plan tests no conjunct holding `{text}`: {tested:?}"))
+    };
+    (find("/"), find("open"))
+}
+
+/// The placement law holds the plan to the written order the core term
+/// states, independently of the shape and the optimizer: a conjunct written
+/// after one that can fail never runs in a scan, nor does the one that can
+/// fail, and a later conjunct never runs first. Each broken plan passes
+/// every other check of acceptance.
+#[test]
+fn a_conjunct_at_or_after_the_first_that_can_fail_keeps_its_written_place() {
+    let fixture = Fixture::new(FAILING_FIRST, &[]);
+    let plan = fixture.plan();
+    fixture
+        .accept(plan.clone())
+        .expect("the planner's plan keeps the written order");
+    let (failing, later) = failing_first_conjuncts(&plan);
+    for moved in [&later, &failing] {
+        let mut broken = plan.clone();
+        place_on_scans(&mut broken, moved);
+        let (check, detail) = fixture.refused(broken);
+        assert_eq!(check, "placement", "{detail}");
+    }
+    // The later conjunct tested before the one that can fail.
+    let mut broken = plan.clone();
+    for id in node_ids(&broken, |node| matches!(node, PhysicalNode::Filter { .. })) {
+        if let Some(PhysicalNode::Filter { filters, .. }) = broken.node_mut(id)
+            && filters.contains(&failing)
+        {
+            filters.insert(0, later.clone());
+        }
+    }
+    let (check, detail) = fixture.refused(broken);
+    assert_eq!(check, "placement", "{detail}");
+}
+
+/// A conjunct that cannot fail, written before the first one that can,
+/// moves into its binding's scan: the law allows it, and acceptance takes
+/// it.
+#[test]
+fn a_conjunct_before_the_first_that_can_fail_may_run_in_its_scan() {
+    let fixture = Fixture::new(
+        r#"query q() {
+    match { $d: Doc } where $d.open = true and 10 / $d.year > 1
+    return { $d.slug }
+}"#,
+        &[],
+    );
+    let plan = fixture.plan();
+    let scanned = plan.live().any(|(_, node)| {
+        matches!(node, PhysicalNode::Scan { spec, .. }
+            if spec.filter.as_ref().is_some_and(|f| f.gq_filters().iter().any(|c| c.to_string().contains("open"))))
+    });
+    assert!(
+        scanned,
+        "the conjunct before the one that can fail runs in the scan"
+    );
+    fixture.accept(plan).expect("the law allows it");
 }

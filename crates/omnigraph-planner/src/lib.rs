@@ -38,6 +38,7 @@ pub mod optimizer;
 pub mod output;
 pub mod passes;
 pub mod physical;
+mod placement;
 pub mod ranking;
 pub mod read_shape;
 pub mod registry;

@@ -1,0 +1,40 @@
+# issue: none
+# notes: A `match_terms` conjunct is pure and total, so the placement law lets
+# notes: it and the key equality before it move into their scans, and the
+# notes: division after them runs only on the rows they keep: `d2` (n 0) has
+# notes: no `graph` in its title and never reaches `10 / $d.n`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node User {
+    handle: String @key
+    total: I64
+}
+node Doc {
+    slug: String @key
+    title: String? @index(fulltext)
+    n: I64
+}
+
+--- seed
+{"type":"User","data":{"handle":"u1","total":10}}
+{"type":"Doc","data":{"slug":"d1","title":"graph","n":1}}
+{"type":"Doc","data":{"slug":"d2","title":"other","n":0}}
+
+--- query
+query a_lexical_guard_keeps_the_division_off_the_row_it_removes() {
+    match { $u: User, $d: Doc }
+    where $u.handle = "u1" and match_terms($d.title, terms("graph")) and $u.total / $d.n > 1
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"d1"}
+
+--- expect shape
+d.slug: String

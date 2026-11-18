@@ -14,6 +14,7 @@
 
 mod budget;
 mod invariants;
+mod placement;
 mod replay;
 mod requirements;
 mod returns;
@@ -114,6 +115,10 @@ impl std::fmt::Display for ValidationError {
 pub struct AcceptInput<'a> {
     pub catalog: &'a Catalog,
     pub ir: &'a ReadShape,
+    /// The checked core read `ir` was shaped from: the placement check
+    /// derives each scope's conjuncts and where each may run from it
+    /// ([`placement`]), never from the shape or the optimizer.
+    pub core: Option<&'a omnigraph_compiler::ir::core::CoreRead>,
     pub params: &'a ParamMap,
     pub keys: &'a dyn KeyIds,
     pub limits: ValidationLimits,
@@ -251,6 +256,9 @@ pub(crate) fn check(
     formed("catalogue source", source::validate_catalogue_sources(plan))?;
     let requirements = Requirements::derive(input, budget)?;
     requirements.check(plan, input, budget)?;
+    if let Some(core) = input.core {
+        placement::check(plan, core, input.params, budget)?;
+    }
     let Some(member) = subset::membership(input) else {
         return Ok((ValidationScope::InvariantsOnly, None));
     };

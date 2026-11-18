@@ -247,6 +247,7 @@ fn correlated(edges: EdgeSelection) -> Operation {
             scan("a"),
             expand("a", "b", vec![]),
             PatternStep::AntiJoin {
+                fails: false,
                 outer_var: "b".to_string(),
                 inner: vec![selected("b", "x", edges)],
                 predicate: omnigraph_compiler::ir::SubqueryPredicate {

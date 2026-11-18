@@ -150,7 +150,7 @@ pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<
             } => {
                 out.insert(dst_var.clone(), dst_type.clone());
             }
-            PatternStep::Filter(_)
+            PatternStep::Filter { .. }
             | PatternStep::Rank { .. }
             | PatternStep::Score { .. }
             | PatternStep::Let { .. } => {}
@@ -158,15 +158,18 @@ pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<
                 outer_var: _,
                 inner,
                 predicate: _,
+                fails: _,
             } => collect_node_bindings(inner, out),
             PatternStep::Optional {
                 outer_var: _,
                 inner,
+                ..
             }
             | PatternStep::Correlate {
                 outer_var: _,
                 inner,
                 read: _,
+                fails: _,
             } => collect_node_bindings(inner, out),
             PatternStep::Union { arms, .. } => {
                 arms.iter().for_each(|arm| collect_node_bindings(arm, out))

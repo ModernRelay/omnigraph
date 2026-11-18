@@ -131,7 +131,7 @@ fn own_eligibility(inner: &[PatternStep]) -> Vec<IRExpr> {
                 dst_filters: filters,
                 ..
             } => push_conjuncts(&mut eligibility, filters),
-            PatternStep::Filter(filter) => {
+            PatternStep::Filter { pred: filter, .. } => {
                 push_conjuncts(&mut eligibility, std::slice::from_ref(filter))
             }
             PatternStep::Rank { .. }
@@ -239,14 +239,14 @@ pub(crate) fn conjunct_regions(
                 push_conjuncts(&mut own, filters);
                 out.extend(own.into_iter().map(|conjunct| (conjunct, here.clone())));
             }
-            PatternStep::Filter(filter) => {
+            PatternStep::Filter { pred: filter, .. } => {
                 let mut own = Vec::new();
                 push_conjuncts(&mut own, std::slice::from_ref(filter));
                 out.extend(own.into_iter().map(|conjunct| (conjunct, here.clone())));
             }
-            PatternStep::Optional { outer_var, inner } => {
-                conjunct_regions(inner, &within(ordinals.optional(&here, outer_var)), out)
-            }
+            PatternStep::Optional {
+                outer_var, inner, ..
+            } => conjunct_regions(inner, &within(ordinals.optional(&here, outer_var)), out),
             PatternStep::Union { arms, bindings, .. } => {
                 for (position, arm) in arms.iter().enumerate() {
                     conjunct_regions(
@@ -298,6 +298,7 @@ fn flatten<'p>(
                 outer_var,
                 inner,
                 read,
+                ..
             } => {
                 correlates.push(CorrelateMatch {
                     outer_var: outer_var.clone(),
@@ -306,7 +307,9 @@ fn flatten<'p>(
                 });
                 flatten(inner, out, optionals, unions, correlates);
             }
-            PatternStep::Optional { outer_var, inner } => {
+            PatternStep::Optional {
+                outer_var, inner, ..
+            } => {
                 let eligibility = own_eligibility(inner);
                 optionals.push(OptionalMatch {
                     outer_var: outer_var.clone(),
@@ -428,7 +431,7 @@ pub(crate) fn tie_columns(steps: &[PatternStep], out: &mut Vec<TieColumn>) {
                     selected: false,
                 },
             ),
-            PatternStep::Filter(_)
+            PatternStep::Filter { .. }
             | PatternStep::Rank { .. }
             | PatternStep::Score { .. }
             | PatternStep::Let { .. }
@@ -640,7 +643,7 @@ impl Requirements {
                     );
                     push_conjuncts(&mut eligibility, filters);
                 }
-                PatternStep::Filter(filter) => {
+                PatternStep::Filter { pred: filter, .. } => {
                     push_conjuncts(&mut eligibility, std::slice::from_ref(filter))
                 }
                 PatternStep::Expand {

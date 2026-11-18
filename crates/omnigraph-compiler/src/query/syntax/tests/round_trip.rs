@@ -1338,6 +1338,7 @@ fn drop_true_filters(term: &mut Term) {
     if let Term::Filter {
         input,
         pred: IRExpr::Literal(Literal::Bool(true), _),
+        ..
     } = term
     {
         *term = std::mem::replace(input.as_mut(), Term::Unit);
@@ -1363,7 +1364,7 @@ fn filters_and_value(core: &CoreDecl) -> (Vec<IRExpr>, IRExpr) {
     let mut term = &read.term;
     loop {
         match term {
-            Term::Filter { input, pred } => {
+            Term::Filter { input, pred, .. } => {
                 filters.push(pred.clone());
                 term = input;
             }

@@ -41,11 +41,13 @@ impl WritePlan {
             selections: shape
                 .selections
                 .into_iter()
+                .zip(shape.selection_reads)
                 // The write's declaration was admitted against the
                 // session's plan budget ceiling; its selection reads
                 // declare none of their own.
-                .map(|read| CompiledQuery {
+                .map(|(read, core)| CompiledQuery {
                     ir: Arc::new(read),
+                    core: Arc::new(core),
                     declared_plan: None,
                 })
                 .collect(),

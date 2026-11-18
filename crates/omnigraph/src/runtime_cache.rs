@@ -376,6 +376,9 @@ pub(crate) struct CompiledQueryKey {
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledQuery {
     pub(crate) ir: Arc<ReadShape>,
+    /// The checked core read the shape was taken from: plan acceptance
+    /// derives the placement of its conjuncts from it, not from the shape.
+    pub(crate) core: Arc<omnigraph_compiler::ir::core::CoreRead>,
     /// The plan budget the declaration declares, `@budget(plan = n)`,
     /// which every session admits against its own `plan_budget_limit`.
     pub(crate) declared_plan: Option<u64>,
@@ -405,6 +408,7 @@ impl CompiledQuery {
         );
         Ok(Self {
             ir,
+            core: Arc::new(*core),
             declared_plan: omnigraph_compiler::query::check::declared_plan(decl),
         })
     }

@@ -717,7 +717,7 @@ pub(super) fn collect_referenced_edge_names(
                 .iter()
                 .for_each(|arm| collect_referenced_edge_names(&arm.steps, out)),
             PatternStep::NodeScan { .. }
-            | PatternStep::Filter(_)
+            | PatternStep::Filter { .. }
             | PatternStep::Rank { .. }
             | PatternStep::Score { .. }
             | PatternStep::Let { .. } => {}

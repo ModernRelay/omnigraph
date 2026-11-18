@@ -83,6 +83,11 @@ const BEHAVIOUR_SITES: &[(&str, &str, &str)] = &[
         "the cuts of Limit, Scan and Sort justified against the query",
     ),
     (
+        "validate/placement.rs",
+        "tested",
+        "the conjuncts Scan, Filter, CrossJoin and ContainsJoin test, for the placement check",
+    ),
+    (
         "validate/invariants.rs",
         "plan_regions",
         "the nested regions of OptionalJoin, Correlate, Union and TargetCut, and the scopes AntiJoin and Fuse leave unwalked",

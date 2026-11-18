@@ -954,6 +954,7 @@ fn a_step_counts_the_nodes_it_adds() {
         ]
     };
     let leaf = Term::Correlate {
+        fails: false,
         outer: Term::Unit.boxed(),
         inner: Term::Env(Vec::new()).boxed(),
     };

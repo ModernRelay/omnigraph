@@ -96,7 +96,9 @@ pub fn written_columns(term: &Term, out: &mut Vec<String>) {
         Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
             written_columns(input, out)
         }
-        Term::Project { input, items, keep } => {
+        Term::Project {
+            input, items, keep, ..
+        } => {
             if *keep {
                 written_columns(input, out);
             } else {
@@ -109,7 +111,7 @@ pub fn written_columns(term: &Term, out: &mut Vec<String>) {
             keys.iter().for_each(|(name, _)| push(out, name));
             aggs.iter().for_each(|(name, _)| push(out, name));
         }
-        Term::Correlate { outer, inner } => {
+        Term::Correlate { outer, inner, .. } => {
             written_columns(outer, out);
             let mut own = Vec::new();
             written_columns(inner, &mut own);
@@ -161,7 +163,12 @@ pub enum PatternStep {
         /// properties carried under this prefix.
         edge_binding: Option<String>,
     },
-    Filter(IRExpr),
+    /// A `where` conjunct over the rows of the steps before it, in written
+    /// order, or a closing triple's identity test. `fails`: the conjunct can
+    /// fail where it is evaluated, the type checker's flag (A3); the
+    /// planner's placement law moves only a conjunct that cannot, and
+    /// nothing below one that can.
+    Filter { pred: IRExpr, fails: bool },
     /// A ranking drawn over the rows of the steps before it, its
     /// population, when it is not the read's leading `order` key cut by the
     /// read's `limit` (that ranking is `order_by`'s first key): `key` is the
@@ -190,6 +197,8 @@ pub enum PatternStep {
         outer_var: String,
         inner: Vec<PatternStep>,
         predicate: SubqueryPredicate,
+        /// The block can fail where it is evaluated (A3).
+        fails: bool,
     },
     /// `from union(a, b, …)`: the bag union of the arms, each its own
     /// pipeline from nothing, every arm binding the union's reference
@@ -227,6 +236,9 @@ pub enum PatternStep {
     Optional {
         outer_var: String,
         inner: Vec<PatternStep>,
+        /// The pattern can fail where it is evaluated: it runs on every
+        /// outer row, and nothing moves below it (A3).
+        fails: bool,
     },
     /// `let $name = value` whose value can fail, the core's `Project`
     /// adding one column: `value` evaluated on every row the steps before it
@@ -234,10 +246,7 @@ pub enum PatternStep {
     /// through unchanged. The value is pure, so a later read of `$name`
     /// evaluates it in place to the same result on the rows that reach it;
     /// no filter written after the `let` runs below this step.
-    Let {
-        name: String,
-        value: IRExpr,
-    },
+    Let { name: String, value: IRExpr },
     /// `from` an inline read (or a declared read's call) with its own
     /// aggregate, `distinct`, `order` or `limit`, the core's `Correlate`
     /// over its `Group`, `Order` and `Cut`: `inner` is the read's pattern and
@@ -250,6 +259,9 @@ pub enum PatternStep {
         outer_var: Option<String>,
         inner: Vec<PatternStep>,
         read: InnerRead,
+        /// The read can fail where it is evaluated: it runs on every outer
+        /// row, and nothing moves below it (A3).
+        fails: bool,
     },
     /// `from rrf(arm, …)`, the core's `Fuse` (the GQ 3 RFC,
     /// section 4, Fusion): each arm is its own pipeline from nothing, the
@@ -421,7 +433,7 @@ impl ReadShape {
                     pending.extend(arms.iter().flat_map(|arm| &arm.steps))
                 }
                 PatternStep::NodeScan { .. }
-                | PatternStep::Filter(_)
+                | PatternStep::Filter { .. }
                 | PatternStep::Rank { .. }
                 | PatternStep::Score { .. }
                 | PatternStep::Let { .. } => {}
@@ -521,9 +533,10 @@ fn without_leaf(term: &Term, leaf: &Term) -> Term {
         return Term::Env(Vec::new());
     }
     match term {
-        Term::Filter { input, pred } => Term::Filter {
+        Term::Filter { input, pred, fails } => Term::Filter {
             input: without_leaf(input, leaf).boxed(),
             pred: pred.clone(),
+            fails: *fails,
         },
         Term::Expand {
             input,
@@ -546,14 +559,25 @@ fn without_leaf(term: &Term, leaf: &Term) -> Term {
             max_hops: *max_hops,
             edge_var: edge_var.clone(),
         },
-        Term::Project { input, items, keep } => Term::Project {
+        Term::Project {
+            input,
+            items,
+            keep,
+            fails,
+        } => Term::Project {
             input: without_leaf(input, leaf).boxed(),
             items: items.clone(),
             keep: *keep,
+            fails: *fails,
         },
-        Term::Correlate { outer, inner } => Term::Correlate {
+        Term::Correlate {
+            outer,
+            inner,
+            fails,
+        } => Term::Correlate {
             outer: without_leaf(outer, leaf).boxed(),
             inner: inner.clone(),
+            fails: *fails,
         },
         other => other.clone(),
     }
@@ -586,7 +610,7 @@ fn physical_names(pipeline: &[PatternStep]) -> HashSet<String> {
             PatternStep::Fuse { target, .. } => {
                 names.insert(target.clone());
             }
-            PatternStep::Filter(_)
+            PatternStep::Filter { .. }
             | PatternStep::AntiJoin { .. }
             | PatternStep::Rank { .. }
             | PatternStep::Score { .. }
@@ -611,8 +635,10 @@ struct Shaper<'a> {
 struct Facts {
     bindings: Vec<BindingFact>,
     traversals: Vec<TraversalFact>,
-    filters: Vec<IRExpr>,
-    blocks: Vec<BlockFact>,
+    /// The scope's `where` conjuncts in written order, after every element:
+    /// the steps keep that order, and the planner's placement law moves the
+    /// ones that may move.
+    conjuncts: Vec<ConjunctFact>,
     /// The `optional { }` elements, in written order.
     optionals: Vec<OptionalFact>,
     /// The `from union(…)` elements, in written order.
@@ -639,14 +665,20 @@ struct Facts {
     /// the elements before it stated: the steps place those first, then the
     /// value's evaluation, then the rest.
     checks: Vec<LetCheck>,
-    /// Whether a `where` conjunct that can fail was stated: it and every
-    /// conjunct after it are evaluated after the elements, in written order,
-    /// never in a scan below them.
-    failing_filter: bool,
-    /// Whether an element that can fail (an `optional` holding a term that
-    /// can fail) was stated: every `where` conjunct after it is evaluated
-    /// after it, never pushed below it (A3).
-    failing_element: bool,
+}
+
+/// One `where` conjunct, as the type checker wrote it.
+#[derive(Debug, Clone)]
+enum ConjunctFact {
+    /// A predicate, with the blocks it reads as values, each a correlated
+    /// read placed right before it.
+    Filter {
+        pred: IRExpr,
+        fails: bool,
+        values: Vec<CorrelateFact>,
+    },
+    /// A block compared with a value of the outer row: a semi-join.
+    Block { block: Box<BlockFact>, fails: bool },
 }
 
 /// How many facts of each kind a scope had stated at one point.
@@ -654,19 +686,18 @@ struct Facts {
 struct Marks {
     bindings: usize,
     traversals: usize,
-    filters: usize,
-    blocks: usize,
+    conjuncts: usize,
     optionals: usize,
     unions: usize,
     correlates: usize,
 }
 
-/// A step that splits a scope's facts at the point it was written: a `let`
-/// whose value can fail (`name` set), or a `where` conjunct that must filter
-/// after a correlated block stated before it (`name` unset).
+/// A `let` whose value can fail, which splits a scope's facts at the point
+/// it was written: the elements before it are placed, then its value is
+/// evaluated on every row they produce, then the rest.
 #[derive(Debug, Clone)]
 struct LetCheck {
-    name: Option<String>,
+    name: String,
     value: IRExpr,
     marks: Marks,
 }
@@ -677,8 +708,7 @@ impl Facts {
         Marks {
             bindings: self.bindings.len(),
             traversals: self.traversals.len(),
-            filters: self.filters.len(),
-            blocks: self.blocks.len(),
+            conjuncts: self.conjuncts.len(),
             optionals: self.optionals.len(),
             unions: self.unions.len(),
             correlates: self.correlates.len(),
@@ -691,8 +721,7 @@ impl Facts {
         Facts {
             bindings: self.bindings[from.bindings..to.bindings].to_vec(),
             traversals: self.traversals[from.traversals..to.traversals].to_vec(),
-            filters: self.filters[from.filters..to.filters].to_vec(),
-            blocks: self.blocks[from.blocks..to.blocks].to_vec(),
+            conjuncts: self.conjuncts[from.conjuncts..to.conjuncts].to_vec(),
             optionals: self.optionals[from.optionals..to.optionals].to_vec(),
             unions: self.unions[from.unions..to.unions].to_vec(),
             correlates: self.correlates[from.correlates..to.correlates]
@@ -710,9 +739,6 @@ impl Facts {
             lets: HashMap::new(),
             inlined: self.inlined,
             checks: Vec::new(),
-            // The segment's filters keep their written order.
-            failing_filter: false,
-            failing_element: false,
         }
     }
 
@@ -723,8 +749,7 @@ impl Facts {
         let Facts {
             bindings,
             traversals,
-            filters,
-            blocks,
+            conjuncts,
             optionals,
             unions,
             correlates,
@@ -734,8 +759,6 @@ impl Facts {
             lets: _,
             inlined: _,
             checks,
-            failing_filter,
-            failing_element,
         } = other;
         if !optionals.is_empty() || !unions.is_empty() || !optional_names.is_empty() {
             return Err(ShapeError::Internal(
@@ -748,10 +771,9 @@ impl Facts {
             check.marks = Marks {
                 bindings: at.bindings + check.marks.bindings,
                 traversals: at.traversals + check.marks.traversals,
-                filters: at.filters + check.marks.filters,
-                blocks: at.blocks + check.marks.blocks,
+                conjuncts: at.conjuncts + check.marks.conjuncts,
                 // An inline read's facts join the scope's bindings,
-                // traversals, filters and blocks.
+                // traversals and conjuncts.
                 optionals: at.optionals,
                 unions: at.unions,
                 correlates: at.correlates + check.marks.correlates,
@@ -765,10 +787,7 @@ impl Facts {
             }));
         self.bindings.extend(bindings);
         self.traversals.extend(traversals);
-        self.filters.extend(filters);
-        self.failing_filter |= failing_filter;
-        self.failing_element |= failing_element;
-        self.blocks.extend(blocks);
+        self.conjuncts.extend(conjuncts);
         self.types.extend(types);
         Ok(())
     }
@@ -808,10 +827,6 @@ impl Facts {
         };
         for binding in &mut self.bindings {
             rename(&mut binding.variable);
-            binding
-                .filters
-                .iter_mut()
-                .for_each(|f| rename_expr(f, &rename));
         }
         for t in &mut self.traversals {
             rename(&mut t.src);
@@ -820,9 +835,6 @@ impl Facts {
                 rename(edge);
             }
         }
-        self.filters
-            .iter_mut()
-            .for_each(|f| rename_expr(f, &rename));
         self.checks
             .iter_mut()
             .for_each(|c| rename_expr(&mut c.value, &rename));
@@ -833,19 +845,29 @@ impl Facts {
                 (name, ty)
             })
             .collect();
-        for block in &mut self.blocks {
-            block.inner.rename(renames);
-            block.outer = std::mem::take(&mut block.outer)
-                .into_iter()
-                .map(|mut name| {
-                    rename(&mut name);
-                    name
-                })
-                .collect();
-            if let Some(arg) = block.left.arg_mut() {
-                rename_expr(arg, &rename);
+        for conjunct in &mut self.conjuncts {
+            match conjunct {
+                ConjunctFact::Filter { pred, values, .. } => {
+                    rename_expr(pred, &rename);
+                    values
+                        .iter_mut()
+                        .for_each(|correlate| correlate.rename(renames));
+                }
+                ConjunctFact::Block { block, .. } => {
+                    block.inner.rename(renames);
+                    block.outer = std::mem::take(&mut block.outer)
+                        .into_iter()
+                        .map(|mut name| {
+                            rename(&mut name);
+                            name
+                        })
+                        .collect();
+                    if let Some(arg) = block.left.arg_mut() {
+                        rename_expr(arg, &rename);
+                    }
+                    rename_expr(&mut block.right, &rename);
+                }
             }
-            rename_expr(&mut block.right, &rename);
         }
         for optional in &mut self.optionals {
             optional.inner.rename(renames);
@@ -862,23 +884,7 @@ impl Facts {
                 .collect();
         }
         for correlate in &mut self.correlates {
-            correlate.inner.rename(renames);
-            correlate.outer = std::mem::take(&mut correlate.outer)
-                .into_iter()
-                .map(|mut name| {
-                    rename(&mut name);
-                    name
-                })
-                .collect();
-            for column in &mut correlate.read.columns {
-                if is_reference(&column.expr) {
-                    rename(&mut column.column);
-                }
-            }
-            correlate
-                .read
-                .exprs_mut()
-                .for_each(|e| rename_expr(e, &rename));
+            correlate.rename(renames);
         }
         self.optional_names = std::mem::take(&mut self.optional_names)
             .into_iter()
@@ -896,8 +902,13 @@ impl Facts {
         for optional in &self.optionals {
             optional.inner.optional_names_into(out);
         }
-        for block in &self.blocks {
-            block.inner.optional_names_into(out);
+        for conjunct in &self.conjuncts {
+            match conjunct {
+                ConjunctFact::Filter { values, .. } => values
+                    .iter()
+                    .for_each(|correlate| correlate.inner.optional_names_into(out)),
+                ConjunctFact::Block { block, .. } => block.inner.optional_names_into(out),
+            }
         }
         for union in &self.unions {
             union
@@ -913,18 +924,25 @@ impl Facts {
     /// `f` over every expression the facts hold, a block's and an
     /// optional's included.
     fn each_expr(&mut self, f: &mut dyn FnMut(&mut IRExpr)) {
-        for binding in &mut self.bindings {
-            binding.filters.iter_mut().for_each(&mut *f);
-        }
-        self.filters.iter_mut().for_each(&mut *f);
         self.lets.values_mut().for_each(&mut *f);
         self.checks.iter_mut().for_each(|c| f(&mut c.value));
-        for block in &mut self.blocks {
-            block.inner.each_expr(f);
-            if let Some(arg) = block.left.arg_mut() {
-                f(arg);
+        for conjunct in &mut self.conjuncts {
+            match conjunct {
+                ConjunctFact::Filter { pred, values, .. } => {
+                    f(pred);
+                    for correlate in values {
+                        correlate.inner.each_expr(f);
+                        correlate.read.exprs_mut().for_each(&mut *f);
+                    }
+                }
+                ConjunctFact::Block { block, .. } => {
+                    block.inner.each_expr(f);
+                    if let Some(arg) = block.left.arg_mut() {
+                        f(arg);
+                    }
+                    f(&mut block.right);
+                }
             }
-            f(&mut block.right);
         }
         for optional in &mut self.optionals {
             optional.inner.each_expr(f);
@@ -944,19 +962,26 @@ impl Facts {
         if lets.is_empty() {
             return;
         }
-        for binding in &mut self.bindings {
-            binding.filters.iter_mut().for_each(|f| substitute(f, lets));
-        }
-        self.filters.iter_mut().for_each(|f| substitute(f, lets));
         self.checks
             .iter_mut()
             .for_each(|c| substitute(&mut c.value, lets));
-        for block in &mut self.blocks {
-            block.inner.substitute(lets);
-            if let Some(arg) = block.left.arg_mut() {
-                substitute(arg, lets);
+        for conjunct in &mut self.conjuncts {
+            match conjunct {
+                ConjunctFact::Filter { pred, values, .. } => {
+                    substitute(pred, lets);
+                    for correlate in values {
+                        correlate.inner.substitute(lets);
+                        correlate.read.exprs_mut().for_each(|e| substitute(e, lets));
+                    }
+                }
+                ConjunctFact::Block { block, .. } => {
+                    block.inner.substitute(lets);
+                    if let Some(arg) = block.left.arg_mut() {
+                        substitute(arg, lets);
+                    }
+                    substitute(&mut block.right, lets);
+                }
             }
-            substitute(&mut block.right, lets);
         }
         for optional in &mut self.optionals {
             optional.inner.substitute(lets);
@@ -976,7 +1001,6 @@ impl Facts {
 struct BindingFact {
     variable: String,
     type_name: String,
-    filters: Vec<IRExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -1005,10 +1029,12 @@ struct UnionFact {
     outer: HashSet<String>,
 }
 
-/// An `optional { }`: its pattern's facts.
+/// An `optional { }`: its pattern's facts, and whether its pattern can
+/// fail (the type checker's flag on its `Correlate`).
 #[derive(Debug, Clone)]
 struct OptionalFact {
     inner: Facts,
+    fails: bool,
 }
 
 /// A `from` over an inline read with its own aggregate, `distinct`, `order`
@@ -1020,6 +1046,33 @@ struct CorrelateFact {
     outer: HashSet<String>,
     read: InnerRead,
     optionals_before: usize,
+    /// The read can fail (the type checker's flag on its `Correlate`).
+    fails: bool,
+}
+
+impl CorrelateFact {
+    /// The read with every variable `renames` names renamed.
+    fn rename(&mut self, renames: &HashMap<String, String>) {
+        let rename = |variable: &mut String| {
+            if let Some(name) = renames.get(variable) {
+                *variable = name.clone();
+            }
+        };
+        self.inner.rename(renames);
+        self.outer = std::mem::take(&mut self.outer)
+            .into_iter()
+            .map(|mut name| {
+                rename(&mut name);
+                name
+            })
+            .collect();
+        for column in &mut self.read.columns {
+            if is_reference(&column.expr) {
+                rename(&mut column.column);
+            }
+        }
+        self.read.exprs_mut().for_each(|e| rename_expr(e, &rename));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1038,16 +1091,6 @@ fn is_reference(expr: &IRExpr) -> bool {
         expr,
         IRExpr::Variable(_, ExprType::Node { .. } | ExprType::Edge { .. })
     )
-}
-
-/// The variable every leaf of `e` reads, when it reads exactly one.
-fn single_variable(e: &IRExpr) -> Option<String> {
-    let mut cols = Vec::new();
-    e.columns(&mut cols);
-    match cols.as_slice() {
-        [one] => Some(one.clone()),
-        _ => None,
-    }
 }
 
 impl<'a> Shaper<'a> {
@@ -1180,6 +1223,7 @@ impl<'a> Shaper<'a> {
             input,
             items: finals,
             keep: false,
+            ..
         } = &read.term
         else {
             return Err(ShapeError::Internal(
@@ -1212,6 +1256,7 @@ impl<'a> Shaper<'a> {
                 input,
                 items: extended,
                 keep: true,
+                ..
             } => match input.as_ref() {
                 Term::Group {
                     input,
@@ -1889,6 +1934,7 @@ impl<'a> Shaper<'a> {
                 input,
                 items,
                 keep: false,
+                ..
             }) => self.inline_read(input, items, &[], &mut facts)?,
             _ => self.facts(population, &mut facts)?,
         }
@@ -2098,7 +2144,6 @@ impl<'a> Shaper<'a> {
                 facts.bindings.push(BindingFact {
                     variable: var.clone(),
                     type_name: type_name.clone(),
-                    filters: Vec::new(),
                 });
                 Ok(())
             }
@@ -2119,7 +2164,6 @@ impl<'a> Shaper<'a> {
                 facts.bindings.push(BindingFact {
                     variable: src.clone(),
                     type_name: edge.from_type.clone(),
-                    filters: Vec::new(),
                 });
                 self.traversal(
                     facts,
@@ -2169,7 +2213,7 @@ impl<'a> Shaper<'a> {
                 );
                 Ok(())
             }
-            Term::Filter { input, pred } => self.filter(input, pred, facts),
+            Term::Filter { input, pred, fails } => self.filter(input, pred, *fails, facts),
             // `let $v = e`: a value column, read wherever its name is. The
             // core evaluates it for every row before `where` (A3), which a
             // value that cannot fail makes the same rows as reading it in
@@ -2180,14 +2224,15 @@ impl<'a> Shaper<'a> {
                 input,
                 items,
                 keep: true,
+                fails,
             } => {
                 self.facts(input, facts)?;
                 for (name, value) in items {
                     let mut value = value.clone();
                     substitute(&mut value, &facts.lets);
-                    if value.can_fail() {
+                    if *fails {
                         facts.checks.push(LetCheck {
-                            name: Some(name.clone()),
+                            name: name.clone(),
                             value: value.clone(),
                             marks: facts.marks(),
                         });
@@ -2201,6 +2246,7 @@ impl<'a> Shaper<'a> {
                 input,
                 items,
                 keep: false,
+                ..
             } => self.inline_read(input, items, &[], facts),
             // `from name(args)`: the declared read's body, read as an inline
             // read with its parameters bound to the arguments.
@@ -2212,11 +2258,24 @@ impl<'a> Shaper<'a> {
                 })?;
                 self.inline_read(input, items, bindings, facts)
             }
-            Term::Correlate { outer, inner } => {
+            Term::Correlate {
+                outer,
+                inner,
+                fails,
+            } => {
                 if let Some(pattern) = optional_pattern(inner) {
-                    return self.optional(outer, pattern, facts);
+                    self.optional(outer, pattern, facts)?;
+                    if let Some(optional) = facts.optionals.last_mut() {
+                        optional.fails = *fails;
+                    }
+                    return Ok(());
                 }
                 self.facts(outer, facts)?;
+                // The correlated reads this element states run on every row
+                // the elements before it produce: the type checker's flag
+                // says whether one can fail there, and then nothing moves
+                // below it.
+                let mark = facts.correlates.len();
                 // A block read as a value in a `let` or a return item.
                 if let Term::Group { input, keys, aggs } = inner.as_ref() {
                     let ([(column, agg)], []) = (aggs.as_slice(), keys.as_slice()) else {
@@ -2224,12 +2283,17 @@ impl<'a> Shaper<'a> {
                             "a block that is not one aggregate without keys".into(),
                         ));
                     };
-                    return self.block_value(input, column, agg, facts);
+                    let value = self.block_value(input, column, agg, *fails, facts)?;
+                    facts.correlates.push(value);
+                } else if let Some((input, items, bindings)) = read_parts(inner) {
+                    self.inline_read(input, items, bindings, facts)?;
+                } else {
+                    self.facts(inner, facts)?;
                 }
-                if let Some((input, items, bindings)) = read_parts(inner) {
-                    return self.inline_read(input, items, bindings, facts);
+                for correlate in &mut facts.correlates[mark..] {
+                    correlate.fails |= *fails;
                 }
-                self.facts(inner, facts)
+                Ok(())
             }
             Term::Union { .. } => self.union(term, facts),
             other => Err(self.unlowered_node(other)),
@@ -2318,8 +2382,11 @@ impl<'a> Shaper<'a> {
             }
         }
         facts.optional_names.extend(introduced);
-        facts.failing_element |= pattern.can_fail();
-        facts.optionals.push(OptionalFact { inner });
+        // Its `Correlate`'s flag is set by the element that wrote it.
+        facts.optionals.push(OptionalFact {
+            inner,
+            fails: false,
+        });
         Ok(())
     }
 
@@ -2482,6 +2549,7 @@ impl<'a> Shaper<'a> {
             outer,
             read,
             optionals_before: facts.optionals.len(),
+            fails: false,
         });
         Ok(())
     }
@@ -2694,19 +2762,13 @@ impl<'a> Shaper<'a> {
                 *variable = name.clone();
             }
         };
-        facts.append(inner)?;
         // The inner `return` computes its values on every inner row, before
-        // any outer `where`: a value that can fail is evaluated there.
+        // any outer `where`: a value that can fail is evaluated there, by
+        // the check its `Project` states among the inner facts.
+        facts.append(inner)?;
         for (column, mut value) in values {
             rename_expr(&mut value, &rename);
             bind_params(&mut value, bindings);
-            if value.can_fail() {
-                facts.checks.push(LetCheck {
-                    name: Some(column.clone()),
-                    value: value.clone(),
-                    marks: facts.marks(),
-                });
-            }
             facts.lets.insert(column, value);
         }
         Ok(())
@@ -2788,6 +2850,7 @@ impl<'a> Shaper<'a> {
             input,
             items,
             keep: true,
+            ..
         } = term
             && matches!(input.as_ref(), Term::Group { .. })
         {
@@ -2811,6 +2874,7 @@ impl<'a> Shaper<'a> {
                 input,
                 items,
                 keep: true,
+                ..
             } = term
             && items
                 .iter()
@@ -3020,6 +3084,7 @@ impl<'a> Shaper<'a> {
             outer,
             read,
             optionals_before: facts.optionals.len(),
+            fails: false,
         });
         Ok(())
     }
@@ -3039,7 +3104,13 @@ impl<'a> Shaper<'a> {
         facts.traversals.push(t);
     }
 
-    fn filter(&self, input: &Term, pred: &IRExpr, facts: &mut Facts) -> Result<(), ShapeError> {
+    fn filter(
+        &self,
+        input: &Term,
+        pred: &IRExpr,
+        fails: bool,
+        facts: &mut Facts,
+    ) -> Result<(), ShapeError> {
         // A triple whose ends were both bound: the expansion to a fresh name
         // and the identity filter tying it to the end.
         if let Term::Expand {
@@ -3078,46 +3149,16 @@ impl<'a> Shaper<'a> {
         let mut cols = Vec::new();
         pred.columns(&mut cols);
         if cols.iter().any(|c| self.is_block_column(c)) {
-            return self.blocks(input, pred, facts);
+            return self.blocks(input, pred, fails, facts);
         }
         self.facts(input, facts)?;
-        // `where`'s conjuncts filter in written order, each on the rows the
-        // ones before it keep: a conjunct that can fail runs after every
-        // element, and no conjunct after it is pushed below it.
-        if facts.failing_filter || facts.failing_element || pred.can_fail() {
-            facts.failing_filter = true;
-            // A block's semi-join is placed after the scope's filters, so a
-            // conjunct written after a block that the last split does not
-            // already order splits the facts: the block filters first.
-            let split_blocks = facts.checks.last().map_or(0, |c| c.marks.blocks);
-            let split_optionals = facts.checks.last().map_or(0, |c| c.marks.optionals);
-            if facts.blocks.len() > split_blocks
-                || (facts.failing_element && facts.optionals.len() > split_optionals)
-            {
-                facts.checks.push(LetCheck {
-                    name: None,
-                    value: pred.clone(),
-                    marks: facts.marks(),
-                });
-            } else {
-                facts.filters.push(pred.clone());
-            }
-            return Ok(());
-        }
-        // A filter over one binding's variable, written right after it, is
-        // that binding's filter.
-        let mut below = input;
-        while let Term::Filter { input, .. } = below {
-            below = input;
-        }
-        if let Term::Scan { var, .. } = below
-            && single_variable(pred).as_deref() == Some(var.as_str())
-            && let Some(binding) = facts.bindings.iter_mut().rev().find(|b| b.variable == *var)
-        {
-            binding.filters.push(pred.clone());
-            return Ok(());
-        }
-        facts.filters.push(pred.clone());
+        // `where`'s conjuncts in written order, each with the type
+        // checker's flag: the planner's placement law decides which move.
+        facts.conjuncts.push(ConjunctFact::Filter {
+            pred: pred.clone(),
+            fails,
+            values: Vec::new(),
+        });
         Ok(())
     }
 
@@ -3127,10 +3168,21 @@ impl<'a> Shaper<'a> {
     /// filter over block values (a block under `or` or `not`, or compared
     /// with another block's value) reads each block's value as a column of
     /// its own correlated read, and the filter runs over those columns.
-    fn blocks(&self, input: &Term, pred: &IRExpr, facts: &mut Facts) -> Result<(), ShapeError> {
-        let mut groups: Vec<(&Term, &str, &Agg, Vec<Col>)> = Vec::new();
+    fn blocks(
+        &self,
+        input: &Term,
+        pred: &IRExpr,
+        fails: bool,
+        facts: &mut Facts,
+    ) -> Result<(), ShapeError> {
+        let mut groups: Vec<(&Term, &str, &Agg, Vec<Col>, bool)> = Vec::new();
         let mut below = input;
-        while let Term::Correlate { outer, inner } = below {
+        while let Term::Correlate {
+            outer,
+            inner,
+            fails: block_fails,
+        } = below
+        {
             let Term::Group { input, keys, aggs } = inner.as_ref() else {
                 break;
             };
@@ -3140,7 +3192,7 @@ impl<'a> Shaper<'a> {
                     "a block that is not one aggregate without keys".into(),
                 ));
             };
-            groups.push((input, column, agg, env_cols(input)));
+            groups.push((input, column, agg, env_cols(input), *block_fails));
             below = outer;
         }
         self.facts(below, facts)?;
@@ -3150,7 +3202,7 @@ impl<'a> Shaper<'a> {
         // their columns, not another block's value nor a full-text call.
         let comparisons: Option<Vec<(CompOp, IRExpr)>> = groups
             .iter()
-            .map(|(_, column, _, _)| {
+            .map(|(_, column, _, _, _)| {
                 block_comparison(pred, column).filter(|(_, right)| {
                     let mut read = Vec::new();
                     right.columns(&mut read);
@@ -3159,13 +3211,20 @@ impl<'a> Shaper<'a> {
             })
             .collect();
         let Some(comparisons) = comparisons else {
-            for (inner, column, agg, _) in groups {
-                self.block_value(inner, column, agg, facts)?;
+            // The blocks are read as values, each placed right before the
+            // conjunct that reads them.
+            let mut values = Vec::new();
+            for (inner, column, agg, _, block_fails) in groups {
+                values.push(self.block_value(inner, column, agg, block_fails, facts)?);
             }
-            facts.filters.push(pred.clone());
+            facts.conjuncts.push(ConjunctFact::Filter {
+                pred: pred.clone(),
+                fails,
+                values,
+            });
             return Ok(());
         };
-        for ((inner, _, agg, env), (op, right)) in groups.into_iter().zip(comparisons) {
+        for ((inner, _, agg, env, _), (op, right)) in groups.into_iter().zip(comparisons) {
             let (inner_facts, agg) = self.block_inner(inner, agg)?;
             let left = match &agg.arg {
                 // Counting a node binding counts its rows.
@@ -3184,12 +3243,15 @@ impl<'a> Shaper<'a> {
                     },
                 },
             };
-            facts.blocks.push(BlockFact {
-                inner: inner_facts,
-                outer: env.iter().map(|c| c.name.clone()).collect(),
-                left,
-                op,
-                right,
+            facts.conjuncts.push(ConjunctFact::Block {
+                block: Box::new(BlockFact {
+                    inner: inner_facts,
+                    outer: env.iter().map(|c| c.name.clone()).collect(),
+                    left,
+                    op,
+                    right,
+                }),
+                fails,
             });
         }
         Ok(())
@@ -3226,8 +3288,9 @@ impl<'a> Shaper<'a> {
         inner: &Term,
         column: &str,
         agg: &Agg,
+        fails: bool,
         facts: &mut Facts,
-    ) -> Result<(), ShapeError> {
+    ) -> Result<CorrelateFact, ShapeError> {
         let outer: HashSet<String> = env_columns(inner).into_iter().collect();
         let (mut inner_facts, agg) = self.block_inner(inner, agg)?;
         inner_facts.inlined = facts.inlined;
@@ -3317,13 +3380,13 @@ impl<'a> Shaper<'a> {
             limit_param: None,
         };
         facts.lets.insert(column.to_string(), value);
-        facts.correlates.push(CorrelateFact {
+        Ok(CorrelateFact {
             inner: inner_facts,
             outer,
             read,
             optionals_before: facts.optionals.len(),
-        });
-        Ok(())
+            fails,
+        })
     }
 
     /// The scope's traversals as expansions from the names already bound,
@@ -3336,7 +3399,6 @@ impl<'a> Shaper<'a> {
         traversals: &[&TraversalFact],
         pipeline: &mut Vec<PatternStep>,
         bound_vars: &mut HashSet<String>,
-        deferred_filters: &mut HashMap<String, Vec<IRExpr>>,
         fresh: &mut FreshNames,
         optional_names: &HashSet<String>,
     ) -> Result<(), ShapeError> {
@@ -3376,8 +3438,9 @@ impl<'a> Shaper<'a> {
                         },
                         false => string.clone(),
                     };
-                    pipeline.push(PatternStep::Filter(
-                        crate::ir::coerce::binary(
+                    // The identity test closing the triple cannot fail.
+                    pipeline.push(PatternStep::Filter {
+                        pred: crate::ir::coerce::binary(
                             IRExpr::PropAccess {
                                 variable: temp_var,
                                 property: id.clone(),
@@ -3391,10 +3454,9 @@ impl<'a> Shaper<'a> {
                             },
                         )
                         .map_err(|e| ShapeError::Internal(e.to_string()))?,
-                    ));
+                        fails: false,
+                    });
                 } else if !src_bound && dst_bound {
-                    let introduced_filters =
-                        deferred_filters.remove(&traversal.src).unwrap_or_default();
                     let dst_var = if traversal.src == "_" {
                         fresh.anon()
                     } else {
@@ -3408,15 +3470,13 @@ impl<'a> Shaper<'a> {
                         dst_type: traversal.src_type.clone(),
                         min_hops: traversal.min_hops,
                         max_hops: traversal.max_hops,
-                        dst_filters: introduced_filters,
+                        dst_filters: Vec::new(),
                         edge_binding,
                     });
                     if traversal.src != "_" {
                         bound_vars.insert(traversal.src.clone());
                     }
                 } else {
-                    let introduced_filters =
-                        deferred_filters.remove(&traversal.dst).unwrap_or_default();
                     let dst_var = if traversal.dst == "_" {
                         fresh.anon()
                     } else {
@@ -3430,7 +3490,7 @@ impl<'a> Shaper<'a> {
                         dst_type: traversal.dst_type.clone(),
                         min_hops: traversal.min_hops,
                         max_hops: traversal.max_hops,
-                        dst_filters: introduced_filters,
+                        dst_filters: Vec::new(),
                         edge_binding,
                     });
                     if traversal.dst != "_" {
@@ -3487,12 +3547,9 @@ impl<'a> Shaper<'a> {
                 outer_physical_names,
                 fresh,
             )?;
-            pipeline.push(match &check.name {
-                Some(name) => PatternStep::Let {
-                    name: name.clone(),
-                    value: check.value.clone(),
-                },
-                None => PatternStep::Filter(check.value.clone()),
+            pipeline.push(PatternStep::Let {
+                name: check.name.clone(),
+                value: check.value.clone(),
             });
             from = check.marks;
         }
@@ -3553,6 +3610,7 @@ impl<'a> Shaper<'a> {
             outer_var,
             inner,
             read: correlate.read.clone(),
+            fails: correlate.fails,
         });
         Ok(())
     }
@@ -3689,8 +3747,6 @@ impl<'a> Shaper<'a> {
                 }
             }
         }
-        let mut deferred_filters: HashMap<String, Vec<IRExpr>> = HashMap::new();
-        let mut rebind_filters: Vec<IRExpr> = Vec::new();
         for binding in &bindings {
             ranked_scans.retain(|&(anchor, variable, type_name)| {
                 if anchor != Some(binding.variable.as_str()) {
@@ -3704,24 +3760,13 @@ impl<'a> Shaper<'a> {
                 bound_vars.insert(variable.to_string());
                 false
             });
-            let binding_filters = binding.filters.clone();
-            if bound_vars.contains(&binding.variable) {
-                rebind_filters.extend(binding_filters);
-                continue;
-            }
-            if deferred_set.contains(&binding.variable) {
-                if !binding_filters.is_empty() {
-                    deferred_filters
-                        .entry(binding.variable.clone())
-                        .or_default()
-                        .extend(binding_filters);
-                }
+            if bound_vars.contains(&binding.variable) || deferred_set.contains(&binding.variable) {
                 continue;
             }
             pipeline.push(PatternStep::NodeScan {
                 variable: binding.variable.clone(),
                 type_name: binding.type_name.clone(),
-                filters: binding_filters,
+                filters: Vec::new(),
             });
             bound_vars.insert(binding.variable.clone());
         }
@@ -3753,11 +3798,9 @@ impl<'a> Shaper<'a> {
             &before_optional,
             pipeline,
             bound_vars,
-            &mut deferred_filters,
             fresh,
             &facts.optional_names,
         )?;
-        pipeline.extend(rebind_filters.into_iter().map(PatternStep::Filter));
         let mut correlates = facts.correlates.iter().peekable();
         for (index, optional) in facts.optionals.iter().enumerate() {
             while let Some(correlate) =
@@ -3785,6 +3828,7 @@ impl<'a> Shaper<'a> {
             pipeline.push(PatternStep::Optional {
                 outer_var: outer_var.unwrap_or_default(),
                 inner,
+                fails: optional.fails,
             });
         }
         // A read returning only values that reads a name the traversals
@@ -3810,53 +3854,68 @@ impl<'a> Shaper<'a> {
             &after_optional,
             pipeline,
             bound_vars,
-            &mut deferred_filters,
             fresh,
             &facts.optional_names,
         )?;
         for correlate in deferred {
             self.place_correlate(correlate, pipeline, bound_vars, outer_physical_names, fresh)?;
         }
-        for filter in &facts.filters {
-            pipeline.push(PatternStep::Filter(filter.clone()));
-        }
-        if facts.blocks.is_empty() {
-            return Ok(());
-        }
-        let mut physical_names = outer_physical_names.clone();
-        for step in pipeline.iter() {
-            match step {
-                PatternStep::NodeScan { variable, .. } => {
-                    physical_names.insert(variable.clone());
-                }
-                PatternStep::Expand {
-                    dst_var,
-                    edge_binding,
-                    ..
+        // The conjuncts in written order, after every element: a value
+        // block right before the conjunct that reads it, a compared block
+        // as its semi-join. The planner's placement law moves the ones that
+        // may move.
+        for conjunct in &facts.conjuncts {
+            match conjunct {
+                ConjunctFact::Filter {
+                    pred,
+                    fails,
+                    values,
                 } => {
-                    physical_names.insert(dst_var.clone());
-                    physical_names.extend(edge_binding.iter().cloned());
+                    for value in values {
+                        self.place_correlate(
+                            value,
+                            pipeline,
+                            bound_vars,
+                            outer_physical_names,
+                            fresh,
+                        )?;
+                    }
+                    pipeline.push(PatternStep::Filter {
+                        pred: pred.clone(),
+                        fails: *fails,
+                    });
                 }
-                PatternStep::Optional { inner, .. } => {
-                    physical_names.extend(self::physical_names(inner));
+                ConjunctFact::Block { block, fails } => {
+                    self.place_block(
+                        block,
+                        *fails,
+                        pipeline,
+                        bound_vars,
+                        outer_physical_names,
+                        fresh,
+                    )?;
                 }
-                PatternStep::Union { bindings, .. } => {
-                    physical_names.extend(bindings.iter().cloned());
-                }
-                PatternStep::Correlate { read, .. } => {
-                    physical_names.extend(read.references().map(str::to_string));
-                }
-                PatternStep::Fuse { target, .. } => {
-                    physical_names.insert(target.clone());
-                }
-                PatternStep::Filter(_)
-                | PatternStep::AntiJoin { .. }
-                | PatternStep::Rank { .. }
-                | PatternStep::Score { .. }
-                | PatternStep::Let { .. } => {}
             }
         }
-        for block in &facts.blocks {
+        Ok(())
+    }
+
+    /// A block compared with a value of the outer row, after the steps in
+    /// `pipeline`: its pattern placed as a scope of its own over the outer
+    /// names it correlates on, then the semi-join that keeps the outer rows
+    /// its aggregate passes.
+    fn place_block(
+        &self,
+        block: &BlockFact,
+        fails: bool,
+        pipeline: &mut Vec<PatternStep>,
+        bound_vars: &HashSet<String>,
+        outer_physical_names: &HashSet<String>,
+        fresh: &mut FreshNames,
+    ) -> Result<(), ShapeError> {
+        let mut physical_names = outer_physical_names.clone();
+        physical_names.extend(self::physical_names(pipeline));
+        {
             let visible_outer: HashSet<String> = bound_vars
                 .iter()
                 .filter(|name| block.outer.contains(*name))
@@ -3901,6 +3960,7 @@ impl<'a> Shaper<'a> {
                 outer_var: outer_var.unwrap_or_default(),
                 inner: inner_pipeline,
                 predicate,
+                fails,
             });
         }
         Ok(())
@@ -4061,7 +4121,7 @@ fn node_type_in(term: &Term, variable: &str) -> Option<String> {
         | Term::Cut { input, .. }
         | Term::Score { input, .. }
         | Term::ApproxTopK { input, .. } => node_type_in(input, variable),
-        Term::Correlate { outer, inner } => {
+        Term::Correlate { outer, inner, .. } => {
             node_type_in(inner, variable).or_else(|| node_type_in(outer, variable))
         }
         Term::Union { left, .. } => node_type_in(left, variable),
@@ -4141,6 +4201,7 @@ fn optional_pattern(inner: &Term) -> Option<&Term> {
     let Term::Correlate {
         outer: row,
         inner: grouped,
+        ..
     } = input.as_ref()
     else {
         return None;
@@ -4175,9 +4236,7 @@ fn nullable_result(agg: &Agg) -> ExprType {
 
 /// The outer variable a block correlates on: the first its traversals
 /// touch, else the first of its bindings that is outer-bound, else the first
-/// its filters read. The term places a filter as soon as its variables are
-/// bound, so the written order of filters and traversals is not recoverable;
-/// a block's traversals come first.
+/// its conjuncts read: a block's traversals come first.
 fn find_outer_var(facts: &Facts, outer_bound: &HashSet<String>) -> Option<String> {
     let traversal = facts.traversals.iter().find_map(|t| {
         [&t.src, &t.dst]
@@ -4194,17 +4253,12 @@ fn find_outer_var(facts: &Facts, outer_bound: &HashSet<String>) -> Option<String
     };
     let filter = || {
         facts
-            .bindings
+            .conjuncts
             .iter()
-            .flat_map(|b| b.filters.iter())
-            .chain(facts.filters.iter())
-            .chain(
-                facts
-                    .checks
-                    .iter()
-                    .filter(|c| c.name.is_none())
-                    .map(|c| &c.value),
-            )
+            .filter_map(|c| match c {
+                ConjunctFact::Filter { pred, .. } => Some(pred),
+                ConjunctFact::Block { .. } => None,
+            })
             .find_map(|f| {
                 let mut cols = Vec::new();
                 f.columns(&mut cols);
@@ -4275,7 +4329,7 @@ fn rename_inner_bindings(
                 }
                 expressions.extend(dst_filters);
             }
-            PatternStep::Filter(expr) => expressions.push(expr),
+            PatternStep::Filter { pred, .. } => expressions.push(pred),
             PatternStep::Rank { binding, key, .. } => {
                 rename(binding);
                 expressions.push(key);
@@ -4289,13 +4343,16 @@ fn rename_inner_bindings(
                 outer_var,
                 inner,
                 predicate,
+                ..
             } => {
                 rename(outer_var);
                 expressions.extend(predicate.left.arg_mut());
                 expressions.push(&mut predicate.right);
                 pending.extend(inner);
             }
-            PatternStep::Optional { outer_var, inner } => {
+            PatternStep::Optional {
+                outer_var, inner, ..
+            } => {
                 rename(outer_var);
                 pending.extend(inner);
             }
@@ -4314,6 +4371,7 @@ fn rename_inner_bindings(
                 outer_var,
                 inner,
                 read,
+                ..
             } => {
                 if let Some(outer_var) = outer_var {
                     rename(outer_var);
@@ -4396,12 +4454,14 @@ fn read_parts(term: &Term) -> Option<(&Term, &[Item], &[Item])> {
             input,
             items,
             keep: false,
+            ..
         } => Some((input, items, &[])),
         Term::Call { bindings, body, .. } => match body.as_ref() {
             Term::Project {
                 input,
                 items,
                 keep: false,
+                ..
             } => Some((input, items, bindings)),
             _ => None,
         },
@@ -4410,40 +4470,12 @@ fn read_parts(term: &Term) -> Option<(&Term, &[Item], &[Item])> {
 }
 
 /// Every expression of a called read's facts with each of its parameters
-/// read as the argument bound to it. A binding's filter whose argument reads
-/// a caller's column is no longer over that binding alone: it joins the
-/// scope's filters, which run once both are bound.
+/// read as the argument bound to it.
 fn bind_arguments(facts: &mut Facts, bindings: &[(String, IRExpr)]) {
     if bindings.is_empty() {
         return;
     }
     facts.each_expr(&mut |e| bind_params(e, bindings));
-    rehome_binding_filters(facts);
-}
-
-/// `facts` with every binding filter that reads more than its binding moved
-/// to the scope's filters, nested scopes included.
-fn rehome_binding_filters(facts: &mut Facts) {
-    for binding in &mut facts.bindings {
-        let (own, other): (Vec<IRExpr>, Vec<IRExpr>) = std::mem::take(&mut binding.filters)
-            .into_iter()
-            .partition(|f| {
-                let mut cols = Vec::new();
-                f.columns(&mut cols);
-                cols.iter().all(|c| *c == binding.variable)
-            });
-        binding.filters = own;
-        facts.filters.extend(other);
-    }
-    for block in &mut facts.blocks {
-        rehome_binding_filters(&mut block.inner);
-    }
-    for optional in &mut facts.optionals {
-        rehome_binding_filters(&mut optional.inner);
-    }
-    for union in &mut facts.unions {
-        union.arms.iter_mut().for_each(rehome_binding_filters);
-    }
 }
 
 /// `expr` with every parameter `bindings` names read as its argument.

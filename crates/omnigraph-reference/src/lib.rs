@@ -688,7 +688,12 @@ impl<'a> Interpreter<'a> {
                     ordered: false,
                 }
             }
-            Term::Filter { input, pred } => {
+            Term::Filter {
+                input,
+                pred,
+                fails: false,
+            } if let Some(sunk) = sink(input, pred) => self.term(&sunk, env)?,
+            Term::Filter { input, pred, .. } => {
                 let input = self.term(input, env)?;
                 let mut rows = Vec::new();
                 for row in input.rows {
@@ -701,7 +706,9 @@ impl<'a> Interpreter<'a> {
                     ordered: input.ordered,
                 }
             }
-            Term::Project { input, items, keep } => {
+            Term::Project {
+                input, items, keep, ..
+            } => {
                 let input = self.term(input, env)?;
                 let mut rows = Vec::new();
                 for row in input.rows {
@@ -749,7 +756,7 @@ impl<'a> Interpreter<'a> {
                     ordered: false,
                 }
             }
-            Term::Correlate { outer, inner } => {
+            Term::Correlate { outer, inner, .. } => {
                 let outer = self.term(outer, env)?;
                 let mut rows = Vec::new();
                 for row in outer.rows {
@@ -1545,6 +1552,95 @@ fn typed(v: Value, scalar: Option<ScalarType>) -> Value {
 }
 
 /// A term's column names, in column order.
+/// `Filter(input, pred)` with a conjunct that cannot fail evaluated where
+/// the columns it reads first exist: into the outer or the inner side of a
+/// `Correlate` that cannot fail, below an expansion it reads no new column
+/// of, past another conjunct that cannot fail and below a `let` that cannot
+/// fail and that it does not read. `None` when it stays where it is
+/// written. A conjunct that cannot fail is pure and total, so this changes
+/// no answer; it keeps a product of independent bindings from being built
+/// whole before its key equalities filter it. Nothing moves below a term
+/// that can fail.
+fn sink(input: &Term, pred: &IRExpr) -> Option<Term> {
+    let mut read = Vec::new();
+    pred.columns(&mut read);
+    let within = |cols: &[String]| read.iter().all(|c| cols.contains(c));
+    let filter = |input: Term| Term::Filter {
+        input: input.boxed(),
+        pred: pred.clone(),
+        fails: false,
+    };
+    let sunk = |input: &Term| sink(input, pred).unwrap_or_else(|| filter(input.clone()));
+    match input {
+        Term::Correlate {
+            outer,
+            inner,
+            fails: false,
+        } => {
+            let outer_cols = columns(outer);
+            if within(&outer_cols) {
+                return Some(Term::Correlate {
+                    outer: sunk(outer).boxed(),
+                    inner: inner.clone(),
+                    fails: false,
+                });
+            }
+            let added: Vec<String> = columns(inner)
+                .into_iter()
+                .filter(|c| !outer_cols.contains(c))
+                .collect();
+            (!read.is_empty() && within(&added)).then(|| Term::Correlate {
+                outer: outer.clone(),
+                inner: sunk(inner).boxed(),
+                fails: false,
+            })
+        }
+        // Past another conjunct that cannot fail only to sink further.
+        Term::Filter {
+            input: below,
+            pred: other,
+            fails: false,
+        } => sink(below, pred).map(|below| Term::Filter {
+            input: below.boxed(),
+            pred: other.clone(),
+            fails: false,
+        }),
+        Term::Expand {
+            input: below,
+            src,
+            dst,
+            src_type,
+            dst_type,
+            edges,
+            min_hops,
+            max_hops,
+            edge_var,
+        } if within(&columns(below)) => Some(Term::Expand {
+            input: sunk(below).boxed(),
+            src: src.clone(),
+            dst: dst.clone(),
+            src_type: src_type.clone(),
+            dst_type: dst_type.clone(),
+            edges: edges.clone(),
+            min_hops: *min_hops,
+            max_hops: *max_hops,
+            edge_var: edge_var.clone(),
+        }),
+        Term::Project {
+            input: below,
+            items,
+            keep: true,
+            fails: false,
+        } if !items.iter().any(|(name, _)| read.contains(name)) => Some(Term::Project {
+            input: sunk(below).boxed(),
+            items: items.clone(),
+            keep: true,
+            fails: false,
+        }),
+        _ => None,
+    }
+}
+
 fn columns(t: &Term) -> Vec<String> {
     match t {
         Term::Unit => Vec::new(),
@@ -1564,7 +1660,9 @@ fn columns(t: &Term) -> Vec<String> {
         Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
             columns(input)
         }
-        Term::Project { input, items, keep } => {
+        Term::Project {
+            input, items, keep, ..
+        } => {
             let mut out = if *keep { columns(input) } else { Vec::new() };
             for (name, _) in items {
                 if !out.contains(name) {
@@ -1578,7 +1676,7 @@ fn columns(t: &Term) -> Vec<String> {
             .map(|(n, _)| n.clone())
             .chain(aggs.iter().map(|(n, _)| n.clone()))
             .collect(),
-        Term::Correlate { outer, inner } => {
+        Term::Correlate { outer, inner, .. } => {
             let mut out = columns(outer);
             for name in columns(inner) {
                 if !out.contains(&name) {

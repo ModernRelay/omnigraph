@@ -907,7 +907,7 @@ fn a_let_that_can_fail_runs_before_where_and_the_elements_after_it() {
                 "let"
             }
             PatternStep::Expand { .. } => "expand",
-            PatternStep::Filter(_) => "filter",
+            PatternStep::Filter { .. } => "filter",
             other => panic!("unexpected step {other:?}"),
         })
         .collect();

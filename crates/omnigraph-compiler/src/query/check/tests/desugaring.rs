@@ -142,12 +142,14 @@ fn env(cols: &[(&str, Ty)]) -> Term {
 }
 fn filter(input: Term, pred: IRExpr) -> Term {
     Term::Filter {
+        fails: false,
         input: input.boxed(),
         pred,
     }
 }
 fn corr(outer: Term, inner: Term) -> Term {
     Term::Correlate {
+        fails: false,
         outer: outer.boxed(),
         inner: inner.boxed(),
     }
@@ -210,7 +212,9 @@ fn exists(c: &str) -> IRExpr {
 }
 fn inline_ret(input: Term, cols: &[(&str, Ty)]) -> Term {
     Term::Project {
+        fails: false,
         input: Term::Project {
+            fails: false,
             input: input.boxed(),
             items: cols
                 .iter()
@@ -277,6 +281,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             "count { p } as a value: Correlate(R, Group(p, [], [agg])), the aggregate column",
             "query f() { match { $p: Person, let $n = count { $q: Person, $p knows $q } } return { $n } }",
             Term::Project {
+                fails: false,
                 input: block(scan("p", "Person"), knows_q_from_env(), "Block2").boxed(),
                 items: vec![("n".into(), col("Block2", val(ScalarType::I64, false)))],
                 keep: true,
@@ -328,6 +333,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
                     Term::Union {
                         left: works().boxed(),
                         right: Term::Project {
+                            fails: false,
                             input: filter(
                                 block(env(&[("p", node("Person"))]), works(), "_opt"),
                                 not(exists("_opt")),
@@ -419,6 +425,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             "let $v = expr: Project adding one named column",
             "query f() { match { $p: Person, let $a = $p.age } return { $a } }",
             Term::Project {
+                fails: false,
                 input: scan("p", "Person").boxed(),
                 items: vec![("a".into(), prop("p", "age", age()))],
                 keep: true,
@@ -437,7 +444,9 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             "query f() { match { from union({ match { $c: Company } return { $c } }, { match { $d: Company } return { $d as c } }, { match { $e: Company } return { $e as c } }) } return { $c } }",
             {
                 let arm = |v: &str| Term::Project {
+                    fails: false,
                     input: Term::Project {
+                        fails: false,
                         input: scan(v, "Company").boxed(),
                         items: vec![("^c".into(), col(v, node("Company")))],
                         keep: true,
@@ -521,9 +530,11 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
     );
     let name = val(ScalarType::String, false);
     let want = Term::Project {
+        fails: false,
         input: Term::Cut {
             input: Term::Order {
                 input: Term::Project {
+                    fails: false,
                     input: scan("p", "Person").boxed(),
                     items: vec![("^p.name".into(), prop("p", "name", name.clone()))],
                     keep: true,

@@ -94,8 +94,10 @@ impl PatternEdge {
 /// column read), and one binding's scan is bounded by its own filter (a key
 /// or unique equality or a list membership) below its table's row count. The
 /// root is the binding with the fewest estimated rows, the first in the
-/// correlated tree on a tie. `None` when the block does not qualify, a block
-/// holding a term that can fail among them.
+/// correlated tree on a tie. `None` when the block does not qualify. The
+/// caller offers no block that can fail: run from a bound key, a block
+/// evaluates its terms on rows no outer row reaches, where a term that can
+/// fail would refuse a read the correlated form answers (A3).
 pub(crate) fn key_set_tree(
     plan: &LogicalPlan,
     inner: LogicalId,
@@ -197,24 +199,6 @@ pub(crate) fn key_set_tree(
     if let Some(argument) = predicate.left.arg() {
         reads_of_expr(argument, &mut reads);
     }
-    // Run from a bound key, the block evaluates its terms on rows no outer
-    // row reaches; a term that can fail there would refuse a read the
-    // correlated form answers (A3), so such a block stays correlated.
-    let scan_filters_fail = scans.values().any(|scan| {
-        matches!(
-            plan.node(*scan),
-            Some(LogicalNode::TableScan { spec, .. })
-                if spec.filter.as_ref().is_some_and(|filter| {
-                    filter.gq_filters().iter().any(IRExpr::can_fail)
-                })
-        )
-    });
-    if scan_filters_fail
-        || residual.iter().any(IRExpr::can_fail)
-        || predicate.left.arg().is_some_and(IRExpr::can_fail)
-    {
-        return Ok(None);
-    }
     if edges.is_empty()
         || reads.iter().any(|read| !introduced.contains(&read.binding))
         || vertices[1..]
@@ -302,6 +286,7 @@ pub(crate) fn key_set_tree(
             LogicalNode::Filter {
                 input: top,
                 conjuncts: residual,
+                fails: false,
             },
             schema,
         );

@@ -96,7 +96,8 @@ named relation: `let $cs = { match { $c: Company } return { $c } }, from $cs`.
 
 `let $v = expr` names a value for `where`, `return`, `order` and later
 elements; a value that can fail (arithmetic) runs on every row before
-`where`, so it fails (`E1`, `E2`) on rows `where` removes: guard it with
+`where`, as does a `from` or an `optional` over one, so it fails (`E1`,
+`E2`) on rows `where` removes: guard it with
 `if(cond, value, 0)` or write it in `return`, which runs after `where`.
 Arithmetic (`+ - * / %`, unary `-`), `if` and `coalesce` widen two numeric
 types to their common one: the wider integer, `I64` for `U32` with a signed

@@ -23,8 +23,8 @@ A query runs against one resolved `ReadTarget`:
    lowers to its ranked scan with `RankScope::Window`, a `Sort` by distance
    then the target's identity, and a `TargetCut` that keeps every row of the
    first `k` targets; the elements and `where` after it are steps above the
-   cut, and filter placement treats the cut as a scope boundary, so no
-   filter moves below it (law 2). The overfetch ladder fills the cut's `k`
+   cut, which selects over the whole relation, so the placement law moves no
+   conjunct below it (law 2). The overfetch ladder fills the cut's `k`
    targets, read from its `selected_targets` counter, instead of the read's
    `limit`. `bm25` has no window. An `rrf` is a `PatternStep::Fuse` whose
    arms are pipelines of their own, each the steps its ranking takes standing
@@ -36,8 +36,8 @@ A query runs against one resolved `ReadTarget`:
    placed after the scope's bindings and traversals and before its filters
    and blocks: its own pattern placed over the outer row, and the logical
    and physical `OptionalJoin` over an `OuterReference`; a traversal from a
-   name it introduces expands after it, filter placement treats its inner
-   tree as a scope of its own, `$x is null` over a reference tests the
+   name it introduces expands after it, its inner tree is a scope of its own
+   for the placement law, `$x is null` over a reference tests the
    identity column, and plan acceptance requires one `OptionalJoin` per
    written optional testing its own conjuncts inside its inner tree and
    nowhere else. A `let` inside it is read in place inside it, and after it
@@ -68,7 +68,7 @@ A query runs against one resolved `ReadTarget`:
    new node kind: no existing one groups, orders or cuts per outer row. With
    an outer name read, its inner tree's leaf is an `OuterReference`;
    without one it runs once and a `CrossJoin` joins it to the elements
-   before it. Filter placement treats its inner tree as a scope of its own,
+   before it. Its inner tree is a scope of its own for the placement law,
    and plan acceptance requires one `Correlate` per such read, returning the
    same read and testing its pattern's conjuncts inside its inner tree.
    A block read as a value (in a `let`, as a return item, compared with
@@ -93,8 +93,8 @@ A query runs against one resolved `ReadTarget`:
    `PatternStep::Score`, the logical and physical `Score` (a new node kind:
    no existing one appends a per-row score without an index or a cut), then
    the elements and `where` after it; its `order` and `limit` are the read's
-   own `Sort` and `Limit` over the `_distance` column, and filter placement
-   treats the node as a scope boundary, since that column exists only above
+   own `Sort` and `Limit` over the `_distance` column, and the node selects
+   over the whole relation for the placement law, so no conjunct moves below
    it. Binding resolves its query vector by node id as it does a `nearest`
    scan's, and plan acceptance requires one `Score` per written `distance`
    over the same binding, property and query.
@@ -121,9 +121,9 @@ A query runs against one resolved `ReadTarget`:
    physical `Let` (a new node kind: no existing node evaluates a value on
    every row without removing or replacing one). The shaper records where
    the `let` was written among the scope's facts and places the facts before
-   it, the `Let`, then the rest; the type checker places every `where`
-   conjunct of the scope above it, and filter placement treats it as a scope
-   boundary, so no conjunct runs below it (A3). The value is pure: a read of
+   it, the `Let`, then the rest; the type checker writes every `where`
+   conjunct of the scope above it, and the `Let` declares that it can fail,
+   so the placement law moves no conjunct below it (A3). The value is pure: a read of
    its name evaluates it in place. Plan acceptance requires one `Let` per such
    value, evaluating the same expression, and `if` and `coalesce` evaluate an
    argument only on the rows that select it.
@@ -522,16 +522,49 @@ A read query runs from a plan. The doors
 query shape the planner refuses (`UnsupportedQuery`) is a `BadRequest` user
 error on execute, the error `explain_query` gives for it.
 
-Filter placement is a planner decision, the `predicate_pushdown` pass
-on a query plan (`place_query_filters`, per scope: the top-level tree and
-each correlated block's inner tree on its own): every conjunct that holds a
-`match_terms` stays a `Filter`, never a scan's or a join's own conjuncts; a scalar filter on exactly one binding that
-`QuerySource::filter_pushable` accepts moves to that binding's scan
-(`ScanSpec.filter`, a `Predicate::Gq` carrying the `IRFilter`), including
-the dependent scan that hydrates an expansion destination; a
-filter on two bindings, one the scanner cannot lower, or one on an outer
-binding inside a negation stays an in-memory `Filter` node where the query
-wrote it. A scan with a
+Where a `where` conjunct runs is decided by one law, applied once, in the
+planner's `placement` module (`crates/omnigraph-planner/src/placement.rs`,
+the `predicate_pushdown` pass on a query plan; the GQ 3 RFC states it after
+`where`'s written-order passage in section 2). The type checker writes every
+conjunct of a scope after the scope's elements, in written order, each a
+`Filter` with one typed fact computed once, `fails`: whether it can fail where
+it is evaluated (arithmetic, or a block it reads as a value that can fail). It
+writes the same fact on every element that can fail: a `let`, a `from`, an
+`optional` and a block read as a value. The shaper keeps that order and those
+facts (`PatternStep::Filter { fails }` and the `fails` of `AntiJoin`,
+`Optional` and `Correlate`), and the logical plan carries them on `Filter`,
+`AntiJoin`, `OptionalJoin` and `Correlate`; no other layer decides what can
+fail. A conjunct that cannot fail moves down from where it is written into the
+scan of the one binding it reads (`ScanSpec.filter`, a `Predicate::Gq`, when
+`QuerySource::filter_pushable` accepts it; the dependent scan that hydrates an
+expansion destination included), or to just above the lowest node whose
+passing inputs do not carry every binding it reads. It never moves below a
+node that can fail, so the conjuncts written before the scope's first one that
+can fail are the ones that move, and that one and every one after it keep their
+written order above every element. A node that selects rows within a group (a
+`limit`, a sort with a fetch, a ranking's `TargetCut`, a `Nearest`, a `Score`,
+and later `shortest`) declares its group key, and a conjunct crosses it only
+when every binding it reads belongs to that key; each of today's declares an
+empty key, a selection over the whole relation, which a conjunct reading a
+column never crosses. Every logical node declares these facts in one
+exhaustive method (`LogicalNode::declares`: whether it can fail, its group key,
+the inputs a conjunct may pass into, the binding a scan absorbs), and the law
+reads only that, never a node's kind. An inner scope (a block's, an
+`optional`'s or a correlated read's pattern, a union's or a fusion's arm) is no
+node's passing input, so a conjunct never moves into one; its own conjuncts
+are placed by the same law within it. A conjunct that holds a `match_terms`
+stays where it is written. Adjacent conjuncts that cannot fail are one `Filter`
+node before and after the moves; a node holding a conjunct that can fail is
+never merged with one that cannot, and lowering puts only a node of conjuncts
+that cannot fail into a `CrossJoin`'s own filters, so the join never runs a
+later conjunct before one that can fail. Plan acceptance holds the plan to the
+law independently (`validate/placement.rs`): it reads each scope's conjuncts
+and their facts from the checked core read, not from the shape or the
+optimizer, and refuses a plan that tests a conjunct written at or after the
+scope's first one that can fail in a scan, below an element of its scope, or
+before a conjunct written ahead of it.
+
+A scan with a
 SQL-string filter inspects its planned filter for full-text demand (a
 `contains_tokens` call); full-text index coverage
 (`FullTextIndexRebuildRequired`) is checked only when a native full-text query

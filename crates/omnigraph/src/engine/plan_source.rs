@@ -112,6 +112,9 @@ pub(crate) struct QuerySource<'a> {
     /// The compiled query with every constant of a filter position folded to
     /// its bound value (`engine::constant`); the planner reads no other form.
     pub ir: ReadShape,
+    /// The checked core read, which plan acceptance derives the placement
+    /// of the conjuncts from.
+    pub core: Arc<omnigraph_compiler::ir::core::CoreRead>,
     pub catalog: &'a Arc<Catalog>,
     /// The pinned snapshot of the user graph; `None` under the
     /// catalogue-only scope, where every table the planner asks for is a
@@ -167,6 +170,7 @@ impl<'a> QuerySource<'a> {
         };
         let mut source = QuerySource {
             ir,
+            core: Arc::clone(&query.core),
             catalog,
             snapshot,
             params,
@@ -626,6 +630,7 @@ impl QuerySource<'_> {
         AcceptInput {
             catalog: self.catalog,
             ir: &self.ir,
+            core: Some(&self.core),
             params: self.params.shared(),
             keys,
             limits: ValidationLimits::DEFAULT,
@@ -655,6 +660,7 @@ pub(crate) fn accept_replay(
     let input = AcceptInput {
         catalog,
         ir: &ir,
+        core: Some(&query.core),
         params: &params,
         keys: &keys,
         limits: ValidationLimits::DEFAULT,
@@ -753,21 +759,24 @@ async fn query_table_statistics(
                     inner,
                     outer_var: _,
                     predicate: _,
+                    fails: _,
                 } => pending.push(inner),
                 PatternStep::Optional {
                     inner,
                     outer_var: _,
+                    fails: _,
                 }
                 | PatternStep::Correlate {
                     inner,
                     outer_var: _,
                     read: _,
+                    fails: _,
                 } => pending.push(inner),
                 PatternStep::Union { arms, .. } => pending.extend(arms.iter().map(Vec::as_slice)),
                 PatternStep::Fuse { arms, .. } => {
                     pending.extend(arms.iter().map(|arm| arm.steps.as_slice()))
                 }
-                PatternStep::Filter(_)
+                PatternStep::Filter { .. }
                 | PatternStep::Rank { .. }
                 | PatternStep::Score { .. }
                 | PatternStep::Let { .. } => {}

@@ -214,9 +214,16 @@ pub enum Term {
         max_hops: Option<u32>,
         edge_var: Option<String>,
     },
+    /// A `where` conjunct in its written position, over every element of
+    /// its scope, or a closing triple's identity test.
     Filter {
         input: Box<Term>,
         pred: IRExpr,
+        /// The conjunct can fail where it is evaluated: its predicate or a
+        /// block it reads (the type checker's one computation of it, A3).
+        /// The planner moves a conjunct that cannot fail and keeps this one
+        /// in written order.
+        fails: bool,
     },
     /// `keep`: the input's columns are kept and `items` appended (the
     /// derived-forms table's `Extend` without an aggregate); otherwise the
@@ -225,6 +232,9 @@ pub enum Term {
         input: Box<Term>,
         items: Vec<(String, IRExpr)>,
         keep: bool,
+        /// An item can fail where it is evaluated: a `let` that can fail
+        /// runs on every row its input produces, and nothing moves below it.
+        fails: bool,
     },
     Group {
         input: Box<Term>,
@@ -235,6 +245,10 @@ pub enum Term {
     Correlate {
         outer: Box<Term>,
         inner: Box<Term>,
+        /// The inner term can fail where it is evaluated (a `from`, an
+        /// `optional` or a block over a term that can fail): it runs on every
+        /// outer row, and nothing moves below it.
+        fails: bool,
     },
     Union {
         left: Box<Term>,
@@ -307,11 +321,16 @@ impl Term {
     }
 
     /// Whether an expression of the term can fail where it is evaluated:
-    /// such a term keeps its place among the elements (A3).
+    /// such a term keeps its place among the elements (A3). The type
+    /// checker computes this once, when it builds the term, and records it
+    /// on the `Filter`, `Project` and `Correlate` that hold such a term; a
+    /// `Group`'s or an `Order`'s own expressions are read here, since one
+    /// appears only inside a `Correlate` or at the read's top.
     pub fn can_fail(&self) -> bool {
         let own = match self {
-            Self::Filter { pred, .. } => pred.can_fail(),
-            Self::Project { items, .. } => items.iter().any(|(_, e)| e.can_fail()),
+            Self::Filter { fails, .. }
+            | Self::Project { fails, .. }
+            | Self::Correlate { fails, .. } => *fails,
             Self::Group { keys, aggs, .. } => {
                 keys.iter().any(|(_, e)| e.can_fail())
                     || aggs
@@ -337,7 +356,7 @@ impl Term {
             | Self::Cut { input, .. }
             | Self::Score { input, .. }
             | Self::ApproxTopK { input, .. } => input.size(),
-            Self::Correlate { outer, inner } => outer.size() + inner.size(),
+            Self::Correlate { outer, inner, .. } => outer.size() + inner.size(),
             Self::Union { left, right } => left.size() + right.size(),
             Self::Fuse { arms, .. } => arms.iter().map(Term::size).sum(),
             Self::Fix { body, .. } | Self::Call { body, .. } => body.size(),
@@ -384,7 +403,7 @@ impl Term {
             | Self::Cut { input, .. }
             | Self::Score { input, .. }
             | Self::ApproxTopK { input, .. } => vec![input],
-            Self::Correlate { outer, inner } => vec![outer, inner],
+            Self::Correlate { outer, inner, .. } => vec![outer, inner],
             Self::Union { left, right } => vec![left, right],
             Self::Fuse { arms, .. } => arms.iter().collect(),
             Self::Fix { body, .. } | Self::Call { body, .. } => vec![body],
