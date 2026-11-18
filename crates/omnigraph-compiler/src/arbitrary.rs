@@ -1036,7 +1036,12 @@ impl ReadGen<'_, '_, '_> {
     fn element(&mut self, scope: &mut Vec<Var>, elements: &mut Vec<String>, depth: u32) {
         let choice = self.c.below(10);
         match choice {
-            1 if self.options.nesting => self.optional(scope, elements, depth),
+            // The placement law's reads draw their `optional` last (a
+            // failing element): one before a `from` that can fail hits a
+            // defect pinned as a hunt (law_engine_reference.rs).
+            1 if self.options.nesting && !self.options.placement => {
+                self.optional(scope, elements, depth)
+            }
             2 => {
                 let ty = *self
                     .c
@@ -1067,7 +1072,12 @@ impl ReadGen<'_, '_, '_> {
                     });
                 }
             }
-            4 if self.options.nesting => self.union_from(scope, elements, depth),
+            // The placement law's reads draw no `union`: one followed by an
+            // `optional` that can fail hits a defect pinned as a hunt
+            // (law_engine_reference.rs).
+            4 if self.options.nesting && !self.options.placement => {
+                self.union_from(scope, elements, depth)
+            }
             _ => {
                 if let Some((text, new)) = self.traversal(scope, choice == 5, false) {
                     elements.push(text);

@@ -42,6 +42,7 @@ use omnigraph_compiler::ParamMap;
 use omnigraph_compiler::arbitrary::{
     Choices, GenGraph, GenRead, GenSchema, ReadOptions, SchemaOptions, choices,
 };
+use omnigraph_compiler::query::value::Literal;
 use proptest::test_runner::{
     Config, FileFailurePersistence, RngAlgorithm, TestCaseError, TestRng, TestRunner,
 };
@@ -506,6 +507,142 @@ fn limit_zero_evaluates_a_return_item_that_can_fail() {
         )
         .await
         .unwrap();
+        judgment.verdict.unwrap_or_else(|e| {
+            panic!(
+                "{e}\nengine: {}\nreference: {}",
+                judgment.engine, judgment.reference
+            )
+        });
+    });
+}
+
+/// The shrunk case of a defect the placement law found, which predates it:
+/// after a correlated `union`, a triple from the union's binding and an
+/// `optional` over its destination whose own `where` can fail, the engine
+/// refuses its own rows (`$n6.__id` holds nulls against its non-null type)
+/// where the reference returns none. Without the `optional`'s `where`, or
+/// with a plain binding in place of the union, both agree. Until the fix the
+/// placement generator draws no `union`.
+#[test]
+#[ignore = "hunt: an optional that can fail over a correlated union's destination nulls the destination's identity"]
+fn an_optional_that_can_fail_after_a_correlated_union_keeps_its_destination() {
+    let schema = r#"node A {
+    k: String @key
+    p0: F64
+}
+node B {
+    k: String @key
+    p0: I64?
+    p1: String?
+}
+node C {
+    k: String @key
+    p0: F64?
+    p1: I32
+    p2: F32?
+}
+edge Rel0: C -> C
+edge Rel1: C -> A
+edge Rel2: B -> A
+"#;
+    let seed = r#"{"type":"A","data":{"k":"d","p0":1.5e3}}
+{"type":"A","data":{"k":"a","p0":100.0}}
+{"type":"A","data":{"k":"f","p0":1.5e3}}
+{"type":"A","data":{"k":"c","p0":100.0}}
+{"type":"A","data":{"k":"b","p0":-2.25}}
+{"type":"B","data":{"k":"c","p0":1,"p1":""}}
+{"type":"B","data":{"k":"e","p0":2147483647,"p1":""}}
+{"type":"B","data":{"k":"a","p0":100,"p1":"graph search"}}
+{"type":"C","data":{"k":"f","p0":0.0,"p1":10,"p2":100.0}}
+{"edge":"Rel0","from":"f","to":"f","data":{}}
+{"edge":"Rel0","from":"f","to":"f","data":{}}
+{"edge":"Rel0","from":"f","to":"f","data":{}}
+{"edge":"Rel0","from":"f","to":"f","data":{}}
+{"edge":"Rel0","from":"f","to":"f","data":{}}
+{"edge":"Rel1","from":"f","to":"c","data":{}}
+{"edge":"Rel1","from":"f","to":"d","data":{}}
+{"edge":"Rel1","from":"f","to":"c","data":{}}
+{"edge":"Rel1","from":"f","to":"c","data":{}}
+{"edge":"Rel2","from":"a","to":"c","data":{}}
+{"edge":"Rel2","from":"e","to":"d","data":{}}
+{"edge":"Rel2","from":"c","to":"b","data":{}}"#;
+    let source = r#"query q() {
+  match { $n1: A, from union({ match { $n3: B, $n3 $k2:rel2 $n1 } where ($n3.p0 >= $n1.p0) return { $n3 as u4 } }, { match { $n5: B } where if(false, true, true) return { $n5 as u4 } }), $u4 rel2 $n6, optional { $n7: C, $n7 rel1 $n6 where ((1 % $n7.p1) = 0) } }
+  where if(($n7.p1 != 0), (((-1) / $n7.p1) > 2), false) and (($n7.p1 * 2147483647) > 10) and ($u4.p0 >= (-7)) and ($n7.p1 < 10)
+  return { (coalesce(datetime("2023-12-31T23:59:59Z"), datetime("2024-01-01T00:00:00Z")) >= datetime("2023-12-31T23:59:59Z")) as c0 }
+  order { c0 desc }
+  limit 3
+}"#;
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap();
+        let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+        session.load_jsonl(seed, LoadMode::Overwrite).await.unwrap();
+        let judgment = omnigraph_gqt::judge_read_against_reference(
+            &session,
+            source,
+            "q",
+            &ParamMap::new(),
+            true,
+        )
+        .await
+        .unwrap();
+        judgment.verdict.unwrap_or_else(|e| {
+            panic!(
+                "{e}\nengine: {}\nreference: {}",
+                judgment.engine, judgment.reference
+            )
+        });
+    });
+}
+
+/// The shrunk case of a second defect the placement law found, which
+/// predates it: the shaper places a triple that closes on an `optional`'s
+/// node (`$n2 rel0 $n2`) after a `from` written later, so the `from`, whose
+/// sum can fail, runs on rows the triple removes and refuses (`E2`) where
+/// the reference, evaluating the elements in written order, returns no row.
+/// The shaper's fixed element order is replaced by the structural lowering;
+/// until then the placement generator draws no `optional` before the
+/// elements that can fail.
+#[test]
+#[ignore = "hunt: a from that can fail runs before a triple written ahead of it that closes on an optional's node"]
+fn a_from_that_can_fail_runs_after_the_triples_written_before_it() {
+    let schema = r#"node A {
+    k: String @key
+    p0: I64?
+}
+edge Rel0: A -> A
+"#;
+    let seed = r#"{"type":"A","data":{"k":"a","p0":0}}
+{"type":"A","data":{"k":"b","p0":0}}
+{"type":"A","data":{"k":"c","p0":0}}
+{"type":"A","data":{"k":"d","p0":100}}
+{"type":"A","data":{"k":"e","p0":0}}
+{"edge":"Rel0","from":"e","to":"a","data":{}}"#;
+    let source = r#"query q($p4: String, $p5: String) {
+  match { $n1: A, optional { $n2: A, $n2 rel0 $n1 where (not false) }, let $l3 = concat(concat($p4, $p5), if(true, $n1.k, $n1.k)), $n2 rel0 $n2, from { match { $n6: A, $n2 rel0{1,2} $n6 } return { sum((10 / $n6.p0)) as s7 } } }
+  where ($n1.k = "a") and ($n1.k = "a")
+  return { $n1.p0 as c0 }
+}"#;
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap();
+        let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+        session.load_jsonl(seed, LoadMode::Overwrite).await.unwrap();
+        let params: ParamMap = [
+            ("p4".to_string(), Literal::String("a".to_string())),
+            ("p5".to_string(), Literal::String("a".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let judgment =
+            omnigraph_gqt::judge_read_against_reference(&session, source, "q", &params, false)
+                .await
+                .unwrap();
         judgment.verdict.unwrap_or_else(|e| {
             panic!(
                 "{e}\nengine: {}\nreference: {}",
