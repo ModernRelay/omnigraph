@@ -84,7 +84,9 @@ at or below the server's ceiling; nothing else.
 
 A submission answers 202 with the record once it is durably accepted, and 200
 once the operation is terminal. Submitting the same id with the same request
-answers the existing record; it never starts the work again. A lookup answers
+returns the existing record without starting work again. Selected-dataset
+requests keep their original digest across the upgrade to the `datasets`
+field. A lookup answers
 200 with the record, or `"lookup": "unknown"` when the record does not hold
 the id. `unknown` does not prove the operation never ran, and it is never a
 reason to resubmit the same work under the same id.
@@ -126,8 +128,9 @@ terminal state:
 - `succeeded`: it published a commit (`published_commit`), or found nothing to
   publish. A succeeded run may still have deferred or failed tables; read each
   table's outcome under `outcome.datasets`. An `optimized` table with
-  `reason: index_failed` published its compaction and then failed its index
-  maintenance (the error is its `detail`), which the next run plans again. A
+  `reason: index_failed` published the compaction or index work it completed
+  before a later index step or coverage check failed. Its `detail` gives
+  the error. The next run checks the published version for remaining work. A
   record lists at most 1,024 tables; `more_datasets` counts the rest per
   outcome and reason (`optimized:index_failed`).
 - `failed`, `cancelled` and `interrupted`: nothing was published, and the

@@ -312,18 +312,12 @@ fn write_record(
                         "  {subject:<40} frags {} → {} ✓",
                         table["fragments_removed"], table["fragments_added"]
                     )?;
-                    // An optimized table carries the reason `index_failed`
-                    // when its index link failed after the rewrite; the
-                    // detail is that error.
                     if table["reason"].as_str() == Some("index_failed") {
                         let first = table["detail"]
                             .as_str()
                             .and_then(|detail| detail.lines().next())
                             .unwrap_or("unknown error");
-                        writeln!(
-                            stdout,
-                            "    ↳ index maintenance failed after the rewrite: {first}"
-                        )?;
+                        writeln!(stdout, "    ↳ index maintenance incomplete: {first}")?;
                     }
                 }
                 "unchanged" => writeln!(stdout, "  {subject:<40} no-op")?,
@@ -552,10 +546,10 @@ mod tests {
         assert_eq!(
             lines
                 .iter()
-                .filter(|line| line.starts_with("↳ index maintenance failed after the rewrite"))
+                .filter(|line| line.starts_with("↳ index maintenance incomplete"))
                 .copied()
                 .collect::<Vec<_>>(),
-            ["↳ index maintenance failed after the rewrite: storage: index build lost"],
+            ["↳ index maintenance incomplete: storage: index build lost"],
             "{text}"
         );
         assert!(

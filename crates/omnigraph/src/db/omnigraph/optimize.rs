@@ -224,11 +224,9 @@ pub struct DatasetOptimizeStats {
     /// The plan's source bytes, when a byte ceiling or the run's byte budget
     /// measured them; what the table spent of the budget.
     pub source_bytes: Option<u64>,
-    /// The error of an [`TableOptimizeOutcome::Optimized`] table's index
-    /// link, when it failed after an earlier link of the table had committed:
-    /// the committed links are in the run's publication, and the next run
-    /// plans the remaining index work again. Its evidence is `Unpublished`.
-    /// `None` on every other table.
+    /// An index maintenance or coverage-reporting error after a link of this
+    /// table committed. All completed links are in the run's publication.
+    /// The next run plans any remaining work and checks coverage again.
     pub index_failure: Option<Arc<OmniError>>,
 }
 
@@ -288,8 +286,8 @@ impl DatasetOptimizeStats {
 
     /// The stable token that qualifies [`Self::outcome`] in serialized
     /// output: why a deferred table was not started, or `index_failed` on an
-    /// optimized table whose index link failed after an earlier link of the
-    /// table committed ([`Self::index_failure`] holds the error). `None` for
+    /// optimized table with an index maintenance or coverage error after a
+    /// link committed ([`Self::index_failure`] holds the error). `None` for
     /// every other table. Once emitted a token is part of the output
     /// contract; keep it stable.
     pub fn reason(&self) -> Option<&'static str> {
@@ -1879,8 +1877,8 @@ async fn apply_optimize_table_effects(
     // no address-domain index, and no engine writer creates the data overlays
     // that would also drop coverage.
     let mut pending_indexes = Vec::new();
-    let mut index_failure = None;
-    match stage_fold_link(db, &tip, &witness, &declared_full_text, step_limit).await {
+    let fold = stage_fold_link(db, &tip, &witness, &declared_full_text, step_limit).await;
+    let index_result = match fold {
         Ok((folded, skipped_folds)) => {
             if let Some((folded, identity)) = folded {
                 tip = folded;
@@ -1908,24 +1906,30 @@ async fn apply_optimize_table_effects(
                         fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
                     }
                     pending_indexes = pending;
-                }
-                Err(error) => {
-                    index_failure = Some(index_link_failure(
-                        error,
-                        tip_identity.is_some(),
+                    // Keep the completed link when only this status read fails.
+                    super::table_ops::append_deferred_full_text_indexes(
+                        &tip,
                         &table_key,
-                    )?);
+                        "main",
+                        &[],
+                        &mut pending_indexes,
+                    )
+                    .await
+                    .map_err(|error| error.with_context("read full-text index coverage"))
                 }
+                Err(error) => Err(error),
             }
         }
-        Err(error) => {
-            index_failure = Some(index_link_failure(
-                error,
-                tip_identity.is_some(),
-                &table_key,
-            )?);
-        }
-    }
+        Err(error) => Err(error),
+    };
+    let index_failure = match index_result {
+        Ok(()) => None,
+        Err(error) => Some(index_maintenance_failure(
+            error,
+            tip_identity.is_some(),
+            &table_key,
+        )?),
+    };
     let Some(identity) = tip_identity else {
         let mut stat = DatasetOptimizeStats::planned(table_key, &metrics, false);
         stat.source_bytes = source_bytes;
@@ -1959,12 +1963,12 @@ async fn apply_optimize_table_effects(
     })
 }
 
-/// What an index link's failure means for its table. After an earlier link
-/// of the table committed, a failure with definite evidence stays with the
+/// What an index maintenance or coverage error means for its table. After a
+/// link of the table committed, a failure with definite evidence stays with the
 /// table as its index failure and the committed links publish; an uncertain
 /// one fails the run, as any staging failure does. With no link committed,
 /// the failure is the table's.
-fn index_link_failure(
+fn index_maintenance_failure(
     error: OmniError,
     committed: bool,
     table_key: &str,
@@ -1983,7 +1987,7 @@ fn index_link_failure(
         target: "omnigraph::optimize",
         table = table_key,
         error = %error,
-        "optimize publishes a table's committed links without the index link that failed after them"
+        "optimize retains the table's committed links after an index maintenance error"
     );
     Ok(Arc::new(error))
 }
@@ -2016,10 +2020,9 @@ async fn stage_fold_link(
 /// One table's index-build link at `tip`: plan the declared indexes the
 /// table lacks, stage them as one `CreateIndex`, holding one permit of
 /// `step_limit`, and commit it detached. Returns the committed link, `None`
-/// when no declared index was missing, and the index work left pending at
-/// the resulting version: a vector column that cannot train (`skipped_folds`
-/// among them), and full-text coverage, which only the explicit rebuild
-/// changes.
+/// when no declared index was missing, and the vector columns that cannot
+/// train (`skipped_folds` among them). The caller checks full-text coverage
+/// at the resulting version.
 #[allow(clippy::too_many_arguments)]
 async fn stage_build_link(
     db: &Omnigraph,
@@ -2063,15 +2066,6 @@ async fn stage_build_link(
                 .await?,
         )
     };
-    let current = built.as_ref().map_or(tip, |(built, _)| built);
-    super::table_ops::append_deferred_full_text_indexes(
-        current,
-        table_key,
-        "main",
-        &[],
-        &mut pending,
-    )
-    .await?;
     Ok((built, pending))
 }
 

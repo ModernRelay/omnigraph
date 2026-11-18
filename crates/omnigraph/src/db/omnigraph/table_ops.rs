@@ -719,6 +719,11 @@ fn full_text_columns(specs: &[crate::storage_layer::IndexBuildSpec]) -> Vec<&str
         .collect()
 }
 
+decide_seam! {
+    /// The metadata read used to report pending full-text coverage.
+    pub static FULL_TEXT_COVERAGE_READ = ("index.full_text_coverage_read", Unreachable, [Fail]);
+}
+
 /// Full-text coverage index maintenance leaves to the explicit rebuild: a
 /// full-text index whose segments leave a current fragment uncovered, or
 /// whose coverage is unknown. It is observable status, never folded
@@ -736,6 +741,7 @@ pub(super) async fn append_deferred_full_text_indexes(
 ) -> Result<()> {
     use lance::index::DatasetIndexInternalExt;
 
+    fail(&FULL_TEXT_COVERAGE_READ)?;
     let ds = snapshot.dataset();
     let indices = ds.load_indices().await.map_err(OmniError::storage)?;
     let full_text: std::collections::BTreeMap<_, _> = indices

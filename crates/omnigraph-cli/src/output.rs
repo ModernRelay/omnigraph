@@ -87,10 +87,7 @@ pub(crate) fn write_optimize(
                     if let Some(error) = &s.index_failure {
                         let error = error.to_string();
                         let first = error.lines().next().unwrap_or("unknown error");
-                        writeln!(
-                            stdout,
-                            "    ↳ index maintenance failed after the rewrite: {first}"
-                        )?;
+                        writeln!(stdout, "    ↳ index maintenance incomplete: {first}")?;
                     }
                 }
                 TableOptimizeOutcome::Failed => {
@@ -115,7 +112,7 @@ pub(crate) fn write_optimize(
             writeln!(stdout, "graph commit: {commit}")?;
         }
         if let Some(key) = &report.resume_at {
-            writeln!(stdout, "resume at: {}", graph_type_subject(key))?;
+            writeln!(stdout, "resume with: --start-at {key}")?;
         }
         match clear_error {
             Some(error) => writeln!(
@@ -2076,12 +2073,12 @@ mod tests {
                     "  node type 'Person'                       frags 3 → 1 ✓\n",
                     "    ↳ index pending on property 'embedding': no trainable vectors\n",
                     "  node type 'Wombat'                       frags 3 → 1 ✓\n",
-                    "    ↳ index maintenance failed after the rewrite: {index_failure}\n",
+                    "    ↳ index maintenance incomplete: {index_failure}\n",
                     "  node type 'Yak'                          no-op\n",
                     "  node type 'Xerus'                        failed ({failure})\n",
                     "  node type 'Zebra'                        deferred (the run reached its writer-gate hold limit)\n",
                     "graph commit: hb1.child\n",
-                    "resume at: node type 'Zebra'\n",
+                    "resume with: --start-at node:Zebra\n",
                     "configuration clear: unknown (timed out)\n",
                 ),
                 failure = failure,

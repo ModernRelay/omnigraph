@@ -6280,9 +6280,17 @@ async fn optimize_publishes_a_tables_rewrite_when_its_index_link_fails() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 4);
     assert_eq!(helpers::count_rows(&db, "node:Company").await, 4);
 
-    // The next run finds the tables compacted and builds their indexes.
-    let retry = db
-        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+    // Only the index build remains. Even when its subsequent coverage read
+    // fails, the published pin must include that build.
+    let request =
+        || omnigraph::db::OptimizeRequest::default().with_datasets(["node:Company", "node:Person"]);
+    let retry = {
+        let _failpoint = catalog::FULL_TEXT_COVERAGE_READ.fire_always();
+        db.optimize_as(None, request()).await.unwrap()
+    };
+    assert!(retry.graph_commit_id.is_some(), "{retry:?}");
+    let built = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
     for key in ["node:Company", "node:Person"] {
@@ -6293,8 +6301,16 @@ async fn optimize_publishes_a_tables_rewrite_when_its_index_link_fails() {
             .unwrap();
         assert!(stat.committed(), "{stat:?}");
         assert_eq!(stat.fragments_removed, 0, "{key}: nothing left to compact");
-        assert!(stat.index_failure.is_none(), "{stat:?}");
-        assert_eq!(stat.reason(), None, "{stat:?}");
+        assert_eq!(pin(&built, key), pin(&snapshot_after, key) + 1);
+        assert_eq!(stat.reason(), Some("index_failed"), "{stat:?}");
+        assert!(
+            stat.index_failure
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("index.full_text_coverage_read"),
+            "{stat:?}"
+        );
         let table = helpers::open_pinned_dataset_for_test(&db, "main", key).await;
         assert!(
             table.load_indices().await.unwrap().iter().any(|index| {
@@ -6306,6 +6322,17 @@ async fn optimize_publishes_a_tables_rewrite_when_its_index_link_fails() {
             "{key}: its declared indexes are built"
         );
     }
+    let healthy = db.optimize_as(None, request()).await.unwrap();
+    assert!(
+        healthy.graph_commit_id.is_none(),
+        "index build repeated: {healthy:?}"
+    );
+    assert!(
+        healthy
+            .datasets
+            .iter()
+            .all(|stat| stat.outcome == omnigraph::db::TableOptimizeOutcome::Unchanged)
+    );
 }
 
 /// A cancellation while a table's staging is under way publishes nothing:

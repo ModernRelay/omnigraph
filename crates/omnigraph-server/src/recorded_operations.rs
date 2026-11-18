@@ -373,9 +373,39 @@ pub(crate) struct OperationOutput {
     lookup: OperationLookup,
     /// The operation's record; absent for an `unknown` lookup.
     #[schema(value_type = Option<Object>)]
+    #[serde(serialize_with = "serialize_api_operation")]
     operation: Option<Operation>,
     /// Whether this server is running it now.
     in_progress: bool,
+}
+
+/// The v1 storage keys and the digest of a retained request are stable.
+/// Only the HTTP response uses the public dataset vocabulary.
+fn serialize_api_operation<S: serde::Serializer>(
+    operation: &Option<Operation>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let Some(operation) = operation else {
+        return serializer.serialize_none();
+    };
+    let mut body = serde_json::to_value(operation).map_err(serde::ser::Error::custom)?;
+    match operation.kind() {
+        OperationKind::Optimize => {
+            for (section, stored, public) in [
+                ("request", "tables", "datasets"),
+                ("outcome", "tables", "datasets"),
+                ("outcome", "more_tables", "more_datasets"),
+            ] {
+                let fields = body[section].as_object_mut().ok_or_else(|| {
+                    serde::ser::Error::custom(format!("invalid optimize {section}"))
+                })?;
+                if let Some(value) = fields.remove(stored) {
+                    fields.insert(public.to_owned(), value);
+                }
+            }
+        }
+    }
+    body.serialize(serializer)
 }
 
 #[derive(Deserialize)]
@@ -1506,6 +1536,66 @@ mod tests {
             assert!(answers_without_the_gate(&op, &[], false));
             assert!(!answers_without_the_gate(&op, &[], true));
         }
+    }
+
+    #[test]
+    fn a_filtered_retry_reads_the_v1_record_and_returns_public_dataset_names() {
+        use serde_json::json;
+
+        let id = "000000YGJ00000000000000001";
+        // Pin the stored request and its original digest independently of the
+        // current encoder. An HTTP rename must not change either one.
+        let saved = json!({
+            "version": 1, "ledger_id": "01JBQZ0000000000000000ABCD",
+            "terminal": [{
+                "operation_id": id, "graph": "g", "schema_identity_domain": "domain-a",
+                "settlement_branch": "main", "principal": "p",
+                "request": {"kind": "optimize", "tables": ["node:Person"]},
+                "request_digest": "sha256:a399bb4a1476b722f62daaf9255ab1cf28949e6e71db5d53894f9bc00e25a13b",
+                "accepted_at": "2026-11-18T07:00:00Z", "state": "succeeded", "timings": {},
+                "outcome": {
+                    "kind": "optimize", "tables": [{
+                        "type_key": "node:Person", "outcome": "unchanged",
+                        "fragments_removed": 0, "fragments_added": 0, "duration_ms": 0
+                    }],
+                    "more_tables": {"deferred": 3}
+                }
+            }]
+        });
+        let mut record: OperationRecord = serde_json::from_value(saved.clone()).unwrap();
+        record.validate().unwrap();
+        let input: StartOptimizeRequest = serde_json::from_value(json!({
+            "operation_id": id, "datasets": ["node:Person"]
+        }))
+        .unwrap();
+        let retry = Operation::accepted(id, "g", "domain-a", input.request(), "p", None);
+        let Admitted::Existing(existing) = record.admit(retry, now_ms()).unwrap() else {
+            panic!("a retry must return the retained operation");
+        };
+        assert_eq!(serde_json::to_value(record).unwrap(), saved);
+        let response = serde_json::to_value(OperationOutput {
+            lookup: OperationLookup::Found,
+            operation: Some(*existing),
+            in_progress: false,
+        })
+        .unwrap();
+        let operation = &response["operation"];
+        let retained = &saved["terminal"][0];
+        assert_eq!(
+            operation["request"]["datasets"],
+            retained["request"]["tables"]
+        );
+        assert_eq!(
+            operation["outcome"]["datasets"],
+            retained["outcome"]["tables"]
+        );
+        assert_eq!(
+            operation["outcome"]["more_datasets"],
+            retained["outcome"]["more_tables"]
+        );
+        assert!(operation["request"].get("tables").is_none());
+        assert!(operation["outcome"].get("tables").is_none());
+        assert!(operation["outcome"].get("more_tables").is_none());
     }
 
     /// A report from a tiny graph, for the fields a record is built from: the

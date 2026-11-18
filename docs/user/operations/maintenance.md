@@ -79,25 +79,21 @@ all (a Blob table's tasks one at a time): budget for that many Blob tables.
 
 ### Bounding a run
 
-Writes to `main` wait while optimize holds its writer gates. A run given
-`--max-gate-hold 30s` starts no table after that long except the first: the
-rest are `deferred`, finished tables publish, and a writer waits at most the
-bound plus one rewrite. Tables run in type-key order; `resume_at` names the
-first deferred one, and `--datasets` runs only the listed tables, in order. A
-direct run keeps no position between invocations: pass that key to the next
-one as `--start-at <key>`, which starts a full-catalog run there and wraps
-around, so successive bounded runs reach every table. A server keeps the
-position itself ([recorded operations](recorded-operations.md)) and refuses
-the flag.
+With `--max-gate-hold 30s`, the first table runs even if the deadline has
+passed. After the deadline, remaining tables are deferred and completed work
+publishes. Writers to `main` wait at most the bound plus one rewrite.
+Direct runs visit tables in type-key order. Copy the printed argument (e.g.
+`--start-at node:Person`) to resume at the first deferred table and wrap around.
+JSON exposes the same key in `resume_at`. A [server](recorded-operations.md)
+remembers its position. Use `--datasets` to visit only the listed tables, in order.
 
-Each table's `outcome` is `optimized`, `unchanged`, `deferred` or `failed`
-(with its `error`; the other tables still publish). When a table's index work
-fails after its compaction, the compaction is still published: the table is
-`optimized` with `reason: index_failed` and the failure as its `error`, and
-the next run plans the index work again. The report adds `input_commit`, `graph_commit_id`,
-`gate_hold_ms` and the `configuration_clear` and `artifact` outcomes, which
-never fail a published run. Exit 0 means the run finished, not that every
-table was optimized: read each table's `outcome` and `reason`.
+Check each table's `outcome` even on exit 0. It can be `optimized`, `unchanged`,
+`deferred` or `failed`. A failed table includes its `error`. Other tables still publish.
+If index maintenance or its coverage check fails after a rewrite or index build,
+completed work publishes as `optimized` with `reason: index_failed` and the error.
+The next run checks coverage and plans remaining work. The report includes
+`input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
+and `artifact` outcomes. Neither of those last two can fail a published run.
 
 A served run also applies the server's
 [table ceilings and byte budget](recorded-operations.md#table-ceilings-and-the-byte-budget).

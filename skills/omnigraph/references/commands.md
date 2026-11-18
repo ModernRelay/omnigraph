@@ -333,13 +333,13 @@ the operation's record (`--no-wait`, `--timeout`), and `--operation <id>`
 observes one; after a lost response it looks the id up and never resubmits.
 `--datasets` runs only the listed tables and `--max-gate-hold 30s` bounds how
 long writers wait: the tables it did not reach are `deferred` and `resume_at`
-names the first. On a direct target pass that key to the next run as
-`--start-at <key>` (a server keeps the position and refuses the flag;
+names the first. On a direct target copy the printed `--start-at <key>`
+argument into the next run (a server keeps the position and refuses the flag;
 `--datasets` and `--max-gate-hold` are refused beside `--operation`). Exit 0
 means the run finished, not that every table was optimized: read each
 dataset's `outcome` (`optimized`, `unchanged`, `deferred`, `failed` with
-`error`) and `reason`, which is `index_failed` when a table's compaction
-published and its index work then failed.
+`error`) and `reason`. With `index_failed`, the run published completed
+table work and the error identifies the index maintenance step that failed.
 
 ### `index build` — a branch's missing and lagging indexes
 

@@ -980,14 +980,14 @@ fn optimize_start_at_resumes_a_bounded_direct_run() {
     init_graph(&graph);
     load_fixture(&graph);
     let optimize = |extra: &[&str]| {
-        parse_stdout_json(&output_success(
+        output_success(
             cli()
                 .arg("optimize")
-                .arg("--json")
                 .arg("--target")
                 .arg(&graph)
+                .args(["--max-gate-hold", "0s"])
                 .args(extra),
-        ))
+        )
     };
     let visited = |payload: &Value| {
         payload["datasets"]
@@ -999,14 +999,22 @@ fn optimize_start_at_resumes_a_bounded_direct_run() {
     };
 
     // A zero hold runs the first table and defers the rest.
-    let first = optimize(&["--max-gate-hold", "0s"]);
+    let first = parse_stdout_json(&optimize(&["--json"]));
     let order = visited(&first);
     assert!(order.len() >= 3, "{first}");
     assert_ne!(first["datasets"][0]["outcome"], "deferred", "{first}");
     assert_eq!(first["datasets"][1]["outcome"], "deferred", "{first}");
     assert_eq!(first["resume_at"], order[1].as_str(), "{first}");
 
-    let second = optimize(&["--max-gate-hold", "0s", "--start-at", &order[1]]);
+    // Copy the human report's arguments verbatim into the next invocation.
+    let human = String::from_utf8(optimize(&[]).stdout).unwrap();
+    let hint = human
+        .lines()
+        .find_map(|line| line.strip_prefix("resume with: "))
+        .unwrap_or_else(|| panic!("missing resume hint in {human}"));
+    let mut args = vec!["--json"];
+    args.extend(hint.split_ascii_whitespace());
+    let second = parse_stdout_json(&optimize(&args));
     let mut wrapped = order[1..].to_vec();
     wrapped.push(order[0].clone());
     assert_eq!(visited(&second), wrapped, "{second}");
