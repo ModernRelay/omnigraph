@@ -1,6 +1,6 @@
 # issue: none
 # notes: Every version of one key written in the same operation counts toward the Blob allowance, though only the latest stays pending.
-# notes: The second upsert of key "same" replaces the first, so each update matches one row; the two updates assign the 15,999-byte payload once each, which counts twice (31,998) and is refused under write_max_bytes = 30000 as `decoded blob input bytes per operation`.
+# notes: The second upsert of key "same" replaces the first, and each assigns the 15,999-byte payload, which counts twice (31,998) and is refused under write_max_bytes = 30000 as `decoded blob input bytes per operation`.
 
 --- runner
 timeout_ms: 10000
@@ -22,13 +22,9 @@ node Doc {
 
 --- mutate
 set write_max_bytes = 30000;
-query upsert_then_assign($payload: Blob) {
-    insert Doc { slug: "same", note: "first" }
-    insert Doc { slug: "same", note: "second" }
-    match { $x: Doc } where $x.slug = "same"
-    update $x set { content: $payload }
-    match { $x: Doc } where $x.slug = "same"
-    update $x set { content: $payload }
+query upsert_twice($payload: Blob) {
+    insert Doc { slug: "same", note: "first", content: $payload }
+    insert Doc { slug: "same", note: "second", content: $payload }
 }
 
 --- params

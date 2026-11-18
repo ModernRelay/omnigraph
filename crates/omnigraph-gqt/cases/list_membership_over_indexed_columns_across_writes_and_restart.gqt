@@ -254,14 +254,20 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- mutate
-query change_covered_rows() {
+query change_covered_row_a() {
     match { $x: Item } where $x.slug = "a"
     update $x set { code: 10, day: date("2024-10-10"), word: "outside" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query change_covered_row_b() {
     match { $x: Item } where $x.slug = "b"
     update $x set { code: 7, day: date("2024-07-07"), word: "theta" }
 }
 
---- expect affected: nodes=2 edges=0
+--- expect affected: nodes=1 edges=0
 
 --- query
 query updated_integer() {

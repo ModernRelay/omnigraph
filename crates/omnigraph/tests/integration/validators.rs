@@ -861,7 +861,6 @@ async fn chained_unique_update_then_reuse_freed_value_is_not_a_violation() {
 query reassign() {
     match { $x: User } where $x.name = "Alice"
     update $x set { email: "temp" }
-    match { $x: User } where $x.name = "Alice"
     update $x set { email: "final" }
     insert User { name: "Carol", email: "temp" }
 }

@@ -1,8 +1,8 @@
 # issue: 1277
 # red_on: f5a0dac9; the later delete excludes null rows that no earlier statement matched, and the wide read selects the all-null row.
-# notes: The shapes beside the written pair of disjoint IN tests. A later delete statement of one mutation
-# notes: excludes the rows earlier statements matched; when two earlier statements test one nullable
-# notes: property with disjoint NOT IN lists, the exclusion must not treat a null row as matched.
+# notes: The shapes beside the written pair of disjoint IN tests. Every group of a write selects on its one
+# notes: snapshot, so delete statements over one type in later groups are refused (`T91`); their union is one
+# notes: group's disjunction of the two disjoint NOT IN tests, which must not treat a null row as matched.
 # notes: A predicate that tests four properties twice each is pushed split on all four; one that tests
 # notes: five is not pushed: a read evaluates it in memory and a mutation refuses it.
 
@@ -85,6 +85,14 @@ query delete_after_disjoint_negated_statements() {
     match { $x: Item } where not ($x.s in ["x"])
     delete $x
     match { $x: Item } where $x.t = "k"
+    delete $x
+}
+
+--- expect error: T91: `delete_after_disjoint_negated_statements`: group 2 selects on type `Item`, which an earlier group of the write changes
+
+--- mutate
+query delete_disjoint_negated_disjuncts() {
+    match { $x: Item } where not ($x.s in ["y"]) or not ($x.s in ["x"]) or $x.t = "k"
     delete $x
 }
 

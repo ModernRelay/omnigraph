@@ -9,7 +9,7 @@
 
 use crate::catalog::Catalog;
 use crate::ir::core::CoreDecl;
-use crate::query::codes::T86;
+use crate::query::codes::{T86, T91};
 use crate::query::diagnostic::QueryDiagnostic;
 use crate::query::syntax::{
     Decl, DeclBody, Element, Expr, LetValue, Pattern, ReadBody, RelExpr, SourceSpan,
@@ -29,6 +29,11 @@ pub(super) fn admit(
     decl: &Decl,
     core: &CoreDecl,
 ) -> Result<(), QueryDiagnostic> {
+    if let CoreDecl::Write(write) = core
+        && let Some(change) = crate::shape::write::earlier_group_change(write, catalog)
+    {
+        return Err(earlier_group_change(decl, &write.name, &change));
+    }
     let shaped = match core {
         CoreDecl::Read(read) => ReadShape::of(read, catalog).map(|_| ()),
         CoreDecl::Write(write) => WriteShape::of(write, catalog).map(|_| ()),
@@ -41,6 +46,43 @@ pub(super) fn admit(
             .at_span_of(&decl.at)),
         Ok(()) | Err(ShapeError::Internal(_)) => Ok(()),
     }
+}
+
+/// `T91`: a write group's selection reads a table an earlier group of the
+/// write changes. Every group selects on the write's one snapshot, so the
+/// group would not see that change; the refusal sits at the group's
+/// `match`, and no single edit keeps the author's meaning, so it prints a
+/// fix and no suggestion.
+fn earlier_group_change(
+    decl: &Decl,
+    name: &str,
+    change: &crate::shape::write::EarlierGroupChange,
+) -> QueryDiagnostic {
+    let (kind, type_name) = change
+        .table
+        .split_once(':')
+        .unwrap_or(("node", change.table.as_str()));
+    let kind = if kind == "edge" { "edge type" } else { "type" };
+    let mut d = QueryDiagnostic::typecheck(
+        T91,
+        format!(
+            "`{name}`: group {} selects on {kind} `{type_name}`, which an earlier group of the \
+             write changes; every group of a write selects on the snapshot the write started \
+             from, so this selection would not see that change",
+            change.group + 1
+        ),
+    );
+    d.fix = Some(
+        "run the group in a second write after this one publishes, or select every row the \
+         statements need in one group and write its statements after that one `match`"
+            .to_string(),
+    );
+    let span = group_pattern(decl, change.group)
+        .and_then(|p| p.spans.elements.first())
+        .and_then(parsed);
+    d.position = span.map(|s| s.position);
+    d.end = span.map(|s| s.end_position);
+    d
 }
 
 /// The `T86` refusal of `u`, at the construct it names in `decl`.

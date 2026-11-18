@@ -2756,6 +2756,9 @@ fn instrument_filtered_update_cost_over_per_commit_fragments() {
 fn update_patch_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    score: I32?\n    content: Blob?\n    emb: Vector(8)?\n}\n";
     const WIDE_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    title: String?\n    content: Blob?\n    emb: Vector(2048)?\n}\n";
+    // `rewrite`'s second statement on `Doc` is an insert whose selection, over
+    // another type, matches nothing: beside it the update writes whole rows.
+    const MARKED_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    score: I32?\n    content: Blob?\n    emb: Vector(8)?\n}\nnode Marker {\n    name: String @key\n}\n";
     const UPDATES: &str = r#"
 query patch() {
     match { $x: Doc } where $x.slug = "d1"
@@ -2764,8 +2767,8 @@ query patch() {
 query rewrite() {
     match { $x: Doc } where $x.slug = "d1"
     update $x set { score: 2 }
-    match { $x: Doc } where $x.slug = "nobody"
-    update $x set { score: 2 }
+    match { $m: Marker } where $m.name = "nobody"
+    insert Doc { slug: "never", age: 0 }
 }
 query widen($title: String) {
     match { $x: Doc } where $x.slug = "d1"
@@ -2867,7 +2870,14 @@ query widen($title: String) {
         (SCHEMA, 8, 16 * 1024, "patch", None, "UpdatePatchBlob16K"),
         (SCHEMA, 8, 128 * 1024, "patch", None, "UpdatePatchBlob128K"),
         (SCHEMA, 8, 1024 * 1024, "patch", None, "UpdatePatchBlob1M"),
-        (SCHEMA, 8, 1024 * 1024, "rewrite", None, "UpdateRowsBlob1M"),
+        (
+            MARKED_SCHEMA,
+            8,
+            1024 * 1024,
+            "rewrite",
+            None,
+            "UpdateRowsBlob1M",
+        ),
         (
             WIDE_SCHEMA,
             2048,

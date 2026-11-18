@@ -1,0 +1,109 @@
+# issue: none
+# notes: Every group of a write selects on the snapshot the write started from, never on the effects the groups
+# notes: before it staged (the GQ 3 RFC, section 2, the sinks). A group whose selection reads a type an earlier
+# notes: group changes is refused at type check (`T91`), whether its selection is a filtered scan of its target or a
+# notes: read the read planner shapes, and a node delete changes its edge types too. A later group reading only
+# notes: types no earlier group changes selects on the snapshot, so an earlier group that read a type a later one
+# notes: changes saw the old values; a statement's keyed effects (an upsert, an endpoint resolved by key) see the
+# notes: statements before it, so a later group's edge insert resolves a person an earlier group inserted.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    city: String?
+}
+
+node Company {
+    slug: String @key
+    name: String
+}
+
+edge WorksAt: Person -> Company
+
+--- seed
+{"type":"Person","data":{"name":"ada","city":"paris"}}
+{"type":"Person","data":{"name":"bob"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+
+--- mutate
+query staged_scan_after_an_update() {
+    match { $p: Person } where $p.name = "ada"
+    update $p set { city: "rome" }
+    match { $q: Person } where $q.name = "ada"
+    update $q set { city: "oslo" }
+}
+--- expect error: T91: `staged_scan_after_an_update`: group 2 selects on type `Person`, which an earlier group of the write changes
+
+--- mutate
+query selection_read_after_an_update() {
+    match { $c: Company } where $c.slug = "acme"
+    update $c set { name: "Acme Two" }
+    match { $p: Person, $p worksAt $c }
+    update $p set { city: $c.name }
+}
+--- expect error: T91: `selection_read_after_an_update`: group 2 selects on type `Company`, which an earlier group of the write changes
+
+--- mutate
+query traversal_after_a_node_delete() {
+    match { $p: Person } where $p.name = "bob"
+    delete $p
+    match { $c: Company, $p $k:worksAt $c }
+    delete $k
+}
+--- expect error: T91: `traversal_after_a_node_delete`: group 2 selects on edge type `WorksAt`, which an earlier group of the write changes
+
+--- query
+query unchanged() { match { $p: Person } return { $p.name, $p.city } }
+--- expect unordered
+{"p.name":"ada","p.city":"paris"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+p.city: String?
+
+--- mutate
+query copy_then_rename() {
+    match { $p: Person, $p worksAt $c } where $c.slug = "acme"
+    update $p set { city: $c.name }
+    match { $c: Company } where $c.slug = "acme"
+    update $c set { name: "Acme Two" }
+}
+--- expect affected: nodes=2 edges=0
+
+--- query
+query after_copy() { match { $p: Person, $p worksAt $c } return { $p.name, $p.city, $c.name } }
+--- expect unordered
+{"p.name":"ada","p.city":"Acme","c.name":"Acme Two"}
+--- expect shape
+p.name: String
+p.city: String?
+c.name: String
+
+--- mutate
+query hire_by_key() {
+    insert Person { name: "cy", city: "lima" }
+    match { $c: Company } where $c.slug = "acme"
+    insert WorksAt { from: "cy", to: $c }
+}
+--- expect affected: nodes=1 edges=1
+
+--- query
+query staff() { match { $p: Person, $p worksAt $c } return { $p.name, $c.slug } }
+--- expect unordered
+{"p.name":"ada","c.slug":"acme"}
+{"p.name":"cy","c.slug":"acme"}
+--- expect shape
+p.name: String
+c.slug: String

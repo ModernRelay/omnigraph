@@ -1,6 +1,7 @@
 # issue: 925
 # red_on: 574a0531dd0177277d751eda9df15e97d08a4099: the third update of one key fails with `@unique violation on Person.name: value 'a' held by 'a' and 'a'`; a later update matches the row's older version and stores a lost update; a keyless row updated four times counts eight.
-# notes: Within one write, each group sees the current version of every row the groups before it wrote, never an older one, and whole-write validation checks the final state once.
+# notes: Within one group, each statement sees the current version of every row the statements before it wrote, never an older one, and whole-write validation checks the final state once.
+# notes: Every group of a write selects on the write's one snapshot, so the issue's later groups re-selecting the rows an earlier group updated are refused (`T91`); its repeated updates are written as several statements over one group's selection.
 
 --- runner
 timeout_ms: 10000
@@ -34,9 +35,7 @@ node Item {
 query score_three_times() {
     match { $p: Person } where $p.name = "a"
     update $p set { score: 1.0 }
-    match { $p: Person } where $p.name = "a"
     update $p set { score: 2.0 }
-    match { $p: Person } where $p.name = "a"
     update $p set { score: 3.0 }
 }
 --- expect affected: nodes=3 edges=0
@@ -50,12 +49,10 @@ p.name: String
 p.score: F64?
 
 --- mutate
-query insert_then_update_twice() {
+query insert_then_upsert_twice() {
     insert Person { name: "b", age: 1 }
-    match { $p: Person } where $p.name = "b"
-    update $p set { age: 2 }
-    match { $p: Person } where $p.name = "b"
-    update $p set { age: 3 }
+    insert Person { name: "b", age: 2 }
+    insert Person { name: "b", age: 3 }
 }
 --- expect affected: nodes=3 edges=0
 
@@ -76,6 +73,14 @@ query no_lost_update() {
     match { $p: Person } where $p.age > 30
     update $p set { flag: true }
 }
+--- expect error: T91: `no_lost_update`: group 2 selects on type `Person`, which an earlier group of the write changes
+
+--- mutate
+query age_twice() {
+    match { $p: Person } where $p.name = "a"
+    update $p set { age: 35 }
+    update $p set { age: 20 }
+}
 --- expect affected: nodes=2 edges=0
 
 --- query
@@ -92,11 +97,8 @@ p.score: F64?
 query bump_keyless_four_times() {
     match { $i: Item } where $i.label = "x"
     update $i set { n: 1 }
-    match { $i: Item } where $i.label = "x"
     update $i set { n: 2 }
-    match { $i: Item } where $i.label = "x"
     update $i set { n: 3 }
-    match { $i: Item } where $i.label = "x"
     update $i set { n: 4 }
 }
 --- expect affected: nodes=4 edges=0

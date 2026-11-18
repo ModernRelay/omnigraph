@@ -16,10 +16,13 @@
 //! those identities, and an `insert` runs once per row. An `insert` with no
 //! clauses runs once.
 //!
-//! A selection read sees the snapshot, not the statements staged before it,
-//! so a group whose selection reads a table an earlier group of the write
-//! changes is not lowered in this release; nor is a selection the read
-//! shaper does not lower, or an assignment that reads a Blob from a row.
+//! Every group selects on the write's one snapshot, never on the effects the
+//! groups before it staged, so the type checker refuses a group whose
+//! selection reads a table an earlier group of the write changes (`T91`,
+//! [`earlier_group_change`]): there the snapshot and the staged effects
+//! would answer differently. A selection the read shaper does not lower, and
+//! an assignment that reads a Blob from a row, are not lowered in this
+//! release.
 
 use std::collections::BTreeSet;
 
@@ -153,33 +156,25 @@ impl WriteShape {
         let mut ops = Vec::new();
         let mut selections = Vec::new();
         let mut selection_reads = Vec::new();
-        // The tables the groups before the current one write.
-        let mut written = BTreeSet::new();
+        // The type checker refuses this (`T91`); a write that reaches the
+        // shaper with it was never checked.
+        if let Some(conflict) = earlier_group_change(write, catalog) {
+            return Err(ShapeError::Internal(format!(
+                "`{name}`: group {} selects on `{}`, which an earlier group changes",
+                conflict.group + 1,
+                conflict.table
+            )));
+        }
         for (g, group) in write.groups.iter().enumerate() {
             match staged(group) {
                 Some(selection) => lower_staged(name, g, group, selection, &mut ops)?,
                 None => {
-                    let mut read = BTreeSet::new();
-                    tables_read(&group.input, catalog, &mut read);
-                    if let Some(table) = read.intersection(&written).next() {
-                        return Err(unsupported(
-                            name,
-                            format!(
-                                "a write group whose selection reads a table an earlier group \
-                                 of the write changes (`{table}`)"
-                            ),
-                            Construct::Group(g),
-                        ));
-                    }
                     let index = selections.len();
                     let (core, query, group_ops) = lower_selected(write, g, group, index, catalog)?;
                     selections.push(query);
                     selection_reads.push(core);
                     ops.extend(group_ops);
                 }
-            }
-            for sink in &group.sinks {
-                tables_written(sink, catalog, &mut written);
             }
         }
         Ok(Self {
@@ -223,9 +218,10 @@ enum Staged {
 /// variable, an assignment reads the row, an `insert` comes before the
 /// statement whose rows it would count, or more than one statement selects
 /// rows. Either form evaluates the selection once, before the group's first
-/// statement; they differ only in that a selection read sees the snapshot,
-/// so a group whose selection reads a table an earlier group changes is
-/// staged or refused, never read stale.
+/// statement. A group whose selection reads a table an earlier group changes
+/// never reaches either form (`T91`), so the staged scan, which reads the
+/// rows staged before it, and the selection read, which reads the snapshot,
+/// select the same rows.
 fn staged(group: &WriteGroup) -> Option<Staged> {
     let mut conjuncts = Vec::new();
     let mut term = &group.input;
@@ -543,6 +539,40 @@ fn blob_property(catalog: &Catalog, target: &MutationTarget, property: &str) -> 
             .get(type_name)
             .is_some_and(|t| t.blob_properties.contains(property)),
     }
+}
+
+/// A write group whose selection reads a table an earlier group of the same
+/// write changes: its index and the table, `node:<T>` or `edge:<e>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EarlierGroupChange {
+    pub group: usize,
+    pub table: String,
+}
+
+/// The first group of `write` whose selection reads a table an earlier group
+/// changes, or `None`. Every group selects on the write's one snapshot (the
+/// GQ 3 RFC, section 2, the sinks), so such a group would read the table as
+/// it was before the earlier group's effects, where reading it after them
+/// would answer differently; the type checker refuses it (`T91`). A group
+/// with no `match` selects nothing, and a statement's keyed effects (an
+/// upsert, an endpoint resolved by key) see the statements before it, so
+/// neither is a selection read.
+pub fn earlier_group_change(write: &CoreWrite, catalog: &Catalog) -> Option<EarlierGroupChange> {
+    let mut written = BTreeSet::new();
+    for (group, g) in write.groups.iter().enumerate() {
+        let mut read = BTreeSet::new();
+        tables_read(&g.input, catalog, &mut read);
+        if let Some(table) = read.intersection(&written).next() {
+            return Some(EarlierGroupChange {
+                group,
+                table: table.clone(),
+            });
+        }
+        for sink in &g.sinks {
+            tables_written(sink, catalog, &mut written);
+        }
+    }
+    None
 }
 
 /// The table keys a selection term reads: every node type it scans, expands

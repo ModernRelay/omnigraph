@@ -673,8 +673,7 @@ query insert_then_update_same_person(
     $name: String, $insert_age: I32, $update_age: I32
 ) {
     insert Person { name: $name, age: $insert_age }
-    match { $x: Person } where $x.name = $name
-    update $x set { age: $update_age }
+    insert Person { name: $name, age: $update_age }
 }
 
 query insert_two_friends($from: String, $a: String, $b: String) {
@@ -689,8 +688,8 @@ query person_with_two_friends($name: String, $age: I32, $a: String, $b: String) 
 }
 
 query mixed_insert_and_delete($name: String, $age: I32, $victim: String) {
-    insert Person { name: $name, age: $age }
     match { $x: Person } where $x.name = $victim
+    insert Person { name: $name, age: $age }
     delete $x
 }
 
@@ -706,17 +705,22 @@ query update_then_filter_by_old_value(
     update $x set { age: $third_new_age }
 }
 
+query update_three_times_in_one_group(
+    $name: String, $first_age: I32, $second_age: I32, $third_age: I32
+) {
+    match { $x: Person } where $x.name = $name
+    update $x set { age: $first_age }
+    update $x set { age: $second_age }
+    update $x set { age: $third_age }
+}
+
 query delete_two_persons($first: String, $second: String) {
-    match { $x: Person } where $x.name = $first
-    delete $x
-    match { $x: Person } where $x.name = $second
+    match { $x: Person } where $x.name = $first or $x.name = $second
     delete $x
 }
 
 query delete_overlapping_persons($name: String, $threshold: I32) {
-    match { $x: Person } where $x.name = $name
-    delete $x
-    match { $x: Person } where $x.age > $threshold
+    match { $x: Person } where $x.name = $name or $x.age > $threshold
     delete $x
 }
 
@@ -1817,8 +1821,8 @@ query update_all() {
 }
 
 /// Blob descriptors do not represent their payload allocation. An update that
-/// carries a Blob (here, beside a second statement on the type, it rewrites
-/// whole rows) must consult `BlobFile::size()` against its remaining byte
+/// carries a Blob (here, beside a second statement on the type, an insert
+/// whose selection matches nothing, it rewrites whole rows) must consult `BlobFile::size()` against its remaining byte
 /// budget before calling `BlobFile::read`; the scoped payload-read probe makes
 /// this a structural assertion rather than inferring it from the eventual
 /// error. Alone, the same update patches `note` (issue #1264): it keeps the
@@ -1832,13 +1836,16 @@ node Document {
     content: Blob?
     note: String?
 }
+node Marker {
+    name: String @key
+}
 "#;
     const UPDATE: &str = r#"
 query update_note($note: String) {
     match { $x: Document } where $x.title = "wide"
     update $x set { note: $note }
-    match { $x: Document } where $x.title = "nobody"
-    update $x set { note: $note }
+    match { $m: Marker } where $m.name = "nobody"
+    insert Document { title: "never" }
 }
 
 query patch_note($note: String) {
@@ -2010,7 +2017,7 @@ query replace_content($c: Blob) {
 }
 
 /// A predicate update that rewrites whole rows (here beside a second
-/// statement on the type) carries many rows' Blob cells: it reads the managed
+/// statement on the type, an insert whose selection matches nothing) carries many rows' Blob cells: it reads the managed
 /// ones in one batched read and the external one through its admitted object,
 /// and rewrites each exactly; the null stays null and the external becomes
 /// managed. The same update alone patches `note` (issue #1264) and reads no
@@ -2026,13 +2033,16 @@ node Document {
     content: Blob?
     note: String?
 }
+node Marker {
+    name: String @key
+}
 "#;
     const UPDATE: &str = r#"
 query update_shelf($note: String) {
     match { $x: Document } where $x.shelf = "a"
     update $x set { note: $note }
-    match { $x: Document } where $x.title = "nobody"
-    update $x set { note: $note }
+    match { $m: Marker } where $m.name = "nobody"
+    insert Document { title: "never", shelf: "never" }
 }
 
 query patch_shelf($note: String) {
@@ -2568,6 +2578,9 @@ node Document {
     content: Blob?
     note: String?
 }
+node Marker {
+    name: String @key
+}
 "#;
     const MUTATIONS: &str = r#"
 query update_note($note: String) {
@@ -2578,8 +2591,8 @@ query update_note($note: String) {
 query update_note_beside_another($note: String) {
     match { $x: Document } where $x.title = "doc"
     update $x set { note: $note }
-    match { $x: Document } where $x.title = "nobody"
-    update $x set { note: $note }
+    match { $m: Marker } where $m.name = "nobody"
+    insert Document { title: "never" }
 }
 
 query set_content($c: Blob?) {
@@ -2801,13 +2814,10 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
-/// Overlapping delete predicates within one query must NOT double-count
-/// `affected_*`. Deletes stage (they no longer inline-commit), so both
-/// statements scan the same unchanged committed snapshot; counting each
-/// predicate independently over-reports when they overlap. The contract —
-/// matching the old inline path, where each delete committed before the next
-/// ran — is the DISTINCT count of rows removed (= what the combined
-/// `(p1) OR (p2)` staged delete actually removes).
+/// Overlapping delete predicates must NOT double-count `affected_*`: the
+/// contract is the DISTINCT count of rows removed. Two delete groups on one
+/// type are refused (`T91`), so the predicates are one group's disjunction
+/// `(p1) OR (p2)`, and its node and cascaded edge counts are distinct.
 ///
 /// Fixture: Alice(30), Bob(25), Charlie(35), Diana(28); Knows Alice→Bob,
 /// Alice→Charlie, Bob→Diana; WorksAt Alice→Acme, Bob→Globex. `name = "Alice"`
@@ -3047,17 +3057,13 @@ edge Right: Hub -> Leaf
     assert_eq!(count_rows(&db, "node:Leaf").await, 2);
 }
 
-/// The overlap-exclusion filter must use SQL `IS NOT TRUE`, not `NOT`: a prior
-/// delete predicate referencing a nullable column must NOT drop a later
-/// statement's matching row just because that column is NULL (SQL UNKNOWN).
-/// With `NOT (age > 30)`, a row with NULL `age` makes the clause UNKNOWN and the
-/// row is filtered out of `deleted_ids` — skipping its cascade (orphaned edges),
-/// or, if it is the only match, leaving the node undeleted. This is a data bug,
-/// not just a miscount.
+/// A delete disjunct over a nullable column must not drop a row another
+/// disjunct matches just because that column is NULL (SQL UNKNOWN): the row
+/// must be deleted and its edges cascaded, never orphaned.
 ///
 /// Data: Charlie (age 35), Zoe (age NULL); Knows Zoe→Charlie. The query deletes
-/// `age > 30` (Charlie) then `name = "Zoe"`. Zoe must still be deleted and her
-/// edge cascaded despite the prior `age > 30` evaluating to UNKNOWN for her.
+/// `age > 30 or name = "Zoe"`. Zoe must still be deleted and her edge cascaded
+/// despite `age > 30` evaluating to UNKNOWN for her.
 #[tokio::test]
 async fn delete_dedup_filter_does_not_drop_null_column_rows() {
     let dir = tempfile::tempdir().unwrap();
@@ -3077,9 +3083,7 @@ edge Knows: Person -> Person
 
     let q = r#"
 query del_age_then_name($threshold: I32, $name: String) {
-    match { $x: Person } where $x.age > $threshold
-    delete $x
-    match { $x: Person } where $x.name = $name
+    match { $x: Person } where $x.age > $threshold or $x.name = $name
     delete $x
 }
 "#;
@@ -3107,10 +3111,9 @@ query del_age_then_name($threshold: I32, $name: String) {
     assert_eq!(r.affected_edges, 1, "Zoe→Charlie, counted once");
 }
 
-/// `insert Person 'X'; update Person where name='X' set age=...` — both
-/// ops produce content on `node:Person` and coalesce into one
-/// `stage_keyed_write` at end-of-query. The accumulator's last-write-wins
-/// dedupe (during `prepare_pending_table`) ensures the update's value
+/// Two keyed inserts of one person in one write both produce content on
+/// `node:Person` and coalesce into one `stage_keyed_write` at end-of-query.
+/// The pending image keeps the later version, so the second upsert's value
 /// wins. Single Lance commit per table per query.
 #[tokio::test]
 async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
@@ -3131,7 +3134,7 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
         )
         .await
         .unwrap();
-    assert_eq!(result.affected_nodes, 2, "1 insert + 1 update reported");
+    assert_eq!(result.affected_nodes, 2, "two upserts reported");
 
     // The end-state row carries the update value (last-write-wins via
     // end-of-query dedupe), proving the staged merge_insert ran with the
@@ -3492,24 +3495,15 @@ edge WorksAt: Person -> Company @card(0..1)
 
 // ─── Chained-mutation correctness — pinned coverage ─────────────────────────
 
-/// Chained `update` ops in one query must respect each previous op's
-/// view of the rows. Without merge-shadow semantics on
-/// `scan_with_pending`, the second update sees the stale committed value
-/// (the first update's row still appears in the Lance scan because the
-/// pending side hasn't committed), the predicate matches it, and the
-/// end-of-query dedupe-last-wins step ends up applying the second update
-/// to a row whose pending value should have shielded it.
-///
-/// Concretely: Alice starts at age=30 in TEST_DATA. Op-1 sets Alice to
-/// age=99. Op-2 updates anyone with age > 50 to age=10. After op-1,
-/// Alice's logical value is age=99 — within op-2's predicate. So op-2
-/// SHOULD update Alice to age=10. The interesting case is: op-2 must
-/// see Alice at age=99 (op-1's pending value), not age=30 (committed).
-/// If the helper unioned without shadowing, op-2 would also match the
-/// stale committed Alice (age=30 doesn't trigger the predicate, but the
-/// row would appear twice and dedupe could pick either). The test
-/// asserts both ends: Alice ends at age=10, the publisher publishes
-/// once.
+/// Repeated `update`s of one row in one write (#925). Every group of a
+/// write selects on its one snapshot, so the issue's chain of groups, a
+/// later one re-selecting the rows an earlier one updated, is refused at
+/// type check (`T91`) and publishes nothing. Several statements over one
+/// group's selection each see the version the statement before wrote: the
+/// write's pending rows hold one current version per id, so three updates
+/// of Alice stage three successive versions, end at the last, count three
+/// and publish once, where the pending table that kept every version
+/// matched Alice twice in the third statement.
 #[tokio::test]
 async fn chained_updates_with_overlapping_predicate_respects_intermediate_value_issue_925() {
     let dir = tempfile::tempdir().unwrap();
@@ -3517,7 +3511,7 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value_
 
     let pre_version = version_main(&db).await.unwrap();
 
-    let result = db
+    let refused = db
         .mutate(
             "main",
             STAGED_QUERIES,
@@ -3533,19 +3527,32 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value_
             ),
         )
         .await
-        .unwrap();
-
-    // After op-1: Alice = 99. After op-2 (where age > 50): Alice
-    // matches (99 > 50) → set to 10. Op-3 repeats op-2's predicate: Alice's
-    // current version (10) does not match it, and her superseded version
-    // (99) is no longer in the write's pending image, so nothing matches.
-    // End state: Alice = 10, and the three statements changed two rows.
+        .expect_err("a later group re-selecting the type an earlier group changed");
+    assert!(refused.to_string().contains("T91"), "{refused}");
     assert_eq!(
-        result.affected_nodes, 2,
-        "op-3 must not match Alice's superseded pending version"
+        version_main(&db).await.unwrap(),
+        pre_version,
+        "a refusal publishes nothing"
+    );
+
+    let result = db
+        .mutate(
+            "main",
+            STAGED_QUERIES,
+            "update_three_times_in_one_group",
+            &mixed_params(
+                &[("$name", "Alice")],
+                &[("$first_age", 99), ("$second_age", 10), ("$third_age", 77)],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.affected_nodes, 3,
+        "each statement updates Alice once"
     );
     let batches = read_table(&db, "node:Person").await;
-    let mut alice_age: Option<i32> = None;
+    let mut alice_ages = Vec::new();
     for batch in &batches {
         let names = batch
             .column_by_name("name")
@@ -3561,14 +3568,14 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value_
             .unwrap();
         for i in 0..batch.num_rows() {
             if names.is_valid(i) && names.value(i) == "Alice" && ages.is_valid(i) {
-                alice_age = Some(ages.value(i));
+                alice_ages.push(ages.value(i));
             }
         }
     }
     assert_eq!(
-        alice_age,
-        Some(10),
-        "chained-update final value must reflect the second update applied to op-1's pending value, untouched by op-3"
+        alice_ages,
+        vec![77],
+        "one Alice, at the last statement's value"
     );
 
     // One manifest version bump: the graph commit rides the same publish CAS
@@ -3581,14 +3588,10 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value_
     );
 }
 
-/// Two `delete` ops on the same node table in one query. Pre-fix,
-/// op-2's `open_table_for_mutation` went through
-/// `open_for_mutation_on_branch` which trips `ensure_expected_version`
-/// (Lance HEAD has advanced past the manifest's pinned version after
-/// op-1's inline-commit, but the manifest hasn't moved). Post-fix,
-/// `open_table_for_mutation` reopens via `inline_committed[table_key]`
-/// at the post-delete Lance version. Test asserts both deletes succeed
-/// in one query, both rows are gone, manifest version advances by 1.
+/// One `delete` of two rows on one node table: both rows are gone and the
+/// manifest version advances by 1. Two delete groups on one type are
+/// refused (`T91`, every group selects on the write's one snapshot), so the
+/// two names are one group's disjunction.
 #[tokio::test]
 async fn multi_statement_delete_on_same_node_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -3636,11 +3639,9 @@ async fn multi_statement_delete_on_same_node_table() {
     }
 }
 
-/// Cascade-then-explicit variant: deleting a node cascades to its
-/// edges, advancing Lance HEAD on the edge table. A subsequent
-/// `delete <Edge>` op in the same query must reopen at the
-/// post-cascade-commit version of the edge table — not trip
-/// `ensure_expected_version` against the manifest's pinned version.
+/// Deleting a node cascades to its edges, so a later group selecting that
+/// edge type would read it on the write's snapshot, before the cascade:
+/// it is refused at type check (`T91`) and nothing is deleted.
 #[tokio::test]
 async fn cascade_delete_node_then_explicit_delete_edge_on_same_table() {
     const QUERY: &str = r#"
@@ -3654,37 +3655,25 @@ query cascade_then_explicit($name: String, $other: String) {
 
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
-
-    // TEST_DATA seeds three Knows edges:
-    //   Alice → Bob, Alice → Charlie (cascade target — should be deleted by op-1)
-    //   Bob → Diana                  (explicit target — should be deleted by op-2)
-    // After both ops, all three edges must be gone. A weaker assertion
-    // (just "count decreased") would pass even if op-2 silently no-op'd
-    // — Bob→Diana would survive. The exact-count check makes both ops
-    // independently observable.
     let pre_knows = count_rows(&db, "edge:Knows").await;
     assert_eq!(
         pre_knows, 3,
         "fixture invariant: TEST_DATA seeds 3 Knows edges"
     );
+    let pre_version = version_main(&db).await.unwrap();
 
-    db.mutate(
-        "main",
-        QUERY,
-        "cascade_then_explicit",
-        &params(&[("$name", "Alice"), ("$other", "Bob")]),
-    )
-    .await
-    .expect("cascade-then-explicit-delete on same edge table must succeed");
-
-    // Both ops landed: cascade removed Alice→Bob and Alice→Charlie;
-    // explicit removed Bob→Diana. Anything > 0 means one op silently
-    // did nothing (the bug we're guarding against).
-    let post_knows = count_rows(&db, "edge:Knows").await;
-    assert_eq!(
-        post_knows, 0,
-        "both cascade + explicit delete must complete (Bob→Diana would survive if op-2 no-op'd)",
-    );
+    let error = db
+        .mutate(
+            "main",
+            QUERY,
+            "cascade_then_explicit",
+            &params(&[("$name", "Alice"), ("$other", "Bob")]),
+        )
+        .await
+        .expect_err("a group selecting the edge type an earlier group's cascade changes");
+    assert!(error.to_string().contains("T91"), "{error}");
+    assert_eq!(count_rows(&db, "edge:Knows").await, pre_knows);
+    assert_eq!(version_main(&db).await.unwrap(), pre_version);
 }
 
 /// A node delete's cascade reads the edge table through
@@ -3696,8 +3685,7 @@ query cascade_then_explicit($name: String, $other: String) {
 /// appended since are matched. Either way: an edge whose
 /// deleted endpoint sits in the last chunk is found, an edge with both
 /// endpoints deleted (first chunk as `src`, last chunk as `dst`) is counted
-/// once, and a later edge `delete` group that selects that edge again
-/// skips it by its recorded row address.
+/// once.
 /// The scale symptom, peak RSS, is guarded by the `heavy-repro:` tests in
 /// `integration/repro_issue_1442.rs`.
 #[tokio::test]
@@ -3707,11 +3695,9 @@ node Doc { slug: String @key }
 edge Link: Doc -> Doc
 ";
     const QUERY: &str = r#"
-query drop_docs($first: String) {
+query drop_docs() {
     match { $d: Doc } where $d.slug != "keep"
     delete $d
-    match { $l: Link } where $l.@src = $first
-    delete $l
 }
 "#;
     let removed = 2 * 8_192 + 5;
@@ -3752,19 +3738,14 @@ query drop_docs($first: String) {
         }
 
         let result = db
-            .mutate(
-                "main",
-                QUERY,
-                "drop_docs",
-                &params(&[("$first", first.as_str())]),
-            )
+            .mutate("main", QUERY, "drop_docs", &params(&[]))
             .await
             .expect("a cascade over several removed-id chunks must succeed");
         assert_eq!(result.affected_nodes, removed, "indexed: {indexed}");
         assert_eq!(
             result.affected_edges, 3,
-            "keep->{last}, {first}->{last} and keep->{middle} are cascaded once each; \
-             the explicit delete adds nothing (indexed: {indexed})"
+            "keep->{last}, {first}->{last} and keep->{middle} are cascaded once each \
+             (indexed: {indexed})"
         );
         assert_eq!(count_rows(&db, "node:Doc").await, 1);
         assert_eq!(
@@ -3929,11 +3910,13 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
 }
 
-/// A blob-table insert followed by a non-blob update must remain one
-/// full-schema merge stream. The update reads the just-inserted pending row,
-/// copies its logical blob column through, and replaces the pending row under
-/// the existing last-write-wins shadow semantics. This used to produce a
-/// partial update batch and fail schema validation at the second op.
+/// A Blob-assigning update followed by a non-Blob update of the same row in
+/// one group must remain one full-schema merge stream. The second update reads
+/// the pending row the first wrote, copies its logical Blob column through,
+/// and replaces the pending row under the last-write-wins shadow semantics.
+/// This used to produce a partial update batch and fail schema validation at
+/// the second op. (A later group cannot re-select a row an earlier group
+/// wrote: every group selects on the write's one snapshot, `T91`.)
 #[tokio::test]
 async fn blob_table_insert_then_non_blob_update_preserves_full_schema() {
     use omnigraph::loader::LoadMode;
@@ -3946,20 +3929,19 @@ node Document {
 }
 "#;
     const BLOB_QUERIES: &str = r#"
-query insert_then_update_note(
+query assign_blob_then_update_note(
     $title: String, $blob: String, $note: String
 ) {
-    insert Document { title: $title, content: $blob }
     match { $x: Document } where $x.title = $title
+    update $x set { content: $blob }
     update $x set { note: $note }
 }
 
-query insert_then_replace_blob(
+query upsert_then_replace_blob(
     $title: String, $first: String, $second: String
 ) {
     insert Document { title: $title, content: $first }
-    match { $x: Document } where $x.title = $title
-    update $x set { content: $second }
+    insert Document { title: $title, content: $second }
 }
 "#;
 
@@ -3988,11 +3970,12 @@ query insert_then_replace_blob(
             .unwrap(),
     );
 
-    // Keep one committed blob row as well as the just-inserted pending row so
+    // Keep one committed blob row beside the row the two updates rewrite so
     // the table has the real blob-v2 physical representation while this query
     // exercises the pending union.
     db.load_jsonl(
-        r#"{"type":"Document","data":{"title":"seed","content":"base64:AQID"}}"#,
+        r#"{"type":"Document","data":{"title":"seed","content":"base64:AQID"}}
+{"type":"Document","data":{"title":"letter"}}"#,
         LoadMode::Overwrite,
     )
     .await
@@ -4002,7 +3985,7 @@ query insert_then_replace_blob(
         .mutate(
             "main",
             BLOB_QUERIES,
-            "insert_then_update_note",
+            "assign_blob_then_update_note",
             &params(&[
                 ("$title", "letter"),
                 ("$blob", "base64:BAUG"),
@@ -4010,10 +3993,10 @@ query insert_then_replace_blob(
             ]),
         )
         .await
-        .expect("blob-table insert + non-blob update must share a full-schema merge batch");
+        .expect("a Blob update + non-blob update must share a full-schema merge batch");
     assert_eq!(
         result.affected_nodes, 2,
-        "one insert plus one pending-row update"
+        "one Blob update plus one pending-row update"
     );
 
     let blob = read_managed_blob_bytes(
@@ -4044,7 +4027,7 @@ query insert_then_replace_blob(
 
     // Mutation coalescing is last-write-wins before URI admission. The first
     // pending value is deliberately outside the allow base; because the
-    // update replaces it in the same query, it must cause no policy check,
+    // second upsert replaces it in the same query, it must cause no policy check,
     // HEAD, or payload read. Only the surviving URI is copied.
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
     let result = omnigraph::instrumentation::with_merge_write_probes(
@@ -4052,7 +4035,7 @@ query insert_then_replace_blob(
         db.mutate(
             "main",
             BLOB_QUERIES,
-            "insert_then_replace_blob",
+            "upsert_then_replace_blob",
             &params(&[
                 ("$title", "last-wins"),
                 (
@@ -4079,8 +4062,9 @@ query insert_then_replace_blob(
 }
 
 /// Two Blob properties interleaved with scalars: an update assigns one Blob and
-/// carries the other, on a committed row and on a row the same mutation
-/// inserted. Carried bytes and scalars keep their values on both rows.
+/// carries the other, on the committed rows and, in a second statement of the
+/// same group, on the pending rows the first statement wrote. Carried bytes
+/// and scalars keep their values on both rows.
 #[tokio::test]
 async fn update_assigning_one_of_two_blobs_carries_the_other_byte_identical() {
     const SCHEMA: &str = r#"
@@ -4093,11 +4077,9 @@ node Doc {
 }
 "#;
     const MUTATIONS: &str = r#"
-query insert_then_set_first(
-    $slug: String, $a: Blob, $title: String, $b: Blob, $rank: I64, $first: Blob
-) {
-    insert Doc { slug: $slug, first: $a, title: $title, second: $b, rank: $rank }
+query set_first_twice($a: Blob, $first: Blob) {
     match { $x: Doc } where $x.rank > 0
+    update $x set { first: $a }
     update $x set { first: $first }
 }
 
@@ -4121,7 +4103,8 @@ query scalars() {
             .unwrap(),
     );
     db.load_jsonl(
-        r#"{"type":"Doc","data":{"slug":"kept","first":"base64:AQID","title":"kept title","second":"base64:BAUG","rank":3}}"#,
+        r#"{"type":"Doc","data":{"slug":"kept","first":"base64:AQID","title":"kept title","second":"base64:BAUG","rank":3}}
+{"type":"Doc","data":{"slug":"fresh","first":"base64:AQID","title":"fresh title","second":"base64:CgsM","rank":7}}"#,
         LoadMode::Overwrite,
     )
     .await
@@ -4131,24 +4114,12 @@ query scalars() {
         .mutate(
             "main",
             MUTATIONS,
-            "insert_then_set_first",
-            &mixed_params(
-                &[
-                    ("$slug", "fresh"),
-                    ("$a", "base64:BwgJ"),
-                    ("$title", "fresh title"),
-                    ("$b", "base64:CgsM"),
-                    ("$first", "base64:DQ4P"),
-                ],
-                &[("$rank", 7)],
-            ),
+            "set_first_twice",
+            &params(&[("$a", "base64:BwgJ"), ("$first", "base64:DQ4P")]),
         )
         .await
         .unwrap();
-    assert_eq!(
-        result.affected_nodes, 3,
-        "one insert, then the committed row and the inserted row updated"
-    );
+    assert_eq!(result.affected_nodes, 4, "each statement updates both rows");
 
     let blob = async |slug: &str, property: &str| {
         read_managed_blob_bytes(
@@ -4443,10 +4414,10 @@ query del($repo: String) { match { $x: Doc } where $x.repoName = $repo  delete $
     );
 }
 
-// #283 (pending side): a chained mutation whose 2nd op filters a camelCase
-// column must read op-1's staged rows through the pending DataFusion `MemTable`
-// (`SELECT … WHERE {filter}` via ctx.sql), which lowercases unquoted idents.
-// This is the path the single update/delete above does NOT exercise.
+// #283 (pending side): a second update of a camelCase-selected row in one
+// group must read op-1's staged row from the pending rows. Every group of a
+// write selects on its one snapshot (a later group re-selecting the type is
+// T91), so the second statement reads the pending row by identity.
 #[tokio::test]
 async fn camelcase_chained_mutation_reads_pending_by_camelcase() {
     let dir = tempfile::tempdir().unwrap();
@@ -4460,7 +4431,6 @@ async fn camelcase_chained_mutation_reads_pending_by_camelcase() {
 query chain($repo: String) {
     match { $x: Doc } where $x.repoName = $repo
     update $x set { status: "stage1" }
-    match { $x: Doc } where $x.repoName = $repo
     update $x set { status: "stage2" }
 }
 "#;

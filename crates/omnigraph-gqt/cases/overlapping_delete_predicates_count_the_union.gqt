@@ -1,7 +1,8 @@
 # issue: none
-# notes: Three deletes in one query whose predicates overlap remove the union
-# notes: of their matches and count each node and each cascaded edge once: the
-# notes: staging ledger excludes rows a prior predicate already matched.
+# notes: Overlapping delete predicates remove the union of their matches and count
+# notes: each node and each cascaded edge once. Every group of a write selects on
+# notes: its one snapshot, so three delete groups on one type are refused (`T91`)
+# notes: and the union is one group's disjunction.
 
 --- runner
 timeout_ms: 10000
@@ -36,6 +37,17 @@ query delete_three_overlapping($threshold: I32) {
     match { $x: Person } where $x.age > $threshold
     delete $x
     match { $x: Person } where $x.name = "Alice"
+    delete $x
+}
+
+--- params
+{"threshold": 35}
+
+--- expect error: T91: `delete_three_overlapping`: group 2 selects on type `Person`, which an earlier group of the write changes
+
+--- mutate
+query delete_overlapping($threshold: I32) {
+    match { $x: Person } where $x.team = "red" or $x.age > $threshold or $x.name = "Alice"
     delete $x
 }
 

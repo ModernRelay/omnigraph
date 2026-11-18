@@ -1024,8 +1024,7 @@ query clear_doc_content($title: String, $content: Blob?) {
 
 query insert_then_clear_doc_content($title: String, $content: Blob, $cleared: Blob?) {
     insert Document { title: $title, content: $content }
-    match { $x: Document } where $x.title = $title
-    update $x set { content: $cleared }
+    insert Document { title: $title, content: $cleared }
 }
 "#;
 

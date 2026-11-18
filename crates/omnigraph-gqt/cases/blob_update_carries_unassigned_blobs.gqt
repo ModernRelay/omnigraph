@@ -1,6 +1,6 @@
 # issue: none
 # notes: An update on a type with two Blob properties assigns one and carries the other.
-# notes: The scalars on both sides of each Blob keep their values on a committed row and on a row inserted in the same mutation.
+# notes: The scalars on both sides of each Blob keep their values on a committed row and on a row an earlier statement of the same group wrote.
 # notes: A null on a non-nullable scalar is refused when the predicate matches no row.
 
 --- runner
@@ -72,14 +72,24 @@ query assign_both($slug: String, $first: Blob?, $second: Blob?) {
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query insert_then_assign_second($first: Blob?, $second: Blob?) {
+query insert_c($first: Blob?) {
     insert Doc { slug: "c", first: $first, title: "gamma", rank: 3 }
+}
+
+--- params
+{"first": "base64:EBES"}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query retitle_then_assign_second($second: Blob?) {
     match { $x: Doc } where $x.slug = "c"
+    update $x set { title: "gamma" }
     update $x set { second: $second }
 }
 
 --- params
-{"first": "base64:EBES", "second": "base64:ExQV"}
+{"second": "base64:ExQV"}
 
 --- expect affected: nodes=2 edges=0
 

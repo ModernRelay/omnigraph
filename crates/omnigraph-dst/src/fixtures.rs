@@ -116,10 +116,8 @@ query all_knows() {
 }
 
 query transfer($a: String, $b: String, $age_a: I32, $age_b: I32, $ver_a: I64, $ver_b: I64) {
-    match { $x: Person } where $x.name = $a
-    update $x set { age: $age_a, ver: $ver_a }
-    match { $x: Person } where $x.name = $b
-    update $x set { age: $age_b, ver: $ver_b }
+    match { $x: Person } where $x.name = $a or $x.name = $b
+    update $x set { age: if($x.name = $a, $age_a, $age_b), ver: if($x.name = $a, $ver_a, $ver_b) }
 }
 
 query all_knows_bound() {

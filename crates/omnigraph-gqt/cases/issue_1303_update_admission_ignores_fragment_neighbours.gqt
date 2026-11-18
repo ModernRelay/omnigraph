@@ -8,7 +8,8 @@
 # notes: The `Doc` tables cover the two Blob scans: one carries the unassigned Blob (its pre-charge
 # notes: measured the slice too), and one assigns every Blob, so the matched rows are carried as scanned.
 # notes: A sole update that carries an unassigned Blob stages a column patch (#1272), so the `DocTwice`
-# notes: steps carry the Blob in two statements (the second matches nothing) to keep that pre-charge
+# notes: steps carry the Blob beside a second statement on the type, an insert whose selection matches nothing,
+# notes: to keep that pre-charge
 # notes: covered. A whole-row update moves its row to a new fragment, so each limited update on a
 # notes: shared table runs on its own fresh table, before any other update has moved row000.
 
@@ -230,8 +231,8 @@ set write_max_bytes = 2048;
 query retitle_apart_doc_in_two_statements() {
     match { $x: ApartDocTwice } where $x.slug = "row000"
     update $x set { title: "twice" }
-    match { $x: ApartDocTwice } where $x.slug = "nobody"
-    update $x set { title: "twice" }
+    match { $n: Shared } where $n.slug = "nobody"
+    insert ApartDocTwice { slug: "never", title: "never" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -241,8 +242,8 @@ set write_max_bytes = 2048;
 query retitle_shared_doc_in_two_statements() {
     match { $x: SharedDocTwice } where $x.slug = "row000"
     update $x set { title: "twice" }
-    match { $x: SharedDocTwice } where $x.slug = "nobody"
-    update $x set { title: "twice" }
+    match { $n: Shared } where $n.slug = "nobody"
+    insert SharedDocTwice { slug: "never", title: "never" }
 }
 
 --- expect affected: nodes=1 edges=0

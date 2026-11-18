@@ -119,6 +119,9 @@ codes! {
     // `optional` introduces enter the enclosing scope nullable, and a triple
     // reading one outside it drops the rows where it is null.
     T90 = "a triple outside an `optional` reads a reference that `optional` introduced, which turns its outer join into an inner one; the fix moves the triple inside the `optional`";
+    // The GQ 3 RFC, section 2, the sinks: every group of a write selects on
+    // the write's one snapshot, never on the effects earlier groups staged.
+    T91 = "a write group's selection reads a type an earlier group of the write changes; every group selects on the snapshot the write started from";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
     // the binding it ranks, and `rrf` arms that rank two bindings are T75.

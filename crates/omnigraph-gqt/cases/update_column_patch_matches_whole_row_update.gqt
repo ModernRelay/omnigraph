@@ -74,8 +74,8 @@ query patch_scores() {
 query rewrite_scores() {
     match { $x: Doc } where $x.age >= 2
     update $x set { score: 5 }
-    match { $x: Doc } where $x.slug = "nobody"
-    update $x set { score: 0 }
+    match { $m: Marker } where $m.name = "nobody"
+    insert Doc { slug: "never", age: 0 }
 }
 
 --- expect affected: nodes=4 edges=0
@@ -232,8 +232,8 @@ query patch_out_of_range() {
 query rewrite_out_of_range() {
     match { $x: Doc } where $x.age = 0
     update $x set { score: 500 }
-    match { $x: Doc } where $x.slug = "nobody"
-    update $x set { score: 0 }
+    match { $m: Marker } where $m.name = "nobody"
+    insert Doc { slug: "never", age: 0 }
 }
 
 --- expect error: @range violation on Doc.score
@@ -250,8 +250,8 @@ query patch_duplicate_code() {
 query rewrite_duplicate_code() {
     match { $x: Doc } where $x.age = 0
     update $x set { code: "c-03" }
-    match { $x: Doc } where $x.slug = "nobody"
-    update $x set { score: 0 }
+    match { $m: Marker } where $m.name = "nobody"
+    insert Doc { slug: "never", age: 0 }
 }
 
 --- expect error: @unique violation on Doc.code
@@ -284,8 +284,8 @@ query patch_again() {
 query rewrite_again() {
     match { $x: Doc } where $x.age < 4
     update $x set { score: 7 }
-    match { $x: Doc } where $x.slug = "nobody"
-    update $x set { score: 0 }
+    match { $m: Marker } where $m.name = "nobody"
+    insert Doc { slug: "never", age: 0 }
 }
 
 --- expect affected: nodes=3 edges=0
@@ -361,8 +361,8 @@ branch create feature_rows from rows
 query rewrite_on_feature() {
     match { $x: Doc } where $x.age = 5
     update $x set { score: 9 }
-    match { $x: Doc } where $x.slug = "nobody"
-    update $x set { score: 0 }
+    match { $m: Marker } where $m.name = "nobody"
+    insert Doc { slug: "never", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -371,8 +371,8 @@ query rewrite_on_feature() {
 query rewrite_on_rows() {
     match { $x: Doc } where $x.age = 0
     update $x set { score: 8 }
-    match { $x: Doc } where $x.slug = "nobody"
-    update $x set { score: 0 }
+    match { $m: Marker } where $m.name = "nobody"
+    insert Doc { slug: "never", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0

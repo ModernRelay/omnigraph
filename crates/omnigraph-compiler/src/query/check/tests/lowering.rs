@@ -170,11 +170,6 @@ const B_IN_PROGRESS: &[InProgress] = &[
     },
     // `WriteShape`.
     InProgress {
-        construct: "a write group selecting over a table an earlier group changes",
-        site: "a write group whose selection reads a table an earlier group of the write changes (`{table}`)",
-        text: "query q() { match { $p: Person } where $p.name = \"ada\" update $p set { city: \"x\" } match { $q: Person, $q worksAt $c } update $c set { name: $q.name } }",
-    },
-    InProgress {
         construct: "an assignment reading a Blob from a row",
         site: "an assignment that reads a Blob from a row (`{property}`)",
         text: "query q() { match { $f: File, $g: File } where $f.name = \"a\" and $g.name = \"b\" update $g set { data: $f.data } }",
@@ -480,11 +475,6 @@ const CLOSURE: &[Row] = &[
             (
                 "query q($h: String) { match { $p: Person, $p worksAt $c } where $c.slug = $h update $p set { city: $c.name } }",
                 Lowers,
-            ),
-            // "a write group selecting over a table an earlier group changes"
-            (
-                "query q() { match { $p: Person } where $p.name = \"ada\" update $p set { city: \"x\" } match { $q: Person, $q worksAt $c } update $c set { name: $q.name } }",
-                Refused("B"),
             ),
         ],
     },
@@ -870,13 +860,42 @@ fn t86_is_at_the_construct() {
         "query q($s: String) { match { $p: Person } where sum(if(match_terms($d.body, terms($s, mode: any)), 1, 0)) { $d: Doc, $p authored $d } > 0 return { $p.name } }",
     );
     assert_eq!(d.position.map(|p| p.column), Some(50), "{d}");
-    // A write group whose selection reads a table an earlier group changes
-    // is refused at that group's `match`.
-    let d = refused(
+}
+
+/// Every group of a write selects on the write's one snapshot, so a group
+/// whose selection reads a type an earlier group changes is `T91` at that
+/// group's `match`, whether its selection is a filtered scan of its target
+/// (the staged form) or a read the read planner shapes; a group reading only
+/// types no earlier group changes is accepted.
+#[test]
+fn a_group_selecting_on_a_type_an_earlier_group_changes_is_t91() {
+    let code = |text: &str| outcome(text).map(|_| ()).map_err(|d| d.code.as_str());
+    for text in [
+        // A selection read after an update of the type it reads.
         "query q() {\n  match { $p: Person } where $p.name = \"ada\"\n  update $p set { city: \"x\" }\n  match { $q: Person, $q worksAt $c }\n  update $c set { name: $q.name }\n}",
+        // A staged scan after an update of its own target.
+        "query q() {\n  match { $p: Person } where $p.name = \"ada\"\n  update $p set { city: \"x\" }\n  match { $q: Person } where $q.name = \"ada\"\n  update $q set { city: \"y\" }\n}",
+    ] {
+        let d = outcome(text).expect_err("refused");
+        assert_eq!(d.code.as_str(), "T91", "{d}");
+        let at = d.position.expect("a position");
+        assert_eq!((at.line, at.column), (4, 11), "{d}");
+        assert!(d.fix.is_some(), "{d}");
+    }
+    // A node delete changes its edges' tables too.
+    assert_eq!(
+        code(
+            "query q() {\n  match { $p: Person } where $p.name = \"ada\"\n  delete $p\n  match { $q: Person, $q worksAt $c }\n  delete $c\n}"
+        ),
+        Err("T91")
     );
-    let at = d.position.expect("a position");
-    assert_eq!((at.line, at.column), (4, 11), "{d}");
+    // A later group reading a type no earlier group changes is accepted.
+    assert_eq!(
+        code(
+            "query q() {\n  match { $p: Person } where $p.name = \"ada\"\n  update $p set { city: \"x\" }\n  match { $c: Company } where $c.name = \"acme\"\n  update $c set { name: \"acme2\" }\n}"
+        ),
+        Ok(())
+    );
 }
 
 /// A `let` whose value can fail is evaluated where it was written: after the

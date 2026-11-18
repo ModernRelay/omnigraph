@@ -42,18 +42,36 @@ query delete_by_exists() {
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query chained_updates() {
+query trim_to_exists() {
     match { $x: Span } where $x.trim = 3
     update $x set { exists: 5 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query exists_to_trim() {
     match { $x: Span } where $x.exists = 5
     update $x set { trim: 7 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query trim_to_interval() {
     match { $x: Span } where $x.trim = 7
     update $x set { interval: 8 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query interval_to_exists() {
     match { $x: Span } where $x.interval = 8
     update $x set { exists: 6 }
 }
 
---- expect affected: nodes=4 edges=0
+--- expect affected: nodes=1 edges=0
 
 --- query
 query survivors() {

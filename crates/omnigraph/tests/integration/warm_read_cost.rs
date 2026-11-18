@@ -3239,9 +3239,10 @@ async fn repeated_merges_reuse_shared_cold_registry_files() {
     }
 }
 
-/// A declaration the planner does not lower is checked and does not run:
+/// A declaration the planner does not lower, or a write whose later group
+/// selects on a type an earlier group changes, is checked and does not run:
 /// each door types it against the handle's accepted catalog and the type
-/// checker refuses it (`T86`), as it answers a type error with its own code,
+/// checker refuses it (`T86`, `T91`), as it answers a type error with its own code,
 /// both after the warm freshness probe and before any table opens. Neither door
 /// issues another storage request on the way.
 #[tokio::test]
@@ -3284,7 +3285,8 @@ async fn an_unlowered_declaration_is_refused_before_any_storage_access() {
         let (outcome, io) =
             measure(db.mutate("main", write, "rename", &params(&[("$name", "Alice")]))).await;
         let error = outcome.expect_err("the declaration does not run");
-        assert_eq!(error.diagnostic().map(|d| d.code.as_str()), Some("T86"), "{error}");
+        // A later group selecting on the type an earlier group changes.
+        assert_eq!(error.diagnostic().map(|d| d.code.as_str()), Some("T91"), "{error}");
         assert_eq!(
             (
                 io.total_reads(),

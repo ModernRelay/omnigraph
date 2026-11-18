@@ -28,8 +28,7 @@ branch create source
 --- mutate branch: source
 query source_changes() {
     insert Person { name: "carol", age: 50 }
-    match { $x: Person } where $x.name = "alice"
-    update $x set { age: 31 }
+    insert Person { name: "alice", age: 31 }
 }
 --- expect affected: nodes=2 edges=0
 
