@@ -2789,3 +2789,64 @@ fn a_list_compared_with_its_element_type_suggests_membership() {
             });
     }
 }
+
+#[test]
+fn an_insert_targets_the_edge_type_sharing_a_node_types_name_by_its_endpoints_issue_921() {
+    let target = |schema: &str, src: &str| -> Result<MutationTarget, String> {
+        let catalog = build_catalog(&parse_schema(schema).unwrap()).unwrap();
+        let (_, checked) = type_source(&catalog, src)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let checked = checked.map_err(|e| format!("{}: {}", e.code.as_str(), e.message))?;
+        let CoreDecl::Write(w) = checked.core else {
+            panic!("a write")
+        };
+        match &w.groups[0].sinks[0] {
+            Sink::Insert { target, .. } => Ok(target.clone()),
+            other => panic!("an insert, got {other:?}"),
+        }
+    };
+    let shared = "node Link { name: String @key }\nedge Link: Link -> Link { weight: I32? }";
+    assert_eq!(
+        target(
+            shared,
+            r#"query q() { insert Link { from: "a", to: "b", weight: 1 } }"#
+        ),
+        Ok(MutationTarget::Edge {
+            type_name: "Link".into()
+        })
+    );
+    assert_eq!(
+        target(shared, r#"query q() { insert Link { name: "a" } }"#),
+        Ok(MutationTarget::Node {
+            type_name: "Link".into()
+        })
+    );
+    // An edge insert missing one endpoint is still an edge insert, refused
+    // for the endpoint it omits.
+    let missing = target(shared, r#"query q() { insert Link { from: "a" } }"#).unwrap_err();
+    assert!(
+        missing.starts_with("T12") && missing.contains("`to`"),
+        "{missing}"
+    );
+    // A node type may declare `from`, which an edge type reserves for its
+    // endpoint: a statement assigning it fits both types.
+    let ambiguous = "node Link { name: String @key  from: String? }\nedge Link: Link -> Link";
+    let refused = target(
+        ambiguous,
+        r#"query q() { insert Link { name: "a", from: "b" } }"#,
+    )
+    .unwrap_err();
+    assert!(
+        refused.starts_with("T11") && refused.contains("both"),
+        "{refused}"
+    );
+    assert_eq!(
+        target(ambiguous, r#"query q() { insert Link { name: "a" } }"#),
+        Ok(MutationTarget::Node {
+            type_name: "Link".into()
+        })
+    );
+}

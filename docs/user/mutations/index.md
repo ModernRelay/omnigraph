@@ -12,7 +12,7 @@ query hire($person_id: String, $company_id: String, $role: String) {
 }
 ```
 
-An edge insert assigns its endpoints as `from` and `to`, the logical ids of existing nodes.
+An edge insert assigns its endpoints as `from` and `to`, the logical ids of existing nodes. Where a node type and an edge type share a name, an insert assigning `from` or `to` writes the edge type and one assigning neither the node type; an insert assigning a `from` or `to` the node type also declares as a property fits both and is refused (`T11`).
 
 ## Statements
 

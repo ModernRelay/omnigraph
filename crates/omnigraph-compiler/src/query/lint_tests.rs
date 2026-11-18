@@ -517,7 +517,7 @@ delete $x
 }
 
 #[test]
-fn same_named_node_and_edge_mutation_keeps_the_typechecked_namespace() {
+fn same_named_node_and_edge_mutation_keeps_the_typechecked_namespace_issue_921() {
     let output = lint_query_file(
         &catalog(
             r#"
@@ -541,6 +541,29 @@ insert Shared { slug: $slug }
     };
     assert_eq!(operation.reads, vec![node.clone()]);
     assert_eq!(operation.writes, vec![node]);
+
+    // Its endpoint assignments make an insert of the same name an edge insert.
+    let output = lint_query_file(
+        &catalog(
+            r#"
+node Shared { slug: String @key }
+edge Shared: Shared -> Shared
+"#,
+        ),
+        r#"
+query link_shared($from: String, $to: String) {
+insert Shared { from: $from, to: $to }
+}
+"#,
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+    let operation = output.results[0].operation.as_ref().unwrap();
+    let edge = QueryGraphFact {
+        kind: QueryGraphFactKind::Edge,
+        type_name: "Shared".to_string(),
+    };
+    assert_eq!(operation.writes, vec![edge]);
 }
 
 #[test]

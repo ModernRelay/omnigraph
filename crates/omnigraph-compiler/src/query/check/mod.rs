@@ -4923,6 +4923,40 @@ impl Ctx<'_> {
     // -----------------------------------------------------------------------
     // Write statements.
 
+    /// Whether `insert T { … }` writes the edge type `T` rather than the node
+    /// type `T`. A node type and an edge type may share a name, and the
+    /// statement's form decides between them: an edge insert assigns its
+    /// endpoints `from` and `to`, which an edge type reserves, and a node
+    /// insert assigns neither. Only a statement that assigns an endpoint name
+    /// the node type also declares as a property fits both, and is refused.
+    fn insert_targets_edge(&self, type_name: &str, assignments: &[Assignment]) -> R<bool> {
+        let node = self.catalog.node_types.get(type_name);
+        let edge = self.catalog.edge_types.get(type_name);
+        let (Some(node), Some(_)) = (node, edge) else {
+            return Ok(node.is_none() && edge.is_some());
+        };
+        let ends: Vec<&str> = assignments
+            .iter()
+            .map(|a| a.property.as_str())
+            .filter(|p| matches!(*p, "from" | "to"))
+            .collect();
+        if ends.is_empty() {
+            return Ok(false);
+        }
+        if let Some(shared) = ends.iter().find(|p| node.properties.contains_key(**p)) {
+            return Err(err_fix(
+                T11,
+                format!(
+                    "`insert {type_name}` fits both the node type `{type_name}`, which declares a property `{shared}`, and the edge type `{type_name}`, whose endpoint `{shared}` is; a statement cannot tell them apart"
+                ),
+                format!(
+                    "rename the node type's property `{shared}` or one of the two types in the schema"
+                ),
+            ));
+        }
+        Ok(true)
+    }
+
     fn statement(&mut self, sc: &mut Scope, s: &Stmt) -> R<(Sink, WriteClass)> {
         match s {
             Stmt::Insert {
@@ -4941,7 +4975,13 @@ impl Ctx<'_> {
                     return Err(err(T10, "insert requires at least one assignment"));
                 }
                 dup_assignments(assignments)?;
-                if let Some(node) = self.catalog.node_types.get(type_name) {
+                let edge_insert = self.insert_targets_edge(type_name, assignments)?;
+                if let Some(node) = self
+                    .catalog
+                    .node_types
+                    .get(type_name)
+                    .filter(|_| !edge_insert)
+                {
                     let mut out = Vec::new();
                     // Each assignment is checked; an unknown property may be
                     // the misspelled required one, so the required check

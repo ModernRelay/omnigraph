@@ -74,7 +74,7 @@ either name before this reservation keeps opening; only new schemas are
 refused.
 
 On edge types the names `from` and `to` are also reserved: they are the
-insert parameters that name the endpoints.
+insert parameters that name the endpoints. A node type and an edge type may share a name; an insert's endpoint assignments then select the edge type ([mutations](../mutations/index.md)).
 
 ## Constraints
 
