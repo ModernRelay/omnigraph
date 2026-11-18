@@ -3194,7 +3194,7 @@ async fn open_case_store(
         .await
         .map_err(|e| format!("init failed: {e}"))?;
     let session = case_session(db, case, engine)?;
-    seed_case(&session, &fixture.seed, case.needs_indices).await?;
+    seed_case(&session, fixture, case.needs_indices).await?;
     Ok((session, uri, dir))
 }
 
@@ -3510,6 +3510,10 @@ fn a_plan_section_follows_a_load_or_mutate_steps_expect_only() {
 fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
     use CaseErrorCode::*;
     const INVALID: &[(&str, &[(CaseErrorCode, usize)])] = &[
+        (
+            "batch_bound_branches_recipe_loads_nothing",
+            &[(BatchBound, 14)],
+        ),
         ("batch_bound_commits_above_rows", &[(BatchBound, 12)]),
         ("batch_bound_commits_with_zero_rows", &[(BatchBound, 12)]),
         (
@@ -3517,6 +3521,10 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
             &[(BatchBound, 12)],
         ),
         ("bind_shape_bind_before_any_write", &[(BindShape, 14)]),
+        (
+            "body_shape_branches_count_above_the_cap",
+            &[(BodyShape, 14)],
+        ),
         ("body_shape_recipe_rows_above_the_limit", &[(BodyShape, 12)]),
         ("body_shape_restart_with_an_argument", &[(BodyShape, 20)]),
         (
@@ -3572,12 +3580,21 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
         ),
         ("query_parse_unclosed_brace", &[(QueryParse, 14)]),
         ("runner_config_timeout_as_a_word", &[(RunnerConfig, 2)]),
+        ("section_order_branches_after_a_step", &[(SectionOrder, 19)]),
         (
             "section_order_schema_after_a_step",
             &[(SectionOrder, 12), (SectionOrder, 17)],
         ),
         ("section_order_seam_before_an_expect", &[(SectionOrder, 16)]),
         ("step_kind_mutation_under_query", &[(StepKind, 14)]),
+        (
+            "substitution_placement_branches_header_names_the_marker",
+            &[(SubstitutionPlacement, 14)],
+        ),
+        (
+            "substitution_placement_branches_recipe_names_the_loop",
+            &[(SubstitutionPlacement, 21)],
+        ),
         (
             "substitution_placement_in_a_step_body",
             &[(SubstitutionPlacement, 16)],
