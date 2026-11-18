@@ -14,6 +14,7 @@ const MAX_RESTORE_EXPORT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 struct VerifiedTables {
     digests: BTreeMap<[u8; 32], [u8; 32]>,
     exported_bytes: u64,
+    blobs: export::RestoreBlobCache,
 }
 
 /// A compact comparison of all live references, retained ancestry and exact
@@ -155,6 +156,8 @@ impl Omnigraph {
                     commits = commits.len(),
                     table_versions = tables.digests.len(),
                     exported_bytes = tables.exported_bytes,
+                    blob_bytes_read = tables.blobs.read_bytes,
+                    blob_cache_hits = tables.blobs.hits,
                     "verifying restored graph history"
                 );
             }
@@ -199,6 +202,14 @@ impl Omnigraph {
                 "graph changed during full-history verification",
             ));
         }
+        tracing::debug!(
+            commits = commits.len(),
+            table_versions = tables.digests.len(),
+            exported_bytes = tables.exported_bytes,
+            blob_bytes_read = tables.blobs.read_bytes,
+            blob_cache_hits = tables.blobs.hits,
+            "verified restored graph history"
+        );
         Ok(RestoreHistoryWitness {
             version: 1,
             schema,
@@ -266,10 +277,10 @@ impl Omnigraph {
                     )));
                 }
                 let digest = export::restored_table_digest(
-                    self,
-                    snapshot,
+                    &dataset,
                     &accepted.catalog,
                     table,
+                    &mut verified.blobs,
                     &mut verified.exported_bytes,
                     MAX_RESTORE_EXPORT_BYTES,
                 )

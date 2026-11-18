@@ -4519,8 +4519,9 @@ fn lance_ordering_stays_behind_bounded_scan_executor() {
 /// `with_io_buffer_size_bytes`, and of `managed_blob_payloads`, the one batched
 /// managed read, in the production sources of the engine crate and the
 /// `GUARDED_CRATES`. A bulk Blob reader calls the helper and adds its row here;
-/// a second raw `read_blobs` call, or `take_blobs` and one `BlobFile::read` per
-/// row, fails.
+/// a second raw `read_blobs` or `take_blobs` site fails. The single-cell
+/// facade and frozen-restore verifier share managed-only handle selection.
+/// Restore streams a bounded range once per immutable object and byte range.
 #[test]
 fn lance_batched_blob_read_call_counts_are_pinned() {
     let src = engine_src_root();
@@ -4560,8 +4561,8 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
             ("with_io_buffer_size_bytes", "table_store.rs".to_string(), 1),
         ],
         "the per-file call counts of the Blob read APIs changed: a bulk Blob \
-         read goes through managed_blob_payloads, and only the single-cell \
-         read facade keeps take_blobs"
+         read goes through managed_blob_payloads, and managed handle selection \
+         stays centralized in blob.rs"
     );
 }
 

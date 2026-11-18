@@ -1259,6 +1259,42 @@ pub(crate) struct ResolvedBlobCell {
     pub(crate) stable_property_id: u64,
 }
 
+/// Resolve descriptor-classified managed row ids in order, without reading their payloads.
+pub(crate) async fn managed_blob_files(
+    dataset: &Arc<lance::Dataset>,
+    row_ids: &[u64],
+    property: &str,
+) -> Result<Vec<BlobFile>> {
+    if row_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let files = dataset
+        .take_blobs(row_ids, property)
+        .await
+        .map_err(OmniError::storage)?;
+    if files.len() != row_ids.len() {
+        return Err(OmniError::blob_integrity(
+            "managed Blob lookup returned the wrong number of slots",
+        ));
+    }
+    files
+        .into_iter()
+        .map(|slot| {
+            let file = slot.ok_or_else(|| {
+                OmniError::blob_integrity(
+                    "a non-null managed Blob descriptor resolved to a null payload slot",
+                )
+            })?;
+            if file.kind() == BlobKind::External || file.uri().is_some() {
+                return Err(OmniError::blob_integrity(
+                    "a managed Blob descriptor resolved to an external payload handle",
+                ));
+            }
+            Ok(file)
+        })
+        .collect()
+}
+
 /// Find one entity's row in an opened table version and classify its Blob
 /// cell from the descriptor alone, without opening any payload: the stable
 /// row id and the descriptor, or `None` when no row has the id. A duplicate id
@@ -1639,26 +1675,12 @@ impl Omnigraph {
                     stable_row_id,
                     &cell,
                 )?;
-                let mut files = dataset
-                    .take_blobs(&[stable_row_id], &cell.property)
-                    .await
-                    .map_err(OmniError::storage)?;
-                if files.len() != 1 {
-                    return Err(OmniError::blob_integrity(format!(
-                        "managed Blob lookup returned {} slots instead of one",
-                        files.len()
-                    )));
-                }
-                let file = files.pop().flatten().ok_or_else(|| {
-                    OmniError::blob_integrity(
-                        "a non-null managed Blob descriptor resolved to a null payload slot",
-                    )
-                })?;
-                if file.kind() == BlobKind::External || file.uri().is_some() {
-                    return Err(OmniError::blob_integrity(
-                        "a managed Blob descriptor resolved to an external payload handle",
-                    ));
-                }
+                let file = managed_blob_files(&dataset, &[stable_row_id], &cell.property)
+                    .await?
+                    .pop()
+                    .ok_or_else(|| {
+                        OmniError::blob_integrity("single managed Blob lookup was empty")
+                    })?;
                 if file.size() != length {
                     return Err(OmniError::blob_integrity(format!(
                         "managed Blob descriptor length {} disagrees with payload length {}",
