@@ -669,6 +669,14 @@ pub const CLI_ONLY_OPERATIONS: &[CliOnlyOperation] = &[
     cli_only("cluster observe", APPLIED),
     cli_only("cluster force-unlock", APPLIED),
     cli_only("cluster upgrade-ledger", APPLIED),
+    cli_only(
+        "cluster verify-restore",
+        "Verifies a stopped graph copy directly with read-only storage access.",
+    ),
+    cli_only(
+        "cluster prepare-restore",
+        "Reserves a fresh destination graph path with storage-owner credentials.",
+    ),
     cli_only("cluster create", MANAGED),
     cli_only("cluster list", MANAGED),
     cli_only("cluster members list", MANAGED),

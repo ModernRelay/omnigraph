@@ -49,7 +49,7 @@ prints the exact flags of the installed binary.
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
-| `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
+| `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `verify-restore` `prepare-restore` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
 | `organization` | `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |

@@ -205,7 +205,7 @@ async fn full_history_refuses_a_historical_external_blob_even_if_the_head_is_por
     let uri = url::Url::from_file_path(&path).unwrap();
     let base = url::Url::from_directory_path(ext.path()).unwrap();
     let policy = ExternalBlobPolicy::allow(vec![
-        ExternalBlobBase::new(base.to_string(), ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+        ExternalBlobBase::new(&base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
     ])
     .unwrap();
     let db = session(
