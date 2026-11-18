@@ -1037,8 +1037,9 @@ impl ReadGen<'_, '_, '_> {
         let choice = self.c.below(10);
         match choice {
             // The placement law's reads draw their `optional` last (a
-            // failing element): one before a `from` that can fail hits a
-            // defect pinned as a hunt (law_engine_reference.rs).
+            // failing element): the shaper's fixed element order runs an
+            // `optional` after elements written later, a defect of the
+            // order pinned as a hunt (law_engine_reference.rs).
             1 if self.options.nesting && !self.options.placement => {
                 self.optional(scope, elements, depth)
             }
@@ -1072,12 +1073,7 @@ impl ReadGen<'_, '_, '_> {
                     });
                 }
             }
-            // The placement law's reads draw no `union`: one followed by an
-            // `optional` that can fail hits a defect pinned as a hunt
-            // (law_engine_reference.rs).
-            4 if self.options.nesting && !self.options.placement => {
-                self.union_from(scope, elements, depth)
-            }
+            4 if self.options.nesting => self.union_from(scope, elements, depth),
             _ => {
                 if let Some((text, new)) = self.traversal(scope, choice == 5, false, false) {
                     elements.push(text);

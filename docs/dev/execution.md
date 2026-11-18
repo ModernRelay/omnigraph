@@ -40,7 +40,10 @@ A query runs against one resolved `ReadTarget`:
    placed after the scope's bindings and traversals and before its filters
    and blocks: its own pattern placed over the outer row, and the logical
    and physical `OptionalJoin` over an `OuterReference`; a traversal from a
-   name it introduces expands after it, its inner tree is a scope of its own
+   name it introduces expands after it, and one from the column of a
+   correlated `from` (a `union`, or an inline read with its own group or
+   cut) after that `from` and before the optionals written after it, which
+   read its ends as outer columns; its inner tree is a scope of its own
    for the placement law, `$x is null` over a reference tests the
    identity column, and plan acceptance requires one `OptionalJoin` per
    written optional testing its own conjuncts inside its inner tree and

@@ -801,7 +801,15 @@ impl Facts {
     fn segment(&self, from: Marks, to: Marks) -> Facts {
         Facts {
             bindings: self.bindings[from.bindings..to.bindings].to_vec(),
-            traversals: self.traversals[from.traversals..to.traversals].to_vec(),
+            traversals: self.traversals[from.traversals..to.traversals]
+                .iter()
+                .cloned()
+                .map(|mut traversal| {
+                    traversal.optionals_before =
+                        traversal.optionals_before.saturating_sub(from.optionals);
+                    traversal
+                })
+                .collect(),
             conjuncts: self.conjuncts[from.conjuncts..to.conjuncts].to_vec(),
             optionals: self.optionals[from.optionals..to.optionals].to_vec(),
             unions: self.unions[from.unions..to.unions].to_vec(),
@@ -870,7 +878,11 @@ impl Facts {
                 correlate
             }));
         self.bindings.extend(bindings);
-        self.traversals.extend(traversals);
+        self.traversals
+            .extend(traversals.into_iter().map(|mut traversal| {
+                traversal.optionals_before = at.optionals;
+                traversal
+            }));
         self.conjuncts.extend(conjuncts);
         self.types.extend(types);
         Ok(())
@@ -1107,6 +1119,10 @@ struct TraversalFact {
     min_hops: u32,
     max_hops: Option<u32>,
     edge_binding: Option<String>,
+    /// How many of the scope's `optional`s were written before it: a
+    /// triple from a correlated read's column expands before the
+    /// `optional`s written after it, which correlate on its ends.
+    optionals_before: usize,
 }
 
 /// A `from union(…)`: each arm's facts, every arm binding the union's
@@ -2312,6 +2328,7 @@ impl<'a> Shaper<'a> {
                             min_hops: 1,
                             max_hops: Some(1),
                             edge_binding: Some(var.clone()),
+                            optionals_before: 0,
                         },
                     );
                     Ok(())
@@ -2342,6 +2359,7 @@ impl<'a> Shaper<'a> {
                             min_hops: *min_hops,
                             max_hops: *max_hops,
                             edge_binding: edge_var.clone(),
+                            optionals_before: 0,
                         },
                     );
                     Ok(())
@@ -3301,6 +3319,7 @@ impl<'a> Shaper<'a> {
         if t.src != "_" {
             facts.types.insert(t.src.clone(), t.src_type.clone());
         }
+        t.optionals_before = facts.optionals.len();
         facts.traversals.push(t);
     }
 
@@ -3341,6 +3360,7 @@ impl<'a> Shaper<'a> {
                     min_hops: *min_hops,
                     max_hops: *max_hops,
                     edge_binding: edge_var.clone(),
+                    optionals_before: 0,
                 },
             );
             return Ok(());
@@ -3996,6 +4016,14 @@ impl<'a> Shaper<'a> {
                     || correlate_names.contains(t.src.as_str())
                     || correlate_names.contains(t.dst.as_str())
             });
+        // A triple from a correlated read's column and no `optional`'s name
+        // expands once that read is placed, before the `optional`s written
+        // after it, which read its ends as outer columns; one written after
+        // an `optional` expands after it.
+        let (mut after_correlate, after_optional): (Vec<&TraversalFact>, Vec<&TraversalFact>) =
+            after_optional.into_iter().partition(|t| {
+                !facts.optional_names.contains(&t.src) && !facts.optional_names.contains(&t.dst)
+            });
         // A triple closing on a reference null on some rows, one an
         // `optional` of this scope or of an enclosing one introduced, reads
         // its identity as nullable.
@@ -4012,6 +4040,11 @@ impl<'a> Shaper<'a> {
             {
                 self.place_correlate(correlate, pipeline, bound_vars, outer_physical_names, fresh)?;
             }
+            let (due, later): (Vec<&TraversalFact>, Vec<&TraversalFact>) = after_correlate
+                .into_iter()
+                .partition(|t| t.optionals_before <= index);
+            after_correlate = later;
+            self.expand_traversals(&due, pipeline, bound_vars, fresh, &nullable)?;
             // The inner tree reads the whole outer row; a name it shares with
             // the scope is that outer column (a rebinding is `T68`).
             let mut visible_outer: HashSet<String> = bound_vars.clone();
@@ -4038,6 +4071,8 @@ impl<'a> Shaper<'a> {
         // A read returning only values that reads a name the traversals
         // from an `optional`'s names bind runs after them; nothing they
         // expand from reads its columns.
+        let after_optional: Vec<&TraversalFact> =
+            after_correlate.into_iter().chain(after_optional).collect();
         let late: HashSet<&str> = after_optional
             .iter()
             .flat_map(|t| [t.src.as_str(), t.dst.as_str()])

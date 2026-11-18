@@ -42,7 +42,6 @@ use omnigraph_compiler::ParamMap;
 use omnigraph_compiler::arbitrary::{
     Choices, GenGraph, GenRead, GenSchema, ReadOptions, SchemaOptions, choices,
 };
-use omnigraph_compiler::query::value::Literal;
 use proptest::test_runner::{
     Config, FileFailurePersistence, RngAlgorithm, TestCaseError, TestRng, TestRunner,
 };
@@ -513,15 +512,15 @@ fn limit_zero_evaluates_a_return_item_that_can_fail() {
     });
 }
 
-/// The shrunk case of a defect the placement law found, which predates it:
+/// The shrunk case of a defect the placement law found, which predated it:
 /// after a correlated `union`, a triple from the union's binding and an
 /// `optional` over its destination whose own `where` can fail, the engine
-/// refuses its own rows (`$n6.__id` holds nulls against its non-null type)
-/// where the reference returns none. Without the `optional`'s `where`, or
-/// with a plain binding in place of the union, both agree. Until the fix the
-/// placement generator draws no `union`.
+/// refused its own rows (`$n6.__id` held nulls against its non-null type)
+/// where the reference returns none. The shaper placed a triple from a
+/// correlated read's column after every `optional`, so the `optional` bound
+/// the destination itself and padded it; such a triple now expands before
+/// the `optional`s written after it (`optional_over_a_correlated_unions_destination.gqt`).
 #[test]
-#[ignore = "hunt: an optional that can fail over a correlated union's destination nulls the destination's identity"]
 fn an_optional_that_can_fail_after_a_correlated_union_keeps_its_destination() {
     let schema = r#"node A {
     k: String @key
@@ -596,15 +595,17 @@ edge Rel2: B -> A
 }
 
 /// The shrunk case of a second defect the placement law found, which
-/// predates it: the shaper places a triple that closes on an `optional`'s
-/// node (`$n2 rel0 $n2`) after a `from` written later, so the `from`, whose
-/// sum can fail, runs on rows the triple removes and refuses (`E2`) where
-/// the reference, evaluating the elements in written order, returns no row.
-/// The shaper's fixed element order is replaced by the structural lowering;
-/// until then the placement generator draws no `optional` before the
-/// elements that can fail.
+/// predates it: the shaper's fixed element order places a triple from a
+/// correlated read's column (`$m rel0 $x`, `$m` drawn by a `from` with its
+/// own cut) after every later `from`, so a `from` written after the triple,
+/// whose sum can fail, runs on rows the triple removes and refuses (`E2`)
+/// where the reference, evaluating the elements in written order, returns
+/// no row. The law first found it as a triple closing on an `optional`'s
+/// node, a text `T90` now refuses. The structural lowering replaces the
+/// fixed order; until then the placement generator draws no `optional`
+/// before the elements that can fail.
 #[test]
-#[ignore = "hunt: a from that can fail runs before a triple written ahead of it that closes on an optional's node"]
+#[ignore = "hunt: a from that can fail runs before a triple written ahead of it from a correlated read's column"]
 fn a_from_that_can_fail_runs_after_the_triples_written_before_it() {
     let schema = r#"node A {
     k: String @key
@@ -612,16 +613,13 @@ fn a_from_that_can_fail_runs_after_the_triples_written_before_it() {
 }
 edge Rel0: A -> A
 "#;
-    let seed = r#"{"type":"A","data":{"k":"a","p0":0}}
+    let seed = r#"{"type":"A","data":{"k":"a","p0":5}}
 {"type":"A","data":{"k":"b","p0":0}}
-{"type":"A","data":{"k":"c","p0":0}}
-{"type":"A","data":{"k":"d","p0":100}}
-{"type":"A","data":{"k":"e","p0":0}}
-{"edge":"Rel0","from":"e","to":"a","data":{}}"#;
-    let source = r#"query q($p4: String, $p5: String) {
-  match { $n1: A, optional { $n2: A, $n2 rel0 $n1 where (not false) }, let $l3 = concat(concat($p4, $p5), if(true, $n1.k, $n1.k)), $n2 rel0 $n2, from { match { $n6: A, $n2 rel0{1,2} $n6 } return { sum((10 / $n6.p0)) as s7 } } }
-  where ($n1.k = "a") and ($n1.k = "a")
-  return { $n1.p0 as c0 }
+{"edge":"Rel0","from":"a","to":"b","data":{}}"#;
+    let source = r#"query q() {
+  match { $n1: A, from { match { $m: A, $n1 rel0 $m } return { $m } order { $m.k } limit 5 }, $m rel0 $x, from { match { $y: A, $n1 rel0{1,2} $y } return { sum((10 / $y.p0)) as s } } }
+  where $n1.k = "a"
+  return { $n1.k as c0 }
 }"#;
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let dir = tempfile::tempdir().unwrap();
@@ -630,16 +628,15 @@ edge Rel0: A -> A
             .unwrap();
         let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
         session.load_jsonl(seed, LoadMode::Overwrite).await.unwrap();
-        let params: ParamMap = [
-            ("p4".to_string(), Literal::String("a".to_string())),
-            ("p5".to_string(), Literal::String("a".to_string())),
-        ]
-        .into_iter()
-        .collect();
-        let judgment =
-            omnigraph_gqt::judge_read_against_reference(&session, source, "q", &params, false)
-                .await
-                .unwrap();
+        let judgment = omnigraph_gqt::judge_read_against_reference(
+            &session,
+            source,
+            "q",
+            &ParamMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
         judgment.verdict.unwrap_or_else(|e| {
             panic!(
                 "{e}\nengine: {}\nreference: {}",
