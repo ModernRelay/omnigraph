@@ -1046,10 +1046,14 @@ fn logged_out() -> IntentReply {
 async fn login_without_an_organization_never_takes_one_of_several_unasked() {
     type Listed = &'static [(&'static str, Option<&'static str>)];
     const ONE: Listed = &[("org_test", Some("Test Org"))];
+    const OTHER_ONLY: Listed = &[("org_other", None)];
     const SEVERAL: Listed = &[("org_other", None), ("org_test", Some("Test Org"))];
     // What is typed (`None`: no terminal), and the organization it settles on.
-    let cases: [(Listed, Option<&str>, Option<&str>); 7] = [
+    let cases: [(Listed, Option<&str>, Option<&str>); 10] = [
+        (&[], None, None),
         (ONE, None, Some("org_test")),
+        (OTHER_ONLY, None, Some("org_other")),
+        (OTHER_ONLY, Some(""), Some("org_other")),
         (SEVERAL, None, None),
         (SEVERAL, Some("1\n"), Some("org_other")),
         (SEVERAL, Some("org_test\n"), Some("org_test")),
@@ -1123,8 +1127,22 @@ async fn login_without_an_organization_never_takes_one_of_several_unasked() {
                     let error = result.unwrap_err();
                     assert_eq!(error.body["type"], "organization_required", "{typed:?}");
                     let detail = error.body["detail"].as_str().unwrap();
-                    for expected in ["--organization", "org_other", "org_test (Test Org)"] {
-                        assert!(detail.contains(expected), "{typed:?}: {detail}");
+                    if listed.is_empty() {
+                        assert!(
+                            detail.contains("no active organization membership"),
+                            "{detail}"
+                        );
+                    } else {
+                        for expected in ["--organization", "org_other", "org_test (Test Org)"] {
+                            assert!(detail.contains(expected), "{typed:?}: {detail}");
+                        }
+                        assert_eq!(
+                            error.body["organizations"],
+                            json!([
+                                {"organization_id": "org_other", "name": null},
+                                {"organization_id": "org_test", "name": "Test Org"}
+                            ])
+                        );
                     }
                     assert!(!error.body.to_string().contains("fresh-refresh"));
                     assert!(store.0.borrow().is_empty(), "{typed:?}");
@@ -1135,6 +1153,20 @@ async fn login_without_an_organization_never_takes_one_of_several_unasked() {
                         requests[1].headers["authorization"],
                         requests[0].headers["authorization"]
                     );
+                    if typed.is_none() && listed.len() > 1 {
+                        let expected = error.body.clone();
+                        let (mut out, mut err) = (Vec::new(), Vec::new());
+                        let exit = crate::app::complete_onboarding(
+                            Err(error.into()),
+                            true,
+                            &mut out,
+                            &mut err,
+                        )
+                        .unwrap();
+                        assert_eq!(exit.code(), 2);
+                        assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), expected);
+                        assert!(err.is_empty());
+                    }
                 }
             }
             assert_eq!(requests.len(), 2, "{typed:?}");
@@ -1323,12 +1355,11 @@ async fn login_without_an_organization_needs_the_api_to_list_them() {
     }
 }
 
-/// A fresh token too close to its expiry to be verified is renewed for the
-/// organization it already names, as happens when a person took their time
-/// choosing; one with time left is used as it is.
+/// Tokens received before the prompt can expire while the user chooses.
+/// Refresh before verification if expired or within the verification margin.
 #[tokio::test]
 async fn a_fresh_token_about_to_expire_is_renewed_for_its_own_organization() {
-    for (seconds, renewed) in [(120, false), (20, true)] {
+    for (seconds, renewed) in [(120, false), (20, true), (-10, true)] {
         let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
         crate::operator_routing::test_transport_scope(&[&api.origin], async {
             let store = MemoryStore::default();
@@ -1341,15 +1372,17 @@ async fn a_fresh_token_about_to_expire_is_renewed_for_its_own_organization() {
             } else {
                 vec![]
             });
-            let body = accept_device(
+            let tokens = serde_json::from_value(fresh.clone()).unwrap();
+            let received_at = OffsetDateTime::now_utc() - time::Duration::seconds(30);
+            let initial = renewal::device_claims(&config(), &tokens, received_at).unwrap();
+            let body = finish_device(
                 &store,
                 &api.origin,
                 config(),
                 &transport.provider(),
-                serde_json::from_value(fresh.clone()).unwrap(),
-                Some("org_test"),
-                OrganizationChoice::Refuse,
-                &mut Vec::new(),
+                tokens,
+                initial,
+                "org_test",
             )
             .await
             .unwrap();
@@ -1693,8 +1726,20 @@ async fn fresh_device_selection_refuses_substitutions_without_changing_cached_cu
 
 #[tokio::test]
 async fn fresh_device_cannot_select_or_revoke_an_existing_cached_session() {
-    for malformed in [false, true] {
-        let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+    // A second profile can claim the same session while the user is choosing.
+    struct InstallAtPrompt<'a>(&'a MemoryStore, HashMap<String, String>);
+    impl Read for InstallAtPrompt<'_> {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            self.0.0.replace(std::mem::take(&mut self.1));
+            Ok(0)
+        }
+    }
+    for (malformed, prompt) in [(false, false), (true, false), (false, true)] {
+        let mut replies = vec![metadata(120, "principal_one")];
+        if prompt {
+            replies.push(memberships(&[("org_other", None), ("org_test", None)]));
+        }
+        let api = IntentApiFixture::new(replies);
         crate::operator_routing::test_transport_scope(&[&api.origin], async {
             let store = MemoryStore::default();
             cache_original_session(&store, &api.origin).await;
@@ -1710,6 +1755,13 @@ async fn fresh_device_cannot_select_or_revoke_an_existing_cached_session() {
             }
             let before = store.0.borrow().clone();
             let transport = MockTransport::with(vec![]);
+            let mut answer = InstallAtPrompt(&store, before.clone()).chain("1\n".as_bytes());
+            let (organization, choice) = if prompt {
+                store.0.borrow_mut().clear();
+                (None, OrganizationChoice::Ask(&mut answer))
+            } else {
+                (Some("org_other"), OrganizationChoice::Refuse)
+            };
             let error = accept_device(
                 &store,
                 &api.origin,
@@ -1721,8 +1773,8 @@ async fn fresh_device_cannot_select_or_revoke_an_existing_cached_session() {
                     "fresh-refresh",
                 ))
                 .unwrap(),
-                Some("org_other"),
-                OrganizationChoice::Refuse,
+                organization,
+                choice,
                 &mut Vec::new(),
             )
             .await
@@ -1737,7 +1789,7 @@ async fn fresh_device_cannot_select_or_revoke_an_existing_cached_session() {
             );
             assert_eq!(*store.0.borrow(), before);
             assert!(transport.requests.lock().unwrap().is_empty());
-            assert_eq!(api.requests().len(), 1);
+            assert_eq!(api.requests().len(), if prompt { 2 } else { 1 });
             api.assert_complete();
         })
         .await;

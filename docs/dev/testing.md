@@ -227,12 +227,14 @@ static set/remove, no-network/no-helper/noninteractive status and pipe-only expo
 before secret acquisition. Managed authentication tests own independent profile
 sessions, principal/session collision refusal, refresh coordination and logout
 cache clearing; lifecycle fixtures retain original-identity recovery checks.
-They also own a login that names no organization (the sign-in's only one kept,
-several asked for at a terminal or refused with the list, an abandoned sign-in
-revoked) and the refusal each credential check gives: a provider response that
+They also own zero, one and multiple active organizations at login, refresh
+when the access token expires during selection, and revocation after an
+abandoned choice. Application tests own interactive and machine-mode dispatch
+and the JSON refusal on stdout. Authentication tests cover each credential
+check: a provider response that
 does not fit the published sign-in configuration is never reported as a saved
 credential's fault. `cli_cluster` owns `organization list` beside the member
-and invitation lists.
+and invitation lists, including the 1,000-membership bound.
 Transport owners cover prefix boundaries, no redirects, explicit proxy selection,
 CA capture and unsupported trust combinations. Extend the shared served-client
 fixtures across managed and standalone graph commands instead of adding an

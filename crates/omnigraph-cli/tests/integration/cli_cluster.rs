@@ -3989,6 +3989,26 @@ fn managed_organization_lists_directory_and_invitation_pages_without_enrolling()
         );
         api.assert_complete();
     }
+    // The API collects ten directory pages into one response.
+    for count in [101, 1000, 1001] {
+        let organizations: Vec<_> = (0..count)
+            .map(|i| serde_json::json!({"organization_id":format!("org_{i}"),"name":null}))
+            .collect();
+        let response = serde_json::json!({"data":{"organizations":organizations},"meta":{}});
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command.args(["list", "--json"]);
+        if count <= 1000 {
+            assert_eq!(parse_stdout_json(&output_success(&mut command)), response);
+        } else {
+            assert_eq!(
+                parse_stdout_json(&output_failure(&mut command))["type"],
+                "api_response_invalid"
+            );
+        }
+        api.assert_complete();
+    }
 }
 
 #[test]

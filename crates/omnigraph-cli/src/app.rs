@@ -415,6 +415,33 @@ fn render_diagnostic(
     lines.join("\n")
 }
 
+fn onboarding_choice(
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
+    json: bool,
+) -> managed::OrganizationChoice<'_> {
+    if stdin_is_terminal && !json {
+        managed::OrganizationChoice::Ask(stdin)
+    } else {
+        managed::OrganizationChoice::Refuse
+    }
+}
+
+pub(crate) fn complete_onboarding(
+    result: Result<()>,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<Completion> {
+    match result {
+        Ok(()) => Ok(Completion::success()),
+        Err(error) => {
+            let failure = error.downcast::<managed::Failure>()?;
+            Ok(Completion::exit(failure.emit(json, stdout, stderr)?))
+        }
+    }
+}
+
 async fn run(
     cli: Cli,
     explicit_config: bool,
@@ -432,27 +459,21 @@ async fn run(
         create_profile: Some(name),
         api,
         organization,
+        json,
         ..
     } = &cli.command
     {
-        // A person at a terminal is asked which organization the profile
-        // is for when they belong to several; anything else is refused.
-        let choice = if stdin_is_terminal {
-            managed::OrganizationChoice::Ask(stdin)
-        } else {
-            managed::OrganizationChoice::Refuse
-        };
-        commands::targets::onboard(
+        let result = commands::targets::onboard(
             &operator,
             name,
             api.as_deref().unwrap_or("https://platform.omnigraph.dev"),
             organization.as_deref(),
-            choice,
+            onboarding_choice(stdin, stdin_is_terminal, *json),
             stdout,
             stderr,
         )
-        .await?;
-        return Ok(Completion::exit(0));
+        .await;
+        return complete_onboarding(result, *json, stdout, stderr);
     }
     let mut target = scope::resolve(&cli, &operator, &cwd, explicit_config, stderr)?;
     let authentication = crate::operator_routing::authentication(&cli, &operator, target.as_ref())?;

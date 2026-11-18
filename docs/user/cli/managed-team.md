@@ -36,7 +36,8 @@ omnigraph organization list --profile work --json
 This lists the organizations you are an active member of, with their names
 and IDs, and marks the one `work` signs in to. It answers from your own
 sign-in and needs no service permission; a workload profile is refused, since
-only a person has memberships. The API returns at most your first 100.
+only a person has memberships. The API returns the complete list, up to
+1,000 active memberships. A larger or incomplete directory returns an error.
 
 A profile belongs to one organization. To work in another, create a profile
 for it with its ID:

@@ -378,8 +378,9 @@ invalidating old derived credentials. See the primary operator reference.
 
 `login --create-profile NAME` explicitly creates a new profile, defaulting its API
 to `https://platform.omnigraph.dev`. Pass `--organization ID` when the person
-belongs to several organizations: without it they are asked at a terminal and
-refused with `organization_required` anywhere else. `organization list --profile
+belongs to several organizations. An interactive login offers a choice.
+With `--json` or nonterminal input, it returns `organization_required` and
+the available organizations. `organization list --profile
 NAME` shows the IDs. Bare login uses `defaults.profile`; it never
 creates a missing profile. Neither form changes routing defaults. Operator YAML
 may be read-only; credential metadata stays in writable `OMNIGRAPH_HOME`.

@@ -729,7 +729,8 @@ async fn two_profiles_for_the_same_human_keep_independent_refresh_custody() {
             .scope(Some(second.clone()), async {
                 assert!(load(&store, origin).unwrap().is_none());
                 let reused = serde_json::from_value(tokens(120, "user_one")).unwrap();
-                assert!(check_device_session(&store, origin, &config(), &reused).is_err());
+                let initial = device_claims(&config(), &reused, OffsetDateTime::now_utc()).unwrap();
+                assert!(check_device_session(&store, origin, &config(), &initial).is_err());
                 let mut session = saved(origin, 120);
                 session.identity.session_id = "session_two".into();
                 session.identity.principal_id = principal.into();

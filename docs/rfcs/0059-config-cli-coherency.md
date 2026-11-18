@@ -123,13 +123,16 @@ person's active memberships, with the fresh sign-in as the credential:
 
 | Memberships | Result |
 |---|---|
-| One | The profile is created in it. |
-| Several, standard input a terminal | List them on stderr and read a number or an organization ID from stdin. Three answers that name none end the sign-in. |
-| Several, anywhere else | Refuse with `organization_required` and the list. Automation never prompts and never infers. |
+| None | Refuse with `organization_required`. |
+| One | Create the profile in the sole active organization. |
+| Several, interactive terminal | List them on stderr and read a number or an organization ID from stdin. Three invalid answers end the sign-in. |
+| Several, `--json` or nonterminal input | Refuse with `organization_required` and the list. With `--json`, write the refusal and its `organizations` array to stdout. |
 
 The sign-in is then exchanged for the chosen organization, as it already is
 for `--organization ID`, and every existing check of the exchanged session
-still applies. A sign-in that selected no organization, or an API that cannot
+still applies. If the access token expires while the person chooses, use the
+same session's refresh token and verify the selected organization before
+saving the profile. A sign-in that selected no organization, or an API that cannot
 list memberships, also refuses with `organization_required`: the CLI cannot
 make an organization the right one by default. A fresh sign-in that is not
 kept is revoked, best effort. `--organization ID` and login to an existing

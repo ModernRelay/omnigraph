@@ -1038,13 +1038,15 @@ fn several_organizations(listed: &[super::organization::Membership], why: &str) 
         .iter()
         .map(super::organization::Membership::label)
         .collect();
-    Failure::refused(
+    let mut failure = Failure::refused(
         "organization_required",
         &format!(
             "{why}; run login again with --organization ORG_ID, one of: {}",
             organizations.join(", ")
         ),
-    )
+    );
+    failure.body["organizations"] = json!(listed);
+    failure
 }
 
 /// Asks which of `listed` the profile is for. An answer is a row's number or
@@ -1101,55 +1103,51 @@ fn ask_organization(
     Err(several_organizations(listed, "no organization was chosen"))
 }
 
-/// The organization of a login that named none: the sign-in's own when it is
-/// the person's only one, else the one they choose. The person's wait is
+/// Select the sole active membership, or ask the person to choose. Their wait is
 /// unbounded, so this runs before the claims lock and the network deadline
 /// of [`accept_device`]; it reads no saved state and keeps nothing.
 async fn settle_organization(
     origin: &str,
-    config: &provider::Config,
     tokens: &workos::AuthenticateResponse,
+    initial: &renewal::Claims,
     choice: OrganizationChoice<'_>,
     stderr: &mut dyn Write,
 ) -> Result<String> {
-    let initial = renewal::device_claims(config, tokens)?;
     // The API authenticates a person's session by its organization, so a
     // sign-in without one cannot ask it which organizations there are.
     let signed = initial
         .organization()
-        .ok_or_else(renewal::organization_required)?
-        .to_owned();
+        .ok_or_else(renewal::organization_required)?;
     let access: &str = tokens.access_token.as_ref();
-    let listed = super::organization::list_memberships(
-        &Api::new(origin.into(), Some(access.to_owned()))?,
-        super::REQUEST_TIMEOUT,
-    )
-    .await
-    .map(|(_, listed)| listed)
-    .map_err(|error| {
-        let error = scrub(error, access);
-        if error.response_status == Some(reqwest::StatusCode::NOT_FOUND) {
-            // An API that cannot say whether there are others cannot make
-            // this sign-in's organization the right one by default.
-            return Failure::refused(
-                "organization_required",
-                "this API does not list your organizations; run login again with --organization ORG_ID",
-            );
-        }
-        error
-    })?;
-    if listed
-        .iter()
-        .all(|organization| organization.organization_id == signed)
-    {
-        return Ok(signed);
-    }
-    match choice {
-        OrganizationChoice::Refuse => Err(several_organizations(
-            &listed,
-            "you are an active member of several organizations and this login names none",
+    let api = Api::new(origin.into(), Some(access.to_owned()))?;
+    let listed = super::organization::list_memberships(&api)
+        .await
+        .map(|(_, listed)| listed)
+        .map_err(|error| {
+            let error = scrub(error, access);
+            if error.response_status == Some(reqwest::StatusCode::NOT_FOUND) {
+                // An API that cannot say whether there are others cannot make
+                // this sign-in's organization the right one by default.
+                return Failure::refused(
+                    "organization_required",
+                    "this API does not list your organizations; run login again with --organization ORG_ID",
+                );
+            }
+            error
+        })?;
+    match listed.as_slice() {
+        [] => Err(Failure::refused(
+            "organization_required",
+            "no active organization membership was found; join an organization before signing in",
         )),
-        OrganizationChoice::Ask(input) => ask_organization(&listed, &signed, input, stderr),
+        [only] => Ok(only.organization_id.clone()),
+        _ => match choice {
+            OrganizationChoice::Refuse => Err(several_organizations(
+                &listed,
+                "you are an active member of several organizations and this login names none",
+            )),
+            OrganizationChoice::Ask(input) => ask_organization(&listed, signed, input, stderr),
+        },
     }
 }
 
@@ -1162,6 +1160,7 @@ async fn discard_device_session(
     origin: &str,
     config: &provider::Config,
     tokens: &workos::AuthenticateResponse,
+    initial: &renewal::Claims,
 ) {
     let _claims_lock = if crate::operator_routing::journal_owner().is_some() {
         match coordination::global_session_lock().await {
@@ -1171,7 +1170,7 @@ async fn discard_device_session(
     } else {
         None
     };
-    if renewal::check_device_session(store, origin, config, tokens).is_ok() {
+    if renewal::check_device_session(store, origin, config, initial).is_ok() {
         let access: &str = tokens.access_token.as_ref();
         renewal::revoke(origin, access.to_owned()).await;
     }
@@ -1188,21 +1187,35 @@ async fn accept_device(
     choice: OrganizationChoice<'_>,
     stderr: &mut dyn Write,
 ) -> Result<Value> {
+    let initial = renewal::device_claims(&config, &tokens, OffsetDateTime::now_utc())?;
     let settled = match organization {
         Some(organization) => organization.to_owned(),
-        None => match settle_organization(origin, &config, &tokens, choice, stderr).await {
+        None => match settle_organization(origin, &tokens, &initial, choice, stderr).await {
             Ok(organization) => organization,
             Err(error) => {
                 // A sign-in without an organization is no session the API
                 // knows, so there is nothing it could revoke.
                 if tokens.organization_id.is_some() {
-                    discard_device_session(store, origin, &config, &tokens).await;
+                    discard_device_session(store, origin, &config, &tokens, &initial).await;
                 }
                 return Err(error);
             }
         },
     };
-    let organization = Some(settled.as_str());
+    finish_device(store, origin, config, provider, tokens, initial, &settled).await
+}
+
+/// The access token was checked when received. It may have expired during the
+/// prompt, so check custody here and renew it before verifying the chosen session.
+async fn finish_device(
+    store: &dyn Store,
+    origin: &str,
+    config: provider::Config,
+    provider: &provider::Provider,
+    tokens: workos::AuthenticateResponse,
+    initial: renewal::Claims,
+    organization: &str,
+) -> Result<Value> {
     let _claims_lock = if crate::operator_routing::journal_owner().is_some() {
         Some(coordination::global_session_lock().await?)
     } else {
@@ -1210,7 +1223,7 @@ async fn accept_device(
     };
     // Keychain reads can require interactive OS consent. Complete the cached
     // session collision check under the origin lock before timing network work.
-    let initial = renewal::check_device_session(store, origin, &config, &tokens)?;
+    renewal::check_device_session(store, origin, &config, &initial)?;
     let (saved, body) = tokio::time::timeout(Duration::from_secs(35), async {
         let tokens =
             renewal::select_device_organization(&config, provider, tokens, initial, organization)
@@ -1219,7 +1232,7 @@ async fn accept_device(
     })
     .await
     .map_err(|_| renewal::unknown())??;
-    if let Err(error) = check_account(organization, &saved.identity.account_id) {
+    if let Err(error) = check_account(Some(organization), &saved.identity.account_id) {
         saved.revoke().await;
         return Err(error);
     }

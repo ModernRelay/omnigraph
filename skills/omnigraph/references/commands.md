@@ -430,9 +430,9 @@ NAME` keeps credentials/journals and requires remaining references to be valid.
 Onboarding requires `login --create-profile NAME`, with optional `--organization ID`
 and `--api URL` (default `https://platform.omnigraph.dev`). A profile belongs to
 one organization. Without `--organization`, a person in one organization gets
-it; a person in several is asked at a terminal and otherwise refused with
-`organization_required` and the list, so in automation, or when unsure, pass
-`--organization ID`. The sign-in's browser session never picks among several.
+it. With several, interactive login asks which one to use. Pass
+`--organization ID` in automation. With `--json`, a required choice returns
+`organization_required` and an `organizations` array on stdout.
 Bare login uses
 `defaults.profile`; `login --profile NAME` selects an existing profile. Missing
 profiles never cause implicit creation, and creation refuses existing names.

@@ -20,16 +20,16 @@ the CLI asks the API which organizations you are an active member of:
 
 | Your memberships | Result |
 |---|---|
-| One | The profile is created in it |
-| Several, at a terminal | The CLI lists them and asks for a number or an organization ID; three answers that name none end the sign-in |
-| Several, without a terminal | Refuses with `organization_required` and lists them; run the command again with `--organization ID` |
+| None | Refuses with `organization_required`. Join an organization before creating a profile. |
+| One | Creates the profile in that organization, even if the browser opened a different one. |
+| Several, at a terminal | Lists the organizations and asks for a number or an organization ID. |
+| Several, with `--json` or without a terminal | Returns `organization_required` and the choices. Run again with `--organization ID`. |
 
-It never creates a profile in whichever of several organizations the browser
-session happened to carry, and it asks the API to revoke a sign-in it does
-not keep. The question
-goes to stderr and the answer is read from stdin, so `--json` still prints one
-document on stdout. [`organization list`](managed-team.md#find-your-organizations)
-shows the same memberships for a profile that already exists.
+For scripts, pass `--json`. If a choice is required, stdout contains one JSON
+object with `type: "organization_required"` and an `organizations` array.
+Each entry has an `organization_id` and an optional name. Use the selected ID
+with `--organization` on the next invocation. For an existing profile, use
+[`organization list`](managed-team.md#find-your-organizations).
 
 ## When a sign-in is refused
 
@@ -38,7 +38,7 @@ is. Each `detail` is a fixed sentence naming one check; none includes a token.
 
 | Refusal | Meaning | What to do |
 |---|---|---|
-| `organization_required` | The sign-in selected no organization, you belong to several and none was named, or the API cannot list them | Run `login --create-profile NAME --organization ORG_ID` |
+| `organization_required` | The API reported no memberships, the sign-in had no organization, or a choice could not be made | Join an organization if you have none. Otherwise pass its ID with `--organization ORG_ID`. |
 | `provider_response_invalid` | The identity provider's new tokens do not fit the sign-in configuration the API publishes at `/v1/auth/config`: another issuer or client, an unreadable or out-of-range token, or a response that names another user or organization than its token | Nothing saved is at fault and signing in again does not help; report the `detail` to the service's administrator |
 | `credential_invalid` | A session this machine saved, its index, or the API's verification of it fails a check | `logout` and `login` for that profile; the `detail` names the saved entry or the verified field |
 | `session_identity_mismatch` | The sign-in is a session this or another profile already holds, or its identity changed during organization selection | Start a new sign-in; see the `detail` |

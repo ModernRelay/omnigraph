@@ -126,7 +126,13 @@ fn claims(
     allow_expired: bool,
     source: Source,
 ) -> Result<Claims> {
-    let claims = provider_claims(token, config, allow_expired, source)?;
+    let claims = provider_claims(
+        token,
+        config,
+        allow_expired,
+        source,
+        OffsetDateTime::now_utc(),
+    )?;
     if claims.org_id.is_none() {
         return Err(source.refuse("the access token names no organization"));
     }
@@ -140,6 +146,7 @@ fn provider_claims(
     config: &provider::Config,
     allow_expired: bool,
     source: Source,
+    observed_at: OffsetDateTime,
 ) -> Result<Claims> {
     validate_token(token)
         .map_err(|_| source.refuse("the access token is empty, too long or not printable ASCII"))?;
@@ -152,7 +159,7 @@ fn provider_claims(
     let claims: Claims =
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).map_err(|_| unreadable())?)
             .map_err(|_| unreadable())?;
-    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let now = observed_at.unix_timestamp();
     if claims.iss != config.issuer {
         return Err(source.refuse(
             "the access token's issuer is not the issuer the API's sign-in configuration names",
@@ -418,12 +425,14 @@ pub(super) fn save(store: &dyn Store, saved: &Session) -> Result<()> {
 pub(super) fn device_claims(
     config: &provider::Config,
     tokens: &workos::AuthenticateResponse,
+    received_at: OffsetDateTime,
 ) -> Result<Claims> {
     let initial = provider_claims(
         tokens.access_token.as_ref(),
         config,
         false,
         Source::Provider,
+        received_at,
     )?;
     validate_token(tokens.refresh_token.as_ref()).map_err(|_| {
         provider_invalid("the provider's refresh token is empty, too long or not printable ASCII")
@@ -440,9 +449,8 @@ pub(super) fn check_device_session(
     store: &dyn Store,
     origin: &str,
     config: &provider::Config,
-    tokens: &workos::AuthenticateResponse,
-) -> Result<Claims> {
-    let initial = device_claims(config, tokens)?;
+    initial: &Claims,
+) -> Result<()> {
     // A provider response must be a new session before it can be selected or
     // revoked. Existing token pairs stay untouched under the caller's origin lock.
     for (org, selected) in index(store, origin)?.sessions {
@@ -470,7 +478,7 @@ pub(super) fn check_device_session(
             "device sign-in reused a previously claimed provider session; start a fresh sign-in",
         ));
     }
-    Ok(initial)
+    Ok(())
 }
 
 fn session_claim(config: &provider::Config, sid: &str) -> Result<String> {
@@ -508,11 +516,8 @@ pub(super) async fn select_device_organization(
     provider: &provider::Provider,
     tokens: workos::AuthenticateResponse,
     initial: Claims,
-    organization: Option<&str>,
+    organization: &str,
 ) -> Result<workos::AuthenticateResponse> {
-    let Some(organization) = organization else {
-        return Ok(tokens);
-    };
     super::super::organization_id(organization)?;
     // A token about to expire cannot outlast its verification, which happens
     // when a person took their time choosing: it is renewed for the same
