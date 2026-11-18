@@ -80,7 +80,11 @@ A file that cannot be read or does not validate never changes the tokens in
 force. This covers a missing or unreadable file, a file that is not a regular
 file, a file other accounts can write, a file over 256 KiB, invalid JSON, and
 any entry the startup checks refuse. The last valid tokens stay in force with no
-expiry, so **while the file is invalid, revocation stops**. The server logs one
+expiry, so **while the file is invalid, revocation stops**. To revoke an
+actor urgently while the file is invalid, deny it in the graph's policy with
+`cluster apply`, which applies without a restart. The last valid tokens never
+time out: a timeout would turn a broken Secret into a lockout of every static
+token. The server logs one
 warning for each refused content, or for each kind of read failure, until the
 next successful read. A rewrite that changes no token (whitespace, key order)
 changes nothing.

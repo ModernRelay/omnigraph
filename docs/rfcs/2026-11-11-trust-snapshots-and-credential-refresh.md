@@ -2,7 +2,7 @@
 rfc: "2026-11-11-trust-snapshots-and-credential-refresh"
 title: "Trust snapshots and credential refresh"
 track: maintainer
-status: draft
+status: accepted
 implementation: in-progress
 authors:
   - ragnorc
@@ -141,7 +141,17 @@ file over the size bound, invalid JSON, a blank actor or token, a reserved
 `principal:` actor, and a duplicate actor or token value. The last good snapshot stays in force until a valid file is
 read. There is no expiry on it: a token file is state, not a time-limited
 assertion. The consequence is stated plainly to operators: **while the file
-is invalid, revocation stops.** The server logs one warning per distinct
+is invalid, revocation stops.** An urgent revocation during such an outage
+goes through the other live door, a policy deny of the actor by
+`cluster apply`. The last good set never times out, by decision: a token
+file is state, not an assertion, so the server enforces no validity period
+the source did not declare; a timeout would turn a delivery failure into a
+lockout of every static principal, which hands an actor who can only corrupt
+the file a stronger capability (lock everyone out) than last-good gives
+(freeze the set); and it would make the opt-in able to leave a deployment
+less available than boot-only. If an operator ever needs fail-closed, the
+primitive is a declared expiry in the token document, enforced as OIDC's
+`expires_at` is, not a server timer. The server logs one warning per distinct
 refused content and, for a failure that yields no content (a missing file, a
 permission refusal, a throttled request), one warning per error class until
 the next successful read. Each names the source and the error class and never
@@ -531,12 +541,8 @@ available today.
 
 ## Unresolved questions
 
-- Should an invalid static file ever time out its last good snapshot? This
-  RFC says no: a token file is state, and the reporter asked for indefinite
-  last-good. The alternative is an optional
-  `..._MAX_STALE_SECONDS` after which static admission fails closed as OIDC
-  does. Not needed for acceptance of the holder; it would be another
-  freshness policy on the same mechanism.
+None. The last-good timeout question is decided in the Static tokens section
+and the decision log entry of 2026-11-17.
 
 ## Decision log
 
@@ -578,3 +584,12 @@ available today.
   `server.md` and `deployment.md`, because both pages were at the docs
   checker's 350-line cap. The read-by-others warning is logged once per file
   mode rather than at every poll, so nothing is logged once per tick.
+- 2026-11-17: accepted. The one unresolved question is settled: the last good
+  static set never times out. A token file is state, not an assertion, so the
+  server enforces only bounds the source declares; a server-side timeout would
+  convert a delivery failure into a lockout, give an actor who can only
+  corrupt the file more power than freezing the set, and let the opt-in make a
+  deployment less available than boot-only. Fail-closed, if ever wanted, is a
+  declared expiry in the document, as OIDC's `expires_at`. The in-system
+  remedy for an urgent revocation during a file outage is a policy deny
+  through `cluster apply`, now stated in the body and the operator docs.
