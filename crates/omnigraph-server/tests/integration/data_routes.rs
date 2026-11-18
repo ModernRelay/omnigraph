@@ -8765,3 +8765,83 @@ async fn removed_routes_and_legacy_query_fields_refuse_without_graph_effects() {
     }
     assert_eq!(main_head_commit_id(&app).await, before);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_dtos_reject_unknown_fields_issue_528() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    // 1. BranchMergeRequest: camelCase "dryRun" or extra field must return 400 Bad Request
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches/merge",
+            &json!({"source": "main", "dryRun": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown field `dryRun`"),
+        "body: {body}"
+    );
+
+    // 2. BranchCreateRequest: unknown field must return 400 Bad Request
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches",
+            &json!({"name": "new_branch", "unexpected": 123}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown field `unexpected`"),
+        "body: {body}"
+    );
+
+    // 3. IngestRequest: unknown field must return 400 Bad Request
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/load",
+            &json!({
+                "data": "{\"type\":\"Person\",\"data\":{\"name\":\"X\",\"age\":1}}",
+                "unexpected": "val",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown field `unexpected`"),
+        "body: {body}"
+    );
+
+    // 4. ChangeBaselineRequest: unknown field must return 400 Bad Request
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/changes/baseline",
+            &json!({"branch": "main", "unexpected": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown field `unexpected`"),
+        "body: {body}"
+    );
+}
