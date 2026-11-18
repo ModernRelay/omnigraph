@@ -2944,6 +2944,132 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
     );
 }
 
+/// An `update` of an indexed vector column that leaves a Blob unassigned is
+/// a column patch, which withdraws every fragment it touches from the vector
+/// index. When that leaves the index covering no fragment, Lance reports no
+/// statistics for it, so it has no partition count to keep: `index build`
+/// and `optimize` rebuild it as a new declared vector index is built, and
+/// build the other indexes of the type, instead of failing the whole batch
+/// on every run (findings queue
+/// `og-stress-vector-index-after-column-patch-blocks-index-build`).
+#[tokio::test]
+async fn index_build_and_optimize_rebuild_a_vector_index_a_column_patch_left_empty() {
+    use lance::index::DatasetIndexExt;
+    use omnigraph::db::{BuiltIndex, BuiltIndexAction, BuiltIndexKind};
+
+    const SCHEMA: &str = "node D {\n    slug: String @key\n    n: I64?\n    s: String?\n    b: Blob?\n    v: Vector(4)? @index\n}\n";
+    const UPDATE: &str = r#"
+query patch($v: Vector(4)?) {
+    update D set { v: $v } where slug in ["k5", "k2"]
+}
+"#;
+    // The vector index's segments and how many current fragments they leave
+    // uncovered.
+    async fn vector_index(db: &Omnigraph) -> (usize, usize) {
+        let ds = helpers::open_pinned_dataset_for_test(db, "main", "node:D").await;
+        let field = ds.schema().field("v").unwrap().id;
+        let indices = ds.load_indices().await.unwrap();
+        let segments = indices
+            .iter()
+            .filter(|index| index.fields == [field])
+            .collect::<Vec<_>>();
+        let uncovered = ds
+            .get_fragments()
+            .iter()
+            .filter(|fragment| {
+                !segments.iter().any(|segment| {
+                    segment
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| bitmap.contains(fragment.id() as u32))
+                })
+            })
+            .count();
+        (segments.len(), uncovered)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        concat!(
+            r#"{"type":"D","data":{"slug":"k2","v":null}}"#,
+            "\n",
+            r#"{"type":"D","data":{"slug":"k5","v":[1.0,-2.0,-2.0,-1.0]}}"#,
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(vector_index(&db).await, (1, 0));
+
+    mutate_main(
+        &db,
+        UPDATE,
+        "patch",
+        &helpers::vector_param("v", &[2.0, 1.0, 0.5, 0.0]),
+    )
+    .await
+    .unwrap();
+    let (segments, uncovered) = vector_index(&db).await;
+    assert_eq!(segments, 1, "the patch keeps the index's definition");
+    assert!(uncovered > 0, "the patch withdraws the fragment it touched");
+
+    let built = db.ensure_indices_on_as("main", None).await.unwrap();
+    assert!(
+        built.indexes.contains(&BuiltIndex {
+            type_key: "node:D".to_string(),
+            property: "v".to_string(),
+            kind: BuiltIndexKind::Vector,
+            action: BuiltIndexAction::Refreshed,
+        }),
+        "{:?}",
+        built.indexes
+    );
+    assert_eq!(vector_index(&db).await, (1, 0));
+
+    // The same state reached again, then folded by optimize.
+    mutate_main(
+        &db,
+        UPDATE,
+        "patch",
+        &helpers::vector_param("v", &[0.0, 1.0, 2.0, 3.0]),
+    )
+    .await
+    .unwrap();
+    assert_ne!(vector_index(&db).await.1, 0);
+    let optimized = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    for table in &optimized.tables {
+        assert_ne!(
+            table.outcome,
+            TableOptimizeOutcome::Failed,
+            "{}: {:?}",
+            table.type_key,
+            table.failure
+        );
+    }
+    assert_eq!(vector_index(&db).await, (1, 0));
+
+    let rows = helpers::query_main(
+        &db,
+        "query near($q: Vector(4)) { match { $d: D } return { $d.slug } order { nearest($d.v, $q) } limit 1 }",
+        "near",
+        &helpers::vector_param("q", &[0.0, 1.0, 2.0, 3.0]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.num_rows(), 1);
+}
+
 /// A branch rebuild stages a detached pin on the inherited location; main's
 /// registrations and rows stay as they were.
 #[tokio::test]
