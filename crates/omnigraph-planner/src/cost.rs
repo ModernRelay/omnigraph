@@ -627,10 +627,10 @@ impl ValidateCostInputs {
 /// overwrite's cardinality scan under a minimum, which the optimizer chooses
 /// before costing. A retained-edge check is planned as Probe, but the engine
 /// chooses its read per edge fragment at run time
-/// (`validate::RemovalEdgeReads`): it probes the fragments a BTREE on the
-/// endpoint covers and reads the others once, whole, matched in memory. The
-/// plan cannot choose for it, because the removed ids are known only when
-/// the overwrite runs.
+/// (`validate::RemovalEdgeReads`): it probes the fragments a BTREE on each
+/// probed endpoint covers and reads the others once, whole, matched in
+/// memory. The plan cannot choose for it, because the removed ids are known
+/// only when the overwrite runs.
 pub fn choose_validate_access(check: &ValidateCheck, inputs: ValidateCostInputs) -> ValidateAccess {
     if matches!(
         check,

@@ -101,14 +101,15 @@ pub(crate) const PROBE_CHUNK_KEYS: usize = 8_192;
 /// therefore held removed ids times uncovered fragments, and no allowance
 /// charged it (#1442). So the removed ids are pushed to every fragment only
 /// when a BTREE on every probed endpoint covers the whole table (Lance plans
-/// no copy; [`PROBE_CHUNK_KEYS`] ids per filter), or when one filter holds
-/// them all and the fragments that BTREE leaves uncovered, times those ids,
-/// are at most [`PROBE_CHUNK_KEYS`] copied ids. Otherwise only the covered
-/// fragments are probed, chunk by chunk, and the uncovered ones are read
-/// once, whole, and matched in memory against the removed ids
-/// ([`EndpointMatch`]), so no uncovered fragment is read once per chunk.
-/// Memory is then one chunk's filter, at most [`PROBE_CHUNK_KEYS`] copied
-/// ids, the removed-id sets and one batch, whatever the fragment count.
+/// no copy; [`PROBE_CHUNK_KEYS`] ids per endpoint per filter), or when one
+/// filter holds them all and the fragments that BTREE leaves uncovered, times
+/// those ids, are at most [`PROBE_CHUNK_KEYS`] copied ids per endpoint.
+/// Otherwise only the covered fragments are probed, chunk by chunk, and the
+/// uncovered ones are read once, whole, and matched in memory against the
+/// removed ids ([`EndpointMatch`]), so no uncovered fragment is read once per
+/// chunk. Memory is then one chunk's filter, at most [`PROBE_CHUNK_KEYS`]
+/// copied ids per endpoint, the removed-id sets and one batch, whatever the
+/// fragment count.
 /// Coverage decides cost only: every fragment is read by exactly one of the
 /// two paths, and both test the same ids.
 pub(crate) struct RemovalEdgeReads<'a> {
@@ -1215,7 +1216,8 @@ mod endpoint_probe_tests {
     /// every fragment is probed, and after one more append the indexed
     /// fragments are probed and only the new one is matched. A removal
     /// whose one filter times the uncovered fragments stays within
-    /// [`PROBE_CHUNK_KEYS`] copied ids keeps its filter on every fragment.
+    /// [`PROBE_CHUNK_KEYS`] copied ids per endpoint keeps its filter on every
+    /// fragment.
     #[tokio::test]
     async fn removal_reads_follow_the_edge_tables_live_coverage_issue_1442() {
         use crate::db::{Omnigraph, ReadTarget};
