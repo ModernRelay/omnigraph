@@ -105,6 +105,10 @@ pub(crate) const INSERT_ABSENCE_PROPERTY: &str = "omnigraph.insert_absence";
 pub(crate) const INSERT_ABSENCE_V1: &str = "v1";
 
 const EXTERNAL_BLOB_PROBE_CONCURRENCY: usize = 8;
+/// The IVF partition count the engine builds a declared vector index with.
+/// A fold keeps an index's own count, except for an index that holds no
+/// rows (`TableStore::vector_partition_count`).
+const ENGINE_VECTOR_PARTITIONS: usize = 1;
 const EXTERNAL_BLOB_REFERENCE_RESOURCE: &str = "external Blob reference cells";
 const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata bytes";
 
@@ -3290,10 +3294,30 @@ impl TableStore {
         Ok(!Self::foldable_index_lag(ds).await?.is_empty())
     }
 
-    /// The partition count Lance reports for a vector index. A fold keeps
-    /// it, so a statistics read that fails or names no positive count is an
-    /// error, not a silent rebuild with one partition.
-    async fn vector_partition_count(ds: &Dataset, name: &str) -> Result<usize> {
+    /// The partition count a fold keeps for a vector index: the count Lance
+    /// reports for the index's segments. For an index that holds rows, a
+    /// statistics read that fails or names no positive count is an error,
+    /// not a silent rebuild with one partition. An index none of whose
+    /// `segments` covers a fragment holds no rows, and Lance reports no
+    /// statistics for it (an empty object per segment): a column patch of
+    /// the indexed column withdraws every fragment it touches. Its former
+    /// shape is not in its metadata, so it is rebuilt as a new declared
+    /// vector index is built, with [`ENGINE_VECTOR_PARTITIONS`].
+    async fn vector_partition_count(
+        ds: &Dataset,
+        name: &str,
+        segments: &[&IndexMetadata],
+    ) -> Result<usize> {
+        if !segments.is_empty()
+            && segments.iter().all(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.is_empty())
+            })
+        {
+            return Ok(ENGINE_VECTOR_PARTITIONS);
+        }
         fn first_num_partitions(value: &serde_json::Value) -> Option<u64> {
             match value {
                 serde_json::Value::Object(map) => map
@@ -3428,7 +3452,11 @@ impl TableStore {
                 // Keep the index's partition count: the engine builds one
                 // partition, but a partitioned index (Lance's split, or an
                 // explicit build) keeps its shape across folds.
-                let partitions = Self::vector_partition_count(ds, &item.name).await?;
+                let segments = existing
+                    .iter()
+                    .filter(|index| index.name == item.name)
+                    .collect::<Vec<_>>();
+                let partitions = Self::vector_partition_count(ds, &item.name, &segments).await?;
                 let params =
                     lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
                 ds_clone
@@ -6036,8 +6064,10 @@ impl TableStore {
                         .await
                 }
                 IndexBuildSpec::Vector { column } => {
-                    let params =
-                        lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
+                    let params = lance::index::vector::VectorIndexParams::ivf_flat(
+                        ENGINE_VECTOR_PARTITIONS,
+                        MetricType::L2,
+                    );
                     let new_idx = ds_clone
                         .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
                         .replace(true)
@@ -9292,17 +9322,37 @@ mod tests {
         )
         .await
         .unwrap();
+        let indices = ds.load_indices().await.unwrap();
+        let segments = indices.iter().collect::<Vec<_>>();
         assert_eq!(
-            TableStore::vector_partition_count(&ds, "embedding_idx")
+            TableStore::vector_partition_count(&ds, "embedding_idx", &segments)
                 .await
                 .unwrap(),
             2
         );
         assert!(
-            TableStore::vector_partition_count(&ds, "missing_idx")
+            TableStore::vector_partition_count(&ds, "missing_idx", &[])
                 .await
                 .is_err(),
             "a failed statistics read must not fold the index with one partition"
+        );
+        // A segment that covers no fragment holds no rows and has no
+        // statistics; an index of only such segments is rebuilt as the
+        // engine builds a new one.
+        let mut emptied = indices[0].clone();
+        emptied.fragment_bitmap.as_mut().unwrap().clear();
+        assert_eq!(
+            TableStore::vector_partition_count(&ds, "embedding_idx", &[&emptied])
+                .await
+                .unwrap(),
+            ENGINE_VECTOR_PARTITIONS
+        );
+        assert_eq!(
+            TableStore::vector_partition_count(&ds, "embedding_idx", &[&emptied, &indices[0]])
+                .await
+                .unwrap(),
+            2,
+            "a segment that covers rows keeps the index's count"
         );
     }
 
