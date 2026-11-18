@@ -97,8 +97,9 @@ COSTS = {
 # the key leaves this list when the RFC's Compatibility section decides it
 # (adds a bullet, which a row then cites) or the branch reverts the change.
 OPEN = {
-    "open:index-pages-read-twice": "A filter's scalar index pages (`page_data`, `page_lookup`) are read by scan-access planning and again by execution, where edition 2 read them once.",
-    "open:block-reads-table-again": "A correlated block reads its table's data file once more than the edition-2 read did.",
+    "open:concurrent-index-searches-reread-a-page": "Lance 13 reads an index page or posting list that concurrent searches of one filter (an `or`, an `in` list, an NGRAM's trigrams) all find uncached once per search, since `search_missing_pages` reads it outside the cache's loader; edition 2 read no such index for this text.",
+    "open:index-probe-where-edition-2-scanned": "The read probes a scalar index the edition-2 plan for this text did not read (a String key or `@index` BTREE edition 2 could not use, or one an earlier step no longer warms); on the simulation's one-fragment tables its requests exceed the data read edition 2's scan shared.",
+    "open:block-binding-scans-its-type": "The respelled block binds its inner node (`$k: Person`), which lowers to a dependent scan of that type reading its data file again, where edition 2's text bound no node there.",
 }
 
 DIAGNOSTIC_CODE = re.compile(r"\b([QTPL]\d{1,3})\b")

@@ -133,7 +133,7 @@ async fn check(
     let plan = scanner.create_plan().await.unwrap();
     let configured = scanner.get_expr_filter().unwrap();
     let all_nodes = nodes(&plan);
-    let actual = inspect(&plan, ds, configured.clone()).await.unwrap();
+    let actual = inspect(&plan, ds, configured.clone(), None).await.unwrap();
     assert_eq!(
         matches!(actual, ScanAccess::IndexProbe { .. }),
         !expected.coverage.is_empty(),
@@ -479,6 +479,93 @@ async fn first_scalar_parser_follows_lance() {
         )
         .await;
     }
+}
+
+/// The scalar index searches `plan` runs, as signatures.
+fn index_searches(plan: &Arc<dyn ExecutionPlan>) -> Vec<Value> {
+    nodes(plan)
+        .iter()
+        .filter_map(|node| node.downcast_ref::<ScalarIndexExec>())
+        .map(|exec| complete_signature(exec.expr()))
+        .collect()
+}
+
+async fn rows_of(plan: Arc<dyn ExecutionPlan>, recheck: Option<&Expr>) -> Vec<i32> {
+    let batches: Vec<RecordBatch> = lance_datafusion::exec::execute_plan(plan, Default::default())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let batch = match recheck {
+            Some(recheck) => crate::table_store::recheck_batch(batch, recheck).unwrap(),
+            None => batch,
+        };
+        let ids = batch.column_by_name("id").unwrap();
+        let ids = ids.as_any().downcast_ref::<Int32Array>().unwrap();
+        rows.extend(ids.values().iter().copied());
+    }
+    rows.sort_unstable();
+    rows
+}
+
+/// A filter that equates the identity column with a literal reaches Lance as
+/// that conjunct alone, so the scan probes one index; the other conjuncts
+/// are rechecked on the rows the probe returns and report as the access's
+/// residual. Pushed whole, Lance probes every indexed conjunct (here a
+/// second BTREE) for the same rows. Either way the rows are the same.
+#[tokio::test]
+async fn an_identity_equality_probes_its_own_index_alone() {
+    let (_dir, ds) = fixture(LanceFileVersion::V2_2).await;
+    let written = ident("y").eq(lit(2)).and(ident("x").eq(lit(1)));
+    let (probe, recheck) = crate::table_store::split_identity_probe(&written, "x").unwrap();
+    assert_eq!(probe, ident("x").eq(lit(1)));
+    assert_eq!(recheck, ident("y").eq(lit(2)));
+
+    let plan_of = |filter: Expr| {
+        let mut scanner = ds.scan();
+        scanner.filter_expr(filter);
+        scanner.prefilter(true);
+        async move {
+            let plan = scanner.create_plan().await.unwrap();
+            (plan, scanner.get_expr_filter().unwrap())
+        }
+    };
+    let (whole, _) = plan_of(written.clone()).await;
+    let whole_searches = index_searches(&whole);
+    assert_eq!(whole_searches.len(), 1);
+    assert!(whole_searches[0].get("and").is_some(), "{whole_searches:?}");
+
+    let (split, configured) = plan_of(probe).await;
+    let split_searches = index_searches(&split);
+    assert_eq!(split_searches.len(), 1);
+    assert_eq!(
+        split_searches[0]["index"],
+        json!("x_probe"),
+        "{split_searches:?}"
+    );
+    let ScanAccess::IndexProbe { residual, .. } = inspect(&split, &ds, configured, Some(&recheck))
+        .await
+        .unwrap()
+    else {
+        panic!("the identity probe is an index probe");
+    };
+    assert_eq!(residual.as_deref(), Some("(y = Int32(2))"));
+
+    assert_eq!(rows_of(split, Some(&recheck)).await, [2]);
+    assert_eq!(rows_of(whole, None).await, [2]);
+
+    // No identity equality, or nothing beside it: nothing to split.
+    assert!(crate::table_store::split_identity_probe(&ident("y").eq(lit(2)), "x").is_none());
+    assert!(crate::table_store::split_identity_probe(&ident("x").eq(lit(1)), "x").is_none());
+    assert!(
+        crate::table_store::split_identity_probe(
+            &ident("x").gt(lit(1)).and(ident("y").eq(lit(2))),
+            "x"
+        )
+        .is_none()
+    );
 }
 
 type FilterSignature = (String, String, Option<Expr>, Option<Expr>, Option<Value>);

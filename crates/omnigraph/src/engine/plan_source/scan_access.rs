@@ -46,7 +46,7 @@ pub(super) async fn index_split(source: &QuerySource<'_>, spec: &ScanSpec) -> Re
         columns.as_ref(),
     )?;
     let (plan, filter) = read.plan_with_filter().await?;
-    inspect(&plan, &dataset, filter).await
+    inspect(&plan, &dataset, filter, read.recheck()).await
 }
 
 fn mirror(expr: &ScalarIndexExpr) -> IndexQuery {
@@ -127,9 +127,10 @@ pub(super) async fn inspect(
     plan: &Arc<dyn ExecutionPlan>,
     dataset: &Dataset,
     filter: Option<Expr>,
+    recheck: Option<&Expr>,
 ) -> Result<ScanAccess> {
-    if let Some(filter) = &filter {
-        if !immutable(filter)? {
+    for expr in filter.iter().chain(recheck) {
+        if !immutable(expr)? {
             return Ok(ScanAccess::Runtime {
                 input: RuntimeInput::DynamicExpression,
             });
@@ -158,6 +159,8 @@ pub(super) async fn inspect(
                 ));
             }
             residuals.extend(covered_residual);
+            // Conjuncts an identity probe leaves to a recheck above Lance.
+            residuals.extend(recheck.cloned());
             let residuals: BTreeSet<_> = residuals.iter().map(|expr| format!("({expr})")).collect();
             let residual = (!residuals.is_empty())
                 .then(|| residuals.into_iter().collect::<Vec<_>>().join(" AND "));

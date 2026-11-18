@@ -369,7 +369,7 @@ async fn measure(
     let (plan, filter) = read.plan_with_filter().await.unwrap();
     if finalized {
         assert!(matches!(
-            inspect(&plan, &ds, filter).await.unwrap(),
+            inspect(&plan, &ds, filter, None).await.unwrap(),
             ScanAccess::IndexProbe { .. }
         ));
     }

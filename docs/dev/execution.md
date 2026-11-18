@@ -724,7 +724,14 @@ never scans query data. Ordinary execution builds no explain JSON or structural 
 which returns an opaque `Decision::PendingQuery`. Both entry points await
 scan-access finalization before binding or publishing an explain. Finalization
 first narrows safe single-String-key predicates, then records Lance's static
-probe or sequential choice. Only the completed decision is `Decision::Engine`. A
+probe or sequential choice. A scan whose pushed filter equates the identity
+column with a literal (the narrowed key's derived equality, or a written one)
+gives Lance that conjunct alone and rechecks the others on the row it returns
+(`table_store::split_identity_probe`), so it probes the identity index and
+never a second index holding the same values; the access reports the
+recheck as its residual. The write path's committed scans (an update's
+match, a delete's ids) split their filter the same way. Only the completed
+decision is `Decision::Engine`. A
 lowering error is a planner defect surfaced as an error, never a fallback to
 a hand-written sequence. `projection_pushdown` writes each scan and expansion destination projection
 from what the whole tree reads through its binding: `id` and the key always;

@@ -6483,6 +6483,24 @@ impl TableStore {
 
         let scan_rows = account.next_scan_rows();
         let scan_bytes = account.next_scan_bytes();
+        // An identity equality on the merge key alone reaches Lance; the rest
+        // is rechecked on the row it returns, when the projection holds it.
+        let (filter, recheck) = match (filter, key_column) {
+            (Some(filter), Some(id_column)) => match split_identity_probe(&filter, id_column) {
+                Some((probe, recheck))
+                    if projection.is_none_or(|columns| {
+                        recheck
+                            .column_refs()
+                            .iter()
+                            .all(|column| columns.contains(&column.name.as_str()))
+                    }) =>
+                {
+                    (Some(probe), Some(recheck))
+                }
+                _ => (Some(filter), None),
+            },
+            (filter, _) => (filter, None),
+        };
         let mut stream =
             Self::scan_stream_with(committed_ds, projection, None, None, false, |scanner| {
                 if let Some(filter) = filter {
@@ -6500,6 +6518,10 @@ impl TableStore {
 
         let mut committed = Vec::new();
         while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+            let batch = match &recheck {
+                Some(recheck) => recheck_batch(batch, recheck)?,
+                None => batch,
+            };
             let batch = if let Some(key_col) = key_column
                 && !pending_keys.is_empty()
             {
@@ -7912,6 +7934,62 @@ fn collect_string_column_values(
 /// `column`, so a missing column here is a programmer error — error
 /// loudly instead of silently passing batches through (which would
 /// re-introduce the union semantics the caller asked us to avoid).
+/// Split a scan filter around an identity equality. `identity = v` (a
+/// literal) selects at most one row, so Lance is given that conjunct alone
+/// and probes the identity index; the other conjuncts are returned to be
+/// rechecked on the row it returns. Probing a second index as well (a key
+/// column's own BTREE beside the identity equality derived from it, or any
+/// other) would read that index's pages for a row the identity probe already
+/// decides; the rows are the same either way. `None` when the filter has no
+/// identity equality or nothing besides it.
+pub(crate) fn split_identity_probe(filter: &Expr, id_column: &str) -> Option<(Expr, Expr)> {
+    use datafusion::logical_expr::utils::{conjunction, split_conjunction};
+    use datafusion::logical_expr::{BinaryExpr, Operator};
+    let conjuncts = split_conjunction(filter);
+    let is_probe = |expr: &Expr| match expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Eq,
+            right,
+        }) => [(left, right), (right, left)]
+            .into_iter()
+            .any(|(column, value)| {
+                matches!(column.as_ref(), Expr::Column(column) if column.name == id_column)
+                    && matches!(value.as_ref(), Expr::Literal(..))
+            }),
+        _ => false,
+    };
+    let at = conjuncts.iter().position(|expr| is_probe(expr))?;
+    let rest = conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != at)
+        .map(|(_, expr)| (*expr).clone());
+    let recheck = conjunction(rest)?;
+    Some((conjuncts[at].clone(), recheck))
+}
+
+/// The rows of `batch` `predicate` keeps (null rejects), the predicate
+/// evaluated as DataFusion evaluates a scan's refine filter.
+pub(crate) fn recheck_batch(batch: RecordBatch, predicate: &Expr) -> Result<RecordBatch> {
+    use datafusion::execution::context::ExecutionProps;
+    use datafusion::physical_expr::create_physical_expr;
+    let schema = datafusion::common::DFSchema::try_from(batch.schema().as_ref().clone())
+        .map_err(|error| OmniError::manifest_internal(format!("recheck schema: {error}")))?;
+    let predicate = create_physical_expr(predicate, &schema, &ExecutionProps::new())
+        .map_err(|error| OmniError::manifest_internal(format!("recheck predicate: {error}")))?;
+    let mask = predicate
+        .evaluate(&batch)
+        .and_then(|value| value.into_array(batch.num_rows()))
+        .map_err(|error| OmniError::manifest_internal(format!("recheck: {error}")))?;
+    let mask = mask
+        .as_any()
+        .downcast_ref::<arrow_array::BooleanArray>()
+        .ok_or_else(|| OmniError::manifest_internal("recheck is not a Boolean"))?;
+    arrow_select::filter::filter_record_batch(&batch, mask)
+        .map_err(|error| OmniError::manifest_internal(format!("recheck filter: {error}")))
+}
+
 fn filter_out_rows_where_string_in(
     batches: Vec<RecordBatch>,
     column: &str,

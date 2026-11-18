@@ -3361,17 +3361,40 @@ async fn scan_deleted_ids(
     removed: &mut Vec<String>,
     addrs: &mut RowAddrTreeMap,
 ) -> Result<()> {
+    // An identity equality alone reaches Lance; the rest of the filter is
+    // rechecked on the row it returns (`split_identity_probe`).
+    let (filter, recheck) = match read.filter {
+        Some(filter) => match crate::table_store::split_identity_probe(&filter, id_column) {
+            Some((probe, recheck)) => (Some(probe), Some(recheck)),
+            None => (Some(filter), None),
+        },
+        None => (None, None),
+    };
+    let recheck_columns: Vec<String> = recheck
+        .iter()
+        .flat_map(|recheck| recheck.column_refs())
+        .map(|column| column.name.clone())
+        .collect();
     // The id column first: the walk reads it as column 0.
-    let projection: Vec<&str> = std::iter::once(id_column)
+    let mut projection: Vec<&str> = std::iter::once(id_column)
         .chain(read.matcher.iter().flat_map(|matcher| matcher.columns()))
         .collect();
+    for column in &recheck_columns {
+        if !projection.contains(&column.as_str()) {
+            projection.push(column);
+        }
+    }
     let mut stream = db
         .storage()
-        .scan_filtered_row_addrs(snapshot, &projection, read.filter, read.fragments)
+        .scan_filtered_row_addrs(snapshot, &projection, filter, read.fragments)
         .await?;
     let mut scanned = RowAddrTreeMap::new();
     let mut found = Vec::new();
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        let batch = match &recheck {
+            Some(recheck) => crate::table_store::recheck_batch(batch, recheck)?,
+            None => batch,
+        };
         let batch = match read.matcher {
             Some(matcher) => matcher.keep(&batch)?,
             None => batch,

@@ -38,6 +38,10 @@ pub(super) struct NodeRead<'n> {
     ds: Dataset,
     pub(super) node_type: &'n omnigraph_compiler::catalog::NodeType,
     filter_expr: Option<Expr>,
+    /// The pushed conjuncts an identity equality leaves to a recheck: Lance
+    /// probes the identity index alone and these run on the rows it returns
+    /// ([`identity_probe`]).
+    recheck: Option<Expr>,
     scalar_index: Option<bool>,
     pub(super) columns: ScanColumns<'n>,
     /// The gate proved the answer empty: no Lance read runs.
@@ -102,8 +106,15 @@ impl<'n> NodeRead<'n> {
             &SearchMode::default(),
             &columns,
         )?;
+        let (filter_expr, recheck) = split_pushed_filter(
+            filters,
+            params,
+            &node_type.arrow_schema,
+            catalog.system_columns.id,
+        );
         Ok(Self {
-            filter_expr: build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema)),
+            filter_expr,
+            recheck,
             ds,
             node_type,
             scalar_index: Some(true),
@@ -137,8 +148,21 @@ impl<'n> NodeRead<'n> {
             &read_columns,
         )?;
 
-        let mut filter_expr =
-            build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
+        // A ranked read keeps every conjunct in Lance's prefilter: a
+        // recheck after the window would cut rows the window already chose.
+        let (mut filter_expr, recheck) = if search_mode.nearest.is_some() {
+            (
+                build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema)),
+                None,
+            )
+        } else {
+            split_pushed_filter(
+                filters,
+                params,
+                &node_type.arrow_schema,
+                catalog.system_columns.id,
+            )
+        };
 
         if let Some(eligible_ids) = search_mode.eligible_ids() {
             let in_list = id_in_list_expr(eligible_ids, catalog.system_columns.id);
@@ -163,6 +187,7 @@ impl<'n> NodeRead<'n> {
             ds,
             node_type,
             filter_expr,
+            recheck,
             scalar_index: search_mode.scalar_index,
             columns,
             proven_empty,
@@ -199,10 +224,48 @@ impl<'n> NodeRead<'n> {
     pub(super) fn plan_with_filter(
         &self,
     ) -> futures::future::BoxFuture<'static, Result<PlannedScan>> {
-        let projection = self.columns.read_projection();
-        TableStore::scan_plan_with_filter(&self.ds, projection.as_deref(), |scanner| {
-            self.configure(scanner, None)
+        let (projection, added) = self.lance_projection();
+        let planned =
+            TableStore::scan_plan_with_filter(&self.ds, projection.as_deref(), |scanner| {
+                self.configure(scanner, None)
+            });
+        let recheck = self.recheck.clone();
+        Box::pin(async move {
+            let (plan, filter) = planned.await?;
+            Ok((with_recheck(plan, recheck.as_ref(), &added)?, filter))
         })
+    }
+
+    /// The conjuncts rechecked on the identity probe's rows, which the
+    /// scan's access reports as its residual.
+    pub(super) fn recheck(&self) -> Option<&Expr> {
+        self.recheck.as_ref()
+    }
+
+    /// The columns Lance reads: the read's own, then any column a recheck
+    /// tests that the read does not return, which the recheck drops again.
+    fn lance_projection(&self) -> (Option<Vec<&'n str>>, Vec<String>) {
+        let mut projection = self.columns.read_projection();
+        let mut added = Vec::new();
+        if let (Some(columns), Some(recheck)) = (projection.as_mut(), self.recheck.as_ref()) {
+            for column in recheck.column_refs() {
+                let name = column.name.as_str();
+                if columns.contains(&name) {
+                    continue;
+                }
+                let node_type: &'n omnigraph_compiler::catalog::NodeType = self.node_type;
+                if let Some(field) = node_type
+                    .arrow_schema
+                    .fields()
+                    .iter()
+                    .find(|field| field.name() == name)
+                {
+                    columns.push(field.name().as_str());
+                    added.push(name.to_string());
+                }
+            }
+        }
+        (projection, added)
     }
 
     /// The Lance plan of this read: the projection, the pushed filter as a
@@ -216,12 +279,82 @@ impl<'n> NodeRead<'n> {
         'static,
         Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
     > {
-        let projection = self.columns.read_projection();
-        TableStore::scan_plan_with(&self.ds, projection.as_deref(), None, false, |scanner| {
-            self.configure(scanner, pipelined_batch)?;
-            configure(scanner)
-        })
+        let (projection, added) = self.lance_projection();
+        let planned =
+            TableStore::scan_plan_with(&self.ds, projection.as_deref(), None, false, |scanner| {
+                self.configure(scanner, pipelined_batch)?;
+                configure(scanner)
+            });
+        let recheck = self.recheck.clone();
+        Box::pin(async move { with_recheck(planned.await?, recheck.as_ref(), &added) })
     }
+}
+
+/// A scan's pushed filter, split around an identity equality
+/// ([`crate::table_store::split_identity_probe`]): Lance probes the identity
+/// index for it alone and the other pushed conjuncts are rechecked on the
+/// row it returns. Without an identity equality every conjunct is pushed.
+pub(super) fn split_pushed_filter(
+    filters: &[IRExpr],
+    params: &ParamMap,
+    schema: &Schema,
+    id_column: &str,
+) -> (Option<Expr>, Option<Expr>) {
+    let pushed = build_lance_filter_expr(filters, params, Some(schema));
+    match pushed
+        .as_ref()
+        .and_then(|filter| crate::table_store::split_identity_probe(filter, id_column))
+    {
+        Some((probe, recheck)) => (Some(probe), Some(recheck)),
+        None => (pushed, None),
+    }
+}
+
+/// `plan` with `recheck` applied to its rows and the columns only the
+/// recheck read (`added`) dropped again, so the output schema is the read's.
+fn with_recheck(
+    plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    recheck: Option<&Expr>,
+    added: &[String],
+) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    use datafusion::common::DFSchema;
+    use datafusion::execution::context::ExecutionProps;
+    use datafusion::physical_expr::create_physical_expr;
+    use datafusion::physical_plan::expressions::Column;
+    use datafusion::physical_plan::filter::FilterExec;
+    use datafusion::physical_plan::projection::ProjectionExec;
+
+    let Some(recheck) = recheck else {
+        return Ok(plan);
+    };
+    let schema = plan.schema();
+    let df_schema = DFSchema::try_from(schema.as_ref().clone())
+        .map_err(|error| OmniError::manifest_internal(format!("recheck schema: {error}")))?;
+    let predicate = create_physical_expr(recheck, &df_schema, &ExecutionProps::new())
+        .map_err(|error| OmniError::manifest_internal(format!("recheck predicate: {error}")))?;
+    let filtered: Arc<dyn datafusion::physical_plan::ExecutionPlan> = Arc::new(
+        FilterExec::try_new(predicate, plan)
+            .map_err(|error| OmniError::manifest_internal(format!("recheck filter: {error}")))?,
+    );
+    if added.is_empty() {
+        return Ok(filtered);
+    }
+    let kept = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| !added.iter().any(|name| name == field.name()))
+        .map(|(index, field)| {
+            (
+                Arc::new(Column::new(field.name(), index))
+                    as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                field.name().clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(Arc::new(ProjectionExec::try_new(kept, filtered).map_err(
+        |error| OmniError::manifest_internal(format!("recheck projection: {error}")),
+    )?))
 }
 
 /// The breaker read of a ranked scan: scan a node type under the supplied

@@ -71,67 +71,49 @@ typed_search_options.gqt	3	error	language.diagnostic	Both refuse an oversized ed
 bare_node_projection_search_scan.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 bm25_distinct_scores_rank_descending.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 bm25_ties_after_traversal.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-compound_and_bare_boolean_filters.gqt	5	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-detached_branch_search_tracks_own_versions.gqt	3	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
 expression_type_errors.gqt	8	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
 expression_type_errors.gqt	13	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
-filtered_nearest_no_match_is_empty.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
+filtered_nearest_no_match_is_empty.gqt	1	requests	open:concurrent-index-searches-reread-a-page	An index search of this filter rereads a page that its concurrent sub-searches both missed in Lance's cache; edition 2 read no such index for this text.
 issue_566_order_key_binds_to_return_item.gqt	6	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
-issue_624_second_merge_after_fast_forward.gqt	9	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-issue_640_search_score_projection.gqt	5	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
+issue_640_search_score_projection.gqt	5	requests	open:index-probe-where-edition-2-scanned	The read probes a scalar index the edition-2 plan did not read, whose two requests exceed what edition 2's scan read on this one-fragment table.
 issue_640_search_score_projection.gqt	9	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 issue_659_compiler_scopes.gqt	11	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
 issue_659_compiler_scopes.gqt	12	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
 issue_659_compiler_scopes.gqt	13	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
-issue_659_compiler_scopes.gqt	27	requests	open:block-reads-table-again	The renamed read's correlated block reads the Person data file a third time, where edition 2's read it twice.
+issue_659_compiler_scopes.gqt	27	requests	open:block-binding-scans-its-type	The respelled block binds `$k: Person`, a dependent scan that reads the Person data file a third time, where edition 2's text bound no node there and read it twice.
 issue_659_edge_selection_contract.gqt	4	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
 issue_659_rrf_typed_edge_identity.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 issue_659_rrf_typed_edge_identity.gqt	3	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 issue_747_full_text_calls_need_a_full_text_index.gqt	6	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-issue_747_full_text_calls_need_a_full_text_index.gqt	7	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution (and the text column once more for the exact lexical scan).
+issue_747_full_text_calls_need_a_full_text_index.gqt	7	requests	open:index-probe-where-edition-2-scanned	The read probes a scalar index the edition-2 plan did not read, whose two requests exceed what edition 2's scan read on this one-fragment table.
 issue_747_full_text_calls_need_a_full_text_index.gqt	8	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 issue_763_exists_predicate.gqt	6	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 issue_787_rrf_order_keys_after_fused_score.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-issue_787_rrf_order_keys_after_fused_score.gqt	3	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution (and the text column once more for the exact lexical scan).
+issue_787_rrf_order_keys_after_fused_score.gqt	3	requests	open:index-probe-where-edition-2-scanned	The read probes a scalar index the edition-2 plan did not read, whose two requests exceed what edition 2's scan read on this one-fragment table.
 issue_788_search_led_aggregate_order_keys.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 issue_788_search_led_aggregate_order_keys.gqt	3	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 issue_788_search_led_aggregate_order_keys.gqt	4	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 issue_788_search_led_aggregate_order_keys.gqt	5	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-list_membership_over_indexed_columns_across_writes_and_restart.gqt	8	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-list_membership_over_indexed_columns_across_writes_and_restart.gqt	21	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
 nearest_bm25_and_rrf_rank_the_search_fixture.gqt	3	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 nearest_bm25_and_rrf_rank_the_search_fixture.gqt	4	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-nearest_ranks_updated_embedding.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-nearest_skips_deleted_rows_and_fills_limit.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
 planner/access_path_hash_join.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 planner/access_path_hash_join.gqt	5	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 planner/access_path_id_lookup.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 planner/contains_beside_search_and_ranking.gqt	3	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 planner/contains_beside_search_and_ranking.gqt	4	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-planner/expand_index_facts_indexed.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-planner/expand_partial_edge_coverage_plans_csr.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-planner/expand_undirected_full_coverage_indexed.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
 planner/hydrate_return_columns_above_a_fusion.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 planner/issue_750_destination_search_membership.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 planner/issue_750_destination_search_membership.gqt	4	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 planner/issue_750_destination_search_membership.gqt	5	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 planner/issue_750_destination_search_membership.gqt	6	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-planner/issue_750_destination_search_membership.gqt	7	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution (and the text column once more for the exact lexical scan).
+planner/issue_750_destination_search_membership.gqt	7	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 planner/issue_750_destination_search_membership.gqt	8	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-planner/issue_789_nearest_and_rrf_rank_a_reached_binding.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-planner/issue_789_ranked_binding_roots_its_component.gqt	3	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution (and the text column once more for the exact lexical scan).
 planner/issue_789_ranked_binding_roots_its_component.gqt	4	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-planner/issue_854_key_index_probe.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-planner/key_filter_costs_one_source.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-planner/key_narrowing_only_on_a_top_level_equality.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-planner/key_narrowing_rebinds_each_parameter_value.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-planner/key_probe_after_branch_merges.gqt	4	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-planner/key_probe_after_branch_merges.gqt	5	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-planner/key_probe_matches_exact_key_bytes.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-planner/nearest_pushes_every_grammar_filter_shape_into_the_scan.gqt	7	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-planner/ranked_access_on_the_scan.gqt	3	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
+planner/key_filter_costs_one_source.gqt	2	requests	open:index-probe-where-edition-2-scanned	The read probes a scalar index the edition-2 plan did not read, whose two requests exceed what edition 2's scan read on this one-fragment table.
+planner/key_narrowing_only_on_a_top_level_equality.gqt	1	requests	open:concurrent-index-searches-reread-a-page	An index search of this filter rereads a page that its concurrent sub-searches both missed in Lance's cache; edition 2 read no such index for this text.
+planner/nearest_pushes_every_grammar_filter_shape_into_the_scan.gqt	7	requests	open:concurrent-index-searches-reread-a-page	An index search of this filter rereads a page that its concurrent sub-searches both missed in Lance's cache; edition 2 read no such index for this text.
+planner/ranked_access_on_the_scan.gqt	3	requests	open:concurrent-index-searches-reread-a-page	An index search of this filter rereads a page that its concurrent sub-searches both missed in Lance's cache; edition 2 read no such index for this text.
 planner/ranked_access_on_the_scan.gqt	4	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-planner/scalar_index_coercion.gqt	4	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
 rank_call_nested_in_a_boolean_projection.gqt	5	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 rank_call_nested_in_a_boolean_projection.gqt	6	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 rank_call_nested_in_a_boolean_projection.gqt	7	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
@@ -144,5 +126,4 @@ text_search_fuzzy_and_match_text_filters.gqt	2	requests	cost.exact-lexical-scan	
 text_search_fuzzy_and_match_text_filters.gqt	3	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 text_search_fuzzy_and_match_text_filters.gqt	5	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 text_search_fuzzy_and_match_text_filters.gqt	6	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-traversal_nearest_empty_after_sources_deleted.gqt	1	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
-update_column_patch_matches_whole_row_update.gqt	4	requests	open:index-pages-read-twice	A scalar index file is read by scan-access planning and again by execution.
+update_column_patch_matches_whole_row_update.gqt	4	requests	open:index-probe-where-edition-2-scanned	The read probes a scalar index the edition-2 plan did not read, whose two requests exceed what edition 2's scan read on this one-fragment table.
