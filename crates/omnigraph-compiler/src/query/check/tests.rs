@@ -946,7 +946,10 @@ fn a_step_counts_the_nodes_it_adds() {
                 inner: Term::Env(Vec::new()),
                 col: "d".to_string(),
                 agg: count_rows(),
-                guard: Some(("g".to_string(), truth.clone())),
+                guard: Some(super::BlockGuard {
+                    columns: vec![("g".to_string(), truth.clone())],
+                    column: "g".to_string(),
+                }),
             },
         ]
     };

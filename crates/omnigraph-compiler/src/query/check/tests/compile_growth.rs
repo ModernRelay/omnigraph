@@ -6,7 +6,10 @@
 //!
 //! - the core term's nodes as stored (a node two parents share counts once);
 //! - the expression nodes of the stored term and of the read's shape, which
-//!   is what the planner lowers;
+//!   is what the planner lowers, except the padding row of each `optional`
+//!   (the RFC's `Project(Filter(Env, ¬ exists p), nulls)`), which names one
+//!   column per column the pattern adds and so grows with the width of the
+//!   relation, not with copies; it is counted apart;
 //! - the compile steps: the expressions the type checker typed plus the term
 //!   nodes the shaper visited.
 //!
@@ -247,6 +250,38 @@ fn expr_nodes(e: &IRExpr) -> usize {
     n
 }
 
+/// Whether `t` is the padding arm of an `optional`'s `Union`, whose left
+/// arm is `left`.
+fn is_padding(t: &Term, left: &Term) -> bool {
+    let Term::Project {
+        input, keep: false, ..
+    } = t
+    else {
+        return false;
+    };
+    let Term::Filter { input, .. } = input.as_ref() else {
+        return false;
+    };
+    let Term::Correlate { inner, .. } = input.as_ref() else {
+        return false;
+    };
+    matches!(inner.as_ref(), Term::Group { input, .. } if std::ptr::eq(input.as_ref(), left))
+}
+
+/// The padding rows' columns: one per column each `optional` pads.
+fn padding(nodes: &[&Term]) -> usize {
+    nodes
+        .iter()
+        .filter_map(|t| match t {
+            Term::Union { left, right } => match right.as_ref() {
+                Term::Project { items, .. } if is_padding(right, left) => Some(items.len()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .sum()
+}
+
 /// The expressions a stored term node holds.
 fn term_exprs(t: &Term) -> usize {
     match t {
@@ -317,6 +352,8 @@ pub(super) struct Work {
     pub term_nodes: usize,
     pub expr_nodes: usize,
     pub steps: usize,
+    /// The `optional` padding rows' columns, apart from `expr_nodes`.
+    pub padding: usize,
 }
 
 pub(super) fn measure(catalog: &Catalog, source: &str) -> Result<Work, String> {
@@ -336,10 +373,13 @@ pub(super) fn measure(catalog: &Catalog, source: &str) -> Result<Work, String> {
     let nodes = stored_nodes(&read.term, &mut seen);
     let (shape, visited) = ReadShape::of_measured(&read, catalog);
     let shape = shape.map_err(|e| e.to_string())?;
+    let padding = padding(&nodes);
     Ok(Work {
         term_nodes: nodes.len(),
-        expr_nodes: nodes.iter().map(|t| term_exprs(t)).sum::<usize>() + shape_exprs(&shape),
+        expr_nodes: nodes.iter().map(|t| term_exprs(t)).sum::<usize>() + shape_exprs(&shape)
+            - padding,
         steps: w.exprs + visited,
+        padding,
     })
 }
 
@@ -373,17 +413,59 @@ fn linear(works: &[Work]) -> bool {
     .all(|d| d[1..].iter().all(|x| *x == d[1]))
 }
 
+/// Whether the padding columns grow by the same amount per unit from the
+/// second unit on, or, for nested `optional`s, whose relation widens by one
+/// column per level, by an amount that itself grows by the same amount.
+fn padding_bounded(family: Family, works: &[Work]) -> bool {
+    let steps: Vec<isize> = works
+        .windows(2)
+        .map(|w| w[1].padding as isize - w[0].padding as isize)
+        .collect();
+    let steps = match family {
+        Family::NestedOptionals => steps.windows(2).map(|w| w[1] - w[0]).collect(),
+        _ => steps,
+    };
+    steps[1..].iter().all(|step| *step == steps[1])
+}
+
 #[test]
 fn compile_work_grows_linearly_in_every_family() {
     let mut failures = Vec::new();
     for family in FAMILIES {
         match grow(family) {
-            Ok(works) if linear(&works) => {}
+            Ok(works) if linear(&works) && padding_bounded(family, &works) => {}
             Ok(works) => failures.push(format!("{family:?}: {works:?}")),
             Err(e) => failures.push(e),
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Sizes the type checker refused, or took exponential time over, before
+/// the core term shared an `optional`'s pattern and a `let` became a
+/// column: each compiles now, within the default plan budget.
+#[test]
+fn reads_past_the_old_limits_compile() {
+    let catalog = catalog();
+    for (family, n) in [
+        // Refused at 8 levels (`T70`, 4,336 nodes).
+        (Family::NestedOptionals, 40),
+        // 2^40 expression nodes when each read of a `let` copied its value.
+        (Family::LetDoubling, 40),
+        (Family::LetFiltered, 40),
+        // Shaped 2^n times.
+        (Family::NestedInlineOptionals, 30),
+        // Each guard copied every disjunct before it.
+        (Family::OrChainOfFailingBlocks, 200),
+    ] {
+        let src = source(family, n);
+        let work = measure(&catalog, &src).unwrap_or_else(|e| panic!("{family:?} at {n}: {e}"));
+        assert!(
+            work.term_nodes + work.expr_nodes < 50 * src.len(),
+            "{family:?} at {n}: {work:?} for {} bytes",
+            src.len()
+        );
+    }
 }
 
 /// The table the change's report quotes: every family's work at each size.

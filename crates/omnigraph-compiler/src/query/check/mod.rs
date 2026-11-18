@@ -1331,6 +1331,10 @@ struct Scope {
     /// evaluated only where these hold (A3), so a block under them that can
     /// fail is evaluated only there too ([`BlockAgg::guard`]).
     guards: Vec<SExpr>,
+    /// Per guard, the column that holds it and every guard before it, once
+    /// a block has needed it: the next block reads that column and adds the
+    /// guards after it, so no guard is copied into a second block's.
+    guard_cols: Vec<Option<String>>,
     pending: Vec<Pending>,
     /// True inside an inline read or a called body: a binding reusing an
     /// outer name is `T68`, since it would silently become a filter.
@@ -1400,6 +1404,7 @@ impl Scope {
             future: HashSet::new(),
             block_buf: Vec::new(),
             guards: Vec::new(),
+            guard_cols: Vec::new(),
             pending: Vec::new(),
             inner,
             correlates: false,
@@ -1413,6 +1418,18 @@ impl Scope {
             refused: false,
             loose_pins: HashSet::new(),
         }
+    }
+
+    /// `guard` holds for the operands typed until it is popped.
+    fn push_guard(&mut self, guard: SExpr) {
+        self.guards.push(guard);
+        self.guard_cols.push(None);
+    }
+
+    /// The guards back to the first `len`.
+    fn truncate_guards(&mut self, len: usize) {
+        self.guards.truncate(len);
+        self.guard_cols.truncate(len);
     }
 
     /// An inner scope over `outer`: it recovers when this scope does, and
@@ -1898,10 +1915,47 @@ impl Ctx<'_> {
         }
     }
 
+    /// The guard a block that can fail runs under, typed where it is
+    /// written: every guard around it, as a column of the outer row. The
+    /// guards a block written before it in this expression already computed
+    /// are read from their column; each guard after them adds a column that
+    /// reads the one before it, so a chain of guarded blocks computes each
+    /// guard once.
+    fn block_guard(&mut self, sc: &mut Scope) -> Option<BlockGuard> {
+        let top = sc.guards.len().checked_sub(1)?;
+        let start = (0..=top)
+            .rev()
+            .find(|level| sc.guard_cols[*level].is_some())
+            .map_or(0, |level| level + 1);
+        let boolean = Ty::scalar(ScalarType::Bool, false);
+        let mut columns = Vec::new();
+        for level in start..=top {
+            let guard = sc.guards[level].clone();
+            let guard = match level
+                .checked_sub(1)
+                .and_then(|below| sc.guard_cols[below].clone())
+            {
+                None => guard,
+                Some(below) => SExpr::new(
+                    SKind::And(
+                        SExpr::new(SKind::Col(below), boolean.clone()).boxed(),
+                        guard.boxed(),
+                    ),
+                    boolean.clone(),
+                ),
+            };
+            let name = self.fresh(FreshRole::Guard);
+            columns.push((name.clone(), guard));
+            sc.guard_cols[level] = Some(name);
+        }
+        let column = sc.guard_cols[top].clone()?;
+        Some(BlockGuard { columns, column })
+    }
+
     /// `T70` when `term`, of `size` nodes, is over the plan budget of the
     /// declaration being checked. Each scope, inline read, call and union
     /// charges the term it builds as it builds it, so an expansion that
-    /// outgrows the budget (nested `optional`s, calls that each call twice)
+    /// outgrows the budget (reads that each call the next one twice)
     /// stops at the first term over it instead of after the whole tree is
     /// built.
     fn charge(&self, size: usize, term: &Term) -> R<()> {
@@ -5473,20 +5527,7 @@ impl Ctx<'_> {
                 // once where it was written, is computed as a column of the
                 // outer row and the block's input keeps the rows where it
                 // holds.
-                let guard = if can_fail {
-                    sc.guards
-                        .iter()
-                        .cloned()
-                        .reduce(|a, b| {
-                            SExpr::new(
-                                SKind::And(a.boxed(), b.boxed()),
-                                Ty::scalar(ScalarType::Bool, false),
-                            )
-                        })
-                        .map(|g| (self.fresh(FreshRole::Guard), g))
-                } else {
-                    None
-                };
+                let guard = if can_fail { self.block_guard(sc) } else { None };
                 sc.block_buf.push(BlockAgg {
                     inner: term,
                     col: col.clone(),
@@ -5699,34 +5740,66 @@ impl Ctx<'_> {
                 let ty = v.ty.clone();
                 SExpr::new(SKind::Not(v.boxed()), ty)
             }
-            Expr::And(l, r) | Expr::Or(l, r) => {
-                let a = self.expr(sc, l, sub);
+            Expr::And(..) | Expr::Or(..) => {
+                let and = matches!(e, Expr::And(..));
+                // The chain of this connective as written, `((d1 op d2) op
+                // d3) …`: its operands in written order.
+                let mut operands = Vec::new();
+                let mut at = e;
+                loop {
+                    match (at, and) {
+                        (Expr::And(l, r), true) | (Expr::Or(l, r), false) => {
+                            operands.push(r.as_ref());
+                            at = l;
+                        }
+                        _ => {
+                            operands.push(at);
+                            break;
+                        }
+                    }
+                }
+                operands.reverse();
+                // Each node of the chain is an expression typed.
+                self.typed_exprs += operands.len().saturating_sub(2);
+                let what = if and { "`and`" } else { "`or`" };
                 // `a and b` evaluates `b` only where `a` is not false, `a or
-                // b` only where `a` is not true.
-                let guard = a
-                    .as_ref()
-                    .ok()
-                    .map(|a| lazy_guard(a, matches!(e, Expr::And(..)), true));
-                let guarded = guard.is_some();
-                sc.guards.extend(guard);
-                let b = self.expr(sc, r, sub);
-                if guarded {
-                    sc.guards.pop();
+                // b` only where `a` is not true: each operand guards every
+                // operand after it, as one guard of its own, so a later
+                // operand's guard copies no earlier one. A chain that
+                // failed to type guards nothing after the failure.
+                let depth = sc.guards.len();
+                let mut chain: Option<R<SExpr>> = None;
+                for (i, operand) in operands.iter().enumerate() {
+                    let typed = self.expr(sc, operand, sub);
+                    let guard = typed.as_ref().ok().map(|t| lazy_guard(t, and, true));
+                    chain = Some(match chain {
+                        None => typed,
+                        Some(left) => match self.both(sc, left, typed) {
+                            Err(e) => Err(e),
+                            Ok((a, b)) => match (require_bool(&a, what), require_bool(&b, what)) {
+                                (Err(e), _) | (_, Err(e)) => Err(e),
+                                (Ok(()), Ok(())) => {
+                                    let ty = Ty::scalar(
+                                        ScalarType::Bool,
+                                        a.ty.nullable() || b.ty.nullable(),
+                                    );
+                                    Ok(if and {
+                                        SExpr::new(SKind::And(a.boxed(), b.boxed()), ty)
+                                    } else {
+                                        SExpr::new(SKind::Or(a.boxed(), b.boxed()), ty)
+                                    })
+                                }
+                            },
+                        },
+                    });
+                    let chained = matches!(chain, Some(Ok(_)));
+                    match guard {
+                        Some(guard) if chained && i + 1 < operands.len() => sc.push_guard(guard),
+                        _ => sc.truncate_guards(depth),
+                    }
                 }
-                let (a, b) = self.both(sc, a, b)?;
-                let what = if matches!(e, Expr::And(..)) {
-                    "`and`"
-                } else {
-                    "`or`"
-                };
-                require_bool(&a, what)?;
-                require_bool(&b, what)?;
-                let ty = Ty::scalar(ScalarType::Bool, a.ty.nullable() || b.ty.nullable());
-                if matches!(e, Expr::And(..)) {
-                    SExpr::new(SKind::And(a.boxed(), b.boxed()), ty)
-                } else {
-                    SExpr::new(SKind::Or(a.boxed(), b.boxed()), ty)
-                }
+                sc.truncate_guards(depth);
+                chain.expect("a chain has two operands")?
             }
         })
     }
@@ -5812,6 +5885,8 @@ impl Ctx<'_> {
             })
             .map(|(position, _)| position)
             .collect();
+        let coalesce_depth = sc.guards.len();
+        let (mut coalesce_guarding, mut coalesce_guarded) = (true, 0);
         for (position, a) in c.args.iter().enumerate() {
             match a {
                 Arg::Expr(_) if deferred.contains(&position) => typed_at.push(None),
@@ -5830,39 +5905,41 @@ impl Ctx<'_> {
                     let guard = match (name, position) {
                         ("if", 1) => earlier(0).map(|cnd| lazy_guard(&cnd, true, false)),
                         ("if", 2) => earlier(0).map(|cnd| lazy_guard(&cnd, false, true)),
-                        // An earlier argument that is a `null` is null on
-                        // every row: it guards nothing.
-                        ("coalesce", p) if p > 0 => (0..p)
-                            .filter(|i| !deferred.contains(i))
-                            .map(earlier)
-                            .collect::<Option<Vec<_>>>()
-                            .and_then(|before| {
-                                before
-                                    .into_iter()
-                                    .map(|b| {
-                                        SExpr::new(
-                                            SKind::IsNull {
-                                                expr: b.boxed(),
-                                                negated: false,
-                                            },
-                                            Ty::scalar(ScalarType::Bool, false),
-                                        )
-                                    })
-                                    .reduce(|a, b| {
-                                        SExpr::new(
-                                            SKind::And(a.boxed(), b.boxed()),
-                                            Ty::scalar(ScalarType::Bool, false),
-                                        )
-                                    })
-                            }),
                         _ => None,
                     };
-                    let guarded = guard.is_some();
-                    sc.guards.extend(guard);
-                    let typed = self.expr(sc, e, At::Value);
-                    if guarded {
-                        sc.guards.pop();
+                    // `coalesce`'s argument is evaluated where every earlier
+                    // one is null: one guard per earlier argument, kept for
+                    // the arguments after it. An earlier argument that is a
+                    // `null` is null on every row: it guards nothing; one
+                    // that failed to type leaves the rest unguarded.
+                    if name == "coalesce" && coalesce_guarding {
+                        for i in coalesce_guarded..position {
+                            if deferred.contains(&i) {
+                                continue;
+                            }
+                            match earlier(i) {
+                                Some(before) => sc.push_guard(SExpr::new(
+                                    SKind::IsNull {
+                                        expr: before.boxed(),
+                                        negated: false,
+                                    },
+                                    Ty::scalar(ScalarType::Bool, false),
+                                )),
+                                None => {
+                                    sc.truncate_guards(coalesce_depth);
+                                    coalesce_guarding = false;
+                                    break;
+                                }
+                            }
+                        }
+                        coalesce_guarded = position;
                     }
+                    let depth = sc.guards.len();
+                    if let Some(guard) = guard {
+                        sc.push_guard(guard);
+                    }
+                    let typed = self.expr(sc, e, At::Value);
+                    sc.truncate_guards(depth);
                     typed_at.push(typed.as_ref().ok().cloned());
                     match typed {
                         Ok(v) => args.push(v),
@@ -5875,6 +5952,7 @@ impl Ctx<'_> {
                     }
                 }
                 Arg::Inline(_) => {
+                    sc.truncate_guards(coalesce_depth);
                     return Err(err(
                         T69,
                         format!("`{name}` reads scalars; an inline read is a relation"),
@@ -5882,6 +5960,7 @@ impl Ctx<'_> {
                 }
             }
         }
+        sc.truncate_guards(coalesce_depth);
         if let Some(e) = failed {
             return Err(e);
         }
@@ -6300,13 +6379,24 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
 
 /// A block typed in an expression: its inner term, the column its aggregate
 /// fills, the aggregate, and, for a block that can fail written under a
-/// guard, the guard's column and the guard as typed where it was written.
+/// guard, the column its guard is.
 #[derive(Debug, Clone)]
 struct BlockAgg {
     inner: Term,
     col: String,
     agg: Agg,
-    guard: Option<(String, SExpr)>,
+    guard: Option<BlockGuard>,
+}
+
+/// The guard a block runs under, as a column of the outer row: `column`,
+/// computed by the last of `columns`, each a guard column the block computes
+/// first, in order. Each holds one guard as typed where it was written and
+/// reads the column before it for the guards around that one, so a guard
+/// another block already computed is read, never copied.
+#[derive(Debug, Clone)]
+struct BlockGuard {
+    columns: Vec<(String, SExpr)>,
+    column: String,
 }
 
 impl BlockAgg {
@@ -6317,10 +6407,10 @@ impl BlockAgg {
     }
 
     /// The nodes [`with_blocks`] adds for the block: `Correlate` and
-    /// `Group` over its inner term, and for a guarded block the guard's
-    /// `Project` and the inner `Filter` on it.
+    /// `Group` over its inner term, and for a guarded block a `Project` per
+    /// guard column it computes and the inner `Filter` on its guard.
     fn added(&self) -> usize {
-        2 + self.inner.size() + if self.guard.is_some() { 2 } else { 0 }
+        2 + self.inner.size() + self.guard.as_ref().map_or(0, |g| g.columns.len() + 1)
     }
 }
 
@@ -6339,14 +6429,16 @@ fn with_blocks(mut t: Term, blocks: Vec<BlockAgg>) -> Term {
     {
         let inner = match guard {
             None => inner,
-            Some((name, guard)) => {
-                t = Term::Project {
-                    input: t.boxed(),
-                    fails: guard.can_fail,
-                    items: vec![(name.clone(), guard.to_ir())],
-                    keep: true,
-                };
-                condition_env(inner, &name)
+            Some(BlockGuard { columns, column }) => {
+                for (name, guard) in columns {
+                    t = Term::Project {
+                        input: t.boxed(),
+                        fails: guard.can_fail,
+                        items: vec![(name, guard.to_ir())],
+                        keep: true,
+                    };
+                }
+                condition_env(inner, &column)
             }
         };
         let inner = Term::Group {
