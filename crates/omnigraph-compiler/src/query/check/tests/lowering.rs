@@ -901,8 +901,9 @@ fn a_let_that_can_fail_runs_before_where_and_the_elements_after_it() {
                 assert!(filters.is_empty(), "a filter below the `let`: {filters:?}");
                 "scan"
             }
+            // The `let`'s column, of a binding the shaper made up for it.
             PatternStep::Let { name, value } => {
-                assert_eq!(name, "next");
+                assert!(name.ends_with("_next"), "{name}");
                 assert!(value.can_fail(), "{value}");
                 "let"
             }

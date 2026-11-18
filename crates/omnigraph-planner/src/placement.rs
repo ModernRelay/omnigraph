@@ -190,6 +190,12 @@ impl Placed for LogicalPlan {
                     stack.extend(input.iter().copied());
                 }
                 LogicalNode::AntiJoin { input, .. } => stack.push(*input),
+                // A `let`'s rows carry its column, under the binding the
+                // shaper made up for it.
+                LogicalNode::Let { input, name, .. } => {
+                    carried.insert(name.clone());
+                    stack.push(*input);
+                }
                 LogicalNode::Union { bindings, .. } => carried.extend(bindings.iter().cloned()),
                 LogicalNode::Fuse { target, .. } => {
                     carried.insert(target.clone());

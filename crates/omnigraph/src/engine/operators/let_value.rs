@@ -1,14 +1,16 @@
-//! `LetExec`: a `let` whose value can fail, the core's `Project` adding one
-//! column (the GQ 3 RFC, section 3). The value is evaluated
-//! on every input row, so a failure (`E1`, `E2`, `E3`) refuses the read on
+//! `LetExec`: a `let`, the core's `Project` adding one column (the GQ 3 RFC,
+//! section 3). The value is computed once on every input row and appended
+//! as the `value` column of the binding the shaper made up for the `let`,
+//! which every later read of the name reads; every row passes through, in
+//! input order. A value that can fail (`E1`, `E2`, `E3`) refuses the read on
 //! the rows the elements before the `let` produce, whatever `where` later
-//! removes (A3); every row passes through unchanged, in input order. The
-//! value is pure, so a later read of the name evaluates it in place to the
-//! same result on the rows that reach it.
+//! removes (A3).
 
 use std::fmt;
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
+use arrow_schema::{Field, Schema};
 use datafusion::common::Result as DfResult;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
@@ -16,11 +18,13 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
+use omnigraph_compiler::shape::read::LET_VALUE;
 
 use super::external;
 use super::shape::{Mapped, Streaming};
 use crate::engine::expr::evaluate_expr;
 use crate::engine::lexical::LexicalColumns;
+use crate::error::{OmniError, Result};
 
 pub(crate) struct LetExec {
     input: Arc<dyn ExecutionPlan>,
@@ -40,9 +44,19 @@ impl LetExec {
         value: IRExpr,
         params: Arc<ParamMap>,
         lexical: Option<Arc<LexicalColumns>>,
-    ) -> Self {
-        let shape = Streaming::new(input.schema());
-        Self {
+    ) -> Result<Self> {
+        let data_type = value.ty().to_arrow().ok_or_else(|| {
+            OmniError::manifest_internal(format!("`let` value `{value}` has no Arrow type"))
+        })?;
+        let input_schema = input.schema();
+        let mut fields: Vec<Arc<Field>> = input_schema.fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new(
+            format!("{name}.{LET_VALUE}"),
+            data_type,
+            true,
+        )));
+        let shape = Streaming::new(Arc::new(Schema::new(fields)));
+        Ok(Self {
             input,
             name,
             value,
@@ -50,7 +64,7 @@ impl LetExec {
             lexical,
             shape,
             metrics: ExecutionPlanMetricsSet::new(),
-        }
+        })
     }
 }
 
@@ -91,13 +105,16 @@ impl ExecutionPlan for LetExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 1, "LetExec has one child");
-        Ok(Arc::new(Self::new(
-            children.pop().expect("one child"),
-            self.name.clone(),
-            self.value.clone(),
-            Arc::clone(&self.params),
-            self.lexical.clone(),
-        )))
+        Ok(Arc::new(
+            Self::new(
+                children.pop().expect("one child"),
+                self.name.clone(),
+                self.value.clone(),
+                Arc::clone(&self.params),
+                self.lexical.clone(),
+            )
+            .map_err(external)?,
+        ))
     }
 
     fn execute(
@@ -120,16 +137,19 @@ impl ExecutionPlan for LetExec {
         let value = self.value.clone();
         let params = Arc::clone(&self.params);
         let lexical = self.lexical.clone();
+        let schema = self.schema();
         Ok(self.shape.map(&self.metrics, input, move |batch| {
-            match &lexical {
+            let column = match &lexical {
                 Some(lexical) => {
                     let widened = lexical.widen(&batch).map_err(external)?;
-                    evaluate_expr(&widened, &value, &params).map_err(external)?;
+                    evaluate_expr(&widened, &value, &params).map_err(external)?
                 }
-                None => {
-                    evaluate_expr(&batch, &value, &params).map_err(external)?;
-                }
-            }
+                None => evaluate_expr(&batch, &value, &params).map_err(external)?,
+            };
+            let mut columns = batch.columns().to_vec();
+            columns.push(column);
+            let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+                .map_err(|e| external(OmniError::arrow_internal(e)))?;
             Ok(Mapped::Batch { batch, lease: None })
         }))
     }

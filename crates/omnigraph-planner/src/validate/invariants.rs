@@ -1102,9 +1102,9 @@ impl Requirements {
         Ok(())
     }
 
-    /// The plan runs one `Let` per `let` whose value can fail, evaluating
-    /// the same value: a plan without one would skip the value's failure on
-    /// a row `where` removes.
+    /// The plan runs one `Let` per `let`, computing the same value: a plan
+    /// without one would read a column nothing computes, or skip a value's
+    /// failure on a row `where` removes.
     fn check_lets(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
         let mut planned: Vec<&IRExpr> = top
             .iter()
@@ -1117,7 +1117,7 @@ impl Requirements {
             return Err(ValidationError::violated(
                 "plan shape",
                 format!(
-                    "the query has {} `let` values that can fail; the plan evaluates {}",
+                    "the query has {} `let` values; the plan computes {}",
                     self.lets.len(),
                     planned.len()
                 ),

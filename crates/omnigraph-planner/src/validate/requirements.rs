@@ -464,8 +464,7 @@ pub struct Requirements {
     /// Every exact score of the query (`distance`, and `bm25` on a field
     /// whose index declares an analyzer), each one `Score` node of the plan.
     pub(crate) scores: Vec<ExactScore>,
-    /// The value of every `let` that can fail, each one `Let` node of the
-    /// plan.
+    /// The value of every `let`, each one `Let` node of the plan.
     pub(crate) lets: Vec<IRExpr>,
     pub(crate) search: Option<Search>,
     /// The fusion the scope's rows come from, each arm a scope of its own

@@ -918,7 +918,7 @@ impl Lower for Walk<'_, '_> {
             value.pop().expect("one value"),
             Arc::clone(self.lowering.params()),
             lexical,
-        );
+        )?;
         self.built(id, exec)
     }
 

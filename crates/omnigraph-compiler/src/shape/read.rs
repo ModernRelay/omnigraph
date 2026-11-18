@@ -38,6 +38,11 @@ use crate::types::{AggSignature, Direction, ExprType, PropType, ScalarType};
 
 use super::{Construct, ElementKind, ProgrammeStage, ShapeError, Unlowered};
 
+/// The property under which a [`PatternStep::Let`]'s binding holds its
+/// value: a `let $v = e` is the column `{binding}.value` of a binding the
+/// shaper makes up, and every read of `$v` reads that column.
+pub const LET_VALUE: &str = "value";
+
 /// A core read's top-level shape: the pattern's steps in run order, then
 /// what the read returns.
 #[derive(Debug, Clone)]
@@ -240,12 +245,12 @@ pub enum PatternStep {
         /// outer row, and nothing moves below it (A3).
         fails: bool,
     },
-    /// `let $name = value` whose value can fail, the core's `Project`
-    /// adding one column: `value` evaluated on every row the steps before it
-    /// produce, a failure refusing the read there (A3), the rows passing
-    /// through unchanged. The value is pure, so a later read of `$name`
-    /// evaluates it in place to the same result on the rows that reach it;
-    /// no filter written after the `let` runs below this step.
+    /// `let $v = value`, the core's `Project` adding one column: `value`
+    /// computed once on every row the steps before it produce, as the
+    /// [`LET_VALUE`] column of the binding `name`, which the shaper made up
+    /// for the `let`; every later read of `$v` reads that column. A value
+    /// that can fail refuses the read there (A3), and no filter written
+    /// after the `let` runs below this step.
     Let { name: String, value: IRExpr },
     /// `from` an inline read (or a declared read's call) with its own
     /// aggregate, `distinct`, `order` or `limit`, the core's `Correlate`
@@ -647,6 +652,8 @@ struct Shaper<'a> {
     /// no `optional` or `union` to the scope it is written in, so the probe
     /// does not read it.
     probing: std::cell::Cell<bool>,
+    /// How many `let` bindings the shaper made up so far.
+    lets_minted: std::cell::Cell<usize>,
 }
 
 /// The pattern facts of one scope, in the order the term states them.
@@ -676,13 +683,14 @@ struct Facts {
     /// the outer scope's for an `optional`'s own. An `optional` here
     /// introduces none of them.
     outer_names: HashSet<String>,
-    /// Each `let` name and its value, earlier `let`s already read into it.
+    /// Each `let` name and the column that holds its value: a read of the
+    /// name is a read of that column, never a copy of the value.
     lets: HashMap<String, IRExpr>,
     /// How many inline reads' hidden names were renamed apart so far.
     inlined: usize,
-    /// Each `let` whose value can fail, with how many facts of each kind
-    /// the elements before it stated: the steps place those first, then the
-    /// value's evaluation, then the rest.
+    /// Each `let`, with how many facts of each kind the elements before it
+    /// stated: the steps place those first, then the value's column, then
+    /// the rest.
     checks: Vec<LetCheck>,
 }
 
@@ -711,11 +719,13 @@ struct Marks {
     correlates: usize,
 }
 
-/// A `let` whose value can fail, which splits a scope's facts at the point
-/// it was written: the elements before it are placed, then its value is
-/// evaluated on every row they produce, then the rest.
+/// A `let`, which splits a scope's facts at the point it was written: the
+/// elements before it are placed, then its value is computed once as a
+/// column of every row they produce, then the rest, which read the column.
 #[derive(Debug, Clone)]
 struct LetCheck {
+    /// The binding the shaper made up whose [`LET_VALUE`] column holds the
+    /// value.
     name: String,
     value: IRExpr,
     marks: Marks,
@@ -975,43 +985,43 @@ impl Facts {
         }
     }
 
-    /// Every expression the facts hold, a block's included, with each
-    /// `let` name read as its value.
-    fn substitute(&mut self, lets: &HashMap<String, IRExpr>) {
+    /// Every expression the facts hold, a block's included, with each name
+    /// `lets` maps read as the column it maps to.
+    fn resolve(&mut self, lets: &HashMap<String, IRExpr>) {
         if lets.is_empty() {
             return;
         }
         self.checks
             .iter_mut()
-            .for_each(|c| substitute(&mut c.value, lets));
+            .for_each(|c| resolve(&mut c.value, lets));
         for conjunct in &mut self.conjuncts {
             match conjunct {
                 ConjunctFact::Filter { pred, values, .. } => {
-                    substitute(pred, lets);
+                    resolve(pred, lets);
                     for correlate in values {
-                        correlate.inner.substitute(lets);
-                        correlate.read.exprs_mut().for_each(|e| substitute(e, lets));
+                        correlate.inner.resolve(lets);
+                        correlate.read.exprs_mut().for_each(|e| resolve(e, lets));
                     }
                 }
                 ConjunctFact::Block { block, .. } => {
-                    block.inner.substitute(lets);
+                    block.inner.resolve(lets);
                     if let Some(arg) = block.left.arg_mut() {
-                        substitute(arg, lets);
+                        resolve(arg, lets);
                     }
-                    substitute(&mut block.right, lets);
+                    resolve(&mut block.right, lets);
                 }
             }
         }
         for optional in &mut self.optionals {
-            optional.inner.substitute(lets);
+            optional.inner.resolve(lets);
         }
         // A union's arms read the scope's `let`s and value columns in place.
         for union in &mut self.unions {
-            union.arms.iter_mut().for_each(|arm| arm.substitute(lets));
+            union.arms.iter_mut().for_each(|arm| arm.resolve(lets));
         }
         for correlate in &mut self.correlates {
-            correlate.inner.substitute(lets);
-            correlate.read.exprs_mut().for_each(|e| substitute(e, lets));
+            correlate.inner.resolve(lets);
+            correlate.read.exprs_mut().for_each(|e| resolve(e, lets));
         }
     }
 }
@@ -1127,6 +1137,7 @@ impl<'a> Shaper<'a> {
             minted: Default::default(),
             visited: Default::default(),
             probing: Default::default(),
+            lets_minted: Default::default(),
         }
     }
 
@@ -1335,23 +1346,23 @@ impl<'a> Shaper<'a> {
         }
         let mut lets = std::mem::take(&mut facts.lets);
         lets.extend(std::mem::take(&mut after_facts.lets));
-        facts.substitute(&lets);
+        facts.resolve(&lets);
         // The elements and `where` after a ranking read its `let`s, and its
         // blocks' values, in place too.
-        after_facts.substitute(&lets);
+        after_facts.resolve(&lets);
         for e in items.values_mut() {
-            substitute(e, &lets);
+            resolve(e, &lets);
         }
         for agg in aggs.values_mut() {
             if let Some(arg) = &mut agg.arg {
-                substitute(arg, &lets);
+                resolve(arg, &lets);
             }
         }
         let order_keys: Vec<(IRExpr, bool)> = order_keys
             .iter()
             .map(|(key, descending)| {
                 let mut key = key.clone();
-                substitute(&mut key, &lets);
+                resolve(&mut key, &lets);
                 (key, *descending)
             })
             .collect();
@@ -1578,7 +1589,7 @@ impl<'a> Shaper<'a> {
                     ty: ranking.score.1.clone(),
                 },
             );
-            after_facts.substitute(&score);
+            after_facts.resolve(&score);
             let physical = physical_names(&pipeline);
             self.place(
                 &after_facts,
@@ -1743,7 +1754,7 @@ impl<'a> Shaper<'a> {
                         ty: r.score.1.clone(),
                     },
                 );
-                substitute(&mut arg, &score);
+                resolve(&mut arg, &score);
             }
             _ => {}
         }
@@ -1959,7 +1970,7 @@ impl<'a> Shaper<'a> {
         }
         *inlined = facts.inlined;
         let lets = std::mem::take(&mut facts.lets);
-        facts.substitute(&lets);
+        facts.resolve(&lets);
         // A `nearest` window searches its binding's scan where the
         // population binds the ranked node as a binding of its own. A
         // population drawn as a read of its own (one holding an `optional`
@@ -2234,30 +2245,22 @@ impl<'a> Shaper<'a> {
                 Ok(())
             }
             Term::Filter { input, pred, fails } => self.filter(input, pred, *fails, facts),
-            // `let $v = e`: a value column, read wherever its name is. The
-            // core evaluates it for every row before `where` (A3), which a
-            // value that cannot fail makes the same rows as reading it in
-            // place; a value that can fail is also evaluated where it was
-            // written, on every row the elements before it produce, and the
-            // type checker placed no `where` conjunct below it.
+            // `let $v = e`: a value column, computed once where it was
+            // written, on every row the elements before it produce (A3),
+            // and read wherever its name is. A value that can fail keeps its
+            // place: the type checker placed no `where` conjunct below it.
             Term::Project {
                 input,
                 items,
                 keep: true,
-                fails,
+                ..
             } => {
                 self.facts(input, facts)?;
                 for (name, value) in items {
                     let mut value = value.clone();
-                    substitute(&mut value, &facts.lets);
-                    if *fails {
-                        facts.checks.push(LetCheck {
-                            name: name.clone(),
-                            value: value.clone(),
-                            marks: facts.marks(),
-                        });
-                    }
-                    facts.lets.insert(name.clone(), value);
+                    resolve(&mut value, &facts.lets);
+                    let column = self.let_column(facts, name, value);
+                    facts.lets.insert(name.clone(), column);
                 }
                 Ok(())
             }
@@ -2338,23 +2341,26 @@ impl<'a> Shaper<'a> {
         facts.inlined = inner.inlined;
         // The optional's own elements and `where` read its `let`s in place.
         let inner_lets = std::mem::take(&mut inner.lets);
-        inner.substitute(&inner_lets);
+        inner.resolve(&inner_lets);
         let introduced: Vec<String> = inner
             .names()
             .into_iter()
             .filter(|name| !outer_columns.contains(name) && !self.is_anon(name))
             .collect();
         // A `let` inside an `optional` is a column of its matches, null on an
-        // outer row with none. Read after it, its value is taken where a node
-        // the optional binds is present and null elsewhere, which a value read
-        // in place would not be (`coalesce`, a constant, an outer name). A
+        // outer row with none: its column is computed in the optional's own
+        // steps, and the optional pads it null where nothing matches. A
         // block's value read in the optional's own `where` is a column of its
         // matches nothing outside it reads.
-        let mut exported: Vec<(&String, &IRExpr)> = inner_lets
+        let mut exported: Vec<(String, IRExpr)> = inner_lets
             .iter()
             .filter(|(name, _)| !self.is_block_column(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
-        exported.sort_by(|a, b| a.0.cmp(b.0));
+        exported.sort_by(|a, b| a.0.cmp(&b.0));
+        // The marker of a match: a node the optional binds, present on the
+        // rows of its matches and null on an outer row with none.
+        let mut matched = None;
         if !exported.is_empty() {
             let mut nodes: Vec<(&String, &String)> = introduced
                 .iter()
@@ -2364,7 +2370,7 @@ impl<'a> Shaper<'a> {
             let Some((marker, type_name)) = nodes.first() else {
                 return Err(self.refuse_at("a `let` inside an `optional` that binds no node", at()));
             };
-            let matched = IRExpr::IsNull {
+            matched = Some(IRExpr::IsNull {
                 expr: Box::new(IRExpr::Variable(
                     marker.to_string(),
                     ExprType::Node {
@@ -2373,40 +2379,61 @@ impl<'a> Shaper<'a> {
                 )),
                 negated: true,
                 ty: scalar(ScalarType::Bool),
-            };
-            for (name, value) in exported {
-                let ty = match value.ty().clone() {
-                    ExprType::Value { scalar, list, .. } => ExprType::Value {
-                        scalar,
-                        list,
-                        nullable: true,
-                    },
-                    other => {
-                        return Err(ShapeError::Internal(format!(
-                            "`let ${name}` inside an optional holds a {}, not a value",
-                            other.spelling()
-                        )));
-                    }
-                };
-                let mut read = IRExpr::Call {
-                    func: crate::ir::expr::ScalarFunc::If,
-                    args: vec![
-                        matched.clone(),
-                        value.clone(),
-                        IRExpr::Literal(Literal::Null, ty.clone()),
-                    ],
-                    ty,
-                };
-                substitute(&mut read, &facts.lets);
-                facts.lets.insert(name.clone(), read);
-            }
+            });
         }
+        let columns: HashSet<String> = inner.checks.iter().map(|c| c.name.clone()).collect();
         facts.optional_names.extend(introduced);
         // Its `Correlate`'s flag is set by the element that wrote it.
         facts.optionals.push(OptionalFact {
             inner,
             fails: false,
         });
+        for (name, value) in exported {
+            let ty = match value.ty().clone() {
+                ExprType::Value { scalar, list, .. } => ExprType::Value {
+                    scalar,
+                    list,
+                    nullable: true,
+                },
+                other => {
+                    return Err(ShapeError::Internal(format!(
+                        "`let ${name}` inside an optional holds a {}, not a value",
+                        other.spelling()
+                    )));
+                }
+            };
+            let read = match value {
+                // A column the optional's own steps compute, which the
+                // optional pads null where nothing matches.
+                IRExpr::PropAccess {
+                    variable, property, ..
+                } if columns.contains(&variable) => IRExpr::PropAccess {
+                    variable,
+                    property,
+                    ty,
+                },
+                // A value read in place (an outer column, a parameter, a
+                // constant) is taken where the optional matched and null
+                // elsewhere: one column after the optional.
+                value => {
+                    let Some(matched) = &matched else {
+                        unreachable!("an exported `let` sets the marker")
+                    };
+                    let mut read = IRExpr::Call {
+                        func: crate::ir::expr::ScalarFunc::If,
+                        args: vec![
+                            matched.clone(),
+                            value,
+                            IRExpr::Literal(Literal::Null, ty.clone()),
+                        ],
+                        ty,
+                    };
+                    resolve(&mut read, &facts.lets);
+                    self.let_column(facts, &name, read)
+                }
+            };
+            facts.lets.insert(name, read);
+        }
         Ok(())
     }
 
@@ -2466,12 +2493,12 @@ impl<'a> Shaper<'a> {
             };
             self.facts(input, &mut inner)?;
             let inner_lets = std::mem::take(&mut inner.lets);
-            inner.substitute(&inner_lets);
+            inner.resolve(&inner_lets);
             let mut renames: HashMap<String, String> = HashMap::new();
             let mut exposed = HashSet::new();
             for (column, expr) in items.iter() {
                 let mut expr = expr.clone();
-                substitute(&mut expr, &inner_lets);
+                resolve(&mut expr, &inner_lets);
                 let IRExpr::Variable(variable, ExprType::Node { type_name }) = &expr else {
                     return Err(ShapeError::Internal(
                         "a union arm's column is not a node after the value arms were drawn"
@@ -2729,12 +2756,12 @@ impl<'a> Shaper<'a> {
         let mut inner = Facts::default();
         self.facts(input, &mut inner)?;
         let inner_lets = std::mem::take(&mut inner.lets);
-        inner.substitute(&inner_lets);
+        inner.resolve(&inner_lets);
         let items: Vec<(String, IRExpr)> = items
             .iter()
             .map(|(column, expr)| {
                 let mut expr = expr.clone();
-                substitute(&mut expr, &inner_lets);
+                resolve(&mut expr, &inner_lets);
                 (column.clone(), expr)
             })
             .collect();
@@ -2789,9 +2816,45 @@ impl<'a> Shaper<'a> {
         for (column, mut value) in values {
             rename_expr(&mut value, &rename);
             bind_params(&mut value, bindings);
+            // A value that is not already a column is computed once, as a
+            // `let` of the enclosing scope, so a read of it never copies it.
+            let value = self.let_column(facts, &column, value);
             facts.lets.insert(column, value);
         }
         Ok(())
+    }
+
+    /// `value` as the column of a `let` named `name` written at the facts'
+    /// current point: a binding made up for it, whose [`LET_VALUE`] column
+    /// the steps compute there; the read of that column is returned. A value
+    /// that is already one leaf (a column, a reference, a parameter, a
+    /// literal) is its own column: reading it is as cheap as reading a copy
+    /// and it cannot fail.
+    fn let_column(&self, facts: &mut Facts, name: &str, value: IRExpr) -> IRExpr {
+        if matches!(
+            value,
+            IRExpr::PropAccess { .. }
+                | IRExpr::Variable(..)
+                | IRExpr::Param(..)
+                | IRExpr::Literal(..)
+                | IRExpr::AliasRef(..)
+        ) {
+            return value;
+        }
+        let n = self.lets_minted.get();
+        self.lets_minted.set(n + 1);
+        let binding = self.shaped(format_args!("l{n}_{name}"));
+        let ty = value.ty().clone();
+        facts.checks.push(LetCheck {
+            name: binding.clone(),
+            value,
+            marks: facts.marks(),
+        });
+        IRExpr::PropAccess {
+            variable: binding,
+            property: LET_VALUE.to_string(),
+            ty,
+        }
     }
 
     /// Whether the scope of `input` states an `optional` or a `union` of its
@@ -2936,9 +2999,9 @@ impl<'a> Shaper<'a> {
         };
         self.facts(term, &mut inner)?;
         let inner_lets = std::mem::take(&mut inner.lets);
-        inner.substitute(&inner_lets);
+        inner.resolve(&inner_lets);
         let read_lets = |mut e: IRExpr| {
-            substitute(&mut e, &inner_lets);
+            resolve(&mut e, &inner_lets);
             e
         };
         let extended: Vec<(String, IRExpr)> = extended
@@ -2951,7 +3014,7 @@ impl<'a> Shaper<'a> {
             .collect();
         for (_, agg) in &mut aggs {
             if let Some(arg) = &mut agg.arg {
-                substitute(arg, &inner_lets);
+                resolve(arg, &inner_lets);
             }
         }
         // What each hidden column is over the read's rows: an item over the
@@ -3010,7 +3073,7 @@ impl<'a> Shaper<'a> {
         }
         for (hidden, e) in &extended {
             let mut e = e.clone();
-            substitute(&mut e, &rows);
+            resolve(&mut e, &rows);
             rows.insert(hidden.clone(), e);
         }
         // The returned columns: a reference binds its column's name.
@@ -3018,7 +3081,7 @@ impl<'a> Shaper<'a> {
         let mut columns = Vec::with_capacity(items.len());
         for (column, item) in items {
             let mut expr = item.clone();
-            substitute(&mut expr, &rows);
+            resolve(&mut expr, &rows);
             if let IRExpr::Variable(variable, _) = &expr
                 && is_reference(&expr)
             {
@@ -3078,7 +3141,7 @@ impl<'a> Shaper<'a> {
             .into_iter()
             .flat_map(|(key, descending)| {
                 let mut key = read_lets(key);
-                substitute(&mut key, &rows);
+                resolve(&mut key, &rows);
                 let keys = match &key {
                     IRExpr::Variable(variable, ty) => reference_identity(variable, ty, id),
                     _ => None,
@@ -3297,10 +3360,10 @@ impl<'a> Shaper<'a> {
         let mut inner_facts = Facts::default();
         self.facts(inner, &mut inner_facts)?;
         let inner_lets = std::mem::take(&mut inner_facts.lets);
-        inner_facts.substitute(&inner_lets);
+        inner_facts.resolve(&inner_lets);
         let mut agg = agg.clone();
         if let Some(arg) = &mut agg.arg {
-            substitute(arg, &inner_lets);
+            resolve(arg, &inner_lets);
         }
         if agg.arg.as_ref().is_some_and(holds_lexical_call) {
             return Err(self.refuse_at(
@@ -3548,9 +3611,10 @@ impl<'a> Shaper<'a> {
     }
 
     /// The pattern's steps: the facts placed as the module documentation
-    /// describes. A `let` whose value can fail splits them: the facts the
-    /// elements before it stated are placed first, then its evaluation, then
-    /// the rest, so it runs on exactly the rows those elements produce.
+    /// describes. A `let` splits them: the facts the elements before it
+    /// stated are placed first, then its column, then the rest, so it is
+    /// computed once on exactly the rows those elements produce and the
+    /// elements after it read it.
     fn place(
         &self,
         facts: &Facts,
@@ -4544,8 +4608,10 @@ fn bind_params(expr: &mut IRExpr, bindings: &[(String, IRExpr)]) {
     }
 }
 
-/// `expr` with every value column a `let` names read as the `let`'s value.
-fn substitute(expr: &mut IRExpr, lets: &HashMap<String, IRExpr>) {
+/// `expr` with every name `lets` maps read as the column it maps to: a
+/// `let`'s column, a ranking's score, a read's value column. Each is a read
+/// of one column, so resolving a name never copies a computed value.
+fn resolve(expr: &mut IRExpr, lets: &HashMap<String, IRExpr>) {
     if lets.is_empty() {
         return;
     }
@@ -4555,17 +4621,17 @@ fn substitute(expr: &mut IRExpr, lets: &HashMap<String, IRExpr>) {
                 *expr = value.clone();
             }
         }
-        IRExpr::Nearest { query, .. } => substitute(query, lets),
+        IRExpr::Nearest { query, .. } => resolve(query, lets),
         IRExpr::Aggregate { arg, .. }
         | IRExpr::Not(arg, _)
         | IRExpr::IsNull { expr: arg, .. }
         | IRExpr::Neg { expr: arg, .. }
-        | IRExpr::Cast { expr: arg, .. } => substitute(arg, lets),
+        | IRExpr::Cast { expr: arg, .. } => resolve(arg, lets),
         IRExpr::Binary { left, right, .. } => {
-            substitute(left, lets);
-            substitute(right, lets);
+            resolve(left, lets);
+            resolve(right, lets);
         }
-        IRExpr::Call { args, .. } => args.iter_mut().for_each(|a| substitute(a, lets)),
+        IRExpr::Call { args, .. } => args.iter_mut().for_each(|a| resolve(a, lets)),
         IRExpr::Literal(_, _) | IRExpr::Param(_, _) | IRExpr::PropAccess { .. } => {}
     }
 }

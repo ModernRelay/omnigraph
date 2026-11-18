@@ -588,6 +588,9 @@ pub(super) fn validate_plan_values(
                         optional_names.insert(dst.as_str());
                         optional_names.extend(edge_binding.as_deref());
                     }
+                    PhysicalNode::Let { name, .. } => {
+                        optional_names.insert(name.as_str());
+                    }
                     _ => {}
                 }
                 work.extend(node.inputs());
@@ -654,6 +657,16 @@ pub(super) fn validate_plan_values(
                     owners
                         .scores
                         .insert((binding.as_str(), column), (data_type, false));
+                }
+                // A `let`'s value is the `value` column of the binding the
+                // shaper made up for it.
+                PhysicalNode::Let { name, value, .. } => {
+                    if let Some(data_type) = value.ty().to_arrow() {
+                        owners.scores.insert(
+                            (name.as_str(), omnigraph_compiler::shape::read::LET_VALUE),
+                            (data_type, value.ty().nullable()),
+                        );
+                    }
                 }
                 PhysicalNode::Fuse { target, .. } => {
                     owners.scores.insert(

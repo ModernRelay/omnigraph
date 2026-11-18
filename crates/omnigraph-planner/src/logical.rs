@@ -717,10 +717,11 @@ pub enum LogicalNode {
         query: IRExpr,
         reads: Vec<ColumnRef>,
     },
-    /// `let $name = value` whose value can fail: `value` evaluated on every
-    /// input row, a failure refusing the read, the rows passing through
-    /// unchanged; `reads` the columns the value reads. No filter written
-    /// after the `let` moves below it (A3).
+    /// `let $v = value`: `value` computed once on every input row as the
+    /// `value` column of the binding `name` the shaper made up, which every
+    /// read of `$v` reads; `reads` the columns the value reads. A value that
+    /// can fail refuses the read there, and no filter written after it moves
+    /// below it (A3).
     Let {
         input: LogicalId,
         name: String,
@@ -906,9 +907,10 @@ impl LogicalNode {
                 fails: *fails,
                 ..Declared::passing(input.iter().copied())
             },
-            // The plan holds a `let` only for a value that can fail.
-            Self::Let { input, .. } => Declared {
-                fails: true,
+            // A `let` fails where its value can; nothing that reads its
+            // column passes it, which `carries` states.
+            Self::Let { input, value, .. } => Declared {
+                fails: value.can_fail(),
                 ..Declared::passing([*input])
             },
             // A sort only orders its rows; with a fetch it keeps the first
