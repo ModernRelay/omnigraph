@@ -820,8 +820,12 @@ impl Snapshot {
                     .await
             }
             None => {
-                open_dataset_entry_at_recorded_manifest(entry, &self.root_uri, self.session.store_registry())
-                    .await
+                open_dataset_entry_at_recorded_manifest(
+                    entry,
+                    &self.root_uri,
+                    self.session.store_registry(),
+                )
+                .await
             }
         }
     }
