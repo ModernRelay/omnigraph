@@ -368,7 +368,8 @@ stages the rewrite detached with fragment ids above the base's high-water
 mark, so it needs no `ReserveFragments`; a lagging scalar or vector index is
 rebuilt whole as a detached commit chained on the rewrite under its name
 (Lance 13 folds only through a linear commit), keeping a vector index's
-partition count; the batch publishes once with an exact CAS on every planned
+partition count (an index whose segments cover no fragment holds no rows and
+is rebuilt with one partition, as a new declared index is); the batch publishes once with an exact CAS on every planned
 pin, and a pin a concurrent writer moved fails the run with a read-set
 conflict so the next run re-plans. A failure before publication leaves
 unpublished staging the collector reclaims once it is dead.

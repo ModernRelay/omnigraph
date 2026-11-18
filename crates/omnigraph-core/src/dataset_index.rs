@@ -474,15 +474,22 @@ pub async fn has_fts_index_on(ds: &Dataset, column: &str) -> Result<bool> {
     }))
 }
 
+/// Whether index segment `index` covers no fragment: its fragment bitmap is
+/// present and empty, so it holds no rows. Lance uses the same test, for
+/// every index kind, when it reports a segment's statistics as an empty
+/// object. A segment without a bitmap has unknown coverage, not none.
+pub fn covers_no_fragment(index: &IndexMetadata) -> bool {
+    index
+        .fragment_bitmap
+        .as_ref()
+        .is_some_and(|bitmap| bitmap.is_empty())
+}
+
 /// Whether `index` is an untrained full-text segment: an empty fragment
 /// bitmap and no postings. It only declares a declared column's analyzer,
 /// which Lance applies to every row no segment covers, and indexes no row.
 pub fn is_untrained_full_text(index: &IndexMetadata) -> bool {
-    is_full_text_index(index)
-        && index
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(|bitmap| bitmap.is_empty())
+    is_full_text_index(index) && covers_no_fragment(index)
 }
 
 /// Whether a full-text segment on `column` holds postings: it covers a
