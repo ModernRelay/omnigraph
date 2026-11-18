@@ -16,9 +16,9 @@
 //! A conjunct is found in the plan by its skeleton: its operators and the
 //! columns it reads, its constant parts (literals, parameters, constant
 //! subterms the engine folded) erased. A conjunct whose skeleton another
-//! conjunct of its scope shares, or that the shaper rewrote (a `let` read in
-//! place, an inline read's names renamed apart), is not found and not
-//! checked.
+//! conjunct of its scope shares, one that reads no column, or one the shaper
+//! rewrote (a `let` read in place, an inline read's names renamed apart), is
+//! not found and not checked.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -60,30 +60,53 @@ pub(super) fn check(
         }
         false
     };
-    for scope in &scopes {
+    // Each written conjunct as the plan tests it, its top-level `and`
+    // operands apart, each with its conjunct's written position and fact. A
+    // part is found only by a skeleton no other part of the read shares,
+    // in any scope; one that reads no column (a constant) shares the empty
+    // skeleton of every constant and is not found.
+    let parts: Vec<Vec<(usize, IRExpr, bool, String)>> = scopes
+        .iter()
+        .map(|scope| {
+            scope
+                .conjuncts
+                .iter()
+                .enumerate()
+                .flat_map(|(at, (pred, fails))| {
+                    pred.clone().into_conjuncts().into_iter().map(move |part| {
+                        let shape = skeleton(&part);
+                        (at, part, *fails, shape)
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for (_, _, _, shape) in parts.iter().flatten() {
+        *counts.entry(shape.as_str()).or_default() += 1;
+    }
+    let unique = |shape: &str| shape != "_" && counts.get(shape) == Some(&1);
+    let found = |shape: &str| -> Vec<(NodeId, usize)> {
+        tested
+            .iter()
+            .filter(|(_, _, s)| s == shape)
+            .map(|(node, at, _)| (*node, *at))
+            .collect()
+    };
+    for (scope, parts) in scopes.iter().zip(&parts) {
         let Some(k) = scope.conjuncts.iter().position(|(_, fails)| *fails) else {
             continue;
         };
-        let skeletons: Vec<String> = scope.conjuncts.iter().map(|(c, _)| skeleton(c)).collect();
-        let unique = |i: usize| skeletons.iter().filter(|s| **s == skeletons[i]).count() == 1;
-        let found = |i: usize| -> Vec<(NodeId, usize)> {
-            tested
-                .iter()
-                .filter(|(_, _, s)| *s == skeletons[i])
-                .map(|(node, at, _)| (*node, *at))
-                .collect()
-        };
-        for i in k..scope.conjuncts.len() {
-            if !unique(i) {
+        for (written_at, part, _, shape) in parts.iter().filter(|p| p.0 >= k) {
+            if !unique(shape) {
                 continue;
             }
-            let written = scope.conjuncts[i].0.to_string();
-            for (node, at) in found(i) {
+            for (node, at) in found(shape) {
                 if let Some(PhysicalNode::Scan { spec, .. }) = plan.node(node) {
                     return Err(ValidationError::violated(
                         CHECK,
                         format!(
-                            "`{written}` is written at or after the scope's first conjunct that can fail, and the plan tests it in the scan of `${}`",
+                            "`{part}` is written at or after the scope's first conjunct that can fail, and the plan tests it in the scan of `${}`",
                             spec.binding.as_deref().unwrap_or("?")
                         ),
                     ));
@@ -93,22 +116,21 @@ pub(super) fn check(
                         return Err(ValidationError::violated(
                             CHECK,
                             format!(
-                                "`{written}` is written at or after the scope's first conjunct that can fail, and the plan tests it below the element that binds `${binding}`"
+                                "`{part}` is written at or after the scope's first conjunct that can fail, and the plan tests it below the element that binds `${binding}`"
                             ),
                         ));
                     }
                 }
-                for j in i + 1..scope.conjuncts.len() {
-                    if !unique(j) {
+                for (_, later, _, later_shape) in parts.iter().filter(|p| p.0 > *written_at) {
+                    if !unique(later_shape) {
                         continue;
                     }
-                    for (later, later_at) in found(j) {
-                        if below(later, node) || (later == node && later_at < at) {
+                    for (later_node, later_at) in found(later_shape) {
+                        if below(later_node, node) || (later_node == node && later_at < at) {
                             return Err(ValidationError::violated(
                                 CHECK,
                                 format!(
-                                    "`{}` is written after `{written}`, which can fail or follows one that can, and the plan tests it first",
-                                    scope.conjuncts[j].0
+                                    "`{later}` is written after `{part}`, which can fail or follows one that can, and the plan tests it first"
                                 ),
                             ));
                         }

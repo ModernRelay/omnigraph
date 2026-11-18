@@ -212,7 +212,8 @@ fn reads(conjunct: &IRExpr) -> BTreeSet<String> {
 /// where the law places it, into a scan or above the node it stops at; the
 /// conjuncts that stay keep their written order. A conjunct holding a
 /// lexical call stays where it is written, which the law allows: the exact
-/// lexical scan runs over the rows that reach it.
+/// lexical scan runs over the rows that reach it; so does one that reads no
+/// column.
 pub(crate) fn place_conjuncts(
     plan: &mut LogicalPlan,
     source: &dyn PlanSource,
@@ -236,11 +237,15 @@ pub(crate) fn place_conjuncts(
         };
         let mut stays = Vec::with_capacity(conjuncts.len());
         for conjunct in conjuncts {
-            if has_lexical_call(&conjunct) {
+            // A conjunct holding a lexical call, or reading no column (a
+            // constant, the same on every row), stays where it is written,
+            // which the law allows.
+            let read = reads(&conjunct);
+            if has_lexical_call(&conjunct) || read.is_empty() {
                 stays.push(conjunct);
                 continue;
             }
-            let target = match place(&*plan, input, &reads(&conjunct)) {
+            let target = match place(&*plan, input, &read) {
                 Placement::Absorbed(scan) if !source.filter_pushable(&conjunct) => {
                     if scan == input {
                         Placement::Stays
