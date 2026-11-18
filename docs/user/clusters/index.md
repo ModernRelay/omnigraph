@@ -317,12 +317,10 @@ operation resumes removal of the exact root. Editing the desired configuration
 does not cancel accepted deletion, and absence during recovery does not create a
 replacement graph.
 
-The ordinary create operation refuses populated graph roots. To register a
-verified history in a freshly bootstrapped cluster, see [full-history
-restore](../operations/restore-history.md). Recreating a missing managed graph, accepting schema
-drift and repairing catalog payloads are not apply modes. Restore missing or
-damaged authoritative data from a verified backup before deploying changes to
-that graph.
+Ordinary creation refuses a populated root. To register a verified history in
+a fresh cluster, see [full-history restore](../operations/restore-history.md).
+For a missing graph, schema drift or damaged catalog data, restore authoritative
+data from a verified backup before deploying changes.
 
 Every present affected root is checked against its achieved schema identity,
 even when source text changes. Removing an already-absent graph still records a

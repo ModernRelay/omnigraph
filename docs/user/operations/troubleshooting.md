@@ -253,16 +253,9 @@ refuses to open it and names the required release line. Follow the qualified
 explicit routes in [Upgrading](upgrade.md) to preserve graph identity and history;
 normal open does not migrate or reset the graph.
 
-Do not edit internal metadata or copy files from individual backing datasets
-between graph roots. Copy a whole root instead; see
-[copying a graph root](../concepts/storage.md#copying-a-graph-root).
-
-## Copied graph roots
-
-| Error | Cause | Action |
-|---|---|---|
-| `storage: Not found` naming an object under the root you opened | The copy of the root is incomplete | The error suggests a refresh, but a retry does not bring the object back: copy the whole root again from a verified backup while no process writes it |
-| `graph dataset … names base …, which …; Omnigraph reads only objects under the opened root, so the dataset is refused` | The graph's storage names a location outside its root, which Omnigraph never writes | Restore the root from a verified backup; do not write to its datasets with other tools |
+If a copied root reports a missing object or refers to an outside dataset,
+restore the whole root from a verified backup. Individual dataset files and
+internal metadata must stay together. See [copying a graph root](../concepts/storage.md#copying-a-graph-root).
 
 ## Cluster failures
 

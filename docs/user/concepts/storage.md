@@ -49,8 +49,8 @@ collected by `cleanup` once nothing else depends on it.
 
 ## Copying a graph root
 
-A whole copy of a graph root is a backup. You can restore it at its own
-location, or open it at a new location on the same kind of storage: another
+A verified, complete copy of a quiescent graph can be restored at its own
+location or opened at a new location on the same kind of storage: another
 local directory, another S3 prefix or bucket, or another Azure prefix or
 container. The copy serves every branch, tag and retained snapshot, and it
 reads and writes only objects under the root you opened.
@@ -66,8 +66,9 @@ reads and writes only objects under the root you opened.
 - For a new cluster, follow [Restore a graph with its history](../operations/restore-history.md)
   to register an independently verified copy in the first deployment.
 - External Blob URIs still point where they pointed before the copy.
-- Omnigraph 0.14.0 and earlier read some branch files at the location the
-  branch was created at. Open a copy at a new location with a later release.
+- Older builds can still read branch files from their original location.
+  Before relying on a relocated backup, verify it with the intended binary
+  while access to the original root is disabled.
 
 ## Local filesystem requirement
 

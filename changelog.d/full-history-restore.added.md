@@ -1,2 +1,1 @@
-Add storage-owner preparation and explicit first-deployment restore of a
-verified graph history, preserving branch heads, commit IDs and schema identity.
+- Restore a verified graph into a fresh cluster with its original branch heads, commit IDs and schema identity.
