@@ -105,6 +105,10 @@ integer, `F64` for an integer or `F32` with a float. An integer literal,
 `-3` included, takes the other operand's integer type when it fits
 (`$p.age - -3` over an `I32` is `I32`, overflowing at `I32` with `E1`);
 `U64` with a signed integer and `-` over an unsigned value are `T72`.
+An integer literal reads the whole range from `-9223372036854775808` to
+`18446744073709551615`: one above the `I64` range is a `U64`, written as a
+parameter's value is (`where $a.size = 18446744073709551615`, `insert Account
+{ size: 18446744073709551615, balance: -5 }`); outside it is `Q005`.
 `from { match … return { … } }` joins an inline read's rows; its own
 aggregate, `distinct`, `order` and `limit` run per outer row when it reads
 an outer name (once otherwise), so an outer `where` or `limit` never widens

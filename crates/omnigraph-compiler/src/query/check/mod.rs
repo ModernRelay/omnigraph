@@ -5285,7 +5285,20 @@ impl Ctx<'_> {
                 untyped_list_as(value, &Ty::Value(pt.clone()))?.to_ir(),
             ));
         }
-        if let Expr::Literal(l) = value {
+        // A negative number is a literal of the property's type, checked
+        // against its range as any literal is: `balance: -5`.
+        let negated = match value {
+            Expr::Neg(inner) => match inner.as_ref() {
+                Expr::Literal(Literal::Integer(n)) => Some(Literal::Integer(-*n)),
+                Expr::Literal(Literal::Float(f)) => Some(Literal::Float(-*f)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(l) = negated.as_ref().or(match value {
+            Expr::Literal(l) => Some(l),
+            _ => None,
+        }) {
             let lt = literal_type(l)?;
             check_literal_type(l, &lt, pt, prop)?;
             let mut want = pt.clone();
@@ -5807,6 +5820,18 @@ impl Ctx<'_> {
                     value
                 }
                 Expr::Neg(inner) => {
+                    // `-9223372036854775808`: the literal is above the `I64`
+                    // range and its negation is the smallest `I64`, which no
+                    // negation of an `I64` reaches, so it is that literal.
+                    if let Expr::Literal(Literal::Integer(n)) = inner.as_ref()
+                        && i64::try_from(*n).is_err()
+                        && i64::try_from(-*n).is_ok()
+                    {
+                        return Ok(SExpr::new(
+                            SKind::Lit(Literal::Integer(-*n)),
+                            Ty::scalar(ScalarType::I64, false),
+                        ));
+                    }
                     let v = self.expr(sc, inner, sub)?;
                     let ty = numeric(&v, "unary `-`")?;
                     if matches!(&ty, Ty::Value(t) if matches!(t.scalar, ScalarType::U32 | ScalarType::U64))

@@ -2738,3 +2738,35 @@ fn a_sql_union_between_reads_prints_the_relation_function() {
     );
     assert_eq!(d.position.map(|p| p.column), Some(53));
 }
+
+#[test]
+fn an_integer_literal_reads_the_whole_integer_range_issue_1279() {
+    use crate::query::value::Literal;
+    let value = |text: &str| match &where_expr(&format!("$a.n = {text}")) {
+        Expr::Compare { right, .. } => right.as_ref().clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        value("18446744073709551615"),
+        Expr::Literal(Literal::Integer(i128::from(u64::MAX)))
+    );
+    assert!(matches!(
+        &value("-9223372036854775808"),
+        Expr::Neg(inner) if **inner == Expr::Literal(Literal::Integer(1_i128 << 63))
+    ));
+    for (text, needle) in [
+        ("18446744073709551616", "above the largest U64"),
+        ("-9223372036854775809", "below the smallest I64"),
+    ] {
+        let src = format!("query q() {{ match {{ $a: A }} where $a.n = {text} return {{ $a }} }}");
+        let refused = refusal_of(&src);
+        assert_eq!(refused.code.as_str(), "Q005", "{refused:?}");
+        assert!(refused.message.contains(needle), "{refused:?}");
+        let at = src.find(text.trim_start_matches('-')).unwrap();
+        assert_eq!(
+            refused.position.map(|p| p.byte as usize),
+            Some(at),
+            "{refused:?}"
+        );
+    }
+}

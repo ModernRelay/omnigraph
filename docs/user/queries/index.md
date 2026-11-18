@@ -75,7 +75,7 @@ integer property a float literal is `F64` even when whole: an `I64` holding
 `9007199254740993` equals the literal `9007199254740992.0`. Parameters use their declared type. An `F32` property
 storing `0.1` differs from the literal `0.1`; `0.5` compares exactly. These
 rules hold for list membership and a write's filters, in a scan or in memory.
-Mixed signed and `U64` values keep integer precision. A literal outside its
+Mixed signed and `U64` values keep integer precision. An integer literal reads from `-9223372036854775808` to `18446744073709551615`, a `U64` above the `I64` range included, and a negative number assigned to a property is a literal of its type. A literal outside its
 property's type is `T3` ([checked literals](diagnostics.md#checked-literals)).
 
 | `x` | `y` | `x and y` | `x or y` |

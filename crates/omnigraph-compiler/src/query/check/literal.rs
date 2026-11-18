@@ -18,7 +18,18 @@ pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
             // Null is compatible with any nullable type; default to String for inference.
             Literal::Null => Ok(PropType::scalar(ScalarType::String, true)),
             Literal::String(_) => Ok(PropType::scalar(ScalarType::String, false)),
-            Literal::Integer(_) => Ok(PropType::scalar(ScalarType::I64, false)),
+            // An integer literal is `I64`, or `U64` above the `I64` range;
+            // its context narrows it further where the value fits.
+            Literal::Integer(n) if i64::try_from(*n).is_ok() => {
+                Ok(PropType::scalar(ScalarType::I64, false))
+            }
+            Literal::Integer(n) if u64::try_from(*n).is_ok() => {
+                Ok(PropType::scalar(ScalarType::U64, false))
+            }
+            Literal::Integer(_) => Err(CompilerError::typed(
+                T3,
+                "integer literal is outside the I64 and U64 ranges".to_string(),
+            )),
             Literal::Float(value) if value.is_infinite() => Err(CompilerError::typed(
                 T3,
                 "float literal is outside the F64 range".to_string(),
@@ -57,6 +68,17 @@ pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
                     scalar = Some(match scalar {
                         None => item_type.scalar,
                         Some(previous) if previous == item_type.scalar => previous,
+                        // `I64` and `U64` elements meet in `U64` where every
+                        // element is non-negative; a negative element beside
+                        // one above the `I64` range has no integer type.
+                        Some(ScalarType::I64 | ScalarType::U64)
+                            if matches!(item_type.scalar, ScalarType::I64 | ScalarType::U64)
+                                && items
+                                    .iter()
+                                    .all(|i| !matches!(i, Literal::Integer(n) if *n < 0)) =>
+                        {
+                            ScalarType::U64
+                        }
                         Some(ScalarType::I64 | ScalarType::F64)
                             if matches!(item_type.scalar, ScalarType::I64 | ScalarType::F64) =>
                         {

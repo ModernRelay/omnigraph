@@ -3830,7 +3830,24 @@ fn expr(pair: Pair<Rule>) -> R<Expr> {
                 let mut parts = pair.into_inner();
                 let first = parts.next().unwrap();
                 if first.as_rule() == Rule::unary_minus {
-                    Ok(Expr::Neg(Box::new(expr(parts.next().unwrap())?)))
+                    let operand = parts.next().unwrap();
+                    let negated = expr(operand.clone())?;
+                    // A negated integer literal below the `I64` range has no
+                    // integer type to take.
+                    if let Expr::Literal(Literal::Integer(n)) = &negated
+                        && -*n < i128::from(i64::MIN)
+                    {
+                        return Err(diagnostic_at(
+                            Q005,
+                            format!(
+                                "invalid integer: `-{}` is below the smallest I64",
+                                operand.as_str().trim()
+                            ),
+                            &operand,
+                        )
+                        .into());
+                    }
+                    Ok(Expr::Neg(Box::new(negated)))
                 } else {
                     expr(first)
                 }
@@ -4551,10 +4568,25 @@ fn literal_of(inner: Pair<Rule>) -> R<Literal> {
         Rule::string_lit => {
             Literal::String(parse_string_lit(&inner).map_err(|e| parse_err(e, &inner))?)
         }
+        // An integer literal is read into the exact carrier, the whole
+        // range of the integer types: a `U64` above the `I64` range is
+        // written as a parameter's value is, and its context types it.
         Rule::integer => {
-            Literal::Integer(i128::from(inner.as_str().parse::<i64>().map_err(|e| {
+            let value = inner.as_str().parse::<i128>().map_err(|e| {
                 Refusal::from(diagnostic_at(Q005, format!("invalid integer: {e}"), &inner))
-            })?))
+            })?;
+            if value > i128::from(u64::MAX) {
+                return Err(diagnostic_at(
+                    Q005,
+                    format!(
+                        "invalid integer: `{}` is above the largest U64",
+                        inner.as_str()
+                    ),
+                    &inner,
+                )
+                .into());
+            }
+            Literal::Integer(value)
         }
         Rule::exp_float_rec => {
             let text = inner.as_str();
