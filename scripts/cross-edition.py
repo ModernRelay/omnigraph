@@ -88,6 +88,7 @@ BULLETS = {
 # row names one of these.
 COSTS = {
     "cost.exact-lexical-scan": "RFC section 4: the exact lexical scan answers every `match_terms` and `bm25`, and no query reads a full-text index, so a lexical read reads its text column's data files.",
+    "cost.keyed-write-keeps-omitted": "Compatibility, Results: a keyed `insert` or `merge` load that omits a property keeps its stored value, so a keyed insert naming fewer than all of its type's properties reads the stored rows its keys replace.",
     "cost.accepted-refusal": "Compatibility, Language: a text edition 2 refused is accepted, so the step runs a read where edition 2 refused before reading.",
 }
 
@@ -99,6 +100,7 @@ COSTS = {
 OPEN = {
     "open:concurrent-index-searches-reread-a-page": "Lance 13 reads an index page or posting list that concurrent searches of one filter (an `or`, an `in` list, an NGRAM's trigrams) all find uncached once per search, since `search_missing_pages` reads it outside the cache's loader; edition 2 read no such index for this text.",
     "open:index-probe-where-edition-2-scanned": "The read probes a scalar index the edition-2 plan for this text did not read (a String key or `@index` BTREE edition 2 could not use, or one an earlier step no longer warms); on the simulation's one-fragment tables its requests exceed the data read edition 2's scan shared.",
+    "open:empty-list-without-context": "An empty list literal takes its element type from its context, as `null` does, and nothing fixes it in a bare `return` item, so it is refused (`T7`) where edition 2 typed it `[String]`; section 5 states the rule for `null`, and no Compatibility bullet names the refusal.",
     "open:block-binding-scans-its-type": "The respelled block binds its inner node (`$k: Person`), which lowers to a dependent scan of that type reading its data file again, where edition 2's text bound no node there.",
 }
 
