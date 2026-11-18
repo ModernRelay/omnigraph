@@ -89,6 +89,12 @@ table's `outcome` is `optimized`, `unchanged`, `deferred` or
 `input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
 and `artifact` outcomes, which never fail a published run.
 
+A served run also applies the server's
+[table ceilings and byte budget](recorded-operations.md#table-ceilings-and-the-byte-budget).
+A table over a ceiling is `deferred` with reason `resource_limit` on every run
+until a ceiling is raised or a direct run optimizes it, and does not set
+`resume_at`.
+
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
 scanning every edge dataset. It is derived: every load is verified and falls
