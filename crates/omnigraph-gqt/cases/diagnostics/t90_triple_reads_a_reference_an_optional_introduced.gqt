@@ -1,0 +1,51 @@
+# issue: none
+# notes: The names an `optional` introduces enter the enclosing scope nullable: null on the rows where it
+# notes: matched nothing. A triple outside the `optional` reading one, at either end, yields no row for a
+# notes: null end, so it would silently turn the outer join into an inner one: `T90`. Its fix moves the
+# notes: triple inside the `optional`, with a binding for each name it introduces; where the moved triple
+# notes: reads a name bound after the `optional`, or the reference was drawn by a `from`, the fix is text
+# notes: alone, and dropping the `optional` is the other fix where only its matches were meant. A block, a
+# notes: later `optional` and an inline read correlate on the reference and stay legal. Nothing executes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+    age: I32?
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+
+--- query
+query friends_employers() { match { $p: Person, optional { $f: Person, $p knows $f }, $f worksAt $c } return { $p.name, $c.name } }
+
+--- expect error: type error: T90: `$f worksAt $c` reads `$f` outside the `optional` that introduces it
+
+--- query
+query admirers_of_staff() { match { $c: Company, optional { $p: Person, $p worksAt $c }, $q knows $p } return { $c.name, $q.name } }
+
+--- expect error: type error: T90: `$q knows $p` reads `$p` outside the `optional` that introduces it
+
+--- query
+query colleagues_of_friends() { match { $p: Person, optional { $f: Person, $p knows $f }, $q: Person, $f knows $q } return { $p.name, $q.name } }
+
+--- expect error: type error: T90: `$f knows $q` reads `$f` outside the `optional` that introduces it
+
+--- query
+query friends_employers_drawn() { match { $p: Person, from { match { $f: Person, $p knows $f, optional { $g: Person, $f knows $g } } return { $g.handle as h, $g } }, $g worksAt $c } return { $p.name, $c.name } }
+
+--- expect error: type error: T90: `$g worksAt $c` reads `$g` outside the `optional` that introduces it

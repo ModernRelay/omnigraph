@@ -724,6 +724,10 @@ struct Facts {
     /// not read: the steps place an `optional` after the scope's bindings
     /// and traversals.
     optional_names: HashSet<String>,
+    /// The outer references this scope reads that are null on some rows:
+    /// those an enclosing scope's `optional` introduced, as the scope's
+    /// `Env` leaf types them.
+    nullable_outer: HashSet<String>,
     /// The type of every node variable the scope binds.
     types: HashMap<String, String>,
     /// Names an enclosing step binds that these facts read without
@@ -811,6 +815,7 @@ impl Facts {
                 })
                 .collect(),
             optional_names: self.optional_names.clone(),
+            nullable_outer: self.nullable_outer.clone(),
             types: self.types.clone(),
             outer_names: self.outer_names.clone(),
             lets: HashMap::new(),
@@ -831,12 +836,14 @@ impl Facts {
             unions,
             correlates,
             optional_names,
+            nullable_outer,
             types,
             outer_names: _,
             lets: _,
             inlined: _,
             checks,
         } = other;
+        self.nullable_outer.extend(nullable_outer);
         if !optionals.is_empty() || !unions.is_empty() || !optional_names.is_empty() {
             return Err(ShapeError::Internal(
                 "an inline read holding an `optional` or a `union` was joined into its outer scope"
@@ -2253,7 +2260,15 @@ impl<'a> Shaper<'a> {
             self.spend(WorkKind::Shaping, 1)?;
             self.spend(WorkKind::ExprNodes, term.expr_nodes())?;
             match term {
-                Term::Unit | Term::Env(_) => Ok(()),
+                Term::Unit => Ok(()),
+                Term::Env(cols) => {
+                    facts.nullable_outer.extend(
+                        cols.iter()
+                            .filter(|c| matches!(c.ty, Ty::Node { nullable: true, .. }))
+                            .map(|c| c.name.clone()),
+                    );
+                    Ok(())
+                }
                 Term::Scan {
                     var,
                     ty: Ty::Node { type_name, .. },
@@ -3577,8 +3592,9 @@ impl<'a> Shaper<'a> {
     /// The scope's traversals as expansions from the names already bound,
     /// each introducing its other end with that binding's filters; a
     /// traversal with neither end bound scans its source.
-    /// `optional_names` are the names an `optional` introduced, null on a
-    /// row it kept without a match.
+    /// `optional_names` are the references null on a row an `optional` kept
+    /// without a match: those an `optional` of the scope introduced, and
+    /// those of an enclosing scope's that the scope reads.
     fn expand_traversals(
         &self,
         traversals: &[&TraversalFact],
@@ -3980,13 +3996,15 @@ impl<'a> Shaper<'a> {
                     || correlate_names.contains(t.src.as_str())
                     || correlate_names.contains(t.dst.as_str())
             });
-        self.expand_traversals(
-            &before_optional,
-            pipeline,
-            bound_vars,
-            fresh,
-            &facts.optional_names,
-        )?;
+        // A triple closing on a reference null on some rows, one an
+        // `optional` of this scope or of an enclosing one introduced, reads
+        // its identity as nullable.
+        let nullable: HashSet<String> = facts
+            .optional_names
+            .union(&facts.nullable_outer)
+            .cloned()
+            .collect();
+        self.expand_traversals(&before_optional, pipeline, bound_vars, fresh, &nullable)?;
         let mut correlates = facts.correlates.iter().peekable();
         for (index, optional) in facts.optionals.iter().enumerate() {
             while let Some(correlate) =
@@ -4036,13 +4054,7 @@ impl<'a> Shaper<'a> {
         for correlate in now {
             self.place_correlate(correlate, pipeline, bound_vars, outer_physical_names, fresh)?;
         }
-        self.expand_traversals(
-            &after_optional,
-            pipeline,
-            bound_vars,
-            fresh,
-            &facts.optional_names,
-        )?;
+        self.expand_traversals(&after_optional, pipeline, bound_vars, fresh, &nullable)?;
         for correlate in deferred {
             self.place_correlate(correlate, pipeline, bound_vars, outer_physical_names, fresh)?;
         }

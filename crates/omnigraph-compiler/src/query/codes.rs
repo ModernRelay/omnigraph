@@ -115,6 +115,10 @@ codes! {
     // The GQ 3 RFC, section 2, Recursion: a declared plan budget above the
     // server's ceiling is refused, never clamped (invariant 11).
     T89 = "a declared `@budget(plan = n)` is above the ceiling `plan_budget_limit` sets";
+    // The GQ 3 RFC, section 3, Scope and correlation: the names an
+    // `optional` introduces enter the enclosing scope nullable, and a triple
+    // reading one outside it drops the rows where it is null.
+    T90 = "a triple outside an `optional` reads a reference that `optional` introduced, which turns its outer join into an inner one; the fix moves the triple inside the `optional`";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
     // the binding it ranks, and `rrf` arms that rank two bindings are T75.

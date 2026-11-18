@@ -257,7 +257,9 @@ error[T84]: type error: T84: `$q` is named in a triple of this block but bound n
 ```
 
 The machine-applicable suggestion inserts `$q: Person, ` before the triple and
-binds every other name the scope's triples introduce in the same edit. The
+binds every other name the scope's triples introduce in the same edit. A
+triple outside an `optional` that reads a name the `optional` introduced is
+`T90`; its suggestion moves the triple inside, binding the names it adds. The
 fixes of `T68`, a binding of a name the enclosing scope holds, are described
 there too.
 

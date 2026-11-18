@@ -2850,3 +2850,73 @@ fn an_insert_targets_the_edge_type_sharing_a_node_types_name_by_its_endpoints_is
         })
     );
 }
+
+/// The names an `optional` introduces enter the enclosing scope nullable
+/// (the GQ 3 RFC, section 3): a triple outside the `optional` reading one,
+/// at either end, is `T90`, since a null end yields no row and would turn
+/// the outer join into an inner one; its fix moves the triple inside the
+/// `optional`, with a binding for each name it introduces and every later
+/// triple reading one of those. A later `optional` from the name, a block
+/// over it, a `where` on its properties and a return of it stay legal.
+#[test]
+fn t90_refuses_a_triple_outside_the_optional_that_introduced_its_end() {
+    use crate::query::diagnostic::Applicability;
+    use crate::query::syntax::parse::apply_edits;
+    for (written, intended) in [
+        (
+            "query q() { match { $p: Person, optional { $f: Person, $p knows $f }, $f worksAt $c } return { $p.name, $c.name } }",
+            "query q() { match { $p: Person, optional { $f: Person, $p knows $f, $c: Company, $f worksAt $c } } return { $p.name, $c.name } }",
+        ),
+        // The destination end too, a chain of triples, and a `where`.
+        (
+            "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c }, $f: Person, $f worksAt $c, $f knows $g } where $p.age > 3 return { $p.name, $g.name } }",
+            "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c }, $f: Person, $f worksAt $c, $f knows $g } where $p.age > 3 return { $p.name, $g.name } }",
+        ),
+        (
+            "query q() { match { $p: Person, optional { $f: Person, $p knows $f }, $f knows $g, $g worksAt $c } return { $p.name, $c.name } }",
+            "query q() { match { $p: Person, optional { $f: Person, $p knows $f, $g: Person, $f knows $g, $c: Company, $g worksAt $c } } return { $p.name, $c.name } }",
+        ),
+        // Inside an `optional`, a nested one's names are as nullable.
+        (
+            "query q() { match { $p: Person, optional { $f: Person, $p knows $f, optional { $g: Person, $f knows $g }, $g worksAt $c } } return { $p.name } }",
+            "query q() { match { $p: Person, optional { $f: Person, $p knows $f, optional { $g: Person, $f knows $g, $c: Company, $g worksAt $c } } } return { $p.name } }",
+        ),
+    ] {
+        let d = refused_with(written, "T90");
+        assert!(d.position.is_some(), "{written}");
+        let Some(suggestion) = d.suggestion.as_deref() else {
+            // A moved triple reading a name bound after the `optional` has
+            // no edit: the fix is the text alone.
+            assert_eq!(written, intended);
+            assert!(
+                d.fix
+                    .as_deref()
+                    .is_some_and(|f| f.contains("drop the `optional`")),
+                "{d}"
+            );
+            continue;
+        };
+        assert_eq!(suggestion.applicability, Applicability::MachineApplicable);
+        let repaired = apply_edits(written, &suggestion.edits);
+        assert_eq!(repaired, intended);
+        ok(&repaired);
+    }
+    // A reference null on some rows that a `from` drew has no `optional` of
+    // this pattern to move into: the fix is the text alone.
+    let d = refused_with(
+        "query q() { match { $p: Person, from { match { $f: Person, $p knows $f, optional { $g: Person, $f knows $g } } return { $g } }, $g worksAt $c } return { $p.name, $c.name } }",
+        "T90",
+    );
+    assert!(d.suggestion.is_none(), "{d}");
+    // Each legal reading of the nullable name, an inline read correlating on
+    // it included: it is evaluated once per outer row, as a block is.
+    for legal in [
+        "query q() { match { $p: Person, optional { $f: Person, $p knows $f }, from { match { $g: Person, $f knows $g } return { count($g) as n } } } return { $p.name, $n } }",
+        "query q() { match { $p: Person, optional { $f: Person, $p knows $f }, optional { $c: Company, $f worksAt $c } } return { $p.name, $c.name } }",
+        "query q() { match { $p: Person, optional { $f: Person, $p knows $f } } where exists { $c: Company, $f worksAt $c } return { $p.name } }",
+        "query q() { match { $p: Person, optional { $f: Person, $p knows $f } } where not exists { $c: Company, $f worksAt $c } and $f.age > 3 return { $p.name, count { $g: Person, $f knows $g } as n } }",
+        "query q() { match { $p: Person, optional { $f: Person, $p knows $f } } return { $p.name, $f.name } }",
+    ] {
+        ok(legal);
+    }
+}

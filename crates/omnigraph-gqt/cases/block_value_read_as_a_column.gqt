@@ -222,7 +222,8 @@ f.handle: String?
 query employees_friends_friend_counts() {
     match {
         $c: Company,
-        optional { $p: Person, $p worksAt $c },
+        $p: Person,
+        $p worksAt $c,
         $p knows $q,
         let $n = count { $r: Person, $q knows $r },
     }

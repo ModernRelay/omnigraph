@@ -75,7 +75,8 @@ of the elements before it, with its matches or once with the names it
 introduces null; an inner scope like a block, so it binds a name new to it,
 `optional { $c: Company, $p worksAt $c }` (`T84`), and reads an outer one
 unbound (`T68`); those names, and its `let`s, are nullable after it, null on
-a row with no match, and returning one of its nodes whole is `T86`), `let`
+a row with no match, a triple outside it reading one is `T90`, whose fix
+moves the triple inside, and returning one of its nodes whole is `T86`), `let`
 and `from`, separated by
 commas (a trailing comma is allowed; a newline is not
 a separator). `where`, after the braces, holds one Boolean expression that sees
@@ -644,6 +645,7 @@ byte edits. Rewrite from the fix and this map:
 | `not { P }` | `not exists { P }` in `where`; `not { φ }` holding only filters is `not coalesce(φ, false)` | `Q012` |
 | `not exists { $p: Person where φ }` (re-mentions an outer binding) | `not (φ)`, or `not coalesce(φ, false)` when φ can be null | `T68` |
 | a block's or `optional`'s triple naming a new variable | bind it inside: `count { $c: Company, $p worksAt $c }` | `T84` |
+| `optional { $f: Person, $p knows $f }, $f worksAt $c` | `optional { $f: Person, $p knows $f, $c: Company, $f worksAt $c }`, or no `optional` for the inner join | `T90` |
 | `$c worksAt $p` against `WorksAt: Person -> Company` | `$p worksAt $c` | `T82` |
 | `$x.t contains "g"`, list `$x.tags contains "r"`, `$x.t starts_with "O"` | `contains($x.t, "g")`, `"r" in $x.tags`, `starts_with($x.t, "O")` | `T7` |
 | `search(f, q)`, `match_text(f, q)`, `fuzzy(f, q[, n])` | `match_terms(f, terms(q, mode: any))`, fuzzy with `max_edits: 2` (or `n`) | `T6` |

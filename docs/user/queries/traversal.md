@@ -220,9 +220,12 @@ query employers() {
 }
 ```
 
-A traversal written after the optional may start from a name it introduces;
-a row where that name is null has no match there. Returning a node the
-optional introduces whole, `return { $c }`, is not lowered
+A triple written after the optional that reads a name it introduces, at
+either end, is `T90`: it would drop every row where the name is null and turn
+the outer join into an inner one. The fix moves the triple inside the
+optional; drop the optional instead where only its matches were meant. A
+later optional, a block, an inline read and a `where` read the name and keep
+the row. Returning a node the optional introduces whole, `return { $c }`, is not lowered
 (`T86`). It prints no fix: returning the node's properties instead runs, but
 with other result columns.
 

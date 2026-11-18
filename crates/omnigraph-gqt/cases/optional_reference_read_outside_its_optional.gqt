@@ -1,0 +1,117 @@
+# issue: none
+# notes: A name an `optional` introduces is null where it matched nothing. Outside the `optional`, a triple
+# notes: from it is `T90`, but every reading that keeps the outer row stays legal: a later `optional` from
+# notes: it, which pads; an `exists`, a `not exists` or a count block over it, which reads a null start as
+# notes: no match (one whose triple closes on it included); a `where` on its properties; and a return of
+# notes: its properties.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32?
+}
+node Company {
+    slug: String @key
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ada","age":36}}
+{"type":"Person","data":{"handle":"bob","age":25}}
+{"type":"Person","data":{"handle":"cy","age":41}}
+{"type":"Person","data":{"handle":"di"}}
+{"type":"Company","data":{"slug":"acme"}}
+{"edge":"Knows","from":"ada","to":"bob","data":{}}
+{"edge":"Knows","from":"bob","to":"cy","data":{}}
+{"edge":"Knows","from":"cy","to":"ada","data":{}}
+{"edge":"Knows","from":"ada","to":"cy","data":{}}
+{"edge":"WorksAt","from":"bob","to":"acme","data":{}}
+
+--- query
+query friends_employers() {
+    match { $p: Person, optional { $f: Person, $p knows $f }, optional { $c: Company, $f worksAt $c } }
+    return { $p.handle, $f.handle, $c.slug }
+}
+
+--- expect unordered
+{"c.slug":"acme","f.handle":"bob","p.handle":"ada"}
+{"f.handle":"ada","p.handle":"cy"}
+{"f.handle":"cy","p.handle":"ada"}
+{"f.handle":"cy","p.handle":"bob"}
+{"p.handle":"di"}
+
+--- expect shape
+p.handle: String
+f.handle: String?
+c.slug: String?
+
+--- query
+query friends_who_work() {
+    match { $p: Person, optional { $f: Person, $p knows $f } }
+    where exists { $c: Company, $f worksAt $c }
+    return { $p.handle, $f.handle }
+}
+
+--- expect unordered
+{"f.handle":"bob","p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+f.handle: String?
+
+--- query
+query idle_or_no_friend() {
+    match { $p: Person, optional { $f: Person, $p knows $f } }
+    where not exists { $c: Company, $f worksAt $c } and ($f is null or $f.age > 30)
+    return { $p.handle, $f.handle, $f.age }
+}
+
+--- expect unordered
+{"f.age":36,"f.handle":"ada","p.handle":"cy"}
+{"f.age":41,"f.handle":"cy","p.handle":"ada"}
+{"f.age":41,"f.handle":"cy","p.handle":"bob"}
+{"p.handle":"di"}
+
+--- expect shape
+p.handle: String
+f.handle: String?
+f.age: I32?
+
+--- query
+query friends_friend_counts() {
+    match { $p: Person, optional { $f: Person, $p knows $f } }
+    return { $p.handle, $f.handle, count { $g: Person, $f knows $g } as n }
+}
+
+--- expect unordered
+{"f.handle":"ada","n":2,"p.handle":"cy"}
+{"f.handle":"bob","n":1,"p.handle":"ada"}
+{"f.handle":"cy","n":1,"p.handle":"ada"}
+{"f.handle":"cy","n":1,"p.handle":"bob"}
+{"n":0,"p.handle":"di"}
+
+--- expect shape
+p.handle: String
+f.handle: String?
+n: I64
+
+--- query
+query friends_known_by_a_third() {
+    match { $p: Person, optional { $f: Person, $p knows $f } }
+    where exists { $q: Person, $q knows $f, $q knows $p }
+    return { $p.handle, $f.handle }
+}
+
+--- expect unordered
+{"f.handle":"cy","p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+f.handle: String?

@@ -231,7 +231,14 @@ the plan is the one the unbound triple planned. An `optional { }` is an inner
 scope too (the scope's `block` and `optional` flags), so the same rule and
 fixes hold inside it, and its new names enter the enclosing scope nullable; an
 `optional` whose only element is a re-mention keeps every row and introduces
-no name, so its `T68` carries no edit. A declaration's own `match` keeps a
+no name, so its `T68` carries no edit. A triple of that enclosing scope that
+reads one of those nullable names is `T90` (`optional_triple`), since its
+`Expand` yields no row for a null end; one suggestion per `optional` moves
+every such triple into it, with the triples that read what it introduces and a
+binding for each new name, and offers no edit when a moved triple reads a name
+bound after the `optional`. An inner scope reads such a name by correlating;
+the shaper types a triple closing on it, inside a later `optional` or a
+block, as nullable by the type the scope's `Env` leaf carries. A declaration's own `match` keeps a
 triple's ends introduced by the triple.
 
 A triple's written order is its direction (`check/mod.rs`, `reversed_triple`).

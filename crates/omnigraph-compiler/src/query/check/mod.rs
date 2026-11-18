@@ -2942,6 +2942,7 @@ impl Ctx<'_> {
         }
         lookahead(&pattern.elements, sc);
         let mut parts = components::Parts::default();
+        let mut moves = OptionalMoves::default();
         // Each triple of an inner scope and the ends it introduced.
         let mut introduced: Vec<(usize, Vec<String>)> = Vec::new();
         for (i, c) in pattern.elements.iter().enumerate() {
@@ -2979,7 +2980,15 @@ impl Ctx<'_> {
             let (steps, binders) = (sc.steps.len(), sc.binders);
             sc.reads.clear();
             let entered = self.enter(element_word(c), pattern.spans.elements.get(i));
-            let typed = self.element(sc, c);
+            let typed = match c {
+                Element::Traversal(t) => {
+                    match optional_triple(self.catalog, sc, pattern, i, t, &mut moves) {
+                        Some(d) => Err(E::D(d)),
+                        None => self.element(sc, c),
+                    }
+                }
+                _ => self.element(sc, c),
+            };
             self.work.leave(entered);
             if self.guard(sc.recover, typed)?.is_none() {
                 sc.block_buf.clear();
@@ -8660,6 +8669,246 @@ fn reversed_triple(
         }
     }
     Some(d)
+}
+
+/// Whether `end` is a reference an `optional` introduced into this scope,
+/// nullable outside it: a nullable node column of the scope's own. An inner
+/// scope reads an enclosing scope's reference by correlating on it: a later
+/// `optional` pads, and a block or an inline read is evaluated once per
+/// outer row, so none of them is a triple of the scope the name entered.
+fn optional_reference(sc: &Scope, end: &str) -> bool {
+    end != "_"
+        && sc
+            .local(end)
+            .is_some_and(|c| matches!(c.ty, Ty::Node { nullable: true, .. }))
+}
+
+/// What a pattern's `T90` refusals have already moved: one suggestion per
+/// `optional` moves every triple bound for it, so two refusals never insert
+/// at one place.
+#[derive(Default)]
+struct OptionalMoves {
+    /// The `optional` elements a suggestion already fills.
+    targets: HashSet<usize>,
+    /// The triples a suggestion already moves.
+    elements: HashSet<usize>,
+}
+
+/// `T90` for a triple, outside an `optional`, that reads a reference the
+/// `optional` introduced (the GQ 3 RFC, section 3): the reference is null on
+/// the rows where the `optional` matched nothing, and a triple yields no row
+/// for a null end, so the outer join would silently become an inner one.
+/// The fix moves the triple inside the `optional`, with a binding for each
+/// name it introduces, and with it every later triple that reads one of those
+/// names; where only the rows the `optional` matches were meant, the other
+/// fix drops the `optional`.
+fn optional_triple(
+    catalog: &Catalog,
+    sc: &Scope,
+    pattern: &Pattern,
+    i: usize,
+    t: &Traversal,
+    moves: &mut OptionalMoves,
+) -> Option<QueryDiagnostic> {
+    use crate::query::syntax::print;
+    let mut ends: Vec<&String> = Vec::new();
+    for end in [&t.src, &t.dst] {
+        if optional_reference(sc, end) && !ends.contains(&end) {
+            ends.push(end);
+        }
+    }
+    if ends.is_empty() {
+        return None;
+    }
+    let written = print::element(&pattern.elements[i]);
+    let named = ends
+        .iter()
+        .map(|e| format!("`${e}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let (pronoun, verb) = if ends.len() == 1 {
+        ("it", "is")
+    } else {
+        ("them", "are")
+    };
+    let mut d = QueryDiagnostic::typecheck(
+        T90,
+        format!(
+            "`{written}` reads {named} outside the `optional` that introduces {pronoun}, where {named} {verb} null on the rows the `optional` matched nothing for: a triple yields no row for a null end, so it would silently turn that outer join into an inner one"
+        ),
+    )
+    .with_fix(format!(
+        "move `{written}` inside the `optional`, or drop the `optional` if only the rows it matches were meant"
+    ));
+    let spans = &pattern.spans.elements;
+    if let Some(span) = spans.get(i) {
+        d.position = Some(span.position);
+        d.end = Some(span.end_position);
+    }
+    if moves.elements.contains(&i) {
+        return Some(d);
+    }
+    if let Some(edits) = optional_move(catalog, sc, pattern, i, moves) {
+        d = d.with_suggestion(Suggestion {
+            applicability: Applicability::MachineApplicable,
+            edits,
+        });
+    }
+    Some(d)
+}
+
+/// The edits that move the triple at `i`, and the later triples reading the
+/// names it introduces, inside the `optional` of this pattern that
+/// introduced its references; none when that `optional` is not an element
+/// of this pattern (a nullable reference a `from` drew), when the moved
+/// triples read names bound after that `optional`, or when a later binding,
+/// `let` or `from` would read what they introduce.
+fn optional_move(
+    catalog: &Catalog,
+    sc: &Scope,
+    pattern: &Pattern,
+    i: usize,
+    moves: &mut OptionalMoves,
+) -> Option<Vec<TextEdit>> {
+    use crate::query::syntax::print;
+    let spans = &pattern.spans.elements;
+    if spans.len() != pattern.elements.len() {
+        return None;
+    }
+    // The `optional` element before `i` that introduced `name`: the last one
+    // whose pattern names it.
+    let introduced_by = |name: &str| {
+        (0..i).rev().find(|&j| match &pattern.elements[j] {
+            Element::Optional(p) => {
+                let mut vars = Vec::new();
+                pattern_vars(p, &mut vars);
+                vars.iter().any(|v| v == name)
+            }
+            _ => false,
+        })
+    };
+    let mut known: HashMap<String, BoundVariable> = HashMap::new();
+    for c in sc.visible() {
+        match c.ty {
+            Ty::Node { type_name, .. } => {
+                known.insert(c.name, BoundVariable::Node { type_name });
+            }
+            Ty::Edge { .. } => {
+                known.insert(c.name, BoundVariable::Edge);
+            }
+            Ty::Value(_) => {}
+        }
+    }
+    // The names the moved triples introduce, each with the `optional` it
+    // moves into.
+    let mut introduced: HashMap<String, usize> = HashMap::new();
+    let mut moved: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+    let mut target: Option<usize> = None;
+    for k in i..pattern.elements.len() {
+        match &pattern.elements[k] {
+            Element::Traversal(u) => {
+                let mut into: Vec<usize> = Vec::new();
+                for end in [&u.src, &u.dst] {
+                    if let Some(j) = introduced.get(end) {
+                        into.push(*j);
+                    } else if k == i && optional_reference(sc, end) {
+                        into.push(introduced_by(end)?);
+                    }
+                }
+                let Some(&j) = into.iter().max() else {
+                    continue;
+                };
+                if into.iter().any(|x| *x != j) || target.is_some_and(|t| t != j) {
+                    return None;
+                }
+                target = Some(j);
+                let resolved = resolve_traversal(catalog, u, &known, &sc.declared).ok()?;
+                let mut bindings = Vec::new();
+                for (end, ty) in [(&u.src, &resolved.src_type), (&u.dst, &resolved.dst_type)] {
+                    if end == "_" || known.contains_key(end) {
+                        continue;
+                    }
+                    if sc.declared.contains_key(end) {
+                        return None;
+                    }
+                    known.insert(
+                        end.clone(),
+                        BoundVariable::Node {
+                            type_name: ty.clone(),
+                        },
+                    );
+                    introduced.insert(end.clone(), j);
+                    bindings.push((end.clone(), ty.clone()));
+                }
+                if let Some(k_name) = &u.edge_binding {
+                    introduced.insert(k_name.clone(), j);
+                }
+                moved.push((k, bindings));
+            }
+            Element::Optional(_) => {}
+            Element::Binding { variable, .. } => {
+                if introduced.contains_key(variable) {
+                    return None;
+                }
+            }
+            Element::Let { .. } | Element::From { .. } => {
+                if !introduced.is_empty() {
+                    return None;
+                }
+            }
+        }
+    }
+    let j = target?;
+    if moves.targets.contains(&j) {
+        return None;
+    }
+    // A moved triple reads, inside the `optional`, only names bound before
+    // it: one bound between the `optional` and the triple would be new there.
+    let mut after: Vec<String> = Vec::new();
+    for c in &pattern.elements[j + 1..i] {
+        after.extend(element_binds(c));
+    }
+    for (k, _) in &moved {
+        if let Element::Traversal(u) = &pattern.elements[*k]
+            && [&u.src, &u.dst]
+                .into_iter()
+                .any(|end| after.contains(end) && !introduced.contains_key(end))
+        {
+            return None;
+        }
+    }
+    let Element::Optional(inner) = &pattern.elements[j] else {
+        return None;
+    };
+    if inner.spans.elements.len() != inner.elements.len() {
+        return None;
+    }
+    let at = inner.spans.elements.last()?.end;
+    let mut text = String::new();
+    let mut edits = Vec::new();
+    for (k, bindings) in &moved {
+        for (name, ty) in bindings {
+            text.push_str(&format!(", ${name}: {ty}"));
+        }
+        text.push_str(", ");
+        text.push_str(&print::element(&pattern.elements[*k]));
+        edits.push(TextEdit {
+            start: spans[k - 1].end,
+            end: spans[*k].end,
+            replacement: String::new(),
+        });
+    }
+    edits.insert(
+        0,
+        TextEdit {
+            start: at,
+            end: at,
+            replacement: text,
+        },
+    );
+    moves.targets.insert(j);
+    moves.elements.extend(moved.iter().map(|(k, _)| *k));
+    Some(edits)
 }
 
 /// `T84` for the names an inner scope's triples introduced that no binding

@@ -754,7 +754,7 @@ impl ReadGen<'_, '_, '_> {
     /// A block read as a value, its own `where` a conjunct that can fail
     /// or not.
     fn block_conjunct(&mut self, scope: &[Var]) -> Option<String> {
-        let (t, new) = self.traversal(scope, false, true)?;
+        let (t, new) = self.traversal(scope, false, true, true)?;
         let mut inner = scope.to_vec();
         inner.extend(new);
         let w = if self.c.flag(60) {
@@ -822,7 +822,7 @@ impl ReadGen<'_, '_, '_> {
             });
         }
         if self.options.nesting && self.c.flag(30) {
-            if let Some((t, new)) = self.traversal(scope, false, true) {
+            if let Some((t, new)) = self.traversal(scope, false, true, true) {
                 let node = new.iter().find_map(|v| match v.kind {
                     VarKind::Node(t) => Some((v.name.clone(), t)),
                     _ => None,
@@ -860,7 +860,7 @@ impl ReadGen<'_, '_, '_> {
             }
         }
         if self.options.nesting && self.c.flag(25) {
-            if let Some((t, new)) = self.traversal(scope, false, true) {
+            if let Some((t, new)) = self.traversal(scope, false, true, true) {
                 let mut inner = scope.clone();
                 inner.extend(new.clone());
                 let w = self.failing_conjunct(&inner);
@@ -1079,7 +1079,7 @@ impl ReadGen<'_, '_, '_> {
                 self.union_from(scope, elements, depth)
             }
             _ => {
-                if let Some((text, new)) = self.traversal(scope, choice == 5, false) {
+                if let Some((text, new)) = self.traversal(scope, choice == 5, false, false) {
                     elements.push(text);
                     scope.extend(new);
                 }
@@ -1089,13 +1089,21 @@ impl ReadGen<'_, '_, '_> {
 
     /// A triple from a node in scope to a fresh node, optionally binding
     /// the edge; with `close`, between two nodes in scope when one fits.
+    /// With `keeps_rows` false, the triple is an element of the scope an
+    /// `optional` introduced its nodes into: it reads none of them, which is
+    /// `T90`, since its null would drop the row. A block, a later `optional`
+    /// and an inline read correlate on one.
     fn traversal(
         &mut self,
         scope: &[Var],
         close: bool,
         nested: bool,
+        keeps_rows: bool,
     ) -> Option<(String, Vec<Var>)> {
-        let nodes = Self::node_vars(scope);
+        let mut nodes = Self::node_vars(scope);
+        if !keeps_rows {
+            nodes.retain(|(n, _)| !self.nullable_nodes.contains(n));
+        }
         if nodes.is_empty() {
             return None;
         }
@@ -1184,7 +1192,7 @@ impl ReadGen<'_, '_, '_> {
     }
 
     fn optional(&mut self, scope: &mut Vec<Var>, elements: &mut Vec<String>, depth: u32) {
-        let Some((t, new)) = self.traversal(scope, false, true) else {
+        let Some((t, new)) = self.traversal(scope, false, true, true) else {
             return;
         };
         let mut inner = scope.clone();
@@ -1203,7 +1211,7 @@ impl ReadGen<'_, '_, '_> {
     /// `from union({ … return { $x as u } }, { … return { $y as u } })`,
     /// correlated on a node in scope, binding `$u`.
     fn union_from(&mut self, scope: &mut Vec<Var>, elements: &mut Vec<String>, depth: u32) {
-        let Some((t1, new1)) = self.traversal(scope, false, true) else {
+        let Some((t1, new1)) = self.traversal(scope, false, true, true) else {
             return;
         };
         let Some(VarKind::Node(ty)) = new1.first().map(|v| v.kind.clone()) else {
@@ -1246,7 +1254,7 @@ impl ReadGen<'_, '_, '_> {
         if depth == 0 {
             return None;
         }
-        let (t, new) = self.traversal(scope, false, true)?;
+        let (t, new) = self.traversal(scope, false, true, true)?;
         let mut inner = scope.to_vec();
         inner.extend(new.clone());
         let w = if self.c.flag(40) {

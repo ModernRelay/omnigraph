@@ -4,7 +4,8 @@
 # notes: on it and nullable in the result (`Correlate(R, Union(p,
 # notes: Project(Filter(Env, ¬ exists p), nulls)))`). A `where` after it filters the
 # notes: joined rows, a filter inside it decides only the matches, and a
-# notes: traversal written after it starts from a name it introduces. A write
+# notes: traversal from a name it introduces belongs inside it: written after
+# notes: it, the traversal would drop the rows it pads (`T90`). A write
 # notes: group's selection runs it too. A `let` inside it is a column of its
 # notes: matches: null on a row with none, whatever its value reads.
 # notes: An inline read or a called read holding an `optional` keeps it.
@@ -87,15 +88,21 @@ c.slug: String?
 --- query
 query friend_employers() { match { $p: Person, optional { $f: Person, $p knows $f }, $f worksAt $c } return { $p.handle, $f.handle, $c.slug } }
 
+--- expect error: type error: T90: `$f worksAt $c` reads `$f` outside the `optional` that introduces it
+
+--- query
+query friend_employers() { match { $p: Person, optional { $f: Person, $p knows $f, $c: Company, $f worksAt $c } } return { $p.handle, $f.handle, $c.slug } }
+
 --- expect unordered
-{"c.slug":"acme","f.handle":"bob","p.handle":"ada"}
 {"c.slug":"acme","f.handle":"ada","p.handle":"cy"}
+{"c.slug":"acme","f.handle":"bob","p.handle":"ada"}
 {"c.slug":"bolt","f.handle":"ada","p.handle":"cy"}
+{"p.handle":"bob"}
 
 --- expect shape
 p.handle: String
 f.handle: String?
-c.slug: String
+c.slug: String?
 
 --- query
 query nested() { match { $p: Person, optional { $c: Company, $p worksAt $c, optional { $t: City, $c locatedIn $t } } } return { $p.handle, $c.slug, $t.slug } }

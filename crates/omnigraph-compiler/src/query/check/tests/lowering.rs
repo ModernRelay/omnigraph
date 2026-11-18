@@ -275,7 +275,7 @@ const CLOSURE: &[Row] = &[
                 Refused("B"),
             ),
             (
-                "query q() { match { $p: Person, optional { $f: Person, $p knows $f }, $f worksAt $c } where $c.name = \"Acme\" return { $p.name, $f.name } }",
+                "query q() { match { $p: Person, optional { $f: Person, $p knows $f, $c: Company, $f worksAt $c } } where $c.name = \"Acme\" return { $p.name, $f.name } }",
                 Lowers,
             ),
             (

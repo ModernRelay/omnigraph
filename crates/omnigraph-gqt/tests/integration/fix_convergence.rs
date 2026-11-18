@@ -381,6 +381,14 @@ const INTENDED: &[(&str, &str)] = &[
         r#"query wrapped($q: Vector(3)) { match { from { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $dist } return { $d, $dist } } } return { $d.slug } }"#,
     ),
     (
+        "diagnostics/t90_triple_reads_a_reference_an_optional_introduced.gqt step 3",
+        "query friends_employers() { match { $p: Person, optional { $f: Person, $p knows $f, $c: Company, $f worksAt $c } } return { $p.name, $c.name } }",
+    ),
+    (
+        "diagnostics/t90_triple_reads_a_reference_an_optional_introduced.gqt step 5",
+        "query admirers_of_staff() { match { $c: Company, optional { $p: Person, $p worksAt $c, $q: Person, $q knows $p } } return { $c.name, $q.name } }",
+    ),
+    (
         "issue_640_search_score_projection.gqt step 23",
         r#"query nearest_projected_without_retrieval($v: Vector(2)) {
     match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.embedding, $v, k: 2) as $distance }
@@ -395,6 +403,10 @@ const INTENDED: &[(&str, &str)] = &[
     match { $a: Person, $b: Person, $a knows $b }
     return { $a.name }
 }"#,
+    ),
+    (
+        "optional_keeps_rows_without_a_match.gqt step 12",
+        "query friend_employers() { match { $p: Person, optional { $f: Person, $p knows $f, $c: Company, $f worksAt $c } } return { $p.handle, $f.handle, $c.slug } }",
     ),
     (
         "rank_key_asc_direction_refused.gqt step 6",
@@ -412,6 +424,27 @@ const INTENDED: &[(&str, &str)] = &[
     return { $d.slug }
     order { $score desc }
     limit 2
+}"#,
+    ),
+    (
+        "traversal_from_an_optional_node.gqt step 3",
+        r#"query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2, $n5: A, $n2 $k4:rel0 $n5 where $n2.p0 is null } }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}"#,
+    ),
+    (
+        "traversal_from_an_optional_node.gqt step 5",
+        r#"query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2, $n5: A, $n2 rel0{1,2} $n5 where $n2.p0 is null } }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}"#,
+    ),
+    (
+        "traversal_from_an_optional_node.gqt step 7",
+        r#"query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2, $n5: A, $n5 rel0 $n2 where $n2.p0 is null } }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
 }"#,
     ),
     (
