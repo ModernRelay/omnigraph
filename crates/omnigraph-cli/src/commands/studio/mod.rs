@@ -1,4 +1,4 @@
-//! `omnigraph studio`: open OmniGraph Studio on an existing server target or
+//! `omnigraph studio`: open Omnigraph Studio on an existing server target or
 //! managed cluster target.
 //!
 //! The command validates the target, builds one `omnigraph-studio://open`
@@ -39,6 +39,9 @@ use crate::targets::{ResolvedTarget, STUDIO_PROTOCOL, TargetBinding, TargetProve
 /// The exit of this command's refusals, the one `finish` gives a target
 /// refusal on a command without a classified outcome.
 const REFUSED: i32 = 2;
+
+/// Studio's `open` link parser bounds each managed identifier at 128 ASCII bytes.
+const STUDIO_ID_MAX_BYTES: usize = 128;
 
 /// The target the link opens, as the invocation resolved it.
 pub(crate) struct StudioScope<'a> {
@@ -197,6 +200,21 @@ fn cluster(scope: &StudioScope<'_>, binding: &crate::managed::Binding) -> Result
             ),
         )
     })?;
+    for (field, id) in [
+        ("cluster_id", &cluster.cluster_id),
+        ("cluster_incarnation", &cluster.cluster_incarnation),
+    ] {
+        if id.len() > STUDIO_ID_MAX_BYTES {
+            return Err(refusal(
+                "target_incompatible",
+                format!(
+                    "target '{name}' has a {}-byte {field}. Studio links accept at most \
+                     {STUDIO_ID_MAX_BYTES} bytes per identifier",
+                    id.len(),
+                ),
+            ));
+        }
+    }
     let graph = scope.graph.or(cluster.default_graph.as_deref());
     graph_segment(graph)?;
     let link = cluster_link(
@@ -286,7 +304,7 @@ fn deliver(
                 writeln!(stdout, "{}", link.link())?;
                 writeln!(
                     stderr,
-                    "opened OmniGraph Studio on target '{}'",
+                    "opened Omnigraph Studio on target '{}'",
                     link.target()
                 )?;
             }
@@ -295,7 +313,7 @@ fn deliver(
         Opening::Unavailable(reason) => reason,
     };
     let error = format!(
-        "studio_unavailable: OmniGraph Studio did not open: {reason}; install it from \
+        "studio_unavailable: Omnigraph Studio did not open: {reason}; install it from \
          {INSTALL_URL}, then open the link"
     );
     if json {
@@ -489,7 +507,7 @@ mod tests {
             stdout,
             format!("omnigraph-studio://open?target=staging&binding={binding}&home={home}\n")
         );
-        assert!(stderr.contains("opened OmniGraph Studio"), "{stderr}");
+        assert!(stderr.contains("opened Omnigraph Studio"), "{stderr}");
     }
 
     /// A managed cluster target opens by identity: the profile's control
@@ -582,7 +600,7 @@ mod tests {
         );
         assert!(!stdout.contains("target="), "{stdout}");
         assert!(
-            stderr.contains("opened OmniGraph Studio on target 'production'"),
+            stderr.contains("opened Omnigraph Studio on target 'production'"),
             "{stderr}"
         );
     }

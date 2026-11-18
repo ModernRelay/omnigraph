@@ -6529,13 +6529,15 @@ fn studio_opens_a_server_target_whose_digests_target_inspect_reports() {
     let endpoint = format!("https://{}", probe.local_addr().unwrap());
     let temp = tempdir().unwrap();
     let absent = temp.path().join("absent");
+    let cluster_id = "c".repeat(128);
+    let incarnation = "i".repeat(128);
     let document = format!(
         "version: 1\nprofiles:\n  work: {{api: '{endpoint}', organization_id: org, auth: {{provider: omnigraph}}}}\n\
          targets:\n  staging:\n    kind: server\n    endpoint: '{endpoint}/graph'\n    \
          auth: {{provider: token, source: {{env: OMNIGRAPH_STAGING_TOKEN}}}}\n    default_graph: knowledge\n  \
          local:\n    kind: server\n    endpoint: 'http://127.0.0.1:9'\n    auth: {{provider: anonymous}}\n  \
          scratch:\n    kind: direct\n    scope: graph\n    uri: 'file://{graph}'\n  \
-         managed:\n    kind: managed\n    profile: work\n    cluster_id: c\n    cluster_incarnation: i\n    \
+         managed:\n    kind: managed\n    profile: work\n    cluster_id: {cluster_id}\n    cluster_incarnation: {incarnation}\n    \
          endpoint: '{endpoint}/data'\n    default_graph: knowledge\n",
         graph = absent.join("graph.omni").display(),
     );
@@ -6669,14 +6671,27 @@ fn studio_opens_a_server_target_whose_digests_target_inspect_reports() {
         }
         let report = parse_stdout_json(&output_success(&mut installed.studio(home, &args)));
         let link = format!(
-            "omnigraph-studio://open?api={api}&organization=org&cluster=c&incarnation=i&graph={opens}"
+            "omnigraph-studio://open?api={api}&organization=org&cluster={cluster_id}&incarnation={incarnation}&graph={opens}"
         );
         assert_eq!(
             report,
             json!({"protocol": 1, "target": "managed", "api": endpoint, "organization": "org",
-                   "cluster": "c", "incarnation": "i", "link": link})
+                   "cluster": cluster_id, "incarnation": incarnation, "link": link})
         );
         opened(&installed, &link);
+    }
+
+    // These are valid operator identifiers but the Studio link protocol bounds each at 128.
+    for id in [&cluster_id, &incarnation] {
+        let overlong = document.replace(id, &format!("{id}x"));
+        fs::write(home.join("config.yaml"), overlong).unwrap();
+        let output = installed
+            .studio(home, &["--target", "managed", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(parse_stdout_json(&output)["code"], "target_incompatible");
+        assert!(installed.take_calls(0).is_empty());
     }
 
     let inline = absent.join("inline.omni");

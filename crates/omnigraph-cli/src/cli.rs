@@ -240,7 +240,7 @@ pub(crate) enum Command {
     /// discovers or hosts a server. stdout carries only MCP messages and
     /// diagnostics go to stderr.
     Mcp(McpArgs),
-    /// Open OmniGraph Studio on an existing server target or managed cluster
+    /// Open Omnigraph Studio on an existing server target or managed cluster
     /// target, print its link and exit.
     ///
     /// For a server target the `omnigraph-studio://open` link names the

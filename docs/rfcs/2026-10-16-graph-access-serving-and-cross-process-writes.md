@@ -531,8 +531,11 @@ the link format, which Studio owns.
   the cluster through a control plane it already knows, as its own OAuth
   client ([A2](#a2-oauth-for-standard-clients-and-managed-access)), and only
   when that control plane lists a cluster with this ID and incarnation in the
-  organization. The launcher sends no request and reads no credential for
-  either form, so it checks nothing against the control plane. A managed
+  organization. Studio's link parser accepts identifiers up to 128 ASCII
+  bytes each. The launcher refuses a longer cluster ID or incarnation with
+  `target_incompatible` before opening Studio. The launcher sends no request
+  and reads no credential for either form, so it checks nothing against the
+  control plane. A managed
   account, which names no cluster, still refuses. Both forms are protocol 1:
   the managed form is produced only where the launcher refused before, and a
   Studio that predates it refuses a link without a `target`.

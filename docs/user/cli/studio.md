@@ -1,6 +1,6 @@
 # Open Studio
 
-`omnigraph studio` opens [OmniGraph Studio](https://github.com/ModernRelay/omnigraph-studio)
+`omnigraph studio` opens [Omnigraph Studio](https://github.com/ModernRelay/omnigraph-studio)
 on a configured server target or managed cluster target, prints the link it
 opened, and exits:
 
@@ -80,6 +80,10 @@ omnigraph-studio://open?api=ORIGIN&organization=ORG_ID&cluster=CLUSTER_ID&incarn
 | `cluster` | The target's `cluster_id` |
 | `incarnation` | The target's `cluster_incarnation`, so a cluster deleted and created again under the same name is not opened in its place |
 | `graph` | The graph `--graph` named; else the target's `default_graph`, when it has one; else absent |
+
+Studio accepts up to 128 ASCII bytes for each managed identifier. If the
+target's `cluster_id` or `cluster_incarnation` exceeds that limit, the CLI
+returns `target_incompatible` before opening Studio.
 
 The link has no `target`, `binding` or `home`: it says which cluster, not
 which name this operator file gives it, so it opens in a Studio that reads

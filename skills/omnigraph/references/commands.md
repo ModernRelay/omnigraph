@@ -511,7 +511,8 @@ operator home. A managed cluster target's link is
 `omnigraph-studio://open?api=ORIGIN&organization=ORG_ID&cluster=CLUSTER_ID&incarnation=INCARNATION[&graph=G]`:
 it identifies the cluster from the operator configuration, carries the
 target's `default_graph` unless `--graph` names another, and Studio opens it
-with its own sign-in to that control plane, not the CLI's login. Direct
+with its own sign-in to that control plane, not the CLI's login. A cluster ID
+or incarnation longer than 128 bytes refuses with `target_incompatible`. Direct
 targets refuse with `target_kind_unsupported`. Where nothing opens Studio's
 links it prints the link and refuses with `studio_unavailable`; it never
 opens a browser. See [Open Studio](../../../docs/user/cli/studio.md).
