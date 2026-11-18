@@ -226,11 +226,11 @@ optional introduces whole, `return { $c }`, is not lowered
 (`T86`). It prints no fix: returning the node's properties instead runs, but
 with other result columns.
 
-Each optional adds a fixed number of nodes to the read's plan, so one read
-holds as many as its plan budget allows (4096 nodes unless the declaration
-writes `@budget(plan = n)`); an optional nested in another doubles the inner
-one. A read whose plan outgrows the budget is refused with `T70` as soon as
-it does. A declared budget above the session's ceiling,
+Each optional adds nodes to the read's plan in proportion to its own
+pattern, an optional nested in another included, so one read holds as many
+as its plan budget allows (4096 nodes unless the declaration writes
+`@budget(plan = n)`). A read whose plan outgrows the budget is refused with
+`T70` as soon as it does. A declared budget above the session's ceiling,
 [`plan_budget_limit`](settings.md) (65536 by default; on a server, the
 operator's), is refused with `T89` before the read is compiled, never
 clamped.

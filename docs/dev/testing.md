@@ -26,7 +26,7 @@ export budget and must not share a binary with the other export tests.
 
 | Package | Primary owners | Shared support |
 |---|---|---|
-| `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests | Module-local fixtures; `arbitrary`, the generators every [generated law](#generated-laws) draws from |
+| `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests; `query::check::tests::compile_growth`, which holds compile work (term nodes, expression nodes, steps) linear in each construct family and compiles the sizes the old bounds refused | Module-local fixtures; `arbitrary`, the generators every [generated law](#generated-laws) draws from |
 | `omnigraph-planner` | In-source optimizer/cost tests and `tests/integration/query_plan.rs`, `tests/integration/registry.rs`, `tests/integration/lower_walk.rs`; plan assertions over real snapshots live in GQT | `PlanSource` fixtures for metadata and refusal states |
 | `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
 | `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, core, catalog, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed | None |

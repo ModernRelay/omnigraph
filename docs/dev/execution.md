@@ -14,9 +14,11 @@ A query runs against one resolved `ReadTarget`:
 3. Shape the core read for the planner (`omnigraph_planner::read_shape`): the
    pattern of scans, expansions, filters and correlated blocks, its return
    items, order, limit and the ranking a `from nearest/bm25/rrf` draws. A
-   `let` value that cannot fail is read wherever its name is; a `from` over an
+   `let` is a column computed once where it was written (`PatternStep::Let`,
+   below), and every read of its name reads that column; a `from` over an
    inline read with no group, order or cut adds the inner pattern's facts,
-   its unreturned names renamed apart. A ranking that is the read's only
+   its unreturned names renamed apart, and each value it returns that is not
+   already a column becomes a `let` of the enclosing scope. A ranking that is the read's only
    element, its score leading the `order` in its direction and its `nearest`
    window the `limit`, stays the leading key today's ranked scan runs. Any
    other ranking is a `PatternStep::Rank` over its population: `nearest`
@@ -32,7 +34,9 @@ A query runs against one resolved `ReadTarget`:
    population with the arm's own `k`, an exact `Score` step, or an inline
    read's uncorrelated `Correlate` whose `order` ranks the arm (see
    [Fusion](#fusion-one-operator-over-any-ranked-arm)). An `optional { p }` (the core's `Correlate(R,
-   Union(p, Project(Filter(Env, ¬ exists p), nulls)))`) is a `PatternStep::Optional`
+   Union(p, Project(Filter(Env, ¬ exists p), nulls)))`, `p` stored once and
+   shared by both arms, so nested optionals grow the term, the plan budget's
+   charge and every walk over it linearly) is a `PatternStep::Optional`
    placed after the scope's bindings and traversals and before its filters
    and blocks: its own pattern placed over the outer row, and the logical
    and physical `OptionalJoin` over an `OuterReference`; a traversal from a
@@ -40,9 +44,11 @@ A query runs against one resolved `ReadTarget`:
    for the placement law, `$x is null` over a reference tests the
    identity column, and plan acceptance requires one `OptionalJoin` per
    written optional testing its own conjuncts inside its inner tree and
-   nowhere else. A `let` inside it is read in place inside it, and after it
-   as `if(<a node it binds> is not null, value, null)`, so it is null on a
-   row with no match whatever it reads. A `from union(…)` whose arms read no outer name is a
+   nowhere else. A `let` inside it is a column its own steps compute, which
+   the `OptionalJoin` pads null on a row with no match; one whose value is a
+   column the optional does not compute (an outer column, a parameter, a
+   constant) is a column after it, `if(<a node it binds> is not null, value,
+   null)`, so it is null on a row with no match whatever it reads. A `from union(…)` whose arms read no outer name is a
    `PatternStep::Union` placed first, each arm its own pipeline from nothing
    with its unreturned names renamed apart, and the logical and physical
    `Union` (a new node kind: no existing one emits the rows of two
@@ -116,17 +122,28 @@ A query runs against one resolved `ReadTarget`:
    over `bm25` is that same `Score` over the arm's population. A plan whose
    one ranking is such a `Score` reports the ranking
    `bm25`, always exhaustive (`ranking::planned_ranking`).
-   A `let` whose value can fail (arithmetic), and a value an inline read
-   returns that can fail, is `PatternStep::Let`, then the logical and
-   physical `Let` (a new node kind: no existing node evaluates a value on
-   every row without removing or replacing one). The shaper records where
-   the `let` was written among the scope's facts and places the facts before
-   it, the `Let`, then the rest; the type checker writes every `where`
-   conjunct of the scope above it, and the `Let` declares that it can fail,
-   so the placement law moves no conjunct below it (A3). The value is pure: a read of
-   its name evaluates it in place. Plan acceptance requires one `Let` per such
-   value, evaluating the same expression, and `if` and `coalesce` evaluate an
-   argument only on the rows that select it.
+   Every `let` whose value is not already a single column, a parameter or a
+   constant, and every such value an inline read returns, is
+   `PatternStep::Let`, then the logical and physical `Let`: the value
+   computed once on every row of the elements before it, appended as the
+   `value` column (`shape::read::LET_VALUE`) of a binding the shaper makes up
+   for it (`Shapedl<n>_<name>`), which every read of the name reads as a
+   property of that binding, so no read copies the value and a chain of
+   `let`s that each read the one before twice compiles in linear work. The
+   shaper records where the `let` was written among the scope's facts and
+   places the facts before it, the `Let`, then the rest; the type checker
+   writes every `where` conjunct of the scope above it. The `Let` carries its
+   binding for the placement law, so a conjunct that reads its column runs
+   above it, and it declares that it can fail exactly when its value can, so
+   the law moves nothing below one that can (A3) and moves a conjunct that
+   reads other columns past one that cannot. Plan acceptance requires one
+   `Let` per such value, computing the same expression, and `if` and
+   `coalesce` evaluate an argument only on the rows that select it. A block
+   that can fail under a guard (`and`, `or`, `if`, `coalesce`) reads its
+   guard from a column of the outer row: each operand of a chain guards the
+   operands after it as one guard of its own, and the column for a block's
+   guards reads the column the block before it computed and adds the guards
+   since, so a chain of guarded blocks computes each guard once.
    The shaper is the compiler's
    (`omnigraph_compiler::shape`), and the type checker runs it on every
    declaration it accepts: a term it does not lower (a `union` arm with
@@ -300,6 +317,46 @@ Stable code owners:
 | Loader | `crates/omnigraph/src/loader/mod.rs` |
 
 Avoid line-number links in documentation; these modules are the stable owners.
+
+## Deep queries
+
+Compiling a read takes work linear in its text. The core term stores each
+subterm once: an `optional`'s pattern, which its desugaring both returns and
+tests for absence, is one node both arms of its `Union` share, and the plan
+budget charges it once (`Term::size`), while a `Call`'s body is still charged
+at every call site, as the RFC's `Call` rule expands it. Every walk over the
+term visits a stored node once (`Term::any_node`, `Term::stored_nodes`; the
+binder binds a shared node once). A `let` is a column, never copied into its
+reads; a block's guard is a column a later guard reads; the shaper probes an
+inline read's own scope for an `optional` or a `union` without shaping the
+reads nested in it. `crates/omnigraph-compiler/src/query/check/tests/compile_growth.rs`
+holds the work to that: term nodes, expression nodes and compile steps grow
+by the same amount per unit of each construct family. The padding row of an
+`optional` (`Project(…, nulls)`) names one column per column its pattern
+adds, so its width follows the relation's, and nested optionals pad a
+quadratic number of columns in their depth, counted apart.
+
+A query may nest 2,048 levels of brackets, `case`s and prefix operators and
+build an expression 16,384 levels deep (`query::depth`, `Q006`). Every walk
+that recurses once per level of an expression or a term (the parser's tree
+builder and span lookup, the type checker, binding, the shaper, the planner
+and plan acceptance, constant folding, engine evaluation, display and the
+reference interpreter) enters each level through `stack::deep`, which grows
+the stack on the heap (`stacker`) when less than `stack::RED_ZONE` remains;
+the expression types' `Clone`, `PartialEq`, `Hash` and `Debug` go through it
+too, and their `Drop` takes a deep tree apart on a heap stack. The generated
+parser recurses on its own, so a parse runs on a stack sized from the
+source's nesting (`stack::with_room`, `depth::GRAMMAR_BYTES_PER_LEVEL`). The
+server's and the CLI's threads keep the platform's default stacks. A thread
+whose platform reports a stack larger than any real one (`ulimit -s
+unlimited` reports the main thread's as running to the next mapping) spends
+only `stack::UNTRUSTED_BUDGET` of it before growing. DataFusion, Lance and
+derived traits of mirror types recurse without the guard, so a predicate
+deeper than `stack::MAX_HANDED_OFF_DEPTH` (256 levels, the expression depth
+a query could reach before the bounds rose) is not pushed into a scan, where
+the engine's own `Filter` evaluates it, is outside plan acceptance's exact
+fragment, and explain writes its typed tree to that depth, the nodes below
+marked `elided`.
 
 ## Traversal and joins
 
@@ -695,7 +752,7 @@ by `engine/scan.rs`, `engine/graph.rs`, `engine/expr.rs` and
 | `Fuse` | `FuseExec` (`operators/fuse.rs`) over its arm subtrees, each lowered once as the plan its ranking runs standing alone, whose rows arrive in the arm's rank order: the arms are drained one after another in written order, and in each a target takes the next rank at its first row, adding `weight / (k + rank)` (the plan's `k`, 60 when absent, bound and checked in `1..=1000000` when lowered; the plan's `weights`, 1.0 when absent) to its fused score, summed in written order in `F64`. One row leaves per target any arm selected, the target's columns from the first arm that selected it and the fused score as `<target>._rrf`, and it neither sorts nor cuts. Every arm row and every fused target is charged to `read_work_limit`, and the held arm rows and per-target state to the query pool (`FuseExec`) | omnigraph |
 | `CrossJoin` | `CrossJoinExec`: the left input collected under the query pool, every left row paired with each right batch, output charged as `cross join output`; an empty left executes nothing on the right. The node's `filters` (conjuncts over both bindings) run in the join; every pair goes through one `PairBuffer`, which charges each right batch's row-size scratch before it grows it, filters the held pairs into a kept batch when it holds the session's batch size of pairs, when their estimated bytes reach the producer's batch bytes, and at each right batch's end, and sends the kept batches as one output once their rows reach the batch size or their bytes the batch bytes (the rest at the end), so an output exceeds the batch size by at most one kept batch | omnigraph |
 | `ContainsJoin` | `ContainsJoinExec`: the planner's join for a `Filter` over a `CrossJoin` holding a `$r.x contains $l.y` conjunct whose `$r` is the unranked table `Scan` on the right and whose two properties are text (`optimizer.rs` `filtered_cross_join`, reported as the `join_algorithm` pass; a search order that later ranks that scan takes the marker off again and turns the join back into the `CrossJoin` of its conjuncts, `Lowering::unmark`, since a ranked scan runs under a search mode and no runtime filter); the filter's other conjuncts are the node's `residual`, and the right scan's `ScanSpec` carries `runtime_filter` (`column`, `needle`, `kind` `text_contains_any`), which the engine's lowering turns into the `RuntimeFilterSlot` both operators share; the lowering refuses a plan (a replayed or edited one) whose marked scan's column or needle differs from its `ContainsJoin`'s, or whose marked plain table scan no `ContainsJoin` fills (a marker on any other scan is not read, and that scan reads unfiltered). The left input is collected under the query pool (`contains join left`); the join admits its `PairBuffer`, then fills that slot (a fill first clears any earlier execution's filter) with one Aho-Corasick automaton over the distinct non-empty `y` values, charged once as `runtime filter needles` and shared with the join (the scan is left unfiltered when a value is empty, since that value is in every text, though the join still pairs through the automaton; none, and the join tests every pair, when the pool refuses it; no right execution when every value is null); both operators print `runtime_filter=$r.x contains any($l.y)`, and `ScanExec` sieves each Lance batch through it as the `Scan` row describes (`runtime_filter_rows_read`, `runtime_filter_rows_dropped`, `runtime_filter_inert`; the join's `runtime_filter_needles`). At its first right batch the join builds its needle rows over that same automaton, which the streaming scan may still be sieving through (`contains_join=aho_corasick`; only the row tables are charged, as `contains join needles`): each non-null text pairs only with the left rows of the needles it holds, the pass over a text stopping once every needle is found and checking for cancellation every 4,096 occurrences, and each empty needle's row pairs with each non-null text; when the pool refuses the needle rows it pairs every row. Every pair goes through the same `PairBuffer` as `CrossJoinExec`, which tests only the `residual` conjuncts on the needle-rows path, whose every pair holds the `contains` conjunct by construction, and the `contains` conjunct with them on the every-row path; with the right scan streaming, the join's memory is the left side plus the shared automaton, the needle rows, one right batch and one output batch, beside the producer queue's two batches in flight. `contains_join_matcher` is 1 when the run paired through the needle rows, 0 when the pool refused them, and absent when no right row reached the join; `contains_join_pairs` counts the pairs found for the non-empty needles before the residual conjuncts, beside a matcher of 1 | omnigraph |
-| `Let` | `LetExec` (`operators/let_value.rs`): per input batch, the value evaluated over the wide batch (`evaluate_expr`) and discarded, every row passed through unchanged in input order; a failure is the value's typed refusal (`E1`, `E2`, `E3`) | omnigraph |
+| `Let` | `LetExec` (`operators/let_value.rs`): per input batch, the value evaluated over the wide batch (`evaluate_expr`) and appended as the `<binding>.value` column, every row passed through in input order; a failure is the value's typed refusal (`E1`, `E2`, `E3`) | omnigraph |
 | `Score` | `ScoreExec` (`operators/score.rs`): per input batch, every other column carried and input order kept. Of kind `distance`: the scored binding's vector column read and its distance under the field's declared distance (`l2` the sum of squared differences, `cosine` one minus the cosine, `dot` one minus the dot product; `VectorDistance::evaluate`) to the value table's query vector for this node appended as `<binding>._distance` (`F32`, non-null); a row whose vector is null, or under `cosine` a zero vector, is filtered out (binding refused a zero `cosine` query vector before the run), and a non-finite stored component, query component or result is the typed refusal `E3`. Of kind `bm25`: the row's identity looked up in the scores `LexicalMembers::resolve` computed with the exact lexical scan before lowering, its `bm25_v1` appended as `<binding>._score` (`F64`, non-null), and a row with none (its value null, token-empty or not matching) filtered out. It reads no index, so its rows are equal under every index state; the output batch is charged as `score output` | omnigraph |
 | `Filter` | `FilterExec`: every `IRFilter` of the node as one conjunction over the wide batch (`evaluate_filter`), so a filter over two bindings reads two columns. A later conjunct, and the right side of `and`/`or`, needs only the rows still undecided (`evaluate_filter_where`): with none it does not run, with at most 20% of the batch it runs on those rows alone, gathered over the columns it reads, and above that share it runs on every row. The result equals evaluation on the undecided rows alone, but whether a decided row is evaluated depends on that share, so an operand that can fail on a row's value must take the gathered path at every share. A full-text call in a conjunct reads a Boolean membership column the operator adds to each batch while it evaluates (`engine/lexical.rs`, `LexicalColumns`): before the plan is lowered, `LexicalMembers::resolve` runs each such call once as the scan's own full-text query (`scan::build_fts_query`; `match_terms` is Lance's zero-edit match query with `Operator::And` for `mode: all` and `Operator::Or` for `mode: any`) over its node type's whole table at the pinned snapshot, with no filter, charged as `full-text membership` for the query's lifetime, and a row is true when its identity is among the matches, so a null document is false and the answer does not depend on index coverage. A `match_terms` over a field whose index declares an analyzer profile is answered instead by the exact lexical scan (`engine/lexical_scan.rs`), which reads no index: it streams the field and the identity at the pinned snapshot, normalizes each value to NFC, tokenizes it with the profile's own Lance pipeline (`InvertedIndexParams::build`), and keeps an identity when every (`all`) or some (`any`) distinct analyzed query term has a stored term within the edit budget (a banded Levenshtein over Unicode scalar values, `bounded_edits`). The same scan reads each exact `bm25` `Score`'s field corpus once for its `bm25_v1` statistics (its size, token total and per-term document frequency, keeping no document), and the `Score` operator then scores each row of its population from the row's own text, which its scan projects (`Bm25Scorer::score`, `Corpus::score`: `libm::log1p` IDF, checked `u64` counts, terms in ascending UTF-8 order, `E1` on overflow, `E3` on a score that is not finite and positive). Query bytes (64 KiB), distinct query terms (1,024) and value bytes (16 MiB) are bounded before and after NFC (`ResourceLimitExceeded`), every analyzed token and term comparison is charged to `read_work_limit`, and a bound edit budget outside `0..=2` or a query with no analyzed term is `T71` or `T20`. `LetExec` reads a call in a `let` the same way, and `projection_pushdown` reads the identity of each binding such a call searches | omnigraph |
 | `Expand` | `ExpandExec`: an unbudgeted named unbound single hop uses one vectorized walk per input batch (`operators/single_hop.rs`); unbudgeted named multi-hop drains its input into the BFS breaker `execute_expand`. Budgeted expansions, including selected multi-hop, consume fixed source windows through `SourceWindows`. Bound edges use the bounded pair producer, spillable pair ordering and incremental hydration within each input batch or budgeted source window. Output chunks contain at most 256 rows (`expand_pairs` counts pairs handed on); dropping the stream at a downstream `Limit` cancels the producer | omnigraph |
