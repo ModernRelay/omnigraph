@@ -125,6 +125,67 @@ async fn login_never_creates_or_overwrites_a_profile_implicitly() {
 }
 
 #[test]
+fn onboarding_only_reads_an_answer_for_human_terminal_output() {
+    for terminal in [false, true] {
+        for json in [false, true] {
+            let mut input = io::empty();
+            assert_eq!(
+                matches!(
+                    super::onboarding_choice(&mut input, terminal, json),
+                    crate::managed::OrganizationChoice::Ask(_)
+                ),
+                terminal && !json
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn profile_creation_emits_a_managed_refusal_through_the_cli() {
+    let home = tempfile::tempdir().unwrap();
+    for json in [false, true] {
+        let mut arguments = vec![
+            "omnigraph",
+            "login",
+            "--create-profile",
+            "work",
+            "--organization",
+            "bad id",
+        ];
+        if json {
+            arguments.push("--json");
+        }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = super::execute(
+            crate::invocation::parse_from(arguments).unwrap(),
+            crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+            &mut io::empty(),
+            true,
+            &mut stdout,
+            false,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completion.code(), 2);
+        if json {
+            let refusal: Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(refusal["type"], "organization_invalid");
+            assert!(refusal["detail"].is_string());
+        } else {
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains("organization_invalid:")
+            );
+        }
+        assert!(!home.path().join("config.yaml").exists());
+    }
+}
+
+#[test]
 fn profile_creation_has_one_explicit_non_overlapping_spelling() {
     for args in [
         vec!["login", "--create-profile", "work"],
@@ -1704,11 +1765,23 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let results = state["deployment_results"].as_array().unwrap();
             assert_eq!(results.len(), 1);
             let id = results[0]["id"].as_str().unwrap();
-            let lock = status.lock_id.as_deref().unwrap();
             let message = format!("{error:#}");
             assert!(message.contains(id), "{message}");
-            assert!(message.contains(lock), "{message}");
+            assert!(message.contains("Admission lock: "), "{message}");
             assert!(!message.contains("\"disposition\""));
+            // The converged apply released its lock (#1359). A later owner that
+            // stops without release leaves the lock the checks below deliver.
+            assert!(status.lock_id.is_none());
+            let later = omnigraph_cluster::acquire_cluster_admission(
+                root,
+                omnigraph_cluster::ClusterAdmissionPurpose::GraphOperation,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let lock = later.lock_id().to_owned();
+            drop(later);
+            let lock = lock.as_str();
             let receipt = omnigraph_cluster::deployment_status(root, Some(id), &caller)
                 .await
                 .unwrap()
@@ -1733,7 +1806,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let lock_bytes = std::fs::read(&lock_path).unwrap();
 
             // Resubmitting the known identity observes the original result even
-            // while admission is retained. It must not run the deployment again.
+            // while another owner's admission is retained. It must not run the deployment again.
             let mut observed = Vec::new();
             let mut custody = Vec::new();
             apply_source(

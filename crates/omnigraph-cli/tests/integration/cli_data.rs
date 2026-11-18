@@ -1032,6 +1032,73 @@ fn embed_seed_preserves_non_entity_rows() {
     assert_eq!(embedded[2]["to"], "dec-alpha");
 }
 
+/// A direct run keeps no resume position between invocations, so a bounded
+/// run names the table it stopped before and the next one is started there
+/// with `--start-at`: it visits that table first and wraps, and successive
+/// bounded runs reach every table instead of starting at the first key each
+/// time.
+#[test]
+fn optimize_start_at_resumes_a_bounded_direct_run() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let optimize = |extra: &[&str]| {
+        output_success(
+            cli()
+                .arg("optimize")
+                .arg("--target")
+                .arg(&graph)
+                .args(["--max-gate-hold", "0s"])
+                .args(extra),
+        )
+    };
+    let visited = |payload: &Value| {
+        payload["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|dataset| dataset["type_key"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // A zero hold runs the first table and defers the rest.
+    let first = parse_stdout_json(&optimize(&["--json"]));
+    let order = visited(&first);
+    assert!(order.len() >= 3, "{first}");
+    assert_ne!(first["datasets"][0]["outcome"], "deferred", "{first}");
+    assert_eq!(first["datasets"][1]["outcome"], "deferred", "{first}");
+    assert_eq!(first["resume_at"], order[1].as_str(), "{first}");
+
+    // Copy the human report's arguments verbatim into the next invocation.
+    let human = String::from_utf8(optimize(&[]).stdout).unwrap();
+    let hint = human
+        .lines()
+        .find_map(|line| line.strip_prefix("resume with: "))
+        .unwrap_or_else(|| panic!("missing resume hint in {human}"));
+    let mut args = vec!["--json"];
+    args.extend(hint.split_ascii_whitespace());
+    let second = parse_stdout_json(&optimize(&args));
+    let mut wrapped = order[1..].to_vec();
+    wrapped.push(order[0].clone());
+    assert_eq!(visited(&second), wrapped, "{second}");
+    assert_ne!(second["datasets"][0]["outcome"], "deferred", "{second}");
+    assert_eq!(second["resume_at"], order[2].as_str(), "{second}");
+
+    // A start position belongs to a full-catalog run; the refusal comes
+    // before the graph is opened.
+    let refused = output_failure(cli().arg("optimize").arg("--target").arg(&graph).args([
+        "--start-at",
+        &order[1],
+        "--datasets",
+        &order[0],
+    ]));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("applies to a full-catalog run"),
+        "{refused:?}"
+    );
+}
+
 #[test]
 fn optimize_json_succeeds_on_local_graph() {
     // Happy path for the resolve_local_uri swap (RFC-010 Slice 1): a positional
@@ -4095,6 +4162,93 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         );
         assert_eq!(actual["http_status"], 200);
         assert_eq!(server.requests().len(), 2);
+        server.assert_complete();
+    }
+}
+
+/// A dry run of a merge is a read of both branches: when its answer is lost
+/// (a severed body here, a client deadline in the report), nothing can have
+/// changed, so it reports no effects and is not sent to reconcile a write. The
+/// same lost answer to a real merge stays unknown. A dry run travels on the
+/// merge route, so it is a read only when the reply confirms it: a reply that
+/// says the server did not run a dry run, or that a dry run wrote, leaves the
+/// effects unknown.
+#[test]
+fn a_dry_run_merge_whose_answer_is_lost_has_no_effects_issue_1447() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+    use serde_json::json;
+
+    let lost = || IntentReply {
+        status: 200,
+        headers: vec![("Content-Length".into(), "1024".into())],
+        body: b"{unfinished".to_vec(),
+    };
+    let cases = [
+        ("lost answer to a dry run", true, lost(), 1, "none"),
+        ("lost answer to a merge", false, lost(), 2, "unknown"),
+        (
+            "a dry run answered as a merge",
+            true,
+            IntentReply::json(
+                200,
+                json!({"source":"review", "target":"main", "outcome":"already_up_to_date",
+                    "actor_id":"alice", "dry_run":false, "commit":null}),
+            ),
+            2,
+            "unknown",
+        ),
+        (
+            "a dry run that reports a write",
+            true,
+            IntentReply::json(
+                200,
+                json!({"source":"review", "target":"main", "outcome":"fast_forward",
+                    "actor_id":"alice", "dry_run":true, "commit":null, "branch_deleted":true}),
+            ),
+            2,
+            "unknown",
+        ),
+    ];
+    for (case, dry_run, reply, exit, effects) in cases {
+        let server = IntentApiFixture::graph(vec![reply]);
+        let mut command = cli();
+        command
+            .args(["--target"])
+            .fixture_target(&server.origin)
+            .args([
+                "--graph",
+                "knowledge",
+                "branch",
+                "merge",
+                "review",
+                "--json",
+            ]);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{case}: {output:?}");
+        let actual = parse_stdout_json(&output);
+        assert_eq!(
+            actual["disposition"]["effects"], effects,
+            "{case}: {actual}"
+        );
+        if effects == "unknown" {
+            assert_eq!(
+                actual["disposition"]["action"], "reconcile",
+                "{case}: {actual}"
+            );
+        } else {
+            assert_ne!(
+                actual["disposition"]["action"], "reconcile",
+                "{case}: {actual}"
+            );
+        }
+        assert_eq!(
+            server.requests().len(),
+            2,
+            "{case}: one discovery and one merge request"
+        );
         server.assert_complete();
     }
 }

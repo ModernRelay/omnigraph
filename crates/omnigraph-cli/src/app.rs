@@ -398,6 +398,11 @@ pub(crate) fn error_output_of(error: &color_eyre::Report) -> Option<ErrorOutput>
         output.code = Some(refusal.code);
         return Some(output);
     }
+    if let Some(reply) = error.downcast_ref::<crate::helpers::ContradictoryReply>() {
+        let mut output = ErrorOutput::message(reply.message.clone());
+        output.code = Some(omnigraph_api_types::ErrorCode::OutcomeUnknown);
+        return Some(output);
+    }
     let diagnostic = if let Some(engine) = error.downcast_ref::<omnigraph::error::OmniError>() {
         engine.diagnostic()
     } else if let Some(compiler) = error.downcast_ref::<omnigraph_compiler::error::CompilerError>()
@@ -422,6 +427,33 @@ fn render_diagnostic(
     lines.extend(output::diagnostic_detail_lines(diagnostic));
     lines.extend(output::further_diagnostic_lines(diagnostic));
     lines.join("\n")
+}
+
+fn onboarding_choice(
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
+    json: bool,
+) -> managed::OrganizationChoice<'_> {
+    if stdin_is_terminal && !json {
+        managed::OrganizationChoice::Ask(stdin)
+    } else {
+        managed::OrganizationChoice::Refuse
+    }
+}
+
+pub(crate) fn complete_onboarding(
+    result: Result<()>,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<Completion> {
+    match result {
+        Ok(()) => Ok(Completion::success()),
+        Err(error) => {
+            let failure = error.downcast::<managed::Failure>()?;
+            Ok(Completion::exit(failure.emit(json, stdout, stderr)?))
+        }
+    }
 }
 
 /// Resolves and dispatches the command, under the `--stats` recorder when
@@ -486,19 +518,21 @@ async fn run_resolved(
         create_profile: Some(name),
         api,
         organization,
+        json,
         ..
     } = &cli.command
     {
-        commands::targets::onboard(
+        let result = commands::targets::onboard(
             &operator,
             name,
             api.as_deref().unwrap_or("https://platform.omnigraph.dev"),
             organization.as_deref(),
+            onboarding_choice(stdin, stdin_is_terminal, *json),
             stdout,
             stderr,
         )
-        .await?;
-        return Ok(Completion::exit(0));
+        .await;
+        return complete_onboarding(result, *json, stdout, stderr);
     }
     let mut target = scope::resolve(&cli, &operator, &cwd, explicit_config, stderr)?;
     let authentication = crate::operator_routing::authentication(&cli, &operator, target.as_ref())?;

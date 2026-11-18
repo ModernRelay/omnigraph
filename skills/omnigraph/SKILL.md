@@ -207,7 +207,7 @@ backend. `--config DIR` is source input only.
 - Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
 - Server: `--target production --graph knowledge`; the registered target owns endpoint and one auth provider.
 - Managed: `--profile work` for account operations; a managed target references that profile and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
-- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup --graph` while the server is stopped. Each direct writer on the root takes the admission lock and keeps it; once that writer has stopped and its I/O has settled, release its exact `lock_id` (from `cluster status --json`) with `cluster force-unlock` before the next writer or the server starts. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
+- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup --graph` while the server is stopped. Each direct writer on the root takes the admission lock. A converged local or S3 `cluster apply` releases it after its writes settle. Maintenance and an unconverged writable apply retain admission. If release is unconfirmed, compare the apply's admission ID with the current `lock_id` in `cluster status --json`. Only force-unlock a matching lock after its writer has stopped and its I/O has settled. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
@@ -230,7 +230,7 @@ destination line.
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
 | Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
-| Managed account | `cluster create/list`, `organization members/invitations`; `--profile NAME` |
+| Managed account | `cluster create/list`, `organization list`, `organization members/invitations`; `--profile NAME` |
 | Managed cluster | `cluster members/pull/push/plan/apply/status/operation/history/cancel/token/delete/undo-delete`; complete cluster target |
 | Local configuration | `config validate/rename-profile/rename-target/recover-rename/recover-operations`, `target list/inspect/add/refresh/remove`, `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
 | Authentication | `login --create-profile NAME`, `login --profile NAME`, or `logout --profile NAME` for platform sessions; `credentials set/status/remove/export` requires explicit profile or standalone target |
@@ -331,9 +331,9 @@ Direct `init`/`load` write local storage, and direct **`cluster apply`** writes 
   whole deployment (graphs, schemas, stored queries, policies, optional S3/Azure
   `storage:` root); `omnigraph cluster apply` converges it and
   `omnigraph-server --cluster .` (or `--cluster s3://bucket/prefix`,
-  config-free) serves it. A direct apply keeps its admission lock: once its
-  writes have settled, release that exact lock with
-  `cluster force-unlock <LOCK_ID>` before starting the server, and send later
+  config-free) serves it. A successful, converged local or S3 direct apply
+  releases admission. For a retained lock or an unconfirmed release, follow the
+  exact-ID recovery steps in `references/cluster.md` before starting the server. Send later
   changes with `cluster apply --target NAME --config DIR` using a registered server target.
   See `references/cluster.md`.
 - **Direct / embedded access — no server.** Address a graph's storage directly
@@ -391,7 +391,11 @@ Changing a profile's principal requires `login --profile NAME
 invalidating old derived credentials. See the primary operator reference.
 
 `login --create-profile NAME` explicitly creates a new profile, defaulting its API
-to `https://platform.omnigraph.dev`. Bare login uses `defaults.profile`; it never
+to `https://platform.omnigraph.dev`. Pass `--organization ID` when the person
+belongs to several organizations. An interactive login offers a choice.
+With `--json` or nonterminal input, it returns `organization_required` and
+the available organizations. `organization list --profile
+NAME` shows the IDs. Bare login uses `defaults.profile`; it never
 creates a missing profile. Neither form changes routing defaults. Operator YAML
 may be read-only; credential metadata stays in writable `OMNIGRAPH_HOME`.
 Credentials retain their expiry through discovery and are checked before dispatch.

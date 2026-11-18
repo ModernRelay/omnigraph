@@ -285,7 +285,7 @@ async fn optimize_writes_no_control_object() {
         .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap()
-        .tables;
+        .datasets;
     assert!(
         stats
             .iter()

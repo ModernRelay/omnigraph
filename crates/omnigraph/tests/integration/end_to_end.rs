@@ -3101,7 +3101,7 @@ async fn full_flow_optimize_then_query_update_and_reopen() {
         .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap()
-        .tables;
+        .datasets;
     assert!(
         stats.iter().any(|s| s.committed()),
         "a multi-fragment table should have compacted in this flow"

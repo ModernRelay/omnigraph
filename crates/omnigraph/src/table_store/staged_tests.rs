@@ -3715,19 +3715,37 @@ fn compaction_blob_batch_rows_bounds_one_batch() {
 
 /// Lance applies a per-run source budget only to the tasks its own planner
 /// returns, so the dropped-column tasks the graph planner appends would run
-/// outside it: options that set any budget are refused before planning.
+/// outside it: options that set any budget are refused before planning. A
+/// plan is executed against the version it was made for: optimize plans a
+/// table once, measures that plan and hands it to staging, which refuses a
+/// plan of any other version instead of rewriting fragments it never chose.
 #[tokio::test]
 async fn table_compaction_planning_refuses_source_budgets() {
+    use crate::table_store::OptimizeStepLimit;
     use lance::dataset::optimize::CompactionOptions;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+    let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
         .await
         .unwrap();
 
     let unbudgeted = TableStore::plan_table_compaction(&ds, &CompactionOptions::default()).await;
     assert!(unbudgeted.is_ok(), "{unbudgeted:?}");
+    let stale = unbudgeted.unwrap();
+    let planned_at = ds.manifest.version;
+    lance_append_inline_local(&mut ds, person_batch(&[("bob", Some(31))])).await;
+    assert_ne!(ds.manifest.version, planned_at);
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    match store
+        .stage_compaction(&ds, stale, &OptimizeStepLimit::new(1))
+        .await
+    {
+        Err(OmniError::Manifest(manifest))
+            if manifest.kind == crate::error::ManifestErrorKind::Internal => {}
+        Err(other) => panic!("a plan of another version must be refused, got {other}"),
+        Ok(_) => panic!("a plan of another version was staged"),
+    }
 
     let budgets = [
         CompactionOptions {
@@ -4106,7 +4124,7 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
         std::time::Duration::from_secs(30),
         with_optimize_step_probes(
             probes.clone(),
-            store.stage_compaction(&ds, &options, &OptimizeStepLimit::new(2)),
+            store.stage_compaction(&ds, plan.clone(), &OptimizeStepLimit::new(2)),
         ),
     )
     .await
@@ -4135,7 +4153,7 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
     let probes = OptimizeStepProbes::rendezvous(1);
     with_optimize_step_probes(
         probes.clone(),
-        store.stage_compaction(&ds, &options, &OptimizeStepLimit::new(1)),
+        store.stage_compaction(&ds, plan, &OptimizeStepLimit::new(1)),
     )
     .await
     .unwrap()
@@ -4144,13 +4162,16 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
     assert_eq!(probes.peak_in_flight(), 1);
 }
 
-/// #1384: the tables of one optimize run share one budget for every heavy
-/// step, not only for compaction tasks. Two tables' compaction tasks (two
-/// each) and two other tables' index folds run within one budget of two, as
-/// `apply_optimize_table_effects` runs them, and the run never has more than
-/// two steps executing at once. Each step waits at a two-party rendezvous, so
-/// a budget that serialized the steps would time out, and a step outside the
-/// budget (or a budget per table) would raise the peak above two.
+/// #1384: one `OptimizeStepLimit` bounds every heavy step taken through it,
+/// not only compaction tasks. Two tables' compaction tasks (two each) and two
+/// other tables' index links (each the fold of a lagging index) run within
+/// one budget of two, and never more than two execute at once. Each step
+/// waits at a two-party rendezvous, so a budget that serialized the steps
+/// would time out, and a step outside the budget (or a budget per table)
+/// would raise the peak above two. This test wires the steps itself; that
+/// optimize takes each table's compaction tasks, index fold and index build
+/// through its run's one budget is owned by
+/// `db::omnigraph::optimize::tests::optimize_takes_every_tables_heavy_steps_through_one_budget_issue_1384`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
     use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
@@ -4197,12 +4218,16 @@ async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
         target_rows_per_fragment: 2,
         ..CompactionOptions::default()
     };
+    let mut plans = Vec::new();
     for ds in [&first, &second] {
         let plan = TableStore::plan_table_compaction(ds, &options)
             .await
             .unwrap();
         assert_eq!(plan.num_tasks(), 2, "the layout plans two tasks");
+        plans.push(plan);
     }
+    let second_plan = plans.pop().unwrap();
+    let first_plan = plans.pop().unwrap();
 
     let limit = OptimizeStepLimit::new(2);
     let probes = OptimizeStepProbes::rendezvous(2);
@@ -4210,8 +4235,8 @@ async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
         std::time::Duration::from_secs(30),
         with_optimize_step_probes(probes.clone(), async {
             tokio::join!(
-                store.stage_compaction(&first, &options, &limit),
-                store.stage_compaction(&second, &options, &limit),
+                store.stage_compaction(&first, first_plan, &limit),
+                store.stage_compaction(&second, second_plan, &limit),
                 limit.run(store.stage_index_fold(&third)),
                 limit.run(store.stage_index_fold(&fourth)),
             )
@@ -4226,5 +4251,144 @@ async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
         probes.peak_in_flight(),
         2,
         "the steps of every table share the budget of two"
+    );
+}
+
+/// A lagging vector index is rebuilt whole. A column Lance cannot train (no
+/// finite, non-null vector left to train on: its typed `Unprocessable`) is
+/// skipped and reported, with the other lagging indexes still staged; any
+/// other failure of the rebuild is an error, so a storage fault is never
+/// reported as a column that cannot train.
+#[tokio::test]
+async fn index_fold_skips_only_a_vector_column_that_cannot_train() {
+    use arrow_array::{BooleanArray, FixedSizeListArray, Float32Array};
+    use arrow_schema::FieldRef;
+    use lance::index::DatasetIndexExt;
+    use lance::index::vector::VectorIndexParams;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    const DIMENSION: usize = 4;
+    let item: FieldRef = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(item.clone(), DIMENSION as i32),
+            true,
+        ),
+    ]));
+    // Rows `first..first + rows`, with a vector when `with_vectors`.
+    let batch = |first: usize, rows: usize, with_vectors: bool| {
+        let ids = StringArray::from(
+            (first..first + rows)
+                .map(|row| format!("v{row}"))
+                .collect::<Vec<_>>(),
+        );
+        let validity = BooleanArray::from(vec![with_vectors; rows]);
+        let vectors = FixedSizeListArray::new(
+            item.clone(),
+            DIMENSION as i32,
+            Arc::new(Float32Array::from(
+                (0..rows * DIMENSION)
+                    .map(|value| (first * DIMENSION + value) as f32)
+                    .collect::<Vec<_>>(),
+            )),
+            Some(validity.values().clone().into()),
+        );
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vectors)]).unwrap()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let store = TableStore::new(root, test_session());
+    // An embedding vector index (and, with `btree`, an id BTREE) over the
+    // first fragment, then an appended fragment no index covers: each lags.
+    let lagging = |name: &'static str, btree: bool, appended_vectors: bool| {
+        let batch = &batch;
+        async move {
+            let uri = format!("{root}/{name}.lance");
+            let mut ds = TableStore::write_dataset(&uri, batch(0, 8, true))
+                .await
+                .unwrap();
+            if btree {
+                ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+                    .name("id_idx".to_string())
+                    .await
+                    .unwrap();
+            }
+            ds.create_index_builder(
+                &["embedding"],
+                IndexType::Vector,
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+            )
+            .name("embedding_idx".to_string())
+            .await
+            .unwrap();
+            let ds = Dataset::open(&uri).await.unwrap();
+            let ds =
+                TableStore::append_or_create_batch(&uri, Some(ds), batch(8, 4, appended_vectors))
+                    .await
+                    .unwrap();
+            (uri, ds)
+        }
+    };
+
+    // The indexed rows are deleted and the appended ones hold no vector: the
+    // vector index lags over a column with nothing to train on.
+    let (uri, mut untrainable) = lagging("untrainable", true, false).await;
+    let indexed = (0..8)
+        .map(|row| format!("'v{row}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    untrainable
+        .delete(&format!("id IN ({indexed})"))
+        .await
+        .unwrap();
+    let untrainable = Dataset::open(&uri).await.unwrap();
+    assert_eq!(untrainable.count_rows(None).await.unwrap(), 4);
+    let reconciliation = store
+        .stage_index_reconciliation(&untrainable, &[])
+        .await
+        .unwrap();
+    assert_eq!(reconciliation.skipped.len(), 1, "the vector column");
+    let (column, reason) = &reconciliation.skipped[0];
+    assert_eq!(column, "embedding");
+    assert!(reason.contains("KMeans cannot train"), "{reason}");
+    assert_eq!(
+        reconciliation.refreshed,
+        vec![super::RefreshedIndex {
+            column: "id".to_string(),
+            vector: false,
+            family: Some(omnigraph_core::dataset_index::ScalarIndexFamily::BTree),
+        }],
+        "the lagging BTREE is still rebuilt"
+    );
+    assert!(reconciliation.staged.is_some());
+
+    // A lagging vector index alone, over trainable vectors, with the
+    // appended fragment's data file gone: the rebuild fails on the read, and
+    // that is an error of the vector index's own rebuild.
+    let (uri, faulted) = lagging("faulted", false, true).await;
+    let appended = faulted
+        .get_fragments()
+        .into_iter()
+        .max_by_key(|fragment| fragment.id())
+        .unwrap();
+    let data_file = appended.metadata().files[0].path.clone();
+    std::fs::remove_file(format!("{uri}/data/{data_file}")).unwrap();
+    let error = match store.stage_index_reconciliation(&faulted, &[]).await {
+        Ok(reconciliation) => panic!(
+            "a rebuild that could not read its rows was reported as skipped {:?}",
+            reconciliation.skipped
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("stage_index_fold: fold index 'embedding_idx'"),
+        "{error}"
     );
 }

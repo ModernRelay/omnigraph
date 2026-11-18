@@ -68,6 +68,8 @@ pub struct CleanupPolicyOptions {
 #[non_exhaustive]
 pub enum TableOptimizeOutcome {
     /// A rewrite or index link was staged and is in the run's publication.
+    /// [`DatasetOptimizeStats::index_failure`] is set when an index link
+    /// failed after an earlier link of the table committed.
     Optimized,
     /// Planning found nothing to do.
     Unchanged,
@@ -142,9 +144,11 @@ impl ResourceMeasure {
     }
 }
 
-/// A table's plan against one ceiling. `measured` is `None` when the size
-/// could not be measured; otherwise counting stopped once it passed the
-/// ceiling, so it is a lower bound.
+/// A table's plan against one ceiling. `measured` is `None` when the plan
+/// records no size to count (a fragment without a row count, a Blob field
+/// the descriptors cannot size); otherwise counting stopped once it passed
+/// the ceiling, so it is a lower bound. A size that could not be read from
+/// storage is the table's failure, not a deferral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceExceeded {
     pub measure: ResourceMeasure,
@@ -220,6 +224,10 @@ pub struct DatasetOptimizeStats {
     /// The plan's source bytes, when a byte ceiling or the run's byte budget
     /// measured them; what the table spent of the budget.
     pub source_bytes: Option<u64>,
+    /// An index maintenance or coverage-reporting error after a link of this
+    /// table committed. All completed links are in the run's publication.
+    /// The next run plans any remaining work and checks coverage again.
+    pub index_failure: Option<Arc<OmniError>>,
 }
 
 impl DatasetOptimizeStats {
@@ -237,6 +245,7 @@ impl DatasetOptimizeStats {
             duration: Duration::ZERO,
             failure: None,
             source_bytes: None,
+            index_failure: None,
         }
     }
 
@@ -250,6 +259,7 @@ impl DatasetOptimizeStats {
             duration: Duration::ZERO,
             failure: None,
             source_bytes: None,
+            index_failure: None,
         }
     }
 
@@ -263,6 +273,7 @@ impl DatasetOptimizeStats {
             duration,
             failure: Some(failure),
             source_bytes: None,
+            index_failure: None,
         }
     }
 
@@ -271,6 +282,20 @@ impl DatasetOptimizeStats {
     /// materialization.
     pub fn committed(&self) -> bool {
         self.outcome == TableOptimizeOutcome::Optimized
+    }
+
+    /// The stable token that qualifies [`Self::outcome`] in serialized
+    /// output: why a deferred table was not started, or `index_failed` on an
+    /// optimized table with an index maintenance or coverage error after a
+    /// link committed ([`Self::index_failure`] holds the error). `None` for
+    /// every other table. Once emitted a token is part of the output
+    /// contract; keep it stable.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self.outcome {
+            TableOptimizeOutcome::Deferred(reason) => Some(reason.as_str()),
+            TableOptimizeOutcome::Optimized if self.index_failure.is_some() => Some("index_failed"),
+            _ => None,
+        }
     }
 }
 
@@ -379,10 +404,10 @@ pub struct OptimizeReport {
     /// The graph commit the run published; `None` when it staged no table.
     pub graph_commit_id: Option<String>,
     /// One entry per table the run considered, in the order it visited them.
-    pub tables: Vec<DatasetOptimizeStats>,
+    pub datasets: Vec<DatasetOptimizeStats>,
     /// The first table a full-catalog run deferred because of a run-wide
     /// bound. A full-catalog run that passes it as `start_at` visits it
-    /// first. `None` when the run stopped on no bound, and for a `tables`
+    /// first. `None` when the run stopped on no bound, and for a `datasets`
     /// request, which neither reads nor moves the resume position.
     pub resume_at: Option<String>,
     /// How long the run held main's writer gates, from acquisition to release.
@@ -591,7 +616,7 @@ pub struct OptimizePublication {
     /// The `__manifest` version of that head.
     pub input_manifest_version: u64,
     /// One outcome for every table the run considered, as the report lists them.
-    pub tables: Vec<DatasetOptimizeStats>,
+    pub datasets: Vec<DatasetOptimizeStats>,
 }
 
 /// Called once, after the run's tables are staged and prepared and before the
@@ -643,7 +668,7 @@ pub enum AuthorityCapture {
 pub struct OptimizeRequest {
     /// Only these table keys (`node:<Type>`, `edge:<Type>`), in this order.
     /// A key that names no declared type is refused before any effect.
-    pub tables: Option<Vec<String>>,
+    pub datasets: Option<Vec<String>>,
     /// For a full-catalog run: start at this table key, or at the first key
     /// after it when no table has it, and wrap around, so the run visits every
     /// table at most once.
@@ -662,12 +687,12 @@ impl OptimizeRequest {
         self
     }
 
-    pub fn with_tables<I, S>(mut self, tables: I) -> Self
+    pub fn with_datasets<I, S>(mut self, table_keys: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.tables = Some(tables.into_iter().map(Into::into).collect());
+        self.datasets = Some(table_keys.into_iter().map(Into::into).collect());
         self
     }
 
@@ -714,7 +739,7 @@ impl OptimizeRequest {
                 "optimize table byte ceiling {table} exceeds the run byte budget {budget}"
             )));
         }
-        let Some(tables) = &self.tables else {
+        let Some(tables) = &self.datasets else {
             let start = self
                 .start_at
                 .as_ref()
@@ -786,13 +811,20 @@ struct PreparedOptimizeTable {
     initial_snapshot: crate::storage_layer::SnapshotHandle,
     witness: crate::table_store::StagingWitness,
     last_linear_version: Option<u64>,
+    /// The compaction plan made for `initial_snapshot`, measured against the
+    /// ceilings and executed as it is: staging does not plan again.
+    plan: lance::dataset::optimize::CompactionPlan,
+    /// Declared indexes already known to be pending if a later link fails
+    /// before the table can plan its index build again.
+    pending_indexes: Vec<super::PendingIndex>,
     /// The plan's source bytes, measured when a byte ceiling or the run's
     /// byte budget is set.
     source_bytes: Option<u64>,
 }
 
 enum OptimizePreparation {
-    Work(PreparedOptimizeTable),
+    /// Boxed: the prepared table carries its compaction plan.
+    Work(Box<PreparedOptimizeTable>),
     Stat(DatasetOptimizeStats),
 }
 
@@ -880,7 +912,7 @@ pub async fn optimize_all_datasets(
     let visit_order = request
         .visit_order(&table_keys)
         .map_err(OmniError::before_effect)?;
-    let full_catalog = request.tables.is_none();
+    let full_catalog = request.datasets.is_none();
 
     // A run cancelled before it holds main's gates (while it waits for the
     // gates behind writers) stops there, holding
@@ -891,7 +923,7 @@ pub async fn optimize_all_datasets(
         input_commit: authority_txn.authority.graph_head.clone(),
         input_manifest_version: authority_txn.base.graph_manifest_version(),
         graph_commit_id: None,
-        tables: visit_order
+        datasets: visit_order
             .iter()
             .filter(|table_key| authority_txn.base.dataset(table_key).is_some())
             .map(|table_key| {
@@ -986,10 +1018,13 @@ pub async fn optimize_all_datasets(
         })
         .collect::<Vec<_>>();
 
+    // A hold the clock cannot add to now is past any deadline the run could
+    // reach, so it bounds nothing; `Instant + Duration` would panic here,
+    // with the gates held.
     let deadline = request
         .limits
         .max_gate_hold
-        .map(|hold| gates_acquired + hold);
+        .and_then(|hold| gates_acquired.checked_add(hold));
     let cancellation = request.cancellation.as_ref();
     let cancel_requested = || cancellation.is_some_and(OptimizeCancellation::is_cancelled);
     let visited = run_table_pipeline(
@@ -1044,7 +1079,7 @@ pub async fn optimize_all_datasets(
                     nonce: intent.nonce,
                     input_commit: intent.input_commit,
                     input_manifest_version: intent.input_manifest_version,
-                    tables: tables.clone(),
+                    datasets: tables.clone(),
                 })
             }
         });
@@ -1113,7 +1148,7 @@ pub async fn optimize_all_datasets(
         input_commit,
         input_manifest_version,
         graph_commit_id,
-        tables,
+        datasets: tables,
         // A cancelled run moved nothing, so the next run starts where this one did.
         resume_at: visited.resume_at.filter(|_| full_catalog && !cancelled),
         gate_hold,
@@ -1242,7 +1277,7 @@ async fn run_table_pipeline(
                     }
                     Ok(OptimizePreparation::Work(work)) => {
                         spent = spent.saturating_add(work.source_bytes.unwrap_or(0));
-                        staging.push(stage(index, started, work));
+                        staging.push(stage(index, started, *work));
                     }
                     // Planning only reads.
                     Err(error) => {
@@ -1560,9 +1595,9 @@ async fn prepare_optimize_table(
         .open_pinned_for_write(&task.full_path, &task.entry)
         .await?;
 
-    // The same plan `stage_compaction` executes: a fragment still holding a
-    // dropped property's values is compaction work even when Lance's planner
-    // would leave the table alone.
+    // The plan `stage_compaction` executes, made once: a fragment still
+    // holding a dropped property's values is compaction work even when
+    // Lance's planner would leave the table alone.
     let options = CompactionOptions::default();
     let plan = TableStore::plan_table_compaction(snapshot.dataset(), &options).await?;
     let will_compact = plan.num_tasks() > 0;
@@ -1600,8 +1635,8 @@ async fn prepare_optimize_table(
     // addresses, and the engine builds none, and only a data overlay newer
     // than an index drops a fragment from it, and no engine writer creates
     // one), so compaction alone causes no fold after it.
-    let index_work = needs_reindex || index_work.needs_commit;
-    let source_bytes = match measure_plan(snapshot.dataset(), &source, index_work, limits).await? {
+    let will_index = needs_reindex || index_work.needs_commit;
+    let source_bytes = match measure_plan(snapshot.dataset(), &source, will_index, limits).await? {
         Ok(source_bytes) => source_bytes,
         Err(exceeded) => {
             return Ok(OptimizePreparation::Stat(DatasetOptimizeStats::deferred(
@@ -1611,7 +1646,7 @@ async fn prepare_optimize_table(
         }
     };
 
-    Ok(OptimizePreparation::Work(PreparedOptimizeTable {
+    Ok(OptimizePreparation::Work(Box::new(PreparedOptimizeTable {
         identity: task.identity,
         table_key: task.table_key,
         full_path: task.full_path,
@@ -1619,14 +1654,19 @@ async fn prepare_optimize_table(
         initial_snapshot: snapshot,
         witness: task.witness,
         last_linear_version: task.entry.version_metadata.last_linear_version(),
+        plan,
+        pending_indexes: index_work.pending,
         source_bytes,
-    }))
+    })))
 }
 
 /// Measure a table's plan against its ceilings, in order, and stop at the
 /// first one it passes; the fragment count comes first, so it bounds the size
 /// requests. Only a set ceiling is measured. On success, the source bytes when
-/// a byte ceiling or the run's byte budget needs them.
+/// a byte ceiling or the run's byte budget needs them. A storage read that
+/// fails while measuring is returned as the error it is, so the table is
+/// reported failed with its cause; a deferral names only a ceiling the plan
+/// passed or a size the plan does not record.
 async fn measure_plan(
     ds: &lance::Dataset,
     source: &[lance_table::format::Fragment],
@@ -1664,13 +1704,11 @@ async fn measure_plan(
     }
     let mut source_bytes = None;
     if let Some(ceiling) = limits.table_source_bytes() {
-        match source_file_bytes(ds, source, ceiling).await {
-            Some(bytes) if bytes > ceiling => {
-                return over(ResourceMeasure::SourceBytes, Some(bytes), ceiling);
-            }
-            Some(bytes) => source_bytes = Some(bytes),
-            None => return over(ResourceMeasure::SourceBytes, None, ceiling),
+        let bytes = source_file_bytes(ds, source, ceiling).await?;
+        if bytes > ceiling {
+            return over(ResourceMeasure::SourceBytes, Some(bytes), ceiling);
         }
+        source_bytes = Some(bytes);
     }
     if let Some(ceiling) = ceilings.blob_bytes
         && !source.is_empty()
@@ -1686,12 +1724,11 @@ async fn measure_plan(
     if let Some(ceiling) = ceilings.index_rows
         && index_work
     {
-        match ds.count_rows(None).await {
-            Ok(rows) if rows as u64 > ceiling => {
-                return over(ResourceMeasure::IndexRows, Some(rows as u64), ceiling);
-            }
-            Ok(_) => {}
-            Err(_) => return over(ResourceMeasure::IndexRows, None, ceiling),
+        let rows = ds.count_rows(None).await.map_err(|error| {
+            OmniError::storage_context("optimize: count the rows an index would cover", error)
+        })? as u64;
+        if rows > ceiling {
+            return over(ResourceMeasure::IndexRows, Some(rows), ceiling);
         }
     }
     Ok(Ok(source_bytes))
@@ -1700,40 +1737,65 @@ async fn measure_plan(
 /// The bytes of `source`'s data, overlay and deletion files: a data file's
 /// recorded size, or a HEAD of the file when none is recorded, and a HEAD of
 /// each deletion file, which records no size in Lance 13. Each file resolves
-/// through the collector's base rule. Counting stops once it passes
-/// `ceiling`. `None` when a size cannot be read.
+/// through the collector's base rule. The recorded sizes are summed first,
+/// since they cost no request; the HEADs then run side by side, as many as
+/// the table's object store allows (`io_parallelism`), and are counted in
+/// file order. Counting stops once it passes `ceiling`, so a total above it
+/// is a lower bound. A size that cannot be read is an error.
 async fn source_file_bytes(
     ds: &lance::Dataset,
     source: &[lance_table::format::Fragment],
     ceiling: u64,
-) -> Option<u64> {
+) -> Result<u64> {
     let mut total = 0_u64;
+    for file in source
+        .iter()
+        .flat_map(|fragment| fragment.referenced_lance_files())
+    {
+        if let Some(size) = file.file_size_bytes.get() {
+            total = total.saturating_add(size.get());
+        }
+    }
+    if total > ceiling {
+        return Ok(total);
+    }
+    // Resolved to owned stores and paths before the requests run, so the
+    // concurrent requests borrow nothing from the plan.
+    let mut unsized_files = Vec::new();
     for fragment in source {
         for file in fragment.referenced_lance_files() {
-            let size = match file.file_size_bytes.get() {
-                Some(size) => size.get(),
-                None => {
-                    let (store, path) =
-                        super::collector::data_file_location(ds, file).await.ok()?;
-                    store.size(&path).await.ok()?
-                }
-            };
-            total = total.saturating_add(size);
-            if total > ceiling {
-                return Some(total);
+            if file.file_size_bytes.get().is_none() {
+                unsized_files.push(super::collector::data_file_location(ds, file).await?);
             }
         }
         if let Some(deletion) = &fragment.deletion_file {
-            let (store, path) = super::collector::deletion_file_location(ds, fragment.id, deletion)
-                .await
-                .ok()?;
-            total = total.saturating_add(store.size(&path).await.ok()?);
-            if total > ceiling {
-                return Some(total);
-            }
+            unsized_files
+                .push(super::collector::deletion_file_location(ds, fragment.id, deletion).await?);
         }
     }
-    Some(total)
+    if unsized_files.is_empty() {
+        return Ok(total);
+    }
+    let parallelism = ds
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?
+        .io_parallelism()
+        .max(1);
+    let mut sizes = futures::stream::iter(unsized_files)
+        .map(|(store, path)| async move {
+            store.size(&path).await.map_err(|error| {
+                OmniError::storage_context(format!("optimize: size of {path}"), error)
+            })
+        })
+        .buffered(parallelism);
+    while let Some(size) = sizes.next().await {
+        total = total.saturating_add(size?);
+        if total > ceiling {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 decide_seam! {
@@ -1746,14 +1808,39 @@ decide_seam! {
     pub static OPTIMIZE_BEFORE_COMPACT = ("optimize.before_compact", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// At the start of each of one table's index links, the fold and the
+    /// index build, after the links before it, if any, committed detached
+    /// (RFC 0067). A failure here is that index link's: a table with a
+    /// committed link still publishes it.
+    pub static OPTIMIZE_BEFORE_INDEX_LINK = ("optimize.before_index_link", Unreachable, [Fail]);
+}
+
+/// A link one table committed detached: the snapshot at it and the staging
+/// identity the manifest pin names.
+type CommittedLink = (
+    crate::storage_layer::SnapshotHandle,
+    crate::table_store::StagedTransactionIdentity,
+);
+
 /// Stage one productive table's maintenance detached from its pin, as a
-/// chain of at most three links: the compaction rewrite, then a whole rebuild
-/// of every foldable index whose coverage lags the rewritten layout (Lance 11
-/// folds only through a linear commit, so `stage_index_fold` rebuilds instead
-/// of merging), then any declared-but-unbuilt index. The rewrite comes first
-/// so an index is rebuilt once, over the settled layout. Each compaction
-/// task, the fold and the index build hold one permit of `step_limit`, the
-/// run's budget, while they run.
+/// chain of at most three links: the compaction rewrite, from the plan the
+/// table was measured with, then a whole rebuild of every foldable index
+/// whose coverage lags the rewritten layout (Lance 13 folds only through a
+/// linear commit, so `stage_index_fold` rebuilds instead of merging), then
+/// any declared-but-unbuilt index. The rewrite comes first so an index is
+/// rebuilt once, over the settled layout. Each compaction task, the fold and
+/// the index build hold one permit of `step_limit`, the run's budget, while
+/// they run.
+///
+/// The links are independent derived state, so an index link does not decide
+/// the fate of the links before it: when the fold or the index build fails
+/// after an earlier link of the table committed, the committed links are
+/// still the table's effect and are published, and the table reports the
+/// failure (`DatasetOptimizeStats::index_failure`). A table whose index
+/// cannot be built is still compacted, and the next run plans the remaining
+/// index work again. With no link committed before it, an index link's
+/// failure is the table's.
 async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
@@ -1767,14 +1854,14 @@ async fn apply_optimize_table_effects(
     let source_bytes = work.source_bytes;
     let declared_full_text = super::table_ops::declared_full_text_columns(catalog, &table_key)?;
     fail(&OPTIMIZE_BEFORE_COMPACT)?;
-    let options = CompactionOptions::default();
-    let mut chain = Vec::new();
+    // Links committed for the table: each moves its published version by one.
+    let mut links = 0_u64;
     let mut tip = base.clone();
     let mut tip_identity = None;
     let mut metrics = CompactionMetrics::default();
     if let Some((staged, compaction_metrics)) = db
         .storage()
-        .stage_compaction(&base, &options, step_limit)
+        .stage_compaction(&base, work.plan, step_limit)
         .await?
     {
         let (rewrite, identity) = db
@@ -1784,31 +1871,50 @@ async fn apply_optimize_table_effects(
         metrics = compaction_metrics;
         tip = rewrite;
         tip_identity = Some(identity);
+        links += 1;
         fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
     }
     // Fold every index whose coverage lags (appended fragments) as a detached
-    // rebuild chained on the rewrite. The rewrite itself leaves none lagging:
-    // Lance 13 carries a row-id-domain index's coverage to the new fragments,
-    // the engine builds no address-domain index, and no engine writer creates
-    // the data overlays that would also drop coverage.
-    let (fold, skipped_folds) = step_limit.run(db.storage().stage_index_fold(&tip)).await?;
-    if let Some(staged) = fold {
-        if tip_identity.is_some() {
-            chain.push(tip.clone());
+    // rebuild chained on the rewrite, then build the declared indexes the
+    // table lacks. The rewrite itself leaves none lagging: Lance 13 carries a
+    // row-id-domain index's coverage to the new fragments, the engine builds
+    // no address-domain index, and no engine writer creates the data overlays
+    // that would also drop coverage.
+    let mut pending_indexes = work.pending_indexes;
+    let mut skipped_folds = Vec::new();
+    let fold = stage_fold_link(
+        db,
+        &tip,
+        &witness,
+        &declared_full_text,
+        step_limit,
+        &mut skipped_folds,
+    )
+    .await;
+    let build = match fold {
+        Ok(folded) => {
+            if let Some((folded, identity)) = folded {
+                tip = folded;
+                tip_identity = Some(identity);
+                links += 1;
+                fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
+            }
+            stage_build_link(
+                db,
+                catalog,
+                &table_key,
+                &tip,
+                &mut pending_indexes,
+                &witness,
+                &declared_full_text,
+                step_limit,
+            )
+            .await
         }
-        let (folded, identity) = db
-            .storage()
-            .commit_staged_detached(tip, staged, &witness, &declared_full_text)
-            .await?;
-        tip = folded;
-        tip_identity = Some(identity);
-        fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
-    }
-    let mut index_work =
-        super::table_ops::plan_index_work_on_dataset_for_catalog(db, catalog, &table_key, &tip)
-            .await?;
+        Err(error) => Err(error),
+    };
     for (column, reason) in skipped_folds {
-        index_work.pending.push(super::PendingIndex {
+        pending_indexes.push(super::PendingIndex {
             type_key: table_key.clone(),
             property: column,
             reason: format!(
@@ -1816,54 +1922,47 @@ async fn apply_optimize_table_effects(
             ),
         });
     }
-    if !index_work.specs.is_empty() {
-        let staged = step_limit
-            .run(db.storage().stage_create_indices(&tip, &index_work.specs))
+    let index_result = match build {
+        Ok(built) => {
+            if let Some((built, identity)) = built {
+                tip = built;
+                tip_identity = Some(identity);
+                links += 1;
+                fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
+            }
+            // Keep the completed link when only this status read fails.
+            super::table_ops::append_deferred_full_text_indexes(
+                &tip,
+                &table_key,
+                "main",
+                &[],
+                &mut pending_indexes,
+            )
             .await
-            .map_err(|error| {
-                error.with_context(format!(
-                    "stage index batch on {table_key} ({:?})",
-                    index_work.specs
-                ))
-            })?;
-        if tip_identity.is_some() {
-            chain.push(tip.clone());
+            .map_err(|error| error.with_context("read full-text index coverage"))
         }
-        let (indexed, identity) = db
-            .storage()
-            .commit_staged_detached(tip, staged, &witness, &declared_full_text)
-            .await?;
-        tip = indexed;
-        tip_identity = Some(identity);
-        fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
-    }
+        Err(error) => Err(error),
+    };
+    let index_failure = match index_result {
+        Ok(()) => None,
+        Err(error) => Some(index_maintenance_failure(
+            error,
+            tip_identity.is_some(),
+            &table_key,
+        )?),
+    };
     let Some(identity) = tip_identity else {
         let mut stat = DatasetOptimizeStats::planned(table_key, &metrics, false);
         stat.source_bytes = source_bytes;
-        stat.pending_indexes = index_work.pending;
-        super::table_ops::append_deferred_full_text_indexes(
-            &tip,
-            &stat.type_key,
-            "main",
-            &[],
-            &mut stat.pending_indexes,
-        )
-        .await?;
+        stat.pending_indexes = pending_indexes;
         return Ok(OptimizeEffectOutcome { stat, effect: None });
     };
     let mut stat = DatasetOptimizeStats::planned(table_key.clone(), &metrics, true);
     stat.source_bytes = source_bytes;
-    stat.pending_indexes = index_work.pending;
-    super::table_ops::append_deferred_full_text_indexes(
-        &tip,
-        &stat.type_key,
-        "main",
-        &[],
-        &mut stat.pending_indexes,
-    )
-    .await?;
+    stat.pending_indexes = pending_indexes;
+    stat.index_failure = index_failure;
     let state = db.storage().table_state(&full_path, &tip).await?;
-    let published_dataset_version = work.expected_version + 1 + chain.len() as u64;
+    let published_dataset_version = work.expected_version + links;
     let version_metadata = state
         .version_metadata
         .with_staged(state.version, identity.uuid.clone())
@@ -1883,6 +1982,99 @@ async fn apply_optimize_table_effects(
             expected_version: work.expected_version,
         }),
     })
+}
+
+/// What an index maintenance or coverage error means for its table. After a
+/// link of the table committed, a failure with definite evidence stays with the
+/// table as its index failure and the committed links publish; an uncertain
+/// one fails the run, as any staging failure does. With no link committed,
+/// the failure is the table's.
+fn index_maintenance_failure(
+    error: OmniError,
+    committed: bool,
+    table_key: &str,
+) -> Result<Arc<OmniError>> {
+    if !committed {
+        return Err(error);
+    }
+    let error = error.with_completion_evidence(CompletionEvidence::Unpublished);
+    if !matches!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::BeforeEffect | CompletionEvidence::Unpublished)
+    ) {
+        return Err(error);
+    }
+    tracing::warn!(
+        target: "omnigraph::optimize",
+        table = table_key,
+        error = %error,
+        "optimize retains the table's committed links after an index maintenance error"
+    );
+    Ok(Arc::new(error))
+}
+
+/// One table's fold link at `tip`: stage a whole rebuild of every foldable
+/// index whose coverage lags, holding one permit of `step_limit`, and commit
+/// it detached. Record the vector columns that could not train before the
+/// commit, so its failure keeps those reasons. Returns `None` when no index
+/// lagged or none could be rebuilt.
+async fn stage_fold_link(
+    db: &Omnigraph,
+    tip: &crate::storage_layer::SnapshotHandle,
+    witness: &crate::table_store::StagingWitness,
+    declared_full_text: &[crate::storage_layer::FullTextColumn],
+    step_limit: &crate::table_store::OptimizeStepLimit,
+    skipped_folds: &mut Vec<(String, String)>,
+) -> Result<Option<CommittedLink>> {
+    fail(&OPTIMIZE_BEFORE_INDEX_LINK)?;
+    let (fold, skipped) = step_limit.run(db.storage().stage_index_fold(tip)).await?;
+    *skipped_folds = skipped;
+    let Some(staged) = fold else {
+        return Ok(None);
+    };
+    db.storage()
+        .commit_staged_detached(tip.clone(), staged, witness, declared_full_text)
+        .await
+        .map(Some)
+}
+
+/// One table's index-build link at `tip`: plan the declared indexes the
+/// table lacks, stage them as one `CreateIndex`, holding one permit of
+/// `step_limit`, and commit it detached. Refresh the declared pending indexes
+/// as soon as the plan is known, so a build failure keeps them. Returns
+/// `None` when no declared index was missing.
+#[allow(clippy::too_many_arguments)]
+async fn stage_build_link(
+    db: &Omnigraph,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    table_key: &str,
+    tip: &crate::storage_layer::SnapshotHandle,
+    pending_indexes: &mut Vec<super::PendingIndex>,
+    witness: &crate::table_store::StagingWitness,
+    declared_full_text: &[crate::storage_layer::FullTextColumn],
+    step_limit: &crate::table_store::OptimizeStepLimit,
+) -> Result<Option<CommittedLink>> {
+    fail(&OPTIMIZE_BEFORE_INDEX_LINK)?;
+    let index_work =
+        super::table_ops::plan_index_work_on_dataset_for_catalog(db, catalog, table_key, tip)
+            .await?;
+    *pending_indexes = index_work.pending;
+    if index_work.specs.is_empty() {
+        return Ok(None);
+    }
+    let staged = step_limit
+        .run(db.storage().stage_create_indices(tip, &index_work.specs))
+        .await
+        .map_err(|error| {
+            error.with_context(format!(
+                "stage index batch on {table_key} ({:?})",
+                index_work.specs
+            ))
+        })?;
+    db.storage()
+        .commit_staged_detached(tip.clone(), staged, witness, declared_full_text)
+        .await
+        .map(Some)
 }
 
 const INTERNAL_CONFIG_RETRY_BUDGET: u32 = 5;
@@ -2829,6 +3021,70 @@ mod tests {
             db.uri().trim_end_matches('/'),
             table_path.trim_start_matches('/')
         )
+    }
+
+    /// #1384: optimize takes every heavy step of the tables it stages, each
+    /// compaction task, index fold and index build, through its run's one
+    /// budget of `concurrency.rewrite` steps. Two tables each have one
+    /// compaction task, a fold to look for and a key index to build. Every
+    /// step waits at a
+    /// two-party rendezvous, so steps that never ran side by side time out,
+    /// a step taken outside the budget is not counted, and a budget per
+    /// table would not hold the peak at two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn optimize_takes_every_tables_heavy_steps_through_one_budget_issue_1384() {
+        use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let schema = "node Person { name: String @key }\nnode Company { name: String @key }\n";
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(Omnigraph::init(uri, schema).await.unwrap()),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        // Three one-row fragments per table: one compaction task each.
+        for name in ["a", "b", "c"] {
+            for type_name in ["Person", "Company"] {
+                db.load_jsonl(
+                    &format!("{{\"type\":\"{type_name}\",\"data\":{{\"name\":\"{name}\"}}}}"),
+                    LoadMode::Merge,
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let probes = OptimizeStepProbes::rendezvous(2);
+        let report = tokio::time::timeout(
+            Duration::from_secs(30),
+            with_optimize_step_probes(
+                probes.clone(),
+                optimize_all_datasets(
+                    &db,
+                    None,
+                    OptimizeRequest::default().with_concurrency(OptimizeConcurrency::new(2, 2)),
+                ),
+            ),
+        )
+        .await
+        .expect("the two tables' steps never ran side by side")
+        .unwrap();
+        assert_eq!(report.datasets.len(), 2, "{report:?}");
+        for stat in &report.datasets {
+            assert!(stat.committed(), "{stat:?}");
+            assert!(stat.fragments_removed > 1, "one compaction task: {stat:?}");
+            assert!(stat.index_failure.is_none(), "{stat:?}");
+        }
+        assert_eq!(
+            probes.entered(),
+            6,
+            "one compaction task, one fold and one index build per table, each within the budget"
+        );
+        assert_eq!(
+            probes.peak_in_flight(),
+            2,
+            "the run never has more steps in flight than its rewrite concurrency"
+        );
     }
 
     #[tokio::test]

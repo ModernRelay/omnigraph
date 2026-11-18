@@ -41,7 +41,7 @@ use crate::command_outcome::{EngineWrite as _, EngineWriteError};
 use crate::graph_http::ApiContractError;
 use crate::graph_http::GraphHttpClient;
 use crate::helpers::{
-    PreconditionFailedCli, apply_bearer_token, branch_statement_change_request,
+    ContradictoryReply, PreconditionFailedCli, apply_bearer_token, branch_statement_change_request,
     branch_statement_query_request, missing_credential, precondition_failed_cli,
     query_params_from_json, remote_json_bounded, remote_no_content, remote_response_json_bounded,
     remote_url, resolve_actor_with_config, select_named_query,
@@ -80,9 +80,9 @@ fn validate_merge_receipt(
         {
             Ok(())
         }
-        _ => bail!(
-            "invalid merge response: outcome and commit disagree; effects are unknown; reconcile before retrying"
-        ),
+        _ => Err(ContradictoryReply::report(
+            "invalid merge response: outcome and commit disagree; effects are unknown; reconcile before retrying",
+        )),
     }
 }
 
@@ -95,14 +95,14 @@ fn validate_merge_output(
     dry_run: bool,
 ) -> Result<()> {
     if output.source != source || output.target != target {
-        bail!(
-            "invalid merge response: source or target differs from the request; effects are unknown; reconcile before retrying"
-        );
+        return Err(ContradictoryReply::report(
+            "invalid merge response: source or target differs from the request; effects are unknown; reconcile before retrying",
+        ));
     }
     if output.dry_run != dry_run {
-        bail!(
-            "invalid merge response: the dry-run flag contradicts the request; effects are unknown; reconcile before retrying"
-        );
+        return Err(ContradictoryReply::report(
+            "invalid merge response: the dry-run flag contradicts the request; effects are unknown; reconcile before retrying",
+        ));
     }
     if dry_run {
         // A dry run writes nothing: no commit, no deletion.
@@ -110,9 +110,9 @@ fn validate_merge_output(
             || output.branch_deleted.is_some()
             || output.branch_delete_error_details.is_some()
         {
-            bail!(
-                "invalid merge response: a dry run reported a write; effects are unknown; reconcile before retrying"
-            );
+            return Err(ContradictoryReply::report(
+                "invalid merge response: a dry run reported a write; effects are unknown; reconcile before retrying",
+            ));
         }
         return Ok(());
     }
@@ -127,9 +127,9 @@ fn validate_merge_output(
         .as_ref()
         .is_some_and(|commit| commit.published == as_commit)
     {
-        bail!(
-            "invalid merge response: the commit's publication state contradicts the request; effects are unknown; reconcile before retrying"
-        );
+        return Err(ContradictoryReply::report(
+            "invalid merge response: the commit's publication state contradicts the request; effects are unknown; reconcile before retrying",
+        ));
     }
     match (
         delete_branch,
@@ -138,9 +138,9 @@ fn validate_merge_output(
     ) {
         (false, None, None) | (true, Some(true), None) => Ok(()),
         (true, Some(false), Some(error)) if !error.error.is_empty() => Ok(()),
-        _ => bail!(
-            "invalid merge response: optional deletion result is incomplete or inconsistent; effects are unknown; reconcile before retrying"
-        ),
+        _ => Err(ContradictoryReply::report(
+            "invalid merge response: optional deletion result is incomplete or inconsistent; effects are unknown; reconcile before retrying",
+        )),
     }
 }
 
@@ -1523,15 +1523,15 @@ impl GraphClient {
                         merge,
                     }) = &output.outcome
                     else {
-                        bail!(
-                            "invalid merge response: missing merge outcome; effects are unknown; reconcile before retrying"
-                        );
+                        return Err(ContradictoryReply::report(
+                            "invalid merge response: missing merge outcome; effects are unknown; reconcile before retrying",
+                        ));
                     };
                     if actual_source != source || actual_target != target || output.branch != target
                     {
-                        bail!(
-                            "invalid merge response: source or target differs from the request; effects are unknown; reconcile before retrying"
-                        );
+                        return Err(ContradictoryReply::report(
+                            "invalid merge response: source or target differs from the request; effects are unknown; reconcile before retrying",
+                        ));
                     }
                     validate_merge_receipt(
                         *merge,
@@ -1544,9 +1544,9 @@ impl GraphClient {
                         .as_ref()
                         .is_some_and(|commit| commit.published == *as_commit)
                     {
-                        bail!(
-                            "invalid merge response: the commit's publication state contradicts the request; effects are unknown; reconcile before retrying"
-                        );
+                        return Err(ContradictoryReply::report(
+                            "invalid merge response: the commit's publication state contradicts the request; effects are unknown; reconcile before retrying",
+                        ));
                     }
                 }
                 Ok(output)
@@ -1675,10 +1675,10 @@ impl GraphClient {
                     _ => false,
                 };
                 if !answered {
-                    bail!(
+                    return Err(ContradictoryReply::report(format!(
                         "invalid `{}` response: the outcome does not describe the requested commit; effects are unknown; reconcile before retrying",
                         write.statement_name()
-                    );
+                    )));
                 }
                 Ok(output)
             }
@@ -1849,9 +1849,9 @@ impl GraphClient {
             GraphClient::Catalogue => return Err(catalogue_scope_refusal("commit publish")),
         };
         if !published.published || published.graph_commit_id != commit_id {
-            bail!(
-                "invalid `commit publish` response: the answer does not describe the requested commit as published; effects are unknown; reconcile before retrying"
-            );
+            return Err(ContradictoryReply::report(
+                "invalid `commit publish` response: the answer does not describe the requested commit as published; effects are unknown; reconcile before retrying",
+            ));
         }
         Ok(published)
     }

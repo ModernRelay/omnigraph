@@ -79,21 +79,27 @@ all (a Blob table's tasks one at a time): budget for that many Blob tables.
 
 ### Bounding a run
 
-Writes to `main` wait while optimize holds its writer gates. A run given
-`--max-gate-hold 30s` starts no table after that long except the first: the
-rest are `deferred`, finished tables publish, and a writer waits at most the
-bound plus one rewrite. Tables run in type-key order; `resume_at` names the
-first deferred one, and `--tables` runs only the listed tables, in order. Each
-table's `outcome` is `optimized`, `unchanged`, `deferred` or
-`failed` (with its `error`; the other tables still publish). The report adds
-`input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
-and `artifact` outcomes, which never fail a published run.
+With `--max-gate-hold 30s`, the first table runs even if the deadline has
+passed. After the deadline, remaining tables are deferred and completed work
+publishes. Writers to `main` wait at most the bound plus one rewrite.
+Direct runs visit tables in type-key order. Copy the printed argument (e.g.
+`--start-at node:Person`) to resume at the first deferred table and wrap around.
+JSON exposes the same key in `resume_at`. A [server](recorded-operations.md)
+remembers its position. Use `--datasets` to visit only the listed tables, in order.
 
-A served run also applies the server's
-[table ceilings and byte budget](recorded-operations.md#table-ceilings-and-the-byte-budget).
-A table over a ceiling is `deferred` with reason `resource_limit` on every run
-until a ceiling is raised or a direct run optimizes it, and does not set
-`resume_at`.
+Check each table's `outcome` even on exit 0. It can be `optimized`, `unchanged`,
+`deferred` or `failed`. A failed table includes its `error`. Other tables still publish.
+If index maintenance or its coverage check fails after a rewrite or index build,
+completed work publishes as `optimized` with `reason: index_failed` and the error.
+The direct report keeps any indexes already identified as pending in `pending_indexes`.
+The next run checks coverage and plans remaining work. The report includes
+`input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
+and `artifact` outcomes. Neither of those last two can fail a published run.
+
+A served run also applies the server's [table ceilings and byte
+budget](recorded-operations.md#table-ceilings-and-the-byte-budget). A table over
+a ceiling is `deferred` with reason `resource_limit` on every run until a
+ceiling is raised or a direct run optimizes it, and does not set `resume_at`.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
@@ -120,16 +126,17 @@ omnigraph index build --target ./cluster-root --graph knowledge \
 ```
 
 On any branch, `index build` builds every declared index a table lacks and
-rebuilds whole, in its own kind, each BTREE, BITMAP, LABEL_LIST, NGRAM or
-vector index that leaves rows uncovered, and each vector index built for
-another [distance](../search/distances.md) than its property's. Every
-table publishes in one graph commit on that branch; other branches and snapshots
-keep their indexes, and a branch with nothing to do publishes nothing. The
-default branch is `main`. As with optimize, a write that lands on a table while
-its batch is staged fails the run with a read-set conflict; run it again. Vector
-properties with no vectors yet and full-text coverage stay pending: only `index
-rebuild --kind full-text` refreshes full-text coverage. No query reads that
-coverage: matching and ranking read the rows with the field's profile.
+rebuilds whole, in its own kind, each BTREE, BITMAP, LABEL_LIST, NGRAM or vector
+index that leaves rows uncovered, and each vector index built for another
+[distance](../search/distances.md) than its property's. Every table publishes in
+one graph commit on that branch; other branches and snapshots keep their
+indexes, and a branch with nothing to do publishes nothing. The default branch
+is `main`. As with optimize, a write that lands on a table while its batch is
+staged fails the run with a read-set conflict; run it again. Vector properties
+with no vectors yet and full-text coverage stay pending: only `index rebuild
+--kind full-text` refreshes full-text coverage, which no query reads. A vector
+rebuild that fails for a reason other than nothing to train on, such as a
+storage failure, fails the command.
 
 JSON reports `branch`, `graph_commit_id` (null for a no-op), `indexes` with each
 `type_key`, `property` (the indexed column, `__id` for the identity index),
@@ -317,21 +324,20 @@ for tables with an `error`.
 
 ### Foreign versions
 
-Every Omnigraph table write is a detached Lance commit that a graph commit
-pins, so a table's linear Lance history ends where the table was created. The
+Every Omnigraph table write is a detached Lance commit that a graph commit pins,
+so a table's linear Lance history ends where the table was created. The
 registration records that point as its last linear version
-(`omnigraph.last_linear_version`). A linear commit above it came from
-something other than Omnigraph writing the table directory, such as a Lance
-client pointed at it. No read or write of the graph resolves the linear
-HEAD, so a foreign version changes no query result and blocks no writer, and
-no command adopts it. A confirmed cleanup run (`cleanup --keep N --confirm`,
-which also removes what its policy does not retain) lists these versions per
-table, under `foreign_versions` with `--json` and by name in the human report,
-and leaves them and their files in place. The preview without `--confirm`
-does not open the graph and lists nothing. Embedded hosts can read the same
-list from the read-only `Omnigraph::cleanup_plan`. To discard them,
-export the graph and load it into a new one; see
-[Troubleshooting](troubleshooting.md#foreign-versions).
+(`omnigraph.last_linear_version`). A linear commit above it came from something
+other than Omnigraph writing the table directory, such as a Lance client pointed
+at it. No read or write of the graph resolves the linear HEAD, so a foreign
+version changes no query result and blocks no writer, and no command adopts it.
+A confirmed cleanup run (`cleanup --keep N --confirm`, which also removes what
+its policy does not retain) lists these versions per table, under
+`foreign_versions` with `--json` and by name in the human report, and leaves
+them and their files in place. The preview without `--confirm` does not open the
+graph and lists nothing. Embedded hosts can read the same list from the read-
+only `Omnigraph::cleanup_plan`. To discard them, export the graph and load it
+into a new one; see [Troubleshooting](troubleshooting.md#foreign-versions).
 
 ## Suggested cadence
 

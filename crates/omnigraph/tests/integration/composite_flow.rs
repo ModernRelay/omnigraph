@@ -313,7 +313,7 @@ async fn composite_flow_canonical_lifecycle() {
         .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap()
-        .tables;
+        .datasets;
     assert!(
         !optimize_stats.is_empty(),
         "optimize must return per-table stats"

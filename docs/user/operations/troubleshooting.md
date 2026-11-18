@@ -103,9 +103,11 @@ could not settle answers `500`.
 The CLI reports the server's disposition when that request was the command's
 only effectful one, and otherwise its own account of the whole command, so a
 lost response is `unknown` with `reconcile`. A read command changes nothing, so
-its failure always has `effects: none`. JSON mode writes the failure to stdout,
-or to stderr when part of the result, such as a streamed page, already reached
-stdout. Stdout then keeps the bytes already written, which can end inside an
+its failure has `effects: none`; `branch merge --dry-run` is such a read. A reply
+that contradicts its request (a merge receipt for another branch, a dry-run answer
+saying no dry run ran) is `unknown` with `reconcile` whatever the command. JSON
+mode writes the failure to stdout, or to stderr when part of the result, such as
+a streamed page, already reached stdout. Stdout then keeps the bytes already written, which can end inside an
 unfinished object, as for `diff`, `branch diff`, `commit changes` and
 `changes poll` with `--json` when they follow every page, and the failure
 document is on stderr. Human mode prints the `disposition` line on
