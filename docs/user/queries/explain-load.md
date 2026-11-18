@@ -67,8 +67,14 @@ table holds no rows removes nothing, so its plan carries neither the
 `retained_edges` checks nor the scan; a node target no edge type references,
 an edge overwrite, an append and a merge carry `none` as well. Under `none`
 no removed id is found, so the removed-id allowance of `write_max_bytes`
-charges nothing. Retained-edge access describes the filtered
-lookup in the incident edge table. Append and merge keep the consulted table,
+charges nothing. Retained-edge access describes the lookup in the incident
+edge table. Its plan always says `probe`, because the removed ids are known
+only when the overwrite runs. At run time the engine pushes them, 8,192 per
+filter, to the edge fragments that a BTREE on the endpoint covers, and reads
+each other fragment once, whole, matching its rows in memory. When a BTREE
+covers every fragment, or when one filter with every removed id, copied to
+each uncovered fragment, holds at most 8,192 ids, every fragment gets the
+filter. Append and merge keep the consulted table,
 so their `edge_ri` and non-key `@unique` checks use `probe` only when every
 looked-up column carries a BTREE covering every fragment of that table (the
 `@key` column's own index, or an `@index` on an orderable scalar; an `@index`

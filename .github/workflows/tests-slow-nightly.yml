@@ -96,6 +96,7 @@ jobs:
             repro_issue_1442::delete_of_one_chunk_over_many_edge_fragments_stays_bounded_issue_1442 \
             repro_issue_1442::overwrite_of_many_ids_over_few_edge_fragments_stays_bounded_issue_1442 \
             repro_issue_1442::overwrite_of_one_chunk_over_many_edge_fragments_stays_bounded_issue_1442 \
+            repro_issue_1442::delete_of_many_ids_over_indexed_and_unindexed_edge_fragments_stays_bounded_issue_1442 \
             mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect \
             merge_fast_forward::hydration_chunks_stay_bounded_when_row_widths_step_up \
             merge_fast_forward::hydration_chunks_stay_bounded_when_wide_rows_interleave

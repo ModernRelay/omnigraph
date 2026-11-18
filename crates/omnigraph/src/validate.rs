@@ -1210,6 +1210,97 @@ mod endpoint_probe_tests {
         assert!(every.matched().is_none());
     }
 
+    /// The plan over a real edge table follows its live BTREE coverage: with
+    /// no index every fragment is matched in memory, after `ensure_indices`
+    /// every fragment is probed, and after one more append the indexed
+    /// fragments are probed and only the new one is matched. A removal
+    /// whose one filter times the uncovered fragments stays within
+    /// [`PROBE_CHUNK_KEYS`] copied ids keeps its filter on every fragment.
+    #[tokio::test]
+    async fn removal_reads_follow_the_edge_tables_live_coverage_issue_1442() {
+        use crate::db::{Omnigraph, ReadTarget};
+        use crate::loader::LoadMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                Omnigraph::init(
+                    dir.path().to_str().unwrap(),
+                    "node Doc { slug: String @key }\nedge Link: Doc -> Doc\n",
+                )
+                .await
+                .unwrap(),
+            ),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.load(
+            "main",
+            r#"{"type":"Doc","data":{"slug":"keep"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+        let append = || async {
+            db.load(
+                "main",
+                r#"{"edge":"Link","from":"keep","to":"keep"}"#,
+                LoadMode::Append,
+            )
+            .await
+            .unwrap();
+        };
+        // One edge per append, so every edge is its own fragment.
+        append().await;
+        append().await;
+
+        let many: Vec<String> = (0..=PROBE_CHUNK_KEYS).map(|i| format!("d{i:07}")).collect();
+        let one = vec!["d0000000".to_string()];
+        // (fragments probed, `None` for every fragment; fragments matched)
+        let split = |ids: &[String]| {
+            let ids = ids.to_vec();
+            let db = &db;
+            async move {
+                let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+                let ds = snapshot.open_lance_dataset("edge:Link").await.unwrap();
+                let reads = RemovalEdgeReads::plan(&ds, ("__src", &ids), ("__dst", &ids))
+                    .await
+                    .unwrap();
+                (
+                    reads.probe_fragments().map(|fragments| fragments.len()),
+                    reads.matched().map_or(0, |(fragments, _)| fragments.len()),
+                )
+            }
+        };
+
+        assert_eq!(
+            split(&many).await,
+            (Some(0), 2),
+            "no index: every fragment matched"
+        );
+        assert_eq!(
+            split(&one).await,
+            (None, 0),
+            "one id: its filter on every fragment"
+        );
+        db.ensure_indices_as(None).await.unwrap();
+        assert_eq!(
+            split(&many).await,
+            (None, 0),
+            "full coverage: every fragment probed"
+        );
+        append().await;
+        assert_eq!(
+            split(&many).await,
+            (Some(2), 1),
+            "the indexed fragments are probed, the appended one matched"
+        );
+        assert_eq!(
+            split(&one).await,
+            (None, 0),
+            "one id: its filter on every fragment"
+        );
+    }
+
     fn or_terms(expr: Expr) -> Vec<Expr> {
         match expr {
             Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {

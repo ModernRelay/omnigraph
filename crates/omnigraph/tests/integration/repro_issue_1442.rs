@@ -88,6 +88,10 @@ fn assert_bounded_rise(before: u64, operation: &str, removed: usize, fragments: 
 async fn delete_rise(removed: usize, fragments: usize) {
     let dir = tempfile::tempdir().unwrap();
     let db = fixture(&dir, removed, fragments).await;
+    delete_and_measure(&db, removed, fragments).await;
+}
+
+async fn delete_and_measure(db: &Session, removed: usize, fragments: usize) {
     let before = peak_rss_bytes();
     let result = db
         .mutate(
@@ -101,7 +105,7 @@ async fn delete_rise(removed: usize, fragments: usize) {
     assert_bounded_rise(before, "delete", removed, fragments);
     assert_eq!(result.affected_nodes, removed);
     assert_eq!(result.affected_edges, 0);
-    assert_eq!(helpers::count_rows(&db, "edge:Link").await, fragments);
+    assert_eq!(helpers::count_rows(db, "edge:Link").await, fragments);
 }
 
 async fn overwrite_rise(removed: usize, fragments: usize) {
@@ -141,4 +145,21 @@ async fn overwrite_of_many_ids_over_few_edge_fragments_stays_bounded_issue_1442(
 #[ignore = "heavy-repro: peak RSS of an overwrite removing 8,192 nodes over 64 edge fragments"]
 async fn overwrite_of_one_chunk_over_many_edge_fragments_stays_bounded_issue_1442() {
     overwrite_rise(8_192, 64).await;
+}
+
+/// The split read: `indexed` fragments a BTREE on both endpoints covers are
+/// probed chunk by chunk, and `appended` fragments after the index are read
+/// once, whole, and matched in memory.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "heavy-repro: peak RSS of deleting 100,000 nodes over 4 indexed and 64 unindexed edge fragments"]
+async fn delete_of_many_ids_over_indexed_and_unindexed_edge_fragments_stays_bounded_issue_1442() {
+    let (removed, indexed, appended) = (100_000, 4, 64);
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir, removed, indexed).await;
+    db.ensure_indices_as(None).await.unwrap();
+    let edge = serde_json::json!({"edge": "Link", "from": "keep", "to": "keep"}).to_string();
+    for _ in 0..appended {
+        db.load_jsonl(&edge, LoadMode::Append).await.unwrap();
+    }
+    delete_and_measure(&db, removed, indexed + appended).await;
 }
