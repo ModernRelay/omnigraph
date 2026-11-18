@@ -17,7 +17,9 @@ use crate::cli::{
     SchemaCommand,
 };
 use crate::graph_http::ApiContractError;
-use crate::helpers::{MissingCredential, PreconditionFailedCli, RemoteErrorCli};
+use crate::helpers::{
+    ContradictoryReply, MissingCredential, PreconditionFailedCli, RemoteErrorCli,
+};
 
 /// What a command can change, which decides how its failure reads.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +285,11 @@ impl Failure {
         let remote = error.downcast_ref::<RemoteErrorCli>();
         let precondition = error.downcast_ref::<PreconditionFailedCli>();
         let read = evidence.kind == CommandKind::Read;
+        // A reply that contradicts its request is evidence about effects,
+        // and it outranks the command's kind: a read sent through a route
+        // that can write (a merge dry run) is a read only when the reply
+        // confirms it.
+        let contradicted = error.downcast_ref::<ContradictoryReply>().is_some();
         let engine_write = error.downcast_ref::<EngineWriteError>().is_some();
         // An embedded write's own refusal, before any request, says what the
         // engine did, projected with what the request path would know.
@@ -357,10 +364,11 @@ impl Failure {
             }
         };
         let served = served.or_else(|| output.disposition.filter(|_| engine_write && embedded));
-        let not_started = read
-            || admission.is_some()
-            || conditional
-            || (evidence.dispatched == 0 && !evidence.writable_open);
+        let not_started = !contradicted
+            && (read
+                || admission.is_some()
+                || conditional
+                || (evidence.dispatched == 0 && !evidence.writable_open));
         let action = if retry {
             Action::Retry
         } else if output.recovery_required.is_some()
