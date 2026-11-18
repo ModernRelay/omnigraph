@@ -169,10 +169,10 @@ load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" head
 - `columns (a, b, …)` names the property each column feeds, by position. It
   is required without `header` and overrides a header's names. `from` and
   `to` name an edge file's endpoint columns and are refused on a node file.
-- An empty field is null; a null for a non-nullable property, a column the
-  type does not declare, a count of `columns` that differs from the source, a
-  malformed number, a repeated name, and an edge file without `from` or `to`
-  are refused before anything is staged.
+- An empty field and `""` are null (there is no empty-string spelling); an empty line is not a
+  record, so a one-column file skips its null rows. A null for a non-nullable property, a column
+  the type does not declare, a count of `columns` that differs from the source, a malformed
+  number, a repeated name, and an edge file without `from` or `to` are refused before anything is staged.
 
 Numbers are typed by the reader. `Bool` takes exactly `true` or `false`.
 `Date` and `DateTime` cells are read as text and pass the checks above
@@ -276,18 +276,18 @@ parse partition that only its own reader charges, so a refusal and its `actual`
 settings reference); a statement it cannot hold refuses before any fragment write.
 The source object is bounded by `load_source_max_bytes` before it is read
 (refused as `csv_source_bytes`).
-An overwrite probes the object's metadata once, then each parse partition
-reads its own byte range in 8 MiB pieces, every read conditional on the etag
-and size the probe captured; a refusal of the partitioned run reads the ranges
-once more as one partition. An append or merge reads the object once per
-statement under the same validators, and every reprepare attempt reuses those
-bytes.
+An overwrite probes the object's metadata once, then each parse partition reads
+its own byte range in 8 MiB pieces, every read conditional on the etag and size
+the probe captured; a refusal of the partitioned run reads the ranges once more
+as one partition. An append or merge reads the object once per statement under
+the same validators, and every reprepare attempt reuses those bytes.
 An object replaced between the probe and the read refuses as an
 external-source error, and nothing is staged.
 Raising `write_max_bytes` lifts `strict_input_arrow_bytes` and
 `staged_write_input_bytes`; raising `query_memory_bytes` admits a larger
-statement; raising `load_source_max_bytes` lifts `csv_source_bytes`. See
-[Blob limits](../blobs.md#limits).
+statement; raising `load_source_max_bytes` lifts `csv_source_bytes`. No setting
+lifts a merge's [validation limit](../branching/merge.md#validation-limit),
+which counts a branch's commits together. See [Blob limits](../blobs.md#limits).
 
 Deletes, including cascades, and overwrite loads collecting replaced IDs have
 a separate `write_max_bytes` allowance per operation for those IDs, summed over all
@@ -327,12 +327,12 @@ records on record ends, neighbouring partitions meet at one record end, and
 the validation puts the slices back in source order, so the rows and their
 order are those of a single parser. A boundary the neighbours cannot agree on
 (inside a quoted field, or after an empty line) refuses that run, and the
-same plan reruns as one partition. Delete staging remains serial. This affects preparation only—one request still
-publishes exactly one graph commit.
+same plan reruns as one partition. Delete staging remains serial. This affects
+preparation only—one request still publishes exactly one graph commit.
 
-A stale strict update, delete, or overwrite can return `read_set_conflict`.
-Refresh the branch and retry deliberately. A `key_conflict` means an append or
-strict insert found an existing id; it never silently becomes an upsert.
+A write overtaken before it takes effect, an update or delete included, reruns on the new head; it returns
+`read_set_conflict` only if the branch was recreated, the schema changed, or another process kept overtaking
+it. A `key_conflict` means an append or strict insert found an existing id; it never silently becomes an upsert.
 
 If a write returns `recovery_required`, do not immediately resubmit it. Reopen
 the graph read-write or restart the server, then retry from a fresh branch head.

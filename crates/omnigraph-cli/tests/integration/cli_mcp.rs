@@ -351,6 +351,7 @@ impl Served {
         output_success(
             cli()
                 .arg("load")
+                .args(["--as", "act-agent"])
                 .arg("--data")
                 .arg(fixture("test.jsonl"))
                 .arg("--mode")

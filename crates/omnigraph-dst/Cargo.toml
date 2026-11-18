@@ -19,7 +19,6 @@ failpoints = ["omnigraph-engine/failpoints"]
 omnigraph-engine = { path = "../omnigraph", version = "0.15.1", features = ["dst"] }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1" }
 arrow-array = { workspace = true }
-lance-core = { workspace = true }
 lance-io = { workspace = true }
 object_store = { workspace = true }
 bytes = { workspace = true }

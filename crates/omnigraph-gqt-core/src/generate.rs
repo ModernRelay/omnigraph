@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 
 use omnigraph::Session;
+use omnigraph::db::ReadTarget;
 use omnigraph::loader::LoadMode;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+
+use crate::diagnostic::{CaseError, CaseErrorCode};
 
 const MAX_ROWS: u64 = 10_000_000;
 const MAX_COMMITS: u64 = 100_000;
@@ -142,8 +145,40 @@ enum Distribution {
     Zipf { exponent: f64 },
 }
 
+/// A recipe rule the generator's YAML body breaks, with the rule's fix unless
+/// the site names a closer one.
+fn recipe(message: impl Into<String>) -> CaseError {
+    CaseError::new(CaseErrorCode::BodyShape, message).fix(
+        "write the recipe as YAML within its limits; the message names the field and the limit",
+    )
+}
+
+/// A batch bound a table's `rows`, `commits` or `batch_rows` breaks.
+fn batch_bound(message: impl Into<String>, fix: impl Into<String>) -> CaseError {
+    CaseError::new(CaseErrorCode::BatchBound, message).fix(fix)
+}
+
+/// The bound every recipe that loads shares: at least one nonempty batch;
+/// `fix` names the site's own spelling of an empty fixture.
+pub(crate) fn require_batches(generated: &Generated, fix: &str) -> Result<(), CaseError> {
+    if generated.call_count() == 0 {
+        return Err(batch_bound(
+            "a generated load requires at least one nonempty batch; empty recipes are admitted only as seeds",
+            fix,
+        ));
+    }
+    Ok(())
+}
+
+/// A rule the `--- branches` header breaks.
+fn branches_header(message: impl Into<String>) -> CaseError {
+    CaseError::new(CaseErrorCode::BodyShape, message).fix(
+        "write `--- branches generate: v1 seed: <u64> count: <n> prefix: <name> [from: <branch>]`; the message names the key",
+    )
+}
+
 impl Seed {
-    pub(crate) fn parse(header: &str, body: String) -> Result<Self, String> {
+    pub(crate) fn parse(header: &str, body: String) -> Result<Self, CaseError> {
         if header == "seed" {
             return Ok(Self::Inline(
                 body.lines()
@@ -152,8 +187,10 @@ impl Seed {
                     .join("\n"),
             ));
         }
-        let args = header.strip_prefix("seed ").ok_or("invalid seed header")?;
-        let seed = parse_arguments(args, false)?.0;
+        let args = header
+            .strip_prefix("seed ")
+            .ok_or_else(|| recipe("invalid seed header"))?;
+        let seed = parse_arguments(args, false).map_err(recipe)?.0;
         Generated::parse(seed, &body).map(Self::Generated)
     }
 
@@ -211,9 +248,153 @@ pub(crate) fn parse_arguments(
     Ok((seed, mode, branch.to_string()))
 }
 
+/// The most branches a `--- branches` section declares, the loop's cap.
+const MAX_BRANCHES: u64 = 10_000;
+/// The one marker a branches recipe admits: the branch's own name.
+pub const BRANCH_MARKER: &str = "${branch}";
+
+/// The `--- branches generate: v1 seed: <u64> count: <n> prefix: <name>
+/// [from: <branch>]` fixture section: `count` branches named `<prefix><i>`,
+/// `i` decimal from zero, forked from `from` after the seed loads and each
+/// loaded with the recipe, `${branch}` in it bound to the branch's name. State
+/// the case declares, built before step 1: no step, label or report row.
+#[derive(Debug)]
+pub struct Branches {
+    seed: u64,
+    count: u64,
+    prefix: String,
+    from: String,
+    /// The recipe text with `${branch}` unresolved; `None` forks bare branches.
+    recipe: Option<String>,
+}
+
+impl Branches {
+    /// The header and the recipe text; the caller has refused every `${`
+    /// that is not `${branch}` line by line, so the recipe is validated once
+    /// here, with the longest name substituted.
+    pub(crate) fn parse(arguments: &str, body: &str) -> Result<Self, CaseError> {
+        let mut branches = parse_branches_arguments(arguments).map_err(branches_header)?;
+        if !body.trim().is_empty() {
+            let longest = Generated::parse(
+                branches.seed,
+                &body.replace(BRANCH_MARKER, &branches.name(branches.count - 1)),
+            )?;
+            require_batches(
+                &longest,
+                "give a table `rows:` and `commits:` of at least 1, or drop the body to fork bare branches",
+            )?;
+            branches.recipe = Some(body.to_string());
+        }
+        Ok(branches)
+    }
+
+    fn name(&self, index: u64) -> String {
+        format!("{}{index}", self.prefix)
+    }
+
+    /// The branch names in fork order.
+    pub fn names(&self) -> impl Iterator<Item = String> + '_ {
+        (0..self.count).map(|index| self.name(index))
+    }
+
+    /// The branch every declared branch forks from.
+    pub fn from(&self) -> &str {
+        &self.from
+    }
+
+    /// The recipe with `${branch}` bound to `branch`; `None` for a bare fork.
+    pub fn recipe(&self, branch: &str) -> Result<Option<Generated>, String> {
+        self.recipe
+            .as_ref()
+            .map(|text| {
+                Generated::parse(self.seed, &text.replace(BRANCH_MARKER, branch))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
+    }
+
+    /// Forks every branch from `from` and appends its recipe, as a `branch
+    /// create` step and a `load generate` step on the branch would.
+    pub async fn load(&self, session: &Session) -> Result<(), String> {
+        for name in self.names() {
+            session
+                .db()
+                .branch_create_from_as(ReadTarget::branch(&self.from), &name, None)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "branches fixture: branch create {name} from {}: {error}",
+                        self.from
+                    )
+                })?;
+            if let Some(generated) = self.recipe(&name)? {
+                generated
+                    .load(session, &name, LoadMode::Append)
+                    .await
+                    .map_err(|error| format!("branches fixture: load {name}: {error}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The header's keys as a `Branches` with no recipe yet.
+fn parse_branches_arguments(arguments: &str) -> Result<Branches, String> {
+    let tokens = arguments.split_whitespace().collect::<Vec<_>>();
+    if !tokens.len().is_multiple_of(2) {
+        return Err("branches header requires key: value pairs".into());
+    }
+    let mut values = BTreeMap::new();
+    for pair in tokens.chunks_exact(2) {
+        if !matches!(
+            pair[0],
+            "generate:" | "seed:" | "count:" | "prefix:" | "from:"
+        ) || values.insert(pair[0], pair[1]).is_some()
+        {
+            return Err(format!(
+                "unknown or repeated branches argument {:?}",
+                pair[0]
+            ));
+        }
+    }
+    if values.get("generate:") != Some(&"v1") {
+        return Err("declared branches require `generate: v1`".into());
+    }
+    let seed = values
+        .get("seed:")
+        .ok_or("declared branches require an explicit `seed: <u64>`")?
+        .parse::<u64>()
+        .map_err(|_| "generator seed must be an unsigned 64-bit integer")?;
+    let count = values
+        .get("count:")
+        .ok_or("declared branches require `count: <n>`")?
+        .parse::<u64>()
+        .map_err(|_| "branches count must be an unsigned integer")?;
+    if count == 0 || count > MAX_BRANCHES {
+        return Err(format!("branches count must be in 1..={MAX_BRANCHES}"));
+    }
+    let prefix = values
+        .get("prefix:")
+        .ok_or("declared branches require `prefix: <name>`")?
+        .to_string();
+    let from = values.get("from:").copied().unwrap_or("main").to_string();
+    Ok(Branches {
+        seed,
+        count,
+        prefix,
+        from,
+        recipe: None,
+    })
+}
+
 impl GeneratedParams {
-    pub(crate) fn parse(arguments: &str, body: &str) -> Result<Self, String> {
-        let (seed, _, _) = parse_arguments(arguments, false)?;
+    pub(crate) fn parse(arguments: &str, body: &str) -> Result<Self, CaseError> {
+        let (seed, _, _) = parse_arguments(arguments, false).map_err(recipe)?;
+        let params = Self::parse_params(body).map_err(recipe)?;
+        Ok(Self { seed, params })
+    }
+
+    fn parse_params(body: &str) -> Result<BTreeMap<String, Column>, String> {
         let recipe: ParamsRecipe = crate::runner_config::yaml(body, "generated params")?;
         if recipe.params.is_empty() || recipe.params.len() > MAX_PARAMS {
             return Err(format!(
@@ -250,10 +431,7 @@ impl GeneratedParams {
                 "generated zipf tables exceed {MAX_ZIPF_ENTRIES} entries"
             ));
         }
-        Ok(Self {
-            seed,
-            params: recipe.params,
-        })
+        Ok(recipe.params)
     }
 
     /// The parameters as the JSON object a literal `--- params` body holds.
@@ -298,52 +476,56 @@ impl Generated {
             .map(Some)
     }
 
-    pub(crate) fn parse(seed: u64, body: &str) -> Result<Self, String> {
-        let recipe: Recipe = crate::runner_config::yaml(body, "generated recipe")?;
-        if recipe.tables.len() > 256 {
-            return Err("generated rows admit at most 256 table recipes".into());
+    pub(crate) fn parse(seed: u64, body: &str) -> Result<Self, CaseError> {
+        let parsed: Recipe =
+            crate::runner_config::yaml(body, "generated recipe").map_err(recipe)?;
+        if parsed.tables.len() > 256 {
+            return Err(recipe("generated rows admit at most 256 table recipes"));
         }
         let mut rows = 0u64;
         let mut commits = 0u64;
         let mut bytes = 0u64;
         let mut zipf_entries = 0u64;
-        for table in &recipe.tables {
+        for table in &parsed.tables {
             let row_bytes = table.validate()?;
             for (_, column) in table.fields() {
                 if let Some((population, _)) = column.zipf() {
                     zipf_entries = zipf_entries
                         .checked_add(population)
-                        .ok_or("zipf table size overflow")?;
+                        .ok_or_else(|| recipe("zipf table size overflow"))?;
                 }
             }
             rows = rows
                 .checked_add(table.rows)
-                .ok_or("generated row count overflow")?;
+                .ok_or_else(|| recipe("generated row count overflow"))?;
             commits = commits
                 .checked_add(table.commits)
-                .ok_or("generated commit count overflow")?;
+                .ok_or_else(|| recipe("generated commit count overflow"))?;
             bytes = bytes
                 .checked_add(
                     table
                         .rows
                         .checked_mul(row_bytes)
-                        .ok_or("generated byte count overflow")?,
+                        .ok_or_else(|| recipe("generated byte count overflow"))?,
                 )
-                .ok_or("generated byte count overflow")?;
+                .ok_or_else(|| recipe("generated byte count overflow"))?;
         }
         if zipf_entries > MAX_ZIPF_ENTRIES {
-            return Err(format!(
+            return Err(recipe(format!(
                 "generated zipf tables exceed {MAX_ZIPF_ENTRIES} entries"
-            ));
+            )));
         }
         if rows > MAX_ROWS || commits > MAX_COMMITS || bytes > MAX_GENERATED_BYTES {
-            return Err(format!(
+            return Err(recipe(format!(
                 "generated rows exceed limits: rows {rows}/{MAX_ROWS}, commits {commits}/{MAX_COMMITS}, bytes {bytes}/{MAX_GENERATED_BYTES}"
-            ));
+            ))
+            .fix(format!(
+                "keep the recipe within {MAX_ROWS} rows, {MAX_COMMITS} commits and {MAX_GENERATED_BYTES} bytes over all tables"
+            )));
         }
         Ok(Self {
             seed,
-            tables: recipe.tables,
+            tables: parsed.tables,
         })
     }
 
@@ -462,27 +644,59 @@ impl Table {
         })
     }
 
-    fn batch_rows(&self) -> Result<u64, String> {
+    fn batch_rows(&self) -> Result<u64, CaseError> {
         if self
             .batch_rows
             .is_some_and(|rows| rows == 0 || rows > MAX_BATCH_ROWS)
         {
-            return Err("generated batch_rows must be in 1..=4096".into());
+            return Err(batch_bound(
+                "generated batch_rows must be in 1..=4096",
+                format!("set `batch_rows:` between 1 and {MAX_BATCH_ROWS}, or drop it"),
+            ));
         }
         if self.rows == 0 && self.commits == 0 {
             return Ok(1);
         }
         if self.commits == 0 || self.commits > self.rows {
-            return Err("generated commits must be in 1..=rows, or both counts zero".into());
+            let fix = if self.rows == 0 {
+                "set `commits: 0` beside `rows: 0`, or give `rows:` a count".to_string()
+            } else {
+                format!(
+                    "set `commits:` between 1 and {}, or set `rows: 0` and `commits: 0`",
+                    self.rows
+                )
+            };
+            return Err(batch_bound(
+                "generated commits must be in 1..=rows, or both counts zero",
+                fix,
+            ));
         }
-        let batch = self.batch_rows.unwrap_or(self.rows.div_ceil(self.commits));
+        let derived = self.rows.div_ceil(self.commits);
+        let batch = self.batch_rows.unwrap_or(derived);
         if batch == 0
             || batch > MAX_BATCH_ROWS
             || self
                 .batch_rows
                 .is_some_and(|_| self.rows.div_ceil(batch) != self.commits)
         {
-            return Err("generated batch_rows must be in 1..=4096 and produce exactly commits nonempty batches".into());
+            let fix = match self.batch_rows {
+                Some(given) if derived > MAX_BATCH_ROWS => format!(
+                    "set `commits: {}` to match `batch_rows: {given}`",
+                    self.rows.div_ceil(given)
+                ),
+                Some(given) => format!(
+                    "set `commits: {}` to match `batch_rows: {given}`, or drop `batch_rows:`",
+                    self.rows.div_ceil(given)
+                ),
+                None => format!(
+                    "set `commits:` at least {} so that rows / commits stays within {MAX_BATCH_ROWS}",
+                    self.rows.div_ceil(MAX_BATCH_ROWS)
+                ),
+            };
+            return Err(batch_bound(
+                "generated batch_rows must be in 1..=4096 and produce exactly commits nonempty batches",
+                fix,
+            ));
         }
         Ok(batch)
     }
@@ -510,7 +724,34 @@ impl Table {
         )
     }
 
-    fn validate(&self) -> Result<u64, String> {
+    /// The byte bound of one row, with every batch bound checked.
+    fn validate(&self) -> Result<u64, CaseError> {
+        let bytes = self.row_bytes().map_err(recipe)?;
+        let limit = u64::try_from(MAX_BATCH_BYTES).map_err(|_| recipe("invalid batch limit"))?;
+        if bytes > limit {
+            return Err(recipe(format!(
+                "generated row byte bound {bytes} exceeds the 16 MiB batch limit on its own; no batch_rows fits one row"
+            ))
+            .fix(
+                "shrink the row: a `blob` column's `length`, a `vector` column's `dimensions` or a `repeat` column's `count`, so one row stays within 16 MiB",
+            ));
+        }
+        let batch_bytes = bytes
+            .checked_mul(self.batch_rows()?)
+            .ok_or_else(|| recipe("generated batch size overflow"))?;
+        if batch_bytes > limit {
+            return Err(batch_bound(
+                "generated batch byte bound exceeds 16 MiB; reduce batch_rows",
+                format!(
+                    "set `batch_rows:` at most {} for this row shape, raising `commits:` to match",
+                    (u64::try_from(MAX_BATCH_BYTES).unwrap_or(u64::MAX) / bytes.max(1)).max(1)
+                ),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn row_bytes(&self) -> Result<u64, String> {
         if self.name.is_empty() || self.name.len() > 256 || self.columns.len() > 256 {
             return Err(
                 "generated table names require 1..=256 bytes and at most 256 columns".into(),
@@ -551,12 +792,6 @@ impl Table {
                 .checked_add(bound)
                 .and_then(|bytes| bytes.checked_add(key_bytes + 8))
                 .ok_or("generated row size overflow")?;
-        }
-        let batch_bytes = bytes
-            .checked_mul(self.batch_rows()?)
-            .ok_or("generated batch size overflow")?;
-        if batch_bytes > u64::try_from(MAX_BATCH_BYTES).map_err(|_| "invalid batch limit")? {
-            return Err("generated batch byte bound exceeds 16 MiB; reduce batch_rows".into());
         }
         Ok(bytes)
     }
@@ -945,9 +1180,45 @@ mod tests {
             assert!(
                 Generated::parse(0, &invalid)
                     .unwrap_err()
+                    .message
                     .contains("batch_rows")
             );
         }
+    }
+
+    /// A `batch_bound` fix names a value the recipe can take: no empty range
+    /// at zero rows, no `batch_rows` above the cap; a recipe-wide limit is a
+    /// recipe rule, `body_shape`. Fix text is not a shape a `.gqt` case pins.
+    #[test]
+    fn batch_bound_fixes_name_a_value_the_recipe_can_take() {
+        let zero_rows = RECIPE.replace("rows: 5", "rows: 0");
+        let fix = Generated::parse(0, &zero_rows).unwrap_err().fix.unwrap();
+        assert!(
+            fix.contains("`commits: 0`") && !fix.contains("between 1 and 0"),
+            "{fix}"
+        );
+        let one_commit = RECIPE
+            .replace("rows: 5", "rows: 4097")
+            .replace("commits: 2", "commits: 1");
+        let fix = Generated::parse(0, &one_commit).unwrap_err().fix.unwrap();
+        assert!(fix.contains("`commits:` at least 2"), "{fix}");
+        let over_the_recipe_limit = RECIPE
+            .replace("rows: 5", "rows: 10000001")
+            .replace("commits: 2", "commits: 10000001");
+        let error = Generated::parse(0, &over_the_recipe_limit).unwrap_err();
+        assert_eq!(error.code, CaseErrorCode::BodyShape);
+        assert!(error.fix.is_some());
+        let one_row_over = RECIPE.replace(
+            "kind: vector, dimensions: 3",
+            "kind: blob, byte: 0, length: 16777216",
+        );
+        let error = Generated::parse(0, &one_row_over).unwrap_err();
+        assert_eq!(error.code, CaseErrorCode::BodyShape);
+        let fix = error.fix.unwrap();
+        assert!(
+            fix.contains("shrink the row") && !fix.contains("batch_rows"),
+            "{fix}"
+        );
     }
 
     /// A `blob` column is the `base64:` input text of `length` repeated
@@ -979,6 +1250,7 @@ mod tests {
                 )
             )
             .unwrap_err()
+            .message
             .contains("16 MiB")
         );
     }

@@ -1,0 +1,1 @@
+- The `omnigraph-bench` README names the S3 credential sources its client renews (instance metadata, container endpoint, web identity) and the one it never does (static keys).

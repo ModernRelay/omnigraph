@@ -1,0 +1,59 @@
+# issue: 1338
+# red_on: 2c4b2f12: the correlated block drains its 16 MiB inner output under the pool and is refused with query_memory_bytes.
+# notes: A correlated block on the per-row path folds each inner batch as it streams: 16,384
+# notes: neighbours with a 1 KiB payload (16 MiB of inner rows) run under a 12 MiB query pool.
+# notes: The conjunct that reads the outer row keeps the block off the key-set path, and max
+# notes: keeps it off the bulk row count.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    payload: String
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 0
+tables:
+  - kind: node
+    name: Person
+    rows: 16385
+    commits: 9
+    batch_rows: 2048
+    columns:
+      name: {kind: key, prefix: p, width: 5}
+      payload: {kind: repeat, text: x, count: 1024}
+  - kind: edge
+    name: Knows
+    rows: 16384
+    commits: 8
+    batch_rows: 2048
+    start: 1
+    from: {kind: literal, value: p00000}
+    to: {kind: key, prefix: p, width: 5}
+    columns: {}
+
+--- query
+set engine = v2;
+set query_memory_bytes = 12582912;
+query hubs() {
+    match {
+        $a: Person { name: "p00000" }
+        max($b.payload) { $a knows $b  $a.name = $a.name } > ""
+    }
+    return { $a.name }
+}
+
+--- expect unordered
+{"a.name": "p00000"}
+
+--- expect shape
+a.name: String
+
+--- expect plan
+anti join $a: correlated

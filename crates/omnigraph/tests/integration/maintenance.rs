@@ -20,10 +20,12 @@ use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::commit::ManifestNamingScheme;
 use omnigraph::IndexCoverage;
 use omnigraph::db::{
-    CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
-    RepairOptions, SnapshotId,
+    ArtifactRefresh, ArtifactSkip, ConfigurationClear, DeferReason, OptimizeBeforePublish,
+    OptimizeCancellation, OptimizeLimits, OptimizePublication, OptimizeRequest, ResourceMeasure,
+    RunCancellation, TableCeilings, TableOptimizeOutcome,
 };
-use omnigraph::error::{BranchStartRefusal, OmniError};
+use omnigraph::db::{CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, SnapshotId};
+use omnigraph::error::{BranchStartRefusal, CompletionEvidence, OmniError};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
@@ -135,21 +137,909 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
     let uri = dir.path().to_str().unwrap();
     let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-    let stats = db.optimize().await.unwrap();
+    let head = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let report = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
 
-    assert_eq!(stats.len(), 5);
-    for s in &stats {
+    // One outcome per node and edge table, in type-key order; `__manifest`
+    // is not a table the run optimizes.
+    let keys = report
+        .tables
+        .iter()
+        .map(|s| s.type_key.as_str())
+        .collect::<Vec<_>>();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(
+        keys, sorted,
+        "a full-catalog run visits tables in key order"
+    );
+    assert_eq!(keys.len(), 4);
+    for s in &report.tables {
+        assert_eq!(s.outcome, TableOptimizeOutcome::Unchanged, "{s:?}");
         assert_eq!(s.fragments_removed, 0, "{} should not remove", s.type_key);
         assert_eq!(s.fragments_added, 0, "{} should not add", s.type_key);
     }
-    // `__manifest` is present and reported as a no-op on an empty graph.
-    let s = stats
-        .iter()
-        .find(|s| s.type_key == "__manifest")
-        .expect("optimize stats missing internal table __manifest");
+    assert_eq!(report.input_commit.as_deref(), Some(head.as_str()));
+    assert_eq!(report.graph_commit_id, None, "nothing to publish");
+    assert_eq!(report.resume_at, None, "no bound stopped the run");
+    assert_eq!(
+        report.configuration_clear,
+        ConfigurationClear::NothingToClear
+    );
     assert!(
-        !s.committed,
-        "__manifest should be a no-op on an empty graph"
+        !matches!(report.artifact, ArtifactRefresh::Failed(_)),
+        "{:?}",
+        report.artifact
+    );
+}
+
+/// A run whose gate hold is used up when its second table's turn comes runs
+/// only the first, defers the rest, publishes once, and names the first
+/// deferred table; a full-catalog run that starts there visits it first and
+/// wraps, so successive runs reach every table.
+#[tokio::test]
+async fn optimize_stops_at_the_gate_hold_and_resumes_at_the_first_deferred_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let bounded = || {
+        omnigraph::db::OptimizeRequest::default()
+            .with_limits(OptimizeLimits::default().with_max_gate_hold(Duration::ZERO))
+    };
+
+    let first = db.optimize_as(None, bounded()).await.unwrap();
+    let keys = first
+        .tables
+        .iter()
+        .map(|s| s.type_key.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(keys.len(), 4, "every table is reported: {first:?}");
+    assert!(
+        !matches!(first.tables[0].outcome, TableOptimizeOutcome::Deferred(_)),
+        "the first table always runs: {first:?}"
+    );
+    for stat in &first.tables[1..] {
+        assert_eq!(
+            stat.outcome,
+            TableOptimizeOutcome::Deferred(DeferReason::GateHoldLimit),
+            "{stat:?}"
+        );
+        assert_eq!(
+            stat.duration,
+            Duration::ZERO,
+            "a deferred table never started"
+        );
+    }
+    assert_eq!(first.resume_at.as_deref(), Some(keys[1].as_str()));
+
+    let second = db
+        .optimize_as(None, bounded().with_start_at(keys[1].clone()))
+        .await
+        .unwrap();
+    let visited = second
+        .tables
+        .iter()
+        .map(|s| s.type_key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        visited,
+        [&keys[1], &keys[2], &keys[3], &keys[0]].map(String::as_str),
+        "the run starts at the resume position and wraps"
+    );
+    assert_eq!(second.resume_at.as_deref(), Some(keys[2].as_str()));
+    assert_eq!(
+        second.input_commit,
+        first.graph_commit_id.clone().or(first.input_commit.clone()),
+        "each run builds on the head the previous one left"
+    );
+
+    // A position after every key wraps to the first, and an unbounded run
+    // finishes the catalog and clears the position.
+    let wrapped = db
+        .optimize_as(
+            None,
+            omnigraph::db::OptimizeRequest::default().with_start_at("~"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrapped.tables[0].type_key, keys[0]);
+    assert_eq!(wrapped.resume_at, None);
+}
+
+/// A table list runs only those tables, in its order, and neither reads nor
+/// sets a resume position; a malformed request is refused before any effect.
+#[tokio::test]
+async fn optimize_table_list_runs_only_those_tables_and_refuses_bad_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let all = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    let keys = all
+        .tables
+        .iter()
+        .map(|s| s.type_key.clone())
+        .collect::<Vec<_>>();
+
+    let listed = db
+        .optimize_as(
+            None,
+            omnigraph::db::OptimizeRequest::default().with_tables([&keys[2], &keys[0]]),
+        )
+        .await
+        .unwrap();
+    let visited = listed
+        .tables
+        .iter()
+        .map(|s| s.type_key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(visited, [keys[2].as_str(), keys[0].as_str()]);
+    assert_eq!(listed.resume_at, None);
+
+    // A bounded list defers its tail but reports no resume position: a list
+    // neither reads nor moves it.
+    let bounded = db
+        .optimize_as(
+            None,
+            omnigraph::db::OptimizeRequest::default()
+                .with_tables([&keys[2], &keys[0]])
+                .with_limits(OptimizeLimits::default().with_max_gate_hold(Duration::ZERO)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bounded.tables[1].outcome,
+        TableOptimizeOutcome::Deferred(DeferReason::GateHoldLimit),
+        "{bounded:?}"
+    );
+    assert_eq!(bounded.resume_at, None);
+
+    let head = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    for request in [
+        omnigraph::db::OptimizeRequest::default().with_tables(["node:Missing"]),
+        omnigraph::db::OptimizeRequest::default().with_tables([&keys[0], &keys[0]]),
+        omnigraph::db::OptimizeRequest::default().with_tables(Vec::<String>::new()),
+        omnigraph::db::OptimizeRequest::default()
+            .with_tables([&keys[0]])
+            .with_start_at(keys[1].clone()),
+        omnigraph::db::OptimizeRequest::default()
+            .with_concurrency(omnigraph::db::OptimizeConcurrency::new(0, 1)),
+        omnigraph::db::OptimizeRequest::default().with_limits(
+            OptimizeLimits::default()
+                .with_table_ceilings(TableCeilings::default().with_source_bytes(2))
+                .with_run_source_bytes(1),
+        ),
+    ] {
+        let error = db.optimize_as(None, request.clone()).await.unwrap_err();
+        assert_eq!(
+            error.completion_evidence(),
+            Some(CompletionEvidence::BeforeEffect),
+            "{request:?}: {error}"
+        );
+    }
+    assert_eq!(
+        db.list_commits(None).await.unwrap()[0].graph_commit_id,
+        head,
+        "a refused request publishes nothing"
+    );
+}
+
+fn recording_hook() -> (
+    OptimizeBeforePublish,
+    std::sync::Arc<std::sync::Mutex<Vec<OptimizePublication>>>,
+) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&seen);
+    let hook = OptimizeBeforePublish::new(move |publication| {
+        recorded.lock().unwrap().push(publication);
+        async { Ok(()) }
+    });
+    (hook, seen)
+}
+
+#[tokio::test]
+async fn optimize_calls_before_publish_once_with_the_nonce_its_commit_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    let head = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+
+    let (hook, seen) = recording_hook();
+    let report = db
+        .optimize_as(None, OptimizeRequest::default().with_before_publish(hook))
+        .await
+        .unwrap();
+    let commit = report.graph_commit_id.clone().expect("the run published");
+    let seen = std::mem::take(&mut *seen.lock().unwrap());
+    assert_eq!(seen.len(), 1, "the hook runs once: {seen:?}");
+    let publication = &seen[0];
+    assert!(
+        omnigraph_core::graph_commit_id::commit_id_answers(&commit, &publication.nonce).unwrap(),
+        "{commit} answers {}",
+        publication.nonce
+    );
+    assert_eq!(publication.input_commit.as_deref(), Some(head.as_str()));
+    assert_eq!(publication.input_commit, report.input_commit);
+    assert_eq!(
+        publication.input_manifest_version,
+        report.input_manifest_version
+    );
+    let outcomes = |tables: &[omnigraph::db::DatasetOptimizeStats]| {
+        tables
+            .iter()
+            .map(|stat| (stat.type_key.clone(), stat.outcome))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(outcomes(&publication.tables), outcomes(&report.tables));
+
+    // A run that stages no table publishes nothing and never calls the hook.
+    let (hook, seen) = recording_hook();
+    let idle = db
+        .optimize_as(None, OptimizeRequest::default().with_before_publish(hook))
+        .await
+        .unwrap();
+    assert_eq!(idle.graph_commit_id, None, "{idle:?}");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn optimize_publishes_nothing_when_before_publish_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    let head = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+
+    // The hook's own evidence claims no effect; the staged rewrites exist, so
+    // the run must report them unpublished instead.
+    let hook = OptimizeBeforePublish::new(|_| async {
+        Err(OmniError::manifest("the operation record was not written").before_effect())
+    });
+    let error = db
+        .optimize_as(None, OptimizeRequest::default().with_before_publish(hook))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Unpublished),
+        "{error}"
+    );
+    assert_eq!(
+        db.list_commits(None).await.unwrap()[0].graph_commit_id,
+        head,
+        "a failed hook publishes nothing"
+    );
+
+    // The staged rewrites are unreachable; the next run re-plans and publishes.
+    let retry = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(retry.graph_commit_id.is_some(), "{retry:?}");
+}
+
+#[tokio::test]
+async fn optimize_cancelled_before_it_starts_publishes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    let head = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+
+    let cancellation = OptimizeCancellation::new();
+    cancellation.cancel();
+    let (hook, seen) = recording_hook();
+    let report = db
+        .optimize_as(
+            None,
+            OptimizeRequest::default()
+                .with_cancellation(cancellation)
+                .with_before_publish(hook),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.cancellation, RunCancellation::Cancelled);
+    assert!(
+        report
+            .tables
+            .iter()
+            .all(|stat| stat.outcome == TableOptimizeOutcome::Deferred(DeferReason::Cancelled)),
+        "{report:?}"
+    );
+    assert_eq!(report.graph_commit_id, None);
+    assert_eq!(report.resume_at, None);
+    assert_eq!(report.configuration_clear, ConfigurationClear::NotRun);
+    assert_eq!(
+        report.artifact,
+        ArtifactRefresh::Skipped(ArtifactSkip::Cancelled)
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "a cancelled run never calls the hook"
+    );
+    assert_eq!(
+        db.list_commits(None).await.unwrap()[0].graph_commit_id,
+        head
+    );
+}
+
+#[tokio::test]
+async fn optimize_finishes_a_cancellation_that_arrives_after_its_last_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+
+    // The hook runs after the last check, inside the publication helper.
+    let cancellation = OptimizeCancellation::new();
+    let late = cancellation.clone();
+    let hook = OptimizeBeforePublish::new(move |_| {
+        late.cancel();
+        async { Ok(()) }
+    });
+    let report = db
+        .optimize_as(
+            None,
+            OptimizeRequest::default()
+                .with_cancellation(cancellation)
+                .with_before_publish(hook),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.cancellation, RunCancellation::ArrivedLate);
+    assert!(report.graph_commit_id.is_some(), "{report:?}");
+    assert!(
+        report
+            .tables
+            .iter()
+            .any(|stat| stat.type_key == "node:Person" && stat.committed()),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.artifact,
+        ArtifactRefresh::Skipped(ArtifactSkip::Cancelled),
+        "the edge scan starts only without a cancellation"
+    );
+}
+
+async fn person_pin(db: &Omnigraph) -> u64 {
+    db.snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version
+}
+
+async fn doc_pin(db: &Omnigraph) -> u64 {
+    db.snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .published_dataset_version
+}
+
+/// Each per-table ceiling defers a table over it with nothing written; the
+/// plan holds a deletion file, which records no size, so the byte measure
+/// reads it from storage.
+#[tokio::test]
+async fn optimize_defers_a_table_over_a_ceiling_and_writes_nothing_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &helpers::params(&[("$name", "Eve")]),
+    )
+    .await
+    .unwrap();
+    let pin = person_pin(&db).await;
+
+    for (ceilings, measure) in [
+        (
+            TableCeilings::default().with_source_fragments(1),
+            ResourceMeasure::SourceFragments,
+        ),
+        (
+            TableCeilings::default().with_source_rows(1),
+            ResourceMeasure::SourceRows,
+        ),
+        (
+            TableCeilings::default().with_source_bytes(1),
+            ResourceMeasure::SourceBytes,
+        ),
+        (
+            TableCeilings::default().with_index_rows(1),
+            ResourceMeasure::IndexRows,
+        ),
+    ] {
+        let report = db
+            .optimize_as(
+                None,
+                OptimizeRequest::default()
+                    .with_limits(OptimizeLimits::default().with_table_ceilings(ceilings)),
+            )
+            .await
+            .unwrap();
+        let person = report
+            .tables
+            .iter()
+            .find(|stat| stat.type_key == "node:Person")
+            .unwrap();
+        let TableOptimizeOutcome::Deferred(DeferReason::ResourceLimit(exceeded)) = person.outcome
+        else {
+            panic!("{measure:?}: {person:?}");
+        };
+        assert_eq!(exceeded.measure, measure);
+        assert_eq!(exceeded.ceiling, 1);
+        assert!(
+            exceeded.measured.is_some_and(|measured| measured > 1),
+            "{exceeded:?}"
+        );
+        assert_eq!(
+            report.resume_at, None,
+            "a resource limit never moves the resume position"
+        );
+        assert_eq!(person_pin(&db).await, pin, "{measure:?} wrote nothing");
+    }
+
+    // Measured whole, including the deletion file's size, the plan fits.
+    let report = db
+        .optimize_as(
+            None,
+            OptimizeRequest::default()
+                .with_limits(OptimizeLimits::default().with_run_source_bytes(u64::MAX)),
+        )
+        .await
+        .unwrap();
+    let person = report
+        .tables
+        .iter()
+        .find(|stat| stat.type_key == "node:Person")
+        .unwrap();
+    assert!(person.committed(), "{person:?}");
+    assert!(
+        person.source_bytes.is_some_and(|bytes| bytes > 0),
+        "{person:?}"
+    );
+}
+
+/// A stable-row-id rewrite carries every BTREE and vector index's coverage to
+/// the new fragments (Lance 13 drops coverage only for zone-map, Bloom and FM
+/// indexes, which the engine does not build), so compaction alone is no index
+/// work: the index-rows ceiling counts only a rebuild the plan already shows,
+/// and the rewrite publishes as one link with no fold after it. A later write
+/// that adds rows is index work again, so the ceiling defers the table again.
+#[tokio::test]
+async fn optimize_rewrite_keeps_index_coverage_so_index_rows_count_only_a_lagging_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = "node Doc {\n    slug: String @key\n    note: String?\n    n: I64 @index\n    embedding: Vector(4) @index\n}\n";
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap(),
+    );
+    let lines = (0..4)
+        .map(|i| {
+            serde_json::json!({
+                "type": "Doc",
+                "data": {"slug": format!("d{i}"), "note": "n", "n": i, "embedding": [i as f32, 0.0, 0.0, 0.0]},
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    db.load_jsonl(&lines, LoadMode::Overwrite).await.unwrap();
+    // Settle every index, then prove the table has nothing left to do and
+    // every declared index exists.
+    db.optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    let settled = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        settled.tables.iter().all(|stat| !stat.committed()),
+        "test precondition: {settled:?}"
+    );
+    let ds = snapshot_main(&db)
+        .await
+        .unwrap()
+        .open_dataset("node:Doc")
+        .await
+        .unwrap();
+    assert!(ds.has_btree_index("n").await.unwrap(), "test precondition");
+    assert!(
+        ds.has_vector_index("embedding").await.unwrap(),
+        "test precondition"
+    );
+    // Dropping a property is compaction work while every index covers every
+    // fragment.
+    assert!(
+        db.apply_schema("node Doc {\n    slug: String @key\n    n: I64 @index\n    embedding: Vector(4) @index\n}\n")
+            .await
+            .unwrap()
+            .applied
+    );
+    let pin = doc_pin(&db).await;
+
+    let report = db
+        .optimize_as(
+            None,
+            OptimizeRequest::default().with_limits(
+                OptimizeLimits::default()
+                    .with_table_ceilings(TableCeilings::default().with_index_rows(1)),
+            ),
+        )
+        .await
+        .unwrap();
+    let doc = report
+        .tables
+        .iter()
+        .find(|stat| stat.type_key == "node:Doc")
+        .unwrap();
+    assert!(
+        doc.committed(),
+        "a rewrite with no lagging index is not index work: {doc:?}"
+    );
+    assert_eq!(
+        doc_pin(&db).await,
+        pin + 1,
+        "the rewrite is the table's only link: no fold follows it"
+    );
+    let settled = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        settled.tables.iter().all(|stat| !stat.committed()),
+        "every index still covers every fragment: {settled:?}"
+    );
+
+    // A write that inserts rows, or rewrites a row (a merge of an existing
+    // key moves it to a new fragment), leaves a fragment outside the id
+    // index, so the table has index work again and the ceiling counts its
+    // live rows on every run until a run without it folds the index, as
+    // docs/user/operations/recorded-operations.md (Table ceilings and the
+    // byte budget) says. Both writes leave 5 live rows.
+    for (write, slug, n) in [("insert", "d4", 4), ("upsert", "d1", 10)] {
+        db.load_jsonl(
+            &serde_json::json!({
+                "type": "Doc",
+                "data": {"slug": slug, "n": n, "embedding": [n as f32, 0.0, 0.0, 0.0]},
+            })
+            .to_string(),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+        let pin = doc_pin(&db).await;
+        for _ in 0..2 {
+            let report = db
+                .optimize_as(
+                    None,
+                    OptimizeRequest::default().with_limits(
+                        OptimizeLimits::default()
+                            .with_table_ceilings(TableCeilings::default().with_index_rows(1)),
+                    ),
+                )
+                .await
+                .unwrap();
+            let doc = report
+                .tables
+                .iter()
+                .find(|stat| stat.type_key == "node:Doc")
+                .unwrap();
+            let TableOptimizeOutcome::Deferred(DeferReason::ResourceLimit(exceeded)) = doc.outcome
+            else {
+                panic!("an {write} is index work again: {doc:?}");
+            };
+            assert_eq!(exceeded.measure, ResourceMeasure::IndexRows);
+            assert_eq!(exceeded.measured, Some(5), "the table's live rows");
+            assert_eq!(report.resume_at, None);
+            assert_eq!(doc_pin(&db).await, pin, "a deferred table writes nothing");
+        }
+        let report = db
+            .optimize_as(None, OptimizeRequest::default())
+            .await
+            .unwrap();
+        assert!(
+            report
+                .tables
+                .iter()
+                .any(|stat| stat.type_key == "node:Doc" && stat.committed()),
+            "a run without the ceiling optimizes it after the {write}: {report:?}"
+        );
+    }
+}
+
+/// The run budget stops the run at the first table that would pass it:
+/// that table and every later one are deferred, and the next run resumes
+/// there. With no table byte ceiling set, the budget is also that ceiling: a
+/// table larger than the budget is deferred `resource_limit` on every run,
+/// writes nothing and never moves the resume position, as
+/// docs/user/operations/recorded-operations.md (Table ceilings and the byte
+/// budget) says.
+#[tokio::test]
+async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    for name in ["Acme", "Beta", "Cygnus", "Delta"] {
+        db.load_jsonl(
+            &serde_json::json!({"type": "Company", "data": {"name": name}}).to_string(),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    }
+
+    // Measure every table's source bytes in a run whose hook refuses to
+    // publish it.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&seen);
+    let probe = OptimizeBeforePublish::new(move |publication| {
+        recorded.lock().unwrap().push(publication);
+        async { Err(OmniError::manifest("measuring only")) }
+    });
+    db.optimize_as(
+        None,
+        OptimizeRequest::default()
+            .with_limits(OptimizeLimits::default().with_run_source_bytes(u64::MAX))
+            .with_before_publish(probe),
+    )
+    .await
+    .unwrap_err();
+    let measured = seen.lock().unwrap()[0]
+        .tables
+        .iter()
+        .filter_map(|stat| Some((stat.type_key.clone(), stat.source_bytes?)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        measured
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["node:Company", "node:Person"],
+        "{measured:?}"
+    );
+
+    // A budget below every table's bytes, with no table ceiling: each table
+    // is over the ceiling the budget implies, run after run.
+    let below = measured[0].1.min(measured[1].1) - 1;
+    let pin = person_pin(&db).await;
+    for _ in 0..2 {
+        let report = db
+            .optimize_as(
+                None,
+                OptimizeRequest::default()
+                    .with_limits(OptimizeLimits::default().with_run_source_bytes(below)),
+            )
+            .await
+            .unwrap();
+        let mut checked = 0;
+        for stat in &report.tables {
+            if !["node:Company", "node:Person"].contains(&stat.type_key.as_str()) {
+                continue;
+            }
+            let TableOptimizeOutcome::Deferred(DeferReason::ResourceLimit(exceeded)) = stat.outcome
+            else {
+                panic!("{stat:?}");
+            };
+            assert_eq!(exceeded.measure, ResourceMeasure::SourceBytes);
+            assert_eq!(exceeded.ceiling, below, "the budget is the ceiling");
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "{report:?}");
+        assert_eq!(report.resume_at, None, "{report:?}");
+        assert_eq!(report.graph_commit_id, None, "{report:?}");
+        assert_eq!(
+            person_pin(&db).await,
+            pin,
+            "a deferred table is not written"
+        );
+    }
+
+    // Each table fits alone, both together do not.
+    let budget = measured[0].1.max(measured[1].1);
+    let limits = OptimizeLimits::default().with_run_source_bytes(budget);
+
+    let report = db
+        .optimize_as(None, OptimizeRequest::default().with_limits(limits))
+        .await
+        .unwrap();
+    let outcome = |report: &omnigraph::db::OptimizeReport, key: &str| {
+        report
+            .tables
+            .iter()
+            .find(|stat| stat.type_key == key)
+            .unwrap()
+            .outcome
+    };
+    assert!(
+        matches!(
+            outcome(&report, "node:Company"),
+            TableOptimizeOutcome::Optimized
+        ),
+        "{report:?}"
+    );
+    assert_eq!(
+        outcome(&report, "node:Person"),
+        TableOptimizeOutcome::Deferred(DeferReason::ByteBudget)
+    );
+    assert_eq!(report.resume_at.as_deref(), Some("node:Person"));
+
+    let next = db
+        .optimize_as(
+            None,
+            OptimizeRequest::default()
+                .with_limits(limits)
+                .with_start_at("node:Person"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome(&next, "node:Person"),
+            TableOptimizeOutcome::Optimized
+        ),
+        "{next:?}"
+    );
+    assert_eq!(next.resume_at, None);
+}
+
+/// The artifact limit holds before the scan (a lower bound) and during it
+/// (the counting build), writes nothing when it stops, and admits the whole
+/// object once there is room for it.
+#[tokio::test]
+async fn optimize_skips_an_artifact_over_its_size_limit() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let artifact = dir.path().join("__graph_index/csr-current.bin");
+    let report = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(report.artifact, ArtifactRefresh::Refreshed);
+    let size = std::fs::metadata(&artifact).unwrap().len();
+    std::fs::remove_file(&artifact).unwrap();
+
+    let bounded = |limit: u64| {
+        let builds = std::sync::Arc::new(AtomicU64::new(0));
+        let probes = omnigraph::instrumentation::QueryIoProbes {
+            graph_build_count: std::sync::Arc::clone(&builds),
+            ..Default::default()
+        };
+        let run = omnigraph::instrumentation::with_query_io_probes(
+            probes,
+            db.optimize_as(
+                None,
+                OptimizeRequest::default()
+                    .with_limits(OptimizeLimits::default().with_artifact_bytes(limit)),
+            ),
+        );
+        async move { (run.await.unwrap().artifact, builds.load(Ordering::Relaxed)) }
+    };
+
+    let (outcome, builds) = bounded(1).await;
+    assert!(
+        matches!(outcome, ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit { counted, limit: 1 }) if counted > 1),
+        "{outcome:?}"
+    );
+    assert_eq!(builds, 0, "a lower bound over the limit starts no scan");
+    assert!(!artifact.exists());
+
+    let (outcome, builds) = bounded(size - 1).await;
+    let ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit { counted, limit }) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(limit, size - 1);
+    assert!(counted > limit, "{counted} vs {limit}");
+    assert_eq!(builds, 1, "the counting build started and stopped");
+    assert!(!artifact.exists(), "a stopped build writes nothing");
+
+    // The counted header is the widest, so admitting the whole object needs
+    // room for its count and length digits.
+    let (outcome, _) = bounded(size + 4096).await;
+    assert_eq!(outcome, ArtifactRefresh::Refreshed);
+    assert_eq!(std::fs::metadata(&artifact).unwrap().len(), size);
+}
+
+/// main's history settles a publication whose answer was lost: the input
+/// head's child answers the run's nonce, another nonce did not commit, a
+/// later commit on main changes neither, an unmoved head stays in doubt, and
+/// a page that ends before the child hands its unvisited parent to the next
+/// page, which settles it.
+#[tokio::test]
+async fn resolve_publication_judges_the_input_heads_child() {
+    use omnigraph::db::PublicationLookup;
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    let (hook, seen) = recording_hook();
+    let report = db
+        .optimize_as(None, OptimizeRequest::default().with_before_publish(hook))
+        .await
+        .unwrap();
+    let commit = report.graph_commit_id.clone().expect("the run published");
+    let publication = seen.lock().unwrap()[0].clone();
+    let lookup = |nonce: String| {
+        let input = publication.input_commit.clone();
+        let version = publication.input_manifest_version;
+        let db = &db;
+        async move {
+            db.resolve_publication(None, &nonce, input.as_deref(), version, None, 256)
+                .await
+                .unwrap()
+        }
+    };
+    let committed = PublicationLookup::Committed {
+        commit_id: commit.clone(),
+    };
+    assert_eq!(lookup(publication.nonce.clone()).await, committed);
+    assert_eq!(
+        lookup("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()).await,
+        PublicationLookup::NotCommitted
+    );
+
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Zed")], &[("$age", 50)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(lookup(publication.nonce.clone()).await, committed);
+
+    let head = db.list_commits(None).await.unwrap()[0].clone();
+    assert_eq!(
+        db.resolve_publication(
+            None,
+            &publication.nonce,
+            Some(&head.graph_commit_id),
+            head.graph_manifest_version,
+            None,
+            256
+        )
+        .await
+        .unwrap(),
+        PublicationLookup::HeadUnchanged
+    );
+
+    // One commit per page: the tip's page ends before the child and names
+    // the child as its next; the page from there settles the run.
+    let input = publication.input_commit.as_deref();
+    let version = publication.input_manifest_version;
+    let PublicationLookup::Walking { next, visited } = db
+        .resolve_publication(None, &publication.nonce, input, version, None, 1)
+        .await
+        .unwrap()
+    else {
+        panic!("a one-commit page from the tip does not reach the child");
+    };
+    assert_eq!(visited, 1);
+    assert_eq!(next, commit, "the cursor is the unvisited parent");
+    assert_eq!(
+        db.resolve_publication(None, &publication.nonce, input, version, Some(&next), 1)
+            .await
+            .unwrap(),
+        committed
     );
 }
 
@@ -159,7 +1049,10 @@ async fn optimize_after_load_then_again_is_idempotent() {
     let db = init_and_load(&dir).await;
 
     // First pass may compact (load wrote real fragments).
-    let _first = db.optimize().await.unwrap();
+    let _first = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
 
     let commits_before = db.list_commits(None).await.unwrap();
     let head_before = commits_before
@@ -170,7 +1063,11 @@ async fn optimize_after_load_then_again_is_idempotent() {
 
     // Second pass should be a no-op: already-compacted graph produces no
     // fragments_removed / fragments_added.
-    let second = db.optimize().await.unwrap();
+    let second = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     for s in &second {
         assert_eq!(
             s.fragments_removed, 0,
@@ -183,7 +1080,7 @@ async fn optimize_after_load_then_again_is_idempotent() {
             s.type_key
         );
         assert!(
-            !s.committed,
+            !s.committed(),
             "{} re-optimize should not commit a new version",
             s.type_key
         );
@@ -234,7 +1131,11 @@ async fn optimize_preserves_manifest_registry_fragments() {
         !cold_files.is_empty(),
         "the fixture must release more registry rows than the hot bound"
     );
-    let stats = db.optimize().await.unwrap();
+    let report = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    let stats = &report.tables;
     let after = Dataset::open(&manifest_uri).await.unwrap();
     let after_files: BTreeSet<_> = after
         .fragments()
@@ -246,13 +1147,14 @@ async fn optimize_preserves_manifest_registry_fragments() {
         "optimize rewrote cold registry files"
     );
 
-    let manifest_stats = stats
-        .iter()
-        .find(|s| s.type_key == "__manifest")
-        .expect("optimize stats missing internal table __manifest");
     assert!(
-        !manifest_stats.committed && manifest_stats.fragments_removed == 0,
-        "the manifest publisher owns hot and cold fragments, so optimize must leave them intact: {manifest_stats:?}"
+        stats.iter().all(|s| s.type_key != "__manifest"),
+        "the manifest publisher owns hot and cold fragments, so optimize must not compact them"
+    );
+    assert_eq!(
+        report.configuration_clear,
+        ConfigurationClear::NothingToClear,
+        "a graph with no stale auto-cleanup keys has nothing to clear"
     );
 
     assert!(
@@ -328,7 +1230,9 @@ async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
         .unwrap()
         .len();
 
-    db.optimize().await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
 
     let ds = Dataset::open(&manifest_uri).await.unwrap();
     // (a) the stale auto_cleanup config was cleared (non-destructive by construction).
@@ -368,10 +1272,9 @@ async fn optimize_preserves_versions_under_stale_auto_cleanup_config_on_data_tab
     add_person_fragments(&db).await; // multiple fragments → will_compact
 
     // Simulate an upgraded graph: set an aggressive stored auto_cleanup config on
-    // the Person table. This is an out-of-band Lance commit (an `UpdateConfig` that
-    // advances HEAD past the manifest), so realign the manifest with a forced repair
-    // first — otherwise optimize skips the table as uncovered drift and never
-    // reaches the scrub. (Forced because UpdateConfig is not verified maintenance.)
+    // the Person table. This is an out-of-band Lance commit (an `UpdateConfig`
+    // above the table's last linear version); optimize stages on the pin, never
+    // the linear HEAD, so it still compacts the table.
     let (_, _, person_full) = person_pin_and_head(&db, &root).await;
     {
         let mut ds = Dataset::open(&person_full).await.unwrap();
@@ -382,12 +1285,6 @@ async fn optimize_preserves_versions_under_stale_auto_cleanup_config_on_data_tab
         .await
         .unwrap();
     }
-    db.repair(RepairOptions {
-        confirm: true,
-        force: true,
-    })
-    .await
-    .unwrap();
 
     let versions_before = Dataset::open(&person_full)
         .await
@@ -398,7 +1295,9 @@ async fn optimize_preserves_versions_under_stale_auto_cleanup_config_on_data_tab
         .len();
     let rows_before = count_rows(&db, "node:Person").await;
 
-    db.optimize().await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
 
     let ds = Dataset::open(&person_full).await.unwrap();
     assert!(
@@ -445,7 +1344,7 @@ node Doc {
     )
     .await
     .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
 
     // A second load with NEW keys appends a fragment the existing BTREEs do not
     // cover (the existence gate skips re-building an index that already exists).
@@ -467,7 +1366,11 @@ node Doc {
         );
     }
 
-    let stats = db.optimize().await.unwrap();
+    let stats = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
 
     // Postcondition: optimize_indices folded the scalar tail in, but preserves
     // the existing FTS artifact instead of merging uncertified postings.
@@ -496,12 +1399,16 @@ node Doc {
     );
     let commits_before = db.list_commits(None).await.unwrap().len();
     for _ in 0..2 {
-        let repeated = db.optimize().await.unwrap();
+        let repeated = db
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap()
+            .tables;
         let doc = repeated
             .iter()
             .find(|stat| stat.type_key == "node:Doc")
             .unwrap();
-        assert!(!doc.committed, "deferred FTS alone is not optimize work");
+        assert!(!doc.committed(), "deferred FTS alone is not optimize work");
         assert_eq!(doc.pending_indexes.len(), 1);
         assert_eq!(doc.pending_indexes[0].property, "slug");
         assert_same_dataset_entry(
@@ -515,7 +1422,10 @@ node Doc {
         assert_eq!(recovery_sidecar_count(&dir), 0);
     }
     assert_eq!(db.list_commits(None).await.unwrap().len(), commits_before);
-    let rebuilt = db.rebuild_full_text_indices_on("main").await.unwrap();
+    let rebuilt = db
+        .rebuild_full_text_indices_on_as("main", None)
+        .await
+        .unwrap();
     assert_eq!(rebuilt.rebuilt_indexes.len(), 1);
     assert_eq!(rebuilt.rebuilt_indexes[0].property, "slug");
     let snap = snapshot_main(&db).await.unwrap();
@@ -653,9 +1563,12 @@ node Tag {\n    slug: String @key\n}\n";
         .clone();
 
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
-    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
-        .await
-        .expect("optimize must not crash on a graph with a Blob table");
+    let stats = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default()),
+    )
+    .await
+    .expect("optimize must not crash on a graph with a Blob table");
     assert_eq!(
         (
             probes.compaction_blob_batch_calls(),
@@ -666,16 +1579,17 @@ node Tag {\n    slug: String @key\n}\n";
     );
 
     let doc = stats
+        .tables
         .iter()
         .find(|s| s.type_key == "node:Doc")
         .expect("Doc stat present");
     let tag = stats
+        .tables
         .iter()
         .find(|s| s.type_key == "node:Tag")
         .expect("Tag stat present");
     // Lance 10's null/empty-safe blob-v2 compaction uses the ordinary path.
-    assert_eq!(doc.skipped, None, "blob table must no longer be skipped");
-    assert!(doc.committed, "blob table compaction must be published");
+    assert!(doc.committed(), "blob table compaction must be published");
     assert!(
         doc.fragments_removed >= 2 && doc.fragments_added >= 1,
         "expected a real rewrite of the multi-fragment blob table, got \
@@ -683,8 +1597,7 @@ node Tag {\n    slug: String @key\n}\n";
         doc.fragments_removed,
         doc.fragments_added
     );
-    assert_eq!(tag.skipped, None, "non-blob table must not be skipped");
-    assert!(tag.committed, "plain table compaction must be published");
+    assert!(tag.committed(), "plain table compaction must be published");
 
     // Both productive tables share one graph visibility point. Physical
     // __manifest compaction below may add Lance versions, so lineage is the
@@ -787,9 +1700,12 @@ async fn optimize_compacts_large_blob_rows_in_bounded_batches() {
     let commits_before = db.list_commits(None).await.unwrap().len();
 
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
-    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
-        .await
-        .unwrap();
+    let stats = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         probes.compaction_blob_batch_calls(),
         1,
@@ -801,11 +1717,14 @@ async fn optimize_compacts_large_blob_rows_in_bounded_batches() {
         "the task runs with the batch derived from its largest row"
     );
     let doc = stats
+        .tables
         .iter()
         .find(|stat| stat.type_key == "node:Doc")
         .expect("Doc stat present");
-    assert_eq!(doc.skipped, None);
-    assert!(doc.committed, "the Blob table compaction must be published");
+    assert!(
+        doc.committed(),
+        "the Blob table compaction must be published"
+    );
     assert_eq!(doc.fragments_removed, fragments_before);
     assert_eq!(
         db.list_commits(None).await.unwrap().len(),
@@ -942,9 +1861,12 @@ async fn optimize_sizes_a_blob_batch_by_the_sum_of_a_rows_blob_columns() {
     }
 
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
-    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
-        .await
-        .unwrap();
+    let stats = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default()),
+    )
+    .await
+    .unwrap();
     assert_eq!(probes.compaction_blob_batch_calls(), 1);
     assert_eq!(
         probes.compaction_blob_batch_rows(),
@@ -952,10 +1874,14 @@ async fn optimize_sizes_a_blob_batch_by_the_sum_of_a_rows_blob_columns() {
         "the batch is derived from the row's 2 MiB, not from its largest 1 MiB column"
     );
     let doc = stats
+        .tables
         .iter()
         .find(|stat| stat.type_key == "node:Doc")
         .expect("Doc stat present");
-    assert!(doc.committed, "the Blob table compaction must be published");
+    assert!(
+        doc.committed(),
+        "the Blob table compaction must be published"
+    );
     assert_eq!(doc.fragments_removed, 2);
     let expected = rows
         .into_iter()
@@ -1031,12 +1957,19 @@ async fn optimize_compacts_blob_fragments_with_deleted_rows() {
         "test precondition: both fragments carry a deletion vector"
     );
 
-    let stats = db.optimize().await.unwrap();
+    let stats = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     let doc = stats
         .iter()
         .find(|stat| stat.type_key == "node:Doc")
         .expect("Doc stat present");
-    assert!(doc.committed, "the Blob table compaction must be published");
+    assert!(
+        doc.committed(),
+        "the Blob table compaction must be published"
+    );
     assert_eq!(doc.fragments_removed, 2);
     let compacted = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
     let fragments = compacted.get_fragments();
@@ -1085,14 +2018,17 @@ async fn optimize_sizes_each_compaction_task_from_its_own_fragments() {
         };
         db.load_jsonl(&line, mode).await.unwrap();
         if load == 1 {
-            db.ensure_indices().await.unwrap();
+            db.ensure_indices_as(None).await.unwrap();
         }
     }
 
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
-    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
-        .await
-        .unwrap();
+    let stats = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         probes.compaction_blob_batch_calls(),
         2,
@@ -1104,10 +2040,14 @@ async fn optimize_sizes_each_compaction_task_from_its_own_fragments() {
         "the second task is sized by its own 64 KiB row, not the first task's 1 MiB row"
     );
     let doc = stats
+        .tables
         .iter()
         .find(|stat| stat.type_key == "node:Doc")
         .expect("Doc stat present");
-    assert!(doc.committed, "the Blob table compaction must be published");
+    assert!(
+        doc.committed(),
+        "the Blob table compaction must be published"
+    );
     let expected = rows
         .into_iter()
         .map(|(slug, content)| (slug.to_string(), vec![Some(content)]))
@@ -1167,10 +2107,40 @@ async fn optimize_does_not_size_a_blob_batch_by_external_references() {
         "test precondition: the load keeps the external reference as a descriptor"
     );
 
-    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
-    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
+    // Nor toward the Blob ceiling: only the 3 managed bytes count.
+    let bounded = db
+        .optimize_as(
+            None,
+            omnigraph::db::OptimizeRequest::default().with_limits(
+                OptimizeLimits::default()
+                    .with_table_ceilings(TableCeilings::default().with_blob_bytes(2)),
+            ),
+        )
         .await
         .unwrap();
+    let doc = bounded
+        .tables
+        .iter()
+        .find(|stat| stat.type_key == "node:Doc")
+        .unwrap();
+    assert_eq!(
+        doc.outcome,
+        TableOptimizeOutcome::Deferred(DeferReason::ResourceLimit(
+            omnigraph::db::ResourceExceeded {
+                measure: ResourceMeasure::BlobBytes,
+                measured: Some(3),
+                ceiling: 2,
+            }
+        ))
+    );
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let stats = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default()),
+    )
+    .await
+    .unwrap();
     assert_eq!(probes.compaction_blob_batch_calls(), 1);
     assert_eq!(
         probes.compaction_blob_batch_rows(),
@@ -1178,10 +2148,14 @@ async fn optimize_does_not_size_a_blob_batch_by_external_references() {
         "a 1 MiB external reference must not lower the batch to 32 rows"
     );
     let doc = stats
+        .tables
         .iter()
         .find(|stat| stat.type_key == "node:Doc")
         .expect("Doc stat present");
-    assert!(doc.committed, "the Blob table compaction must be published");
+    assert!(
+        doc.committed(),
+        "the Blob table compaction must be published"
+    );
     assert_eq!(doc.fragments_removed, 2);
 }
 
@@ -1287,9 +2261,16 @@ async fn optimize_then_cleanup_erases_dropped_property_values() {
         .await
         .unwrap();
     // Settle index work, then prove Lance's planner leaves both tables alone.
-    db.optimize().await.unwrap();
-    for stat in db.optimize().await.unwrap() {
-        assert!(!stat.committed, "test precondition: {stat:?}");
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    for stat in db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables
+    {
+        assert!(!stat.committed(), "test precondition: {stat:?}");
     }
     assert_eq!(
         helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc")
@@ -1334,17 +2315,26 @@ async fn optimize_then_cleanup_erases_dropped_property_values() {
     let commits_before = db.list_commits(None).await.unwrap().len();
 
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
-    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
-        .await
-        .unwrap();
-    let stat = |key: &str| stats.iter().find(|stat| stat.type_key == key).unwrap();
+    let stats = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default()),
+    )
+    .await
+    .unwrap();
+    let stat = |key: &str| {
+        stats
+            .tables
+            .iter()
+            .find(|stat| stat.type_key == key)
+            .unwrap()
+    };
     let doc = stat("node:Doc");
     assert!(
-        doc.committed,
+        doc.committed(),
         "the fragment holding dropped values is rewritten"
     );
     assert_eq!((doc.fragments_removed, doc.fragments_added), (1, 1));
-    assert!(!stat("node:Tag").committed, "Tag has nothing to rewrite");
+    assert!(!stat("node:Tag").committed(), "Tag has nothing to rewrite");
     assert_eq!(
         helpers::pinned_version(&db, "main", "node:Tag").await,
         tag_pin
@@ -1384,9 +2374,14 @@ async fn optimize_then_cleanup_erases_dropped_property_values() {
         doc_blob_values(&db, &["content"]).await == expected,
         "the remaining properties survive the rewrite"
     );
-    for stat in db.optimize().await.unwrap() {
+    for stat in db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables
+    {
         assert!(
-            !stat.committed,
+            !stat.committed(),
             "a second optimize has nothing left: {stat:?}"
         );
     }
@@ -1408,8 +2403,10 @@ async fn optimize_then_cleanup_erases_dropped_property_values() {
         db.branch_merge("retained", "main").await.unwrap().outcome,
         MergeOutcome::Merged
     );
-    db.optimize().await.unwrap();
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     for needle in &needles {
         assert!(
@@ -1418,7 +2415,7 @@ async fn optimize_then_cleanup_erases_dropped_property_values() {
         );
     }
     db.branch_delete("retained").await.unwrap();
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     for needle in &needles {
         let found = files_containing(dir.path(), needle);
@@ -1472,13 +2469,17 @@ async fn optimize_publishes_compaction_to_manifest_so_schema_apply_succeeds() {
         .get_fragments()
         .len();
 
-    let stats = db.optimize().await.unwrap();
+    let stats = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     let person = stats
         .iter()
         .find(|s| s.type_key == "node:Person")
         .expect("Person stat present");
     assert!(
-        person.committed,
+        person.committed(),
         "Person is multi-fragment, so optimize must have compacted it"
     );
 
@@ -1532,13 +2533,19 @@ async fn optimize_compacts_the_pin_under_foreign_head_drift() {
     let (pin_before, head_before, _) = forge_person_compaction_drift(&db, &root).await;
     let rows_before = count_rows(&db, "node:Person").await;
 
-    let stats = db.optimize().await.unwrap();
+    let stats = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     let person = stats
         .iter()
         .find(|s| s.type_key == "node:Person")
         .expect("Person stat present");
-    assert_eq!(person.skipped, None);
-    assert!(person.committed, "optimize compacts the multi-fragment pin");
+    assert!(
+        person.committed(),
+        "optimize compacts the multi-fragment pin"
+    );
 
     let (pin_after, head_after, _) = person_pin_and_head(&db, &root).await;
     assert_ne!(pin_after, pin_before, "optimize publishes a new pin");
@@ -1550,10 +2557,11 @@ async fn optimize_compacts_the_pin_under_foreign_head_drift() {
     assert_eq!(count_rows(&db, "node:Person").await, rows_before);
 }
 
-/// Repair preview names linear commits above the last linear version as
-/// `foreign_drift` and publishes nothing.
+/// The collector's plan names linear commits above the last linear version
+/// as foreign and publishes nothing, and writers stage on the pin
+/// regardless: a strict schema apply still succeeds.
 #[tokio::test]
-async fn repair_preview_reports_foreign_drift_without_adopting_it() {
+async fn foreign_drift_is_listed_without_publishing_and_schema_apply_stages_on_the_pin() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir
         .path()
@@ -1564,65 +2572,22 @@ async fn repair_preview_reports_foreign_drift_without_adopting_it() {
     let db = init_and_load(&dir).await;
     let (pin_before, head_before, _) = forge_person_compaction_drift(&db, &root).await;
 
-    let stats = db
-        .repair(RepairOptions {
-            confirm: false,
-            force: false,
-        })
-        .await
-        .unwrap();
-    assert_eq!(stats.graph_manifest_version, None);
-    let person = stats
-        .datasets
-        .iter()
-        .find(|s| s.type_key == "node:Person")
-        .expect("Person repair stat present");
-    assert_eq!(person.classification, RepairClassification::ForeignDrift);
-    assert_eq!(person.action, RepairAction::NoOp);
-    assert_eq!(person.lance_head_version, head_before);
-    assert!(
-        person.operations.len() == 1 && person.operations[0].contains("foreign linear version"),
-        "foreign drift names the linear versions above the last linear version: {:?}",
-        person.operations
-    );
-
-    let (pin_after, head_after, _) = person_pin_and_head(&db, &root).await;
-    assert_eq!(pin_after, pin_before);
-    assert_eq!(head_after, head_before);
-}
-
-/// A confirmed repair never adopts foreign drift, and writers stage on the
-/// pin regardless: the strict schema apply still succeeds.
-#[tokio::test]
-async fn repair_confirm_never_adopts_foreign_drift() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir
-        .path()
-        .to_str()
-        .unwrap()
-        .trim_end_matches('/')
-        .to_string();
-    let db = init_and_load(&dir).await;
-    let (pin_before, head_before, _) = forge_person_compaction_drift(&db, &root).await;
-
-    let stats = db
-        .repair(RepairOptions {
-            confirm: true,
-            force: false,
-        })
-        .await
-        .unwrap();
+    let commits_before = db.list_commits(None).await.unwrap();
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
     assert_eq!(
-        stats.graph_manifest_version, None,
-        "confirmed repair publishes nothing for foreign drift"
+        db.list_commits(None).await.unwrap(),
+        commits_before,
+        "the collector's plan publishes nothing"
     );
-    let person = stats
-        .datasets
-        .iter()
-        .find(|s| s.type_key == "node:Person")
-        .expect("Person repair stat present");
-    assert_eq!(person.classification, RepairClassification::ForeignDrift);
-    assert_eq!(person.action, RepairAction::NoOp);
+    let person = main_plan(&report, "node:Person");
+    let last_linear = person
+        .last_linear_version
+        .expect("every registration records its last linear version");
+    assert_eq!(
+        person.foreign_versions,
+        (last_linear + 1..=head_before).collect::<Vec<_>>(),
+        "the plan names every linear version above the last linear version"
+    );
 
     let (pin_after, head_after, _) = person_pin_and_head(&db, &root).await;
     assert_eq!(pin_after, pin_before);
@@ -1637,12 +2602,17 @@ async fn repair_confirm_never_adopts_foreign_drift() {
         .await
         .expect("strict schema apply stages on the pin under foreign drift");
     assert!(result.applied);
+    let (_, head_after_apply, _) = person_pin_and_head(&db, &root).await;
+    assert_eq!(
+        head_after_apply, head_before,
+        "the schema apply neither moves nor adopts the foreign HEAD"
+    );
 }
 
-/// Force does not change the judgement: a foreign raw delete is reported as
-/// `foreign_drift`, never adopted, and reads still resolve the pin.
+/// A foreign raw delete is listed by the collector, never adopted, and reads
+/// still resolve the pin.
 #[tokio::test]
-async fn repair_force_never_adopts_a_foreign_delete() {
+async fn a_foreign_delete_is_listed_by_the_collector_and_never_adopted() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir
         .path()
@@ -1653,21 +2623,13 @@ async fn repair_force_never_adopts_a_foreign_delete() {
     let db = init_and_load(&dir).await;
     let (pin_before, head_before, _) = forge_person_delete_drift(&db, &root).await;
 
-    let stats = db
-        .repair(RepairOptions {
-            confirm: true,
-            force: true,
-        })
-        .await
-        .unwrap();
-    assert_eq!(stats.graph_manifest_version, None);
-    let person = stats
-        .datasets
-        .iter()
-        .find(|s| s.type_key == "node:Person")
-        .expect("Person repair stat present");
-    assert_eq!(person.classification, RepairClassification::ForeignDrift);
-    assert_eq!(person.action, RepairAction::NoOp);
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let person = main_plan(&report, "node:Person");
+    assert!(
+        person.foreign_versions.contains(&head_before),
+        "the foreign delete is listed: {:?}",
+        person.foreign_versions
+    );
 
     let (pin_after, head_after, _) = person_pin_and_head(&db, &root).await;
     assert_eq!(pin_after, pin_before);
@@ -1681,9 +2643,9 @@ async fn repair_force_never_adopts_a_foreign_delete() {
 
 /// A never-written table's linear creation pin under a foreign linear commit:
 /// the write stages a detached pin on the pin, the foreign HEAD stays, and
-/// repair reports it as `foreign_drift` without publishing.
+/// the collector lists it as foreign without publishing.
 #[tokio::test]
-async fn write_on_a_never_written_table_succeeds_over_foreign_drift_and_repair_reports_it() {
+async fn write_on_a_never_written_table_succeeds_over_foreign_drift_and_the_collector_lists_it() {
     let dir = tempfile::tempdir().unwrap();
     let db = helpers::session(
         Omnigraph::init(dir.path().to_str().unwrap(), TEST_SCHEMA)
@@ -1726,25 +2688,13 @@ async fn write_on_a_never_written_table_succeeds_over_foreign_drift_and_repair_r
         "the write neither moves nor adopts the foreign HEAD"
     );
 
-    let stats = db
-        .repair(RepairOptions {
-            confirm: true,
-            force: false,
-        })
-        .await
-        .unwrap();
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let company = main_plan(&report, "node:Company");
     assert_eq!(
-        stats.graph_manifest_version, None,
-        "repair publishes nothing for foreign drift"
+        company.foreign_versions,
+        vec![forged_head],
+        "the foreign commit above the creation pin is listed"
     );
-    let company = stats
-        .datasets
-        .iter()
-        .find(|s| s.type_key == "node:Company")
-        .expect("Company repair stat present");
-    assert_eq!(company.classification, RepairClassification::ForeignDrift);
-    assert_eq!(company.action, RepairAction::NoOp);
-    assert_eq!(company.lance_head_version, forged_head);
     assert_eq!(
         helpers::pinned_version(&db, "main", "node:Company").await,
         pin
@@ -1784,7 +2734,7 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
     db.load_jsonl(r#"{"type":"Person","data":{"name":"Alice","age":30,"biography":"organism university running"}}"#, LoadMode::Merge, )
     .await
     .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
 
     helpers::forge_linear_head_from_pin(&db, "main", "node:Person", 0).await;
     let person_uri = node_table_uri(&db, "Person").await;
@@ -1928,7 +2878,10 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
     assert_eq!(recovery_sidecar_count(&dir), 0);
 
     // A force rebuild remains a real operation after coverage is complete.
-    let repeated = db.rebuild_full_text_indices_on("main").await.unwrap();
+    let repeated = db
+        .rebuild_full_text_indices_on_as("main", None)
+        .await
+        .unwrap();
     assert_eq!(repeated.rebuilt_indexes, expected);
     assert_ne!(repeated.graph_commit_id, result.graph_commit_id);
     assert_eq!(
@@ -2089,6 +3042,148 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
     );
 }
 
+/// An `update` of an indexed vector column that leaves a Blob unassigned is
+/// a column patch, which withdraws every fragment it touches from the vector
+/// index. When that leaves the index covering no fragment, Lance reports no
+/// statistics for it, so it has no partition count to keep: `index build`
+/// and `optimize` rebuild it as a new declared vector index is built, and
+/// build the other indexes of the type, instead of failing the whole batch
+/// on every run (findings queue
+/// `og-stress-vector-index-after-column-patch-blocks-index-build`).
+#[tokio::test]
+async fn index_build_and_optimize_rebuild_a_vector_index_a_column_patch_left_empty() {
+    use lance::index::DatasetIndexExt;
+    use omnigraph::db::{BuiltIndex, BuiltIndexAction, BuiltIndexKind};
+
+    const SCHEMA: &str = "node D {\n    slug: String @key\n    n: I64?\n    s: String?\n    b: Blob?\n    v: Vector(4)? @index\n}\n";
+    const UPDATE: &str = r#"
+query patch($v: Vector(4)?) {
+    update D set { v: $v } where slug in ["k5", "k2"]
+}
+"#;
+    // The vector index's segments, how many of them cover no fragment, and
+    // how many current fragments they leave uncovered.
+    async fn vector_index(db: &Omnigraph) -> (usize, usize, usize) {
+        let ds = helpers::open_pinned_dataset_for_test(db, "main", "node:D").await;
+        let field = ds.schema().field("v").unwrap().id;
+        let indices = ds.load_indices().await.unwrap();
+        let segments = indices
+            .iter()
+            .filter(|index| index.fields == [field])
+            .collect::<Vec<_>>();
+        let empty = segments
+            .iter()
+            .filter(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.is_empty())
+            })
+            .count();
+        let uncovered = ds
+            .get_fragments()
+            .iter()
+            .filter(|fragment| {
+                !segments.iter().any(|segment| {
+                    segment
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| bitmap.contains(fragment.id() as u32))
+                })
+            })
+            .count();
+        (segments.len(), empty, uncovered)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        concat!(
+            r#"{"type":"D","data":{"slug":"k2","v":null}}"#,
+            "\n",
+            r#"{"type":"D","data":{"slug":"k5","v":[1.0,-2.0,-2.0,-1.0]}}"#,
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(vector_index(&db).await, (1, 0, 0));
+
+    mutate_main(
+        &db,
+        UPDATE,
+        "patch",
+        &helpers::vector_param("v", &[2.0, 1.0, 0.5, 0.0]),
+    )
+    .await
+    .unwrap();
+    let (segments, empty, uncovered) = vector_index(&db).await;
+    assert_eq!(segments, 1, "the patch keeps the index's definition");
+    assert_eq!(empty, 1, "the patch leaves no segment covering a fragment");
+    assert!(uncovered > 0, "the patch withdraws the fragment it touched");
+
+    let built = db.ensure_indices_on_as("main", None).await.unwrap();
+    assert!(
+        built.indexes.contains(&BuiltIndex {
+            type_key: "node:D".to_string(),
+            property: "v".to_string(),
+            kind: BuiltIndexKind::Vector,
+            action: BuiltIndexAction::Refreshed,
+        }),
+        "{:?}",
+        built.indexes
+    );
+    assert_eq!(vector_index(&db).await, (1, 0, 0));
+
+    // The same state reached again, then folded by optimize.
+    mutate_main(
+        &db,
+        UPDATE,
+        "patch",
+        &helpers::vector_param("v", &[0.0, 1.0, 2.0, 3.0]),
+    )
+    .await
+    .unwrap();
+    let (segments, empty, uncovered) = vector_index(&db).await;
+    assert_eq!(
+        (segments, empty),
+        (1, 1),
+        "the patch empties the index again"
+    );
+    assert_ne!(uncovered, 0);
+    let optimized = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    for table in &optimized.tables {
+        assert_ne!(
+            table.outcome,
+            TableOptimizeOutcome::Failed,
+            "{}: {:?}",
+            table.type_key,
+            table.failure
+        );
+    }
+    assert_eq!(vector_index(&db).await, (1, 0, 0));
+
+    let rows = helpers::query_main(
+        &db,
+        "query near($q: Vector(4)) { match { $d: D } return { $d.slug } order { nearest($d.v, $q) } limit 1 }",
+        "near",
+        &helpers::vector_param("q", &[0.0, 1.0, 2.0, 3.0]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.num_rows(), 1);
+}
+
 /// A branch rebuild stages a detached pin on the inherited location; main's
 /// registrations and rows stay as they were.
 #[tokio::test]
@@ -2097,7 +3192,7 @@ async fn full_text_rebuild_on_a_branch_stages_on_the_inherited_location_without_
     let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
     let inherited = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
-    db.ensure_indices_on("feature").await.unwrap();
+    db.ensure_indices_on_as("feature", None).await.unwrap();
     assert_same_dataset_entry(
         inherited.dataset("node:Person").unwrap(),
         db.snapshot_of(ReadTarget::branch("feature"))
@@ -2111,7 +3206,10 @@ async fn full_text_rebuild_on_a_branch_stages_on_the_inherited_location_without_
     let main_commits_before = db.list_commits(None).await.unwrap();
     let feature_commits_before = db.list_commits(Some("feature")).await.unwrap();
 
-    let result = db.rebuild_full_text_indices_on("feature").await.unwrap();
+    let result = db
+        .rebuild_full_text_indices_on_as("feature", None)
+        .await
+        .unwrap();
     assert_eq!(result.branch, "feature");
     assert_eq!(result.rebuilt_indexes.len(), 2);
     let feature = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
@@ -2197,7 +3295,10 @@ async fn full_text_rebuild_reports_empty_builds_but_not_no_work() {
     .await
     .unwrap();
     let before = snapshot_main(&db).await.unwrap();
-    let result = db.rebuild_full_text_indices_on("main").await.unwrap();
+    let result = db
+        .rebuild_full_text_indices_on_as("main", None)
+        .await
+        .unwrap();
     assert_eq!(result.branch, "main");
     assert_eq!(result.graph_commit_id, None);
     assert!(result.rebuilt_indexes.is_empty());
@@ -2212,7 +3313,10 @@ async fn full_text_rebuild_reports_empty_builds_but_not_no_work() {
         .await
         .unwrap();
     let before = snapshot_main(&db).await.unwrap();
-    let result = db.rebuild_full_text_indices_on("main").await.unwrap();
+    let result = db
+        .rebuild_full_text_indices_on_as("main", None)
+        .await
+        .unwrap();
     assert_eq!(result.rebuilt_indexes.len(), 2);
     assert!(result.graph_commit_id.is_some());
     let after = snapshot_main(&db).await.unwrap();
@@ -2299,7 +3403,10 @@ async fn full_text_rebuild_refuses_unsupported_physical_inventory_before_effects
                     .version,
             );
         }
-        let error = db.rebuild_full_text_indices_on("main").await.unwrap_err();
+        let error = db
+            .rebuild_full_text_indices_on_as("main", None)
+            .await
+            .unwrap_err();
         assert!(
             error.to_string().contains("unsupported_internal_id_fts"),
             "{error}"
@@ -2342,7 +3449,7 @@ async fn cleanup_without_any_policy_option_errors() {
     let db = init_and_load(&dir).await;
 
     let err = db
-        .cleanup(CleanupPolicyOptions::default())
+        .cleanup_as(CleanupPolicyOptions::default(), None)
         .await
         .expect_err("cleanup with no policy options must error");
 
@@ -2372,10 +3479,13 @@ async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
     );
 
     let _stats = db
-        .cleanup(CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        .cleanup_as(
+            CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -2408,7 +3518,7 @@ async fn cleanup_keep_exceeding_history_preserves_every_available_version() {
     );
 
     let pins = pins_in_history(&db, "main", "node:Person").await;
-    db.cleanup(keep_ten).await.unwrap();
+    db.cleanup_as(keep_ten, None).await.unwrap();
 
     // Every version a commit pins stays; only a chain's links below its
     // pinned tip (the first load's effect beneath its full-text declaration)
@@ -2430,10 +3540,13 @@ async fn cleanup_older_than_zero_preserves_head() {
     // Lance must still preserve the head manifest, so the table is openable
     // afterwards and a subsequent load still works.
     let _stats = db
-        .cleanup(CleanupPolicyOptions {
-            keep_versions: None,
-            older_than: Some(Duration::from_secs(0)),
-        })
+        .cleanup_as(
+            CleanupPolicyOptions {
+                keep_versions: None,
+                older_than: Some(Duration::from_secs(0)),
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -2472,10 +3585,13 @@ async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
         "precondition: lazy-branch pin must fall outside keep=1 retention"
     );
 
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
 
@@ -2489,10 +3605,13 @@ async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
     // timestamp and version predicates with AND, so injecting the branch pin
     // as `before_version` keeps the inherited version even when every old
     // manifest satisfies the timestamp cutoff.
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: None,
-        older_than: Some(Duration::from_secs(0)),
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::from_secs(0)),
+        },
+        None,
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -2530,10 +3649,13 @@ async fn cleanup_retains_the_commit_a_branch_starts_at() {
 
     db.branch_create_from(at(&loaded), "at-load").await.unwrap();
     let people_at_load = count_rows_branch(&db, "at-load", "node:Person").await;
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -2589,10 +3711,13 @@ async fn cleanup_uses_oldest_pin_across_multiple_live_lazy_branches() {
     .await
     .unwrap();
 
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
 
@@ -2632,10 +3757,13 @@ async fn cleanup_fails_closed_when_live_lazy_branch_pin_is_unopenable() {
     let person_before = detached_versions(&person_uri).await;
 
     let stats = db
-        .cleanup(CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        .cleanup_as(
+            CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .unwrap();
     let row = |type_key: &str| {
@@ -2678,7 +3806,7 @@ async fn cleanup_reports_foreign_head_drift_and_keeps_it() {
         .expect("every registration records its last linear version");
     let foreign: Vec<u64> = (last_linear + 1..=head_version).collect();
 
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     let person = stats
         .iter()
         .find(|row| row.type_key == "node:Person")
@@ -2718,13 +3846,18 @@ async fn cleanup_then_optimize_preserves_rows_and_table_remains_writable() {
         "fixture should seed both Person and Company rows"
     );
 
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
-    db.optimize().await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
 
     // Head is preserved through both ops.
     assert_eq!(count_rows(&db, "node:Person").await, people_before);
@@ -2804,10 +3937,13 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
         );
     }
 
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
 
@@ -2856,10 +3992,13 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
     );
 
     // Idempotent: a second cleanup with the orphan already gone is a no-op.
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     assert!(
@@ -2935,10 +4074,13 @@ async fn cleanup_reconciles_live_branch_orphan_fork_and_keeps_the_branch_write()
     let main_people = count_rows(&db, "node:Person").await;
     let main_companies = count_rows(&db, "node:Company").await;
 
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
 
@@ -3038,10 +4180,13 @@ async fn cleanup_age_window_preserves_a_recent_snapshot_across_a_pointer_switch(
         .await
         .unwrap();
     assert_eq!(before.num_rows(), base_count + 1);
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+        },
+        None,
+    )
     .await
     .unwrap();
     assert!(
@@ -3059,10 +4204,13 @@ async fn cleanup_age_window_preserves_a_recent_snapshot_across_a_pointer_switch(
         .await
         .unwrap();
     assert_eq!(after.num_rows(), base_count + 1);
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: Some(Duration::ZERO),
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: Some(Duration::ZERO),
+        },
+        None,
+    )
     .await
     .unwrap();
     assert!(
@@ -3092,10 +4240,13 @@ async fn cleanup_age_window_preserves_recent_ref_absent_descendant() {
         .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
         .unwrap();
     std::fs::write(&recent_file, b"recent interrupted residue").unwrap();
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: None,
-        older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+        },
+        None,
+    )
     .await
     .unwrap();
     assert!(
@@ -3106,10 +4257,13 @@ async fn cleanup_age_window_preserves_recent_ref_absent_descendant() {
         recent_file.exists(),
         "a missing ref is not permission to discard a recent object"
     );
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: None,
-        older_than: Some(Duration::ZERO),
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::ZERO),
+        },
+        None,
+    )
     .await
     .unwrap();
     assert!(
@@ -3118,21 +4272,21 @@ async fn cleanup_age_window_preserves_recent_ref_absent_descendant() {
     );
 }
 
-/// The archive begins a retirement age window, then leaves with its unneeded tree.
-/// Native lifecycle contents and filesystem timestamps require the Rust owner.
-#[tokio::test]
-async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-    db.branch_create("feature").await.unwrap();
-    let manifest_uri = dir.path().join("__manifest");
+/// Backdate the live `__manifest` branch `branch`: its ref's `create_at` to
+/// zero and every file of its ref and tree to the epoch, so `cleanup`'s age
+/// window has passed for them. Returns the ref and tree paths.
+async fn age_manifest_branch(
+    root: &std::path::Path,
+    branch: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let manifest_uri = root.join("__manifest");
     let manifest = Dataset::open(manifest_uri.to_str().unwrap()).await.unwrap();
     let native = manifest
         .list_branches()
         .await
         .unwrap()
         .into_keys()
-        .find(|name| name.starts_with("feature."))
+        .find(|name| name.starts_with(&format!("{branch}.")))
         .unwrap();
     let live_ref = manifest_uri
         .join("_refs/branches")
@@ -3159,6 +4313,19 @@ async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
                 .unwrap();
         }
     }
+    (live_ref, tree)
+}
+
+/// The archive begins a retirement age window, then leaves with its unneeded tree.
+/// Native lifecycle contents and filesystem timestamps require the Rust owner.
+#[tokio::test]
+async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    let manifest_uri = dir.path().join("__manifest");
+    let manifest = Dataset::open(manifest_uri.to_str().unwrap()).await.unwrap();
+    let (live_ref, tree) = age_manifest_branch(dir.path(), "feature").await;
     db.branch_delete("feature").await.unwrap();
     assert!(!live_ref.exists());
     let archive = tree.join("_omnigraph_retired_branch.json");
@@ -3179,10 +4346,13 @@ async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
             > std::time::SystemTime::UNIX_EPOCH,
         "retirement writes a recent archive even when the tree is old"
     );
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: None,
-        older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+        },
+        None,
+    )
     .await
     .unwrap();
     assert!(
@@ -3193,10 +4363,13 @@ async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
         tree.exists(),
         "the recent retirement metadata must protect the aged physical tree"
     );
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: None,
-        older_than: Some(Duration::ZERO),
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::ZERO),
+        },
+        None,
+    )
     .await
     .unwrap();
     assert!(
@@ -3206,6 +4379,60 @@ async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
     assert!(
         !tree.exists(),
         "unneeded native history is reclaimed with its archive"
+    );
+}
+
+/// A handle that found a commit on a branch looks there first for the other
+/// commits of its history block. Once the branch is deleted and `cleanup`
+/// reclaims its tree, that branch has no `_versions` listing: the lookup must
+/// drop the hint and answer from `__history`, where the deletion archived the
+/// branch's commits. A warm handle across `cleanup` is not a `.gqt` step.
+#[tokio::test]
+async fn commit_lookup_past_a_reclaimed_branch_tree_reads_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    for name in ["First", "Second"] {
+        let person = mixed_params(&[("$name", name)], &[("$age", 30)]);
+        helpers::mutate_branch(&db, "feature", MUTATION_QUERIES, "insert_person", &person)
+            .await
+            .unwrap();
+    }
+    let commits = db.list_commits(Some("feature")).await.unwrap();
+    let (second, first) = (commits[0].clone(), commits[1].clone());
+
+    let reader = helpers::session(Omnigraph::open(uri).await.unwrap());
+    assert_eq!(
+        reader.get_commit(&first.graph_commit_id).await.unwrap(),
+        first,
+        "test setup: the scan finds the commit on `feature` and remembers its block there"
+    );
+    let (_, tree) = age_manifest_branch(dir.path(), "feature").await;
+    db.branch_delete("feature").await.unwrap();
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::ZERO),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !tree.exists(),
+        "test setup: cleanup reclaimed the deleted branch's tree"
+    );
+
+    assert_eq!(
+        reader.get_commit(&second.graph_commit_id).await.unwrap(),
+        second,
+        "the hinted branch's tree is gone: the lookup reads `__history`"
+    );
+    assert_eq!(
+        reader.get_commit(&first.graph_commit_id).await.unwrap(),
+        first,
+        "and keeps reading it once the hint is dropped"
     );
 }
 
@@ -3255,10 +4482,13 @@ async fn cleanup_age_window_preserves_recent_native_mutation_and_aged_parent() {
     let changed = child.delete("name = 'Alice'").await.unwrap();
     assert_eq!(changed.num_deleted_rows, 1);
     let latest = changed.new_dataset.version().version;
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: None,
-        older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+        },
+        None,
+    )
     .await
     .unwrap();
     let branches = Dataset::open(&person_uri)
@@ -3290,10 +4520,13 @@ async fn cleanup_age_window_preserves_recent_native_mutation_and_aged_parent() {
         retained.count_rows(None).await.unwrap(),
         count_rows(&db, "node:Person").await - 1
     );
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: None,
-        older_than: Some(Duration::ZERO),
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::ZERO),
+        },
+        None,
+    )
     .await
     .unwrap();
     let branches = Dataset::open(&person_uri)
@@ -3389,10 +4622,13 @@ async fn cleanup_preserves_the_pin_a_lazy_child_reads_after_its_parent_retires()
             .clone();
         db.branch_delete("feature").await.unwrap();
         db.branch_create("feature").await.unwrap();
-        db.cleanup(CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        db.cleanup_as(
+            CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -3451,10 +4687,13 @@ async fn cleanup_reclaims_dead_incarnation_fork_of_live_branch() {
         ds.create_branch(&dead_native, base, None).await.unwrap();
     }
 
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
 
@@ -3520,10 +4759,13 @@ async fn cleanup_reclaims_dead_incarnation_fork_of_live_branch() {
     db.apply_schema(TEST_SCHEMA).await.unwrap();
     let replacement_uri = node_table_uri(&db, "Company").await;
     assert_ne!(replacement_uri, company_uri);
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     assert!(
@@ -3582,7 +4824,7 @@ async fn index_build_tolerates_null_vector_rows() {
     // Must not abort: the untrainable vector column is deferred, while id,
     // slug (FTS), and n (BTREE) are built together in one table transaction.
     let pending = db
-        .ensure_indices()
+        .ensure_indices_as(None)
         .await
         .expect("ensure_indices must not abort when a vector column has no trainable vectors yet");
     assert_eq!(pending.len(), 1, "only the null vector index is pending");
@@ -3649,7 +4891,9 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
         );
     }
 
-    db.optimize().await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
 
     // Postcondition: optimize's reconciler materialized the declared index.
     let snap = snapshot_main(&db).await.unwrap();
@@ -3705,7 +4949,9 @@ async fn optimize_materializes_index_after_type_rename() {
         );
     }
 
-    db.optimize().await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open_dataset("node:Item").await.unwrap();
@@ -3737,7 +4983,7 @@ async fn collector_retains_malformed_witnesses_after_retirement_history_is_gone(
     let identity = manifest.branches().get(&native).await.unwrap().identifier;
     assert_ne!(identity, BranchIdentifier::main());
     db.branch_delete("retired").await.unwrap();
-    let rows = db.cleanup(keep_one()).await.unwrap();
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     assert!(!dir.path().join("__manifest/tree").join(&native).exists());
     let identity = serde_json::to_string(&identity).unwrap();
@@ -3814,7 +5060,7 @@ async fn collector_retains_malformed_witnesses_after_retirement_history_is_gone(
             );
         }
     }
-    let rows = db.cleanup(keep_one()).await.unwrap();
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     let remaining = detached_versions(&table_uri).await;
     for (label, version) in versions {
@@ -3868,7 +5114,7 @@ async fn collector_sweeps_the_pin_that_only_a_pruned_manifest_version_names() {
     );
     assert!(plan.sweep_paths.is_disjoint(&plan.marked_paths));
 
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     let row = stats
         .iter()
         .find(|row| row.type_key == "node:Person")
@@ -4082,7 +5328,7 @@ async fn collector_repeat_run_discovers_what_an_earlier_pass_left() {
 async fn collector_finds_nothing_to_sweep_after_todays_cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     insert_person(&db, "main", "Eve").await;
     mutate_main(
         &db,
@@ -4092,7 +5338,9 @@ async fn collector_finds_nothing_to_sweep_after_todays_cleanup() {
     )
     .await
     .unwrap();
-    db.optimize().await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     db.branch_create("feature").await.unwrap();
     insert_person(&db, "feature", "Frank").await;
     db.branch_merge("feature", "main").await.unwrap();
@@ -4102,7 +5350,7 @@ async fn collector_finds_nothing_to_sweep_after_todays_cleanup() {
     )
     .await
     .unwrap();
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     for row in &stats {
         assert!(row.error.is_none(), "every table's version GC ran: {row:?}");
     }
@@ -4151,10 +5399,13 @@ async fn cleanup_on_a_detached_only_graph_counts_manifest_versions_for_keep() {
     let third = staged_since(&person_uri, &after_second).await;
 
     let stats = db
-        .cleanup(CleanupPolicyOptions {
-            keep_versions: Some(2),
-            older_than: None,
-        })
+        .cleanup_as(
+            CleanupPolicyOptions {
+                keep_versions: Some(2),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .unwrap();
     let person = |stats: &[omnigraph::db::DatasetCleanupStats]| {
@@ -4179,7 +5430,7 @@ async fn cleanup_on_a_detached_only_graph_counts_manifest_versions_for_keep() {
     assert!(!remaining.contains(&first), "{remaining:?}");
     assert!(remaining.contains(&second) && remaining.contains(&third));
 
-    let row = person(&db.cleanup(keep_one()).await.unwrap());
+    let row = person(&db.cleanup_as(keep_one(), None).await.unwrap());
     assert_eq!(
         row.manifests_removed, 1,
         "keep 1 prunes the publication that named the second pin: {row:?}"
@@ -4188,7 +5439,7 @@ async fn cleanup_on_a_detached_only_graph_counts_manifest_versions_for_keep() {
     assert!(!remaining.contains(&second), "{remaining:?}");
     assert!(remaining.contains(&third));
 
-    let row = person(&db.cleanup(keep_one()).await.unwrap());
+    let row = person(&db.cleanup_as(keep_one(), None).await.unwrap());
     assert_eq!(row.manifests_removed, 0, "a rerun finds nothing: {row:?}");
     let report = db.cleanup_plan(keep_one()).await.unwrap();
     for plan in &report.tables {
@@ -4651,7 +5902,7 @@ async fn collector_reclaims_aged_orphans_without_deleting_recent_blob_sidecars()
             .unwrap();
     }
     let rows_before = count_rows(&db, "node:Person").await;
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     for relative in recent {
         assert!(
@@ -4719,7 +5970,7 @@ async fn collector_reclaims_blob_sidecars_after_the_last_retained_pin() {
     db.load_jsonl(&row(&current_payload), LoadMode::Overwrite)
         .await
         .unwrap();
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     for path in &old_sidecars {
         assert!(
@@ -4740,7 +5991,7 @@ async fn collector_reclaims_blob_sidecars_after_the_last_retained_pin() {
     let report = db.cleanup_plan(keep_one()).await.unwrap();
     let plan = main_plan(&report, "node:Doc");
     assert!(plan.errors.is_empty(), "{:?}", plan.errors);
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     for path in &old_sidecars {
         assert!(

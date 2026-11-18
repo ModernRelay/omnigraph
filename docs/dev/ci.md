@@ -154,9 +154,9 @@ the scopes, the predecessor build and install scripts (compared exactly) and
 the required case names, so removing or altering one fails `Check Workflow Action Pins` and
 this job. The 90-minute budget covers two cold builds into one target
 directory: the predecessor CLI alone (one package, one bin, no test features),
-then the current tree's test targets, whose dev-dependency features (lance-io
-defaults and `test-util`) differ, so only dependency artifacts with matching
-features are reused.
+then the current tree's test targets, whose dev-dependency features
+(`test-util`) differ, so only dependency artifacts with matching features are
+reused.
 
 The released 0.12 cluster-ledger journey is separate
 [manual release qualification](testing.md#manual-012-cluster-upgrade-qualification).
@@ -442,7 +442,12 @@ timings, not asserted here. nextest runs no doctest, so the step keeps a
 `scripts/check-workspace-test-owners.py` reads that report for the owners
 the job requires by name (the two upgrade journeys and the CLI/server/proxy
 journeys listed in the step) and for the upgrade journeys' captured notices,
-in place of grepping a `--nocapture` log. The local command in
+in place of grepping a `--nocapture` log. The same profile prints no line for
+a passing test (`status-level = "slow"`): the run's log holds the start line,
+the `SLOW` line of a test still running after a minute, each failure with its
+captured output as it happens and once more in the final summary, and the
+summary line, so a log of the workspace's tests opens in GitHub's viewer and
+reads as its failures. The local command in
 [testing.md](testing.md) stays `cargo test`; the two run the same binaries.
 
 Every run, red or green, uploads that report as `test-workspace-junit` and

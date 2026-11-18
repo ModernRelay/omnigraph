@@ -12,6 +12,7 @@ use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
+use object_store::prefix::PrefixStore;
 use object_store::{DynObjectStore, GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutPayload};
 use url::Url;
 
@@ -28,7 +29,9 @@ use conditional::{Answer, ConditionalRequest, Resolution, Step};
 pub use conditional::{CONDITIONAL_REQUEST_REISSUES, RequestClient};
 
 mod read_through;
-pub use read_through::{FrozenDirectory, ReadThroughStore};
+#[cfg(any(test, feature = "test-util"))]
+pub mod read_through_contract;
+pub use read_through::{FrozenDirectory, ReadThroughMount, ReadThroughStore};
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
@@ -274,6 +277,12 @@ pub enum StorageError {
         #[source]
         source: std::io::Error,
     },
+    /// A conditional write whose outcome no answer settled: a copy may still
+    /// land, or a failed write's read-back could not say whether it applied.
+    /// Every other error of a conditional write is a refusal that applied
+    /// nothing.
+    #[error("{0}")]
+    Unresolved(StorageFailure),
     #[error("storage resource '{resource}' for '{uri}' exceeds limit {limit} (actual {actual})")]
     ResourceLimit {
         resource: String,
@@ -286,6 +295,55 @@ pub enum StorageError {
 impl StorageError {
     fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
+    }
+
+    /// Whether a conditional write ended with no answer that settled it
+    /// ([`Self::Unresolved`]). Every other error of a conditional write is a
+    /// refusal that applied nothing, the owning scope's refusal of a key with
+    /// an unsettled request included.
+    pub fn is_unresolved_conditional(&self) -> bool {
+        matches!(self, Self::Unresolved(_))
+    }
+
+    /// The class of evidence this error carries, for a caller that must
+    /// answer its own client by it. A resource limit is an operator-actionable
+    /// capacity constraint (`Configuration`), and an internal error a broken
+    /// contract of the backend or this adapter (`Permanent`). Like the kind
+    /// itself, this is not a replay decision.
+    pub fn failure_kind(&self) -> StorageFailureKind {
+        match self {
+            Self::Backend(failure) | Self::Unresolved(failure) | Self::Io { failure, .. } => {
+                failure.kind
+            }
+            Self::ResourceLimit { .. } => StorageFailureKind::Configuration,
+            Self::Internal(_) => StorageFailureKind::Permanent,
+        }
+    }
+
+    /// The failure this error carries, when it carries one.
+    fn failure(&self) -> Option<&StorageFailure> {
+        match self {
+            Self::Backend(failure) | Self::Unresolved(failure) | Self::Io { failure, .. } => {
+                Some(failure)
+            }
+            Self::Internal(_) | Self::ResourceLimit { .. } => None,
+        }
+    }
+
+    /// A read-back that was to settle a write's outcome failed, so that
+    /// outcome stays unknown.
+    fn unread_outcome(self, action: &str, uri: &str) -> Self {
+        let kind = self
+            .failure()
+            .map_or(StorageFailureKind::Unknown, |failure| failure.kind);
+        Self::Unresolved(StorageFailure::new(
+            kind,
+            format!(
+                "storage {action} is unresolved for '{}': the read-back that was to settle it \
+                 failed, so whether it applied is unknown: {self}",
+                redacted_storage_uri(uri)
+            ),
+        ))
     }
 
     fn backend(kind: StorageFailureKind, message: impl Into<String>) -> Self {
@@ -1035,6 +1093,12 @@ pub trait StorageAdapter: Debug + Send + Sync {
         None
     }
 
+    /// The mount this adapter reads through, which every other store of the
+    /// same root must read through as well.
+    fn read_through_mount(&self) -> Option<ReadThroughMount> {
+        None
+    }
+
     async fn read_text(&self, uri: &str) -> Result<String>;
     /// Read a text object if it exists using one backend GET.
     ///
@@ -1228,6 +1292,10 @@ pub struct ObjectStorageAdapter {
     omit_read_etag: bool,
     #[cfg(test)]
     omit_write_etag: bool,
+    /// Set when `store` reads through a frozen directory; `codec` is then
+    /// [`UriCodec::Local`] and nothing may reach the directory tree except
+    /// through `store`.
+    read_through: Option<ReadThroughMount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1271,6 +1339,7 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+            read_through: None,
         }
     }
 
@@ -1312,53 +1381,7 @@ impl ObjectStorageAdapter {
 
     fn s3_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
         let location = parse_s3_uri(root_uri)?;
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(&location.bucket);
-
-        if let Some(endpoint) = env::var("AWS_ENDPOINT_URL_S3")
-            .ok()
-            .or_else(|| env::var("AWS_ENDPOINT_URL").ok())
-        {
-            builder = builder.with_endpoint(&endpoint);
-            if endpoint.starts_with("http://") || env_var_truthy("AWS_ALLOW_HTTP") {
-                builder = builder.with_allow_http(true);
-            }
-        }
-
-        if env_var_truthy("AWS_S3_FORCE_PATH_STYLE") {
-            builder = builder.with_virtual_hosted_style_request(false);
-        }
-
-        let build = |builder: AmazonS3Builder| {
-            builder.build().map_err(|err| {
-                let kind = classify_object_store_error(&err);
-                StorageError::backend(
-                    kind,
-                    format!(
-                        "failed to initialize s3 storage for '{}': {}",
-                        root_uri, err
-                    ),
-                )
-            })
-        };
-        let retrying = match scope {
-            Some(_) => Some(build(
-                builder.clone().with_retry(scoped_read_retry_config()),
-            )?),
-            None => None,
-        };
-        if scope.is_some() {
-            builder = builder.with_retry(single_attempt_retry_config());
-        }
-        let store = builder.build().map_err(|err| {
-            let kind = classify_object_store_error(&err);
-            StorageError::backend(
-                kind,
-                format!(
-                    "failed to initialize s3 storage for '{}': {}",
-                    root_uri, err
-                ),
-            )
-        })?;
+        let (store, retrying) = s3_clients(&location.bucket, root_uri, scope.is_some())?;
 
         let adapter = Self {
             store: Arc::new(store),
@@ -1371,6 +1394,7 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+            read_through: None,
         };
         Ok(match (scope, retrying) {
             (Some(scope), Some(retrying)) => {
@@ -1481,6 +1505,7 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+            read_through: None,
         };
         Ok(match (scope, retrying) {
             (Some(scope), Some(retrying)) => {
@@ -1504,6 +1529,7 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+            read_through: None,
         }
     }
 
@@ -1525,7 +1551,160 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+            read_through: None,
         }
+    }
+
+    /// Storage for the graph root `root_uri` read through the base `base_uri`:
+    /// an object the root does not hold is read from the base, every write
+    /// and every delete marker lands under the root, and the base is never
+    /// written. Both are root URIs of one backend: two local directories, or
+    /// two `s3://` prefixes of one endpoint (the base may be another bucket).
+    /// The root is the layer of a [`ReadThroughMount`], so a later adapter
+    /// over the same root finds the same graph, and
+    /// [`StorageAdapter::read_through_mount`] hands the mount to the other
+    /// stores of the root.
+    ///
+    /// # Errors
+    /// When the two roots are not of one kind, when that kind is neither
+    /// local nor S3, when the root and the base are one directory or prefix
+    /// or one lies inside the other, when the base cannot be listed or holds
+    /// a symlink, or when the root's delete markers cannot be listed.
+    pub async fn durable_read_through(base_uri: &str, root_uri: &str) -> Result<Self> {
+        Self::durable_read_through_with_scope(base_uri, root_uri, None).await
+    }
+
+    async fn durable_read_through_with_scope(
+        base_uri: &str,
+        root_uri: &str,
+        scope: Option<StorageIoScope>,
+    ) -> Result<Self> {
+        let kind = storage_kind_for_uri(root_uri)?;
+        if storage_kind_for_uri(base_uri)? != kind {
+            return Err(StorageError::backend(
+                StorageFailureKind::Configuration,
+                format!(
+                    "read-through storage needs a base and a clone root of one kind, got '{base_uri}' and '{root_uri}'"
+                ),
+            ));
+        }
+        match kind {
+            StorageKind::Local => {
+                let adapter = Self::local_read_through(base_uri, root_uri).await?;
+                Ok(match scope {
+                    Some(scope) => adapter.with_scope(scope),
+                    None => adapter,
+                })
+            }
+            StorageKind::S3 => Self::s3_read_through(base_uri, root_uri, scope).await,
+            StorageKind::Azure => Err(StorageError::backend(
+                StorageFailureKind::Configuration,
+                format!("read-through storage needs a local or s3 clone root, got '{root_uri}'"),
+            )),
+        }
+    }
+
+    /// The S3 instance of [`Self::durable_read_through`]: both clients from the
+    /// standard `AWS_*` environment (one endpoint by construction), the base's
+    /// index from one listing, the mount named by the clone root's bucket and prefix.
+    async fn s3_read_through(
+        base_uri: &str,
+        root_uri: &str,
+        scope: Option<StorageIoScope>,
+    ) -> Result<Self> {
+        let root = parse_s3_uri(root_uri)?;
+        let base = parse_s3_uri(base_uri)?;
+        let root_key = ObjectPath::from(root.key.as_str());
+        let base_key = ObjectPath::from(base.key.as_str());
+        if root.bucket == base.bucket && s3_prefixes_overlap(root_key.as_ref(), base_key.as_ref()) {
+            return Err(StorageError::backend(
+                StorageFailureKind::Configuration,
+                format!(
+                    "read-through storage needs a clone root and a base that do not contain each other, got '{root_uri}' and '{base_uri}'"
+                ),
+            ));
+        }
+        let base_store = build_s3_store(s3_bucket_builder(&base.bucket), base_uri)?;
+        let frozen = FrozenDirectory::over(Arc::new(PrefixStore::new(base_store, base_key)))
+            .await
+            .map_err(|err| storage_backend_error("read_through_open", base_uri, err))?;
+        let (layer, retrying) = s3_clients(&root.bucket, root_uri, scope.is_some())?;
+        let layer: Arc<DynObjectStore> = Arc::new(layer);
+        let mount = ReadThroughMount::open(layer.as_ref(), frozen, root_key)
+            .await
+            .map_err(|err| storage_backend_error("read_through_open", root_uri, err))?
+            .in_bucket(root.bucket.as_str());
+        let adapter = Self {
+            store: Arc::new(mount.store(layer)),
+            scope: None,
+            codec: UriCodec::S3 {
+                bucket: root.bucket,
+            },
+            supports_conditional_update: true,
+            #[cfg(test)]
+            omit_read_etag: false,
+            #[cfg(test)]
+            omit_write_etag: false,
+            read_through: Some(mount.clone()),
+        };
+        Ok(match (scope, retrying) {
+            (Some(scope), Some(retrying)) => {
+                let retrying: Arc<dyn ObjectStore> = Arc::new(mount.store(Arc::new(retrying)));
+                adapter.with_scope_and_retrying(scope, retrying)
+            }
+            _ => adapter,
+        })
+    }
+
+    /// The local instance of [`Self::durable_read_through`].
+    async fn local_read_through(base_uri: &str, root_uri: &str) -> Result<Self> {
+        let root = absolutize_lexically(local_path_from_uri(root_uri)?)?;
+        let base = absolutize_lexically(local_path_from_uri(base_uri)?)?;
+        let held = resolve_existing(&root);
+        let read = resolve_existing(&base);
+        if held.starts_with(&read) || read.starts_with(&held) {
+            return Err(StorageError::backend(
+                StorageFailureKind::Configuration,
+                format!(
+                    "read-through storage needs a clone root and a base that do not contain each other, got '{root_uri}' and '{base_uri}'"
+                ),
+            ));
+        }
+        let prefix = ObjectPath::from_absolute_path(&root).map_err(|err| {
+            StorageError::backend(
+                StorageFailureKind::Configuration,
+                format!("invalid local object path for '{root_uri}': {err}"),
+            )
+        })?;
+        let layer: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+        let frozen = FrozenDirectory::local(&base)
+            .await
+            .map_err(|err| storage_backend_error("read_through_open", base_uri, err))?;
+        let mount = ReadThroughMount::open(layer.as_ref(), frozen, prefix)
+            .await
+            .map_err(|err| storage_backend_error("read_through_open", root_uri, err))?;
+        Ok(Self {
+            store: Arc::new(mount.store(layer)),
+            scope: None,
+            codec: UriCodec::Local,
+            supports_conditional_update: false,
+            #[cfg(test)]
+            omit_read_etag: false,
+            #[cfg(test)]
+            omit_write_etag: false,
+            read_through: Some(mount),
+        })
+    }
+
+    /// [`Self::durable_read_through`] whose mutations belong to the supplied
+    /// owner, the scope sitting above the mount as it sits above a plain
+    /// store of the same backend.
+    pub async fn durable_read_through_scoped(
+        base_uri: &str,
+        root_uri: &str,
+        scope: StorageIoScope,
+    ) -> Result<Self> {
+        Self::durable_read_through_with_scope(base_uri, root_uri, Some(scope)).await
     }
 
     /// Shared body of the bounded existence-tolerant reads: one ranged GET of
@@ -1823,6 +2002,38 @@ impl ObjectStorageAdapter {
         }
     }
 
+    /// The one GET every versioned read and read-back takes: the object and
+    /// its ETag, or the store's error (`NotFound` when no object exists).
+    /// What it observes settles an earlier conditional request to the key
+    /// whose precondition no longer holds (scoped.rs), so every owner read
+    /// settles alike. An answer without an ETag shows nothing about the
+    /// version and settles nothing.
+    async fn get_observed(
+        &self,
+        location: &ObjectPath,
+    ) -> object_store::Result<(object_store::GetResult, Option<String>)> {
+        let result = self.store.get(location).await;
+        if !self.supports_conditional_update {
+            return result.map(|result| (result, None));
+        }
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                if matches!(err, object_store::Error::NotFound { .. }) {
+                    self.settle_superseded(location, None);
+                }
+                return Err(err);
+            }
+        };
+        let etag = result.meta.e_tag.clone();
+        #[cfg(test)]
+        let etag = if self.omit_read_etag { None } else { etag };
+        if let Some(token) = &etag {
+            self.settle_superseded(location, Some(token));
+        }
+        Ok((result, etag))
+    }
+
     /// Read a key back after a conditional write: its bytes and its ETag,
     /// or `None` when no object exists.
     async fn read_back(
@@ -1830,14 +2041,11 @@ impl ObjectStorageAdapter {
         uri: &str,
         location: &ObjectPath,
     ) -> Result<Option<(bytes::Bytes, Option<String>)>> {
-        let result = match self.store.get(location).await {
-            Ok(result) => result,
+        let (result, etag) = match self.get_observed(location).await {
+            Ok(observed) => observed,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(err) => return Err(storage_backend_error("read back", uri, err)),
         };
-        let etag = result.meta.e_tag.clone();
-        #[cfg(test)]
-        let etag = if self.omit_read_etag { None } else { etag };
         let bytes = result
             .bytes()
             .await
@@ -1845,14 +2053,17 @@ impl ObjectStorageAdapter {
         Ok(Some((bytes, etag)))
     }
 
-    /// A read-back showed that `precondition` no longer holds at `location`.
-    fn settle_failed_precondition(
-        &self,
-        location: &ObjectPath,
-        precondition: &scoped::Precondition,
-    ) {
+    /// A read observed `location` at `observed` (absent when `None`).
+    fn settle_superseded(&self, location: &ObjectPath, observed: Option<&str>) {
         if let Some(scope) = &self.scope {
-            scope.settle_failed_precondition(location, precondition);
+            scope.settle_superseded(location, observed);
+        }
+    }
+
+    /// A local replacement of `location` returned an error and so finished.
+    fn settle_returned_local_write(&self, location: &ObjectPath) {
+        if let Some(scope) = &self.scope {
+            scope.settle_returned_local_write(location);
         }
     }
 
@@ -1937,6 +2148,10 @@ fn is_hard_link_capability_refusal(error: &std::io::Error) -> bool {
 impl StorageAdapter for ObjectStorageAdapter {
     fn io_scope(&self) -> Option<StorageIoScope> {
         self.scope.clone()
+    }
+
+    fn read_through_mount(&self) -> Option<ReadThroughMount> {
+        self.read_through.clone()
     }
 
     async fn read_text(&self, uri: &str) -> Result<String> {
@@ -2037,11 +2252,10 @@ impl StorageAdapter for ObjectStorageAdapter {
             Resolution::Unsettled { error, .. } => error,
         };
         // Equal bytes are this call's: `contents` identifies its writer.
-        match self.read_back(uri, &location).await? {
-            Some((bytes, _)) => {
-                self.settle_failed_precondition(&location, &scoped::Precondition::Absent);
-                Ok(bytes == contents.as_bytes())
-            }
+        let read = self.read_back(uri, &location).await;
+        match read.map_err(|error| error.unread_outcome("write_if_absent", uri))? {
+            // The read-back's observation settled the key (`get_observed`).
+            Some((bytes, _)) => Ok(bytes == contents.as_bytes()),
             None => Err(unresolved_conditional_error("write_if_absent", uri, lost)),
         }
     }
@@ -2336,14 +2550,10 @@ impl StorageAdapter for ObjectStorageAdapter {
 
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
         let location = self.object_path(uri)?;
-        let result = self
-            .store
-            .get(&location)
+        let (result, etag) = self
+            .get_observed(&location)
             .await
             .map_err(|err| storage_backend_error("read", uri, err))?;
-        let etag = result.meta.e_tag.clone();
-        #[cfg(test)]
-        let etag = if self.omit_read_etag { None } else { etag };
         let bytes = result
             .bytes()
             .await
@@ -2369,8 +2579,8 @@ impl StorageAdapter for ObjectStorageAdapter {
         let location = self.object_path(uri)?;
         // A normal GET handles empty objects (an HTTP byte range cannot), and
         // exposes the exact generation's size/token before body collection.
-        let result = match self.store.get(&location).await {
-            Ok(result) => result,
+        let (result, etag) = match self.get_observed(&location).await {
+            Ok(observed) => observed,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(err) => return Err(storage_backend_error("bounded_read", uri, err)),
         };
@@ -2384,9 +2594,6 @@ impl StorageAdapter for ObjectStorageAdapter {
         if expected_bytes > max_bytes {
             return Err(limit_error(expected_bytes));
         }
-        let etag = result.meta.e_tag.clone();
-        #[cfg(test)]
-        let etag = if self.omit_read_etag { None } else { etag };
         let remote_token = if self.supports_conditional_update {
             Some(required_remote_etag("bounded_read", uri, etag)?)
         } else {
@@ -2432,7 +2639,6 @@ impl StorageAdapter for ObjectStorageAdapter {
                 e_tag: Some(expected_version.to_string()),
                 version: None,
             };
-            let precondition = scoped::Precondition::update(&version);
             let lost = match self
                 .send_conditional_put(
                     "write_if_match",
@@ -2454,15 +2660,18 @@ impl StorageAdapter for ObjectStorageAdapter {
                 }
                 Resolution::Unsettled { error, .. } => error,
             };
-            let Some((bytes, etag)) = self.read_back(uri, &location).await? else {
-                self.settle_failed_precondition(&location, &precondition);
+            let read = self.read_back(uri, &location).await;
+            let read = read.map_err(|error| error.unread_outcome("write_if_match", uri))?;
+            // What the read-back observed settled the key unless it still
+            // shows the expected version (`get_observed`).
+            let Some((bytes, etag)) = read else {
                 return Ok(None);
             };
-            let current = required_remote_etag("read back", uri, etag)?;
+            let current = required_remote_etag("read back", uri, etag)
+                .map_err(|error| error.unread_outcome("write_if_match", uri))?;
             if current == expected_version {
                 return Err(unresolved_conditional_error("write_if_match", uri, lost));
             }
-            self.settle_failed_precondition(&location, &precondition);
             return Ok((bytes == contents.as_bytes()).then_some(current));
         }
         // Local emulation: content-compare then atomic replace. NOT a
@@ -2479,11 +2688,27 @@ impl StorageAdapter for ObjectStorageAdapter {
         if local_version_token(&current) != expected_version {
             return Ok(None);
         }
-        self.store
-            .put(&location, payload)
-            .await
-            .map_err(|err| storage_backend_error("write_if_match", uri, err))?;
-        Ok(Some(local_version_token(contents.as_bytes())))
+        let Err(err) = self.store.put(&location, payload).await else {
+            return Ok(Some(local_version_token(contents.as_bytes())));
+        };
+        if self.codec != UriCodec::Local {
+            return Err(storage_backend_error("write_if_match", uri, err));
+        }
+        // A local write has finished when it returns, so the file holds its
+        // outcome and nothing of it can land later: settle the key, then read
+        // which outcome it was. Left unsettled, the key would refuse every
+        // later write for the life of the process.
+        self.settle_returned_local_write(&location);
+        let read = self.read_back(uri, &location).await;
+        match read.map_err(|error| error.unread_outcome("write_if_match", uri))? {
+            Some((bytes, _)) if bytes == contents.as_bytes() => {
+                Ok(Some(local_version_token(contents.as_bytes())))
+            }
+            Some((bytes, _)) if local_version_token(&bytes) == expected_version => {
+                Err(storage_backend_error("write_if_match", uri, err))
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
@@ -2491,7 +2716,7 @@ impl StorageAdapter for ObjectStorageAdapter {
         // leave empty directory skeletons that local existence probes
         // (cluster graph_root_exists uses std Path::exists) report as
         // still-present. remove_dir_all reclaims them in one call.
-        if self.codec == UriCodec::Local {
+        if self.codec == UriCodec::Local && self.read_through.is_none() {
             let path = absolutize_lexically(local_path_from_uri(prefix_uri)?)?;
             let request = scoped::Request::new(
                 "delete_prefix",
@@ -2517,6 +2742,11 @@ impl StorageAdapter for ObjectStorageAdapter {
             return result;
         }
         let prefix = self.object_path(prefix_uri.trim_end_matches('/'))?;
+        if let Some(mount) = &self.read_through {
+            mount
+                .refuse_reserved(&prefix)
+                .map_err(|err| storage_backend_error("delete_prefix", prefix_uri, err))?;
+        }
         let mut entries = self.store.list(Some(&prefix));
         // Consume the backend's paginated stream without retaining the full
         // graph inventory. The caller keeps writers excluded throughout purge.
@@ -2530,6 +2760,9 @@ impl StorageAdapter for ObjectStorageAdapter {
                 Err(object_store::Error::NotFound { .. }) => {}
                 Err(err) => return Err(storage_backend_error("delete_prefix", prefix_uri, err)),
             }
+        }
+        if self.codec == UriCodec::Local && self.read_through.is_some() {
+            return Ok(());
         }
         // ObjectStore::list is segment-scoped and excludes an exact prefix
         // object on some backends. Such a marker belongs to this root too.
@@ -2623,13 +2856,13 @@ fn log_conditional_reissue(op: &'static str, reissue: u32, error: &object_store:
 /// a copy may still land.
 fn unresolved_conditional_error(action: &str, uri: &str, err: object_store::Error) -> StorageError {
     let kind = classify_object_store_error(&err);
-    StorageError::backend(
+    StorageError::Unresolved(StorageFailure::new(
         kind,
         format!(
             "storage {action} is unresolved for '{uri}': no answer settled the request and the \
              object does not show it, so a copy may still land: {err}"
         ),
-    )
+    ))
 }
 
 fn single_attempt_retry_config() -> object_store::RetryConfig {
@@ -2776,6 +3009,26 @@ fn is_windows_drive_path(value: &str) -> bool {
         && matches!(bytes[2], b'/' | b'\\')
 }
 
+/// `path` with its longest existing ancestor resolved through symlinks, so
+/// two spellings of one directory compare equal.
+fn resolve_existing(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(existing) {
+            return missing
+                .iter()
+                .rev()
+                .fold(resolved, |path, name| path.join(name));
+        }
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return path.to_path_buf();
+        };
+        missing.push(name);
+        existing = parent;
+    }
+}
+
 /// Lexically absolutize a local path: join relative paths onto the current
 /// working directory and fold `.` / `..` components, without touching the
 /// filesystem. Required because `object_store::path::Path` rejects
@@ -2823,6 +3076,72 @@ fn local_path_from_file_uri(uri: &str) -> Result<PathBuf> {
             format!("invalid file uri '{}'", uri),
         )
     })
+}
+
+/// An S3 client builder for `bucket` from the standard `AWS_*` environment:
+/// the endpoint override, plain HTTP where the endpoint or `AWS_ALLOW_HTTP`
+/// asks for it, and path-style requests under `AWS_S3_FORCE_PATH_STYLE`.
+fn s3_bucket_builder(bucket: &str) -> AmazonS3Builder {
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    if let Some(endpoint) = env::var("AWS_ENDPOINT_URL_S3")
+        .ok()
+        .or_else(|| env::var("AWS_ENDPOINT_URL").ok())
+    {
+        builder = builder.with_endpoint(&endpoint);
+        if endpoint.starts_with("http://") || env_var_truthy("AWS_ALLOW_HTTP") {
+            builder = builder.with_allow_http(true);
+        }
+    }
+    if env_var_truthy("AWS_S3_FORCE_PATH_STYLE") {
+        builder = builder.with_virtual_hosted_style_request(false);
+    }
+    builder
+}
+
+fn build_s3_store(builder: AmazonS3Builder, root_uri: &str) -> Result<object_store::aws::AmazonS3> {
+    builder.build().map_err(|err| {
+        let kind = classify_object_store_error(&err);
+        StorageError::backend(
+            kind,
+            format!("failed to initialize s3 storage for '{root_uri}': {err}"),
+        )
+    })
+}
+
+/// The clients of one `s3://` root: the store its reads and writes go to and,
+/// when `scoped`, a second client with bounded retries for its reads, the
+/// first then single-attempt (`ObjectStorageAdapter::with_scope_and_retrying`).
+fn s3_clients(
+    bucket: &str,
+    root_uri: &str,
+    scoped: bool,
+) -> Result<(
+    object_store::aws::AmazonS3,
+    Option<object_store::aws::AmazonS3>,
+)> {
+    let mut builder = s3_bucket_builder(bucket);
+    let retrying = match scoped {
+        true => Some(build_s3_store(
+            builder.clone().with_retry(scoped_read_retry_config()),
+            root_uri,
+        )?),
+        false => None,
+    };
+    if scoped {
+        builder = builder.with_retry(single_attempt_retry_config());
+    }
+    Ok((build_s3_store(builder, root_uri)?, retrying))
+}
+
+/// Whether two canonical key prefixes of one bucket (object-store paths: no
+/// empty or trailing segment) name one set of objects or one lies inside the
+/// other; the empty prefix is the bucket itself.
+fn s3_prefixes_overlap(a: &str, b: &str) -> bool {
+    a == b
+        || a.is_empty()
+        || b.is_empty()
+        || a.starts_with(&format!("{b}/"))
+        || b.starts_with(&format!("{a}/"))
 }
 
 fn parse_s3_uri(uri: &str) -> Result<S3Location> {
@@ -4063,6 +4382,7 @@ mod tests {
                 supports_conditional_update: true,
                 omit_read_etag: false,
                 omit_write_etag: false,
+                read_through: None,
             },
             probe,
         )
@@ -4653,6 +4973,7 @@ mod tests {
             supports_conditional_update: true,
             omit_read_etag: false,
             omit_write_etag: false,
+            read_through: None,
         };
         assert_bounded_list_prefix_and_uri_contract(
             &s3_adapter,
@@ -4738,6 +5059,9 @@ mod tests {
         LoseAnswer,
         /// Lose the put before it reaches the object.
         LoseRequest,
+        /// Lose the put before it reaches the object, and fail every read
+        /// from then on, as a store that stops answering does.
+        LoseRequestAndReads,
         /// Refuse the put before it applies.
         Refuse,
         /// Answer as S3 answers a conditional put while another one to the
@@ -4756,6 +5080,8 @@ mod tests {
         inner: Arc<InMemory>,
         script: Mutex<std::collections::VecDeque<PutScript>>,
         puts: std::sync::atomic::AtomicUsize,
+        /// Reads still to fail, as a store that stops answering does.
+        failing_gets: std::sync::atomic::AtomicUsize,
     }
 
     impl ScriptedPutStore {
@@ -4764,6 +5090,7 @@ mod tests {
                 inner: Arc::new(InMemory::new()),
                 script: Mutex::new(script.into_iter().collect()),
                 puts: std::sync::atomic::AtomicUsize::new(0),
+                failing_gets: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -4802,6 +5129,11 @@ mod tests {
                     Err(lost_answer())
                 }
                 Some(PutScript::LoseRequest) => Err(lost_answer()),
+                Some(PutScript::LoseRequestAndReads) => {
+                    self.failing_gets
+                        .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+                    Err(lost_answer())
+                }
                 Some(PutScript::Refuse) => Err(object_store::Error::PermissionDenied {
                     path: location.to_string(),
                     source: "access denied".into(),
@@ -4836,6 +5168,17 @@ mod tests {
             location: &ObjectPath,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
+            let failing = self
+                .failing_gets
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok();
+            if failing {
+                return Err(lost_answer());
+            }
             self.inner.get_opts(location, options).await
         }
 
@@ -4883,6 +5226,7 @@ mod tests {
             supports_conditional_update: true,
             omit_read_etag: false,
             omit_write_etag: false,
+            read_through: None,
         };
         match scope {
             Some(scope) => adapter.with_scope(scope),
@@ -4891,6 +5235,103 @@ mod tests {
     }
 
     const LOCK: &str = "__cluster/lock.json";
+
+    /// On a local root, `write_text_if_match` is a read, a compare and an
+    /// unconditional put. A put that fails has finished, so it settles its
+    /// key: the next write of the record goes through, instead of every
+    /// write of it being refused until the process restarts. Whether the
+    /// failed put applied is read back from the file.
+    #[tokio::test]
+    async fn a_failed_local_if_match_write_settles_its_key() {
+        const RECORD: &str = "/graph/__cluster/operations.json";
+        for (case, script, outcome) in [
+            ("not applied", PutScript::LoseRequest, None),
+            ("applied", PutScript::LoseAnswer, Some("v2")),
+        ] {
+            let store = ScriptedPutStore::new([]);
+            let scope = StorageIoScope::new();
+            let adapter = ObjectStorageAdapter {
+                store: store.clone(),
+                scope: None,
+                codec: UriCodec::Local,
+                supports_conditional_update: false,
+                omit_read_etag: false,
+                omit_write_etag: false,
+                read_through: None,
+            }
+            .with_scope(scope.clone());
+            adapter.write_text(RECORD, "v1").await.unwrap();
+            let (_, v1) = adapter.read_text_versioned(RECORD).await.unwrap();
+            store.script.lock().unwrap().push_back(script);
+            let result = adapter.write_text_if_match(RECORD, "v2", &v1).await;
+            assert_eq!(scope.unsettled_keys(), 0, "{case}: the key is settled");
+            match outcome {
+                None => {
+                    assert!(result.is_err(), "{case}: {result:?}");
+                    let held = adapter.read_text(RECORD).await.unwrap();
+                    assert_eq!(held, "v1", "{case}");
+                    assert!(
+                        adapter
+                            .write_text_if_match(RECORD, "v2", &v1)
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "{case}: the next write goes through"
+                    );
+                }
+                Some(written) => {
+                    assert!(result.unwrap().is_some(), "{case}");
+                    assert_eq!(adapter.read_text(RECORD).await.unwrap(), written, "{case}");
+                }
+            }
+            assert!(!scope.is_uncertain(), "{case}: a clean release is possible");
+        }
+    }
+
+    /// A read-back that was to settle a write's outcome and failed leaves
+    /// that outcome unknown, so the write is unresolved, never a refusal that
+    /// applied nothing: a create or an if-match whose every answer was lost,
+    /// and a failed local put, each with its read-back failing.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_read_back_leaves_the_write_unresolved() {
+        let all_lost = 1 + CONDITIONAL_REQUEST_REISSUES as usize;
+        for case in ["create", "if-match", "local if-match"] {
+            let store = ScriptedPutStore::new([]);
+            let adapter = match case {
+                "local if-match" => ObjectStorageAdapter {
+                    store: store.clone(),
+                    scope: None,
+                    codec: UriCodec::Local,
+                    supports_conditional_update: false,
+                    omit_read_etag: false,
+                    omit_write_etag: false,
+                    read_through: None,
+                },
+                _ => scripted_adapter(&store, UriCodec::Memory, None),
+            };
+            const KEY: &str = "/graph/state.json";
+            let version = if case == "create" {
+                None
+            } else {
+                adapter.write_text(KEY, "v1").await.unwrap();
+                Some(adapter.read_text_versioned(KEY).await.unwrap().1)
+            };
+            let script = match case {
+                "local if-match" => vec![PutScript::LoseRequestAndReads],
+                _ => [lost(all_lost - 1), vec![PutScript::LoseRequestAndReads]].concat(),
+            };
+            store.script.lock().unwrap().extend(script);
+            let error = match &version {
+                None => adapter.write_text_if_absent(KEY, "v2").await.map(|_| ()),
+                Some(version) => adapter
+                    .write_text_if_match(KEY, "v2", version)
+                    .await
+                    .map(|_| ()),
+            }
+            .expect_err(case);
+            assert!(error.is_unresolved_conditional(), "{case}: {error}");
+        }
+    }
 
     fn lost(times: usize) -> Vec<PutScript> {
         vec![PutScript::LoseRequest; times]
@@ -5954,6 +6395,7 @@ mod tests {
             supports_conditional_update: true,
             omit_read_etag: false,
             omit_write_etag: false,
+            read_through: None,
         };
         assert!(
             adapter
@@ -6054,6 +6496,49 @@ mod tests {
         assert_eq!(adapter.read_text(uri).await.unwrap(), "new");
     }
 
+    /// A caller answering its own client by the failure's class (the served
+    /// cluster's control-object reads) gets it from the error, never from its
+    /// text: bytes that are not UTF-8 and an object over the bound fail the
+    /// same way on every read, while an I/O error with no typed kind is
+    /// `Unknown`.
+    #[tokio::test]
+    async fn a_failed_bounded_versioned_read_carries_its_failure_kind_issue_1356() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ObjectStorageAdapter::local();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_owned();
+
+        std::fs::write(dir.path().join("bytes.json"), [0xff, 0xfe, 0xfd]).unwrap();
+        let not_text = adapter
+            .read_text_versioned_if_exists_bounded(&path("bytes.json"), 16)
+            .await
+            .expect_err("bytes that are not UTF-8 are not text");
+        assert_eq!(not_text.failure_kind(), StorageFailureKind::Permanent);
+
+        std::fs::write(dir.path().join("large.json"), "0123456789").unwrap();
+        let over_bound = adapter
+            .read_text_versioned_if_exists_bounded(&path("large.json"), 4)
+            .await
+            .expect_err("an object over the bound is refused");
+        assert!(matches!(over_bound, StorageError::ResourceLimit { .. }));
+        assert_eq!(over_bound.failure_kind(), StorageFailureKind::Configuration);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("loop.json"), dir.path().join("loop.json"))
+                .unwrap();
+            let untyped = adapter
+                .read_text_versioned_if_exists_bounded(&path("loop.json"), 16)
+                .await
+                .expect_err("a self-symlink cannot be read");
+            assert_eq!(untyped.failure_kind(), StorageFailureKind::Unknown);
+        }
+
+        assert_eq!(
+            StorageError::internal("broken contract").failure_kind(),
+            StorageFailureKind::Permanent
+        );
+    }
+
     /// Where hard links work the probe is negative and cleans up after
     /// itself. (The positive branch needs a filesystem that refuses
     /// `hard_link(2)`, e.g. FAT32, which this suite cannot assume.)
@@ -6094,6 +6579,180 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent");
         assert!(hard_link_refusal_in(&missing).is_none());
+    }
+
+    #[tokio::test]
+    async fn read_through_storage_refuses_a_remote_clone_root() {
+        let err = ObjectStorageAdapter::durable_read_through(
+            "az://container/base",
+            "az://container/root",
+        )
+        .await
+        .expect_err("a clone root is a local directory or an s3 prefix");
+        let text = err.to_string();
+        assert!(
+            text.contains("read-through storage needs a local or s3 clone root"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_through_storage_refuses_s3_prefixes_that_contain_each_other() {
+        for (base, root) in [
+            ("s3://bucket/graph", "s3://bucket/graph"),
+            ("s3://bucket/graph", "s3://bucket/graph/clone"),
+            ("s3://bucket/graph/sub", "s3://bucket/graph"),
+            ("s3://bucket", "s3://bucket/clone"),
+            ("s3://bucket/graph/", "s3://bucket/graph"),
+            ("s3://bucket/graph//sub", "s3://bucket/graph/sub"),
+            ("s3://bucket/graph/sub", "s3://bucket/graph//sub/"),
+            ("s3://bucket//graph", "s3://bucket/graph/clone"),
+        ] {
+            let text = ObjectStorageAdapter::durable_read_through(base, root)
+                .await
+                .expect_err("one prefix inside the other")
+                .to_string();
+            assert!(
+                text.contains("do not contain each other"),
+                "{base} and {root}: {text}"
+            );
+        }
+        assert!(!s3_prefixes_overlap("graph", "graphs"));
+        assert!(!s3_prefixes_overlap("a/graph", "b/graph"));
+    }
+
+    #[tokio::test]
+    async fn read_through_storage_refuses_a_base_and_a_clone_root_of_different_kinds() {
+        let local = tempfile::tempdir().unwrap();
+        let local = local.path().to_str().unwrap();
+        for (base, root) in [(local, "s3://bucket/root"), ("s3://bucket/base", local)] {
+            let text = ObjectStorageAdapter::durable_read_through(base, root)
+                .await
+                .expect_err("both roots on one backend")
+                .to_string();
+            assert!(
+                text.contains("needs a base and a clone root of one kind"),
+                "{base} and {root}: {text}"
+            );
+        }
+        assert!(!std::path::Path::new(local).join("__clone").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_over_a_clone_root_masks_the_base_and_keeps_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("base");
+        let root = directory.path().join("root");
+        std::fs::create_dir_all(base.join("graph/table")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(base.join("graph/table/a"), b"base a").unwrap();
+        std::fs::write(base.join("graph/other"), b"base other").unwrap();
+        let root_uri = root.to_str().unwrap().to_owned();
+        let adapter = ObjectStorageAdapter::durable_read_through(base.to_str().unwrap(), &root_uri)
+            .await
+            .unwrap();
+        let table = format!("{root_uri}/graph/table");
+        StorageAdapter::write_text(&adapter, &format!("{table}/b"), "clone b")
+            .await
+            .unwrap();
+
+        StorageAdapter::delete_prefix(&adapter, &table)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            StorageAdapter::list_dir(&adapter, &table).await.unwrap(),
+            Vec::<String>::new(),
+            "the base object and the clone's own object are both gone from the clone"
+        );
+        assert_eq!(
+            StorageAdapter::read_text(&adapter, &format!("{root_uri}/graph/other"))
+                .await
+                .unwrap(),
+            "base other",
+            "a sibling outside the prefix still reads through"
+        );
+        assert_eq!(
+            std::fs::read(base.join("graph/table/a")).unwrap(),
+            b"base a"
+        );
+        assert!(
+            root.join("__clone/deleted/graph/table/a").is_file(),
+            "the whiteout's key is the deleted key relative to the clone root"
+        );
+        assert!(!root.join("graph/table/b").exists());
+        assert!(
+            root.join("__clone/created").is_file(),
+            "the reserved directory is never deleted as part of a prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_refuses_the_reserved_directory_of_a_clone_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("base");
+        let root = directory.path().join("root");
+        std::fs::create_dir_all(base.join("graph")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(base.join("graph/a"), b"base a").unwrap();
+        let root_uri = root.to_str().unwrap().to_owned();
+        let adapter = ObjectStorageAdapter::durable_read_through(base.to_str().unwrap(), &root_uri)
+            .await
+            .unwrap();
+        StorageAdapter::delete(&adapter, &format!("{root_uri}/graph/a"))
+            .await
+            .unwrap();
+
+        for reserved in ["__clone", "__clone/deleted", "__clone/deleted/graph"] {
+            let text = StorageAdapter::delete_prefix(&adapter, &format!("{root_uri}/{reserved}"))
+                .await
+                .expect_err("the reserved directory is the storage's own")
+                .to_string();
+            assert!(
+                text.contains("is inside the store's reserved directory"),
+                "{reserved}: {text}"
+            );
+        }
+        assert!(root.join("__clone/deleted/graph/a").is_file());
+    }
+
+    #[tokio::test]
+    async fn read_through_storage_refuses_a_clone_root_and_a_base_that_contain_each_other() {
+        let directory = tempfile::tempdir().unwrap();
+        let outer = directory.path().join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("a"), b"base a").unwrap();
+        let mut pairs = vec![
+            (outer.clone(), outer.clone()),
+            (outer.clone(), inner.join("new")),
+            (inner.clone(), outer.clone()),
+        ];
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("alias");
+            std::os::unix::fs::symlink(&outer, &alias).unwrap();
+            pairs.push((outer.clone(), alias.join("inner/new")));
+        }
+
+        for (base, root) in pairs {
+            let text = ObjectStorageAdapter::durable_read_through(
+                base.to_str().unwrap(),
+                root.to_str().unwrap(),
+            )
+            .await
+            .expect_err("a clone root apart from its base")
+            .to_string();
+            assert!(
+                text.contains("do not contain each other"),
+                "{} over {}: {text}",
+                root.display(),
+                base.display()
+            );
+        }
+        assert!(!outer.join("__clone").exists());
+        assert!(!inner.join("__clone").exists());
+        assert!(!inner.join("new").exists());
     }
 
     /// A generic create-if-absent failure on a link-capable filesystem keeps

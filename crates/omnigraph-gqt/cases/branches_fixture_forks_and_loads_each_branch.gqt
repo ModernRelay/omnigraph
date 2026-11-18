@@ -1,0 +1,76 @@
+# issue: none
+# notes: A declared branches fixture forks three branches from the seeded main before step 1 and runs its recipe on each with the branch marker bound to the branch's name; none of it is a step. branch list sees the three, main keeps its own rows, a branch holds the seed rows plus its own, and a branch merges back.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Chunk { slug: String @key n: I64 }
+
+--- seed generate: v1 seed: 0
+tables:
+  - kind: node
+    name: Chunk
+    rows: 2
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: base-, width: 3}
+      n: {kind: ordinal, start: 0, step: 1}
+
+--- branches generate: v1 seed: 0 count: 3 prefix: w from: main
+tables:
+  - kind: node
+    name: Chunk
+    rows: 2
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: ${branch}-, width: 3}
+      n: {kind: ordinal, start: 10, step: 1}
+
+--- query
+branch list
+--- expect unordered
+{"name": "main"}
+{"name": "w0"}
+{"name": "w1"}
+{"name": "w2"}
+--- expect shape
+name: String
+
+--- query
+query on_main() { match { $c: Chunk } return { $c.slug } }
+--- expect unordered
+{"c.slug": "base-000"}
+{"c.slug": "base-001"}
+--- expect shape
+c.slug: String
+
+--- query branch: w1
+query on_w1() { match { $c: Chunk } return { $c.slug, $c.n } }
+--- expect unordered
+{"c.slug": "base-000", "c.n": 0}
+{"c.slug": "base-001", "c.n": 1}
+{"c.slug": "w1-000", "c.n": 10}
+{"c.slug": "w1-001", "c.n": 11}
+--- expect shape
+c.slug: String
+c.n: I64
+
+--- mutate
+branch merge w2 into main
+--- expect ok
+
+--- query
+query after_merge() { match { $c: Chunk } return { count($c) as n } }
+--- expect unordered
+{"n": 4}
+--- expect shape
+n: I64

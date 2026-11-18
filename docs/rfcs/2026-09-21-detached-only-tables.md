@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-21
-updated: 2026-10-18
+updated: 2026-11-13
 discussion: null
 supersedes: []
 superseded_by: []
@@ -146,17 +146,15 @@ second format.
   one publication. No table effect has post-publication work; a schema apply
   still installs its contract files after its publication, which this RFC
   leaves untouched (Invariants, 5).
-- **`repair`.** The blocked outcome no longer exists. On a graph table
-  `repair` reports `no_drift` when the linear HEAD equals that table's
-  last linear version (Design, Pins), and `foreign_drift` otherwise.
-  `foreign_drift` prints that version and the HEAD, is never published, with
-  or without `--confirm --force`, and does not fail the command.
-  `verified_maintenance`, `suspicious` and `unverifiable` no longer
-  apply to graph tables, and a linear head below `published_dataset_version`
-  is the normal state of every table rather than `manifest_internal`. Drift
-  does not affect reads or writes, because no read or write resolves a
-  table's linear HEAD; only `repair` and the v10-row rule of Format and
-  migration still read it.
+- **Foreign linear commits.** The blocked outcome no longer exists, and
+  the `repair` command is removed. A linear commit above a table's last
+  linear version (Design, Pins) is foreign: it is never published or
+  adopted, and the collector lists it in the table's `cleanup` result row
+  under `foreign_versions`. A linear head below `published_dataset_version`
+  is the normal state of every table rather than `manifest_internal`.
+  Foreign commits do not affect reads or writes, because no read or write
+  resolves a table's linear HEAD; only the collector and the v10-row rule of
+  Format and migration still read it.
 - **`cleanup`.** Deletes manifests, and their files, from two populations:
   those that were published and are no longer retained, and those that were
   never published and are dead under the staging rule of Garbage collection.
@@ -383,12 +381,11 @@ retirement history: its valid identity can be judged by the post-inventory cut.
 
 A dead staging can never be published: its compare-and-swap is against an
 authority the branch has left, and its writer restages rather than reusing it.
-That restaging is narrower than the rule. `mutate` refreshes and reprepares
-only an insert-only mutation after a pre-effect `ReadSetChanged`; an update or
-a delete returns the conflict to the caller instead of replaying a stale
-read-modify-write plan (`exec/mutation.rs`). The proof does not rest on which
-of the two happens, because neither publishes the staging the collector
-reclaims.
+That restaging is narrower than the rule. A writer sent back before effects
+prepares again from its request on a fresh view (`db/reprepare.rs`), or
+returns the conflict to the caller when its identity changed or its bound is
+reached. The proof does not rest on which of the two happens, because neither
+publishes the staging the collector reclaims.
 
 The staging rule retains ambiguous effects; reclamation progress is conditional.
 On a branch that keeps publishing,
@@ -1097,3 +1094,17 @@ New evidence, each an entry in `blocked_on`:
   imported lineage and exact selected merge bases survive owner retirement;
   this does not retain every historical commit or change branch-control
   concurrency boundaries.
+- 2026-11-13: the `repair` command and `repair_report_as` are removed. On
+  every stamp this build opens, the report only classified a table
+  `foreign_drift`, which the collector already lists as `foreign_versions`,
+  and it took the full write critical section to read. User and operational
+  behavior: the `repair` bullet is rewritten as "Foreign linear commits",
+  superseding "On a graph table `repair` reports `no_drift` when the linear
+  HEAD equals that table's last linear version (Design, Pins), and
+  `foreign_drift` otherwise", "`foreign_drift` prints that version and the
+  HEAD, is never published, with or without `--confirm --force`, and does
+  not fail the command", "`verified_maintenance`, `suspicious` and
+  `unverifiable` no longer apply to graph tables" and "only `repair` and the
+  v10-row rule of Format and migration still read it". The 2026-09-25 entry's
+  `repair` sentences and the references to `repair` in Motivation, Format
+  and migration and Rollout describe the code at that time.

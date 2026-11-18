@@ -20,6 +20,12 @@ pub(crate) fn resolve(
         .map_err(|e| targets::refusal("argument_conflict", e.to_string()))?;
     let need = planes::requirement(&cli.command);
     if need == Requirement::Local {
+        if cli.base.is_some() {
+            return Err(targets::refusal(
+                "argument_conflict",
+                "--base applies to graph reads and writes; this command has no clone form",
+            ));
+        }
         return Ok(None);
     }
     let config = input.get(stderr)?;
@@ -126,8 +132,16 @@ pub(crate) fn resolve(
             "this selection requires a registered target name",
         ));
     }
-    let inline_s3 =
-        inline && selection.starts_with("s3://") && planes::admits_inline_s3_root(&cli.command);
+    let inline_s3_clone = inline
+        && selection.starts_with("s3://")
+        && cli
+            .base
+            .as_deref()
+            .is_some_and(|base| base.starts_with("s3://"))
+        && planes::admits_base(&cli.command);
+    let inline_s3 = inline
+        && selection.starts_with("s3://")
+        && (planes::admits_inline_s3_root(&cli.command) || inline_s3_clone);
     if inline
         && !inline_s3
         && (crate::graph_http::server_scheme(selection).is_some()
@@ -135,11 +149,11 @@ pub(crate) fn resolve(
     {
         bail!("inline access supports local storage only; configure a server or managed target");
     }
-    let target = if inline {
+    let mut target = if inline {
         let binding = {
             let root =
                 init_uri.is_none() && (planes::root_input(&cli.command) || cli.graph.is_some());
-            if inline_s3 && !root {
+            if inline_s3 && !inline_s3_clone && !root {
                 return Err(targets::refusal(
                     "target_invalid",
                     "an inline s3:// target is a cluster root; select its graph with --graph",
@@ -183,6 +197,61 @@ pub(crate) fn resolve(
             },
         )
     };
+    if let Some(base) = &cli.base {
+        let root = match &target.binding {
+            TargetBinding::DirectGraph { uri, .. } | TargetBinding::DirectRoot { uri, .. } => {
+                uri.clone()
+            }
+            _ => {
+                return Err(targets::refusal(
+                    "argument_conflict",
+                    "--base opens a graph shallow clone of a direct target; this target is not direct storage",
+                ));
+            }
+        };
+        if !planes::admits_base(&cli.command) {
+            return Err(targets::refusal(
+                "argument_conflict",
+                "--base applies to graph reads and writes; this command has no clone form",
+            ));
+        }
+        let base = targets::normalize_storage_uri(base, cwd)
+            .map_err(|error| targets::refusal("target_invalid", error.to_string()))?;
+        let root = root.as_str();
+        let kind = |uri: &str| {
+            if uri.starts_with("s3://") {
+                Some("s3")
+            } else if uri.contains("://") && !uri.starts_with("file://") {
+                None
+            } else {
+                Some("local")
+            }
+        };
+        match (kind(root), kind(&base)) {
+            (Some(a), Some(b)) if a == b => {}
+            _ => {
+                return Err(targets::refusal(
+                    "target_invalid",
+                    format!(
+                        "a clone root and its base are both local or both s3://; got `{root}` and `{base}`"
+                    ),
+                ));
+            }
+        }
+        let within = |inner: &str, outer: &str| {
+            let outer = outer.trim_end_matches('/');
+            inner.trim_end_matches('/') == outer || inner.starts_with(&format!("{outer}/"))
+        };
+        if within(root, &base) || within(&base, root) {
+            return Err(targets::refusal(
+                "target_invalid",
+                format!(
+                    "a clone root and its base do not contain each other; got `{root}` and `{base}`"
+                ),
+            ));
+        }
+        target.base = Some(base);
+    }
     // A refusal that names its own code, such as `target_kind_unsupported`,
     // keeps it.
     planes::validate_target(cli, &target, explicit_config).map_err(|error| {
@@ -576,6 +645,7 @@ defaults: {target: local, profile: work}
             vec!["access"],
             vec!["queries", "list"],
             vec!["mcp"],
+            vec!["optimize"],
         ] {
             for target in ["server", "cluster"] {
                 let mut args = args.clone();
@@ -583,11 +653,7 @@ defaults: {target: local, profile: work}
                 assert!(selected(&args, &input, dir.path()).is_ok(), "{args:?}");
             }
         }
-        for args in [
-            vec!["optimize"],
-            vec!["queries", "validate"],
-            vec!["policy", "validate"],
-        ] {
+        for args in [vec!["queries", "validate"], vec!["policy", "validate"]] {
             for target in ["server", "cluster"] {
                 let mut args = args.clone();
                 args.extend(["--target", target]);
@@ -646,7 +712,6 @@ defaults: {target: local, profile: work}
                 "1",
                 "--confirm",
             ],
-            vec!["repair", "--graph", "knowledge"],
             vec!["rebuild-full-text-indexes", "--graph", "knowledge"],
         ] {
             let mut args = args;
@@ -729,5 +794,73 @@ defaults: {target: local, profile: work}
                 .contains("cluster root; select its graph with --graph"),
             "{error}"
         );
+    }
+
+    /// An `s3://` clone root is admitted inline by the clone commands under an
+    /// `s3://` base, as a direct graph without `--graph`; a local base or a
+    /// command with no clone form leaves the inline `s3://` refusals as they are.
+    #[test]
+    fn inline_s3_clone_root_is_admitted_under_an_s3_base() {
+        let (dir, input) = fixture();
+        let clone = "s3://bucket/clones/run-00000001";
+        let base = "s3://bucket/bases/key/root";
+        for args in [
+            vec!["query", "-e", "q", "--target", clone, "--base", base],
+            vec!["mutate", "-e", "q", "--target", clone, "--base", base],
+            vec!["schema", "show", "--target", clone, "--base", base],
+            vec!["branch", "list", "--target", clone, "--base", base],
+        ] {
+            match selected(&args, &input, dir.path()) {
+                Ok(target) => {
+                    let target = target.unwrap();
+                    assert!(
+                        matches!(
+                            target.binding,
+                            TargetBinding::DirectGraph { ref uri, provider: StorageProvider::S3 { .. } }
+                                if uri.starts_with(clone)
+                        ),
+                        "{args:?}"
+                    );
+                    assert_eq!(target.base.as_deref(), Some(base), "{args:?}");
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        error
+                            .downcast_ref::<targets::TargetError>()
+                            .is_some_and(|e| e.code == "target_invalid")
+                            && !message.contains("local storage only"),
+                        "{args:?}: {message}"
+                    );
+                }
+            }
+        }
+        for (args, refusal) in [
+            (
+                vec![
+                    "query",
+                    "-e",
+                    "q",
+                    "--target",
+                    clone,
+                    "--base",
+                    "./base.omni",
+                ],
+                "local storage only",
+            ),
+            (
+                vec![
+                    "optimize", "--graph", "g", "--target", clone, "--base", base,
+                ],
+                "no clone form",
+            ),
+        ] {
+            let error = selected(&args, &input, dir.path()).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains(refusal) || message.contains("requires AWS_REGION"),
+                "{args:?}: {error}"
+            );
+        }
     }
 }

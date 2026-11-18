@@ -214,11 +214,10 @@ client's write evidence; initialization and system-column upgrade retain their
 own execution paths and do not claim the data-write outcome envelope. The upgrade
 adapter keeps its separate read-only check and execution modes.
 
-`commands/maintenance` owns optimize, repair, cleanup, full-text index rebuilding
+`commands/maintenance` owns optimize, cleanup, full-text index rebuilding
 and storage upgrade arguments and dispatch. Supplied output writers keep delivery
 failures in application completion. Cleanup retains preview and consent before
-write admission; rebuild retains its actor and branch; repair delivers its report
-before any refusal error. The storage-upgrade adapter retains its existing
+write admission; rebuild retains its actor and branch. The storage-upgrade adapter retains its existing
 conversion and recovery owner. These commands do not use the data-write outcome
 envelope or replay an operation after delivery failure.
 
@@ -296,7 +295,11 @@ gates for single-writer ownership.
   (`Omnigraph::install_coordinator`). A read and a write sharing one handle
   and branch (for example, the server's requests on `main`) no longer wait
   for each other; a read that starts while a publish is in flight binds the
-  installed state and sees the publish once it is installed.
+  installed state and sees the publish once it is installed. While the
+  process holds the branch's [writer epoch](writes.md#writer-epoch) with its
+  last publication there on record, a read of the handle's bound branch takes
+  the installed state at or above that publication with no probe of the
+  branch's head.
 - Write preparation may overlap. Durable effects are ordered by the shared
   schema, branch, and sorted-table gates, then fenced again by persisted
   authority and Lance transaction identity.

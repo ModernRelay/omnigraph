@@ -80,6 +80,33 @@ pub struct ManifestState {
     /// published.
     pub graph_heads: HashMap<String, String>,
     pub schema_contract: Option<SchemaContractHead>,
+    /// The writer epoch of the branch read, from this SAME manifest version:
+    /// its `writer_epoch` row's when that branch incarnation wrote the row, 0
+    /// with no row or with one its fork source wrote.
+    pub writer_epoch: u64,
+}
+
+/// The `writer_epoch` row, a control fact: the JSON payload of its `metadata`
+/// column. A branch holds at most one, and a branch forked from it starts
+/// with a copy that reads as epoch 0 there ([`Self::resolved`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriterEpochRow {
+    /// The generation of the process allowed to move the branch's head.
+    pub(crate) epoch: u64,
+    /// The Lance native ref the row was written on, `None` on main.
+    pub(crate) native: Option<String>,
+    /// The ULID the operation that wrote the row minted before its first
+    /// attempt: the identity of this control fact.
+    pub(crate) attempt_id: String,
+}
+
+impl WriterEpochRow {
+    /// The epoch `row` gives the branch whose native ref is `native_branch`.
+    pub(crate) fn resolved(row: Option<&Self>, native_branch: Option<&str>) -> u64 {
+        row.filter(|row| row.native.as_deref() == native_branch)
+            .map_or(0, |row| row.epoch)
+    }
 }
 
 /// The small fields of the `schema_contract` row: the JSON payload of its
@@ -790,6 +817,7 @@ pub(crate) struct ManifestRows {
     pub(crate) schema_contract_head: Option<SchemaContractHead>,
     pub(crate) schema_contract: Option<SchemaContractRow>,
     pub(crate) registry: LineageRegistry,
+    pub(crate) writer_epoch: Option<WriterEpochRow>,
 }
 
 /// The columns of a [`manifest_schema`] batch under construction, one entry
@@ -936,12 +964,22 @@ impl ManifestRows {
             batch.registry.push_null();
         }
 
+        if let Some(epoch) = &self.writer_epoch {
+            batch
+                .object_ids
+                .push(crate::WRITER_EPOCH_OBJECT_ID.to_string());
+            batch.object_types.push(crate::OBJECT_TYPE_WRITER_EPOCH);
+            batch.tables.push_payload(epoch)?;
+            batch.commits.push_null();
+            batch.replaced.push_null();
+            batch.registry.push_null();
+        }
         if let Some(contract) = &self.schema_contract {
             batch
                 .object_ids
                 .push(crate::SCHEMA_CONTRACT_OBJECT_ID.to_string());
             batch.object_types.push(crate::OBJECT_TYPE_SCHEMA_CONTRACT);
-            batch.tables.push_contract(&contract.head)?;
+            batch.tables.push_payload(&contract.head)?;
             batch.commits.push_null();
             batch.replaced.push_null();
             batch.registry.push_null();
@@ -974,17 +1012,25 @@ impl ManifestRows {
     /// native ref is `native_branch`: the pinned tables by alias, and the exact
     /// head.
     pub(crate) fn state(&self, version: u64, native_branch: Option<&str>) -> Result<ManifestState> {
-        let mut state = manifest_state(&self.tables, &self.head, version, native_branch)?;
+        let mut state = manifest_state(
+            &self.tables,
+            &self.head,
+            self.writer_epoch.as_ref(),
+            version,
+            native_branch,
+        )?;
         state.schema_contract = self.schema_contract_head.clone();
         Ok(state)
     }
 }
 
-/// The visible state of the `table` rows and the head commit's record of one
-/// `__manifest` version, as [`ManifestRows::state`] reads it.
+/// The visible state of the `table` rows, the head commit's record and the
+/// `writer_epoch` row of one `__manifest` version, as [`ManifestRows::state`]
+/// reads it. A commit's own record holds no control fact and passes `None`.
 pub(crate) fn manifest_state(
     tables: &[TableRow],
     head: &GraphLineageRow,
+    writer_epoch: Option<&WriterEpochRow>,
     version: u64,
     native_branch: Option<&str>,
 ) -> Result<ManifestState> {
@@ -1013,6 +1059,7 @@ pub(crate) fn manifest_state(
             .map(|head| (head_key(head), head.graph_commit_id.clone()))
             .into_iter()
             .collect(),
+        writer_epoch: WriterEpochRow::resolved(writer_epoch, native_branch),
     })
 }
 
@@ -1206,6 +1253,7 @@ struct RowsDecoder {
     buffered: Vec<(GraphLineageRow, bool)>,
     replaced: BTreeMap<(u64, TableIdentity), (ReplacedClock, RawTable)>,
     registry: LineageRegistry,
+    writer_epoch: Option<WriterEpochRow>,
     version: Option<u64>,
 }
 
@@ -1262,6 +1310,11 @@ impl RowsDecoder {
                     !table_columns.is_null(row)
                         || !replaced_columns.is_null(row)
                         || !commit_columns.holds_only_lineage_edges(row)
+                }
+                crate::OBJECT_TYPE_WRITER_EPOCH => {
+                    !table_columns.is_null_beside_metadata(row)
+                        || !commit_columns.is_null(row)
+                        || !replaced_columns.is_null(row)
                 }
                 _ => false,
             };
@@ -1330,6 +1383,20 @@ impl RowsDecoder {
                     if self.schema_contract_head.replace(head).is_some() {
                         return Err(OmniError::manifest_internal(
                             "manifest has two schema_contract rows",
+                        ));
+                    }
+                }
+                crate::OBJECT_TYPE_WRITER_EPOCH => {
+                    let epoch = decode_metadata_payload(
+                        object_ids,
+                        string_column(&batch, "metadata")?,
+                        row,
+                        crate::WRITER_EPOCH_OBJECT_ID,
+                        object_type,
+                    )?;
+                    if self.writer_epoch.replace(epoch).is_some() {
+                        return Err(OmniError::manifest_internal(
+                            "manifest has two writer_epoch rows",
                         ));
                     }
                 }
@@ -1486,6 +1553,7 @@ impl RowsDecoder {
             head,
             buffer: CommitBuffer { commits, replaced },
             registry,
+            writer_epoch: self.writer_epoch,
         })
     }
 
@@ -1497,6 +1565,7 @@ impl RowsDecoder {
             || !self.replaced.is_empty()
             || self.schema_contract_head.is_some()
             || self.schema_contract.is_some()
+            || self.writer_epoch.is_some()
         {
             return Err(OmniError::manifest_internal(
                 "a cold fragment of `__manifest` holds rows beside the block registry",
@@ -1656,19 +1725,32 @@ fn decode_schema_contract_row(
     metadata: &StringArray,
     row: usize,
 ) -> Result<SchemaContractHead> {
-    require_object_id(
+    decode_metadata_payload(
         object_ids,
+        metadata,
         row,
         crate::SCHEMA_CONTRACT_OBJECT_ID,
         crate::OBJECT_TYPE_SCHEMA_CONTRACT,
-    )?;
+    )
+}
+
+/// Decode the payload of the one row of `object_type`, whose id is
+/// `object_id`, out of the JSON of its `metadata` column.
+fn decode_metadata_payload<T: serde::de::DeserializeOwned>(
+    object_ids: &StringArray,
+    metadata: &StringArray,
+    row: usize,
+    object_id: &str,
+    object_type: &str,
+) -> Result<T> {
+    require_object_id(object_ids, row, object_id, object_type)?;
     if metadata.is_null(row) {
-        return Err(OmniError::manifest_internal(
-            "manifest schema_contract row missing metadata".to_string(),
-        ));
+        return Err(OmniError::manifest_internal(format!(
+            "manifest {object_type} row missing metadata"
+        )));
     }
     serde_json::from_str(metadata.value(row)).map_err(|e| {
-        OmniError::manifest_internal(format!("failed to decode schema_contract metadata: {e}"))
+        OmniError::manifest_internal(format!("failed to decode {object_type} metadata: {e}"))
     })
 }
 

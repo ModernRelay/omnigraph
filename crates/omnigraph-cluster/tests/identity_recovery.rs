@@ -197,11 +197,12 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
     let actors = "[principal:original, principal:recovery, principal:adopter]";
     fs::write(
         dir.path().join("graph.policy.yaml"),
-        format!("version: 1\ngroups:\n  operators: {actors}\nrules:\n  - id: read\n    allow: {{ actors: {{ group: operators }}, actions: [read] }}\n  - id: schema\n    allow: {{ actors: {{ group: operators }}, actions: [schema_apply], target_branch_scope: any }}\n"),
+        format!("version: 1\ngroups:\n  operators: {actors}\n  appliers: [principal:applier]\nrules:\n  - id: read\n    allow: {{ actors: {{ group: operators }}, actions: [read] }}\n  - id: schema\n    allow: {{ actors: {{ group: operators }}, actions: [schema_apply], target_branch_scope: any }}\n  - id: applier-schema\n    allow: {{ actors: {{ group: appliers }}, actions: [schema_apply], target_branch_scope: any }}\n"),
     ).unwrap();
+    // principal:manager manages the cluster but holds no graph action.
     fs::write(
         dir.path().join("cluster.policy.yaml"),
-        format!("version: 1\ngroups:\n  operators: {actors}\nrules:\n  - id: config\n    allow: {{ actors: {{ group: operators }}, actions: [config_manage] }}\n"),
+        "version: 1\ngroups:\n  operators: [principal:original, principal:recovery, principal:adopter, principal:manager]\nrules:\n  - id: config\n    allow: { actors: { group: operators }, actions: [config_manage] }\n",
     ).unwrap();
     fs::write(
         dir.path().join("cluster.yaml"),
@@ -307,24 +308,19 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
     assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before_denial);
     assert_eq!(file_bytes(&graph), graph_bytes);
 
-    // A storage-owning recovery without an actor still fails the installed
-    // engine policy. Preserve that bounded cause without losing original work.
-    let missing_actor = DeploymentCaller::storage_owner(None);
-    let error = Box::pin(reconcile_deployment(root, &id, true, &missing_actor))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, "deployment_outcome_unknown");
-    assert!(error.message.contains("no actor"), "{error:?}");
-    assert!(error.message.len() <= 4096);
+    // A storage-owning recovery without an actor cannot author the settlement
+    // the installed graph policy judges. Nothing ran, so it is a policy
+    // refusal before admission, not an unknown outcome: no lock, no ledger or
+    // graph change, and the original work stays outstanding.
+    // The same holds for every caller the policy refuses, not only a missing
+    // actor: a storage owner whose --as lacks schema_apply, and an identity
+    // that manages the cluster but cannot read the graph.
+    let refused = refused_recovery_callers();
+    for caller in &refused {
+        refuse_recovery_before_admission(dir.path(), &id, caller).await;
+    }
     assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before_denial);
     assert_eq!(file_bytes(&graph), graph_bytes);
-    let lock = deployment_status(root, Some(&id), &original)
-        .await
-        .unwrap()
-        .lock_id
-        .unwrap();
-    assert!(error.message.contains(&lock));
-    force_unlock_storage_root(root, &lock).await.unwrap();
 
     {
         let _fail = cluster_seams::DEPLOYMENT_AFTER_SETTLEMENT_INTENT.fire_always();
@@ -356,14 +352,11 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
         .lock_id
         .unwrap();
     force_unlock_storage_root(root, &lock).await.unwrap();
-    // Once a fence is persisted, invocation refusal must preserve its exact
-    // identity and expose the same policy cause rather than generic uncertainty.
-    let error = Box::pin(reconcile_deployment(root, &id, true, &missing_actor))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, "deployment_outcome_unknown");
-    assert!(error.message.contains("no actor"), "{error:?}");
-    assert!(error.message.len() <= 4096);
+    // Once a fence is persisted, the refusal must preserve its exact identity
+    // and expose the same policy cause rather than generic uncertainty.
+    for caller in &refused {
+        refuse_recovery_before_admission(dir.path(), &id, caller).await;
+    }
     let retained: serde_json::Value =
         serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
     assert_eq!(
@@ -371,13 +364,6 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
         fence
     );
     assert_eq!(file_bytes(&graph), graph_bytes);
-    let lock = deployment_status(root, Some(&id), &original)
-        .await
-        .unwrap()
-        .lock_id
-        .unwrap();
-    assert!(error.message.contains(&lock));
-    force_unlock_storage_root(root, &lock).await.unwrap();
     fs::remove_file(dir.path().join("people.pg")).unwrap();
     fs::remove_file(dir.path().join("cluster.yaml")).unwrap();
 
@@ -460,12 +446,169 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
         original_state["applied_revision"]["result_revision"]
     );
     assert!(finished.get("outstanding").is_none());
-    assert!(
-        deployment_status(root, Some(&id), &adopter)
+    let lock = deployment_status(root, Some(&id), &adopter)
+        .await
+        .unwrap()
+        .lock_id
+        .unwrap();
+    force_unlock_storage_root(root, &lock).await.unwrap();
+
+    // Settling a started schema change needs only `schema_apply` on `main`,
+    // the check the engine makes when it settles: a storage owner whose actor
+    // holds `schema_apply` but not `read` recovers it. The deletion below
+    // refuses the same caller, which pins the difference between the rules.
+    let applier = DeploymentCaller::storage_owner(Some("principal:applier".into()));
+    fs::write(
+        dir.path().join("people.pg"),
+        "node Person { name: String @key\n email: String? }",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: people.pg\npolicies:\n  graph:\n    file: graph.policy.yaml\n    applies_to: [knowledge]\n  management:\n    file: cluster.policy.yaml\n    applies_to: [cluster]\n",
+    )
+    .unwrap();
+    let mut schema_change = String::new();
+    {
+        let _fail = cluster_seams::DEPLOYMENT_AFTER_STARTED.fire_always();
+        let error = Box::pin(apply_deployment(
+            dir.path(),
+            None,
+            &original,
+            |issued, _, _| schema_change = issued.to_string(),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "injected_failpoint");
+    }
+    let lock = deployment_status(root, Some(&schema_change), &original)
+        .await
+        .unwrap()
+        .lock_id
+        .unwrap();
+    force_unlock_storage_root(root, &lock).await.unwrap();
+    fs::remove_file(dir.path().join("people.pg")).unwrap();
+    fs::remove_file(dir.path().join("cluster.yaml")).unwrap();
+    let DeploymentLookup::Complete { result } =
+        Box::pin(reconcile_deployment(root, &schema_change, true, &applier))
             .await
             .unwrap()
-            .lock_id
-            .is_some()
+    else {
+        panic!("expected terminal schema result");
+    };
+    assert_eq!(
+        result.recovery_executors["knowledge"].actor.as_deref(),
+        Some("principal:applier")
+    );
+    assert!(
+        matches!(
+            result.graphs["knowledge"],
+            GraphDeploymentResult::Schema { .. }
+        ),
+        "{:?}",
+        result.graphs
+    );
+    let lock = deployment_status(root, Some(&schema_change), &original)
+        .await
+        .unwrap()
+        .lock_id
+        .unwrap();
+    force_unlock_storage_root(root, &lock).await.unwrap();
+
+    // A pending deletion: recovery needs what forward deletion needs, `read`
+    // and `schema_apply`, and a caller without them is refused before
+    // admission too, including the storage owner `--as` principal:applier
+    // that settled the schema change above.
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs: {}\npolicies:\n  management:\n    file: cluster.policy.yaml\n    applies_to: [cluster]\n",
+    )
+    .unwrap();
+    let mut deletion = String::new();
+    {
+        let _fail = cluster_seams::DEPLOYMENT_AFTER_STARTED.fire_always();
+        let error = Box::pin(apply_deployment(
+            dir.path(),
+            None,
+            &original,
+            |issued, _, _| deletion = issued.to_string(),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "injected_failpoint");
+    }
+    let pending: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    assert!(
+        pending["outstanding"]["graphs"]["knowledge"]["delete"]["root"]
+            .as_str()
+            .is_some(),
+        "{pending}"
+    );
+    let lock = deployment_status(root, Some(&deletion), &original)
+        .await
+        .unwrap()
+        .lock_id
+        .unwrap();
+    force_unlock_storage_root(root, &lock).await.unwrap();
+    let ledger_before_denial = fs::read(&ledger_path).unwrap();
+    let cluster_bytes = file_bytes(dir.path());
+    for caller in refused.iter().chain([&applier]) {
+        refuse_recovery_before_admission(dir.path(), &deletion, caller).await;
+    }
+    assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before_denial);
+    assert!(
+        file_bytes(dir.path()) == cluster_bytes,
+        "refused deletion recovery must not change graph, ledger or admission bytes"
+    );
+    let DeploymentLookup::Complete { result } =
+        Box::pin(reconcile_deployment(root, &deletion, true, &adopter))
+            .await
+            .unwrap()
+    else {
+        panic!("expected terminal deletion result");
+    };
+    assert!(
+        matches!(
+            result.graphs["knowledge"],
+            GraphDeploymentResult::Deleted { .. }
+        ),
+        "{:?}",
+        result.graphs
+    );
+}
+
+/// Callers the test graph's policy refuses for recovery: a storage owner with
+/// no actor, a storage owner whose actor holds no graph action, and an
+/// identity that manages the cluster but holds no graph action.
+fn refused_recovery_callers() -> [DeploymentCaller; 3] {
+    [
+        DeploymentCaller::storage_owner(None),
+        DeploymentCaller::storage_owner(Some("principal:outsider".into())),
+        DeploymentCaller::AuthenticatedIdentity(
+            IdentityAuthorization::authenticated("principal:manager").unwrap(),
+        ),
+    ]
+}
+
+/// A policy refusal known before any effect is reported as `policy_denied`
+/// before admission: no lock is taken.
+async fn refuse_recovery_before_admission(dir: &Path, id: &str, caller: &DeploymentCaller) {
+    let error = Box::pin(reconcile_deployment(
+        dir.to_str().unwrap(),
+        id,
+        true,
+        caller,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "policy_denied", "{caller:?}: {error:?}");
+    if caller.actor().is_none() {
+        assert!(error.message.contains("--as"), "{error:?}");
+    }
+    assert!(
+        !dir.join("__cluster/lock.json").exists(),
+        "{caller:?} took the lock"
     );
 }
 

@@ -10,6 +10,50 @@ use crate::gqt_served::{
     ServerDeploymentReceiptV1,
 };
 
+/// The embedded scenarios the server has a door for: a warm-up read, the
+/// measured read, the lifecycle's no-op restart and a verification read.
+const SERVED_READS: [&str; 16] = [
+    "e2e-query-scan",
+    "e2e-query-wide-scan",
+    "e2e-query-filter",
+    "e2e-query-lookup",
+    "e2e-query-count",
+    "e2e-query-grouped",
+    "e2e-query-top-people",
+    "e2e-query-friends",
+    "e2e-query-filtered-friends",
+    "e2e-query-no-friends",
+    "e2e-query-count-bare",
+    "e2e-query-destination-projection",
+    "e2e-query-grouped-fanout",
+    "e2e-traversal-hop1",
+    "e2e-traversal-hop2",
+    "e2e-traversal-hop3",
+];
+/// The query and traversal scenarios the server has no door for: four need
+/// indexes, two pin a traversal path.
+const NO_SERVED_DOOR: [&str; 6] = [
+    "e2e-query-destination-search",
+    "e2e-nearest-prefilter",
+    "e2e-nearest-nprobes-one",
+    "e2e-rrf-traversal",
+    "e2e-traversal-selective-csr",
+    "e2e-traversal-selective-indexed",
+];
+
+fn served_environment() -> GqtEnvironment {
+    crate::catalog::served_environment(apfs_backend(), NetworkPosition::SameHost)
+}
+/// The scenario planned against a same-host server over the recorded backend;
+/// the catalog as shipped, since a served point takes the `none` reset the
+/// environment derives and no recorded override.
+fn served_plan(name: &str) -> PlannedGqt {
+    crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml"))
+        .unwrap()
+        .plan_in(name, &served_environment())
+        .unwrap()
+}
+
 fn receipt_for(plan: &PlannedGqt, url: &str) -> ServerDeploymentReceiptV1 {
     ServerDeploymentReceiptV1 {
         format_version: 1,
@@ -52,35 +96,54 @@ fn served_catalog_preserves_embedded_defaults_and_contains_only_reads() {
     explicit["network_position"] = "same-host".into();
     let explicit: GqtEnvironment = serde_json::from_value(explicit).unwrap();
     assert_eq!(serde_json::to_value(explicit).unwrap(), implicit);
-    for (group, count) in [("query-shapes-served", 13), ("traversal-served", 3)] {
-        let suite = recorded_catalog().resolve(Some(group), None).unwrap();
-        assert_eq!(suite.runs.len(), count);
-        for run in suite.runs {
-            let p = run.case.gqt().unwrap();
-            assert_eq!(p.definition.environment.target, Target::Server);
-            assert_eq!(p.definition.protocol.reset, ResetMode::None);
-            assert_eq!(p.definition.protocol.attribution, Attribution::Off);
-            assert_eq!(
-                p.cache_condition.process,
-                ProcessLifecycle::LongRunningServer
-            );
-            assert_eq!(p.cache_condition.engine, EnginePreparation::WarmedByProgram);
-            assert_eq!(
-                p.cache_condition.page_cache,
-                PageCacheCondition::Uncontrolled
-            );
-            assert_eq!(p.cache_condition.iterations, 1);
-            assert_eq!(p.definition.workload.measured_step.ordinal, 2);
-            let q = p.queries.parse().unwrap();
-            assert!(q.fixture.is_none());
-            assert_eq!(q.steps().len(), 3);
-            assert!(q.steps().iter().all(|s| s.kind == StepKind::Query));
-            assert!(
-                p.dataset_build_plan()
-                    .unwrap_err()
-                    .contains("the dataset cache does not apply")
-            );
-        }
+    let catalog = recorded_catalog();
+    for id in SERVED_READS {
+        let p = catalog.plan_in(id, &served_environment()).unwrap();
+        let embedded = catalog.plan_in(id, &recorded_environment()).unwrap();
+        assert_eq!(p.definition.environment.target, Target::Server);
+        assert_eq!(p.definition.protocol.reset, ResetMode::None);
+        assert_eq!(p.definition.protocol.attribution, Attribution::Off);
+        assert_eq!(
+            p.cache_condition.process,
+            ProcessLifecycle::LongRunningServer
+        );
+        assert_eq!(p.cache_condition.engine, EnginePreparation::WarmedByProgram);
+        assert_eq!(
+            p.cache_condition.page_cache,
+            PageCacheCondition::Uncontrolled
+        );
+        assert_eq!(p.cache_condition.iterations, 1);
+        assert_eq!(p.definition.workload.measured_step.ordinal, 2);
+        assert_eq!(
+            p.definition.workload.measured_step, embedded.definition.workload.measured_step,
+            "{id}: one scenario, one measured step on either target"
+        );
+        assert_eq!(p.queries.sha256, embedded.queries.sha256);
+        assert_ne!(p.planned_sha256, embedded.planned_sha256);
+        let q = p.queries.parse().unwrap();
+        assert!(q.fixture.is_none());
+        assert_eq!(
+            q.steps().iter().map(|s| s.kind).collect::<Vec<_>>(),
+            [
+                StepKind::Query,
+                StepKind::Query,
+                StepKind::Restart,
+                StepKind::Query
+            ],
+            "{id}"
+        );
+        assert!(
+            p.dataset_build_plan()
+                .unwrap_err()
+                .contains("the dataset cache does not apply")
+        );
+    }
+    for id in NO_SERVED_DOOR {
+        let error = catalog.plan_in(id, &served_environment()).unwrap_err();
+        assert!(
+            error[0].message.contains("no door") || error[0].message.contains("environment"),
+            "{id}: {error:?}"
+        );
     }
 }
 
@@ -93,7 +156,7 @@ fn replan(mut p: PlannedGqt) -> Result<PlannedGqt, String> {
 
 #[test]
 fn served_identity_axes_and_read_only_suffix_are_enforced() {
-    let p = plan("e2e-query-count-served");
+    let p = served_plan("e2e-query-count");
     let mut remote = p.clone();
     remote.definition.environment.network_position = NetworkPosition::Remote;
     let remote = replan(remote).unwrap();
@@ -111,30 +174,62 @@ fn served_identity_axes_and_read_only_suffix_are_enforced() {
     invalid.definition.protocol.reset = ResetMode::None;
     assert!(replan(invalid).is_err());
     const PROPOSE: &str = "\n--- mutate\nquery propose() as commit { insert Person { name: \"zed\" } }\n--- expect affected: nodes=1 edges=0\n--- bind commit $w\n";
+    let restarted = format!("{}\n--- restart\n", p.queries.text);
+    let parsed = omnigraph_gqt_core::parse_case("served_restart_suffix", &restarted).unwrap();
+    assert_eq!(
+        admit_target_queries(
+            &parsed,
+            &p.definition.workload.measured_step,
+            Target::Server
+        )
+        .unwrap(),
+        p.cache_condition,
+        "a restart after the measured step is the lifecycle's no-op"
+    );
+    assert!(
+        omnigraph_gqt_core::admit_served(&parsed)
+            .unwrap_err()
+            .contains("no door for step 3 (restart), step 5 (restart)"),
+        "a conformance case has no measured step to place a restart after"
+    );
+    let early = p
+        .queries
+        .text
+        .replacen("\n--- query\n", "\n--- restart\n\n--- query\n", 1);
+    let parsed = omnigraph_gqt_core::parse_case("served_restart_prefix", &early).unwrap();
+    let error = admit_target_queries(
+        &parsed,
+        &crate::gqt_case::MeasuredStep {
+            ordinal: 3,
+            text: p.definition.workload.measured_step.text.clone(),
+        },
+        Target::Server,
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("no door for step 1 (restart)"),
+        "a restart before the measured step claims a reopened engine: {error}"
+    );
     for (suffix, refusal) in [
         (
-            "\n--- restart\n".to_string(),
-            "omnigraph-server has no door for step 4 (restart)",
-        ),
-        (
             "\n--- mutate\nquery write() { delete Person where name = \"added\" }\n--- expect affected: nodes=0 edges=0\n".to_string(),
-            "step 4 (mutate) advances a branch head; reset:none admits a served write only as an unpublished commit",
+            "step 5 (mutate) advances a branch head; reset:none admits a served write only as an unpublished commit",
         ),
         (
             "\n--- mutate\nbranch merge \"b0\"\n--- expect outcome: merged\n".to_string(),
-            "step 4 (branch merge) advances a branch head",
+            "step 5 (branch merge) advances a branch head",
         ),
         (
             format!("{PROPOSE}--- mutate\ncommit publish \"${{w}}\"\n--- expect ok\n"),
-            "step 5 (commit publish) is not admissible served",
+            "step 6 (commit publish) is not admissible served",
         ),
         (
             "\n--- mutate\ncommit drop \"hb1-literal\"\n--- expect ok\n".to_string(),
-            "step 4 (commit drop) drops a commit this workload did not bind",
+            "step 5 (commit drop) drops a commit this workload did not bind",
         ),
         (
             "\n--- mutate\nbranch create \"scratch\"\n--- expect ok\n".to_string(),
-            "step 4 (branch create) is not admissible served",
+            "step 5 (branch create) is not admissible served",
         ),
     ] {
         let text = format!("{}{suffix}", p.queries.text);
@@ -166,7 +261,7 @@ fn served_identity_axes_and_read_only_suffix_are_enforced() {
             .map(|s| s.kind)
             .filter(|k| !SERVED_READ_KINDS.contains(k))
             .collect::<Vec<_>>(),
-        [StepKind::Mutate, StepKind::CommitDrop]
+        [StepKind::Restart, StepKind::Mutate, StepKind::CommitDrop]
     );
     let measured = p
         .queries
@@ -221,7 +316,7 @@ fn served_environment_requires_explicit_network_position() {
 
 #[test]
 fn receipt_graph_ids_match_the_server_namespace() {
-    let mut receipt = receipt_for(&plan("e2e-query-count-served"), "http://localhost:8080");
+    let mut receipt = receipt_for(&served_plan("e2e-query-count"), "http://localhost:8080");
     for graph in ["0", "-", "tenant-001", &"a".repeat(64)] {
         receipt.graph = graph.into();
         receipt.validate().unwrap();
@@ -242,7 +337,7 @@ fn receipt_graph_ids_match_the_server_namespace() {
 
 #[test]
 fn deployment_receipts_refuse_unbound_or_non_release_evidence() {
-    let p = plan("e2e-query-count-served");
+    let p = served_plan("e2e-query-count");
     let receipt = receipt_for(&p, "http://127.0.0.1:8000/");
     receipt.validate().unwrap();
     let mutations: &[fn(&mut ServerDeploymentReceiptV1)] = &[
@@ -303,7 +398,7 @@ fn deployment_receipts_refuse_unbound_or_non_release_evidence() {
 
 #[test]
 fn receipt_refuses_future_format_and_bad_digests() {
-    let receipt = receipt_for(&plan("e2e-query-count-served"), "http://127.0.0.1:8000");
+    let receipt = receipt_for(&served_plan("e2e-query-count"), "http://127.0.0.1:8000");
     receipt.validate().unwrap();
     let mutations: &[fn(&mut ServerDeploymentReceiptV1)] = &[
         |r| r.format_version = 2,
@@ -382,8 +477,8 @@ fn served_redaction_covers_form_encoded_token() {
 }
 
 /// A served receipt is admitted as a read, as a write whose commit stayed
-/// unpublished, or as a drop; a published write, a publish, or a write with
-/// no commit evidence is not.
+/// unpublished, as a drop, or as the no-op restart; a published write, a
+/// publish, or a write with no commit evidence is not.
 #[test]
 fn served_receipts_admit_reads_unpublished_writes_and_drops() {
     use crate::gqt_runner::{GqtOperationKind, GqtStepObservation, served_receipt_admitted};
@@ -407,7 +502,8 @@ fn served_receipts_admit_reads_unpublished_writes_and_drops() {
         (GqtOperationKind::CommitPublish, Some(true), false),
         (GqtOperationKind::Load, None, false),
         (GqtOperationKind::BranchCreate, None, false),
-        (GqtOperationKind::Restart, None, false),
+        (GqtOperationKind::Restart, None, true),
+        (GqtOperationKind::Restart, Some(false), false),
     ] {
         assert_eq!(
             served_receipt_admitted(&receipt(kind, published)),
@@ -1205,6 +1301,7 @@ val: I64
             merge: None,
             server_receipt_sha256: Some(input.receipt.digest().unwrap()),
             client_peak_rss_bytes: None,
+            base_manifest_sha256: None,
         }
     }
 
@@ -1241,6 +1338,7 @@ val: I64
                 state_sha256: "a".repeat(64),
             },
             fixture_manifest_sha256: "b".repeat(64),
+            route: Default::default(),
         };
         assert!(embedded.validate(&bound).is_err());
         assert!(!accepts(&sample, &embedded.proof().unwrap(), false));
@@ -1371,7 +1469,7 @@ val: I64
 
 #[test]
 fn served_admission_rejects_loop_writes_and_wrong_environment() {
-    let p = plan("e2e-query-count-served");
+    let p = served_plan("e2e-query-count");
     let suffix = "\n--- loop $i 0 2\n--- mutate\nquery write() { delete Person where name = \"added\" }\n--- expect affected: nodes=0 edges=0\n--- endloop\n";
     let text = format!("{}{suffix}", p.queries.text);
     let parsed = omnigraph_gqt_core::parse_case("served_loop_write", &text).unwrap();
@@ -1382,12 +1480,15 @@ fn served_admission_rejects_loop_writes_and_wrong_environment() {
     )
     .unwrap_err();
     assert!(
-        error.contains("step 4 (mutate) advances a branch head"),
+        error.contains("step 5 (mutate) advances a branch head"),
         "{error}"
     );
 
     for (from, to) in [
-        ("target: omnigraph-server", "target: omnigraph-engine"),
+        (
+            "  - target: omnigraph-server\n    storage: local-filesystem\n",
+            "",
+        ),
         (
             "storage: local-filesystem",
             "storage: in-memory-object-store",
@@ -1407,7 +1508,7 @@ fn served_admission_rejects_loop_writes_and_wrong_environment() {
 
 #[test]
 fn served_zero_warmup_has_uncontrolled_server_cache() {
-    let mut p = plan("e2e-query-count-served");
+    let mut p = served_plan("e2e-query-count");
     let first = p.queries.text.find("\n--- query\n").unwrap();
     let second = p.queries.text[first + 1..].find("\n--- query\n").unwrap() + first + 1;
     p.queries.text.replace_range(first..second, "");
@@ -1502,7 +1603,7 @@ async fn served_evidence_budget_refuses_oversized_combined_sut() {
 
 #[cfg(unix)]
 mod process_supervision {
-    use super::{plan, receipt_for};
+    use super::{receipt_for, served_plan};
     use crate::gqt_protocol::{
         ChildFrameV2, PreparationProofV2, RepetitionInputV2, WORKER_PROTOCOL_VERSION,
         digest_worker_executable, write_frame,
@@ -1540,7 +1641,7 @@ exit 0
     }
 
     fn input(worker: &Path, root: &Path) -> SupervisionInput {
-        let planned = plan("e2e-query-count-served");
+        let planned = served_plan("e2e-query-count");
         let receipt = receipt_for(&planned, "http://127.0.0.1:9");
         let bound = receipt.bind(&planned).unwrap();
         let execution = RepetitionInputV2::Served {
@@ -1572,7 +1673,7 @@ exit 0
     fn sample(input: &SupervisionInput) -> GqtRepObservation {
         let parsed = input.case.plan.queries.parse().unwrap();
         let descriptors = parsed.steps();
-        assert_eq!(descriptors.len(), 3);
+        assert_eq!(descriptors.len(), 4);
         assert_eq!(input.case.plan.definition.workload.measured_step.ordinal, 2);
         let PreparationProofV2::Served {
             server_receipt_sha256,
@@ -1606,6 +1707,7 @@ exit 0
             merge: None,
             server_receipt_sha256: Some(server_receipt_sha256),
             client_peak_rss_bytes: None,
+            base_manifest_sha256: None,
         }
     }
 

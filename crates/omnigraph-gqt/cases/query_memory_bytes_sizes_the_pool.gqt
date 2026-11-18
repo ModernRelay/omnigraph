@@ -1,7 +1,9 @@
 # issue: none
 # notes: The per-query memory pool is the `query_memory_bytes` session setting: a tiny value
-# notes: refuses a query whose tracked work exceeds it; the default (150 MiB) and a raised
-# notes: value run the same query through both the engine and the server.
+# notes: refuses a query whose tracked work exceeds it; the default (150 MiB) and an explicit
+# notes: allowance below it run the same query through both the engine and the server. A
+# notes: served request cannot raise it above the server's ceiling
+# notes: (`data_routes::request_budgets_stop_at_the_server_ceiling`).
 
 --- runner
 timeout_ms: 10000
@@ -46,8 +48,8 @@ query default_runs() {
 p.id: I64
 
 --- query
-set query_memory_bytes = 1073741824;
-query raised_runs() {
+set query_memory_bytes = 104857600;
+query explicit_runs() {
     match { $p: Person }
     return { $p.id }
 }

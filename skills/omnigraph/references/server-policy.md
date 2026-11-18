@@ -160,7 +160,10 @@ Graph-scoped actions are:
 | `change` | Mutations, loads, `load csv` (and its `explain` source probe), and Blob put/clear |
 | `schema_apply` | Schema changes: `cluster apply --target` needs it on each existing graph whose schema changes |
 | `branch_create`, `branch_delete`, `branch_merge` | Corresponding branch operation |
+| `branch_claim` | Claim of a branch's writer epoch; no CLI command or HTTP route claims in this release, only a program embedding the engine |
 | `commit_publish`, `commit_drop` | Publish or drop an unpublished commit; drop an unattached commit |
+| `maintain` | Optimize, index builds and the full-text rebuild; `change` admits none of them |
+| `reclaim` | Cleanup, which permanently removes unretained history |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved; no current public operation |
 
@@ -206,12 +209,12 @@ rules:
       actions: [invoke_query]
 ```
 
-`branch_scope` is valid only with `read`, `export`, and `change`;
+`branch_scope` is valid only with `read`, `export`, `change`, and `maintain`;
 `target_branch_scope` only with `branch_create`, `branch_delete`,
-`branch_merge`, `schema_apply`, `commit_publish`, and `commit_drop`. Any other pairing, or both scopes on one
+`branch_merge`, `branch_claim`, `schema_apply`, `commit_publish`, and `commit_drop`. Any other pairing, or both scopes on one
 rule, is refused. Values are `any`, `protected`, or `unprotected`, where
 protected branches are the bundle's top-level `protected_branches: [main, …]`
-list. `invoke_query`, `graph_list` and `config_manage` take no branch scope.
+list. `invoke_query`, `reclaim`, `graph_list` and `config_manage` take no branch scope.
 
 ```bash
 omnigraph policy validate --target ./company-data --graph knowledge
@@ -238,11 +241,14 @@ Served requests always use the server's policy engine. Embedded engine hosts
 can also install a policy engine, and every mutating engine entry point then
 enforces it.
 
-The standalone CLI opening a direct `--target` does **not** load the
-cluster server's Cedar bundle. Its `--as` value records actor attribution but
-does not recreate server authorization. Protect raw graph storage with object
-store IAM/ACLs and restrict who can run direct maintenance. Served writes reject
-client-supplied actor identity because only the token may select it.
+A direct CLI write or maintenance command on a cluster graph (a root
+target with `--graph`, or the graph's own store) installs the policy the
+cluster applied to that graph, the one `omnigraph access` reports. It refuses
+an actor the policy does not admit, or no `--as`, with `forbidden` before any
+effect, as the server would. A standalone graph has no policy. The direct actor
+is self-declared, so this is not authentication: protect raw graph storage with
+object store IAM/ACLs. Served writes reject client-supplied actor identity
+because only the token may select it.
 
 Canonical contracts: [server operations](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/server.md)
 and [authorization](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/policy.md).
