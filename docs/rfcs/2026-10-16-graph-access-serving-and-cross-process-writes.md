@@ -492,7 +492,7 @@ Studio's spec 012 lists this as E15.
 `omnigraph studio --target NAME [--graph G]` validates the target, opens
 `omnigraph-studio://open?target=NAME&binding=<digest>&home=<digest>[&graph=G]`
 for a server target, or
-`omnigraph-studio://open?api=<origin>&organization=<id>&cluster=<id>&incarnation=<id>[&graph=G]`
+`omnigraph-studio://open-cluster?api=<origin>&organization=<id>&cluster=<id>&incarnation=<id>[&graph=G]`
 for a managed cluster target, prints the link and exits, as `codex app` opens
 the Codex app. It owns nothing at runtime, so its one contract with Studio is
 the link format, which Studio owns.
@@ -537,8 +537,8 @@ the link format, which Studio owns.
   and reads no credential for either form, so it checks nothing against the
   control plane. A managed
   account, which names no cluster, still refuses. Both forms are protocol 1:
-  the managed form is produced only where the launcher refused before, and a
-  Studio that predates it refuses a link without a `target`.
+  the managed form is produced only where the launcher refused before, and an
+  older Studio refuses the unknown `open-cluster` route before resolving a connection.
 - A link opens without executing a write, as Studio's own link rules require.
   Write affordances follow the server's access response and the person's
   explicit action; opening a link grants no authority or server mode.
@@ -1637,7 +1637,9 @@ proposal.
   refuses the target: it emits a second link form that identifies the cluster
   (control plane, organization, cluster ID, incarnation) instead of naming a
   target for Studio to resolve through the CLI. The form is an addition within
-  `protocols.studio` 1. Superseded sentences: the target table's "Managed
+  `protocols.studio` 1. The distinct `open-cluster` route prevents older Studio
+  receivers from selecting a matching CLI connection for a managed link.
+  Superseded sentences: the target table's "Managed
   cluster" `studio` cell, "Deferred to A2"; Opening Studio's opening sentence,
   which named one link form; A2's "The launcher stays refused (the target
   table's "Deferred to A2" and Opening Studio)"; and the 2026-10-25 entry's

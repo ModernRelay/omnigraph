@@ -6531,8 +6531,10 @@ fn studio_opens_a_server_target_whose_digests_target_inspect_reports() {
     let absent = temp.path().join("absent");
     let cluster_id = "c".repeat(128);
     let incarnation = "i".repeat(128);
+    // Studio opens the managed cluster using its own transport. The CLI profile's CA is absent.
     let document = format!(
-        "version: 1\nprofiles:\n  work: {{api: '{endpoint}', organization_id: org, auth: {{provider: omnigraph}}}}\n\
+        "version: 1\nprofiles:\n  work: {{api: '{endpoint}', organization_id: org, auth: {{provider: omnigraph}}, \
+         transport: {{tls: {{ca: {{mode: append, file: missing-ca.pem}}}}}}}}\n\
          targets:\n  staging:\n    kind: server\n    endpoint: '{endpoint}/graph'\n    \
          auth: {{provider: token, source: {{env: OMNIGRAPH_STAGING_TOKEN}}}}\n    default_graph: knowledge\n  \
          local:\n    kind: server\n    endpoint: 'http://127.0.0.1:9'\n    auth: {{provider: anonymous}}\n  \
@@ -6671,7 +6673,7 @@ fn studio_opens_a_server_target_whose_digests_target_inspect_reports() {
         }
         let report = parse_stdout_json(&output_success(&mut installed.studio(home, &args)));
         let link = format!(
-            "omnigraph-studio://open?api={api}&organization=org&cluster={cluster_id}&incarnation={incarnation}&graph={opens}"
+            "omnigraph-studio://open-cluster?api={api}&organization=org&cluster={cluster_id}&incarnation={incarnation}&graph={opens}"
         );
         assert_eq!(
             report,

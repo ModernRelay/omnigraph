@@ -1,7 +1,7 @@
 //! `omnigraph studio`: open Omnigraph Studio on an existing server target or
 //! managed cluster target.
 //!
-//! The command validates the target, builds one `omnigraph-studio://open`
+//! The command validates the target, builds one `omnigraph-studio://`
 //! link, hands it to the platform and exits; it owns nothing at runtime and
 //! sends no request. The link has one of two forms:
 //!
@@ -247,8 +247,8 @@ fn link(target: &str, binding: &str, home: &str, graph: Option<&str>) -> String 
     link
 }
 
-/// `omnigraph-studio://open?api=ORIGIN&organization=ORG&cluster=ID&incarnation=ID[&graph=G]`.
-/// It has no `target`: a reader tells the two forms apart by that.
+/// `omnigraph-studio://open-cluster?api=ORIGIN&organization=ORG&cluster=ID&incarnation=ID[&graph=G]`.
+/// The distinct route makes older receivers refuse before selecting a connection.
 fn cluster_link(
     api: &str,
     organization: &str,
@@ -257,7 +257,7 @@ fn cluster_link(
     graph: Option<&str>,
 ) -> String {
     let mut link = format!(
-        "{SCHEME}://open?api={}&organization={}&cluster={}&incarnation={}",
+        "{SCHEME}://open-cluster?api={}&organization={}&cluster={}&incarnation={}",
         query_value(api),
         query_value(organization),
         query_value(cluster),
@@ -369,7 +369,7 @@ mod tests {
                 "01INCARNATION",
                 None
             ),
-            "omnigraph-studio://open?api=https:%2F%2Fplatform.example.com&organization=org_01\
+            "omnigraph-studio://open-cluster?api=https:%2F%2Fplatform.example.com&organization=org_01\
              &cluster=01CLUSTER&incarnation=01INCARNATION"
         );
         // A control plane under a path prefix keeps its route, encoded.
@@ -381,7 +381,7 @@ mod tests {
                 "i",
                 Some("knowledge")
             ),
-            "omnigraph-studio://open?api=https:%2F%2Fcontrol.example.com%2Fprefix\
+            "omnigraph-studio://open-cluster?api=https:%2F%2Fcontrol.example.com%2Fprefix\
              &organization=org_01&cluster=c&incarnation=i&graph=knowledge"
         );
     }
@@ -520,7 +520,7 @@ mod tests {
         let (_home, input, target) = resolved_from(MANAGED, "production");
         for (graph, opened) in [(None, "knowledge"), (Some("notes"), "notes")] {
             let expected = format!(
-                "omnigraph-studio://open?api=https:%2F%2Fcontrol.example.com%2Fprefix\
+                "omnigraph-studio://open-cluster?api=https:%2F%2Fcontrol.example.com%2Fprefix\
                  &organization=org_work&cluster=01CLUSTER&incarnation=01INCARNATION&graph={opened}"
             );
             let mut runner = Recorded::answering(vec![("open", exited(true, ""))]);
@@ -579,7 +579,7 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["link"],
                 format!(
-                    "omnigraph-studio://open?api=https:%2F%2Fcontrol.example.com%2Fprefix\
+                    "omnigraph-studio://open-cluster?api=https:%2F%2Fcontrol.example.com%2Fprefix\
                      &organization=org_work&cluster=01CLUSTER&incarnation=01INCARNATION{suffix}"
                 )
             );
@@ -595,7 +595,8 @@ mod tests {
         let (result, stdout, stderr) = run_with(scope, false, Platform::MacOs, &mut runner);
         assert_eq!(result.unwrap(), Completion::success());
         assert!(
-            stdout.starts_with("omnigraph-studio://open?api=") && stdout.lines().count() == 1,
+            stdout.starts_with("omnigraph-studio://open-cluster?api=")
+                && stdout.lines().count() == 1,
             "{stdout}"
         );
         assert!(!stdout.contains("target="), "{stdout}");

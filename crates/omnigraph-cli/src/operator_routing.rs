@@ -659,7 +659,10 @@ pub(crate) fn freeze_transports(
     use crate::cli::Command;
     use crate::planes::Requirement;
     use crate::targets::TargetBinding;
-    if matches!(&cli.command, Command::Config { .. }) {
+    // A client handoff consumes only the target identity. The receiving client owns HTTP.
+    if crate::planes::requirement(&cli.command) == Requirement::ServedTarget
+        || matches!(&cli.command, Command::Config { .. })
+    {
         return Ok(());
     }
     if matches!(

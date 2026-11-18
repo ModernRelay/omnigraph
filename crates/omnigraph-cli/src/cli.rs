@@ -246,7 +246,7 @@ pub(crate) enum Command {
     /// For a server target the `omnigraph-studio://open` link names the
     /// target, `--graph` when given, and digests of the target's binding and
     /// of this operator home, which Studio checks against its own resolution
-    /// of the target. For a managed cluster target it identifies the cluster:
+    /// of the target. For a managed target the `open-cluster` link identifies
     /// the control plane, the organization, and the cluster's ID and
     /// incarnation, which Studio opens with its own sign-in. It carries no
     /// secret and acquires no credential. Direct targets refuse. Without

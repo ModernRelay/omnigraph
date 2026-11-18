@@ -70,7 +70,7 @@ With `--json` the command prints the link and the facts it was built from:
 ### A managed cluster target
 
 ```text
-omnigraph-studio://open?api=ORIGIN&organization=ORG_ID&cluster=CLUSTER_ID&incarnation=INCARNATION[&graph=ID]
+omnigraph-studio://open-cluster?api=ORIGIN&organization=ORG_ID&cluster=CLUSTER_ID&incarnation=INCARNATION[&graph=ID]
 ```
 
 | Parameter | Meaning |
@@ -98,7 +98,7 @@ cluster that has since been deleted, or an organization you have left, is
 Studio's to report.
 
 ```json
-{"protocol":1,"target":"production","api":"https://platform.omnigraph.dev","organization":"org_…","cluster":"…","incarnation":"…","link":"omnigraph-studio://open?api=https:%2F%2Fplatform.omnigraph.dev&organization=org_…&cluster=…&incarnation=…"}
+{"protocol":1,"target":"production","api":"https://platform.omnigraph.dev","organization":"org_…","cluster":"…","incarnation":"…","link":"omnigraph-studio://open-cluster?api=https:%2F%2Fplatform.omnigraph.dev&organization=org_…&cluster=…&incarnation=…"}
 ```
 
 `target` in this report is the name the command resolved; the link does not
@@ -108,9 +108,9 @@ carry it.
 
 `protocol` is `protocols.studio` in [`omnigraph version --json`](../install.md#verify).
 It versions both link forms, this report, and the digests `target inspect`
-reports. The managed cluster form was added within protocol 1: every link,
-report and digest for a server target is unchanged, and a Studio that
-predates the form refuses a link without a `target` instead of misreading it.
+reports. The managed cluster route is an addition to protocol 1. Older Studio
+releases refuse the unknown `open-cluster` route. If Studio reports that it
+cannot open the link, update Studio and reopen it.
 Without `--json` the link is the only line on stdout.
 
 ## Platforms
