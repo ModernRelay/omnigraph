@@ -91,6 +91,7 @@ Check each table's `outcome` even on exit 0. It can be `optimized`, `unchanged`,
 `deferred` or `failed`. A failed table includes its `error`. Other tables still publish.
 If index maintenance or its coverage check fails after a rewrite or index build,
 completed work publishes as `optimized` with `reason: index_failed` and the error.
+The direct report keeps any indexes already identified as pending in `pending_indexes`.
 The next run checks coverage and plans remaining work. The report includes
 `input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
 and `artifact` outcomes. Neither of those last two can fail a published run.

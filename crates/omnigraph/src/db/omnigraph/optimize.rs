@@ -814,6 +814,9 @@ struct PreparedOptimizeTable {
     /// The compaction plan made for `initial_snapshot`, measured against the
     /// ceilings and executed as it is: staging does not plan again.
     plan: lance::dataset::optimize::CompactionPlan,
+    /// Declared indexes already known to be pending if a later link fails
+    /// before the table can plan its index build again.
+    pending_indexes: Vec<super::PendingIndex>,
     /// The plan's source bytes, measured when a byte ceiling or the run's
     /// byte budget is set.
     source_bytes: Option<u64>,
@@ -1632,8 +1635,8 @@ async fn prepare_optimize_table(
     // addresses, and the engine builds none, and only a data overlay newer
     // than an index drops a fragment from it, and no engine writer creates
     // one), so compaction alone causes no fold after it.
-    let index_work = needs_reindex || index_work.needs_commit;
-    let source_bytes = match measure_plan(snapshot.dataset(), &source, index_work, limits).await? {
+    let will_index = needs_reindex || index_work.needs_commit;
+    let source_bytes = match measure_plan(snapshot.dataset(), &source, will_index, limits).await? {
         Ok(source_bytes) => source_bytes,
         Err(exceeded) => {
             return Ok(OptimizePreparation::Stat(DatasetOptimizeStats::deferred(
@@ -1652,6 +1655,7 @@ async fn prepare_optimize_table(
         witness: task.witness,
         last_linear_version: task.entry.version_metadata.last_linear_version(),
         plan,
+        pending_indexes: index_work.pending,
         source_bytes,
     })))
 }
@@ -1876,49 +1880,66 @@ async fn apply_optimize_table_effects(
     // row-id-domain index's coverage to the new fragments, the engine builds
     // no address-domain index, and no engine writer creates the data overlays
     // that would also drop coverage.
-    let mut pending_indexes = Vec::new();
-    let fold = stage_fold_link(db, &tip, &witness, &declared_full_text, step_limit).await;
-    let index_result = match fold {
-        Ok((folded, skipped_folds)) => {
+    let mut pending_indexes = work.pending_indexes;
+    let mut skipped_folds = Vec::new();
+    let fold = stage_fold_link(
+        db,
+        &tip,
+        &witness,
+        &declared_full_text,
+        step_limit,
+        &mut skipped_folds,
+    )
+    .await;
+    let build = match fold {
+        Ok(folded) => {
             if let Some((folded, identity)) = folded {
                 tip = folded;
                 tip_identity = Some(identity);
                 links += 1;
                 fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
             }
-            match stage_build_link(
+            stage_build_link(
                 db,
                 catalog,
                 &table_key,
                 &tip,
-                skipped_folds,
+                &mut pending_indexes,
                 &witness,
                 &declared_full_text,
                 step_limit,
             )
             .await
-            {
-                Ok((built, pending)) => {
-                    if let Some((built, identity)) = built {
-                        tip = built;
-                        tip_identity = Some(identity);
-                        links += 1;
-                        fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
-                    }
-                    pending_indexes = pending;
-                    // Keep the completed link when only this status read fails.
-                    super::table_ops::append_deferred_full_text_indexes(
-                        &tip,
-                        &table_key,
-                        "main",
-                        &[],
-                        &mut pending_indexes,
-                    )
-                    .await
-                    .map_err(|error| error.with_context("read full-text index coverage"))
-                }
-                Err(error) => Err(error),
+        }
+        Err(error) => Err(error),
+    };
+    for (column, reason) in skipped_folds {
+        pending_indexes.push(super::PendingIndex {
+            type_key: table_key.clone(),
+            property: column,
+            reason: format!(
+                "vector index coverage lags and the column cannot train an index: {reason}"
+            ),
+        });
+    }
+    let index_result = match build {
+        Ok(built) => {
+            if let Some((built, identity)) = built {
+                tip = built;
+                tip_identity = Some(identity);
+                links += 1;
+                fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
             }
+            // Keep the completed link when only this status read fails.
+            super::table_ops::append_deferred_full_text_indexes(
+                &tip,
+                &table_key,
+                "main",
+                &[],
+                &mut pending_indexes,
+            )
+            .await
+            .map_err(|error| error.with_context("read full-text index coverage"))
         }
         Err(error) => Err(error),
     };
@@ -1994,79 +2015,66 @@ fn index_maintenance_failure(
 
 /// One table's fold link at `tip`: stage a whole rebuild of every foldable
 /// index whose coverage lags, holding one permit of `step_limit`, and commit
-/// it detached. Returns the committed link, `None` when no index lagged or
-/// none could be rebuilt, and the vector columns whose index could not be
-/// trained.
+/// it detached. Record the vector columns that could not train before the
+/// commit, so its failure keeps those reasons. Returns `None` when no index
+/// lagged or none could be rebuilt.
 async fn stage_fold_link(
     db: &Omnigraph,
     tip: &crate::storage_layer::SnapshotHandle,
     witness: &crate::table_store::StagingWitness,
     declared_full_text: &[String],
     step_limit: &crate::table_store::OptimizeStepLimit,
-) -> Result<(Option<CommittedLink>, Vec<(String, String)>)> {
+    skipped_folds: &mut Vec<(String, String)>,
+) -> Result<Option<CommittedLink>> {
     fail(&OPTIMIZE_BEFORE_INDEX_LINK)?;
     let (fold, skipped) = step_limit.run(db.storage().stage_index_fold(tip)).await?;
-    let folded = match fold {
-        Some(staged) => Some(
-            db.storage()
-                .commit_staged_detached(tip.clone(), staged, witness, declared_full_text)
-                .await?,
-        ),
-        None => None,
+    *skipped_folds = skipped;
+    let Some(staged) = fold else {
+        return Ok(None);
     };
-    Ok((folded, skipped))
+    db.storage()
+        .commit_staged_detached(tip.clone(), staged, witness, declared_full_text)
+        .await
+        .map(Some)
 }
 
 /// One table's index-build link at `tip`: plan the declared indexes the
 /// table lacks, stage them as one `CreateIndex`, holding one permit of
-/// `step_limit`, and commit it detached. Returns the committed link, `None`
-/// when no declared index was missing, and the vector columns that cannot
-/// train (`skipped_folds` among them). The caller checks full-text coverage
-/// at the resulting version.
+/// `step_limit`, and commit it detached. Refresh the declared pending indexes
+/// as soon as the plan is known, so a build failure keeps them. Returns
+/// `None` when no declared index was missing.
 #[allow(clippy::too_many_arguments)]
 async fn stage_build_link(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     table_key: &str,
     tip: &crate::storage_layer::SnapshotHandle,
-    skipped_folds: Vec<(String, String)>,
+    pending_indexes: &mut Vec<super::PendingIndex>,
     witness: &crate::table_store::StagingWitness,
     declared_full_text: &[String],
     step_limit: &crate::table_store::OptimizeStepLimit,
-) -> Result<(Option<CommittedLink>, Vec<super::PendingIndex>)> {
+) -> Result<Option<CommittedLink>> {
     fail(&OPTIMIZE_BEFORE_INDEX_LINK)?;
     let index_work =
         super::table_ops::plan_index_work_on_dataset_for_catalog(db, catalog, table_key, tip)
             .await?;
-    let mut pending = index_work.pending;
-    for (column, reason) in skipped_folds {
-        pending.push(super::PendingIndex {
-            type_key: table_key.to_string(),
-            property: column,
-            reason: format!(
-                "vector index coverage lags and the column cannot train an index: {reason}"
-            ),
-        });
+    *pending_indexes = index_work.pending;
+    if index_work.specs.is_empty() {
+        return Ok(None);
     }
-    let built = if index_work.specs.is_empty() {
-        None
-    } else {
-        let staged = step_limit
-            .run(db.storage().stage_create_indices(tip, &index_work.specs))
-            .await
-            .map_err(|error| {
-                error.with_context(format!(
-                    "stage index batch on {table_key} ({:?})",
-                    index_work.specs
-                ))
-            })?;
-        Some(
-            db.storage()
-                .commit_staged_detached(tip.clone(), staged, witness, declared_full_text)
-                .await?,
-        )
-    };
-    Ok((built, pending))
+    let staged = step_limit
+        .run(db.storage().stage_create_indices(tip, &index_work.specs))
+        .await
+        .map_err(|error| {
+            error.with_context(format!(
+                "stage index batch on {table_key} ({:?})",
+                index_work.specs
+            ))
+        })?;
+    db.storage()
+        .commit_staged_detached(tip.clone(), staged, witness, declared_full_text)
+        .await
+        .map(Some)
 }
 
 const INTERNAL_CONFIG_RETRY_BUDGET: u32 = 5;

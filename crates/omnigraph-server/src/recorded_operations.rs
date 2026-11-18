@@ -373,39 +373,9 @@ pub(crate) struct OperationOutput {
     lookup: OperationLookup,
     /// The operation's record; absent for an `unknown` lookup.
     #[schema(value_type = Option<Object>)]
-    #[serde(serialize_with = "serialize_api_operation")]
     operation: Option<Operation>,
     /// Whether this server is running it now.
     in_progress: bool,
-}
-
-/// The v1 storage keys and the digest of a retained request are stable.
-/// Only the HTTP response uses the public dataset vocabulary.
-fn serialize_api_operation<S: serde::Serializer>(
-    operation: &Option<Operation>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    let Some(operation) = operation else {
-        return serializer.serialize_none();
-    };
-    let mut body = serde_json::to_value(operation).map_err(serde::ser::Error::custom)?;
-    match operation.kind() {
-        OperationKind::Optimize => {
-            for (section, stored, public) in [
-                ("request", "tables", "datasets"),
-                ("outcome", "tables", "datasets"),
-                ("outcome", "more_tables", "more_datasets"),
-            ] {
-                let fields = body[section].as_object_mut().ok_or_else(|| {
-                    serde::ser::Error::custom(format!("invalid optimize {section}"))
-                })?;
-                if let Some(value) = fields.remove(stored) {
-                    fields.insert(public.to_owned(), value);
-                }
-            }
-        }
-    }
-    body.serialize(serializer)
 }
 
 #[derive(Deserialize)]
@@ -1539,26 +1509,24 @@ mod tests {
     }
 
     #[test]
-    fn a_filtered_retry_reads_the_v1_record_and_returns_public_dataset_names() {
+    fn a_filtered_retry_returns_the_stored_dataset_record() {
         use serde_json::json;
 
         let id = "000000YGJ00000000000000001";
-        // Pin the stored request and its original digest independently of the
-        // current encoder. An HTTP rename must not change either one.
+        // Pin a stored operation independently of the encoder used by admission.
         let saved = json!({
             "version": 1, "ledger_id": "01JBQZ0000000000000000ABCD",
             "terminal": [{
                 "operation_id": id, "graph": "g", "schema_identity_domain": "domain-a",
                 "settlement_branch": "main", "principal": "p",
-                "request": {"kind": "optimize", "tables": ["node:Person"]},
-                "request_digest": "sha256:a399bb4a1476b722f62daaf9255ab1cf28949e6e71db5d53894f9bc00e25a13b",
+                "request": {"kind": "optimize", "datasets": ["node:Person"]},
+                "request_digest": "sha256:2d8f01f95c7efe313e8cec982bc5563d70f6c5cba0a2e6e13f1b7d355e1fa8ba",
                 "accepted_at": "2026-11-18T07:00:00Z", "state": "succeeded", "timings": {},
                 "outcome": {
-                    "kind": "optimize", "tables": [{
+                    "kind": "optimize", "datasets": [{
                         "type_key": "node:Person", "outcome": "unchanged",
                         "fragments_removed": 0, "fragments_added": 0, "duration_ms": 0
-                    }],
-                    "more_tables": {"deferred": 3}
+                    }]
                 }
             }]
         });
@@ -1579,23 +1547,7 @@ mod tests {
             in_progress: false,
         })
         .unwrap();
-        let operation = &response["operation"];
-        let retained = &saved["terminal"][0];
-        assert_eq!(
-            operation["request"]["datasets"],
-            retained["request"]["tables"]
-        );
-        assert_eq!(
-            operation["outcome"]["datasets"],
-            retained["outcome"]["tables"]
-        );
-        assert_eq!(
-            operation["outcome"]["more_datasets"],
-            retained["outcome"]["more_tables"]
-        );
-        assert!(operation["request"].get("tables").is_none());
-        assert!(operation["outcome"].get("tables").is_none());
-        assert!(operation["outcome"].get("more_tables").is_none());
+        assert_eq!(response["operation"], saved["terminal"][0]);
     }
 
     /// A report from a tiny graph, for the fields a record is built from: the

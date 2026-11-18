@@ -6057,18 +6057,17 @@ async fn optimize_table_failure_fails_only_that_table_and_publishes_the_rest() {
 /// The fold and the index build are separate links. When the build fails
 /// after the fold committed, the fold still publishes, whether or not a
 /// rewrite came before it: the table is `optimized` with the reason
-/// `index_failed`, the rebuilt index covers every fragment, and the next run
-/// builds the index that failed.
+/// `index_failed`, keeps the reason for an unrelated pending index, and
+/// publishes the rebuilt index. The next run builds the index that failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(optimize)]
 async fn optimize_keeps_a_tables_fold_when_its_index_build_fails() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let schema = "node Doc {\n    slug: String @key\n    n: I64 @index\n    embedding: Vector(8)? @index\n}\n";
+    let schema = "node Doc {\n    slug: String @key\n    n: I64 @index\n    embedding: Vector(8)? @index\n    secondary: Vector(8)? @index\n}\n";
     let db = helpers::session(Omnigraph::init(&uri, schema).await.unwrap());
-    // Rows without a vector: the scalar indexes build, and the vector index
-    // has nothing to train on and stays pending.
+    // The scalar indexes build. Both vector columns start out empty.
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"n\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"n\":2}}",
@@ -6079,9 +6078,13 @@ async fn optimize_keeps_a_tables_fold_when_its_index_build_fails() {
     let pending = db.ensure_indices_as(None).await.unwrap();
     assert_eq!(
         pending.len(),
-        1,
-        "only the vector index is pending: {pending:?}"
+        2,
+        "both vector indexes are pending: {pending:?}"
     );
+    let secondary = pending
+        .iter()
+        .find(|entry| entry.property == "secondary")
+        .expect("the secondary vector has no training data");
     // Rows with vectors, in a second fragment the built indexes do not cover:
     // the fold has work, and the vector index can now be built.
     db.load_jsonl(
@@ -6121,6 +6124,7 @@ async fn optimize_keeps_a_tables_fold_when_its_index_build_fails() {
         "{stat:?}"
     );
     assert_eq!(stat.reason(), Some("index_failed"), "{stat:?}");
+    assert!(stat.pending_indexes.contains(secondary), "{stat:?}");
     let index_failure = stat
         .index_failure
         .as_ref()
@@ -6163,6 +6167,7 @@ async fn optimize_keeps_a_tables_fold_when_its_index_build_fails() {
     assert!(stat.committed(), "{stat:?}");
     assert_eq!(stat.reason(), None, "{stat:?}");
     assert!(stat.index_failure.is_none(), "{stat:?}");
+    assert!(stat.pending_indexes.contains(secondary), "{stat:?}");
     let retried = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await

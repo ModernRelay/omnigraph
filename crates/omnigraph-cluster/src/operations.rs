@@ -146,9 +146,8 @@ impl OperationRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OptimizeOptions {
-    /// Only these table keys, in this order. The v1 record and request
-    /// digest use the original name; the HTTP API calls this `datasets`.
-    #[serde(rename = "tables", default, skip_serializing_if = "Option::is_none")]
+    /// Only these datasets, identified by type key, in this order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datasets: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_gate_hold_ms: Option<u64>,
@@ -200,17 +199,13 @@ pub struct OptimizeOutcome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_at: Option<String>,
     /// At most [`MAX_TABLE_OUTCOMES`] tables, in the run's visit order.
-    #[serde(rename = "tables", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub datasets: Vec<TableOutcome>,
     /// The tables beyond the listed ones, counted per outcome code and
     /// reason: the key is the outcome code, followed by a colon and the
     /// reason when the outcome has one (`deferred:gate_hold_limit`,
     /// `optimized:index_failed`).
-    #[serde(
-        rename = "more_tables",
-        default,
-        skip_serializing_if = "BTreeMap::is_empty"
-    )]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub more_datasets: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_at: Option<String>,
@@ -1431,20 +1426,15 @@ mod tests {
             .collect();
         outcome.set_datasets(tables);
         assert_eq!(outcome.datasets.len(), MAX_TABLE_OUTCOMES);
-        let counted: Vec<(&str, u64)> = outcome
-            .more_datasets
-            .iter()
-            .map(|(key, count)| (key.as_str(), *count))
-            .collect();
         assert_eq!(
-            counted,
-            [
-                ("deferred:byte_budget", 1),
-                ("deferred:gate_hold_limit", 1),
-                ("optimized", 1),
-                ("optimized:index_failed", 1),
-                ("unchanged", 1),
-            ],
+            serde_json::to_value(&outcome).unwrap()["more_datasets"],
+            serde_json::json!({
+                "deferred:byte_budget": 1,
+                "deferred:gate_hold_limit": 1,
+                "optimized": 1,
+                "optimized:index_failed": 1,
+                "unchanged": 1
+            }),
             "an index failure past the cap is not counted as a clean optimized table"
         );
         assert!(

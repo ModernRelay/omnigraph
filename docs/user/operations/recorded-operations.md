@@ -60,7 +60,7 @@ The budget is also the table byte ceiling when
 more bytes than the budget is therefore never optimized by a served run. To
 optimize it, raise the budget, or stop the server and run `omnigraph optimize`
 on the cluster root directly, which applies neither. Give that run
-`--tables <type key>` (for example `--tables node:Document`) to optimize only
+`--datasets <type key>` (for example `--datasets node:Document`) to optimize only
 the oversized table, so the server restarts sooner. A direct run keeps the
 root's admission lock: release it with `cluster force-unlock`, as after a
 [direct apply](../clusters/index.md#bootstrap-a-cluster), before the server
@@ -84,9 +84,7 @@ at or below the server's ceiling; nothing else.
 
 A submission answers 202 with the record once it is durably accepted, and 200
 once the operation is terminal. Submitting the same id with the same request
-returns the existing record without starting work again. Selected-dataset
-requests keep their original digest across the upgrade to the `datasets`
-field. A lookup answers
+returns the existing record without starting work again. A lookup answers
 200 with the record, or `"lookup": "unknown"` when the record does not hold
 the id. `unknown` does not prove the operation never ran, and it is never a
 reason to resubmit the same work under the same id.

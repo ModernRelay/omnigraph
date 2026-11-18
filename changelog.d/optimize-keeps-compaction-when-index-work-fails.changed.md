@@ -1,5 +1,5 @@
-- `optimize` publishes completed compaction and index builds when a later
-  index step or its coverage check fails. The table reports `optimized` with
-  the reason `index_failed`. See [bounding a run][optimize-index-failed].
+- When an index step or coverage check fails, [`optimize`][optimize-index-failed]
+  publishes completed work and reports `index_failed`. Direct reports also list
+  indexes already known to be pending.
 
 [optimize-index-failed]: ../docs/user/operations/maintenance.md#bounding-a-run

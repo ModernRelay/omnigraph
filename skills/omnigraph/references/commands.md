@@ -340,6 +340,7 @@ means the run finished, not that every table was optimized: read each
 dataset's `outcome` (`optimized`, `unchanged`, `deferred`, `failed` with
 `error`) and `reason`. With `index_failed`, the run published completed
 table work and the error identifies the index maintenance step that failed.
+On a direct target, `pending_indexes` also lists indexes already known to need work.
 
 ### `index build` — a branch's missing and lagging indexes
 
