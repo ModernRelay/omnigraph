@@ -1663,18 +1663,16 @@ fn is_durable_identifier(identifier: &str) -> bool {
         })
 }
 
-fn collect_durable_use_renames(tree: &syn::UseTree, hits: &mut Vec<String>) {
+/// Collects each `use … as` rename in a use tree as (imported name, new name).
+fn collect_use_renames(tree: &syn::UseTree, renames: &mut Vec<(String, String)>) {
     match tree {
-        syn::UseTree::Rename(rename) if is_durable_identifier(&rename.ident.to_string()) => {
-            hits.push(format!(
-                "durable identifier `{}` renamed to `{}`",
-                rename.ident, rename.rename
-            ));
+        syn::UseTree::Rename(rename) => {
+            renames.push((rename.ident.to_string(), rename.rename.to_string()));
         }
-        syn::UseTree::Path(path) => collect_durable_use_renames(&path.tree, hits),
+        syn::UseTree::Path(path) => collect_use_renames(&path.tree, renames),
         syn::UseTree::Group(group) => {
             for item in &group.items {
-                collect_durable_use_renames(item, hits);
+                collect_use_renames(item, renames);
             }
         }
         _ => {}
@@ -1685,6 +1683,10 @@ fn collect_durable_use_renames(tree: &syn::UseTree, hits: &mut Vec<String>) {
 struct CallInventory {
     counts: BTreeMap<String, usize>,
     macro_hits: Vec<String>,
+    /// `use … as` renames as (imported name, new name). `counts` keys a call
+    /// by the last identifier of its path, so a renamed import's calls are
+    /// counted under the new name.
+    use_renames: Vec<(String, String)>,
 }
 
 impl CallInventory {
@@ -1730,7 +1732,15 @@ impl<'ast> Visit<'ast> for CallInventory {
     }
 
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
-        collect_durable_use_renames(&node.tree, &mut self.macro_hits);
+        let mut renames = Vec::new();
+        collect_use_renames(&node.tree, &mut renames);
+        for (name, rename) in &renames {
+            if is_durable_identifier(name) {
+                self.macro_hits
+                    .push(format!("durable identifier `{name}` renamed to `{rename}`"));
+            }
+        }
+        self.use_renames.extend(renames);
         visit::visit_item_use(self, node);
     }
 
@@ -3105,6 +3115,40 @@ fn structural_call_scanner_skips_test_functions_and_rejects_hidden_shapes() {
             .macro_hits
             .iter()
             .any(|hit| hit.contains("include!"))
+    );
+}
+
+#[test]
+fn structural_call_scanner_records_use_renames() {
+    let ast = parse_rust_source(
+        r#"
+        use crate::instrumentation::open_pinned_dataset_at_recorded_manifest as open_fast;
+        use omnigraph_core::{instrumentation::{pinned_commit_handler as handler}, other};
+
+        async fn read(uri: &str) {
+            let _ = open_fast(uri).await;
+            let _ = handler();
+        }
+        "#,
+        "scanner use-rename self-test",
+    );
+    let inventory = call_inventory(&ast);
+    assert_eq!(
+        inventory.use_renames,
+        vec![
+            (
+                "open_pinned_dataset_at_recorded_manifest".to_string(),
+                "open_fast".to_string()
+            ),
+            ("pinned_commit_handler".to_string(), "handler".to_string()),
+        ]
+    );
+    assert_eq!(inventory.counts.get("open_fast"), Some(&1));
+    assert_eq!(
+        inventory
+            .counts
+            .get("open_pinned_dataset_at_recorded_manifest"),
+        None
     );
 }
 
@@ -4570,26 +4614,42 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
 /// `open_pinned_dataset_at_recorded_manifest` stays `pub` because the catalog
 /// calls it across the crate boundary, and the engine imports all of core's
 /// instrumentation, so this count, not visibility, keeps the engine off it.
+/// A call is counted by the last name of its path, so the guard also refuses
+/// a `use … as` that renames one of the three. A function used as a value
+/// (`let open = open_pinned_dataset_at_recorded_manifest;`) is not a call, and
+/// the guard does not see it.
 #[test]
 fn recorded_manifest_open_call_counts_are_pinned() {
+    const PINNED: [&str; 3] = [
+        "open_pinned_dataset_at_recorded_manifest",
+        "open_dataset_entry_at_recorded_manifest",
+        "pinned_commit_handler",
+    ];
     let src = engine_src_root();
     let mut sites = Vec::new();
+    let mut renamed = Vec::new();
     for (relative, file) in labeled_scan_files(&src, true) {
         let contents = std::fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
         let ast = parse_rust_source(&contents, &relative);
         let inventory = call_inventory(&ast);
-        for function in [
-            "open_pinned_dataset_at_recorded_manifest",
-            "open_dataset_entry_at_recorded_manifest",
-            "pinned_commit_handler",
-        ] {
+        for function in PINNED {
             let count = inventory.counts.get(function).copied().unwrap_or(0);
             if count > 0 {
                 sites.push((function, relative.clone(), count));
             }
         }
+        for (name, rename) in &inventory.use_renames {
+            if PINNED.contains(&name.as_str()) {
+                renamed.push(format!("{relative}: `{name}` renamed to `{rename}`"));
+            }
+        }
     }
+    assert!(
+        renamed.is_empty(),
+        "a renamed import hides recorded-manifest opener calls from the count \
+         below: {renamed:?}"
+    );
     sites.sort();
     assert_eq!(
         sites,
