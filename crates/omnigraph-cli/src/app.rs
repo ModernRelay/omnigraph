@@ -398,6 +398,11 @@ pub(crate) fn error_output_of(error: &color_eyre::Report) -> Option<ErrorOutput>
         output.code = Some(refusal.code);
         return Some(output);
     }
+    if let Some(reply) = error.downcast_ref::<crate::helpers::ContradictoryReply>() {
+        let mut output = ErrorOutput::message(reply.message.clone());
+        output.code = Some(omnigraph_api_types::ErrorCode::OutcomeUnknown);
+        return Some(output);
+    }
     let diagnostic = if let Some(engine) = error.downcast_ref::<omnigraph::error::OmniError>() {
         engine.diagnostic()
     } else if let Some(compiler) = error.downcast_ref::<omnigraph_compiler::error::CompilerError>()

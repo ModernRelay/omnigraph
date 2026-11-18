@@ -3996,6 +3996,93 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
     }
 }
 
+/// A dry run of a merge is a read of both branches: when its answer is lost
+/// (a severed body here, a client deadline in the report), nothing can have
+/// changed, so it reports no effects and is not sent to reconcile a write. The
+/// same lost answer to a real merge stays unknown. A dry run travels on the
+/// merge route, so it is a read only when the reply confirms it: a reply that
+/// says the server did not run a dry run, or that a dry run wrote, leaves the
+/// effects unknown.
+#[test]
+fn a_dry_run_merge_whose_answer_is_lost_has_no_effects_issue_1447() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+    use serde_json::json;
+
+    let lost = || IntentReply {
+        status: 200,
+        headers: vec![("Content-Length".into(), "1024".into())],
+        body: b"{unfinished".to_vec(),
+    };
+    let cases = [
+        ("lost answer to a dry run", true, lost(), 1, "none"),
+        ("lost answer to a merge", false, lost(), 2, "unknown"),
+        (
+            "a dry run answered as a merge",
+            true,
+            IntentReply::json(
+                200,
+                json!({"source":"review", "target":"main", "outcome":"already_up_to_date",
+                    "actor_id":"alice", "dry_run":false, "commit":null}),
+            ),
+            2,
+            "unknown",
+        ),
+        (
+            "a dry run that reports a write",
+            true,
+            IntentReply::json(
+                200,
+                json!({"source":"review", "target":"main", "outcome":"fast_forward",
+                    "actor_id":"alice", "dry_run":true, "commit":null, "branch_deleted":true}),
+            ),
+            2,
+            "unknown",
+        ),
+    ];
+    for (case, dry_run, reply, exit, effects) in cases {
+        let server = IntentApiFixture::graph(vec![reply]);
+        let mut command = cli();
+        command
+            .args(["--target"])
+            .fixture_target(&server.origin)
+            .args([
+                "--graph",
+                "knowledge",
+                "branch",
+                "merge",
+                "review",
+                "--json",
+            ]);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{case}: {output:?}");
+        let actual = parse_stdout_json(&output);
+        assert_eq!(
+            actual["disposition"]["effects"], effects,
+            "{case}: {actual}"
+        );
+        if effects == "unknown" {
+            assert_eq!(
+                actual["disposition"]["action"], "reconcile",
+                "{case}: {actual}"
+            );
+        } else {
+            assert_ne!(
+                actual["disposition"]["action"], "reconcile",
+                "{case}: {actual}"
+            );
+        }
+        assert_eq!(
+            server.requests().len(),
+            2,
+            "{case}: one discovery and one merge request"
+        );
+        server.assert_complete();
+    }
+}
+
 #[test]
 fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
