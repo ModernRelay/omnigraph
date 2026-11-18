@@ -65,23 +65,29 @@ where
     };
     let mut stdin = io::stdin();
     let stdin_is_terminal = stdin.is_terminal();
+    let mut stdout = io::stdout();
+    let stdout_is_terminal = stdout.is_terminal();
     execute(
         parsed,
         operator::InvocationConfig::capture(),
         &mut stdin,
         stdin_is_terminal,
-        &mut io::stdout(),
+        &mut stdout,
+        stdout_is_terminal,
         &mut io::stderr(),
     )
     .await
 }
 
+/// `stdout_is_terminal` describes the stream `stdout` writes to; only the
+/// process boundary can know it, so a caller writing elsewhere passes false.
 async fn execute(
     parsed: ParsedInvocation,
     operator: operator::InvocationConfig,
     stdin: &mut dyn Read,
     stdin_is_terminal: bool,
     stdout: &mut dyn Write,
+    stdout_is_terminal: bool,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     let ParsedInvocation {
@@ -108,6 +114,7 @@ async fn execute(
         stdin,
         stdin_is_terminal,
         &mut stdout,
+        stdout_is_terminal,
         stderr,
     ));
     let (result, evidence) = if let Some(kind) = observe {
@@ -391,6 +398,11 @@ pub(crate) fn error_output_of(error: &color_eyre::Report) -> Option<ErrorOutput>
         output.code = Some(refusal.code);
         return Some(output);
     }
+    if let Some(reply) = error.downcast_ref::<crate::helpers::ContradictoryReply>() {
+        let mut output = ErrorOutput::message(reply.message.clone());
+        output.code = Some(omnigraph_api_types::ErrorCode::OutcomeUnknown);
+        return Some(output);
+    }
     let diagnostic = if let Some(engine) = error.downcast_ref::<omnigraph::error::OmniError>() {
         engine.diagnostic()
     } else if let Some(compiler) = error.downcast_ref::<omnigraph_compiler::error::CompilerError>()
@@ -425,6 +437,7 @@ async fn run(
     stdin: &mut dyn Read,
     stdin_is_terminal: bool,
     stdout: &mut dyn Write,
+    stdout_is_terminal: bool,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     let Some(stats) = cli.stats.clone() else {
@@ -436,6 +449,7 @@ async fn run(
             stdin,
             stdin_is_terminal,
             stdout,
+            stdout_is_terminal,
             stderr,
         )
         .await;
@@ -450,6 +464,7 @@ async fn run(
             stdin,
             stdin_is_terminal,
             stdout,
+            stdout_is_terminal,
             stderr,
         ),
     )
@@ -464,6 +479,7 @@ async fn run_resolved(
     stdin: &mut dyn Read,
     stdin_is_terminal: bool,
     stdout: &mut dyn Write,
+    stdout_is_terminal: bool,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     let cwd = std::env::current_dir()?;
@@ -540,6 +556,7 @@ async fn run_resolved(
                     stdin,
                     stdin_is_terminal,
                     stdout,
+                    stdout_is_terminal,
                     stderr,
                 ),
             ),
@@ -555,6 +572,7 @@ async fn dispatch(
     stdin: &mut dyn Read,
     stdin_is_terminal: bool,
     stdout: &mut dyn Write,
+    stdout_is_terminal: bool,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     crate::operator_routing::freeze_transports(&cli, target.as_ref())?;
@@ -845,6 +863,7 @@ async fn dispatch(
                     actor: cli.as_actor.as_deref(),
                     yes: cli.yes,
                 },
+                stdout_is_terminal,
                 machine,
                 stdout,
                 stderr,

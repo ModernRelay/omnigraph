@@ -369,13 +369,15 @@ Lance's size and deletion heuristics select. It stages the rewrite detached
 with fragment ids above the base's high-water mark, so it needs no
 `ReserveFragments`; a lagging scalar or vector index is rebuilt whole as a
 detached commit chained on the rewrite under its name (Lance 13 folds only
-through a linear commit), keeping a vector index's partition count, and a
-declared index the table lacks is built as a third. The links are
-independent: an index link that fails after an earlier link of the table
-committed leaves the committed links as the table's effect, reported
-`optimized` with the reason `index_failed`, and one that fails with no link
-before it fails the table. The batch publishes once with an exact CAS on every
-planned pin, and a pin a concurrent writer moved fails the run with a read-set
+through a linear commit). A vector index keeps its partition count unless its
+segments cover no fragments, in which case it uses one partition, as a new
+declared index does. A declared index the table lacks is built as a third
+link. A definite index failure leaves completed links eligible for the batch
+publication, including an index build whose final coverage read failed. The
+table reports `optimized` with reason `index_failed` when it has a committed
+link. A definite failure before the first link commits fails the table.
+Uncertain effects fail the run. The batch publishes once with an exact CAS on
+every planned pin, and a pin a concurrent writer moved fails the run with a read-set
 conflict so the next run re-plans. A failure before publication leaves
 unpublished staging the collector reclaims once it is dead.
 
@@ -730,7 +732,17 @@ id scan also returns each matched row's address at the table's pin, and
 `stage_all` writes the deletion vectors for exactly those rows
 (`TableStore::stage_delete_rows`, Lance's `DeleteBuilder` after its scan), so
 a deleted table is scanned once; addresses from another version than the
-reopened pin take Lance's scanning delete. A node delete whose predicate has
+reopened pin take Lance's scanning delete. A node removal reads each edge
+table that references the type for the edges touching its removed ids (the
+delete cascade, and the retained-edge check of an Overwrite, `load csv` or a
+merge) through `validate::RemovalEdgeReads`. Lance gives every fragment that
+no index answers a pushed filter on its own copy of the filter, built before
+the scan reads. So the plan pushes the ids to every fragment, 8,192 per
+filter, only when a BTREE on each probed endpoint covers the table, or when
+one filter holds every id and the uncovered fragments times those ids stay at
+most 8,192; otherwise it probes the covered fragments and reads the uncovered
+ones once, whole, matching their rows against the removed ids in memory
+(#1442). A node delete whose predicate has
 a `<key> = v` conjunct on the type's single String `@key` also filters on the
 derived id when the pinned table has an id BTREE, as the read planner's key
 narrowing does. Mutation validation reads the write's pinned base through the

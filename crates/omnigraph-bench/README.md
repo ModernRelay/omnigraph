@@ -12,7 +12,7 @@ build script or normal `test-util` requirement. The GQT binary separately owns
 correctness/DST execution and never supplies these wall-clock measurements.
 
 The [catalog guide](../../benchmarks/README.md) contains complete examples. The
-[`local-regression` group](../../benchmarks/benchmarks.yaml)
+[`local-regression` suite](../../benchmarks/benchmarks.yaml)
 contains bounded history, idle-registration, multi-table, branch-identity,
 churn, configured history-release, and equal-current/different-history pairs.
 The larger [history recipes](../../benchmarks/README.md#opt-in-history-scale) are opt-in.
@@ -201,8 +201,8 @@ but do not independently verify the declaration. Every served record therefore
 has `claim_eligible: false` and `sut.kind: declared-deployment`.
 
 One invocation accepts one receipt, endpoint and graph. All selected scenarios
-must use that receipt's dataset recipe and backend; incompatible groups fail
-before archive creation or network activity. The groups are discovery sets:
+must use that receipt's dataset recipe and backend; incompatible suites fail
+before archive creation or network activity. The suites are discovery sets:
 run their different fixture recipes in separate invocations against matching
 provisioned graphs. The served environment is the run's: the receipt's backend
 and `--network-position` (`same-host` unless given; `same-region` or `remote`
@@ -629,13 +629,26 @@ backend is probed as on every local run. The children run with a cleared
 environment plus the `AWS_*` client variables, `LANCE_MEM_POOL_SIZE`, the
 locale, `PATH`, `HOME` and a `TMPDIR` under the worker's scratch.
 
+The S3 client of this harness and of the measured `omnigraph` is object_store's,
+reading its credential from that crate's own chain, not the AWS SDK's: a
+credential from the instance metadata service, from a container-credentials
+endpoint (`AWS_CONTAINER_CREDENTIALS_FULL_URI` or `_RELATIVE_URI` with
+`AWS_CONTAINER_AUTHORIZATION_TOKEN`) or from a web-identity token file
+(`AWS_WEB_IDENTITY_TOKEN_FILE` with `AWS_ROLE_ARN`) is renewed by the client
+before it expires; static keys in `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+and `AWS_SESSION_TOKEN` are never renewed, so a run longer than such a
+session's lifetime fails at its first store call after the expiry. A run meant
+to outlive one session gives the measured process one of the renewing sources;
+`CHILD_ENVIRONMENT` passes every one of these names through, and a test pins
+the list.
+
 A `--store` run without `--archive` puts every completed run's record into the
 store under `records/<sha256>.json`, put-if-absent, under one session id; the
 `--json` output names them in `store_records`. Nothing censored is put. The
 record names its base by the manifest's identity fields, object count and
 bytes, and the manifest's sha256 (the digest every sample carries), never by
 the object listing, which stays in the store's `base-manifest.json`.
-`run <scenario|group> --store <uri> --at <ref> [--at <ref>]...` measures
+`run <scenario|suite> --store <uri> --at <ref> [--at <ref>]...` measures
 commits: every ref is resolved with `git rev-parse` in the working directory,
 its `omnigraph` taken from the store's `builds/<sha>/<triple>/omnigraph` or,
 on a miss, built from `git archive <sha>` in a scratch directory under the
@@ -646,16 +659,32 @@ binary is inspected, before any run: a product writing another storage format
 refuses the whole command as `not_comparable`, and a binary whose `version
 --json` names another commit than its ref is refused as
 `product_commit_mismatch` (a development build names no commit and is admitted
-under any ref); then the selection runs once per ref against the same bases,
-each record carrying `requested_commit` beside the binary's own
-`source_commit`, and the table prints one row per ref and scenario (commit,
-version, repetitions, min, p50, max, the measured step's Lance calls at p50,
-records put). When a later ref's run fails, the refs completed before it are
-printed first (the table, or one line per ref under `--json`), since their
-records are already in the store. `--at` runs catalog scenarios only, never a
-legacy case file, and conflicts with `--archive` and `--product`.
+under any ref), and every scenario's run options are checked for every ref, so
+a selection with one point that resets another way is refused whole and
+nothing is measured; then every scenario of the selection runs once per ref, in
+`--at` order, before the next scenario (the first ref is the baseline a later
+one is read against, and the refs' runs of one scenario are neighbours in time,
+so a drifting machine or store moves both alike), the records of one ref
+sharing one session id, each record carrying `requested_commit` beside the
+binary's own `source_commit`, and the table prints one row per ref and
+scenario (commit, version, repetitions, min, p50, max, the measured step's
+Lance calls at p50, records put). When a run fails, the failure document
+carries the failing ref's completed runs, and the records put before it are
+printed first, per ref (the table, or one line per ref under `--json`), since
+they are already in the store. `--at` runs catalog scenarios only, never
+a legacy case file, and conflicts with `--archive` and `--product`.
 
-`report <scenario|group> --store <uri>` reads the store's `records/` and
+`--catalog <dir | file>`, repeatable on `run`, `report`, `show`, `list` and
+`cache status`, reads several catalogs in one call (a directory means its
+`benchmarks.yaml`): a name resolves in the first catalog that declares it as a
+suite or a scenario, `run` and `report` use that catalog, `show` names it as
+`config`, and `list` prints every catalog (`--json`: `{"catalogs": [...]}`, one
+inventory each). `--config` keeps its one-catalog meaning and the two conflict.
+A name declared in none of two or more catalogs fails naming every catalog
+read; under one catalog it fails as under `--config`. A catalog missing or
+invalid anywhere in the list fails the command, named by its path.
+
+`report <scenario|suite> --store <uri>` reads the store's `records/` and
 prints the selection's series: one row per record (invocation time, commit,
 system under test, version, observed and requested repetitions, min, p50,
 max, status), grouped by scenario, `point_id` and machine label; a group is
@@ -671,7 +700,7 @@ sample.
 ## End-to-end query and traversal workloads
 
 The shared [catalog](../../benchmarks/benchmarks.yaml) owns the `end-to-end`,
-`query-shapes` and `traversal` groups. They execute complete public graph
+`query-shapes` and `traversal` suites. They execute complete public graph
 operations with expected rows authored in GQT. Each case identifies its own
 fixture size and cache treatment; bounded replacements have new experiment
 identities and do not preserve the historical Rust timing series.

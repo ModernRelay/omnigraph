@@ -70,24 +70,50 @@ pub(crate) async fn open_read_only_with_binding(
     Ok(db)
 }
 
+/// The one writable opener of an embedded command. A graph inside a cluster
+/// is admitted first (before the opener's capability probe), and the policy
+/// the applied revision binds to it is installed on the handle, so every
+/// `_as` writer judges the declared actor as a server judges a served one. A
+/// standalone graph has no policy. `storage` builds the adapter the caller
+/// opens the graph with; it runs only once the graph is admitted, since
+/// building a read-through adapter under `--base` writes the clone marker.
+pub(crate) async fn open_writable(
+    binding: &CapturedStorageBinding,
+    storage: impl Future<Output = Result<Arc<dyn omnigraph::storage::StorageAdapter>>>,
+    stderr: &mut dyn Write,
+) -> Result<omnigraph::db::Omnigraph> {
+    let policy = match ensure_graph_with_binding(binding, stderr).await? {
+        Some(owner) => owner.graph_policy(binding.uri()).await.map_err(report)?,
+        None => None,
+    };
+    crate::command_outcome::writable_open();
+    let db = omnigraph::db::Omnigraph::open_with_storage(binding.uri(), storage.await?).await?;
+    Ok(match policy {
+        Some(policy) => db.with_policy(policy),
+        None => db,
+    })
+}
+
 /// Acquire before the writable opener (including its capability probe), and
-/// reuse only the same canonical root's admission during this command.
-pub(crate) async fn ensure_graph_with_binding(
+/// reuse only the same canonical root's admission during this command. The
+/// admission a cluster graph is under, or `None` for a standalone graph.
+async fn ensure_graph_with_binding(
     binding: &CapturedStorageBinding,
     stderr: &mut dyn Write,
-) -> Result<()> {
+) -> Result<Option<ClusterAdmission>> {
     let uri = binding.uri();
     let Some(root) = omnigraph_cluster::cluster_root_for_graph_binding(binding)
         .await
         .map_err(report)?
     else {
-        return Ok(());
+        return Ok(None);
     };
     let key = binding.for_uri(&root)?.identity();
     let owners = COMMAND.try_with(Arc::clone).unwrap_or_default();
     let mut owners = owners.lock().await;
     if let Some(owner) = owners.get(&key) {
-        return owner.validate_graph_uri(uri).await.map_err(report);
+        owner.validate_graph_uri(uri).await.map_err(report)?;
+        return Ok(Some(owner.clone()));
     }
     if let Some(owner) = omnigraph_cluster::acquire_graph_admission_with_binding(
         binding,
@@ -107,9 +133,10 @@ pub(crate) async fn ensure_graph_with_binding(
         writeln!(stderr, "{custody}")
             .and_then(|()| stderr.flush())
             .map_err(|error| color_eyre::Report::from(error).wrap_err(custody))?;
-        owners.insert(key, owner);
+        owners.insert(key, owner.clone());
+        return Ok(Some(owner));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn report(diagnostic: omnigraph_cluster::Diagnostic) -> color_eyre::Report {

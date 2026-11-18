@@ -61,7 +61,7 @@ fn public_inventory_is_sorted_complete_and_stable() {
                 expected
             );
             assert_eq!(
-                first["value"]["groups"]["search"].as_array().unwrap().len(),
+                first["value"]["suites"]["search"].as_array().unwrap().len(),
                 2
             );
         }
@@ -110,8 +110,8 @@ fn shared_catalog_leaves_the_volume_to_the_host() {
         );
         assert_eq!(shown["value"]["protocol"]["reset"], reset, "{id}");
     }
-    for group in ["aws-xfs-process-cold", "aws-xfs-history64"] {
-        assert_eq!(shared.groups[group].len(), 1, "{group}");
+    for suite in ["aws-xfs-process-cold", "aws-xfs-history64"] {
+        assert_eq!(shared.suites[suite].len(), 1, "{suite}");
     }
 }
 #[test]
@@ -683,8 +683,8 @@ fn the_catalog_names_no_environment_and_no_twin() {
             scenario.id
         );
     }
-    for group in catalog.definition.groups.keys() {
-        assert!(!group.ends_with("-served"), "{group}");
+    for suite in catalog.definition.suites.keys() {
+        assert!(!suite.ends_with("-served"), "{suite}");
     }
     let workloads: Vec<_> = fs::read_dir(catalog.root.join("workloads"))
         .unwrap()
@@ -692,4 +692,185 @@ fn the_catalog_names_no_environment_and_no_twin() {
         .filter(|name| name.ends_with("_served.gqt"))
         .collect();
     assert!(workloads.is_empty(), "{workloads:?}");
+}
+
+/// Two catalogs on one call: a name resolves in the first that declares it,
+/// `show` names that catalog, `list --json` answers one inventory per catalog.
+#[test]
+fn several_catalogs_resolve_a_name_in_the_first_that_declares_it() {
+    let directory = tempfile::tempdir().unwrap();
+    copy_pair(directory.path());
+    run(
+        directory.path(),
+        &[
+            "init",
+            "--fixture",
+            "fixtures/tiny_graph.gqt",
+            "--workload",
+            "workloads/tiny_read.gqt",
+            "--step",
+            "1",
+            "--output",
+            "custom.yaml",
+            "--json",
+        ],
+        true,
+    );
+    let custom = directory.path().canonicalize().unwrap().join("custom.yaml");
+    let custom = custom.to_str().unwrap();
+    let public = root()
+        .join("benchmarks/benchmarks.yaml")
+        .canonicalize()
+        .unwrap();
+    let public = public.to_str().unwrap();
+    let listed = run(
+        &root(),
+        &[
+            "list",
+            "scenarios",
+            "--catalog",
+            "benchmarks",
+            "--catalog",
+            custom,
+            "--json",
+        ],
+        true,
+    );
+    let catalogs = listed["value"]["catalogs"].as_array().unwrap();
+    assert_eq!(catalogs.len(), 2, "{listed}");
+    assert_eq!(catalogs[0]["config"], public, "{listed}");
+    assert_eq!(catalogs[1]["config"], custom, "{listed}");
+    assert_eq!(catalogs[1]["entries"][0]["id"], "custom", "{listed}");
+    let shown = run(
+        &root(),
+        &[
+            "show",
+            "custom",
+            "--catalog",
+            "benchmarks",
+            "--catalog",
+            custom,
+            "--json",
+        ],
+        true,
+    );
+    assert_eq!(shown["value"]["config"], custom, "{shown}");
+    let shown = run(
+        &root(),
+        &[
+            "show",
+            "tiny-read",
+            "--catalog",
+            custom,
+            "--catalog",
+            "benchmarks",
+            "--json",
+        ],
+        true,
+    );
+    assert_eq!(shown["value"]["config"], public, "{shown}");
+    let missing = run(
+        &root(),
+        &[
+            "show",
+            "missing",
+            "--catalog",
+            "benchmarks",
+            "--catalog",
+            custom,
+            "--json",
+        ],
+        false,
+    );
+    assert_eq!(
+        missing["diagnostics"][0]["code"], "unknown_selection",
+        "{missing}"
+    );
+    let message = missing["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains(custom) && message.contains(public),
+        "{missing}"
+    );
+}
+
+/// `--config` beside `--catalog` is a usage error; a catalog missing later in
+/// the list fails naming its path; `--catalog` takes the catalog route past a
+/// local file named like the scenario.
+#[test]
+fn catalog_flags_refuse_the_conflict_a_missing_catalog_and_the_legacy_route() {
+    let public = root().join("benchmarks");
+    let public = public.to_str().unwrap();
+    let config = root().join("benchmarks/benchmarks.yaml");
+    let config = config.to_str().unwrap();
+    for args in [
+        [
+            "list",
+            "scenarios",
+            "--config",
+            config,
+            "--catalog",
+            public,
+            "--json",
+        ],
+        [
+            "run",
+            "tiny-read",
+            "--config",
+            config,
+            "--catalog",
+            public,
+            "--json",
+        ],
+    ] {
+        let conflict = run(&root(), &args, false);
+        assert_eq!(
+            conflict["diagnostics"][0]["code"], "invalid_arguments",
+            "{conflict}"
+        );
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let empty = directory.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    let missing = run(
+        &root(),
+        &[
+            "show",
+            "tiny-read",
+            "--catalog",
+            public,
+            "--catalog",
+            empty.to_str().unwrap(),
+            "--json",
+        ],
+        false,
+    );
+    assert_eq!(
+        missing["diagnostics"][0]["code"], "config_read_error",
+        "{missing}"
+    );
+    let message = missing["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains(empty.join("benchmarks.yaml").to_str().unwrap()),
+        "{missing}"
+    );
+    fs::write(directory.path().join("tiny-read"), "not a case\n").unwrap();
+    fs::write(
+        directory.path().join("benchmarks.yaml"),
+        "version: 2\nscenarios:\n- id: tiny-read\n  fixture: fixtures/absent.gqt\n  workload: workloads/absent.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- query branch: main\n      query items() { match { $i: Item } return { $i.key as key } }\n",
+    )
+    .unwrap();
+    let legacy = run(directory.path(), &["run", "tiny-read", "--json"], false);
+    assert_eq!(
+        legacy["diagnostics"][0]["code"], "invalid_case_yaml",
+        "{legacy}"
+    );
+    let catalog = run(
+        directory.path(),
+        &["run", "tiny-read", "--catalog", ".", "--json"],
+        false,
+    );
+    assert_eq!(
+        catalog["diagnostics"][0]["code"], "invalid_scenario",
+        "{catalog}"
+    );
 }

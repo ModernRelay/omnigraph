@@ -44,7 +44,7 @@ mod yaml;
 pub use concurrent::{ConcurrentStep, SessionExpect, SessionKind, SessionOp};
 pub use diagnostic::{CaseError, CaseErrorCode, CaseErrors};
 use diagnostic::{nearest, suggestion};
-pub use generate::{Generated, GeneratedParams, Seed};
+pub use generate::{BRANCH_MARKER, Branches, Generated, GeneratedParams, Seed};
 
 /// A step's `--- params`: a literal JSON body under the loop's substitution
 /// rule, or a generated recipe, which takes no substitution.
@@ -117,6 +117,8 @@ pub struct Case {
 pub struct Fixture {
     pub schema: String,
     pub seed: Seed,
+    /// The `--- branches` section after the seed, when the case declares one.
+    pub branches: Option<Branches>,
 }
 
 impl Case {
@@ -2188,10 +2190,11 @@ fn complete_decl_step(
 }
 
 /// The section kinds a header may name, for a near miss.
-const SECTION_KINDS: [&str; 16] = [
+const SECTION_KINDS: [&str; 17] = [
     "runner",
     "schema",
     "seed",
+    "branches",
     "csv",
     "load",
     "query",
@@ -2207,8 +2210,13 @@ const SECTION_KINDS: [&str; 16] = [
     "seam",
 ];
 
-/// The optional `--- schema` + `--- seed` pair at the head of the step
-/// sections, and the sections after it; the schema's refusal and the
+/// Whether a section header names the `--- branches` fixture section.
+fn is_branches_section(name: &str) -> bool {
+    name == "branches" || name.starts_with("branches ")
+}
+
+/// The optional `--- schema` + `--- seed` pair, the optional `--- branches`
+/// after them, and the sections after those; the schema's refusal and the
 /// seed's report together, neither hiding the other.
 fn parse_fixture<'a>(
     sections: &'a [Section<'a>],
@@ -2251,8 +2259,51 @@ fn parse_fixture<'a>(
                     return Err(errors);
                 }
             };
+            let (branches, rest) = match sections.get(2) {
+                Some(section) if is_branches_section(&section.name) => {
+                    for (idx, line) in &section.body {
+                        if line.split("${").skip(1).any(|after| {
+                            !after.starts_with(&BRANCH_MARKER["${".len()..])
+                        }) {
+                            errors.push(
+                                CaseError::new(
+                                    CaseErrorCode::SubstitutionPlacement,
+                                    "a branches recipe admits `${branch}` and no other `${` marker",
+                                )
+                                .fix("write `${branch}` for the branch's name, or drop the marker")
+                                .at_line(idx + 1),
+                            );
+                        }
+                    }
+                    if !errors.is_empty() {
+                        return Err(errors);
+                    }
+                    let arguments = section.name["branches".len()..].trim();
+                    if arguments.contains("${") {
+                        (None, &sections[3..])
+                    } else {
+                        match Branches::parse(arguments, &yaml_body(&section.body))
+                            .map_err(|error| error.line_or(section.header_line + 1))
+                        {
+                            Ok(branches) => (Some(branches), &sections[3..]),
+                            Err(error) => {
+                                errors.push(error);
+                                return Err(errors);
+                            }
+                        }
+                    }
+                }
+                _ => (None, &sections[2..]),
+            };
             if errors.is_empty() {
-                Ok((Some(Fixture { schema, seed }), &sections[2..]))
+                Ok((
+                    Some(Fixture {
+                        schema,
+                        seed,
+                        branches,
+                    }),
+                    rest,
+                ))
             } else {
                 Err(errors)
             }
@@ -2263,6 +2314,13 @@ fn parse_fixture<'a>(
                 "schema and seed are optional together; `--- schema` must precede `--- seed`",
             )
             .fix("write `--- schema` before `--- seed`, or drop both"),
+        ]),
+        Some(name) if is_branches_section(name) => Err(vec![
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "`--- branches` follows `--- schema` and `--- seed`; it declares branches over the seed",
+            )
+            .fix("write `--- schema` and `--- seed` before `--- branches`, or drop it"),
         ]),
         _ => Ok((None, sections)),
     }
@@ -2582,6 +2640,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             (None, &sections[..])
         }
     };
+    let fixture_sections = sections;
     let (fixture, sections) = match parse_fixture(sections) {
         Ok(parts) => parts,
         Err(fixture_errors) => {
@@ -2594,7 +2653,10 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             let fixture_sections = sections
                 .iter()
                 .take_while(|s| {
-                    s.name == "schema" || s.name == "seed" || s.name.starts_with("seed ")
+                    s.name == "schema"
+                        || s.name == "seed"
+                        || s.name.starts_with("seed ")
+                        || is_branches_section(&s.name)
                 })
                 .count();
             (None, &sections[fixture_sections..])
@@ -2610,6 +2672,13 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
     let mut source_lines = BTreeMap::new();
     let mut csv_sections: BTreeMap<String, String> = BTreeMap::new();
     let mut substitutable_lines: HashSet<usize> = HashSet::new();
+    if let Some(section) = fixture_sections
+        .iter()
+        .take(3)
+        .find(|s| is_branches_section(&s.name))
+    {
+        substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+    }
     let mut bound_names: HashSet<String> = HashSet::new();
 
     for section in sections {
@@ -2697,11 +2766,11 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                     )
                     .fix("write `--- seam` with `at:`, `occurrence:`, `scope:` and `action:` lines"));
                 }
-                "runner" | "schema" | "seed" => {
+                "runner" | "schema" | "seed" | "branches" => {
                     return Err(CaseError::new(
                         CaseErrorCode::SectionOrder,
                         format!(
-                            "`--- {kind}` is out of position; schema then seed lead the file, once each"
+                            "`--- {kind}` is out of position; schema, seed, then branches lead the file, once each"
                         ),
                     )
                     .fix(format!(
@@ -2746,13 +2815,10 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                     }
                     let (seed, mode, branch) = generate::parse_arguments(rest, true)?;
                     let generated = Generated::parse(seed, &yaml_body(&section.body))?;
-                    if generated.call_count() == 0 {
-                        return Err(CaseError::new(
-                            CaseErrorCode::BatchBound,
-                            "a generated load requires at least one nonempty batch; empty recipes are admitted only as seeds",
-                        )
-                        .fix("give a table `rows:` and `commits:` of at least 1, or make the recipe a `--- seed` section"));
-                    }
+                    generate::require_batches(
+                        &generated,
+                        "give a table `rows:` and `commits:` of at least 1, or make the recipe a `--- seed` section",
+                    )?;
                     ordinal += 1;
                     cursor.pending = Some(Pending::Load {
                         ordinal,
@@ -5138,13 +5204,23 @@ pub fn case_session(db: Omnigraph, case: &Case, engine: Engine) -> Result<Sessio
     Ok(Session::from_defaults(Arc::new(db), settings))
 }
 
-pub async fn seed_case(session: &Session, seed: &Seed, needs_indices: bool) -> Result<(), String> {
-    seed.load(session).await?;
+/// The fixture on a fresh store: the seed, the indices a traversal pin
+/// needs on `main`, then the declared branches, forked from that indexed
+/// head; none of it is a step.
+pub async fn seed_case(
+    session: &Session,
+    fixture: &Fixture,
+    needs_indices: bool,
+) -> Result<(), String> {
+    fixture.seed.load(session).await?;
     if needs_indices {
         session
             .ensure_indices_as(None)
             .await
             .map_err(|e| format!("ensure_indices failed: {e}"))?;
+    }
+    if let Some(branches) = &fixture.branches {
+        branches.load(session).await?;
     }
     Ok(())
 }

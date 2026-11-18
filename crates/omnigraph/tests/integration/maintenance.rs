@@ -727,7 +727,8 @@ async fn optimize_fails_a_table_whose_plan_size_cannot_be_read() {
 /// the new fragments (Lance 13 drops coverage only for zone-map, Bloom and FM
 /// indexes, which the engine does not build), so compaction alone is no index
 /// work: the index-rows ceiling counts only a rebuild the plan already shows,
-/// and the rewrite publishes as one link with no fold after it.
+/// and the rewrite publishes as one link with no fold after it. A later write
+/// that adds rows is index work again, so the ceiling defers the table again.
 #[tokio::test]
 async fn optimize_rewrite_keeps_index_coverage_so_index_rows_count_only_a_lagging_rebuild() {
     let dir = tempfile::tempdir().unwrap();
@@ -814,11 +815,71 @@ async fn optimize_rewrite_keeps_index_coverage_so_index_rows_count_only_a_laggin
         settled.datasets.iter().all(|stat| !stat.committed()),
         "every index still covers every fragment: {settled:?}"
     );
+
+    // A write that inserts rows, or rewrites a row (a merge of an existing
+    // key moves it to a new fragment), leaves a fragment outside the id
+    // index, so the table has index work again and the ceiling counts its
+    // live rows on every run until a run without it folds the index, as
+    // docs/user/operations/recorded-operations.md (Table ceilings and the
+    // byte budget) says. Both writes leave 5 live rows.
+    for (write, slug, n) in [("insert", "d4", 4), ("upsert", "d1", 10)] {
+        db.load_jsonl(
+            &serde_json::json!({
+                "type": "Doc",
+                "data": {"slug": slug, "n": n, "embedding": [n as f32, 0.0, 0.0, 0.0]},
+            })
+            .to_string(),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+        let pin = doc_pin(&db).await;
+        for _ in 0..2 {
+            let report = db
+                .optimize_as(
+                    None,
+                    OptimizeRequest::default().with_limits(
+                        OptimizeLimits::default()
+                            .with_table_ceilings(TableCeilings::default().with_index_rows(1)),
+                    ),
+                )
+                .await
+                .unwrap();
+            let doc = report
+                .tables
+                .iter()
+                .find(|stat| stat.type_key == "node:Doc")
+                .unwrap();
+            let TableOptimizeOutcome::Deferred(DeferReason::ResourceLimit(exceeded)) = doc.outcome
+            else {
+                panic!("an {write} is index work again: {doc:?}");
+            };
+            assert_eq!(exceeded.measure, ResourceMeasure::IndexRows);
+            assert_eq!(exceeded.measured, Some(5), "the table's live rows");
+            assert_eq!(report.resume_at, None);
+            assert_eq!(doc_pin(&db).await, pin, "a deferred table writes nothing");
+        }
+        let report = db
+            .optimize_as(None, OptimizeRequest::default())
+            .await
+            .unwrap();
+        assert!(
+            report
+                .tables
+                .iter()
+                .any(|stat| stat.type_key == "node:Doc" && stat.committed()),
+            "a run without the ceiling optimizes it after the {write}: {report:?}"
+        );
+    }
 }
 
 /// The run budget stops the run at the first table that would pass it:
 /// that table and every later one are deferred, and the next run resumes
-/// there.
+/// there. With no table byte ceiling set, the budget is also that ceiling: a
+/// table larger than the budget is deferred `resource_limit` on every run,
+/// writes nothing and never moves the resume position, as
+/// docs/user/operations/recorded-operations.md (Table ceilings and the byte
+/// budget) says.
 #[tokio::test]
 async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
     let dir = tempfile::tempdir().unwrap();
@@ -862,6 +923,43 @@ async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
         ["node:Company", "node:Person"],
         "{measured:?}"
     );
+
+    // A budget below every table's bytes, with no table ceiling: each table
+    // is over the ceiling the budget implies, run after run.
+    let below = measured[0].1.min(measured[1].1) - 1;
+    let pin = person_pin(&db).await;
+    for _ in 0..2 {
+        let report = db
+            .optimize_as(
+                None,
+                OptimizeRequest::default()
+                    .with_limits(OptimizeLimits::default().with_run_source_bytes(below)),
+            )
+            .await
+            .unwrap();
+        let mut checked = 0;
+        for stat in &report.tables {
+            if !["node:Company", "node:Person"].contains(&stat.type_key.as_str()) {
+                continue;
+            }
+            let TableOptimizeOutcome::Deferred(DeferReason::ResourceLimit(exceeded)) = stat.outcome
+            else {
+                panic!("{stat:?}");
+            };
+            assert_eq!(exceeded.measure, ResourceMeasure::SourceBytes);
+            assert_eq!(exceeded.ceiling, below, "the budget is the ceiling");
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "{report:?}");
+        assert_eq!(report.resume_at, None, "{report:?}");
+        assert_eq!(report.graph_commit_id, None, "{report:?}");
+        assert_eq!(
+            person_pin(&db).await,
+            pin,
+            "a deferred table is not written"
+        );
+    }
+
     // Each table fits alone, both together do not.
     let budget = measured[0].1.max(measured[1].1);
     let limits = OptimizeLimits::default().with_run_source_bytes(budget);
@@ -3048,6 +3146,148 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
         db.list_commits(Some("feature")).await.unwrap(),
         feature_commits
     );
+}
+
+/// An `update` of an indexed vector column that leaves a Blob unassigned is
+/// a column patch, which withdraws every fragment it touches from the vector
+/// index. When that leaves the index covering no fragment, Lance reports no
+/// statistics for it, so it has no partition count to keep: `index build`
+/// and `optimize` rebuild it as a new declared vector index is built, and
+/// build the other indexes of the type, instead of failing the whole batch
+/// on every run (findings queue
+/// `og-stress-vector-index-after-column-patch-blocks-index-build`).
+#[tokio::test]
+async fn index_build_and_optimize_rebuild_a_vector_index_a_column_patch_left_empty() {
+    use lance::index::DatasetIndexExt;
+    use omnigraph::db::{BuiltIndex, BuiltIndexAction, BuiltIndexKind};
+
+    const SCHEMA: &str = "node D {\n    slug: String @key\n    n: I64?\n    s: String?\n    b: Blob?\n    v: Vector(4)? @index\n}\n";
+    const UPDATE: &str = r#"
+query patch($v: Vector(4)?) {
+    update D set { v: $v } where slug in ["k5", "k2"]
+}
+"#;
+    // The vector index's segments, how many of them cover no fragment, and
+    // how many current fragments they leave uncovered.
+    async fn vector_index(db: &Omnigraph) -> (usize, usize, usize) {
+        let ds = helpers::open_pinned_dataset_for_test(db, "main", "node:D").await;
+        let field = ds.schema().field("v").unwrap().id;
+        let indices = ds.load_indices().await.unwrap();
+        let segments = indices
+            .iter()
+            .filter(|index| index.fields == [field])
+            .collect::<Vec<_>>();
+        let empty = segments
+            .iter()
+            .filter(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.is_empty())
+            })
+            .count();
+        let uncovered = ds
+            .get_fragments()
+            .iter()
+            .filter(|fragment| {
+                !segments.iter().any(|segment| {
+                    segment
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| bitmap.contains(fragment.id() as u32))
+                })
+            })
+            .count();
+        (segments.len(), empty, uncovered)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        concat!(
+            r#"{"type":"D","data":{"slug":"k2","v":null}}"#,
+            "\n",
+            r#"{"type":"D","data":{"slug":"k5","v":[1.0,-2.0,-2.0,-1.0]}}"#,
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(vector_index(&db).await, (1, 0, 0));
+
+    mutate_main(
+        &db,
+        UPDATE,
+        "patch",
+        &helpers::vector_param("v", &[2.0, 1.0, 0.5, 0.0]),
+    )
+    .await
+    .unwrap();
+    let (segments, empty, uncovered) = vector_index(&db).await;
+    assert_eq!(segments, 1, "the patch keeps the index's definition");
+    assert_eq!(empty, 1, "the patch leaves no segment covering a fragment");
+    assert!(uncovered > 0, "the patch withdraws the fragment it touched");
+
+    let built = db.ensure_indices_on_as("main", None).await.unwrap();
+    assert!(
+        built.indexes.contains(&BuiltIndex {
+            type_key: "node:D".to_string(),
+            property: "v".to_string(),
+            kind: BuiltIndexKind::Vector,
+            action: BuiltIndexAction::Refreshed,
+        }),
+        "{:?}",
+        built.indexes
+    );
+    assert_eq!(vector_index(&db).await, (1, 0, 0));
+
+    // The same state reached again, then folded by optimize.
+    mutate_main(
+        &db,
+        UPDATE,
+        "patch",
+        &helpers::vector_param("v", &[0.0, 1.0, 2.0, 3.0]),
+    )
+    .await
+    .unwrap();
+    let (segments, empty, uncovered) = vector_index(&db).await;
+    assert_eq!(
+        (segments, empty),
+        (1, 1),
+        "the patch empties the index again"
+    );
+    assert_ne!(uncovered, 0);
+    let optimized = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    for table in &optimized.tables {
+        assert_ne!(
+            table.outcome,
+            TableOptimizeOutcome::Failed,
+            "{}: {:?}",
+            table.type_key,
+            table.failure
+        );
+    }
+    assert_eq!(vector_index(&db).await, (1, 0, 0));
+
+    let rows = helpers::query_main(
+        &db,
+        "query near($q: Vector(4)) { match { $d: D } return { $d.slug } order { nearest($d.v, $q) } limit 1 }",
+        "near",
+        &helpers::vector_param("q", &[0.0, 1.0, 2.0, 3.0]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.num_rows(), 1);
 }
 
 /// A branch rebuild stages a detached pin on the inherited location; main's

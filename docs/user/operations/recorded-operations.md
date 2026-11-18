@@ -22,8 +22,8 @@ record, refuses them; direct `omnigraph optimize` stays available there.
 | `OMNIGRAPH_OPTIMIZE_MAX_GATE_HOLD_SECONDS` | `300` | The largest gate hold a request may ask for. |
 | `OMNIGRAPH_OPTIMIZE_ARTIFACT_WRITE_LIMIT_BYTES` | `536870912` | The largest adjacency artifact a served run writes. |
 | `OMNIGRAPH_OPTIMIZE_PLANNING_CONCURRENCY` | `8` | Tables a served run plans ahead of the one it rewrites; it rewrites one at a time. |
-| `OMNIGRAPH_OPTIMIZE_MAX_SOURCE_FRAGMENTS`, `_MAX_SOURCE_ROWS`, `_MAX_SOURCE_BYTES`, `_MAX_BLOB_BYTES`, `_MAX_INDEX_ROWS` | unset | The per-table ceilings every served run applies ([bounding a run](maintenance.md#bounding-a-run)). |
-| `OMNIGRAPH_OPTIMIZE_RUN_SOURCE_BYTES` | unset | The run byte budget. |
+| `OMNIGRAPH_OPTIMIZE_MAX_SOURCE_FRAGMENTS`, `_MAX_SOURCE_ROWS`, `_MAX_SOURCE_BYTES`, `_MAX_BLOB_BYTES`, `_MAX_INDEX_ROWS` | unset | The per-table ceilings every served run applies ([table ceilings and the byte budget](#table-ceilings-and-the-byte-budget)). |
+| `OMNIGRAPH_OPTIMIZE_RUN_SOURCE_BYTES` | unset | The run byte budget, and the table byte ceiling when `_MAX_SOURCE_BYTES` is unset. |
 
 A value that does not parse, a default above its ceiling, or a table byte
 ceiling above the run budget stops the server at startup. The ceilings are the
@@ -34,6 +34,37 @@ measuring is not a deferral: that table is `failed` with the storage error,
 and the run goes on to the next. Every
 route needs the [`maintain`](policy.md#actions) action on the graph's `main`
 branch, for the actor the bearer token resolves to.
+
+### Table ceilings and the byte budget
+
+A per-table ceiling is checked before any of that table's work starts. The
+fragment, row, byte and blob ceilings are measured from the table's compaction
+plan; `_MAX_INDEX_ROWS` counts the table's live rows, and only when the table
+has index work. A table over one is `deferred` with reason `resource_limit`:
+the run does not compact it, rebuild its lagging indexes or rewrite its dropped
+properties, and goes on to the next table. This does not move the resume
+position (`resume_at`), so every later run defers that table again until a
+ceiling is raised or a direct run optimizes it. After a direct run, the next
+write that inserts rows puts them in a fragment that the index on the table's
+id does not cover, so the table has index work again. An update can do the
+same, because it can move the updated rows to a new fragment: a `load --mode
+merge` of existing keys always does. A table with more live rows than
+`_MAX_INDEX_ROWS` is therefore deferred again after any such write, even one
+that adds no rows, and while it gets writes only a direct run optimizes it.
+The run byte budget defers, with reason `byte_budget`, the first table that
+would take the run past it and every table after it, and the run resumes
+there.
+
+The budget is also the table byte ceiling when
+`OMNIGRAPH_OPTIMIZE_MAX_SOURCE_BYTES` is unset. A table whose compaction reads
+more bytes than the budget is therefore never optimized by a served run. To
+optimize it, raise the budget, or stop the server and run `omnigraph optimize`
+on the cluster root directly, which applies neither. Give that run
+`--tables <type key>` (for example `--tables node:Document`) to optimize only
+the oversized table, so the server restarts sooner. A direct run keeps the
+root's admission lock: release it with `cluster force-unlock`, as after a
+[direct apply](../clusters/index.md#bootstrap-a-cluster), before the server
+starts again.
 
 ## Submit, look up, cancel
 
@@ -116,7 +147,9 @@ when its server stopped is `interrupted` at the next submission or lookup.
 
 A full-catalog run that a gate hold or the byte budget stopped records the
 table to start at; the next full-catalog submission for that graph starts
-there, so successive bounded runs reach every table.
+there, so successive bounded runs reach every table that fits the server's
+per-table ceilings; a table over one never moves that position
+([table ceilings](#table-ceilings-and-the-byte-budget)).
 
 Cancellation stops the run at its next safe boundary. A run that already
 started its publication finishes it and reports that the cancellation arrived

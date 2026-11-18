@@ -763,7 +763,7 @@ pub(crate) async fn build_dataset(
                 .await
                 .map_err(|e| e.to_string())?;
             let session = case_session(db, &case, Engine::V2)?;
-            seed_case(&session, &fixture.seed, plan.needs_indices).await?;
+            seed_case(&session, fixture, plan.needs_indices).await?;
             (session, case, None)
         }
         DatasetRecipe::Registered {

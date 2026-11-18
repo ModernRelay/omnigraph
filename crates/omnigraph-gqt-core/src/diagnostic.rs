@@ -140,7 +140,7 @@ impl CaseErrorCode {
                 "the runner section is YAML with `timeout_ms` in 1..=600000 and 1 to 16 distinct `environments`, each a known `target` with its `storage` and, under DST, 1 to 64 distinct `seeds`"
             }
             CaseErrorCode::SectionOrder => {
-                "`--- runner` leads the file; `--- schema` then `--- seed` follow it together, once each; no later section repeats them; a `--- seam` is followed by the step it arms"
+                "`--- runner` leads the file; `--- schema` then `--- seed` follow it together, once each, and `--- branches` only after them; no later section repeats them; a `--- seam` is followed by the step it arms"
             }
             CaseErrorCode::UnknownSection => "a section header names a known section kind",
             CaseErrorCode::BodyShape => {
@@ -184,7 +184,7 @@ impl CaseErrorCode {
                 "a `${name}` operand, a `snapshot: $name` or a `from commit ${name}` names a commit bound by an earlier `--- bind commit $name`"
             }
             CaseErrorCode::SubstitutionPlacement => {
-                "`${...}` appears only in a params or expect body and names the enclosing loop's variable or a bound commit"
+                "`${...}` appears only in a params or expect body and names the enclosing loop's variable or a bound commit, or is `${branch}` in a branches recipe; a `${` in the branches header is refused as on any header line"
             }
             CaseErrorCode::BatchBound => {
                 "a generated load's batch stays within 16 MiB and 4096 rows, with `commits` in 1..=rows and `batch_rows` producing exactly `commits` nonempty batches"

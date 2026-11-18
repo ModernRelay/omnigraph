@@ -1983,8 +1983,9 @@ pub fn record_ordered_cursor_hydration(rows: usize, bytes: u64) {
     });
 }
 
-/// Record one projected scalar validation batch before it is charged to the
-/// operation-wide retention budget. No-op when no test probe is installed.
+/// Record one projected scalar batch merge validation sweeps, by its Arrow
+/// allocation; the sweep keeps only its key columns. No-op when no test probe
+/// is installed.
 pub fn record_merge_validation_batch(projected_bytes: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.validation_scan_batches.fetch_add(1, Ordering::Relaxed);

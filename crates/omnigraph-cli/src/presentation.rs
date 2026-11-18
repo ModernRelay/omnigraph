@@ -3,8 +3,9 @@
 use std::io::Write;
 
 use color_eyre::eyre::Result;
-use omnigraph_api_types::ReadOutput;
+use omnigraph_api_types::{ErrorCode, ReadOutput};
 
+use crate::helpers::CodedRefusal;
 use crate::invocation::MachineErrors;
 use crate::operator::OperatorConfig;
 use crate::read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
@@ -48,6 +49,20 @@ impl ReadPresentation {
         }
     }
 
+    /// Arrow output is binary, which a terminal cannot show: when stdout is
+    /// one, refuse before the command does any work. The caller can fix it
+    /// by redirecting stdout.
+    pub(crate) fn refuse_terminal(&self, stdout_is_terminal: bool) -> Result<()> {
+        if self.format == ReadOutputFormat::Arrow && stdout_is_terminal {
+            return Err(CodedRefusal::report(
+                ErrorCode::BadRequest,
+                "`--format arrow` writes a binary Arrow IPC stream, and stdout is a terminal; \
+                 redirect stdout to a file or a pipe, for example `> result.arrow`",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_read(&self, output: &ReadOutput, writer: &mut dyn Write) -> Result<()> {
         writeln!(
             writer,
@@ -61,12 +76,16 @@ impl ReadPresentation {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::sync::Arc;
 
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
     use omnigraph_api_types::{ChangeOutput, ReadTargetOutput};
+    use omnigraph_compiler::result::QueryResult;
 
     use super::*;
     use crate::output::{write_change_human, write_json};
-    use crate::read_format::TableCellLayout;
+    use crate::read_format::{TableCellLayout, write_arrow_stream};
 
     #[test]
     fn format_precedence_also_selects_machine_errors() {
@@ -97,6 +116,33 @@ mod tests {
                     _ => None,
                 }
             );
+        }
+    }
+
+    #[test]
+    fn only_arrow_refuses_a_terminal_stdout_issue_1428() {
+        use ReadOutputFormat::{Arrow, Csv, Json, Jsonl, Kv, Table, Toon};
+
+        for format in [Table, Kv, Csv, Jsonl, Json, Toon, Arrow] {
+            let presentation =
+                ReadPresentation::capture(&OperatorConfig::default(), Some(format), false, None);
+            presentation.refuse_terminal(false).unwrap();
+            match presentation.refuse_terminal(true) {
+                Ok(()) => assert_ne!(format, Arrow),
+                Err(error) => {
+                    assert_eq!(format, Arrow);
+                    // Coded, so the classified failure asks for a fix, not
+                    // a refresh that changes nothing.
+                    let refusal = error.downcast_ref::<CodedRefusal>().unwrap();
+                    assert_eq!(refusal.code, ErrorCode::BadRequest);
+                    assert!(
+                        refusal.message.contains("stdout is a terminal")
+                            && refusal.message.contains("> result.arrow"),
+                        "{}",
+                        refusal.message
+                    );
+                }
+            }
         }
     }
 
@@ -187,10 +233,27 @@ mod tests {
         assert_eq!(writer.bytes.len(), 5);
     }
 
+    fn query_result() -> QueryResult {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let names = StringArray::from(vec![Some("Alice"), None]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(names)]).unwrap();
+        QueryResult::new(schema, vec![batch])
+    }
+
+    /// `--format arrow` writes the result's own IPC stream and nothing else.
+    #[test]
+    fn arrow_output_is_the_result_s_ipc_stream_issue_1428() {
+        let result = query_result();
+        let mut bytes = Vec::new();
+        write_arrow_stream(&result, &mut bytes).unwrap();
+        assert_eq!(bytes, result.to_arrow_ipc().unwrap());
+    }
+
     #[test]
     fn injected_writers_report_errors_after_partial_output() {
         let presentation = ReadPresentation::capture(&OperatorConfig::default(), None, false, None);
         assert_writer_failure(|writer| presentation.write_read(&read_output(), writer));
+        assert_writer_failure(|writer| write_arrow_stream(&query_result(), writer));
         assert_writer_failure(|writer| write_json(&serde_json::json!({ "ok": true }), writer));
         let change = ChangeOutput {
             branch: "main".to_owned(),

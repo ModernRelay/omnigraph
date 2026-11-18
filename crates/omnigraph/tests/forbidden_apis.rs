@@ -1000,9 +1000,11 @@ gateway_surfaces! {
     ],
     "omnigraph-core/dataset_index.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "validate_full_text_scan", "validate_full_text_demand", "is_full_text_index",
-        "is_untrained_full_text", "key_column_index_coverage", "has_unindexed_fragments", "user_indices_for_column",
+        "covers_no_fragment", "is_untrained_full_text", "key_column_index_coverage", "has_unindexed_fragments",
+        "user_indices_for_column",
         "has_btree_index_on", "has_fts_index_on", "has_fts_postings_on", "has_vector_index_on",
         "current_fragments", "is_btree_index", "key_column_coverage", "key_column_uncovered_tail",
+        "key_column_covered_fragments",
     ],
     "omnigraph-core/staging.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "is_detached_version",
@@ -1201,6 +1203,9 @@ durable_calls! {
     // fork before the incarnation refusal; read-only access to the handle.
     ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("exec/blob_write.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
+    // A delete cascade plans its edge-table reads from the edge table's index
+    // coverage (`validate::RemovalEdgeReads`); read-only metadata access.
+    ("exec/mutation.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     // Commit-change enumeration: pinned parent/child handles for the ordered
     // merge's typed row comparison. Read-only by construction — the enumerator
     // stages no transaction and publishes nothing.
@@ -1223,7 +1228,7 @@ durable_calls! {
     // rebuilt in memory, so this write can never change a query's result. It
     // runs in a task the run awaits, so a dropped run cannot drop it.
     ("db/omnigraph/optimize.rs", ".write_bytes(", 1, WriteProtocol::PhysicalOnly),
-    ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V9),
+    ("exec/merge.rs", "SnapshotHandle::new(", 3, MERGE_V9),
 }
 
 const DURABLE_PRIMITIVES: &[&str] = &[

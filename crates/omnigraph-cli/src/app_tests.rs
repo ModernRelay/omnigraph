@@ -25,6 +25,7 @@ async fn login_uses_the_default_profile_without_starting_onboarding_issue_1115()
             &mut io::empty(),
             false,
             &mut stdout,
+            false,
             &mut stderr,
         )
         .await
@@ -62,6 +63,7 @@ async fn managed_target_add_uses_the_resolved_default_profile_issue_1115() {
             &mut io::empty(),
             false,
             &mut Vec::new(),
+            false,
             &mut Vec::new(),
         )
         .await
@@ -101,6 +103,7 @@ async fn login_never_creates_or_overwrites_a_profile_implicitly() {
                 &mut io::empty(),
                 terminal,
                 &mut Vec::new(),
+                false,
                 &mut stderr,
             )
             .await;
@@ -183,6 +186,7 @@ async fn argument_refusal_help_and_success_return_without_terminating_the_caller
             &mut io::empty(),
             false,
             &mut out,
+            false,
             &mut Vec::new(),
         )
         .await
@@ -248,6 +252,7 @@ async fn handled_lint_failure_allows_a_following_successful_invocation() {
                 &mut io::empty(),
                 false,
                 stdout,
+                false,
                 &mut stderr,
             )
             .await;
@@ -1197,6 +1202,7 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
         &mut FailedInput,
         false,
         &mut stdout,
+        false,
         &mut stderr,
     )
     .await
@@ -1352,6 +1358,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
         &mut io::empty(),
         false,
         &mut stdout,
+        false,
         &mut stderr,
     )
     .await
@@ -1876,6 +1883,7 @@ async fn run_cli(args: &[&str]) -> (Completion, String, String) {
         &mut io::empty(),
         false,
         &mut stdout,
+        false,
         &mut stderr,
     )
     .await
@@ -2063,6 +2071,64 @@ async fn base_is_refused_where_the_command_has_no_clone_form() {
         "{stdout}{stderr}"
     );
     assert!(!temp.path().join("clone").exists());
+}
+
+/// `--format arrow` writes the result batches of a query run on direct
+/// storage. A served target, whose server answers JSON, refuses it from the
+/// target's kind alone: before the credential is read (the token's variable
+/// is unset) and before any request.
+#[tokio::test]
+async fn query_format_arrow_refuses_a_served_target_before_credentials_issue_1428() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "version: 1\ntargets:\n  prod:\n    kind: server\n    endpoint: https://data.example\n    default_graph: knowledge\n    auth: {provider: token, source: {env: OMNIGRAPH_ISSUE_1428_UNSET_TOKEN}}\n",
+    )
+    .unwrap();
+    for verb_args in [
+        vec![
+            "-e",
+            "query people() { match { $p: Person } return { $p.slug } }",
+        ],
+        vec!["stored_people"],
+    ] {
+        let parsed = crate::invocation::parse_from(
+            [
+                "omnigraph",
+                "query",
+                "--target",
+                "prod",
+                "--format",
+                "arrow",
+            ]
+            .into_iter()
+            .chain(verb_args.iter().copied()),
+        )
+        .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = super::execute(
+            parsed,
+            crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+            &mut io::empty(),
+            false,
+            &mut stdout,
+            false,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert_eq!(completion.code(), 1, "{verb_args:?}: {stderr}");
+        assert!(stdout.is_empty(), "{verb_args:?}");
+        assert_eq!(
+            stderr,
+            "target_kind_unsupported: `--format arrow` writes the result batches of a query \
+             run on direct storage; target 'prod' is served, and its server answers JSON: use \
+             `--format json` or `--format jsonl`\n",
+            "{verb_args:?}"
+        );
+    }
 }
 
 /// Every file under `root` with its length, so a tree can be compared
