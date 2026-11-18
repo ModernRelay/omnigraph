@@ -70,7 +70,6 @@ BULLETS = {
     "results.full-text-analysis": "Results: rows change on every full-text field where edition 2's analysis differs from its profile (`english_v1` by default: the token filter, the stop list's stems and NFC).",
     "results.bm25-f64": "Results: `bm25` scores are `bm25_v1`'s `F64` on every field, where edition 2 gave Lance's `F32`.",
     "results.full-text-index-required": "Results: a read that edition 2 refused with `FullTextIndexRequired` returns rows.",
-    "results.keyed-load-keeps-omitted": "Results: a keyed `insert` or `merge` load that omits a property keeps its stored value where edition 2 erased it.",
     "results.fusion-window": "Results: fusion rows change where an arm's window differs from today's `limit`-sized one, and a fusion result loses the fan-out rows and population columns today's carries.",
     "results.limit-tie-rule": "Results: a read with `limit` and no `order` returns the first rows under the tie rule rather than the first rows a scan yields.",
     "results.integer-float-comparison": "Results: an integer property compared with a whole-number float literal compares as `F64`.",
@@ -88,7 +87,6 @@ BULLETS = {
 # row names one of these.
 COSTS = {
     "cost.exact-lexical-scan": "RFC section 4: the exact lexical scan answers every `match_terms` and `bm25`, and no query reads a full-text index, so a lexical read reads its text column's data files.",
-    "cost.keyed-write-keeps-omitted": "Compatibility, Results: a keyed `insert` or `merge` load that omits a property keeps its stored value, so a keyed insert naming fewer than all of its type's properties reads the stored rows its keys replace.",
     "cost.accepted-refusal": "Compatibility, Language: a text edition 2 refused is accepted, so the step runs a read where edition 2 refused before reading.",
 }
 
