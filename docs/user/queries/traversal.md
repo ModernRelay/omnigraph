@@ -226,14 +226,17 @@ optional introduces whole, `return { $c }`, is not lowered
 (`T86`). It prints no fix: returning the node's properties instead runs, but
 with other result columns.
 
-Each optional adds nodes to the read's plan in proportion to its own
-pattern, an optional nested in another included, so one read holds as many
-as its plan budget allows (4096 nodes unless the declaration writes
-`@budget(plan = n)`). A read whose plan outgrows the budget is refused with
-`T70` as soon as it does. A declared budget above the session's ceiling,
-[`plan_budget_limit`](settings.md) (65536 by default; on a server, the
-operator's), is refused with `T89` before the read is compiled, never
-clamped.
+A read's plan budget bounds the work of compiling and planning it: every
+node of its plan built, every expression typed, each scope's copy of the
+names around it, and each step of lowering and planning, in one count. It is
+32768 unless the declaration writes `@budget(plan = n)`. A read whose work
+passes it is refused with `T70` as soon as it does, naming the construct
+whose work grew and how much it charged. Each optional adds work in
+proportion to its pattern and to the names around it, so nesting or a long
+run of them grows faster than the text. A declared budget above the
+session's ceiling, [`plan_budget_limit`](settings.md) (65536 by default; on a
+server, the operator's), is refused with `T89` before the read is compiled,
+never clamped.
 
 ## Values and inline reads
 

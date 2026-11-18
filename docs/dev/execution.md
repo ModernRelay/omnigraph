@@ -35,8 +35,8 @@ A query runs against one resolved `ReadTarget`:
    read's uncorrelated `Correlate` whose `order` ranks the arm (see
    [Fusion](#fusion-one-operator-over-any-ranked-arm)). An `optional { p }` (the core's `Correlate(R,
    Union(p, Project(Filter(Env, ¬ exists p), nulls)))`, `p` stored once and
-   shared by both arms, so nested optionals grow the term, the plan budget's
-   charge and every walk over it linearly) is a `PatternStep::Optional`
+   shared by both arms, so nested optionals grow the term and every walk
+   over it linearly) is a `PatternStep::Optional`
    placed after the scope's bindings and traversals and before its filters
    and blocks: its own pattern placed over the outer row, and the logical
    and physical `OptionalJoin` over an `OuterReference`; a traversal from a
@@ -320,11 +320,12 @@ Avoid line-number links in documentation; these modules are the stable owners.
 
 ## Deep queries
 
-Compiling a read takes work linear in its text. The core term stores each
-subterm once: an `optional`'s pattern, which its desugaring both returns and
-tests for absence, is one node both arms of its `Union` share, and the plan
-budget charges it once (`Term::size`), while a `Call`'s body is still charged
-at every call site, as the RFC's `Call` rule expands it. Every walk over the
+Compiling a read builds a term and expressions linear in its text. The core
+term stores each subterm once: an `optional`'s pattern, which its desugaring
+both returns and tests for absence, is one node both arms of its `Union`
+share, and the plan budget charges it once (`Term::size`), while a `Call`'s
+body is still charged at every call site, as the RFC's `Call` rule expands
+it. Every walk over the
 term visits a stored node once (`Term::any_node`, `Term::stored_nodes`; the
 binder binds a shared node once). A `let` is a column, never copied into its
 reads; a block's guard is a column a later guard reads; the shaper probes an
@@ -335,6 +336,33 @@ by the same amount per unit of each construct family. The padding row of an
 `optional` (`Project(…, nulls)`) names one column per column its pattern
 adds, so its width follows the relation's, and nested optionals pad a
 quadratic number of columns in their depth, counted apart.
+
+### The plan budget
+
+A declaration's plan budget, `@budget(plan = n)` or `DEFAULT_PLAN_BUDGET`
+(32,768), bounds the work of turning it into a plan. One meter
+(`omnigraph_compiler::budget::PlanWork`) counts that work in one unit, charged
+as it happens, and the work stops at the first charge past the budget with
+`T70`, so a refused declaration costs at most twice its budget beyond reading
+its source. The type checker charges every term node it builds (a shared
+`Call` body or a named relation again at each later site or draw, walked by
+`Term::weight` no further than the budget left), every expression node those
+nodes hold, every expression it types, each scope's copy of the names around
+it (`Ctx::inner_scope`) and each scope's read of its pattern
+(`SyntaxSize`, also stopped at the budget left). The last two grow with
+nesting depth and with a long run of `optional`s or blocks, as the copying
+does. The shaper charges each term node it visits and the expression nodes it
+copies. The planner resumes the meter from `ReadShape::work`
+(`source::QueryWork`) and charges each shape step it resolves, the shape's
+size for each pass, and each state a plan search explores
+(`QueryWork::explore`: today one join order per pattern block, the written
+one). Every charge is a function of the declaration and the schema, so the
+bound plan records the work (`Assumptions::plan_work`) and a replay's compile
+must charge the same. `T70` names the construct whose work grew and how much
+it charged, and advises no larger budget. A declared budget above the
+session's `plan_budget_limit` is `T89` before anything is charged.
+`compile_growth.rs` holds a refusal to twice the budget in every kind, and the
+planner's `query_plan.rs` the planning share.
 
 A query may nest 2,048 levels of brackets, `case`s and prefix operators and
 build an expression 16,384 levels deep (`query::depth`, `Q006`). Every walk
