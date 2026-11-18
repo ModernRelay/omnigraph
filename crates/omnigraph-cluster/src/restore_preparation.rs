@@ -1,6 +1,6 @@
 use super::*;
 use omnigraph::db::RestoreHistoryWitness;
-use omnigraph_storage::CapturedStorageBinding;
+use omnigraph_storage::{CapturedStorageBinding, StorageKind};
 
 /// Shared upper bound on either exact descriptor object and the local input.
 pub const MAX_RESTORE_DESCRIPTOR_BYTES: usize = 1024 * 1024;
@@ -23,8 +23,17 @@ pub async fn verify_restore_history(
         ));
     }
     let store = ClusterStore::for_storage_binding(binding)?;
-    let uri = store.graph_root(graph);
+    let uri = store.canonical_managed_graph_root(graph)?;
+    // The copy is stopped. Refuse local links before the graph opener reads
+    // its manifest or schema through the filesystem.
+    if store.kind() == StorageKind::Local {
+        omnigraph_storage::FrozenDirectory::verify_local_tree(Path::new(&uri))
+            .map_err(|err| deployment::refusal("restore_graph_unreadable", err.to_string()))?;
+    }
     let storage = store.graph_storage(&uri)?;
+    Omnigraph::ensure_no_pending_recovery_with_storage(&uri, storage.clone())
+        .await
+        .map_err(|err| deployment::refusal("graph_recovery_required", err.to_string()))?;
     let db = Omnigraph::open_read_only_with_storage(&uri, storage)
         .await
         .map_err(|err| deployment::refusal("restore_graph_unreadable", err.to_string()))?;
@@ -48,7 +57,7 @@ pub async fn prepare_graph_restore(
     let ledger = restore::fresh_restore_ledger(&state)?;
     receipt.validate_binding(&store.canonical_root()?, ledger, 2, &receipt.graph)?;
     let digest = sha256_hex(descriptor_json.as_bytes());
-    let graph_uri = store.graph_root(&receipt.graph);
+    let graph_uri = store.canonical_managed_graph_root(&receipt.graph)?;
     let adapter = store.graph_storage(&graph_uri)?;
     if store
         .has_restore_reservation(&digest, descriptor_json)

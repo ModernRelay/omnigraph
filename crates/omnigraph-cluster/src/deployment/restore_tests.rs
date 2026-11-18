@@ -10,6 +10,25 @@ async fn full_history_restore_rechecks_the_seal_when_settling_an_accepted_id() {
     exercise_sealed_restore(true).await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn offline_restore_rejects_a_link_before_opening_manifest_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = dir.path().join("graphs/knowledge.omni");
+    fs::create_dir_all(&graph).unwrap();
+    std::os::unix::fs::symlink(dir.path(), graph.join("linked")).unwrap();
+    let binding = omnigraph_storage::CapturedStorageBinding::capture(
+        &format!("file://{}", dir.path().display()),
+        &omnigraph_storage::StorageDestination::Local,
+    )
+    .unwrap();
+    let error = verify_restore_history(&binding, "knowledge")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "restore_graph_unreadable");
+    assert!(error.message.contains("symlink"), "{error:?}");
+}
+
 async fn exercise_sealed_restore(interrupt_after_acceptance: bool) {
     let dir = crate::tests::identity_fixture();
     let config = dir.path().join(CLUSTER_CONFIG_FILE);
@@ -99,6 +118,29 @@ async fn exercise_sealed_restore(interrupt_after_acceptance: bool) {
         &omnigraph_storage::StorageDestination::Local,
     )
     .unwrap();
+    #[cfg(unix)]
+    if !interrupt_after_acceptance {
+        let graphs = dir.path().join("graphs");
+        let parked = dir.path().join("original-layout");
+        if graphs.exists() {
+            fs::rename(&graphs, &parked).unwrap();
+        }
+        let alternate = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(alternate.path(), &graphs).unwrap();
+        for error in [
+            prepare_graph_restore(&binding, &json).await.unwrap_err(),
+            verify_restore_history(&binding, "knowledge")
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.code, "cluster_graph_root_mismatch");
+        }
+        assert_eq!(fs::read_dir(alternate.path()).unwrap().count(), 0);
+        fs::remove_file(&graphs).unwrap();
+        if parked.exists() {
+            fs::rename(&parked, &graphs).unwrap();
+        }
+    }
     assert_eq!(
         prepare_graph_restore(&binding, &json).await.unwrap(),
         digest
@@ -112,6 +154,24 @@ async fn exercise_sealed_restore(interrupt_after_acceptance: bool) {
             "source unexpectedly collides with reserved birth marker"
         );
         fs::rename(item.path(), dest).unwrap();
+    }
+    if !interrupt_after_acceptance {
+        let pending = target.join("__recovery");
+        fs::create_dir_all(&pending).unwrap();
+        let sidecar = pending.join("fixture.json");
+        fs::write(&sidecar, "{}").unwrap();
+        assert_eq!(
+            verify_restore_history(&binding, "knowledge")
+                .await
+                .unwrap_err()
+                .code,
+            "graph_recovery_required"
+        );
+        fs::remove_file(&sidecar).unwrap();
+        assert_eq!(
+            verify_restore_history(&binding, "knowledge").await.unwrap(),
+            history
+        );
     }
     // The only remaining source is an empty directory; all historical reads
     // during preview, publication and serving must resolve at the destination.
