@@ -178,7 +178,8 @@ law's nightly breadth; the self-test holds the two pins equal. The comparison, t
 reference: until the break merges, to a later merge base when `main` is merged
 into the branch; after it, never. Measured on the 2-CPU dev box, both runner
 builds take about 11 minutes cold and the comparison 5.5 minutes at three
-jobs; the 90-minute budget is UNVERIFIED until the first hosted run.
+jobs; on the first hosted run the two cold builds took 45 minutes and each
+comparison pass 6, so the job's budget is 120 minutes.
 
 The released 0.12 cluster-ledger journey is separate
 [manual release qualification](testing.md#manual-012-cluster-upgrade-qualification).

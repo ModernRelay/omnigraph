@@ -463,8 +463,10 @@ def run_side(
     except subprocess.TimeoutExpired:
         output = f"timed out after {timeout_s} s"
         status = "timeout"
-    status_file.write_text(json.dumps({"status": status, "message": short(output, 600)}))
-    return read_side(artifacts, status, short(output, 600))
+    # The output opens with trace paths; its end holds the verdict.
+    tail = " ".join(output.split())[-900:]
+    status_file.write_text(json.dumps({"status": status, "message": tail}))
+    return read_side(artifacts, status, tail)
 
 
 def read_side(artifacts: Path, status: str, message: str) -> SideResult:
@@ -586,10 +588,10 @@ def run(args: argparse.Namespace) -> int:
                     f"`{short(old.failure[1], 200)}`; the steps after it are not compared"
                 )
             else:
-                if old.status != "passed":
-                    unrunnable.append(f"{case}: edition 2 {old.status}: {old.message}")
-                if new.status != "passed":
-                    unrunnable.append(f"{case}: current {new.status}: {new.message}")
+                for label, side in (("edition 2", old), ("current", new)):
+                    if side.status != "passed":
+                        why = f"step {side.failure[0]}: {short(side.failure[1], 400)}; " if side.failure else ""
+                        unrunnable.append(f"{case}: {label} {side.status}: {why}{side.message}")
             pairs = align(old.order, new.order)
             matched_old = set(pairs.values())
             for key, sig in old.order:

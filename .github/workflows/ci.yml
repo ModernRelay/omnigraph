@@ -1135,8 +1135,10 @@ jobs:
     runs-on: ubuntu-latest
     # Two runner builds share one target directory (the pinned edition-2
     # commit's `omnigraph-gqt`, then this tree's), then every case pair runs
-    # under the deterministic simulation twice per side.
-    timeout-minutes: 90
+    # under the deterministic simulation twice per side. Measured cold on the
+    # first hosted run (2026-11-18): the two builds 45 minutes, each
+    # comparison pass 6.
+    timeout-minutes: 120
     permissions:
       contents: read
     env:
