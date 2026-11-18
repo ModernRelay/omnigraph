@@ -279,6 +279,40 @@ pub async fn key_column_uncovered_tail(
     Ok(Some(widest))
 }
 
+/// The current fragments of `ds` on which every index keyed on `column` is a
+/// BTREE that covers them, under [`key_column_index_coverage`]'s rule: on
+/// these Lance answers a `column IN (...)` test from the index and plans no
+/// filter, and on every other fragment it plans the filter, with its own copy
+/// of the key list. Empty when no BTREE can serve the column (none, another
+/// index kind, a segment that does not report its coverage, a fragment
+/// without `physical_rows`), since Lance then filters every fragment.
+pub async fn key_column_covered_fragments(ds: &Dataset, column: &str) -> Result<BTreeSet<u64>> {
+    let Some(field_id) = ds.schema().field(column).map(|field| field.id) else {
+        return Ok(BTreeSet::new());
+    };
+    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+    let current = current_fragments(ds);
+    let Ok(tails) = key_column_tails(
+        &indices,
+        field_id,
+        column,
+        &current,
+        ds.fragments()
+            .iter()
+            .all(|fragment| fragment.physical_rows.is_some()),
+    ) else {
+        return Ok(BTreeSet::new());
+    };
+    let mut covered = current;
+    for (_, tail) in tails {
+        let Ok(uncovered) = tail else {
+            return Ok(BTreeSet::new());
+        };
+        covered.retain(|fragment| !uncovered.contains(fragment));
+    }
+    Ok(covered)
+}
+
 /// The fragments a BTREE on a key column leaves uncovered, as
 /// [`key_column_uncovered_tail`] reports them: the largest count of such
 /// fragments one index leaves, and the largest total of their data-file
@@ -506,15 +540,22 @@ pub async fn has_fts_index_on(ds: &Dataset, column: &str) -> Result<bool> {
     }))
 }
 
+/// Whether index segment `index` covers no fragment: its fragment bitmap is
+/// present and empty, so it holds no rows. Lance uses the same test, for
+/// every index kind, when it reports a segment's statistics as an empty
+/// object. A segment without a bitmap has unknown coverage, not none.
+pub fn covers_no_fragment(index: &IndexMetadata) -> bool {
+    index
+        .fragment_bitmap
+        .as_ref()
+        .is_some_and(|bitmap| bitmap.is_empty())
+}
+
 /// Whether `index` is an untrained full-text segment: an empty fragment
 /// bitmap and no postings. It only declares a declared column's analyzer,
 /// which Lance applies to every row no segment covers, and indexes no row.
 pub fn is_untrained_full_text(index: &IndexMetadata) -> bool {
-    is_full_text_index(index)
-        && index
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(|bitmap| bitmap.is_empty())
+    is_full_text_index(index) && covers_no_fragment(index)
 }
 
 /// Whether a full-text segment on `column` holds postings: it covers a

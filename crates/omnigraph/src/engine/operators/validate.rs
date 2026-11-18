@@ -336,13 +336,26 @@ async fn judge_after_drain(
                 .and_then(|admitted| LoadReadReuse::new(db, judge.snapshot(), admitted))
         };
         let mut deleted = DeletedIdBudget::new(judge.write_budget);
+        // What the retained-edge check holds per removed id
+        // (`validate::RemovalEdgeReads`): the id itself and its entry in the
+        // src and dst membership sets. Its pushed filters list one chunk of
+        // ids per endpoint at a time, and the plan keeps the copies Lance
+        // makes of them to one chunk in all, so the first chunk of ids also
+        // charges those literals: a filter's and its copies', per endpoint.
+        let mut removed_ids = 0usize;
         let mut admit_removed = |id: &str| {
             deleted.retain(id)?;
-            let reserve = || {
+            let in_first_chunk = removed_ids < crate::validate::PROBE_CHUNK_KEYS;
+            removed_ids += 1;
+            let reserve = || -> DfResult<()> {
                 charged.entries::<String>(1)?;
-                charged.entries::<Expr>(2)?;
-                charged.entries::<&String>(2)?;
-                charged.string(id.len().saturating_mul(3))
+                charged.entries::<&str>(2)?;
+                charged.string(id.len())?;
+                if in_first_chunk {
+                    charged.entries::<Expr>(4)?;
+                    charged.string(id.len().saturating_mul(4))?;
+                }
+                Ok(())
             };
             reserve().map_err(|error| charged.error(error))
         };

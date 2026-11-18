@@ -1420,34 +1420,23 @@ pub(super) async fn open_table_for_mutation(
     Ok((opened.handle, opened.full_path, opened.table_branch))
 }
 
-/// The rows of `table_key`, at its pinned `version`, that an earlier delete
-/// statement of this mutation already scheduled for removal: a delete
-/// statement's scan leaves them out of the rows it counts and records.
+/// The rows earlier delete statements of this query already scheduled on
+/// `table_key`: their row addresses, recorded at `version`, or `None` when no
+/// statement has touched the table. A statement skips them when it counts its
+/// `affected_*`, so overlapping statements count each row once and their
+/// counts sum to the union the combined staged delete removes. Matching by
+/// address rather than re-evaluating the earlier predicates puts no earlier
+/// statement's test into this scan's filter: a cascade's predicate lists every
+/// removed id (#1442), and a row an earlier predicate left null-valued was not
+/// matched, so it has no address and is not skipped (#1277).
 ///
-/// Deletes stage, so every statement of a delete-only mutation scans the same
-/// committed snapshot. Counting each predicate on its own would count rows
-/// that overlapping statements share twice, and record their ids twice. The
-/// combined staged delete removes the union `p₁ ∪ p₂ ∪ …`; leaving out the
-/// rows earlier statements scheduled makes each statement contribute
-/// `|pₙ \ (p₁ ∪ …)|`, whose sum is exactly that distinct count. The statement's
-/// own predicate is still what gets recorded.
-///
-/// Every recorded predicate also records the addresses its scan matched
-/// (`MutationStaging::record_deleted_row_addrs`), so their union is exactly
-/// the rows the earlier predicates selected as true: a row an earlier
-/// predicate leaves unknown (a null) was never recorded and stays in, and a
-/// chunk of one statement's selected entities leaves out the rows an earlier
-/// chunk's cascade reached. The exclusion is a set of addresses, not a filter,
-/// so no statement's scan grows with the predicates recorded before it.
-///
-/// LOAD-BEARING on D₂: this exclusion assumes the committed snapshot is
-/// invariant across the query's statements, which holds only because D₂
-/// (`enforce_no_mixed_destructive_constructive`) forbids mixing inserts/updates
-/// with deletes — so a delete-touched table never has pending writes that would
-/// shift what a later statement sees. If D₂ is ever relaxed, this exclusion
-/// must be revisited (a later delete would then need to see prior in-query
-/// writes).
-fn scheduled_deletes<'a>(
+/// LOAD-BEARING on D₂: every statement of a delete-only query reads the same
+/// committed snapshot, because `enforce_no_mixed_destructive_constructive`
+/// leaves a delete-touched table no pending writes, so one address names one
+/// row across statements. If D₂ is ever relaxed, this must be revisited.
+/// Addresses recorded at another version would name other rows, an internal
+/// contract failure as in `MutationStaging::record_deleted_row_addrs`.
+fn recorded_row_addrs<'a>(
     recorded: &'a HashMap<String, (u64, RowAddrTreeMap)>,
     table_key: &str,
     version: u64,
@@ -1456,8 +1445,7 @@ fn scheduled_deletes<'a>(
         None => Ok(None),
         Some((recorded_version, addrs)) if *recorded_version == version => Ok(Some(addrs)),
         Some((recorded_version, _)) => Err(OmniError::manifest_internal(format!(
-            "delete row addresses for '{table_key}' captured at version {recorded_version}, \
-             scanned at {version}"
+            "delete row addresses for '{table_key}' captured at versions {recorded_version} and {version}"
         ))),
     }
 }
@@ -2879,13 +2867,19 @@ impl Omnigraph {
                 Some(id_conjunct) => pred_expr.clone().and(id_conjunct),
                 None => pred_expr.clone(),
             };
-        let (deleted_ids, deleted_addrs) = scan_deleted_ids(
+        // A row an earlier delete statement on this table already matched is
+        // skipped by its recorded row address, so it is counted once.
+        let mut deleted_ids = Vec::new();
+        let mut deleted_addrs = RowAddrTreeMap::new();
+        scan_deleted_ids(
             self,
             &ds,
             txn.catalog.system_columns.id,
-            scan_predicate,
-            scheduled_deletes(&staging.deleted_row_addrs, &table_key, ds.version())?,
+            DeletedRowsRead::filtered(scan_predicate),
+            recorded_row_addrs(&staging.deleted_row_addrs, &table_key, ds.version())?,
             &mut staging.deleted_id_budget,
+            &mut deleted_ids,
+            &mut deleted_addrs,
         )
         .await?;
 
@@ -2920,21 +2914,22 @@ impl Omnigraph {
             .collect();
 
         for (edge_name, from_type, to_type) in &edge_info {
-            let mut cascade_filters = Vec::new();
+            let mut endpoints = Vec::new();
             if from_type == type_name {
-                cascade_filters.push(id_in_list_expr(
-                    &deleted_ids,
-                    txn.catalog.system_columns.src,
-                ));
+                endpoints.push(txn.catalog.system_columns.src);
             }
             if to_type == type_name {
-                cascade_filters.push(id_in_list_expr(
-                    &deleted_ids,
-                    txn.catalog.system_columns.dst,
-                ));
+                endpoints.push(txn.catalog.system_columns.dst);
             }
-            let Some(cascade_filter) = cascade_filters.into_iter().reduce(Expr::or) else {
+            if endpoints.is_empty() {
                 continue;
+            }
+            let probed = |column: &str| -> &[String] {
+                if endpoints.contains(&column) {
+                    &deleted_ids
+                } else {
+                    &[]
+                }
             };
 
             let edge_table_key = format!("edge:{}", edge_name);
@@ -2950,37 +2945,80 @@ impl Omnigraph {
             // Delete is a STRICT op, so collapse #1 never skips its open.
             let edge_ds = edge_handle.expect("strict Delete op always opens its dataset");
 
-            // `affected_edges` was the post-inline-commit `deleted_rows`; with
-            // staged deletes the rows aren't removed until end-of-query, so
-            // count the matching committed edges now. Exact under D₂ (no staged
-            // inserts can add matches mid-query), and bounded by the cascade
-            // working set. Leave out edges a prior delete statement (a prior
-            // cascade, or an explicit edge delete) on this table already
-            // scheduled (`scheduled_deletes`), so an edge incident to two
-            // deleted nodes — or matched by both a cascade and an explicit
-            // `delete <Edge>` — is counted once. Record the ORIGINAL cascade
-            // filter (the combined staged delete removes the union); skip only
-            // when nothing NEW matches.
-            // Scan (not count) the cascade-removed edge ids so validation
-            // recounts the OTHER endpoint's @card after the cascade; `len()` is
-            // the affected count.
-            let (matched_ids, matched_addrs) = scan_deleted_ids(
-                self,
-                &edge_ds,
-                txn.catalog.system_columns.id,
-                cascade_filter.clone(),
-                scheduled_deletes(
-                    &staging.deleted_row_addrs,
-                    &edge_table_key,
-                    edge_ds.version(),
-                )?,
-                &mut staging.deleted_id_budget,
+            // `affected_edges` counts the committed edges the cascade removes;
+            // the staged delete removes them at end-of-query. Exact under D₂
+            // (no staged inserts can add matches mid-query). The removed node
+            // ids are read through `RemovalEdgeReads`: pushed in bounded
+            // chunks where an index answers them, matched in memory on the
+            // fragments it leaves uncovered, never one filter over every id
+            // copied per fragment (#1442). An edge that two reads find, or
+            // that an earlier delete statement on this table (a prior cascade
+            // or an explicit `delete <Edge>`) already scheduled, is skipped by
+            // its row address, so it is counted once. Scan (not count) the
+            // removed edge ids so validation recounts the OTHER endpoint's
+            // @card after the cascade; `len()` is the affected count.
+            let mut matched_ids = Vec::new();
+            let mut matched_addrs = RowAddrTreeMap::new();
+            let (src, dst) = (
+                txn.catalog.system_columns.src,
+                txn.catalog.system_columns.dst,
+            );
+            let reads = crate::validate::RemovalEdgeReads::plan(
+                edge_ds.dataset(),
+                (src, probed(src)),
+                (dst, probed(dst)),
             )
             .await?;
+            let scheduled = recorded_row_addrs(
+                &staging.deleted_row_addrs,
+                &edge_table_key,
+                edge_ds.version(),
+            )?;
+            for filter in reads.probe_filters() {
+                scan_deleted_ids(
+                    self,
+                    &edge_ds,
+                    txn.catalog.system_columns.id,
+                    DeletedRowsRead {
+                        filter: Some(filter),
+                        fragments: reads.probe_fragments(),
+                        matcher: None,
+                    },
+                    scheduled,
+                    &mut staging.deleted_id_budget,
+                    &mut matched_ids,
+                    &mut matched_addrs,
+                )
+                .await?;
+            }
+            if let Some((fragments, matcher)) = reads.matched() {
+                scan_deleted_ids(
+                    self,
+                    &edge_ds,
+                    txn.catalog.system_columns.id,
+                    DeletedRowsRead {
+                        filter: None,
+                        fragments: Some(fragments),
+                        matcher: Some(&matcher),
+                    },
+                    scheduled,
+                    &mut staging.deleted_id_budget,
+                    &mut matched_ids,
+                    &mut matched_addrs,
+                )
+                .await?;
+            }
             let matched = matched_ids.len();
             affected_edges += matched;
 
             if matched > 0 {
+                // The staged delete removes exactly the recorded addresses;
+                // the predicate is the transaction's recorded text.
+                let cascade_filter = endpoints
+                    .iter()
+                    .map(|column| id_in_list_expr(&deleted_ids, column))
+                    .reduce(Expr::or)
+                    .expect("a cascade has at least one endpoint");
                 cascaded_edge_tables.push(edge_table_key.clone());
                 staging.record_deleted_ids(&edge_table_key, matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
@@ -3033,23 +3071,28 @@ impl Omnigraph {
         let ds = handle.expect("strict Delete op always opens its dataset");
 
         // Count matching committed edges now (the staged delete won't remove
-        // them until end-of-query). Exact under D₂; leave out edges a prior
-        // delete statement on this table (an earlier cascade or edge delete)
-        // already scheduled (`scheduled_deletes`), so overlapping statements
+        // them until end-of-query). Exact under D₂; exclude edges a prior delete
+        // statement on this table (an earlier cascade or edge delete) already
+        // scheduled, by its recorded row address, so overlapping statements
         // don't double-count. Record the ORIGINAL predicate below (the combined
         // staged delete removes the union); only record when something NEW
         // matches.
+        //
         // Scan the matched edge ids (not just count): the ids feed validation so
         // a delete emptying a src below @card min is rejected; `len()` is the
         // affected count. One scan replaces the former count-here + resolve-at-
         // validation re-scan.
-        let (deleted_ids, deleted_addrs) = scan_deleted_ids(
+        let mut deleted_ids = Vec::new();
+        let mut deleted_addrs = RowAddrTreeMap::new();
+        scan_deleted_ids(
             self,
             &ds,
             txn.catalog.system_columns.id,
-            pred_expr.clone(),
-            scheduled_deletes(&staging.deleted_row_addrs, &table_key, ds.version())?,
+            DeletedRowsRead::filtered(pred_expr.clone()),
+            recorded_row_addrs(&staging.deleted_row_addrs, &table_key, ds.version())?,
             &mut staging.deleted_id_budget,
+            &mut deleted_ids,
+            &mut deleted_addrs,
         )
         .await?;
         let affected = deleted_ids.len();
@@ -3138,25 +3181,56 @@ async fn key_id_conjunct(
     ))
 }
 
-/// Walk the exact typed predicate a batch at a time, leaving out the rows at
-/// the `scheduled` addresses (see `scheduled_deletes`), admitting each other
-/// id against `budget` before copying it, and keep each matched row's address
-/// so the staged delete removes exactly these rows without scanning again.
+/// The rows one scan of [`scan_deleted_ids`] reads: those `filter` selects on
+/// `fragments` (`None`: the whole table), or, with `matcher`, every row of
+/// `fragments` that it keeps (`crate::validate::RemovalEdgeReads`).
+struct DeletedRowsRead<'r, 'm> {
+    filter: Option<Expr>,
+    fragments: Option<Vec<lance_table::format::Fragment>>,
+    matcher: Option<&'r crate::validate::EndpointMatch<'m>>,
+}
+
+impl DeletedRowsRead<'_, '_> {
+    fn filtered(filter: Expr) -> Self {
+        Self {
+            filter: Some(filter),
+            fragments: None,
+            matcher: None,
+        }
+    }
+}
+
+/// Walk the rows `read` selects a batch at a time, admitting each id against
+/// `budget` before copying it, and keep each matched row's address so the
+/// staged delete removes exactly these rows without scanning again. The ids
+/// and addresses accumulate into `removed` and `addrs` across a statement's
+/// reads; a row already in `addrs` (an earlier read of this statement) or in
+/// `scheduled` (an earlier statement's rows) is skipped before it is charged.
 async fn scan_deleted_ids(
     db: &Omnigraph,
     snapshot: &SnapshotHandle,
     id_column: &str,
-    filter: Expr,
+    read: DeletedRowsRead<'_, '_>,
     scheduled: Option<&RowAddrTreeMap>,
     budget: &mut DeletedIdBudget,
-) -> Result<(Vec<String>, RowAddrTreeMap)> {
+    removed: &mut Vec<String>,
+    addrs: &mut RowAddrTreeMap,
+) -> Result<()> {
+    // The id column first: the walk reads it as column 0.
+    let projection: Vec<&str> = std::iter::once(id_column)
+        .chain(read.matcher.iter().flat_map(|matcher| matcher.columns()))
+        .collect();
     let mut stream = db
         .storage()
-        .scan_filtered_row_addrs(snapshot, &[id_column], filter)
+        .scan_filtered_row_addrs(snapshot, &projection, read.filter, read.fragments)
         .await?;
-    let mut removed = Vec::new();
-    let mut addrs = RowAddrTreeMap::new();
+    let mut scanned = RowAddrTreeMap::new();
+    let mut found = Vec::new();
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        let batch = match read.matcher {
+            Some(matcher) => matcher.keep(&batch)?,
+            None => batch,
+        };
         let ids = batch
             .column(0)
             .as_any()
@@ -3175,20 +3249,24 @@ async fn scan_deleted_ids(
         }
         for i in 0..ids.len() {
             let addr = row_addrs.value(i);
-            if scheduled.is_some_and(|scheduled| scheduled.contains(addr)) {
+            if !scanned.insert(addr) {
+                return Err(OmniError::manifest_internal(
+                    "delete id scan returned one row address twice",
+                ));
+            }
+            if addrs.contains(addr) || scheduled.is_some_and(|rows| rows.contains(addr)) {
                 continue;
             }
             let id = ids.value(i);
             budget.retain(id)?;
             removed.push(id.to_owned());
-            if !addrs.insert(addr) {
-                return Err(OmniError::manifest_internal(
-                    "delete id scan returned one row address twice",
-                ));
-            }
+            found.push(addr);
         }
     }
-    Ok((removed, addrs))
+    for addr in found {
+        addrs.insert(addr);
+    }
+    Ok(())
 }
 
 /// Concat the matched batches from `scan_with_pending` into a single batch.

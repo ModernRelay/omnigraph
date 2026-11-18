@@ -400,7 +400,8 @@ stages the rewrite detached with fragment ids above the base's high-water
 mark, so it needs no `ReserveFragments`; a lagging scalar or vector index is
 rebuilt whole as a detached commit chained on the rewrite under its name
 (Lance 13 folds only through a linear commit), keeping a vector index's
-partition count; the batch publishes once with an exact CAS on every planned
+partition count (an index whose segments cover no fragment holds no rows and
+is rebuilt with one partition, as a new declared index is); the batch publishes once with an exact CAS on every planned
 pin, and a pin a concurrent writer moved fails the run with a read-set
 conflict so the next run re-plans. A failure before publication leaves
 unpublished staging the collector reclaims once it is dead.
@@ -754,8 +755,18 @@ id scan also returns each matched row's address at the table's pin, and
 a deleted table is scanned once; addresses from another version than the
 reopened pin take Lance's scanning delete. A delete statement's scan leaves
 out the rows at the addresses earlier statements of the mutation recorded
-(`scheduled_deletes`), so statements that overlap count and record each row
-once, and no scan's filter grows with the statements before it. A node delete whose predicate has
+(`recorded_row_addrs`), so statements that overlap count and record each row
+once, and no scan's filter grows with the statements before it. A node removal reads each edge
+table that references the type for the edges touching its removed ids (the
+delete cascade, and the retained-edge check of an Overwrite, `load csv` or a
+merge) through `validate::RemovalEdgeReads`. Lance gives every fragment that
+no index answers a pushed filter on its own copy of the filter, built before
+the scan reads. So the plan pushes the ids to every fragment, 8,192 per
+filter, only when a BTREE on each probed endpoint covers the table, or when
+one filter holds every id and the uncovered fragments times those ids stay at
+most 8,192; otherwise it probes the covered fragments and reads the uncovered
+ones once, whole, matching their rows against the removed ids in memory
+(#1442). A node delete whose predicate has
 a `<key> = v` conjunct on the type's single String `@key` also filters on the
 derived id when the pinned table has an id BTREE, as the read planner's key
 narrowing does. Mutation validation reads the write's pinned base through the
