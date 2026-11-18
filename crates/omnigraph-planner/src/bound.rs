@@ -33,8 +33,11 @@ use crate::physical::{NodeId, PhysicalPlan};
 /// ranked scan's `eligibility`, a pre-pass's `on_empty` and
 /// `coverage_admits`, and the assumptions' full-text coverage. Version 15
 /// removes from version 14 a ranked scan's `kind`, which named `nearest`,
-/// the one ranking a scan computes.
-pub const BOUND_PLAN_VERSION: u32 = 15;
+/// the one ranking a scan computes. Version 16 adds to version 15 the
+/// assumptions' `plan_work`, the read's plan budget and the work typing,
+/// shaping and planning charged to it, which a replay's compile must
+/// charge again.
+pub const BOUND_PLAN_VERSION: u32 = 16;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

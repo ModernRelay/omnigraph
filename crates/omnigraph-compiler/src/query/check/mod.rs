@@ -20,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::budget::{Overrun, PlanWork, WorkKind};
 use crate::catalog::Catalog;
 use crate::error::CompilerError;
 use crate::ir::core::MutationTarget;
@@ -320,20 +321,32 @@ enum Typed {
 }
 
 fn typed_decl(catalog: &Catalog, unit: &HashMap<String, &Decl>, decl: &Decl) -> Typed {
-    typed_decl_measured(catalog, unit, decl, &mut Measured::default())
+    typed_decl_measured(
+        catalog,
+        unit,
+        decl,
+        &mut crate::budget::WorkRecord::default(),
+        &mut None,
+        &mut 0,
+    )
 }
 
 /// The measured work of typing one declaration.
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct TypingWork {
-    /// The expressions typed ([`Ctx::typed_exprs`]).
-    pub exprs: usize,
-    /// The largest term charged to the plan budget ([`Ctx::largest_charged`]).
-    pub largest_term: usize,
+    /// The work typing charged to the plan budget, by kind.
+    pub work: crate::budget::WorkSpent,
+    /// The expressions typed, each written expression once per time it is
+    /// typed: the measure the growth laws hold to the source's size.
+    pub typed_exprs: usize,
     pub accepted: bool,
     /// The checked declaration, when it is accepted.
     pub core: Option<CoreDecl>,
+    /// The refusals, when it is refused.
+    pub refusals: Vec<QueryDiagnostic>,
+    /// The charge that passed the plan budget, when one did.
+    pub overrun: Option<crate::budget::Overrun>,
 }
 
 /// The work typing each declaration of `source` took, by name.
@@ -349,38 +362,37 @@ pub(crate) fn typing_work(catalog: &Catalog, source: &str) -> Vec<(String, Typin
     decls
         .iter()
         .map(|d| {
-            let mut work = Measured::default();
-            let typed = typed_decl_measured(catalog, &unit, d, &mut work);
+            let mut work = crate::budget::WorkRecord::default();
+            let mut overrun = None;
+            let mut typed_exprs = 0;
+            let typed =
+                typed_decl_measured(catalog, &unit, d, &mut work, &mut overrun, &mut typed_exprs);
+            let (accepted, core, refusals) = match typed {
+                Typed::Checked(checked) => (true, Some(checked.core), Vec::new()),
+                Typed::Refused { refusals, .. } => (false, None, refusals),
+            };
             (
                 d.name.clone(),
                 TypingWork {
-                    exprs: work.exprs,
-                    largest_term: work.largest_term,
-                    accepted: matches!(typed, Typed::Checked(_)),
-                    core: match typed {
-                        Typed::Checked(checked) => Some(checked.core),
-                        _ => None,
-                    },
+                    work: work.spent,
+                    typed_exprs,
+                    accepted,
+                    core,
+                    refusals,
+                    overrun,
                 },
             )
         })
         .collect()
 }
 
-/// What [`typed_decl_measured`] reports of its pass; only the tests read
-/// it.
-#[derive(Default)]
-#[cfg_attr(not(test), allow(dead_code))]
-struct Measured {
-    exprs: usize,
-    largest_term: usize,
-}
-
 fn typed_decl_measured(
     catalog: &Catalog,
     unit: &HashMap<String, &Decl>,
     decl: &Decl,
-    work: &mut Measured,
+    work: &mut crate::budget::WorkRecord,
+    overrun: &mut Option<crate::budget::Overrun>,
+    typed_exprs: &mut usize,
 ) -> Typed {
     let refused = |d: QueryDiagnostic| Typed::Refused {
         refusals: vec![d],
@@ -397,10 +409,13 @@ fn typed_decl_measured(
         at: None,
         element_span: None,
         refusals: Vec::new(),
-        plan_limit: DEFAULT_PLAN_BUDGET,
+        work: PlanWork::new(DEFAULT_PLAN_BUDGET as u64),
+        overrun: std::cell::RefCell::new(None),
         typed_calls: HashMap::new(),
+        fail_memo: FailMemo::default(),
         typed_exprs: 0,
-        largest_charged: std::cell::Cell::new(0),
+        calls_below: Vec::new(),
+        expanding: Vec::new(),
     };
     let params = match param_types(&decl.name, &decl.params) {
         Ok(p) => p,
@@ -425,15 +440,20 @@ fn typed_decl_measured(
                 term: r.rel.term,
                 result: r.rel.ty,
                 plan_budget: r.budget,
+                work: crate::budget::WorkSoFar::new(ctx.work.record()),
                 fresh: ctx.made_up.clone(),
             }))
         }),
         DeclBody::Write(w) => ctx.write_decl(decl, w).map(CoreDecl::Write),
     };
-    *work = Measured {
-        exprs: ctx.typed_exprs,
-        largest_term: ctx.largest_charged.get(),
-    };
+    *work = ctx.work.record();
+    *overrun = ctx.work.overrun();
+    *typed_exprs = ctx.typed_exprs;
+    // Past the plan budget, the overrun alone: what else was refused before
+    // it, or because the compile stopped, is not the author's to fix first.
+    if let Some(d) = ctx.overrun.borrow_mut().take() {
+        return refused(d.at_span_of(&decl.at));
+    }
     // Every refusal recorded by a recovery point, then the one that ended
     // the pass, each at its span or at the declaration's name.
     let mut refusals = std::mem::take(&mut ctx.refusals);
@@ -503,7 +523,7 @@ fn at_operand(e: E, operand: &Expr, written: &SourceSpan) -> E {
 }
 
 /// A diagnostic without a position, placed at `span`.
-trait AtSpan {
+pub(super) trait AtSpan {
     fn at_span_of(self, span: &SourceSpan) -> Self;
 }
 
@@ -1210,22 +1230,34 @@ struct Ctx<'a> {
     /// The refusals the recovery points of the declaration recorded
     /// ([`Ctx::recover`]).
     refusals: Vec<QueryDiagnostic>,
-    /// The plan budget of the declaration being checked: every term built
-    /// for it is a subtree of its expanded tree, so a term over the budget
-    /// stops the compile as soon as it is built ([`Ctx::charge`]).
-    plan_limit: usize,
+    /// The plan budget of the declaration being checked and the work
+    /// charged to it ([`crate::budget`]): every term node and expression
+    /// node built and every expression typed, so a compile stops as soon as
+    /// its work passes the budget ([`Ctx::spend`]).
+    work: PlanWork,
+    /// The refusal of the charge that passed the budget: once the work
+    /// passed it, no refusal is recorded and the compile ends with this one.
+    overrun: std::cell::RefCell<Option<QueryDiagnostic>>,
     /// Each declared read the declaration calls, typed once: its body's
     /// term, type and column shapes. A body that reached a recursive
     /// reference depends on the call frames and is typed at each call.
-    typed_calls: HashMap<String, (Term, RelTy, Vec<Option<String>>)>,
+    typed_calls: HashMap<String, TypedCall>,
+    /// The verdicts of [`Term::can_fail`] over the terms built so far.
+    fail_memo: FailMemo,
     /// How many expressions the pass typed, each written expression once
-    /// per time it is typed: the deterministic measure of a declaration's
-    /// typing work that the tests hold to the source's size.
+    /// per time it is typed.
     typed_exprs: usize,
-    /// The largest term size charged to the plan budget
-    /// ([`Self::charge`]): how far a build went before a refusal stopped it.
-    largest_charged: std::cell::Cell<usize>,
+    /// The calls the last call typed or expanded runs through, itself first:
+    /// what a refusal names when the work passes the budget inside it.
+    calls_below: Vec<String>,
+    /// The calls a shared body being charged at a later call site runs
+    /// through ([`Ctx::overrun_refusal`]).
+    expanding: Vec<String>,
 }
+
+/// A declared read typed once: its body's term, type and column shapes, and
+/// the calls its body runs through.
+type TypedCall = (Term, RelTy, Vec<Option<String>>, Vec<String>);
 
 struct Frame {
     decl: String,
@@ -1310,7 +1342,12 @@ struct Scope {
     params: HashMap<String, PropType>,
     /// Columns of enclosing scopes visible here (correlation).
     outer: Vec<Col>,
+    /// The first of `outer` with each name, by position: a lookup is one
+    /// probe, not a scan of the enclosing scopes' columns.
+    outer_at: HashMap<String, usize>,
     cols: Vec<Col>,
+    /// The first of `cols` with each name, by position ([`Scope::push_col`]).
+    col_at: HashMap<String, usize>,
     rels: HashMap<String, Rel>,
     free: Vec<String>,
     /// The binder step index of each local column.
@@ -1353,7 +1390,7 @@ struct Scope {
     optional: bool,
     /// While a filter written earlier is placed: the names bound before it,
     /// the only outer names a block inside it correlates on.
-    block_visible: Option<Vec<String>>,
+    block_visible: Option<std::rc::Rc<HashSet<String>>>,
     /// Every column read since an element began, local or outer: what the
     /// element's inner term reads, for the product rule (`components`).
     reads: Vec<String>,
@@ -1384,16 +1421,26 @@ enum Pending {
     /// A conjunct of `where` and the names bound before it: a block inside it
     /// correlates on those alone.
     /// And where the `where` was written, start and end.
-    Filter(Expr, Vec<String>, Option<(Position, Position)>),
+    Filter(
+        Expr,
+        std::rc::Rc<HashSet<String>>,
+        Option<(Position, Position)>,
+    ),
 }
 
 impl Scope {
     fn new(params: HashMap<String, PropType>, outer: Vec<Col>, rels: HashMap<String, Rel>) -> Self {
         let inner = !outer.is_empty();
+        let mut outer_at = HashMap::with_capacity(outer.len());
+        for (i, c) in outer.iter().enumerate() {
+            outer_at.entry(c.name.clone()).or_insert(i);
+        }
         Self {
             params,
             outer,
+            outer_at,
             cols: Vec::new(),
+            col_at: HashMap::new(),
             rels,
             free: Vec::new(),
             bound_at: HashMap::new(),
@@ -1490,20 +1537,41 @@ impl Scope {
     /// scope's `outer`.
     fn visible(&self) -> Vec<Col> {
         let mut out = self.cols.clone();
-        for c in &self.outer {
-            if !out.iter().any(|o| o.name == c.name) {
-                out.push(c.clone());
-            }
-        }
+        out.extend(
+            self.outer
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| {
+                    !self.col_at.contains_key(&c.name) && self.outer_at.get(&c.name) == Some(i)
+                })
+                .map(|(_, c)| c.clone()),
+        );
         out
     }
 
     fn local(&self, name: &str) -> Option<&Col> {
-        self.cols.iter().find(|c| c.name == name)
+        self.col_at.get(name).map(|i| &self.cols[*i])
     }
 
     fn outer_col(&self, name: &str) -> Option<&Col> {
-        self.outer.iter().find(|c| c.name == name)
+        self.outer_at.get(name).map(|i| &self.outer[*i])
+    }
+
+    /// Add `c` to the scope's columns.
+    fn push_col(&mut self, c: Col) {
+        self.col_at.entry(c.name.clone()).or_insert(self.cols.len());
+        self.cols.push(c);
+    }
+
+    /// Remove the columns from `len` on, and return them.
+    fn truncate_cols(&mut self, len: usize) -> Vec<Col> {
+        let removed: Vec<Col> = self.cols.drain(len..).collect();
+        for c in &removed {
+            if self.col_at.get(&c.name).is_some_and(|i| *i >= len) {
+                self.col_at.remove(&c.name);
+            }
+        }
+        removed
     }
 
     /// The type of a column visible here, marking an outer one free.
@@ -1536,7 +1604,7 @@ impl Scope {
         self.steps.push((at * 2 + 1, step));
         for c in binds {
             self.bound_at.insert(c.name.clone(), at);
-            self.cols.push(c.clone());
+            self.push_col(c.clone());
         }
     }
 
@@ -1822,6 +1890,10 @@ impl Ctx<'_> {
     /// recording is `None` too. A recursive read's pending type is not a
     /// refusal and propagates.
     fn recover<T>(&mut self, result: R<T>) -> R<Option<T>> {
+        // Past the plan budget the compile ends: nothing more is checked.
+        if let Some(d) = self.overrun.borrow().as_ref() {
+            return result.map(Some).map_err(|_| E::D(d.clone()));
+        }
         match result {
             Ok(v) => Ok(Some(v)),
             Err(E::D(d)) => {
@@ -1941,37 +2013,87 @@ impl Ctx<'_> {
         Some(BlockGuard { columns, column })
     }
 
-    /// `T70` when `term`, of `size` nodes, is over the plan budget of the
-    /// declaration being checked. Each scope, inline read, call and union
-    /// charges the term it builds as it builds it, so an expansion that
-    /// outgrows the budget (reads that each call the next one twice)
-    /// stops at the first term over it instead of after the whole tree is
-    /// built.
-    fn charge(&self, size: usize, term: &Term) -> R<()> {
-        self.largest_charged
-            .set(self.largest_charged.get().max(size));
-        if size <= self.plan_limit {
-            return Ok(());
+    /// Charge `n` units of `kind` to the declaration's plan budget
+    /// ([`crate::budget`]); past it, `T70`, which no recovery point records
+    /// past: the compile ends with it.
+    fn spend(&self, kind: WorkKind, n: usize) -> R<()> {
+        if let Some(d) = self.overrun.borrow().as_ref() {
+            return Err(E::D(d.clone()));
         }
+        let Err(overrun) = self.work.charge(kind, n) else {
+            return Ok(());
+        };
+        let d = self.overrun_refusal(&overrun);
+        *self.overrun.borrow_mut() = Some(d.clone());
+        Err(E::D(d))
+    }
+
+    /// `T70` for `overrun`, naming the chain of calls being expanded.
+    fn overrun_refusal(&self, overrun: &Overrun) -> QueryDiagnostic {
         let name = self.frames.first().map_or("", |f| f.decl.as_str());
-        let mut chain: Vec<String> = self.frames.iter().skip(1).map(|f| f.decl.clone()).collect();
-        call_chain(term, &mut chain);
-        Err(err_fix(
-            T70,
-            format!(
-                "`{name}` expands past its plan budget of {} plan nodes (one of its terms alone has {size}); the expansion runs through {}",
-                self.plan_limit,
-                if chain.is_empty() {
-                    "no declared read".to_string()
-                } else {
-                    chain.join(" → ")
-                }
-            ),
-            format!(
-                "declare `@budget(plan = n)` with `n` above {} on `{name}`, or share a relation with `let`",
-                self.plan_limit
-            ),
-        ))
+        let chain: Vec<&str> = self
+            .frames
+            .iter()
+            .skip(1)
+            .map(|f| f.decl.as_str())
+            .chain(self.expanding.iter().map(String::as_str))
+            .collect();
+        overrun.refusal(name, &chain)
+    }
+
+    /// Charge the expanded tree of `term`, built once and shared again
+    /// (a declared read's body at a later call site, a named relation at
+    /// each draw), walking no further than the budget left
+    /// ([`Term::weight`]).
+    fn charge_expansion(&self, term: &Term) -> R<()> {
+        let remaining = usize::try_from(self.work.remaining()).unwrap_or(usize::MAX);
+        let (terms, exprs) = term.weight(remaining);
+        self.charge(Built {
+            terms,
+            exprs,
+            steps: 0,
+        })
+    }
+
+    /// Charge `term`'s top node, just built over a term already charged,
+    /// and the expressions it holds.
+    fn charge_top(&self, term: &Term) -> R<()> {
+        self.charge(Built {
+            terms: 1,
+            exprs: term.expr_nodes(),
+            steps: 0,
+        })
+    }
+
+    /// An inner scope of `sc` over `outer`, its environment charged as it
+    /// is copied: the outer columns, the parameters, the named relations and
+    /// the names of the error type. A scope nested `d` deep copies what the
+    /// scopes around it hold, so this charge grows with nesting and with a
+    /// long run of `optional`s or blocks, as the copying does.
+    fn inner_scope(&self, sc: &Scope, outer: Vec<Col>) -> R<Scope> {
+        self.spend(
+            WorkKind::Typing,
+            outer.len() + sc.params.len() + sc.rels.len() + sc.poisoned.len(),
+        )?;
+        Ok(sc.inner_scope(outer))
+    }
+
+    /// Charge the term nodes and the expression nodes `nodes` adds, and
+    /// the term nodes it rewrote.
+    fn charge(&self, nodes: Built) -> R<()> {
+        self.spend(WorkKind::TermNodes, nodes.terms)?;
+        self.spend(WorkKind::ExprNodes, nodes.exprs)?;
+        self.spend(WorkKind::Typing, nodes.steps)
+    }
+
+    /// The written construct `span` holds, as a refusal names it: work
+    /// charged while it is checked is charged to it, unless an enclosing
+    /// construct is already being charged ([`PlanWork::enter`]).
+    fn enter(&self, what: &str, span: Option<&SourceSpan>) -> bool {
+        self.work.enter(|| match span {
+            Some(s) => format!("{what} at {}:{}", s.position.line, s.position.column),
+            None => what.to_string(),
+        })
     }
 
     /// The construct being checked was written at `span`.
@@ -2014,7 +2136,9 @@ impl Ctx<'_> {
         let params = param_types(&decl.name, &decl.params)?;
         let budget = if top {
             let budget = self.recorded_annotations(decl)?;
-            self.plan_limit = budget.plan;
+            // Nothing is charged before the budget is known.
+            self.work = PlanWork::new(budget.plan as u64);
+            self.work.phase(format!("the body of `{}`", decl.name));
             budget
         } else {
             annotations(decl)?
@@ -2061,26 +2185,8 @@ impl Ctx<'_> {
                 lattice,
             };
         }
-        let size = rel.term.size();
-        if size > budget.plan {
-            let mut chain = Vec::new();
-            call_chain(&rel.term, &mut chain);
-            return Err(err_fix(
-                T70,
-                format!(
-                    "`{name}` expands to {size} plan nodes, over its plan budget of {}; the expansion runs through {}",
-                    budget.plan,
-                    if chain.is_empty() {
-                        "no declared read".to_string()
-                    } else {
-                        chain.join(" → ")
-                    }
-                ),
-                format!(
-                    "declare `@budget(plan = {size})` on `{name}`, or share a relation with `let`"
-                ),
-            ));
-        }
+        // Every node of the expanded tree was charged as it was built, so
+        // a tree over the budget stopped the compile there.
         Ok(ReadOut {
             params,
             rel,
@@ -2117,7 +2223,9 @@ impl Ctx<'_> {
                 self.recover::<()>(Err(refused))?;
             }
         }
-        self.plan_limit = self.recorded_annotations(decl)?.plan;
+        let plan = self.recorded_annotations(decl)?.plan;
+        self.work = PlanWork::new(plan as u64);
+        self.work.phase(format!("the body of `{}`", decl.name));
         let pmap: HashMap<String, PropType> = params.iter().cloned().collect();
         let mut groups = Vec::new();
         let mut class: Option<(WriteClass, String)> = None;
@@ -2178,6 +2286,7 @@ impl Ctx<'_> {
             class: class.map_or(WriteClass::Constructive, |(c, _)| c),
             write_mode: decl.write_mode.clone(),
             fresh: self.made_up.clone(),
+            work: crate::budget::WorkSoFar::new(self.work.record()),
         })
     }
 
@@ -2233,7 +2342,9 @@ impl Ctx<'_> {
                 continue;
             }
             seen.push(name.clone());
+            let entered = self.enter("the return item", body.spans.items.get(i));
             let typed = self.return_item(&mut sc, p, &name, &mut items, &mut aggs, &mut post);
+            self.work.leave(entered);
             if self.guard(top, typed)?.is_none() {
                 sc.block_buf.clear();
                 sc.refused = true;
@@ -2268,7 +2379,16 @@ impl Ctx<'_> {
                 },
             );
         }
-        let mut term = self.finish(&mut sc)?.unwrap_or(Term::Unit);
+        let mut term = match self.finish(&mut sc)? {
+            Some(term) => term,
+            None => {
+                self.charge(Built {
+                    terms: 1,
+                    ..Built::default()
+                })?;
+                Term::Unit
+            }
+        };
         // A refused item holding an aggregate grouped the return too.
         let grouped = !aggs.is_empty()
             || !post.is_empty()
@@ -2356,6 +2476,7 @@ impl Ctx<'_> {
                 keys: keys.clone(),
                 aggs,
             };
+            self.charge_top(&term)?;
             if !post_items.is_empty() {
                 term = Term::Project {
                     input: term.boxed(),
@@ -2363,12 +2484,14 @@ impl Ctx<'_> {
                     items: post_items,
                     keep: true,
                 };
+                self.charge_top(&term)?;
             }
             if !order.is_empty() {
                 term = Term::Order {
                     input: term.boxed(),
                     keys: order.into_iter().map(|(k, d)| (k.to_ir(), d)).collect(),
                 };
+                self.charge_top(&term)?;
             }
         } else {
             let ext: Vec<(String, SExpr)> = items.into_iter().flatten().collect();
@@ -2417,11 +2540,13 @@ impl Ctx<'_> {
                 items: ext.into_iter().map(|(n, e)| (n, e.to_ir())).collect(),
                 keep: true,
             };
+            self.charge_top(&term)?;
             if !order.is_empty() {
                 term = Term::Order {
                     input: term.boxed(),
                     keys: order.into_iter().map(|(k, d)| (k.to_ir(), d)).collect(),
                 };
+                self.charge_top(&term)?;
             }
         }
         if let Some(limit) = &body.limit {
@@ -2447,6 +2572,7 @@ impl Ctx<'_> {
                     input: term.boxed(),
                     k,
                 };
+                self.charge_top(&term)?;
             }
         }
         // An inline read holding a refusal is of the error type; the top
@@ -2470,6 +2596,7 @@ impl Ctx<'_> {
             keep: false,
             fails: false,
         };
+        self.charge_top(&term)?;
         let ordered_ranked = if body.order.is_empty() {
             None
         } else {
@@ -2517,7 +2644,7 @@ impl Ctx<'_> {
             let mut hidden = Vec::new();
             let rewritten = self.extract_aggs(sc, &p.expr, &mut hidden)?;
             for (n, a) in &hidden {
-                sc.cols.push(Col {
+                sc.push_col(Col {
                     name: n.clone(),
                     ty: a.ty.clone(),
                 });
@@ -2737,18 +2864,24 @@ impl Ctx<'_> {
         let env = if sc.free.is_empty() {
             None
         } else {
+            let free: HashSet<&str> = sc.free.iter().map(String::as_str).collect();
             Some(Term::Env(
                 sc.outer
                     .iter()
-                    .filter(|c| sc.free.contains(&c.name))
+                    .filter(|c| free.contains(c.name.as_str()))
                     .cloned()
                     .collect(),
             ))
         };
+        if env.is_some() {
+            self.charge(Built {
+                terms: 1,
+                ..Built::default()
+            })?;
+        }
         let mut acc = env;
-        // The scope's term so far is charged against the plan budget after
-        // every step, counting only the nodes the step adds.
-        let mut size = acc.as_ref().map_or(0, Term::size);
+        // Every step's nodes are charged as it is applied, counting only the
+        // nodes the step builds: a term it holds was charged when built.
         // Filters placed before every binder wait for the first leaf when
         // there is no `Env` to sit on.
         let mut early = Vec::new();
@@ -2757,35 +2890,31 @@ impl Ctx<'_> {
                 early.push(step);
                 continue;
             }
-            acc = Some(self.charged(acc, step, &mut size)?);
+            acc = Some(self.charged(acc, step)?);
             if !early.is_empty() {
                 for s in std::mem::take(&mut early) {
-                    acc = Some(self.charged(acc, s, &mut size)?);
+                    acc = Some(self.charged(acc, s)?);
                 }
             }
         }
         for s in early {
             if acc.is_none() {
-                size = 1;
+                self.charge(Built {
+                    terms: 1,
+                    ..Built::default()
+                })?;
             }
-            acc = Some(self.charged(acc.or(Some(Term::Unit)), s, &mut size)?);
+            acc = Some(self.charged(acc.or(Some(Term::Unit)), s)?);
         }
         Ok(acc)
     }
 
-    /// `step` applied to `acc`, whose size is `size`, and the result charged
-    /// ([`Self::charge`]): the nodes the step adds ([`Step::added`]) are
-    /// counted from the step itself, so `acc` is not walked again.
-    fn charged(&mut self, acc: Option<Term>, step: Step, size: &mut usize) -> R<Term> {
-        *size = match acc {
-            None => 0,
-            Some(_) => *size + step.added(),
-        };
-        let term = apply(acc, step);
-        if *size == 0 {
-            *size = term.size();
-        }
-        self.charge(*size, &term)?;
+    /// `step` applied to `acc`, and the nodes it built charged
+    /// ([`Self::charge`]): neither `acc` nor a term the step holds is walked
+    /// again.
+    fn charged(&mut self, acc: Option<Term>, step: Step) -> R<Term> {
+        let (term, built) = apply_counted(acc, step, &mut self.fail_memo);
+        self.charge(built)?;
         Ok(term)
     }
 
@@ -2794,6 +2923,13 @@ impl Ctx<'_> {
     /// binder it reads. A block in the `where` correlates on every element's
     /// names (section 3).
     fn pattern(&mut self, sc: &mut Scope, pattern: &Pattern) -> R<()> {
+        // A scope reads its whole pattern, the patterns nested in it
+        // included, a bounded number of times before typing it (the
+        // lookahead, the product and membership checks, each filter's
+        // names): charged here, since a pattern nested `d` deep is read
+        // again at each level.
+        let left = usize::try_from(self.work.remaining()).unwrap_or(usize::MAX);
+        self.spend(WorkKind::Typing, SyntaxSize::of(pattern, left))?;
         if let Some(fix) = aggregate_filter_fix(self.catalog, pattern, self.in_write) {
             return Err(fix);
         }
@@ -2838,10 +2974,12 @@ impl Ctx<'_> {
             let before = sc.cols.len();
             let (steps, binders) = (sc.steps.len(), sc.binders);
             sc.reads.clear();
+            let entered = self.enter(element_word(c), pattern.spans.elements.get(i));
             let typed = self.element(sc, c);
+            self.work.leave(entered);
             if self.guard(sc.recover, typed)?.is_none() {
                 sc.block_buf.clear();
-                for col in sc.cols.drain(before..) {
+                for col in sc.truncate_cols(before) {
                     sc.bound_at.remove(&col.name);
                 }
                 sc.steps.truncate(steps);
@@ -2879,12 +3017,21 @@ impl Ctx<'_> {
             if written.is_some() {
                 self.at = written;
             }
-            let before: Vec<String> = sc.visible().into_iter().map(|c| c.name).collect();
+            // One set of the names bound before the `where`, shared by its
+            // conjuncts.
+            let before: std::rc::Rc<HashSet<String>> =
+                std::rc::Rc::new(sc.visible().into_iter().map(|c| c.name).collect());
             for conj in conjuncts(predicate) {
-                sc.pending
-                    .push(Pending::Filter(conj.clone(), before.clone(), written));
+                sc.pending.push(Pending::Filter(
+                    conj.clone(),
+                    std::rc::Rc::clone(&before),
+                    written,
+                ));
             }
-            self.flush(sc, false)?;
+            let entered = self.enter("the `where`", pattern.spans.predicate.as_ref());
+            let flushed = self.flush(sc, false);
+            self.work.leave(entered);
+            flushed?;
         }
         // The product rule is a typing rule: a refused element is of the
         // error type and passes it, joining the components it names, and a
@@ -3037,6 +3184,12 @@ impl Ctx<'_> {
                 format!("`${var}` is already a parameter or a named relation"),
             ));
         }
+        // A leaf is charged where it is built; the scope's fold charges
+        // only the nodes over it.
+        self.charge(Built {
+            terms: 1,
+            ..Built::default()
+        })?;
         sc.push_binder(
             Step::Leaf(Term::Scan {
                 var: var.to_string(),
@@ -3111,21 +3264,24 @@ impl Ctx<'_> {
                 ));
             }
         }
+        // The two ends as the scope binds them: a lookup each, never a
+        // scan of every column in scope, so a pattern's triples are typed
+        // in time linear in their number.
         let mut bindings: HashMap<String, BoundVariable> = HashMap::new();
-        for c in sc.visible() {
-            match &c.ty {
-                Ty::Node { type_name, .. } => {
+        for end in [&t.src, &t.dst] {
+            match sc.local(end).or_else(|| sc.outer_col(end)).map(|c| &c.ty) {
+                Some(Ty::Node { type_name, .. }) => {
                     bindings.insert(
-                        c.name.clone(),
+                        end.clone(),
                         BoundVariable::Node {
                             type_name: type_name.clone(),
                         },
                     );
                 }
-                Ty::Edge { .. } => {
-                    bindings.insert(c.name.clone(), BoundVariable::Edge);
+                Some(Ty::Edge { .. }) => {
+                    bindings.insert(end.clone(), BoundVariable::Edge);
                 }
-                Ty::Value(_) => {}
+                Some(Ty::Value(_)) | None => {}
             }
         }
         let catalogue = match &t.selector {
@@ -3139,14 +3295,15 @@ impl Ctx<'_> {
                 "this release does not support a catalogue edge (`@property`, `@from`, …) yet",
             ));
         }
-        let mut declared_nodes = sc.declared_nodes.clone();
-        for c in sc.visible() {
-            if matches!(c.ty, Ty::Node { .. }) {
-                declared_nodes.insert(c.name.clone());
-            }
-        }
+        let declared_node = |end: &String| {
+            sc.declared_nodes.contains(end)
+                || matches!(
+                    sc.local(end).or_else(|| sc.outer_col(end)).map(|c| &c.ty),
+                    Some(Ty::Node { .. })
+                )
+        };
         if matches!(t.selector, EdgeSelector::Wildcard)
-            && (!declared_nodes.contains(&t.src) || !declared_nodes.contains(&t.dst))
+            && (!declared_node(&t.src) || !declared_node(&t.dst))
         {
             return Err(err(
                 T5,
@@ -3299,7 +3456,7 @@ impl Ctx<'_> {
             sc.push_binder(expand, &binds);
         } else {
             // Neither end bound: an independent pattern, correlated in.
-            let leaf = apply(
+            let (leaf, mut built) = apply_counted(
                 Some(Term::Scan {
                     var: from.clone(),
                     ty: Ty::Node {
@@ -3308,7 +3465,10 @@ impl Ctx<'_> {
                     },
                 }),
                 expand,
+                &mut self.fail_memo,
             );
+            built.terms += 1;
+            self.charge(built)?;
             binds.insert(
                 0,
                 Col {
@@ -3327,7 +3487,7 @@ impl Ctx<'_> {
     fn optional(&mut self, sc: &mut Scope, pattern: &Pattern) -> R<()> {
         self.flush(sc, false)?;
         let before: Vec<String> = sc.visible().iter().map(|c| c.name.clone()).collect();
-        let mut inner = sc.inner_scope(sc.visible());
+        let mut inner = self.inner_scope(sc, sc.visible())?;
         inner.inner = false;
         inner.block = true;
         inner.optional = true;
@@ -3391,8 +3551,7 @@ impl Ctx<'_> {
             LetValue::Expr(_) => None,
         };
         if let Some(r) = rel {
-            // A bound relation is charged as it is bound, drawn or not.
-            self.charge(r.term.size(), &r.term)?;
+            // A bound relation was charged as it was built, drawn or not.
             sc.rels.insert(name.to_string(), r);
             return Ok(());
         }
@@ -3499,7 +3658,7 @@ impl Ctx<'_> {
                 "read the outer `${variable}` without binding it inside the block, or write the filter as a conjunct of the `where`"
             ))));
         }
-        let mut probe = sc.inner_scope(outer.to_vec());
+        let mut probe = self.inner_scope(sc, outer.to_vec())?;
         probe.recover = false;
         probe.inner = false;
         probe.correlates = true;
@@ -3575,7 +3734,7 @@ impl Ctx<'_> {
             None => sc.visible(),
         };
         self.re_mention_only(sc, block, &outer)?;
-        let mut inner = sc.inner_scope(outer);
+        let mut inner = self.inner_scope(sc, outer)?;
         inner.inner = false;
         inner.block = true;
         let mark = self.refusals.len();
@@ -3628,7 +3787,7 @@ impl Ctx<'_> {
                     RelArg::Inline(b) => b,
                     _ => unreachable!(),
                 };
-                let mut inner = sc.inner_scope(sc.visible());
+                let mut inner = self.inner_scope(sc, sc.visible())?;
                 inner.inner = true;
                 let r = self.read_body(body, inner)?;
                 for f in &r.free {
@@ -3713,6 +3872,9 @@ impl Ctx<'_> {
 
     fn rel_var(&mut self, sc: &mut Scope, v: &str) -> R<Rel> {
         if let Some(r) = sc.rels.get(v).cloned() {
+            // The named relation's tree, charged at each draw: the expanded
+            // tree holds it once per draw.
+            self.charge_expansion(&r.term)?;
             for f in &r.free {
                 sc.col(f);
             }
@@ -3883,7 +4045,10 @@ impl Ctx<'_> {
                 left: acc.term.boxed(),
                 right: arm.term.boxed(),
             };
-            self.charge(term.size(), &term)?;
+            self.charge(Built {
+                terms: 1,
+                ..Built::default()
+            })?;
             acc = Rel {
                 term,
                 ty: RelTy { cols },
@@ -4648,9 +4813,23 @@ impl Ctx<'_> {
         // The body of a read typed once per declaration, so a read called
         // many times (each caller calling the next twice) is not typed
         // again at each call.
+        // The expanded tree is charged at every call site (the RFC's `Call`
+        // rule): the body's nodes are charged as it is typed, and its tree
+        // again at each later site that shares it.
         let (term, ty, shaped) = match self.typed_calls.get(&c.name) {
-            Some(typed) if self.assume.is_empty() => typed.clone(),
+            Some((term, ty, shaped, below)) if self.assume.is_empty() => {
+                let typed = (term.clone(), ty.clone(), shaped.clone());
+                let below = below.clone();
+                self.expanding = std::iter::once(c.name.clone())
+                    .chain(below.iter().cloned())
+                    .collect();
+                self.charge_expansion(&typed.0)?;
+                self.expanding.clear();
+                self.calls_below = std::iter::once(c.name.clone()).chain(below).collect();
+                typed
+            }
             _ => {
+                self.calls_below.clear();
                 self.frames.push(Frame {
                     decl: c.name.clone(),
                     params: params.clone(),
@@ -4662,22 +4841,35 @@ impl Ctx<'_> {
                     term, ty, shaped, ..
                 } = out?.rel;
                 if self.assume.is_empty() && !reaches_recursion(&term) {
-                    self.typed_calls
-                        .insert(c.name.clone(), (term.clone(), ty.clone(), shaped.clone()));
+                    self.typed_calls.insert(
+                        c.name.clone(),
+                        (
+                            term.clone(),
+                            ty.clone(),
+                            shaped.clone(),
+                            self.calls_below.clone(),
+                        ),
+                    );
                 }
+                self.calls_below.insert(0, c.name.clone());
                 (term, ty, shaped)
             }
         };
+        let bindings: Vec<(String, IRExpr)> = params
+            .iter()
+            .map(|(p, _)| p.clone())
+            .zip(bindings.iter().map(SExpr::to_ir))
+            .collect();
+        self.charge(Built {
+            terms: 1,
+            exprs: bindings.iter().map(|(_, e)| ir_nodes(e)).sum(),
+            steps: 0,
+        })?;
         let term = Term::Call {
             name: c.name.clone(),
-            bindings: params
-                .iter()
-                .map(|(p, _)| p.clone())
-                .zip(bindings.iter().map(SExpr::to_ir))
-                .collect(),
+            bindings,
             body: term.boxed(),
         };
-        self.charge(term.size(), &term)?;
         Ok(Rel {
             term,
             ty,
@@ -5343,6 +5535,7 @@ impl Ctx<'_> {
     fn expr(&mut self, sc: &mut Scope, e: &Expr, at: At) -> R<SExpr> {
         crate::stack::deep(|| {
             self.typed_exprs += 1;
+            self.spend(WorkKind::Typing, 1)?;
             let sub = at;
             let boolean = Ty::scalar(ScalarType::Bool, false);
             Ok(match e {
@@ -5762,6 +5955,7 @@ impl Ctx<'_> {
                     operands.reverse();
                     // Each node of the chain is an expression typed.
                     self.typed_exprs += operands.len().saturating_sub(2);
+                    self.spend(WorkKind::Typing, operands.len().saturating_sub(2))?;
                     let what = if and { "`and`" } else { "`or`" };
                     // `a and b` evaluates `b` only where `a` is not false, `a or
                     // b` only where `a` is not true: each operand guards every
@@ -5949,7 +6143,16 @@ impl Ctx<'_> {
                         }
                         let typed = self.expr(sc, e, At::Value);
                         sc.truncate_guards(depth);
-                        typed_at.push(typed.as_ref().ok().cloned());
+                        // Kept only where a later argument's guard reads it:
+                        // `if`'s condition, `coalesce`'s arguments before
+                        // its last. Copying every argument would copy a
+                        // nested `if`'s whole else branch at each level.
+                        let read_later = match name {
+                            "if" => position == 0,
+                            "coalesce" => position + 1 < c.args.len(),
+                            _ => false,
+                        };
+                        typed_at.push(read_later.then(|| typed.as_ref().ok().cloned()).flatten());
                         match typed {
                             Ok(v) => args.push(v),
                             Err(e) => {
@@ -6141,16 +6344,18 @@ impl Ctx<'_> {
                 }
                 "if" => {
                     no_options(c)?;
-                    let [cnd, a, b] = args.as_slice() else {
+                    // The arguments are moved, never copied: a nested `if`'s
+                    // else branch holds the rest of the chain.
+                    let Ok([cnd, a, b]) = <[SExpr; 3]>::try_from(args) else {
                         return Err(err(T7, "`if(c, a, b)` takes three arguments"));
                     };
-                    require_bool(cnd, "`if`'s condition")?;
-                    let ty = common(a, b, "if")?;
-                    let (a, b) = (fit(a.clone(), &ty), fit(b.clone(), &ty));
+                    require_bool(&cnd, "`if`'s condition")?;
+                    let ty = common(&a, &b, "if")?;
+                    let (a, b) = (fit(a, &ty), fit(b, &ty));
                     SExpr::new(
                         SKind::Call {
                             func: "if".into(),
-                            args: vec![cnd.clone(), a, b],
+                            args: vec![cnd, a, b],
                             options: Vec::new(),
                         },
                         ty,
@@ -6165,12 +6370,14 @@ impl Ctx<'_> {
                     // there takes the other argument's type.
                     let mut ty = first.ty.clone();
                     for (i, a) in args.iter().enumerate().skip(1) {
+                        let null;
                         let so_far = if i == 1 {
-                            first.clone()
+                            first
                         } else {
-                            SExpr::new(SKind::Null, ty.clone())
+                            null = SExpr::new(SKind::Null, ty.clone());
+                            &null
                         };
-                        ty = common(&so_far, a, "coalesce")?;
+                        ty = common(so_far, a, "coalesce")?;
                     }
                     let all_null = args.iter().all(|a| a.ty.nullable());
                     let ty = ty.with_nullable(all_null);
@@ -6227,17 +6434,83 @@ enum RelArg<'a> {
 // ---------------------------------------------------------------------------
 // Folding steps into terms.
 
-fn apply(acc: Option<Term>, step: Step) -> Term {
-    let correlate = |acc: Option<Term>, t: Term| match acc {
+/// The term nodes and expression nodes a construction built, the work the
+/// plan budget charges for it ([`crate::budget`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Built {
+    terms: usize,
+    exprs: usize,
+    /// Term nodes rewritten rather than built, charged as typing work.
+    steps: usize,
+}
+
+impl Built {
+    fn node(&mut self, exprs: usize) {
+        self.terms += 1;
+        self.exprs += exprs;
+    }
+}
+
+/// [`Term::can_fail`] over the terms one compile builds, each shared
+/// subterm walked once: a term built over earlier ones (a scope's fold, a
+/// block over its inner read) reads their verdicts instead of walking them
+/// again. It keeps every subterm it has a verdict for alive, so no address
+/// it holds is reused for another term.
+#[derive(Default)]
+struct FailMemo {
+    known: HashMap<*const Term, bool>,
+    alive: Vec<Arc<Term>>,
+}
+
+impl FailMemo {
+    fn term(&mut self, t: &Term) -> bool {
+        crate::stack::deep(|| {
+            t.fails_here()
+                || match t {
+                    Term::Fuse { arms, .. } => arms.iter().any(|a| self.term(a)),
+                    other => other.shared_children().into_iter().any(|c| self.shared(c)),
+                }
+        })
+    }
+
+    fn shared(&mut self, t: &Arc<Term>) -> bool {
+        let at = Arc::as_ptr(t);
+        if let Some(fails) = self.known.get(&at) {
+            return *fails;
+        }
+        let fails = self.term(t);
+        self.known.insert(at, fails);
+        self.alive.push(Arc::clone(t));
+        fails
+    }
+}
+
+/// The nodes of a bound expression.
+fn ir_nodes(e: &IRExpr) -> usize {
+    let mut n = 0;
+    e.visit_nodes(|_| n += 1);
+    n
+}
+
+/// [`apply`], and the nodes it built: a term the step holds (a leaf, an
+/// `optional`'s pattern, a block's inner term) was charged when it was
+/// built and is not counted again.
+fn apply_counted(acc: Option<Term>, step: Step, memo: &mut FailMemo) -> (Term, Built) {
+    let mut built = Built::default();
+    let correlate = |acc: Option<Term>, t: Term, built: &mut Built, memo: &mut FailMemo| match acc {
         None => t,
-        Some(a) => Term::Correlate {
-            outer: a.boxed(),
-            fails: t.can_fail(),
-            inner: t.boxed(),
-        },
+        Some(a) => {
+            built.node(0);
+            let inner = t.boxed();
+            Term::Correlate {
+                outer: a.boxed(),
+                fails: memo.shared(&inner),
+                inner,
+            }
+        }
     };
-    match step {
-        Step::Leaf(t) => correlate(acc, t),
+    let term = match step {
+        Step::Leaf(t) => correlate(acc, t, &mut built, memo),
         Step::Expand {
             src,
             dst,
@@ -6250,6 +6523,7 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
             semi,
         } => {
             let target = semi.clone().unwrap_or_else(|| dst.clone());
+            built.node(0);
             let e = Term::Expand {
                 input: acc.unwrap_or(Term::Unit).boxed(),
                 src,
@@ -6263,9 +6537,8 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
             };
             match semi {
                 None => e,
-                Some(t) => Term::Filter {
-                    input: e.boxed(),
-                    pred: SExpr::new(
+                Some(t) => {
+                    let pred = SExpr::new(
                         SKind::Cmp {
                             op: CompOp::Eq,
                             left: SExpr::new(
@@ -6287,22 +6560,29 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
                         },
                         Ty::scalar(ScalarType::Bool, false),
                     )
-                    .to_ir(),
-                    fails: false,
-                },
+                    .to_ir();
+                    built.node(ir_nodes(&pred));
+                    Term::Filter {
+                        input: e.boxed(),
+                        pred,
+                        fails: false,
+                    }
+                }
             }
         }
         Step::Filter { blocks, pred } => {
             // The conjunct can fail where its predicate or a block it reads
             // can: the one computation of it the planner reads (A3).
-            let fails = pred.can_fail || blocks.iter().any(BlockAgg::can_fail);
-            let t = with_blocks(acc.unwrap_or(Term::Unit), blocks);
+            let fails = pred.can_fail || blocks.iter().any(|b| b.can_fail(memo));
+            let t = with_blocks(acc.unwrap_or(Term::Unit), blocks, &mut built, memo);
             if matches!(pred.kind, SKind::Lit(Literal::Bool(true))) {
-                return t;
+                return (t, built);
             }
+            let pred = pred.to_ir();
+            built.node(ir_nodes(&pred));
             Term::Filter {
                 input: t.boxed(),
-                pred: pred.to_ir(),
+                pred,
                 fails,
             }
         }
@@ -6311,11 +6591,13 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
             name,
             value,
         } => {
-            let t = with_blocks(acc.unwrap_or(Term::Unit), blocks);
+            let t = with_blocks(acc.unwrap_or(Term::Unit), blocks, &mut built, memo);
+            let value_ir = value.to_ir();
+            built.node(ir_nodes(&value_ir));
             Term::Project {
                 input: t.boxed(),
                 fails: value.can_fail,
-                items: vec![(name, value.to_ir())],
+                items: vec![(name, value_ir)],
                 keep: true,
             }
         }
@@ -6337,10 +6619,16 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
             } else {
                 Term::Env(env.clone())
             };
+            // The row, the `Correlate` and `Group` over the pattern, the
+            // `Filter` on its absence, the padding `Project` and the `Union`;
+            // the `Correlate` with the outer rows is counted where it is
+            // built.
+            built.terms += 6;
+            built.exprs += 1;
             let unmatched = Term::Filter {
                 input: Term::Correlate {
                     outer: row.boxed(),
-                    fails: inner.can_fail(),
+                    fails: memo.shared(&inner),
                     inner: Term::Group {
                         input: Arc::clone(&inner),
                         keys: Vec::new(),
@@ -6349,27 +6637,43 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
                     .boxed(),
                 }
                 .boxed(),
-                pred: not_exists(&col).to_ir(),
+                pred: {
+                    let pred = not_exists(&col).to_ir();
+                    built.exprs += ir_nodes(&pred);
+                    pred
+                },
                 fails: false,
             };
             // The arms of a `Union` match by name, so the unmatched row
             // holds every column `p` holds, in `p`'s order: the outer
             // columns it reads, and null in each column it adds, the names
             // it binds and the ones its lowering made up alike.
-            let items = output_columns(&inner)
+            // Each column is looked up, never searched for, so the row
+            // costs what it holds.
+            let types = column_types(&inner);
+            let first = |cols: &[Col]| -> HashMap<String, Ty> {
+                let mut at = HashMap::with_capacity(cols.len());
+                for c in cols {
+                    at.entry(c.name.clone()).or_insert_with(|| c.ty.clone());
+                }
+                at
+            };
+            let (env_at, new_at) = (first(&env), first(&new_cols));
+            let items: Vec<(String, IRExpr)> = output_columns(&inner)
                 .into_iter()
                 .filter_map(|name| {
-                    if let Some(c) = env.iter().find(|c| c.name == name) {
-                        let read = SExpr::new(SKind::Col(c.name.clone()), c.ty.clone());
+                    if let Some(ty) = env_at.get(&name) {
+                        let read = SExpr::new(SKind::Col(name.clone()), ty.clone());
                         return Some((name, read.to_ir()));
                     }
-                    let ty = match new_cols.iter().find(|c| c.name == name) {
-                        Some(c) => c.ty.with_nullable(true).expr_type(),
-                        None => nullable_type(column_type(&inner, &name)?),
+                    let ty = match new_at.get(&name) {
+                        Some(ty) => ty.with_nullable(true).expr_type(),
+                        None => nullable_type(types.get(&name)?.clone()),
                     };
                     Some((name, IRExpr::Literal(Literal::Null, ty)))
                 })
                 .collect();
+            built.exprs += items.len();
             correlate(
                 Some(acc.unwrap_or(Term::Unit)),
                 Term::Union {
@@ -6382,9 +6686,12 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
                     }
                     .boxed(),
                 },
+                &mut built,
+                memo,
             )
         }
-    }
+    };
+    (term, built)
 }
 
 /// A block typed in an expression: its inner term, the column its aggregate
@@ -6412,15 +6719,8 @@ struct BlockGuard {
 impl BlockAgg {
     /// The block can fail where it is evaluated: its inner term or its
     /// aggregate's argument.
-    fn can_fail(&self) -> bool {
-        self.inner.can_fail() || self.agg.arg.as_ref().is_some_and(IRExpr::can_fail)
-    }
-
-    /// The nodes [`with_blocks`] adds for the block: `Correlate` and
-    /// `Group` over its inner term, and for a guarded block a `Project` per
-    /// guard column it computes and the inner `Filter` on its guard.
-    fn added(&self) -> usize {
-        2 + self.inner.size() + self.guard.as_ref().map_or(0, |g| g.columns.len() + 1)
+    fn can_fail(&self, memo: &mut FailMemo) -> bool {
+        memo.term(&self.inner) || self.agg.arg.as_ref().is_some_and(IRExpr::can_fail)
     }
 }
 
@@ -6429,7 +6729,7 @@ impl BlockAgg {
 /// outer row (`Project`) and its inner term's `Env` row is kept only where
 /// that column holds, so on an outer row the guard rejects the block reads
 /// nothing and evaluates nothing: `count` 0, every other aggregate null.
-fn with_blocks(mut t: Term, blocks: Vec<BlockAgg>) -> Term {
+fn with_blocks(mut t: Term, blocks: Vec<BlockAgg>, built: &mut Built, memo: &mut FailMemo) -> Term {
     for BlockAgg {
         inner,
         col,
@@ -6441,25 +6741,31 @@ fn with_blocks(mut t: Term, blocks: Vec<BlockAgg>) -> Term {
             None => inner,
             Some(BlockGuard { columns, column }) => {
                 for (name, guard) in columns {
+                    let guard_ir = guard.to_ir();
+                    built.node(ir_nodes(&guard_ir));
                     t = Term::Project {
                         input: t.boxed(),
                         fails: guard.can_fail,
-                        items: vec![(name, guard.to_ir())],
+                        items: vec![(name, guard_ir)],
                         keep: true,
                     };
                 }
-                condition_env(inner, &column)
+                condition_env(inner, &column, built)
             }
         };
+        // The `Group` with its aggregate and the `Correlate`.
+        built.node(1 + agg.arg.as_ref().map_or(0, ir_nodes));
+        built.node(0);
         let inner = Term::Group {
             input: inner.boxed(),
             keys: Vec::new(),
             aggs: vec![(col, agg)],
-        };
+        }
+        .boxed();
         t = Term::Correlate {
             outer: t.boxed(),
-            fails: inner.can_fail(),
-            inner: inner.boxed(),
+            fails: memo.shared(&inner),
+            inner,
         };
     }
     t
@@ -6468,12 +6774,17 @@ fn with_blocks(mut t: Term, blocks: Vec<BlockAgg>) -> Term {
 /// `t` with its `Env` row (the leaf its own steps were built on) kept only
 /// where the outer Boolean column `guard` holds; the `Env` exposes `guard`
 /// beside the columns it already read.
-fn condition_env(t: Term, guard: &str) -> Term {
+fn condition_env(t: Term, guard: &str, built: &mut Built) -> Term {
     crate::stack::deep(|| {
         let boolean = Ty::scalar(ScalarType::Bool, false);
-        let step = |input: Arc<Term>| Arc::new(condition_env(Arc::unwrap_or_clone(input), guard));
+        // Each node on the way down to the `Env` is rebuilt: a step of the
+        // type checker's work.
+        built.steps += 1;
+        let mut step =
+            |input: Arc<Term>| Arc::new(condition_env(Arc::unwrap_or_clone(input), guard, built));
         match t {
             Term::Env(mut cols) => {
+                built.node(1);
                 cols.push(Col {
                     name: guard.to_string(),
                     ty: boolean.clone(),
@@ -6548,25 +6859,6 @@ fn condition_env(t: Term, guard: &str) -> Term {
     })
 }
 
-impl Step {
-    /// How many nodes [`apply`] adds above a present `acc`, read from the
-    /// step without building them.
-    fn added(&self) -> usize {
-        let blocks = |blocks: &[BlockAgg]| blocks.iter().map(BlockAgg::added).sum::<usize>();
-        match self {
-            Step::Leaf(t) => 1 + t.size(),
-            Step::Expand { semi, .. } => 1 + usize::from(semi.is_some()),
-            Step::Filter { blocks: b, pred } => {
-                blocks(b) + usize::from(!matches!(pred.kind, SKind::Lit(Literal::Bool(true))))
-            }
-            Step::Let { blocks: b, .. } => blocks(b) + 1,
-            // Correlate, Union, Project, Filter, Correlate, the row, Group,
-            // and the inner term, which both arms of the `Union` share.
-            Step::Optional { inner, .. } => 7 + inner.size(),
-        }
-    }
-}
-
 /// The guard a lazy row's later operand is evaluated under, over the
 /// earlier operand `e` as it was typed: the rows where `e` is `when`, a null
 /// `e` selected when `on_null`. `b` in `a and b` runs where `a` is true or
@@ -6600,106 +6892,134 @@ fn reaches_recursion(t: &Term) -> bool {
 /// The column names a term produces (types are not needed by the fold).
 /// The type of the column `name` that `t` outputs, from the node that
 /// adds it.
-fn column_type(t: &Term, name: &str) -> Option<ExprType> {
-    crate::stack::deep(|| match t {
-        Term::Unit => None,
-        Term::Env(cols) => cols
-            .iter()
-            .find(|c| c.name == name)
-            .map(|c| c.ty.expr_type()),
-        Term::Scan { var, ty } => (var == name).then(|| ty.expr_type()),
-        Term::Expand {
-            input,
-            dst,
-            dst_type,
-            edges,
-            edge_var,
-            ..
-        } => {
-            if dst == name {
-                Some(ExprType::Node {
-                    type_name: dst_type.clone(),
-                })
-            } else if edge_var.as_deref() == Some(name) {
-                Some(ExprType::Edge {
-                    type_name: edges
-                        .members()
-                        .iter()
-                        .map(|m| m.edge_type.as_str())
-                        .collect::<Vec<_>>()
-                        .join("|"),
-                })
-            } else {
-                column_type(input, name)
+/// The type of each column `t` adds, by name: [`output_columns`]'s names,
+/// each with the type of the node that adds it, the first such node where
+/// two do (an item over its input, an outer column over an inner one), in
+/// one walk.
+fn column_types(t: &Term) -> HashMap<String, ExprType> {
+    crate::stack::deep(|| {
+        // `first` holds the names that take precedence over `then`'s.
+        let over = |mut then: HashMap<String, ExprType>, first: HashMap<String, ExprType>| {
+            then.extend(first);
+            then
+        };
+        let listed = |pairs: Vec<(String, ExprType)>| {
+            let mut out = HashMap::with_capacity(pairs.len());
+            for (n, ty) in pairs {
+                out.entry(n).or_insert(ty);
             }
-        }
-        Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
-            column_type(input, name)
-        }
-        Term::Project {
-            input, items, keep, ..
-        } => match items.iter().find(|(n, _)| n == name) {
-            Some((_, e)) => Some(e.ty().clone()),
-            None if *keep => column_type(input, name),
-            None => None,
-        },
-        Term::Group { keys, aggs, .. } => keys
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, e)| e.ty().clone())
-            .or_else(|| {
-                aggs.iter()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, a)| a.ty.expr_type())
-            }),
-        Term::Correlate { outer, inner, .. } => {
-            column_type(outer, name).or_else(|| column_type(inner, name))
-        }
-        Term::Union { left, .. } => column_type(left, name),
-        Term::Score {
-            input, kind, out, ..
-        } => {
-            if out == name {
-                Some(ExprType::Value {
-                    scalar: match kind {
+            out
+        };
+        let value = |scalar| ExprType::Value {
+            scalar,
+            list: false,
+            nullable: false,
+        };
+        match t {
+            Term::Unit => HashMap::new(),
+            Term::Env(cols) => listed(
+                cols.iter()
+                    .map(|c| (c.name.clone(), c.ty.expr_type()))
+                    .collect(),
+            ),
+            Term::Scan { var, ty } => HashMap::from([(var.clone(), ty.expr_type())]),
+            Term::Expand {
+                input,
+                dst,
+                dst_type,
+                edges,
+                edge_var,
+                ..
+            } => {
+                let mut own = Vec::new();
+                own.push((
+                    dst.clone(),
+                    ExprType::Node {
+                        type_name: dst_type.clone(),
+                    },
+                ));
+                if let Some(e) = edge_var {
+                    own.push((
+                        e.clone(),
+                        ExprType::Edge {
+                            type_name: edges
+                                .members()
+                                .iter()
+                                .map(|m| m.edge_type.as_str())
+                                .collect::<Vec<_>>()
+                                .join("|"),
+                        },
+                    ));
+                }
+                over(column_types(input), listed(own))
+            }
+            Term::Filter { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
+                column_types(input)
+            }
+            Term::Project {
+                input, items, keep, ..
+            } => {
+                let own = listed(
+                    items
+                        .iter()
+                        .map(|(n, e)| (n.clone(), e.ty().clone()))
+                        .collect(),
+                );
+                if *keep {
+                    over(column_types(input), own)
+                } else {
+                    own
+                }
+            }
+            Term::Group { keys, aggs, .. } => over(
+                listed(
+                    aggs.iter()
+                        .map(|(n, a)| (n.clone(), a.ty.expr_type()))
+                        .collect(),
+                ),
+                listed(
+                    keys.iter()
+                        .map(|(n, e)| (n.clone(), e.ty().clone()))
+                        .collect(),
+                ),
+            ),
+            Term::Correlate { outer, inner, .. } => over(column_types(inner), column_types(outer)),
+            Term::Union { left, .. } => column_types(left),
+            Term::Score {
+                input, kind, out, ..
+            } => over(
+                column_types(input),
+                HashMap::from([(
+                    out.clone(),
+                    value(match kind {
                         ScoreKind::Distance => ScalarType::F32,
                         ScoreKind::Bm25 => ScalarType::F64,
-                    },
-                    list: false,
-                    nullable: false,
-                })
-            } else {
-                column_type(input, name)
+                    }),
+                )]),
+            ),
+            Term::ApproxTopK { input, out, .. } => over(
+                column_types(input),
+                HashMap::from([(out.clone(), value(ScalarType::F32))]),
+            ),
+            Term::Fuse {
+                arms, target, out, ..
+            } => {
+                let mut own = HashMap::from([(out.clone(), value(ScalarType::F64))]);
+                if target != out
+                    && let Some(ty) = arms.iter().find_map(|a| column_types(a).remove(target))
+                {
+                    own.insert(target.clone(), ty);
+                }
+                own
             }
+            Term::Fix { body, .. } | Term::Call { body, .. } => column_types(body),
+            Term::RecRef { ty, .. } => listed(
+                ty.cols
+                    .iter()
+                    .map(|c| (c.name.clone(), c.ty.expr_type()))
+                    .collect(),
+            ),
         }
-        Term::ApproxTopK { input, out, .. } => {
-            if out == name {
-                Some(ExprType::Value {
-                    scalar: ScalarType::F32,
-                    list: false,
-                    nullable: false,
-                })
-            } else {
-                column_type(input, name)
-            }
-        }
-        Term::Fuse {
-            arms, target, out, ..
-        } => {
-            if out == name {
-                Some(ExprType::Value {
-                    scalar: ScalarType::F64,
-                    list: false,
-                    nullable: false,
-                })
-            } else if target == name {
-                arms.iter().find_map(|a| column_type(a, name))
-            } else {
-                None
-            }
-        }
-        Term::Fix { body, .. } | Term::Call { body, .. } => column_type(body, name),
-        Term::RecRef { ty, .. } => ty.get(name).map(|c| c.ty.expr_type()),
     })
 }
 
@@ -6759,8 +7079,9 @@ fn output_columns(t: &Term) -> Vec<String> {
             .collect(),
         Term::Correlate { outer, inner, .. } => {
             let mut v = output_columns(outer);
+            let mut seen: HashSet<String> = v.iter().cloned().collect();
             for c in output_columns(inner) {
-                if !v.contains(&c) {
+                if seen.insert(c.clone()) {
                     v.push(c);
                 }
             }
@@ -7078,24 +7399,6 @@ fn is_exists_of(pred: &IRExpr, col: &str) -> bool {
         )
 }
 
-fn call_chain(t: &Term, out: &mut Vec<String>) {
-    // Pre-order, each stored node once: a shared subterm names its calls
-    // where it is first reached.
-    let mut seen: HashSet<*const Term> = HashSet::new();
-    let mut pending = vec![t];
-    while let Some(node) = pending.pop() {
-        if !seen.insert(node as *const Term) {
-            continue;
-        }
-        if let Term::Call { name, .. } = node
-            && !out.contains(name)
-        {
-            out.push(name.clone());
-        }
-        pending.extend(node.children().into_iter().rev());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Helpers.
 
@@ -7274,6 +7577,22 @@ fn adapt(e: SExpr, other: &Ty) -> SExpr {
             }
         }
         _ => e,
+    }
+}
+
+/// The type [`adapt`] gives `e` against `other`, read without copying `e`:
+/// only a literal, or a negated one, takes its context's type, and copying
+/// any other operand would copy a nested branch at each level.
+fn adapted_type(e: &SExpr, other: &Ty) -> Ty {
+    let literal = match &e.kind {
+        SKind::Lit(_) => true,
+        SKind::Neg(inner) => matches!(inner.kind, SKind::Lit(_)),
+        _ => false,
+    };
+    if literal {
+        adapt(e.clone(), other).ty.clone()
+    } else {
+        e.ty.clone()
     }
 }
 
@@ -7739,12 +8058,12 @@ fn null_comparison(op: CompOp, left: &Expr, right: &Expr, written: &SourceSpan) 
 }
 
 fn common(a: &SExpr, b: &SExpr, what: &str) -> R<Ty> {
-    let a2 = adapt(a.clone(), &b.ty);
-    let b2 = adapt(b.clone(), &a2.ty);
-    let nullable = a2.ty.nullable() || b2.ty.nullable();
-    match (&a2.ty, &b2.ty) {
+    let a_ty = adapted_type(a, &b.ty);
+    let b_ty = adapted_type(b, &a_ty);
+    let nullable = a_ty.nullable() || b_ty.nullable();
+    match (&a_ty, &b_ty) {
         (Ty::Value(x), Ty::Value(y)) if x.scalar == y.scalar && x.list == y.list => {
-            Ok(a2.ty.with_nullable(nullable))
+            Ok(a_ty.with_nullable(nullable))
         }
         (Ty::Value(x), Ty::Value(y))
             if x.scalar.is_numeric() && y.scalar.is_numeric() && !x.list && !y.list =>
@@ -8462,7 +8781,7 @@ fn pending_vars(p: &Pending, sc: &Scope) -> Vec<String> {
 /// The variables a filter waits for: those it names outside its blocks, and
 /// those a block names that were bound before the filter was written (the
 /// rest are the block's own).
-fn filter_vars(e: &Expr, before: &[String], out: &mut Vec<String>) {
+fn filter_vars(e: &Expr, before: &HashSet<String>, out: &mut Vec<String>) {
     let mut all = Vec::new();
     expr_vars(e, &mut all);
     let mut in_blocks = Vec::new();
@@ -8498,6 +8817,97 @@ fn expr_vars_outside_blocks(e: &Expr, out: &mut Vec<String>) {
 }
 
 /// Every direct operand of an expression that is not a block.
+/// The syntax nodes of a pattern, counted until they pass `limit`: its
+/// elements, every expression node, and the patterns, blocks and inline
+/// reads nested in it. The count stops at the limit, so reading a pattern
+/// for its size costs at most the budget left.
+struct SyntaxSize {
+    n: usize,
+    limit: usize,
+}
+
+impl SyntaxSize {
+    fn of(p: &Pattern, limit: usize) -> usize {
+        let mut size = Self { n: 0, limit };
+        size.pattern(p);
+        size.n
+    }
+
+    /// Count `k` nodes; whether to go on.
+    fn add(&mut self, k: usize) -> bool {
+        self.n = self.n.saturating_add(k);
+        self.n <= self.limit
+    }
+
+    fn pattern(&mut self, p: &Pattern) -> bool {
+        crate::stack::deep(|| {
+            for e in &p.elements {
+                let more = self.add(1)
+                    && match e {
+                        Element::Optional(q) => self.pattern(q),
+                        Element::Let {
+                            value: LetValue::Expr(x),
+                            ..
+                        } => self.expr(x),
+                        Element::Let {
+                            value: LetValue::Relation(body),
+                            ..
+                        }
+                        | Element::From {
+                            rel: RelExpr::Inline(body),
+                            ..
+                        } => self.body(body),
+                        Element::From {
+                            rel: RelExpr::Call(c),
+                            ..
+                        } => self.call(c),
+                        Element::From { .. } | Element::Binding { .. } | Element::Traversal(_) => {
+                            true
+                        }
+                    };
+                if !more {
+                    return false;
+                }
+            }
+            p.predicate.as_ref().is_none_or(|w| self.expr(w))
+        })
+    }
+
+    fn body(&mut self, b: &ReadBody) -> bool {
+        self.pattern(&b.pattern)
+            && b.projections.iter().all(|p| self.expr(&p.expr))
+            && b.order.iter().all(|o| self.expr(&o.expr))
+    }
+
+    fn expr(&mut self, e: &Expr) -> bool {
+        crate::stack::deep(|| {
+            if !self.add(1) {
+                return false;
+            }
+            match e {
+                Expr::Block(b) => {
+                    self.pattern(&b.pattern) && b.arg.as_deref().is_none_or(|a| self.expr(a))
+                }
+                Expr::Call(c) => self.call(c),
+                other => {
+                    let mut more = true;
+                    for_each_child(other, &mut |child| more = more && self.expr(child));
+                    more
+                }
+            }
+        })
+    }
+
+    fn call(&mut self, c: &Call) -> bool {
+        self.add(1)
+            && c.args.iter().all(|a| match a {
+                Arg::Expr(e) => self.expr(e),
+                Arg::Inline(body) => self.body(body),
+            })
+            && c.options.iter().all(|(_, e)| self.expr(e))
+    }
+}
+
 fn for_each_child(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     match e {
         Expr::Literal(_)
@@ -8549,6 +8959,17 @@ fn statement_names(s: &Stmt) -> Vec<String> {
 /// naming one of the error type is of the error type; a name read inside an
 /// expression or an inner scope is of the error type where it is read, so
 /// the rest of that expression or scope is still checked.
+/// How a refusal names the element `c`.
+fn element_word(c: &Element) -> &'static str {
+    match c {
+        Element::Let { .. } => "the `let`",
+        Element::From { .. } => "the `from`",
+        Element::Optional(_) => "the `optional`",
+        Element::Binding { .. } => "the binding",
+        Element::Traversal(_) => "the traversal",
+    }
+}
+
 fn element_names(c: &Element) -> Vec<String> {
     let mut out = match c {
         Element::Optional(_) => Vec::new(),

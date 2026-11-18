@@ -175,9 +175,74 @@ pub struct AdjacencyProof {
     pub version_window: Option<(u64, u64)>,
 }
 
+/// A read's plan budget as the planner charges it ([`omnigraph_compiler::budget`]):
+/// the meter, resumed from what typing and shaping charged, and the shape's
+/// size, which every pass over the plan is charged. Both are functions of
+/// the read and the schema, never of the snapshot, so a read charges the
+/// same planning work on every snapshot and every run.
+pub struct QueryWork {
+    pub meter: omnigraph_compiler::budget::PlanWork,
+    /// The read's shape steps, its return items and order keys
+    /// ([`omnigraph_compiler::shape::read::ReadShape::size`]).
+    pub steps: usize,
+    pub name: String,
+}
+
+impl QueryWork {
+    pub fn of(read: &omnigraph_compiler::shape::read::ReadShape) -> Self {
+        let meter = omnigraph_compiler::budget::PlanWork::resume(read.work);
+        meter.phase(format!("planning `{}`", read.name));
+        Self {
+            meter,
+            steps: read.size(),
+            name: read.name.clone(),
+        }
+    }
+
+    fn charged(
+        &self,
+        kind: omnigraph_compiler::budget::WorkKind,
+        n: usize,
+    ) -> Result<(), PlanError> {
+        self.meter
+            .charge(kind, n)
+            .map_err(|overrun| PlanError::Unsupported(Box::new(overrun.refusal(&self.name, &[]))))
+    }
+
+    /// Charge one planner pass over the plan: the shape's size.
+    pub fn pass(&self) -> Result<(), PlanError> {
+        self.charged(omnigraph_compiler::budget::WorkKind::Planning, self.steps)
+    }
+
+    /// Charge one shape step resolved into the logical plan.
+    pub fn step(&self) -> Result<(), PlanError> {
+        self.charged(omnigraph_compiler::budget::WorkKind::Planning, 1)
+    }
+
+    /// Charge `states` states a plan search explored: each candidate a rule
+    /// considers (a join order of a pattern block, an access path), before
+    /// it is considered, so a search stops at the budget.
+    pub fn explore(&self, states: usize) -> Result<(), PlanError> {
+        self.charged(omnigraph_compiler::budget::WorkKind::Planning, states)
+    }
+}
+
+/// Charge one planner pass to the read's plan budget, when `source` plans a
+/// read that carries one.
+pub(crate) fn charge_pass(source: &dyn PlanSource) -> Result<(), PlanError> {
+    source.query_work().map_or(Ok(()), QueryWork::pass)
+}
+
 /// The planner's whole view of the store. Implemented by the engine over its
 /// pinned snapshot; implemented in memory by the planner's own tests.
 pub trait PlanSource {
+    /// The plan budget of the read being planned, which resolution, every
+    /// pass and every plan search charge; `None` when the source plans no
+    /// read (a diff, a merge, a load, a write), or for a test source.
+    fn query_work(&self) -> Option<&QueryWork> {
+        None
+    }
+
     /// Render a key value only when its identity agrees with supported persisted rows.
     fn canonical_key_id(
         &self,

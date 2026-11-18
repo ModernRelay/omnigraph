@@ -478,6 +478,13 @@ impl IRExpr {
 
     /// Visit every node, each before its children, without recursing on a
     /// user-sized expression tree.
+    /// The expression's nodes: the plan budget's measure of it.
+    pub fn nodes(&self) -> usize {
+        let mut n = 0;
+        self.visit_nodes(|_| n += 1);
+        n
+    }
+
     pub fn visit_nodes(&self, mut visit: impl FnMut(&Self)) {
         let mut pending = vec![self];
         while let Some(expr) = pending.pop() {

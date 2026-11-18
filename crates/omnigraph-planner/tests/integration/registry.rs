@@ -361,6 +361,7 @@ fn documents_query() -> Operation {
         limit_param: None,
         written_columns: Vec::new(),
         made_up: Default::default(),
+        work: Default::default(),
     }))
 }
 

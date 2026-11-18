@@ -137,6 +137,11 @@ pub struct Assumptions {
     /// Retained even when rewrites remove an expansion, for historical replay admission.
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_wildcard_traversal: bool,
+    /// The read's plan budget and the work typing, shaping and planning
+    /// charged to it ([`omnigraph_compiler::budget`]): a function of the read
+    /// and the schema, which a replay's compile must charge again exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_work: Option<omnigraph_compiler::budget::WorkRecord>,
     /// The fingerprint of every catalogue table the plan read, keyed by
     /// table key: the binary's rows and schema for that type. A replay is
     /// refused by a binary whose catalogue fingerprints differ.

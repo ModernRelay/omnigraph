@@ -2,9 +2,7 @@
 //! 10, "Type-check tests"), the RFC's examples type-checked, and one repair
 //! per type-level refusal shape.
 
-use super::{
-    BlockAgg, CheckedDecl, SExpr, SKind, Step, apply, check_source, count_rows, type_source,
-};
+use super::{BlockAgg, CheckedDecl, SExpr, SKind, Step, check_source, count_rows, type_source};
 use crate::catalog::{Catalog, build_catalog};
 use crate::ir::core::*;
 use crate::query::syntax::parse::parse_source;
@@ -770,10 +768,14 @@ fn a_run_of_optionals_grows_the_term_linearly() {
     for n in [3, 8, 30, 100] {
         assert_eq!(size(n), one + (n - 1) * step, "{n} optionals");
     }
-    // Past the budget the read is refused, after the term reaches it.
-    let n = 4096 / step + 1;
+    // Past the budget the read is refused: each node of its term is
+    // charged, and more work besides.
+    let n = DEFAULT_PLAN_BUDGET / step + 1;
     let m = refused(&read(n), "T70");
-    assert!(m.contains("plan budget of 4096"), "{m}");
+    assert!(
+        m.contains(&format!("plan budget of {DEFAULT_PLAN_BUDGET}")),
+        "{m}"
+    );
 }
 
 /// The plan budget is charged as the term is built: an expansion that
@@ -784,13 +786,13 @@ fn a_run_of_optionals_grows_the_term_linearly() {
 /// levels fit the budget.
 #[test]
 fn a_plan_budget_overrun_stops_as_the_term_is_built() {
-    // How far the build went: the first term over the 4096-node budget, at
-    // most one doubling past it, never the 2^30 nodes of the whole
+    // How far the build went: the work charged when it passed the budget,
+    // at most one shared body past it, never the 2^30 nodes of the whole
     // expansion.
     let largest = |source: &str| -> usize {
         let work = super::typing_work(&catalog(), source);
         let (_, first) = &work[0];
-        first.largest_term
+        first.work.total() as usize
     };
     let mut nested = String::from("$q30: Person, $q29 knows $q30");
     for i in (1..30).rev() {
@@ -804,7 +806,10 @@ fn a_plan_budget_overrun_stops_as_the_term_is_built() {
     );
     ok(&source);
     let built = largest(&source);
-    assert!(built < 1024, "30 nested optionals charge {built} nodes");
+    assert!(
+        built < 4096,
+        "30 nested optionals charge {built} work units"
+    );
     let mut reads = vec!["query r30() { match { $p: Person } return { $p } }".to_string()];
     for i in (0..30).rev() {
         reads.push(format!(
@@ -819,7 +824,8 @@ fn a_plan_budget_overrun_stops_as_the_term_is_built() {
     assert!(m.contains("plan budget") && m.contains("r1 → r2"), "{m}");
     assert!(!super::typing_work(&catalog(), &source)[0].1.accepted);
     let built = largest(&source);
-    assert!((4096..3 * 4096).contains(&built), "{built}: {m}");
+    let budget = crate::ir::core::DEFAULT_PLAN_BUDGET;
+    assert!((budget..3 * budget).contains(&built), "{built}: {m}");
 }
 
 /// A declared read is typed once per declaration however often it is
@@ -848,7 +854,7 @@ fn a_called_read_is_typed_once_however_often_it_is_called() {
         .into_iter()
         .map(|(_, work)| {
             assert!(work.accepted);
-            work.exprs
+            work.typed_exprs
         })
         .collect();
     let steps: Vec<usize> = work.windows(2).map(|w| w[0] - w[1]).collect();
@@ -901,7 +907,7 @@ fn guarded_blocks_are_typed_once_each_and_capture_no_name() {
                     panic!("one declaration");
                 };
                 assert!(work.accepted, "{form}: {source}");
-                work.exprs
+                work.typed_exprs
             })
             .collect();
         let steps: Vec<usize> = work.windows(2).map(|w| w[1] - w[0]).collect();
@@ -921,8 +927,8 @@ fn guarded_blocks_are_typed_once_each_and_capture_no_name() {
     );
 }
 
-/// [`Step::added`] counts exactly the nodes [`apply`] adds above a present
-/// term, for every kind of step.
+/// [`super::apply_counted`] charges exactly the nodes a step adds above a
+/// present term, and the expressions they hold, for every kind of step.
 #[test]
 fn a_step_counts_the_nodes_it_adds() {
     let truth = SExpr::new(
@@ -980,9 +986,28 @@ fn a_step_counts_the_nodes_it_adds() {
         },
     ];
     for step in steps {
-        let added = step.added();
-        let built = apply(Some(Term::Unit), step).size() - 1;
-        assert_eq!(added, built);
+        // The nodes of the terms the step holds were charged when they were
+        // built; the step charges every other node it adds, and the
+        // expressions they hold.
+        let held: Vec<&Term> = match &step {
+            Step::Leaf(t) => vec![t],
+            Step::Filter { blocks, .. } | Step::Let { blocks, .. } => {
+                blocks.iter().map(|b| &b.inner).collect()
+            }
+            Step::Optional { inner, .. } => vec![inner],
+            Step::Expand { .. } => Vec::new(),
+        };
+        let held_nodes: usize = held.iter().map(|t| t.size()).sum();
+        let held_exprs: usize = held
+            .iter()
+            .flat_map(|t| t.stored_nodes())
+            .map(Term::expr_nodes)
+            .sum();
+        let (term, built) =
+            super::apply_counted(Some(Term::Unit), step, &mut super::FailMemo::default());
+        assert_eq!(built.terms + held_nodes, term.size() - 1, "{term:?}");
+        let exprs: usize = term.stored_nodes().into_iter().map(Term::expr_nodes).sum();
+        assert_eq!(built.exprs + held_exprs, exprs, "{term:?}");
     }
 }
 

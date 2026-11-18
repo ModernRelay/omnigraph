@@ -451,11 +451,16 @@ query ordered_person($name: String) {
 /// choose, Tokio's defaults: an `or` chain of 10,000 terms and arithmetic
 /// nested in 1,000 brackets. Every walk over them grows its own stack (an
 /// `or` chain of 200 terms once overflowed a debug server's worker and
-/// aborted the process).
+/// aborted the process). The chain's compile work, about 80,000 units, is
+/// past the default plan budget: the operator raises the ceiling and the
+/// chain declares its budget.
 #[test]
 fn remote_read_deep_past_the_corpus_keeps_the_server_serving() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
-    let server = spawn_server_with_cluster_default_stack(cluster.path());
+    let server = spawn_server_with_cluster_default_stack(
+        cluster.path(),
+        &[("OMNIGRAPH_PLAN_BUDGET_LIMIT", "1000000")],
+    );
     let temp = tempfile::tempdir().unwrap();
     let chain = (0..10_000)
         .map(|i| format!("$p.name = \"n{i}\""))
@@ -469,7 +474,7 @@ fn remote_read_deep_past_the_corpus_keeps_the_server_serving() {
     fs::write(
         &deep,
         format!(
-            "query chain() {{ match {{ $p: Person }} where {chain} or $p.name = \"Alice\" return {{ count($p) as n }} }}\n\
+            "query chain() @budget(plan = 1000000) {{ match {{ $p: Person }} where {chain} or $p.name = \"Alice\" return {{ count($p) as n }} }}\n\
              query nested() {{ match {{ $p: Person }} where {nested} > 29 return {{ count($p) as n }} }}"
         ),
     )

@@ -352,6 +352,9 @@ pub(super) struct Work {
     pub term_nodes: usize,
     pub expr_nodes: usize,
     pub steps: usize,
+    /// The work the plan budget is charged with when `q` is typed and
+    /// shaped ([`crate::budget`]).
+    pub charged: crate::budget::WorkSpent,
     /// The `optional` padding rows' columns, apart from `expr_nodes`.
     pub padding: usize,
 }
@@ -373,12 +376,21 @@ pub(super) fn measure(catalog: &Catalog, source: &str) -> Result<Work, String> {
     let nodes = stored_nodes(&read.term, &mut seen);
     let (shape, visited) = ReadShape::of_measured(&read, catalog);
     let shape = shape.map_err(|e| e.to_string())?;
+    // Every node of the expanded tree was charged as it was built.
+    let tree = read.term.size();
+    if (shape.work.spent.term_nodes as usize) < tree {
+        return Err(format!(
+            "{tree} term nodes, {} charged",
+            shape.work.spent.term_nodes
+        ));
+    }
     let padding = padding(&nodes);
     Ok(Work {
         term_nodes: nodes.len(),
         expr_nodes: nodes.iter().map(|t| term_exprs(t)).sum::<usize>() + shape_exprs(&shape)
             - padding,
-        steps: w.exprs + visited,
+        steps: w.typed_exprs + visited,
+        charged: shape.work.spent,
         padding,
     })
 }
@@ -408,6 +420,8 @@ fn linear(works: &[Work]) -> bool {
         counts(|w| w.term_nodes),
         counts(|w| w.expr_nodes),
         counts(|w| w.steps),
+        // The expanded tree, charged as it is built.
+        counts(|w| w.charged.term_nodes as usize),
     ]
     .iter()
     .all(|d| d[1..].iter().all(|x| *x == d[1]))
@@ -487,5 +501,153 @@ fn compile_work_table() {
                 break;
             }
         }
+    }
+}
+
+/// The budgets a refusal's cost is measured at: the work at refusal must
+/// stay within twice each, so it grows with the budget, not the source.
+const REFUSAL_BUDGETS: [usize; 3] = [256, 1024, 4096];
+
+/// `q` declaring `budget`, with `elements` in its `match` and returning
+/// `returned`, then `decls`.
+fn declared(budget: usize, elements: &str, returned: &str, decls: &[String]) -> String {
+    let mut source = format!(
+        "query q() @budget(plan = {budget}) {{ match {{ {elements} }} return {{ {returned} }} }}"
+    );
+    for d in decls {
+        source.push('\n');
+        source.push_str(d);
+    }
+    source
+}
+
+/// A chain of `n` conjuncts bound by a `let`: about four typing units and
+/// four expression nodes each.
+fn conjunct_chain(n: usize) -> String {
+    let chain: Vec<String> = (0..n).map(|i| format!("$p.age > {i}")).collect();
+    format!("$p: Person, let $b = {}", chain.join(" and "))
+}
+
+/// A chain of `n` triples: no expression, one term node each.
+fn triple_chain(n: usize) -> String {
+    let triples: Vec<String> = (1..=n)
+        .map(|i| format!("$p{} knows $p{i}", i - 1))
+        .collect();
+    format!("$p0: Person, {}", triples.join(", "))
+}
+
+/// Reads that each call the next twice, `depth` deep: an expanded tree of
+/// 2^depth bodies, each body typed once.
+fn doubling_calls(depth: usize) -> Vec<String> {
+    let mut reads = Vec::new();
+    for i in 1..depth {
+        reads.push(format!(
+            "query r{i}() {{ match {{ from union(r{}(), r{}()) }} return {{ $p }} }}",
+            i + 1,
+            i + 1
+        ));
+    }
+    reads.push(format!(
+        "query r{depth}() {{ match {{ $p: Person }} return {{ $p }} }}"
+    ));
+    reads
+}
+
+/// A read built to pass its plan budget is refused with `T70` by the charge
+/// that passes it, with at most twice the budget's work done, whatever the
+/// size of the source, in every kind of work: typing (a long `and` chain,
+/// read and typed node by node), expression nodes (a shorter chain typed
+/// within the budget, whose stored nodes pass it), term nodes (reads that
+/// each call the next twice, sixteen times the budget expanded, each shared
+/// body charged at a later call site by a walk that stops at the budget
+/// left), the read
+/// of a long pattern (a chain of triples) and shaping (the shaper on a read
+/// typed under a larger budget). The planner's share is the planner's test
+/// (`query_plan::a_plan_past_its_budget_stops_within_twice_the_budget`).
+/// The refusal names the construct whose work grew and how much it charged,
+/// and advises no larger budget.
+#[test]
+fn a_compile_past_its_budget_stops_within_twice_the_budget_in_every_kind() {
+    use crate::budget::WorkKind;
+    let catalog = catalog();
+    let refused = |source: &str, budget: usize, kind: Option<WorkKind>| {
+        let work = super::super::typing_work(&catalog, source);
+        let (_, w) = work.into_iter().find(|(n, _)| n == "q").expect("q");
+        assert!(!w.accepted, "accepted:\n{source}");
+        let overrun = w.overrun.expect("refused by the budget");
+        let message = w.refusals[0].message.clone();
+        assert_eq!(w.refusals[0].code.as_str(), "T70", "{message}");
+        assert!(message.contains("grew the most, charging"), "{message}");
+        assert!(!message.contains("@budget"), "{message}");
+        if let Some(kind) = kind {
+            assert_eq!(overrun.kind, kind, "{budget}: {message}");
+        }
+        let total = overrun.spent.total() as usize;
+        assert!(
+            (budget + 1..=2 * budget).contains(&total),
+            "{budget}: {total}: {message}"
+        );
+        message
+    };
+    for budget in REFUSAL_BUDGETS {
+        refused(
+            &declared(budget, &conjunct_chain(budget), "$p.handle, $b", &[]),
+            budget,
+            Some(WorkKind::Typing),
+        );
+        refused(
+            &declared(
+                budget,
+                &conjunct_chain(budget * 3 / 32),
+                "$p.handle, $b",
+                &[],
+            ),
+            budget,
+            Some(WorkKind::ExprNodes),
+        );
+        // The shared bodies' nodes are charged together with the
+        // expressions they hold; term nodes are most of the work.
+        let calls = declared(
+            budget,
+            "from union(r1(), r1())",
+            "$p",
+            &doubling_calls(budget.ilog2() as usize + 4),
+        );
+        let message = refused(&calls, budget, None);
+        assert!(message.contains("q → r1 → r2"), "{message}");
+        let work = super::super::typing_work(&catalog, &calls);
+        let spent = work[0].1.overrun.as_ref().expect("refused").spent;
+        assert!(
+            WorkKind::ALL
+                .iter()
+                .all(|k| spent.of(*k) <= spent.term_nodes),
+            "{budget}: {spent:?}"
+        );
+        refused(
+            &declared(budget, &triple_chain(2 * budget), "$p0.handle", &[]),
+            budget,
+            None,
+        );
+        // Shaping: the triple chain typed under a larger budget, shaped
+        // under one that leaves `budget` units for the shaper.
+        let source = declared(65_536, &triple_chain(budget), "$p0.handle", &[]);
+        let work = super::super::typing_work(&catalog, &source);
+        let Some(CoreDecl::Read(mut read)) = work.into_iter().next().unwrap().1.core else {
+            panic!("the chain types under the larger budget");
+        };
+        let typed = read.work.0.spent.total() as usize;
+        read.work.0.limit = (typed + budget) as u64;
+        let (shaped, visited) = ReadShape::of_measured(&read, &catalog);
+        let Err(crate::shape::ShapeError::OverBudget { overrun, .. }) = shaped else {
+            panic!("shaped past its budget");
+        };
+        assert_eq!(overrun.kind, WorkKind::Shaping);
+        let shaping = overrun.spent.shaping as usize;
+        assert_eq!(shaping, visited, "one unit per node the shaper visited");
+        assert_eq!(
+            shaping,
+            budget + 1,
+            "the shaper stops at its first node past"
+        );
     }
 }

@@ -3539,3 +3539,52 @@ fn every_single_plan_edit_is_refused_or_replays_the_run() {
 fn every_single_plan_edit_is_refused_or_replays_the_run_at_nightly_breadth() {
     plan_acceptance_law(300, 100);
 }
+
+/// A run's plan records its read's plan budget and the work typing, shaping
+/// and planning charged to it, a function of the read and the schema alone:
+/// the replay's compile charges the same work again, so a plan whose
+/// recorded compile work was edited, or that records none, is refused.
+#[tokio::test]
+async fn a_plan_records_its_plan_budget_work_and_a_replay_charges_it_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = citations(&dir).await;
+    let run = db
+        .query_inspected(
+            ReadTarget::branch("main"),
+            CITATION_QUERIES,
+            "cited",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let work = run
+        .plan
+        .plan
+        .assumptions()
+        .plan_work
+        .expect("the plan records its plan-budget work");
+    assert_eq!(
+        work.limit,
+        omnigraph_compiler::ir::core::DEFAULT_PLAN_BUDGET as u64
+    );
+    for kind in omnigraph_compiler::budget::WorkKind::ALL {
+        assert!(work.spent.of(kind) > 0, "{kind:?}: {work:?}");
+    }
+    assert!(work.spent.total() <= work.limit, "{work:?}");
+    replayed(&db, CITATION_QUERIES, "cited", &ParamMap::new()).await;
+    for edit in [
+        (|object: &mut serde_json::Map<String, Value>| {
+            if let Some(work) = object.get_mut("plan_work") {
+                let typing = work["spent"]["typing"].as_u64().unwrap();
+                work["spent"]["typing"] = serde_json::json!(typing + 1);
+            }
+        }) as fn(&mut serde_json::Map<String, Value>),
+        |object| {
+            object.remove("plan_work");
+        },
+    ] {
+        let mut edit = edit;
+        let error = edited_replay_refusal(&mut edit).await;
+        assert!(error.to_string().contains("plan-budget work"), "{error}");
+    }
+}

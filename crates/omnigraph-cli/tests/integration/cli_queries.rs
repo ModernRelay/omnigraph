@@ -793,24 +793,24 @@ fn a_declared_plan_budget_above_plan_budget_limit_is_refused() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
-    let within = "query q() @budget(plan = 30) { match { $p: Person } return { $p.name } }";
-    let above = "query q() @budget(plan = 31) { match { $p: Person } return { $p.name } }";
+    let within = "query q() @budget(plan = 100) { match { $p: Person } return { $p.name } }";
+    let above = "query q() @budget(plan = 101) { match { $p: Person } return { $p.name } }";
     output_success(
         embedded("query", &graph)
             .arg("-e")
             .arg(within)
             .arg("--set")
-            .arg("plan_budget_limit=30"),
+            .arg("plan_budget_limit=100"),
     );
     let stderr = stderr_string(&output_failure(
         embedded("query", &graph)
             .arg("-e")
             .arg(above)
             .arg("--set")
-            .arg("plan_budget_limit=30"),
+            .arg("plan_budget_limit=100"),
     ));
     assert!(
-        stderr.contains("T89") && stderr.contains("`plan_budget_limit` = 30"),
+        stderr.contains("T89") && stderr.contains("`plan_budget_limit` = 100"),
         "{stderr}"
     );
 
@@ -820,17 +820,17 @@ fn a_declared_plan_budget_above_plan_budget_limit_is_refused() {
             .arg("-e")
             .arg(within)
             .arg("--set")
-            .arg("plan_budget_limit=30"),
+            .arg("plan_budget_limit=100"),
     );
     let stderr = stderr_string(&output_failure(
         served("query", &server)
             .arg("-e")
             .arg(above)
             .arg("--set")
-            .arg("plan_budget_limit=30"),
+            .arg("plan_budget_limit=100"),
     ));
     assert!(
-        stderr.contains("T89") && stderr.contains("`plan_budget_limit` = 30"),
+        stderr.contains("T89") && stderr.contains("`plan_budget_limit` = 100"),
         "{stderr}"
     );
 }

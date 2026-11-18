@@ -161,6 +161,7 @@ fn query(two: bool) -> ReadShape {
         limit_param: None,
         written_columns: Vec::new(),
         made_up: Default::default(),
+        work: Default::default(),
     }
 }
 fn prepared(query: &ReadShape, source: &ProbeSource) -> Decision {

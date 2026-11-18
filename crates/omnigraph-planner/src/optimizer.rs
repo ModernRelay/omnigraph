@@ -39,7 +39,7 @@ use crate::physical::{
     OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankScope,
     RankedAccess, ScanInput, StatisticSource, TextContains,
 };
-use crate::source::{NodeTypeSpec, PlanSource, SideId};
+use crate::source::{NodeTypeSpec, PlanSource, SideId, charge_pass};
 use crate::validate::subset::{Role, Rule, Tracer};
 
 pub const ROW_ID: &str = "_rowid";
@@ -343,6 +343,7 @@ fn resolve_query(
         limit_param,
         written_columns,
         made_up: _,
+        work: _,
     } = ir;
     if let (Some(param), None) = (limit_param, limit) {
         return Err(PlanError::Internal(format!(
@@ -466,8 +467,16 @@ fn resolve_pipeline(
     next_binding: &mut u16,
     seed: Option<LogicalId>,
 ) -> Result<LogicalId, PlanError> {
+    // The pattern block's one join order, the written one: the state this
+    // planner explores; a join enumeration charges each order it considers.
+    if let Some(work) = source.query_work() {
+        work.explore(1)?;
+    }
     let mut current: Option<LogicalId> = seed;
     for op in ops {
+        if let Some(work) = source.query_work() {
+            work.step()?;
+        }
         let node = match op {
             PatternStep::NodeScan {
                 variable,
@@ -1870,6 +1879,7 @@ pub(crate) fn rewrite_with(
     let mut fired = Vec::new();
     let query = is_query_plan(plan);
     for pass in PassId::of_stage(PassStage::Rewrite) {
+        charge_pass(source)?;
         let applied = match pass {
             PassId::Resolve => true,
             PassId::PredicatePushdown => {
@@ -1929,6 +1939,10 @@ pub(crate) fn physical_plan_with(
     tracer: &mut Tracer,
 ) -> Result<Optimized, PlanError> {
     let query = is_query_plan(plan);
+    // Every physical and finalizing pass, charged before the stage runs.
+    for _ in PassId::of_stage(PassStage::Physical).chain(PassId::of_stage(PassStage::Finalize)) {
+        charge_pass(source)?;
+    }
     let before = plan
         .schema(plan.root())
         .cloned()

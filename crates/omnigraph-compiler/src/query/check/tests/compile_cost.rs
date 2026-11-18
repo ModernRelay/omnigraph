@@ -6,8 +6,8 @@
 //! guard (`if` and `coalesce`), a run of blocks bound by `let`, and a chain
 //! of declared reads each calling the next once. Two deterministic counts
 //! are measured per size: the expressions the checker types for the read,
-//! each called read typed once, and the term the read's plan budget is
-//! charged with. The law: from the second unit on, each unit adds exactly
+//! each called read typed once, and the term nodes the read's plan budget
+//! is charged with, its expanded tree ([`crate::budget`]). The law: from the second unit on, each unit adds exactly
 //! the same amount to both counts, so neither grows faster than the source;
 //! an exponential construct (an `optional` that copies its outer relation,
 //! a call typed once per call site) fails at the third size.
@@ -126,24 +126,29 @@ fn grown(
 }
 
 /// `(the expressions typing the read types, its callees included once
-/// each, the term its plan budget is charged with)`; every declaration
-/// must be accepted. Each declaration of a source is typed as its own
-/// root, so a sum over a chain of `n` reads would count the chain's tail
-/// `n` times.
+/// each, the term nodes its plan budget is charged with, the expanded
+/// tree)`; every declaration must be accepted. Each declaration of a
+/// source is typed as its own root, so a sum over a chain of `n` reads
+/// would count the chain's tail `n` times.
 fn measure(catalog: &crate::catalog::Catalog, source: &str) -> Result<(usize, usize), String> {
     let work = super::super::typing_work(catalog, source);
     let mut exprs = 0;
-    let mut term = 0;
+    let mut charged = 0;
     for (name, w) in &work {
         if !w.accepted {
             return Err(format!("`{name}` is refused"));
         }
         if name == "q" {
-            exprs = w.exprs;
-            term = w.largest_term;
+            exprs = w.typed_exprs;
+            let Some(crate::ir::core::CoreDecl::Read(read)) = &w.core else {
+                return Err("`q` is not a read".to_string());
+            };
+            let shape = crate::shape::read::ReadShape::of(read, catalog)
+                .map_err(|e| format!("`q` does not shape: {e}"))?;
+            charged = shape.work.spent.term_nodes as usize;
         }
     }
-    Ok((exprs, term))
+    Ok((exprs, charged))
 }
 
 fn law(cases: u32) {
@@ -207,7 +212,7 @@ fn law(cases: u32) {
             .collect();
         if increments[1..].iter().any(|d| *d != increments[1]) {
             return Err(proptest::test_runner::TestCaseError::fail(format!(
-                "{family:?}: (typed expressions, charged term) per size {:?}, increments {increments:?}\n--- schema\n{}\n--- largest read\n{}",
+                "{family:?}: (typed expressions, charged term nodes) per size {:?}, increments {increments:?}\n--- schema\n{}\n--- largest read\n{}",
                 counts.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
                 schema.text(),
                 counts.last().unwrap().1

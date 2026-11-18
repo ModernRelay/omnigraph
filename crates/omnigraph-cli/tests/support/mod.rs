@@ -637,14 +637,20 @@ pub fn spawn_server_with_cluster(cluster_dir: &Path) -> TestServer {
 
 /// Cluster boot with `RUST_MIN_STACK` removed from the server's environment,
 /// so its runtime threads get the stack the binary itself chooses rather
-/// than the test runner's.
-pub fn spawn_server_with_cluster_default_stack(cluster_dir: &Path) -> TestServer {
+/// than the test runner's, and with `envs` set.
+pub fn spawn_server_with_cluster_default_stack(
+    cluster_dir: &Path,
+    envs: &[(&str, &str)],
+) -> TestServer {
     let mut command = server_process();
     command
         .arg("--cluster")
         .arg(cluster_dir)
         .arg("--unauthenticated")
         .env_remove("RUST_MIN_STACK");
+    for (name, value) in envs {
+        command.env(name, value);
+    }
     spawn_server_process(command)
 }
 

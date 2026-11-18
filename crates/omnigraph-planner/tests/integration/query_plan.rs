@@ -203,6 +203,7 @@ fn ir(pipeline: Vec<PatternStep>, returns: Vec<IRExpr>, order_by: Vec<IRExpr>) -
         limit_param: None,
         written_columns: Vec::new(),
         made_up: Default::default(),
+        work: Default::default(),
     }))
 }
 
@@ -355,3 +356,56 @@ mod logical;
 
 #[path = "../query_plan/edge_selections.rs"]
 mod edge_selections;
+
+/// The planner charges the read's plan budget as it plans
+/// (`omnigraph_compiler::budget`): one unit per shape step it resolves and
+/// per join order it explores, and the shape's size for each pass. A read
+/// planned past its budget is refused with `T70` by the charge that passes
+/// it, with at most twice the budget's planning done: a shape of more steps
+/// than the budget stops in resolution, a smaller one in the pass that
+/// passes it.
+#[test]
+fn a_plan_past_its_budget_stops_within_twice_the_budget() {
+    use omnigraph_compiler::budget::WorkRecord;
+    use omnigraph_compiler::query::value::BinaryOp;
+    use omnigraph_planner::{Unrouted, plan_query};
+    for budget in [256usize, 1024, 4096] {
+        for steps in [2 * budget, budget / 4] {
+            let mut pipeline = vec![scan("a")];
+            pipeline.extend((0..steps).map(|i| PatternStep::Filter {
+                pred: IRExpr::binary(
+                    prop("a", "slug"),
+                    BinaryOp::Compare(CompOp::Eq),
+                    IRExpr::Literal(Literal::String(i.to_string()), property_type("slug")),
+                ),
+                fails: false,
+            }));
+            let Operation::Query(mut query) = ir(pipeline, vec![prop("a", "slug")], vec![]) else {
+                unreachable!("a read")
+            };
+            query.work = WorkRecord::fresh(budget as u64);
+            let refused = futures::executor::block_on(plan_query(&query, &source(), &bounds()))
+                .expect_err("planned past its budget");
+            let Unrouted::UnsupportedQuery { diagnostic } = refused else {
+                panic!("{budget}/{steps}: {refused:?}");
+            };
+            assert_eq!(diagnostic.code.as_str(), "T70", "{}", diagnostic.message);
+            let message = &diagnostic.message;
+            let total: usize = message
+                .split(" work units at ")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("no total in {message}"));
+            assert!(
+                (budget + 1..=2 * budget).contains(&total),
+                "{budget}/{steps}: {message}"
+            );
+            assert!(
+                message.contains(&format!("(planning {total})")),
+                "{message}"
+            );
+            assert!(message.contains("planning `q` grew the most"), "{message}");
+        }
+    }
+}

@@ -1313,8 +1313,12 @@ fn deep_expressions_compile_and_run_on_default_thread_stacks() {
     for _ in 0..1_000 {
         nested = format!("({nested} + 0)");
     }
+    // The chain's 10,001 disjuncts are about 80,000 units of compile work:
+    // past the default plan budget, so it declares one under a raised
+    // ceiling. Its stack, not its budget, is what this test holds.
     let queries = format!(
-        "query chain() {{ match {{ $p: Person }} where {chain} or $p.name = \"Alice\" return {{ $p.name }} }}\n\
+        "set plan_budget_limit = 1000000;\n\
+         query chain() @budget(plan = 1000000) {{ match {{ $p: Person }} where {chain} or $p.name = \"Alice\" return {{ $p.name }} }}\n\
          query nested() {{ match {{ $p: Person }} where {nested} > 29 return {{ $p.name }} order {{ $p.name }} }}"
     );
     let run = std::thread::Builder::new()

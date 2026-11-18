@@ -29,6 +29,10 @@ impl From<ShapeError> for PlanError {
             ShapeError::Internal(detail) => {
                 PlanError::Internal(format!("{P006}: the shaper met a defect: {detail}"))
             }
+            over @ ShapeError::OverBudget { .. } => PlanError::Unsupported(Box::new(
+                over.over_budget()
+                    .expect("an over-budget shaping is a refusal"),
+            )),
         }
     }
 }

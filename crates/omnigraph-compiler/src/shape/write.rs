@@ -29,8 +29,7 @@ use crate::catalog::Catalog;
 use crate::ir::IRExpr;
 use crate::ir::IRParam;
 use crate::ir::core::{
-    AssignValue, CoreRead, CoreWrite, DEFAULT_PLAN_BUDGET, MutationTarget, RelTy, Sink, Term, Ty,
-    WriteGroup,
+    AssignValue, CoreRead, CoreWrite, MutationTarget, RelTy, Sink, Term, Ty, WriteGroup,
 };
 use crate::query::file::Param;
 use crate::query::value::{BinaryOp, Literal};
@@ -517,7 +516,8 @@ fn lower_selected(
         defaults: write.defaults.clone(),
         term,
         result: RelTy::default(),
-        plan_budget: DEFAULT_PLAN_BUDGET,
+        plan_budget: write.work.0.limit as usize,
+        work: write.work.clone(),
         fresh: write.fresh.clone(),
     };
     // The selection's refusals point into the group's `match`; the

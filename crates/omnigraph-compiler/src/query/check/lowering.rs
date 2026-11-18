@@ -18,9 +18,12 @@ use crate::shape::read::ReadShape;
 use crate::shape::write::WriteShape;
 use crate::shape::{Construct, ElementKind, ShapeError, Unlowered};
 
+use super::AtSpan;
+
 /// `T86` for the first term of `core` that this release's planner does not
-/// lower. A shaping defect is not the author's refusal: the planner reports
-/// it when the declaration runs.
+/// lower, or `T70` when shaping it passes its plan budget. A shaping defect
+/// is not the author's refusal: the planner reports it when the declaration
+/// runs.
 pub(super) fn admit(
     catalog: &Catalog,
     decl: &Decl,
@@ -32,6 +35,10 @@ pub(super) fn admit(
     };
     match shaped {
         Err(ShapeError::Unlowered(u)) => Err(refusal(decl, &u)),
+        Err(e @ ShapeError::OverBudget { .. }) => Err(e
+            .over_budget()
+            .expect("an over-budget shaping is a refusal")
+            .at_span_of(&decl.at)),
         Ok(()) | Err(ShapeError::Internal(_)) => Ok(()),
     }
 }

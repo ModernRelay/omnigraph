@@ -22,6 +22,7 @@
 //! whole terms. Names are deterministic (fresh names come from a counter per
 //! declaration, [`Fresh`]), so two spellings of one term compare equal.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::expr::IRExpr;
@@ -331,7 +332,13 @@ impl Term {
     /// `Group`'s or an `Order`'s own expressions are read here, since one
     /// appears only inside a `Correlate` or at the read's top.
     pub fn can_fail(&self) -> bool {
-        self.any_node(|node| match node {
+        self.any_node(Self::fails_here)
+    }
+
+    /// Whether this node, its inputs apart, can fail where it is evaluated:
+    /// [`Term::can_fail`] holds when one node of the term does.
+    pub fn fails_here(&self) -> bool {
+        match self {
             Self::Filter { fails, .. }
             | Self::Project { fails, .. }
             | Self::Correlate { fails, .. } => *fails,
@@ -343,7 +350,30 @@ impl Term {
             }
             Self::Order { keys, .. } => keys.iter().any(|(e, _)| e.can_fail()),
             _ => false,
-        })
+        }
+    }
+
+    /// The node's shared inputs (every input but a `Fuse`'s arms, which it
+    /// holds in place).
+    pub fn shared_children(&self) -> Vec<&Arc<Term>> {
+        match self {
+            Self::Unit
+            | Self::Env(_)
+            | Self::Scan { .. }
+            | Self::RecRef { .. }
+            | Self::Fuse { .. } => Vec::new(),
+            Self::Expand { input, .. }
+            | Self::Filter { input, .. }
+            | Self::Project { input, .. }
+            | Self::Group { input, .. }
+            | Self::Order { input, .. }
+            | Self::Cut { input, .. }
+            | Self::Score { input, .. }
+            | Self::ApproxTopK { input, .. } => vec![input],
+            Self::Correlate { outer, inner, .. } => vec![outer, inner],
+            Self::Union { left, right } => vec![left, right],
+            Self::Fix { body, .. } | Self::Call { body, .. } => vec![body],
+        }
     }
 
     /// Every stored node of the term once, pre-order: a subterm two parents
@@ -448,6 +478,92 @@ impl Term {
         self.node().name()
     }
 
+    /// The term nodes and the expression nodes of the expanded tree, as
+    /// [`Term::size`] counts it (a `Call`'s body at each call site, an
+    /// `optional`'s shared pattern once), counted until together they pass
+    /// `limit`: the walk costs at most `limit` steps past the nodes it
+    /// counts, however large the expansion.
+    pub fn weight(&self, limit: usize) -> (usize, usize) {
+        enum Next<'t> {
+            Visit(&'t Term),
+            Mark(*const Term),
+            Unmark(*const Term),
+        }
+        let mut shared: HashMap<*const Term, usize> = HashMap::new();
+        let mut pending = vec![Next::Visit(self)];
+        let (mut terms, mut exprs) = (0usize, 0usize);
+        while let Some(next) = pending.pop() {
+            let node = match next {
+                Next::Visit(node) => node,
+                Next::Mark(at) => {
+                    *shared.entry(at).or_default() += 1;
+                    continue;
+                }
+                Next::Unmark(at) => {
+                    if let Some(n) = shared.get_mut(&at) {
+                        *n -= 1;
+                    }
+                    continue;
+                }
+            };
+            if shared.get(&(node as *const Term)).is_some_and(|n| *n > 0) {
+                continue;
+            }
+            terms += 1;
+            exprs += node.expr_nodes();
+            if terms + exprs > limit {
+                break;
+            }
+            match node {
+                // The left arm is the pattern the right arm tests for
+                // absence: counted once, under the left arm.
+                Self::Union { left, right } => {
+                    let at = Arc::as_ptr(left);
+                    pending.push(Next::Unmark(at));
+                    pending.push(Next::Visit(right));
+                    pending.push(Next::Mark(at));
+                    pending.push(Next::Visit(left));
+                }
+                other => pending.extend(other.children().into_iter().map(Next::Visit)),
+            }
+        }
+        (terms, exprs)
+    }
+
+    /// The expression nodes this node holds, its inputs' apart: the plan
+    /// budget's measure of what a phase copies of it ([`crate::budget`]).
+    pub fn expr_nodes(&self) -> usize {
+        match self {
+            Self::Filter { pred, .. } => pred.nodes(),
+            Self::Project { items, .. } => items.iter().map(|(_, e)| e.nodes()).sum(),
+            Self::Group { keys, aggs, .. } => {
+                keys.iter().map(|(_, e)| e.nodes()).sum::<usize>()
+                    + aggs
+                        .iter()
+                        .map(|(_, a)| 1 + a.arg.as_ref().map_or(0, IRExpr::nodes))
+                        .sum::<usize>()
+            }
+            Self::Order { keys, .. } => keys.iter().map(|(e, _)| e.nodes()).sum(),
+            Self::ApproxTopK { query, .. } => query.nodes(),
+            Self::Score {
+                query: ScoreQuery::Vector(query),
+                ..
+            } => query.nodes(),
+            Self::Call { bindings, .. } => bindings.iter().map(|(_, e)| e.nodes()).sum(),
+            Self::Unit
+            | Self::Env(_)
+            | Self::Scan { .. }
+            | Self::Expand { .. }
+            | Self::Correlate { .. }
+            | Self::Union { .. }
+            | Self::Cut { .. }
+            | Self::Score { .. }
+            | Self::Fuse { .. }
+            | Self::Fix { .. }
+            | Self::RecRef { .. } => 0,
+        }
+    }
+
     /// The node's inputs, in the order a pre-order walk visits them.
     pub fn children(&self) -> Vec<&Term> {
         match self {
@@ -549,6 +665,9 @@ pub struct CoreRead {
     pub result: RelTy,
     /// `@budget(plan = n)`, or the compiler's constant.
     pub plan_budget: usize,
+    /// The plan budget and the work typing charged to it, which shaping and
+    /// planning go on charging ([`crate::budget`]).
+    pub work: crate::budget::WorkSoFar,
     /// The names the type checker made up, with their roles.
     pub fresh: Fresh,
 }
@@ -603,6 +722,9 @@ pub struct CoreWrite {
     pub write_mode: MutationWriteMode,
     /// As [`CoreRead::fresh`].
     pub fresh: Fresh,
+    /// As [`CoreRead::work`]: each group's selection read is shaped against
+    /// it.
+    pub work: crate::budget::WorkSoFar,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -648,8 +770,12 @@ impl Sink {
 }
 
 /// The compiler-wide plan budget when a declaration declares none (the RFC
-/// leaves its value open, Unresolved question 2).
-pub const DEFAULT_PLAN_BUDGET: usize = 4096;
+/// leaves its value open, Unresolved question 3), in the work units of
+/// [`crate::budget`]. The largest charge of a read in the GQT corpus is
+/// 2,506 (`optional_thirty_blocks_run.gqt`: typing, shaping and planning)
+/// and of a generated read 960 (41,732 reads of the generated laws at their
+/// nightly breadth), so the default is thirteen times the corpus's largest.
+pub const DEFAULT_PLAN_BUDGET: usize = 32_768;
 
 /// `rrf`'s defaults.
 pub const RRF_DEFAULT_K: u64 = 60;

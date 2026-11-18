@@ -98,6 +98,7 @@ fn query(order_by: IRExpr) -> ReadShape {
         limit_param: None,
         written_columns: Vec::new(),
         made_up: Default::default(),
+        work: Default::default(),
     }
 }
 
@@ -426,6 +427,7 @@ fn two_docs(filter: Option<IRExpr>) -> PhysicalPlan {
         limit_param: None,
         written_columns: Vec::new(),
         made_up: Default::default(),
+        work: Default::default(),
     };
     futures::executor::block_on(plan_query(&query, &source(), &fixture_bounds::BOUNDS))
         .expect("the query plans")

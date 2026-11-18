@@ -136,6 +136,11 @@ pub enum ShapeError {
     Unlowered(Box<Unlowered>),
     /// The term is not one the type checker produces: a defect.
     Internal(String),
+    /// Shaping the read passed its plan budget ([`crate::budget`]).
+    OverBudget {
+        name: String,
+        overrun: Box<crate::budget::Overrun>,
+    },
 }
 
 impl ShapeError {
@@ -161,8 +166,19 @@ impl std::fmt::Display for ShapeError {
         match self {
             Self::Unlowered(u) => f.write_str(&u.message()),
             Self::Internal(detail) => write!(f, "shaping a checked declaration failed: {detail}"),
+            Self::OverBudget { name, overrun } => write!(f, "`{name}` {overrun}"),
         }
     }
 }
 
 impl std::error::Error for ShapeError {}
+
+impl ShapeError {
+    /// `T70` when shaping passed the plan budget.
+    pub fn over_budget(&self) -> Option<crate::query::diagnostic::QueryDiagnostic> {
+        match self {
+            Self::OverBudget { name, overrun } => Some(overrun.refusal(name, &[])),
+            _ => None,
+        }
+    }
+}

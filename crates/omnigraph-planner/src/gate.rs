@@ -28,7 +28,7 @@ use crate::registry::{Coverage, Entry, Route, coverage, lookup};
 use crate::route::RouteOverride;
 use crate::source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    FragmentStat, IndexFact, NodeTypeSpec, PlanSource, SideId,
+    FragmentStat, IndexFact, NodeTypeSpec, PlanSource, QueryWork, SideId,
 };
 use crate::validate::subset::{Role, Rule, Tracer};
 use crate::validate::{self, AcceptInput, AcceptedPlan, ValidationError};
@@ -39,6 +39,8 @@ use crate::validate::{self, AcceptInput, AcceptedPlan, ValidationError};
 struct Recorded<'s> {
     source: &'s dyn PlanSource,
     read: RefCell<Assumptions>,
+    /// The plan budget of the read being planned.
+    work: Option<QueryWork>,
 }
 
 impl<'s> Recorded<'s> {
@@ -50,6 +52,15 @@ impl<'s> Recorded<'s> {
         Self {
             source,
             read: RefCell::new(read),
+            work: None,
+        }
+    }
+
+    /// The source for planning `query`, which charges its plan budget.
+    fn for_query(source: &'s dyn PlanSource, query: &ReadShape) -> Self {
+        Self {
+            work: Some(QueryWork::of(query)),
+            ..Self::new(source, query.has_wildcard_traversal())
         }
     }
 
@@ -60,6 +71,7 @@ impl<'s> Recorded<'s> {
         assumptions.gate_policy = self.source.gate_policy();
         assumptions.memory_limit = bounds.query_memory_pool_bytes;
         assumptions.read_work_limit = self.source.read_work_limit();
+        assumptions.plan_work = self.work.as_ref().map(|w| w.meter.record());
         assumptions
     }
 
@@ -81,6 +93,10 @@ impl<'s> Recorded<'s> {
 }
 
 impl PlanSource for Recorded<'_> {
+    fn query_work(&self) -> Option<&QueryWork> {
+        self.work.as_ref()
+    }
+
     fn index_facts(&self, dataset_key: &str) -> Vec<IndexFact> {
         self.source.index_facts(dataset_key)
     }
@@ -441,7 +457,7 @@ pub async fn plan_query(
 ) -> Result<PhysicalPlan, Unrouted> {
     let mut optimized = {
         let operation = Operation::Query(Box::new(query.clone()));
-        let recorded = Recorded::new(source, query.has_wildcard_traversal());
+        let recorded = Recorded::for_query(source, query);
         let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
         let mut optimized =
             crate::optimizer::optimize(&mut logical, &recorded, bounds).map_err(Unrouted::of)?;
@@ -508,7 +524,7 @@ pub(crate) fn plan_traced(
     explain: bool,
 ) -> Result<Traced, Unrouted> {
     let operation = Operation::Query(Box::new(query.clone()));
-    let recorded = Recorded::new(source, query.has_wildcard_traversal());
+    let recorded = Recorded::for_query(source, query);
     let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
     let initial = explain.then(|| logical.to_json());
     let mut tracer = Tracer::for_plan(&logical);
@@ -1013,6 +1029,7 @@ mod tests {
             limit_param: None,
             written_columns: Vec::new(),
             made_up: Default::default(),
+            work: Default::default(),
         };
         let source = source.with_explain_dump_dir(dir.path().to_path_buf());
         EXPLAIN_RENDERS.with(|count| count.set(0));

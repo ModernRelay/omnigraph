@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::budget::{PlanWork, WorkKind, WorkRecord};
 use crate::catalog::Catalog;
 use crate::ir::core::{
     Agg, Col, CoreRead, Count, Fresh, FreshRole, LexicalQuery, RRF_DEFAULT_K, ScoreKind,
@@ -72,6 +73,9 @@ pub struct ReadShape {
     /// rule orders their identities after the declared ones. A made-up name
     /// starts with an uppercase letter or `^`, which no written name does.
     pub made_up: std::collections::BTreeSet<String>,
+    /// The read's plan budget and the work typing and shaping charged to
+    /// it, which planning goes on charging ([`crate::budget`]).
+    pub work: WorkRecord,
 }
 
 /// The columns `term` adds to its rows, in the order the core term adds
@@ -415,6 +419,40 @@ impl InnerRead {
 }
 
 impl ReadShape {
+    /// The shape's steps, nested ones included, its return items and its
+    /// order keys: what one planner pass over its plan is charged
+    /// ([`crate::budget`]).
+    pub fn size(&self) -> usize {
+        fn steps(list: &[PatternStep]) -> usize {
+            let mut pending: Vec<&[PatternStep]> = vec![list];
+            let mut n = 0;
+            while let Some(list) = pending.pop() {
+                n += list.len();
+                for step in list {
+                    match step {
+                        PatternStep::AntiJoin { inner, .. }
+                        | PatternStep::Optional { inner, .. }
+                        | PatternStep::Correlate { inner, .. } => pending.push(inner),
+                        PatternStep::Union { arms, .. } => {
+                            pending.extend(arms.iter().map(Vec::as_slice))
+                        }
+                        PatternStep::Fuse { arms, .. } => {
+                            pending.extend(arms.iter().map(|a| a.steps.as_slice()))
+                        }
+                        PatternStep::NodeScan { .. }
+                        | PatternStep::Expand { .. }
+                        | PatternStep::Filter { .. }
+                        | PatternStep::Rank { .. }
+                        | PatternStep::Score { .. }
+                        | PatternStep::Let { .. } => {}
+                    }
+                }
+            }
+            n
+        }
+        steps(&self.pipeline) + self.return_exprs.len() + self.order_by.len()
+    }
+
     pub fn has_edge_selections(&self) -> bool {
         self.any_edge_selection(|edges| edges.named().is_none())
     }
@@ -452,7 +490,7 @@ impl ReadShape {
     /// The shape of `read`, or the term this release's planner does not
     /// lower.
     pub fn of(read: &CoreRead, catalog: &Catalog) -> Result<Self, ShapeError> {
-        Shaper::new(catalog, &read.name, &read.params, &read.fresh).read(read)
+        Shaper::new(catalog, read).read(read)
     }
 
     /// [`ReadShape::of`], and the term nodes the shaper visited.
@@ -461,7 +499,7 @@ impl ReadShape {
         read: &CoreRead,
         catalog: &Catalog,
     ) -> (Result<Self, ShapeError>, usize) {
-        let shaper = Shaper::new(catalog, &read.name, &read.params, &read.fresh);
+        let shaper = Shaper::new(catalog, read);
         let shape = shaper.read(read);
         (shape, shaper.visited.get())
     }
@@ -653,6 +691,10 @@ struct Shaper<'a> {
     /// The term nodes the shaper visited: the compile-cost growth tests
     /// read it.
     visited: std::cell::Cell<usize>,
+    /// The read's plan budget, charged on from where the type checker left
+    /// it: one unit per term node visited and one per expression node it
+    /// holds, which the shape copies.
+    work: PlanWork,
     /// Set while [`Shaper::holds_optional_or_union`] reads one scope's own
     /// facts: a nested inline read is a scope of its own, which contributes
     /// no `optional` or `union` to the scope it is written in, so the probe
@@ -1141,22 +1183,30 @@ fn is_reference(expr: &IRExpr) -> bool {
 }
 
 impl<'a> Shaper<'a> {
-    fn new(
-        catalog: &'a Catalog,
-        name: &'a str,
-        params: &'a [(String, PropType)],
-        fresh: &'a Fresh,
-    ) -> Self {
+    fn new(catalog: &'a Catalog, read: &'a CoreRead) -> Self {
+        let work = PlanWork::resume(*read.work.0);
+        work.phase(format!("lowering `{}`", read.name));
         Self {
             catalog,
-            name,
-            params,
-            fresh,
+            name: &read.name,
+            params: &read.params,
+            fresh: &read.fresh,
             minted: Default::default(),
             visited: Default::default(),
+            work,
             probing: Default::default(),
             lets_minted: Default::default(),
         }
+    }
+
+    /// Charge `n` units of `kind` to the read's plan budget.
+    fn spend(&self, kind: WorkKind, n: usize) -> Result<(), ShapeError> {
+        self.work
+            .charge(kind, n)
+            .map_err(|overrun| ShapeError::OverBudget {
+                name: self.name.to_string(),
+                overrun,
+            })
     }
 
     /// A name this shaper makes up, `Shaped` and then `suffix`: it starts
@@ -1627,8 +1677,20 @@ impl<'a> Shaper<'a> {
                 &mut fresh,
             )?;
         }
+        // The read's own projection, cut and order, and the expressions of
+        // what it returns and orders by, which the shape copies.
+        self.spend(WorkKind::Shaping, 3)?;
+        self.spend(
+            WorkKind::ExprNodes,
+            return_exprs
+                .iter()
+                .map(|p| p.expr.nodes())
+                .chain(order_by.iter().map(|o| o.expr.nodes()))
+                .sum(),
+        )?;
         Ok(ReadShape {
             name: read.name.clone(),
+            work: self.work.record(),
             params: read
                 .params
                 .iter()
@@ -2188,6 +2250,8 @@ impl<'a> Shaper<'a> {
     fn facts(&self, term: &Term, facts: &mut Facts) -> Result<(), ShapeError> {
         crate::stack::deep(|| {
             self.visited.set(self.visited.get() + 1);
+            self.spend(WorkKind::Shaping, 1)?;
+            self.spend(WorkKind::ExprNodes, term.expr_nodes())?;
             match term {
                 Term::Unit | Term::Env(_) => Ok(()),
                 Term::Scan {

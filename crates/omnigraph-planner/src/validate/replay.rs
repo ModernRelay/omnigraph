@@ -194,6 +194,26 @@ pub fn accept_replay(
             ),
         });
     }
+    // The plan budget's work is a function of the read and the schema: the
+    // replay's compile must have charged exactly what the run's did.
+    let recorded = envelope.plan.plan.assumptions().plan_work;
+    let compiled = input.ir.work;
+    let agrees = recorded.is_some_and(|recorded| {
+        recorded.limit == compiled.limit
+            && omnigraph_compiler::budget::WorkSpent {
+                planning: 0,
+                ..recorded.spent
+            } == compiled.spent
+    });
+    if !agrees {
+        return Err(ReplayRefusal::InvalidEvidence {
+            reason: format!(
+                "the plan records plan-budget work {}; the replay's compile charges {:?} before planning",
+                recorded.map_or_else(|| "none".to_string(), |r| format!("{r:?}")),
+                compiled
+            ),
+        });
+    }
     let mut budget = Budget::new(input.limits);
     let (scope, derivation) = check(
         &envelope.plan.plan,

@@ -132,7 +132,7 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         default: "65536",
         scope: SettingScope::Request,
         env: "OMNIGRAPH_PLAN_BUDGET_LIMIT",
-        doc: "the largest plan budget a declaration may declare with `@budget(plan = n)`, the nodes its expanded core term may hold; a declaration declaring more is refused (`T89`) before it is compiled, never clamped",
+        doc: "the largest plan budget a declaration may declare with `@budget(plan = n)`, the work units its compile and plan may charge; a declaration declaring more is refused (`T89`) before it is compiled, never clamped",
     },
     SettingSpec {
         name: "write_max_bytes",

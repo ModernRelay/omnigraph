@@ -17039,7 +17039,7 @@
           },
           "plan_budget_limit": {
             "type": "integer",
-            "description": "the largest plan budget a declaration may declare with `@budget(plan = n)`, the nodes its expanded core term may hold; a declaration declaring more is refused (`T89`) before it is compiled, never clamped",
+            "description": "the largest plan budget a declaration may declare with `@budget(plan = n)`, the work units its compile and plan may charge; a declaration declaring more is refused (`T89`) before it is compiled, never clamped",
             "maximum": 9223372036854775807,
             "minimum": 1
           },
