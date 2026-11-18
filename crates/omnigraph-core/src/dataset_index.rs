@@ -277,6 +277,40 @@ pub async fn key_column_uncovered_tail(
     Ok(Some(widest))
 }
 
+/// The current fragments of `ds` on which every index keyed on `column` is a
+/// BTREE that covers them, under [`key_column_index_coverage`]'s rule: on
+/// these Lance answers a `column IN (...)` test from the index and plans no
+/// filter, and on every other fragment it plans the filter, with its own copy
+/// of the key list. Empty when no BTREE can serve the column (none, another
+/// index kind, a segment that does not report its coverage, a fragment
+/// without `physical_rows`), since Lance then filters every fragment.
+pub async fn key_column_covered_fragments(ds: &Dataset, column: &str) -> Result<BTreeSet<u64>> {
+    let Some(field_id) = ds.schema().field(column).map(|field| field.id) else {
+        return Ok(BTreeSet::new());
+    };
+    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+    let current = current_fragments(ds);
+    let Ok(tails) = key_column_tails(
+        &indices,
+        field_id,
+        column,
+        &current,
+        ds.fragments()
+            .iter()
+            .all(|fragment| fragment.physical_rows.is_some()),
+    ) else {
+        return Ok(BTreeSet::new());
+    };
+    let mut covered = current;
+    for (_, tail) in tails {
+        let Ok(uncovered) = tail else {
+            return Ok(BTreeSet::new());
+        };
+        covered.retain(|fragment| !uncovered.contains(fragment));
+    }
+    Ok(covered)
+}
+
 /// The fragments a BTREE on a key column leaves uncovered, as
 /// [`key_column_uncovered_tail`] reports them: the largest count of such
 /// fragments one index leaves, and the largest total of their data-file

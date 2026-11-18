@@ -720,7 +720,17 @@ id scan also returns each matched row's address at the table's pin, and
 `stage_all` writes the deletion vectors for exactly those rows
 (`TableStore::stage_delete_rows`, Lance's `DeleteBuilder` after its scan), so
 a deleted table is scanned once; addresses from another version than the
-reopened pin take Lance's scanning delete. A node delete whose predicate has
+reopened pin take Lance's scanning delete. A node removal reads each edge
+table that references the type for the edges touching its removed ids (the
+delete cascade, and the retained-edge check of an Overwrite, `load csv` or a
+merge) through `validate::RemovalEdgeReads`. Lance gives every fragment that
+no index answers a pushed filter on its own copy of the filter, built before
+the scan reads. So the plan pushes the ids to every fragment, 8,192 per
+filter, only when a BTREE on each probed endpoint covers the table, or when
+one filter holds every id and the uncovered fragments times those ids stay at
+most 8,192; otherwise it probes the covered fragments and reads the uncovered
+ones once, whole, matching their rows against the removed ids in memory
+(#1442). A node delete whose predicate has
 a `<key> = v` conjunct on the type's single String `@key` also filters on the
 derived id when the pinned table has an id BTREE, as the read planner's key
 narrowing does. Mutation validation reads the write's pinned base through the

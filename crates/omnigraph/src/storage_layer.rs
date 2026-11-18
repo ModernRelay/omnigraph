@@ -591,12 +591,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// [`Self::scan_filtered`] with Lance's `_rowaddr` as the last output
     /// column: the exact rows a later [`Self::stage_delete_rows`] on the same
-    /// snapshot removes.
+    /// snapshot removes. `None` filter reads every row; `fragments` limits
+    /// the scan to those fragments (`None`: the whole table).
     async fn scan_filtered_row_addrs(
         &self,
         snapshot: &SnapshotHandle,
         projection: &[&str],
-        filter: Expr,
+        filter: Option<Expr>,
+        fragments: Option<Vec<lance_table::format::Fragment>>,
     ) -> Result<DatasetRecordBatchStream>;
 
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>>;
@@ -1152,7 +1154,8 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         projection: &[&str],
-        filter: Expr,
+        filter: Option<Expr>,
+        fragments: Option<Vec<lance_table::format::Fragment>>,
     ) -> Result<DatasetRecordBatchStream> {
         TableStore::scan_stream_with(
             snapshot.dataset(),
@@ -1161,7 +1164,12 @@ impl TableStorage for TableStore {
             None,
             false,
             |scanner| {
-                scanner.filter_expr(filter);
+                if let Some(filter) = filter {
+                    scanner.filter_expr(filter);
+                }
+                if let Some(fragments) = fragments {
+                    scanner.with_fragments(fragments);
+                }
                 scanner.with_row_address();
                 scanner.batch_size(ID_SCAN_BATCH_ROWS);
                 scanner.batch_size_bytes(ID_SCAN_BATCH_BYTES);

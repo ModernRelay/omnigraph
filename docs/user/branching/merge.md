@@ -217,6 +217,12 @@ Those keys are limited to 32 MiB per merge, counted as the bytes of their
 values (a string's length, plus 4 bytes; a null counts nothing), whatever
 buffers storage returned them in. The checks hold each key in lookup tables of
 their own, so their memory is several times this count, not bounded by it.
+To find the edges that still reference a removed id, the merge looks up
+8,192 removed ids at a time in the parts of the edge table that an index on
+the edge endpoints covers. It reads the parts that no index covers yet (rows
+added since the last `optimize`) once, and matches them against the removed
+ids. So the lookup's memory does not grow with the number of removed ids
+times the number of those parts.
 The limit is fixed: `write_max_bytes` and `query_memory_bytes` do not change
 it. The check sets no bound of its own on a row's width. A merge that writes
 rows (for a table both branches changed) keeps its own `write_max_bytes`
