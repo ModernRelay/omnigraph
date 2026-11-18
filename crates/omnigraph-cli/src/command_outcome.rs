@@ -71,6 +71,8 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
         | Command::Access(_) => Some(Read),
         Command::Load(_) | Command::Mutate(_) => Some(Write),
         Command::Branch { command, .. } => Some(match command {
+            // A dry run is a read of both branches; it writes nothing.
+            BranchCommand::Merge { dry_run: true, .. } => Read,
             BranchCommand::Create { .. }
             | BranchCommand::Delete { .. }
             | BranchCommand::Merge { .. } => Write,
