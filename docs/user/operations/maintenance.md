@@ -79,15 +79,22 @@ all (a Blob table's tasks one at a time): budget for that many Blob tables.
 
 ### Bounding a run
 
-Writes to `main` wait while optimize holds its writer gates. A run given
-`--max-gate-hold 30s` starts no table after that long except the first: the
-rest are `deferred`, finished tables publish, and a writer waits at most the
-bound plus one rewrite. Tables run in type-key order; `resume_at` names the
-first deferred one, and `--tables` runs only the listed tables, in order. Each
-table's `outcome` is `optimized`, `unchanged`, `deferred` or
-`failed` (with its `error`; the other tables still publish). The report adds
+With `--max-gate-hold 30s`, the first table runs even if the deadline has
+passed. After the deadline, remaining tables are deferred and completed work
+publishes. Writers to `main` wait at most the bound plus one rewrite.
+Direct runs visit tables in type-key order. Copy the printed argument (e.g.
+`--start-at node:Person`) to resume at the first deferred table and wrap around.
+JSON exposes the same key in `resume_at`. A [server](recorded-operations.md)
+remembers its position. Use `--datasets` to visit only the listed tables, in order.
+
+Check each table's `outcome` even on exit 0. It can be `optimized`, `unchanged`,
+`deferred` or `failed`. A failed table includes its `error`. Other tables still publish.
+If index maintenance or its coverage check fails after a rewrite or index build,
+completed work publishes as `optimized` with `reason: index_failed` and the error.
+The direct report keeps any indexes already identified as pending in `pending_indexes`.
+The next run checks coverage and plans remaining work. The report includes
 `input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
-and `artifact` outcomes, which never fail a published run.
+and `artifact` outcomes. Neither of those last two can fail a published run.
 
 A served run also applies the server's
 [table ceilings and byte budget](recorded-operations.md#table-ceilings-and-the-byte-budget).
@@ -128,7 +135,9 @@ As with optimize, a write that lands on a table while its batch is staged fails
 the run with a read-set conflict; run the command again. A vector property with
 no vectors yet and full-text coverage stay pending: only `index rebuild --kind
 full-text` refreshes a full-text index's coverage, and queries match uncovered
-rows with the index's analyzer meanwhile.
+rows with the index's analyzer meanwhile. Pending covers only a vector
+property with nothing to train on; a rebuild that fails for any other reason,
+a storage failure for one, fails the command.
 
 JSON reports `branch`, `graph_commit_id` (null for a no-op), `indexes` with each
 `type_key`, `property` (the indexed column, `__id` for the identity index),

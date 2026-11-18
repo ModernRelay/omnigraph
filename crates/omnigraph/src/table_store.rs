@@ -826,22 +826,36 @@ pub(crate) struct RowPreservingChain {
 /// Walk `current`'s chain of commits by `read_version` links down to
 /// `captured_version` and return it when every link preserves rows
 /// ([`RowPreservingChain`]). `None` when a link is any other operation,
-/// records no transaction, or the walk reaches neither the captured version
-/// nor a stop within [`ROW_PRESERVING_CHAIN_MAX_LINKS`]: the write must then
-/// treat the table as changed.
+/// records no transaction, is no longer in storage, or the walk reaches
+/// neither the captured version nor a stop within
+/// [`ROW_PRESERVING_CHAIN_MAX_LINKS`]: the write must then treat the table as
+/// changed.
+///
+/// A link below `current` is named by no `__manifest` version, so `cleanup`
+/// deletes it, and a run can do so between a write's capture and its gates.
+/// A link that is not found, at its checkout or when its transaction is read
+/// (Lance 13 reads it from the manifest's inline section, else from the
+/// transaction file the sweep deletes first), is therefore an unreadable
+/// chain, not a storage fault. `current` is the table's pin, which the
+/// collector keeps whole, so a failure to read its own transaction stays an
+/// error.
 pub(crate) async fn row_preserving_chain(
     current: &Dataset,
     captured_version: u64,
 ) -> Result<Option<RowPreservingChain>> {
+    let collected = |error: &OmniError| {
+        error
+            .storage_failure()
+            .is_some_and(|failure| failure.kind == crate::error::StorageFailureKind::NotFound)
+    };
     let mut links = Vec::new();
     let mut dataset = current.clone();
     for _ in 0..ROW_PRESERVING_CHAIN_MAX_LINKS {
-        let Some(transaction) = dataset
-            .read_transaction()
-            .await
-            .map_err(OmniError::storage)?
-        else {
-            return Ok(None);
+        let transaction = match dataset.read_transaction().await.map_err(OmniError::storage) {
+            Ok(Some(transaction)) => transaction,
+            Ok(None) => return Ok(None),
+            Err(error) if !links.is_empty() && collected(&error) => return Ok(None),
+            Err(error) => return Err(error),
         };
         if !matches!(
             transaction.operation,
@@ -858,10 +872,15 @@ pub(crate) async fn row_preserving_chain(
         if read_version == 0 {
             return Ok(None);
         }
-        dataset = dataset
+        dataset = match dataset
             .checkout_version(read_version)
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(OmniError::storage)
+        {
+            Ok(link) => link,
+            Err(error) if collected(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
     }
     Ok(None)
 }
@@ -3374,12 +3393,14 @@ impl TableStore {
     }
 
     /// RFC 0067: stage one `CreateIndex` that folds every lagging foldable
-    /// index, ready to commit detached. Lance's own fold (`optimize_indices`)
-    /// merges the delta and previous segments through a crate-private path
-    /// and commits linearly; this rebuilds each lagging index whole under its
+    /// index, ready to commit detached. Lance 13's own fold
+    /// (`optimize_indices`) merges the delta and previous segments through a
+    /// crate-private module (`index::append`) and commits linearly
+    /// (`apply_commit`); this rebuilds each lagging index whole under its
     /// name with the public builder, which leaves the same single segment
-    /// Lance's merge would. A vector index the builder cannot train (a column
-    /// with no non-null rows) is skipped and reported by column.
+    /// Lance's merge would. A vector index the builder cannot train (Lance's
+    /// `Unprocessable`: too few finite, non-null vectors to train on) is
+    /// skipped and reported by column; any other build failure is an error.
     pub async fn stage_index_fold(&self, ds: &Dataset) -> Result<StagedIndexFold> {
         let (batch, _, skipped) = Self::index_fold_batch(ds).await?;
         Ok(StagedIndexFold {
@@ -3420,7 +3441,8 @@ impl TableStore {
     }
 
     /// The fold batch: every lagging foldable index rebuilt whole under its
-    /// name, the columns rebuilt, and the vector columns that could not train.
+    /// name, the columns rebuilt, and the vector columns that could not train
+    /// (see [`Self::stage_index_fold`] for what that covers).
     async fn index_fold_batch(
         ds: &Dataset,
     ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
@@ -3473,7 +3495,12 @@ impl TableStore {
             };
             let new_idx = match built {
                 Ok(index) => index,
-                Err(error) if item.vector => {
+                // Lance 13 raises `Unprocessable` only from vector training,
+                // when the column holds too few finite, non-null vectors for
+                // the index's centroids: a state of the data, reported as
+                // pending. Any other failure of the build (a storage fault
+                // above all) is an error, never a column that "cannot train".
+                Err(error @ lance::Error::Unprocessable { .. }) if item.vector => {
                     tracing::warn!(
                         index = item.name.as_str(),
                         column = column.as_str(),
@@ -5014,23 +5041,33 @@ impl TableStore {
         Ok(plan)
     }
 
-    /// RFC 0067: plan ([`Self::plan_table_compaction`]) and execute Lance
-    /// compaction against a pinned base and stage the result as one `Rewrite`
-    /// transaction. The new fragments take ids above the base's high-water
-    /// mark, so the commit needs no `ReserveFragments` (whose replay would
-    /// not conflict with its twin). A stable-row-id rewrite carries every
-    /// index's coverage over to the new fragments when Lance applies it.
-    /// `None` when the plan has no task. Every task of a Blob table is sized
-    /// before any executes, so a sizing refusal leaves no rewritten file
-    /// behind. The tasks run side by side, each holding one permit of `limit`
-    /// ([`OptimizeStepLimit`]), the run's budget of heavy steps.
+    /// RFC 0067: execute `plan` ([`Self::plan_table_compaction`]'s for `ds`)
+    /// against a pinned base and stage the result as one `Rewrite`
+    /// transaction. The caller plans once and hands that plan here, so the
+    /// plan a run measured against its ceilings is the one it executes; a
+    /// plan of another version is refused. The new fragments take ids above
+    /// the base's high-water mark, so the commit needs no `ReserveFragments`
+    /// (whose replay would not conflict with its twin). A stable-row-id
+    /// rewrite carries every index's coverage over to the new fragments when
+    /// Lance applies it. `None` when the plan has no task. Every task of a
+    /// Blob table is sized before any executes, so a sizing refusal leaves no
+    /// rewritten file behind. The tasks run side by side, each holding one
+    /// permit of `limit` ([`OptimizeStepLimit`]), the run's budget of heavy
+    /// steps.
     pub async fn stage_compaction(
         &self,
         ds: &Dataset,
-        options: &CompactionOptions,
+        plan: CompactionPlan,
         limit: &OptimizeStepLimit,
     ) -> Result<Option<StagedCompaction>> {
-        let plan = Self::plan_table_compaction(ds, options).await?;
+        if plan.read_version != ds.manifest.version {
+            return Err(OmniError::manifest_internal(format!(
+                "compaction of {} was planned at version {} and cannot be staged against version {}",
+                ds.uri(),
+                plan.read_version,
+                ds.manifest.version
+            )));
+        }
         Self::stage_compaction_plan(ds, plan, limit).await
     }
 
@@ -6041,7 +6078,9 @@ impl TableStore {
                         ds_clone.create_index_builder(&columns, IndexType::BTree, &params);
                     // Same-snapshot builders cannot see each other's new
                     // default names; companions need explicit distinct names
-                    // even with Lance 11's sequential collision avoidance.
+                    // even with Lance 13's sequential collision avoidance,
+                    // which suffixes a default name only against the
+                    // committed indexes (`index/create.rs`).
                     if let Some(name) = name {
                         builder = builder.name(name.clone());
                     }
@@ -8148,10 +8187,12 @@ fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &
     Ok(())
 }
 
-/// Managed Blob bytes one compaction scanner batch may materialize: Lance 11
-/// rewrites a Blob table through a scanner that reads every managed payload of
-/// a batch, so `stage_compaction` sizes each task's batches against this, per
-/// row (a row sums its Blob columns; one over the budget is a one-row batch).
+/// Managed Blob bytes one compaction scanner batch may materialize: Lance 13
+/// never binary-copies a table with a Blob column
+/// (`can_use_binary_copy_current`) and rewrites it through a scanner whose
+/// every batch has its managed payloads read (`transform_blob_v2_batch`), so
+/// `stage_compaction` sizes each task's batches against this, per row (a row
+/// sums its Blob columns; one over the budget is a one-row batch).
 const COMPACTION_BLOB_BATCH_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 /// Most rows a Blob table's compaction batch may hold: Lance's own fallback
 /// default. `stage_compaction` always sets the derived size on a Blob table,

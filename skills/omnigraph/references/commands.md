@@ -325,12 +325,22 @@ compaction, or prepares again once, holding writes off, when it changes a row
 the run moved. None returns `read_set_conflict` for it. Writes to `main` wait
 while it holds main's writer gates: `--max-gate-hold 30s` starts no table after
 that long except the first, so a write waits about the bound plus one table,
-and `--tables node:Person,edge:Knows` runs only those tables, in that order.
+and `--datasets node:Person,edge:Knows` runs only those tables, in that order.
 Each table reports `optimized`, `unchanged`, `deferred` or `failed`; one
 table's failure does not stop the others, so read the report. Against a server
 target it runs as a recorded operation: it prints an operation id, waits for
 the operation's record (`--no-wait`, `--timeout`), and `--operation <id>`
 observes one; after a lost response it looks the id up and never resubmits.
+`--datasets` runs only the listed tables and `--max-gate-hold 30s` bounds how
+long writers wait: the tables it did not reach are `deferred` and `resume_at`
+names the first. On a direct target copy the printed `--start-at <key>`
+argument into the next run (a server keeps the position and refuses the flag;
+`--datasets` and `--max-gate-hold` are refused beside `--operation`). Exit 0
+means the run finished, not that every table was optimized: read each
+dataset's `outcome` (`optimized`, `unchanged`, `deferred`, `failed` with
+`error`) and `reason`. With `index_failed`, the run published completed
+table work and the error identifies the index maintenance step that failed.
+On a direct target, `pending_indexes` also lists indexes already known to need work.
 
 ### `index build` — a branch's missing and lagging indexes
 
@@ -344,6 +354,8 @@ rows uncovered, in one graph commit on that branch; a second run is a no-op with
 a null `graph_commit_id`. Read `indexes` (`kind`, `action`: `built` or
 `refreshed`) and `pending_indexes`: full-text coverage stays pending with the
 `index rebuild --kind full-text` remedy, as do vector properties with no vectors.
+Only those are pending: a rebuild that fails for another reason, a storage
+failure for one, fails the command.
 The remedy for `FullTextIndexRequired` on any branch.
 
 ### `index rebuild` — explicit analyzer upgrade
