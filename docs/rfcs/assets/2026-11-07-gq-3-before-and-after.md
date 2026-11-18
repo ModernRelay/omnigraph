@@ -660,7 +660,7 @@ query mentions($q: String) {
 // edition 3
 query mentions($q: String) {
   match { $d: Doc }
-  where search($d.body, $q) and fuzzy($d.body, $q, max_edits: 2)
+  where match_terms($d.body, terms($q, mode: any)) and match_terms($d.body, terms($q, mode: any, max_edits: 2))
   return { $d.title }
 }
 ```
