@@ -66,7 +66,6 @@ async fn resolve_pinned_for_write(
     let caches = db.read_caches();
     let target = entry.published_dataset_version;
     let table_branch = entry.native_dataset_branch.as_deref();
-    let e_tag = entry.version_metadata.e_tag();
     let location = table_location(full_path, table_branch);
     let dataset = match held_twin(db, entry).await {
         Some(held) => held,
@@ -77,10 +76,7 @@ async fn resolve_pinned_for_write(
                     &entry.dataset_path,
                     table_branch,
                     target,
-                    e_tag,
-                    entry.version_metadata.staged_version(),
-                    entry.version_metadata.transaction_uuid(),
-                    entry.version_metadata.last_linear_version(),
+                    &entry.version_metadata,
                     &location,
                     Some(&caches.session),
                     None,

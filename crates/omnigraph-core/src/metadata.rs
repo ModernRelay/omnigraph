@@ -268,6 +268,16 @@ impl TableVersionMetadata {
         self.e_tag.as_deref()
     }
 
+    /// The manifest object this pin's writer recorded, when the row holds both
+    /// its size and its token; a row from before either was recorded has none.
+    pub fn recorded_manifest(&self) -> Option<crate::lance_clone::RecordedManifest> {
+        Some(crate::lance_clone::RecordedManifest::new(
+            &self.manifest_path,
+            self.manifest_size?,
+            self.e_tag.as_deref()?,
+        ))
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub fn naming_scheme(&self) -> Option<&str> {
         self.naming_scheme.as_deref()

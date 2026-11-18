@@ -199,7 +199,7 @@ impl TableHandleCache {
         inner.entries.invalidate_all();
     }
 
-    /// Return the dataset for `(dataset_path, branch, version, e_tag)`, reusing a
+    /// Return the dataset for `(dataset_path, branch, version, pin)`, reusing a
     /// held handle (0 open IO) or opening it once at `location` with the shared
     /// `session` on a miss. A `statement_wrapper` stacks over the per-query
     /// instrumentation wrapper, so instrumentation sees only its misses.
@@ -208,15 +208,18 @@ impl TableHandleCache {
         dataset_path: &str,
         table_branch: Option<&str>,
         version: u64,
-        e_tag: Option<&str>,
-        staged_version: Option<u64>,
-        transaction_uuid: Option<&str>,
-        last_linear_version: Option<u64>,
+        pin: &crate::metadata::TableVersionMetadata,
         location: &str,
         session: Option<&Arc<Session>>,
         statement_wrapper: Option<Arc<crate::read_memo::RangeMemoWrapper>>,
     ) -> Result<Dataset> {
-        let key = TableHandleKey::new(dataset_path, table_branch, version, staged_version, e_tag);
+        let key = TableHandleKey::new(
+            dataset_path,
+            table_branch,
+            version,
+            pin.staged_version(),
+            pin.e_tag(),
+        );
         {
             let mut inner = self.inner.lock().await;
             if let Some(held) = inner.entries.get(&key) {
@@ -238,16 +241,9 @@ impl TableHandleCache {
         // Miss: open without holding the lock (the open is async IO). A concurrent
         // double-miss opens twice and one wins the insert — correct (the dataset
         // at a version is immutable) and rare.
-        let ds = crate::instrumentation::open_pinned_dataset(
-            location,
-            version,
-            staged_version,
-            transaction_uuid,
-            last_linear_version,
-            session,
-            wrapper,
-        )
-        .await?;
+        let ds =
+            crate::instrumentation::open_pinned_dataset(location, version, pin, session, wrapper)
+                .await?;
         if let (Some(memo), Some(session)) = (memo, session) {
             memo.register_dataset(&ds, session).await;
         }
@@ -414,8 +410,13 @@ mod tests {
     }
 
     async fn open(cache: &TableHandleCache, uri: &str, version: u64) -> Dataset {
+        // A pin from before the size and token were recorded: Lance resolves it.
+        let pin = crate::metadata::TableVersionMetadata::from_json_str(
+            r#"{"manifest_path":"p","manifest_size":null,"e_tag":null,"naming_scheme":null}"#,
+        )
+        .unwrap();
         cache
-            .get_or_open("t", None, version, None, None, None, None, uri, None, None)
+            .get_or_open("t", None, version, &pin, uri, None, None)
             .await
             .unwrap()
     }
