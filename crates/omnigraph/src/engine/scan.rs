@@ -322,6 +322,20 @@ pub(super) async fn execute_node_scan(
             }
         }
     }
+    // Lance keeps whichever rows it meets first at the window's `k`-th
+    // distance, so a tie at the last place would be decided by physical
+    // order. The scan asks for one row past `k`, widens while the tie
+    // reaches the last row it fetched, and cuts the tie by identity itself
+    // (`window_by_identity`), as the core's tie rule orders it.
+    let mut fetch: usize = nearest_target.as_ref().map_or(0, |(_, _, k)| {
+        let every_row_within_k = known_matches.is_some_and(|matches| matches <= *k)
+            || dataset_rows.is_some_and(|rows| rows <= *k as u64);
+        if every_row_within_k {
+            *k
+        } else {
+            k.saturating_add(1)
+        }
+    });
     scan_report.probes.clear();
     scan_report.ann_metrics.clear();
     scan_report.exact = false;
@@ -339,12 +353,13 @@ pub(super) async fn execute_node_scan(
             std::sync::Mutex<Option<lance_datafusion::exec::ExecutionSummaryCounts>>,
         > = Arc::new(std::sync::Mutex::new(None));
         let stats_sink = scan_stats.clone();
+        let attempt_fetch = fetch;
         let batches: Vec<RecordBatch> = Box::pin(async {
             let plan = read
                 .plan(None, |scanner| {
-                    if let Some((prop, query_arr, k)) = nearest_target.as_ref() {
+                    if let Some((prop, query_arr, _)) = nearest_target.as_ref() {
                         scanner
-                            .nearest(prop, query_arr, *k, nearest_distance)
+                            .nearest(prop, query_arr, attempt_fetch, nearest_distance)
                             .map_err(|error| OmniError::storage_context("nearest", error))?;
                         scanner.use_index(use_index);
                         if let Some(maximum) = probe_budget {
@@ -381,7 +396,10 @@ pub(super) async fn execute_node_scan(
             break (batches, attempt_memory);
         };
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        crate::instrumentation::record_ann_scan_rows(rows as u64);
+        // The rows the attempt holds for the window: the one past `k` that
+        // shows whether a tie crosses the cut is not one of them.
+        let window_rows = rows.min(*k);
+        crate::instrumentation::record_ann_scan_rows(window_rows as u64);
         let summary: Option<(Option<u64>, Option<u64>)> = scan_stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -403,7 +421,7 @@ pub(super) async fn execute_node_scan(
             crate::instrumentation::record_ann_partition_counters(searched, ranked);
         }
         scan_report.nearest_scan = Some(NearestScanReport {
-            rows,
+            rows: window_rows,
             k: *k,
             maximum_nprobes: probe_budget,
             exhausted: !use_index || known_matches.is_some_and(|matches| rows >= matches),
@@ -412,9 +430,9 @@ pub(super) async fn execute_node_scan(
         scan_report.probes.push(ProbeAttempt {
             maximum_nprobes: probe_budget,
             flat: !use_index,
-            rows,
+            rows: window_rows,
         });
-        let unreached = batches_hold_infinite_distance(&batches);
+        let unreached = batches_hold_infinite_distance(&batches, *k);
         // The scan uses a vector index only when it is IVF_FLAT by the
         // field's distance (any other runs flat, above), which scores every
         // row of a partition it searches exactly, so an attempt that
@@ -448,6 +466,10 @@ pub(super) async fn execute_node_scan(
                     ),
                 ));
             }
+            if let Some(wider) = wider_fetch_for_a_boundary_tie(&batches, *k, fetch, type_rows) {
+                fetch = wider;
+                continue;
+            }
             break (batches, attempt_memory);
         }
         let Some(policy) = policy else {
@@ -464,7 +486,14 @@ pub(super) async fn execute_node_scan(
             probe_budget,
             last_rung,
         ) {
-            LadderStep::Stop => break (batches, attempt_memory),
+            LadderStep::Stop => {
+                if let Some(wider) = wider_fetch_for_a_boundary_tie(&batches, *k, fetch, type_rows)
+                {
+                    fetch = wider;
+                    continue;
+                }
+                break (batches, attempt_memory);
+            }
             LadderStep::FlatRescan => {
                 tracing::debug!(
                     variable,
@@ -550,6 +579,15 @@ pub(super) async fn execute_node_scan(
             .concat(&schema, &batches)
             .map_err(|error| memory.error(error))?
     };
+    let scan_result = match nearest_target.as_ref() {
+        Some((_, _, k)) => match window_by_identity(&scan_result, *k, catalog.system_columns.id)? {
+            Some(kept) => attempt_memory
+                .take(&scan_result, &kept)
+                .map_err(|error| memory.error(error))?,
+            None => scan_result,
+        },
+        None => scan_result,
+    };
     if has_blobs {
         memory
             .grow(
@@ -564,6 +602,75 @@ pub(super) async fn execute_node_scan(
         return Ok(result);
     }
     Ok(scan_result)
+}
+
+/// The larger fetch a nearest scan needs when the `k`-th place of its
+/// window is tied with the last row Lance returned: Lance filled the fetch
+/// (it cut), and the largest distance it returned equals the `k`-th, so a
+/// row it left out may tie too. `None` when no tie can cross the cut. The
+/// fetch doubles, bounded by the type's live rows, so a tie is resolved in
+/// a number of extra passes logarithmic in its width.
+fn wider_fetch_for_a_boundary_tie(
+    batches: &[RecordBatch],
+    k: usize,
+    fetch: usize,
+    type_rows: u64,
+) -> Option<usize> {
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    if k == 0 || fetch <= k || rows < fetch {
+        return None;
+    }
+    let mut distances: Vec<f32> = batches
+        .iter()
+        .filter_map(|batch| batch.column_by_name("_distance"))
+        .filter_map(|column| column.as_any().downcast_ref::<Float32Array>())
+        .flat_map(|distances| distances.iter().flatten())
+        .collect();
+    if distances.len() <= k {
+        return None;
+    }
+    distances.sort_by(f32::total_cmp);
+    let boundary = distances[k - 1];
+    let last = distances[distances.len() - 1];
+    if !boundary.is_finite() || last.total_cmp(&boundary).is_gt() {
+        return None;
+    }
+    let wider = fetch
+        .saturating_mul(2)
+        .min(usize::try_from(type_rows).unwrap_or(usize::MAX));
+    (wider > fetch).then_some(wider)
+}
+
+/// The first `k` rows of a nearest scan's result by distance, then by the
+/// node's identity, the core's tie rule: the window's last place goes to
+/// the smaller identity whatever order Lance met the tied rows in. `None`
+/// when the result already holds no more than `k` rows.
+fn window_by_identity(batch: &RecordBatch, k: usize, id: &str) -> Result<Option<UInt32Array>> {
+    if batch.num_rows() <= k {
+        return Ok(None);
+    }
+    let column = |name: &str| {
+        batch.column_by_name(name).map(Arc::clone).ok_or_else(|| {
+            OmniError::manifest_internal(format!("a nearest scan's rows carry no column '{name}'"))
+        })
+    };
+    let ascending = Some(arrow_schema::SortOptions {
+        descending: false,
+        nulls_first: true,
+    });
+    let keys = [
+        arrow_ord::sort::SortColumn {
+            values: column("_distance")?,
+            options: ascending,
+        },
+        arrow_ord::sort::SortColumn {
+            values: column(id)?,
+            options: ascending,
+        },
+    ];
+    arrow_ord::sort::lexsort_to_indices(&keys, Some(k))
+        .map(Some)
+        .map_err(OmniError::arrow_internal)
 }
 
 /// The columns one node scan reads and emits. Blob properties are never `.gq`

@@ -40,7 +40,8 @@ refused (`T65`) with the `from` form as its fix.
 
 Search arguments use their declared types. `nearest` requires its window `k`
 (`T17`), an integer literal or parameter of at least 1: it selects the `k`
-nearest targets of the population with every row each has, and the read's
+nearest targets of the population with every row each has, a tie at its last
+place going to the smaller identity, and the read's
 `limit`, which may be larger, smaller or absent, cuts the rows after that. A
 window read from a parameter takes the count the parameter is bound to when
 the read runs, in an `rrf` arm too; a count below 1 is refused. `terms(…)`

@@ -818,16 +818,22 @@ pub(super) fn ladder_step(
     }
 }
 
-/// Whether any row of a nearest scan carries `_distance = +inf`: Lance's
-/// marker for a prefilter-admitted row its partition search did not reach
-/// (the late search's match-count stop, `lance/src/io/exec/knn.rs`).
-pub(super) fn batches_hold_infinite_distance(batches: &[RecordBatch]) -> bool {
-    batches.iter().any(|batch| {
-        batch
-            .column_by_name("_distance")
-            .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
-            .is_some_and(|distances| distances.iter().flatten().any(f32::is_infinite))
-    })
+/// Whether a row within the first `k` places of a nearest scan carries
+/// `_distance = +inf`: Lance's marker for a prefilter-admitted row its
+/// partition search did not reach (the late search's match-count stop,
+/// `lance/src/io/exec/knn.rs`). `+inf` sorts last, so a window holds one
+/// exactly when fewer of its rows than its places are finite; the row the
+/// scan fetches past `k` to see a boundary tie is outside the window.
+pub(super) fn batches_hold_infinite_distance(batches: &[RecordBatch], k: usize) -> bool {
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    let finite = batches
+        .iter()
+        .filter_map(|batch| batch.column_by_name("_distance"))
+        .filter_map(|column| column.as_any().downcast_ref::<Float32Array>())
+        .flat_map(|distances| distances.iter().flatten())
+        .filter(|distance| !distance.is_infinite())
+        .count();
+    finite < rows.min(k)
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! Shrunk cases of defects the physical-layout variants
 //! (`tests/gq_layout_tests.rs`) found, each pinned as a `hunt:` until its
-//! fix lands: the case runs under the layout that breaks it.
+//! fix lands and kept as a regression after it: the case runs under every
+//! layout, the one that broke it included.
 
 use std::path::Path;
 
@@ -22,11 +23,12 @@ fn run_under(stem: &str, text: &str, layout: Layout) -> Result<(), String> {
 /// `d2 [2, 0]`: `d1` at distance 0, then `d0` and `d2` tied at 1, of which
 /// the smaller identity, `d0`, is in the window. Under layout `d` (the
 /// rows spread over fragments with deleted copies, then indexed), the
-/// window takes `d2`: the tie at the window's boundary is decided by the
-/// rows' physical order, not by identity. Found by the layout variants on
-/// `rrf_refuses_arms_and_options_outside_its_contract.gqt`.
+/// window took `d2`: Lance kept whichever tied row it met first. Found by
+/// the layout variants on
+/// `rrf_refuses_arms_and_options_outside_its_contract.gqt`. The second
+/// step ties four rows at the window's last place, more than the one row
+/// past `k` the scan first asks for, so the scan widens before it cuts.
 #[test]
-#[ignore = "hunt: a nearest window's boundary tie is decided by fragment order under layout d"]
 fn nearest_window_boundary_tie_is_by_identity_under_every_layout() {
     let text = r#"# issue: none
 
@@ -46,6 +48,10 @@ node Doc {
 {"type":"Doc","data":{"slug":"d0","embedding":[0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d1","embedding":[1.0,0.0]}}
 {"type":"Doc","data":{"slug":"d2","embedding":[2.0,0.0]}}
+{"type":"Doc","data":{"slug":"d3","embedding":[1.0,1.0]}}
+{"type":"Doc","data":{"slug":"d4","embedding":[0.0,1.0]}}
+{"type":"Doc","data":{"slug":"d5","embedding":[2.0,1.0]}}
+{"type":"Doc","data":{"slug":"d6","embedding":[1.0,2.0]}}
 
 --- query
 query window() {
@@ -58,6 +64,22 @@ query window() {
 
 --- expect unordered
 {"d.slug":"d0"}
+{"d.slug":"d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query wide_tie() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from nearest($all, $d.embedding, [1.0, 1.0], k: 2) as $s,
+    }
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"d3"}
 {"d.slug":"d1"}
 
 --- expect shape

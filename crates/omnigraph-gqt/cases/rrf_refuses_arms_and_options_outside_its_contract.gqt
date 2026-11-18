@@ -7,7 +7,6 @@
 # notes: differ are distinct arms: from [0, 0] the window of 2 is d0, d1; from [1, 0] it is d1, then d0
 # notes: (tied with d2 at distance 1, the smaller identity), so d0 and d1 tie and d2 is selected by
 # notes: neither; a weight of 1000000 on the second arm puts its first target, d1, first.
-# layout: skipped d: hunt: a nearest window's boundary tie is decided by fragment order (layout_hunts::nearest_window_boundary_tie_is_by_identity_under_every_layout)
 
 --- runner
 timeout_ms: 10000
