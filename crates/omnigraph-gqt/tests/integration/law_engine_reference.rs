@@ -354,6 +354,117 @@ fn run_law(cases: u32) {
     );
 }
 
+/// Generated reads of the placement law (the GQ 3 RFC, section 2): a
+/// `where` of two to five conjuncts that mix pure ones with ones that can
+/// fail, in every written position, after elements that can fail.
+const PLACEMENT_CASES: u32 = 64;
+const PLACEMENT_NIGHTLY: u32 = 2_000;
+
+/// The read with the conjuncts written before its first one that can fail
+/// reversed: they are pure and total, so their order is the planner's to
+/// choose and the answer does not change. `None` when fewer than two
+/// precede it.
+fn pure_prefix_reversed(source: &str) -> Option<String> {
+    let mut out = Vec::new();
+    let mut changed = false;
+    for line in source.lines() {
+        match line.strip_prefix("  where ") {
+            Some(pred) => {
+                let mut conjuncts = top_level_and(pred);
+                let k = conjuncts
+                    .iter()
+                    .position(|c| can_fail(c))
+                    .unwrap_or(conjuncts.len());
+                if k >= 2 {
+                    conjuncts[..k].reverse();
+                    changed = true;
+                }
+                out.push(format!("  where {}", conjuncts.join(" and ")));
+            }
+            None => out.push(line.to_string()),
+        }
+    }
+    changed.then(|| out.join("\n"))
+}
+
+/// The top-level `and` operands of an unparenthesized chain, each kept as
+/// written.
+fn top_level_and(pred: &str) -> Vec<String> {
+    let bytes = pred.as_bytes();
+    let (mut depth, mut in_str, mut start) = (0i32, false, 0);
+    let mut out = Vec::new();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'"' if i == 0 || bytes[i - 1] != b'\\' => in_str = !in_str,
+            b'(' | b'{' | b'[' if !in_str => depth += 1,
+            b')' | b'}' | b']' if !in_str => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && !in_str && pred[i..].starts_with(" and ") {
+            out.push(pred[start..i].to_string());
+            start = i + 5;
+        }
+    }
+    out.push(pred[start..].to_string());
+    out
+}
+
+async fn check_placement(sample: &Sample) -> Result<(), String> {
+    TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (_dir, session) = load(sample).await?;
+    let source = &sample.read.source;
+    if judge(&session, sample, source, "planner's choice").await? {
+        NONEMPTY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(reversed) = pure_prefix_reversed(source) {
+        judge(&session, sample, &reversed, "pure prefix reversed").await?;
+    }
+    session
+        .ensure_indices_as(None)
+        .await
+        .map_err(|e| format!("ensure_indices failed: {e}\n{}", sample.describe()))?;
+    judge(&session, sample, source, "indexes built").await?;
+    Ok(())
+}
+
+fn run_placement_law(cases: u32) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut runner = law_runner(cases, "tests/regressions/law_placement.txt");
+    let options = ReadOptions {
+        placement: true,
+        search: false,
+        ..ReadOptions::default()
+    };
+    let result = runner.run(&(choices(64), choices(1024), choices(512)), |(s, g, q)| {
+        let sample = sample(&s, &g, &q, options);
+        rt.block_on(check_placement(&sample))
+            .map_err(TestCaseError::fail)
+    });
+    if let Err(e) = result {
+        panic!("{e}");
+    }
+    let nonempty = NONEMPTY.load(std::sync::atomic::Ordering::Relaxed);
+    let total = TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("{nonempty} of {total} generated placement reads returned a row");
+}
+
+/// The placement law: a `where`'s conjuncts before the first one that can
+/// fail move freely, that one and every one after it filter in written
+/// order above every element, and nothing moves below an element that can
+/// fail. The engine must answer each generated read as the reference does,
+/// rows or the same refusal, before and after its pure prefix is reversed
+/// and with every declared index built.
+#[test]
+fn engine_equals_reference_on_generated_placements() {
+    run_placement_law(PLACEMENT_CASES);
+}
+
+#[test]
+#[ignore = "nightly: 2,000 generated placement reads; the gate runs 64"]
+fn engine_equals_reference_on_generated_placements_at_nightly_breadth() {
+    run_placement_law(PLACEMENT_NIGHTLY);
+}
+
 #[test]
 fn engine_equals_reference_on_generated_reads() {
     run_law(CASES);

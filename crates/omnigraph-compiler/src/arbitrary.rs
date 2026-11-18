@@ -576,6 +576,12 @@ pub struct ReadOptions {
     pub nesting: bool,
     pub aggregates: bool,
     pub order_limit: bool,
+    /// The placement law's reads: a `where` of two to five conjuncts mixing
+    /// pure ones with ones that can fail (arithmetic over a zero or an
+    /// extreme, a block read as a value whose own `where` can fail, a guard
+    /// over them) in every written position, after elements that can fail
+    /// (a `let`, a correlated `from` and an `optional` over a division).
+    pub placement: bool,
 }
 
 impl Default for ReadOptions {
@@ -587,6 +593,7 @@ impl Default for ReadOptions {
             nesting: true,
             aggregates: true,
             order_limit: true,
+            placement: false,
         }
     }
 }
@@ -655,8 +662,14 @@ impl ReadGen<'_, '_, '_> {
         for _ in 0..n_more {
             self.element(&mut scope, &mut elements, self.options.max_depth);
         }
+        if self.options.placement {
+            self.failing_elements(&mut scope, &mut elements);
+        }
         let mut text = format!("  match {{ {} }}", elements.join(", "));
-        if self.c.flag(45) {
+        if self.options.placement {
+            let w = self.placement_where(&scope);
+            let _ = write!(text, "\n  where {w}");
+        } else if self.c.flag(45) {
             let w = self.expr(Class::Bool, &scope, self.options.max_depth);
             let _ = write!(text, "\n  where {w}");
         }
@@ -692,6 +705,171 @@ impl ReadGen<'_, '_, '_> {
             }
         }
         (text, ordered)
+    }
+
+    /// The integer leaves in scope that a division may meet as zero: node
+    /// and edge properties and integer `let`s.
+    fn int_leaves(&self, scope: &[Var]) -> Vec<String> {
+        self.leaves(Class::Int, scope)
+    }
+
+    /// A comparison that cannot fail: a property, `let` or key against a
+    /// literal.
+    fn pure_conjunct(&mut self, scope: &[Var]) -> String {
+        let ints = self.int_leaves(scope);
+        if !ints.is_empty() && self.c.flag(60) {
+            let leaf = self.c.pick(&ints).clone();
+            let op = *self.c.pick(&["=", "!=", "<", ">", "<=", ">="]);
+            let lit = int_literal(INTS[self.c.below(7)]);
+            return format!("({leaf} {op} {lit})");
+        }
+        let strs = self.leaves(Class::Str, scope);
+        if strs.is_empty() {
+            return self.literal(Class::Bool);
+        }
+        let leaf = self.c.pick(&strs).clone();
+        let op = *self.c.pick(&["=", "!="]);
+        format!("({leaf} {op} {})", self.literal(Class::Str))
+    }
+
+    /// A comparison over arithmetic that a zero divisor or an overflow in
+    /// the graph makes fail; a pure one when no integer is in scope.
+    fn failing_conjunct(&mut self, scope: &[Var]) -> String {
+        let ints = self.int_leaves(scope);
+        if ints.is_empty() {
+            return self.pure_conjunct(scope);
+        }
+        let leaf = self.c.pick(&ints).clone();
+        let lit = int_literal(INTS[1 + self.c.below(6)]);
+        match self.c.below(3) {
+            0 => format!(
+                "(({lit} / {leaf}) > {})",
+                int_literal(INTS[self.c.below(7)])
+            ),
+            1 => format!("(({lit} % {leaf}) = 0)"),
+            _ => format!("(({leaf} * {}) > {lit})", int_literal(INTS[8])),
+        }
+    }
+
+    /// A block read as a value, its own `where` a conjunct that can fail
+    /// or not.
+    fn block_conjunct(&mut self, scope: &[Var]) -> Option<String> {
+        let (t, new) = self.traversal(scope, false, true)?;
+        let mut inner = scope.to_vec();
+        inner.extend(new);
+        let w = if self.c.flag(60) {
+            self.failing_conjunct(&inner)
+        } else {
+            self.pure_conjunct(&inner)
+        };
+        let body = format!("{{ {t} where {w} }}");
+        Some(match self.c.below(4) {
+            0 => format!("(exists {body})"),
+            1 => format!("(not exists {body})"),
+            2 => format!("(count {body} > {})", self.c.below(2)),
+            _ => format!("(count {body} = 0)"),
+        })
+    }
+
+    /// One conjunct of [`Self::placement_where`].
+    fn placement_conjunct(&mut self, scope: &[Var]) -> String {
+        match self.c.below(7) {
+            0 | 1 => self.pure_conjunct(scope),
+            2 | 3 => self.failing_conjunct(scope),
+            4 => self
+                .block_conjunct(scope)
+                .unwrap_or_else(|| self.failing_conjunct(scope)),
+            5 => {
+                let guard = self.pure_conjunct(scope);
+                let guarded = self.failing_conjunct(scope);
+                match self.c.below(3) {
+                    0 => format!("({guard} or {guarded})"),
+                    1 => format!("if({guard}, {guarded}, false)"),
+                    _ => format!("({guard} and {guarded})"),
+                }
+            }
+            _ => {
+                let guard = self.pure_conjunct(scope);
+                let block = self
+                    .block_conjunct(scope)
+                    .unwrap_or_else(|| self.failing_conjunct(scope));
+                format!("({guard} or {block})")
+            }
+        }
+    }
+
+    /// The placement law's `where`: two to five conjuncts in written order.
+    fn placement_where(&mut self, scope: &[Var]) -> String {
+        let n = 2 + self.c.below(4);
+        let conjuncts: Vec<String> = (0..n).map(|_| self.placement_conjunct(scope)).collect();
+        conjuncts.join(" and ")
+    }
+
+    /// Elements that can fail, each with some chance, after the read's
+    /// others: a `let` over a division, a correlated `from` summing one, and
+    /// an `optional` whose own `where` holds one. The `where` after them
+    /// may move below none of them.
+    fn failing_elements(&mut self, scope: &mut Vec<Var>, elements: &mut Vec<String>) {
+        let ints = self.int_leaves(scope);
+        if !ints.is_empty() && self.c.flag(30) {
+            let leaf = self.c.pick(&ints).clone();
+            let v = self.var("l");
+            let lit = int_literal(INTS[1 + self.c.below(6)]);
+            elements.push(format!("let {v} = ({lit} / {leaf})"));
+            scope.push(Var {
+                name: v,
+                kind: VarKind::Scalar(Sc::I64),
+            });
+        }
+        if self.options.nesting && self.c.flag(30) {
+            if let Some((t, new)) = self.traversal(scope, false, true) {
+                let node = new.iter().find_map(|v| match v.kind {
+                    VarKind::Node(t) => Some((v.name.clone(), t)),
+                    _ => None,
+                });
+                let mut inner = scope.clone();
+                inner.extend(new.clone());
+                let arg = match node {
+                    Some((name, t)) => {
+                        let props: Vec<String> = self.schema.nodes[t]
+                            .props
+                            .iter()
+                            .filter(|p| p.scalar().is_some_and(|s| s.class() == Class::Int))
+                            .map(|p| format!("{name}.{}", p.name))
+                            .collect();
+                        if props.is_empty() {
+                            None
+                        } else {
+                            let prop = self.c.pick(&props).clone();
+                            Some(format!("({} / {prop})", int_literal(INTS[6])))
+                        }
+                    }
+                    None => None,
+                };
+                if let Some(arg) = arg {
+                    let s = self.var("s");
+                    elements.push(format!(
+                        "from {{ match {{ {t} }} return {{ sum({arg}) as {} }} }}",
+                        &s[1..]
+                    ));
+                    scope.push(Var {
+                        name: s,
+                        kind: VarKind::Scalar(Sc::I64),
+                    });
+                }
+            }
+        }
+        if self.options.nesting && self.c.flag(25) {
+            if let Some((t, new)) = self.traversal(scope, false, true) {
+                let mut inner = scope.clone();
+                inner.extend(new.clone());
+                let w = self.failing_conjunct(&inner);
+                elements.push(format!("optional {{ {t} where {w} }}"));
+                self.nullable_nodes
+                    .extend(new.iter().map(|v| v.name.clone()));
+                scope.extend(new);
+            }
+        }
     }
 
     fn node_vars(scope: &[Var]) -> Vec<(String, usize)> {
