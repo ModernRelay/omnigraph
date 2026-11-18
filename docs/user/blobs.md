@@ -266,11 +266,10 @@ and retry.
 | 64 KiB | One external URI | `external Blob URI bytes` |
 | 4 MiB | One embedded managed range read | `Blob read range bytes` |
 
-Superseded versions of a key written in one operation count as input
-(`decoded blob input bytes per operation`) until the last-write-wins fold.
-An update of a row inserted earlier in the same mutation is such a version:
-it carries the pending row's Blob, so that payload counts twice, the carried
-copy as `materialized blob payload bytes`.
+Repeated updates to the same row in one mutation retain only the latest
+pending version in staging; previous pending versions of that row are replaced,
+so their carried Blob payloads no longer occupy the operation's retained
+payload allowance.
 
 [`write_max_bytes`](queries/settings.md) defaults to 32 MiB and accepts any
 integer of at least `1`; a Blob put stays bounded at 32 MiB by the put limit
