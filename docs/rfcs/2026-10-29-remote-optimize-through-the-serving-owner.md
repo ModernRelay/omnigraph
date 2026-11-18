@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-29
-updated: 2026-11-15
+updated: 2026-11-18
 discussion: https://github.com/ModernRelay/omnigraph/pull/1214
 supersedes: []
 superseded_by: []
@@ -112,8 +112,12 @@ durable before any effect and before the response. From then on:
 
 - **Identity.** One operation id names one request: graph, branch (main),
   kind (`optimize`), exact options and principal. The same id with the same
-  request returns the existing operation. The same id with a different request
-  is refused. A new id is a new operation and can repeat work.
+  request returns the existing operation, including its original dataset
+  outcomes once terminal. Repeating the request starts no new run and publishes
+  no additional graph commit. The server refuses a different request under
+  the same id and refuses to execute an evicted id (§2.5). A caller that
+  wants another attempt submits a new id. The engine then plans against the
+  current published graph (§1.5).
 - **Progress.** Status moves through `accepted`, `running` and `publishing`
   to one terminal state: `succeeded`, `failed`, `cancelled` or `interrupted`.
   A terminal record is never rewritten. A run whose publication is in doubt
@@ -425,7 +429,9 @@ index link that committed is complete without the next. When an index link
 fails with definite evidence after an earlier link of the same table
 committed, the committed links publish: the table is `optimized`, and its
 outcome carries the failure as the reason `index_failed`, with the error as
-its detail. The next run plans the remaining index work again. Discarding the
+its detail. If the dataset has not changed, a new run sees the published
+rewrite and retries only the outstanding index work. Queries still return
+every matching row while that index work is outstanding. Discarding the
 committed links would repeat the rewrite, the expensive step, on every run
 for as long as the index failure lasts, and each discarded rewrite leaves
 files only `cleanup` reclaims, which cannot run while a server holds the
@@ -1615,3 +1621,12 @@ dated pending entry in its decision log:
     `max_gate_hold_ms`, as implemented.
   - **Unresolved questions.** 2 (exit status with failed tables, decided
     with `cleanup`) and 3 (index results in the outcome) are new.
+- 2026-11-18 — Maintainer decision on idempotent `optimize` in
+  [#1415](https://github.com/ModernRelay/omnigraph/pull/1415). The Identity
+  rule replaces “a new id is a new operation and can repeat work” with the
+  two cases above. Replaying an accepted request returns its recorded
+  operation. A deliberate new run plans from the published graph. In §1.5,
+  the sentence about the next run now specifies that a completed rewrite
+  survives a definite later index failure. With unchanged input, only the
+  outstanding index work needs another attempt. The replay and partial
+  failure regressions are in [#1418](https://github.com/ModernRelay/omnigraph/pull/1418).
