@@ -190,10 +190,12 @@ impl TableVersionMetadata {
     /// carries a transaction uuid also accepts a v10 pin's linear twin, whose
     /// manifest differs but whose transaction is the same.
     ///
-    /// `dataset` must report the store's identity: open it through Lance's
-    /// own resolution (`open_dataset_entry`), never at the recorded manifest
-    /// (`instrumentation::open_pinned_dataset_at_recorded_manifest`), whose
-    /// dataset reports this pin's own ETag and so always passes.
+    /// Open `dataset` through Lance's own resolution (`open_dataset_entry`).
+    /// There an attached version reports the store's ETag and a detached
+    /// version reports none, so for a detached pin, which every write makes,
+    /// the transaction uuid decides. Never pass a dataset opened at the
+    /// recorded manifest (`instrumentation::open_pinned_dataset_at_recorded_manifest`):
+    /// it reports this pin's own ETag, so it always passes.
     pub fn witnesses(&self, dataset: &Dataset) -> bool {
         match self.e_tag.as_deref() {
             None => return true,

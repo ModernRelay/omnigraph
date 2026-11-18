@@ -4561,6 +4561,61 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
     );
 }
 
+/// Pins where a pinned table is opened at its registration's recorded
+/// manifest (issue 1250). That dataset reports the recorded size and ETag, not
+/// the store's, so it passes `TableVersionMetadata::witnesses` for any ETag
+/// the row holds. The one caller is the catalog's opener for a snapshot with
+/// no read caches; an open that checks a pin's identity (the change feed's and
+/// the Blob read's re-opens of a named branch) resolves through Lance.
+/// `open_pinned_dataset_at_recorded_manifest` stays `pub` because the catalog
+/// calls it across the crate boundary, and the engine imports all of core's
+/// instrumentation, so this count, not visibility, keeps the engine off it.
+#[test]
+fn recorded_manifest_open_call_counts_are_pinned() {
+    let src = engine_src_root();
+    let mut sites = Vec::new();
+    for (relative, file) in labeled_scan_files(&src, true) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let inventory = call_inventory(&ast);
+        for function in [
+            "open_pinned_dataset_at_recorded_manifest",
+            "open_dataset_entry_at_recorded_manifest",
+            "pinned_commit_handler",
+        ] {
+            let count = inventory.counts.get(function).copied().unwrap_or(0);
+            if count > 0 {
+                sites.push((function, relative.clone(), count));
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            (
+                "open_dataset_entry_at_recorded_manifest",
+                "omnigraph-catalog/lib.rs".to_string(),
+                1
+            ),
+            (
+                "open_pinned_dataset_at_recorded_manifest",
+                "omnigraph-catalog/lib.rs".to_string(),
+                1
+            ),
+            (
+                "pinned_commit_handler",
+                "omnigraph-core/instrumentation.rs".to_string(),
+                1
+            ),
+        ],
+        "the call sites of the recorded-manifest open changed: a dataset opened \
+         at the recorded manifest reports the recorded ETag and is never a \
+         witness, so only a snapshot with no read caches opens through it"
+    );
+}
+
 /// Pins the vector index the engine builds to IVF_FLAT, which scores every
 /// row of a partition it searches exactly. A read reports its `nearest`
 /// search exhaustive when it searched every partition; a quantized or graph

@@ -1500,9 +1500,11 @@ mod tests {
 
         // Whose identity a recorded open reports: the recorded one. A row whose
         // ETag is not the store's still opens at the recorded location and
-        // reports that ETag, so it passes the row's own witness check; Lance's
-        // resolution reports the store's identity and fails it. This is why the
-        // witness opens never take the recorded location.
+        // reports that ETag, so it passes the row's own witness check whatever
+        // the ETag. Through Lance's resolution a detached version reports no
+        // size and no ETag (`default_resolve_version`), so the ETag arm cannot
+        // match and, with no transaction uuid on the row, the check fails. This
+        // is why the witness opens never take the recorded location.
         let foreign_tag = "\"not-the-store-token\"";
         let foreign = row(location.size, Some(foreign_tag));
         let at_recorded = open(foreign.clone()).await.unwrap();
@@ -1513,10 +1515,8 @@ mod tests {
         );
         assert!(foreign.witnesses(&at_recorded));
         let through_lance = open(legacy.clone()).await.unwrap();
-        assert_ne!(
-            through_lance.manifest_location().e_tag.as_deref(),
-            Some(foreign_tag)
-        );
+        assert!(through_lance.manifest_location().e_tag.is_none());
+        assert!(through_lance.manifest_location().size.is_none());
         assert!(!foreign.witnesses(&through_lance));
         counter.take();
 
