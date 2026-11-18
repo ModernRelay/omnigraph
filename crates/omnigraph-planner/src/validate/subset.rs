@@ -181,7 +181,6 @@ pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
     let Some(PatternStep::NodeScan {
         variable,
         type_name,
-        filters,
     }) = pipeline.next()
     else {
         return None;
@@ -191,12 +190,13 @@ pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
     // member: it is evaluated above the scan, and its derivation would hold
     // mirrors no deeper walk may take apart.
     let deep = |filter: &IRExpr| filter.depth() > omnigraph_compiler::stack::MAX_HANDED_OFF_DEPTH;
-    if filters
+    if ir
+        .pipeline
         .iter()
-        .chain(ir.pipeline.iter().filter_map(|op| match op {
+        .filter_map(|op| match op {
             PatternStep::Filter { pred, .. } => Some(pred),
             _ => None,
-        }))
+        })
         .any(deep)
     {
         return None;
@@ -205,9 +205,6 @@ pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
         binding: variable,
         node_type,
     };
-    if !filters.iter().all(|filter| fragment.predicate(filter)) {
-        return None;
-    }
     for op in pipeline {
         match op {
             PatternStep::Filter { pred: filter, .. } if fragment.predicate(filter) => {}
@@ -646,12 +643,10 @@ fn canonical(
         .ok_or_else(|| invalid(format!("the plan records no pin of `{type_key}`")))?;
     let mut conjuncts: Vec<IRExpr> = Vec::new();
     for op in &ir.pipeline {
-        let filters: Vec<IRExpr> = match op {
-            PatternStep::NodeScan { filters, .. } => filters.clone(),
-            PatternStep::Filter { pred: filter, .. } => vec![filter.clone()],
-            _ => Vec::new(),
+        let PatternStep::Filter { pred: filter, .. } = op else {
+            continue;
         };
-        for conjunct in filters.into_iter().flat_map(IRExpr::into_conjuncts) {
+        for conjunct in filter.clone().into_conjuncts() {
             if !conjuncts.contains(&conjunct) {
                 conjuncts.push(conjunct);
             }

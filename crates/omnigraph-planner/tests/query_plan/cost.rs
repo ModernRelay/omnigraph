@@ -64,7 +64,7 @@ fn coverage_requires_every_endpoint_and_every_candidate_to_be_complete() {
                 (vec![unusable, dst.clone()], direction == Direction::In),
                 (vec![src, duplicate, dst], direction == Direction::In),
             ] {
-                let mut hop = expand("a", "b", vec![]);
+                let mut hop = expand("a", "b");
                 let PatternStep::Expand { edges, .. } = &mut hop else {
                     unreachable!()
                 };
@@ -97,7 +97,7 @@ fn coverage_requires_every_endpoint_and_every_candidate_to_be_complete() {
 #[test]
 fn bound_expand_coverage_defaults_only_missing_provenance_to_legacy() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -173,7 +173,7 @@ fn bound_expand_coverage_defaults_only_missing_provenance_to_legacy() {
 #[test]
 fn expand_mode_records_the_frontier_and_applies_its_hard_cap() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -210,7 +210,7 @@ fn expand_mode_records_the_frontier_and_applies_its_hard_cap() {
 #[test]
 fn a_forced_traversal_overrides_the_cost_model() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -243,11 +243,7 @@ fn a_forced_traversal_overrides_the_cost_model() {
 #[test]
 fn a_second_expand_after_a_csr_expand_reuses_the_warm_csr() {
     let op = ir(
-        vec![
-            scan("a"),
-            expand("a", "b", vec![]),
-            expand("b", "c", vec![]),
-        ],
+        vec![scan("a"), expand("a", "b"), expand("b", "c")],
         vec![prop("c", "slug")],
         vec![],
     );
@@ -291,7 +287,7 @@ fn a_second_expand_after_a_csr_expand_reuses_the_warm_csr() {
 #[test]
 fn access_path_follows_the_frontier_estimate_and_the_table_row_count() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -314,7 +310,7 @@ fn access_path_follows_the_frontier_estimate_and_the_table_row_count() {
     assert!(fired.contains(&"access_path"), "{fired:?}");
 
     let from_s = ir(
-        vec![scan_of("a", "S"), expand("a", "b", vec![])],
+        vec![scan_of("a", "S"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -352,7 +348,7 @@ fn access_path_follows_the_frontier_estimate_and_the_table_row_count() {
 #[test]
 fn access_path_looks_ids_up_when_the_build_side_does_not_fit_the_pool() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -435,7 +431,7 @@ fn access_path_looks_ids_up_when_the_build_side_does_not_fit_the_pool() {
 #[test]
 fn access_path_sizes_only_projected_columns() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -530,16 +526,19 @@ fn a_key_equality_on_the_source_scan_bounds_the_frontier_to_one_row() {
                 PatternStep::NodeScan {
                     variable: "a".to_string(),
                     type_name: "T".to_string(),
-                    filters: vec![IRExpr::comparison(
+                },
+                PatternStep::Filter {
+                    pred: IRExpr::comparison(
                         prop("a", property),
                         CompOp::Eq,
                         IRExpr::Literal(
                             Literal::String("x".into()),
                             value_type(ScalarType::String, false),
                         ),
-                    )],
+                    ),
+                    fails: false,
                 },
-                expand("a", "b", vec![]),
+                expand("a", "b"),
             ],
             vec![prop("b", "slug")],
             vec![],
@@ -582,7 +581,7 @@ fn a_key_equality_on_the_source_scan_bounds_the_frontier_to_one_row() {
 #[test]
 fn no_statistics_keeps_the_id_lookup_and_records_no_access_pass() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -606,7 +605,7 @@ fn no_statistics_keeps_the_id_lookup_and_records_no_access_pass() {
 #[test]
 fn no_statistics_records_csr_with_no_estimate() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -633,7 +632,7 @@ fn no_statistics_records_csr_with_no_estimate() {
 /// Synthetic caps isolate the cold cost comparison from hard-cap decisions.
 #[test]
 fn two_hops_choose_a_cold_csr_below_both_caps() {
-    let mut step = expand("a", "b", vec![]);
+    let mut step = expand("a", "b");
     if let PatternStep::Expand { max_hops, .. } = &mut step {
         *max_hops = Some(2);
     }
@@ -972,18 +971,23 @@ fn a_limit_hydrates_every_large_scan_but_not_a_key_lookup() {
     );
 
     let lookup = ir(
-        vec![PatternStep::NodeScan {
-            variable: "c".to_string(),
-            type_name: "T".to_string(),
-            filters: vec![IRExpr::comparison(
-                prop("c", "slug"),
-                CompOp::Eq,
-                IRExpr::Literal(
-                    Literal::String("one".to_string()),
-                    value_type(ScalarType::String, false),
+        vec![
+            PatternStep::NodeScan {
+                variable: "c".to_string(),
+                type_name: "T".to_string(),
+            },
+            PatternStep::Filter {
+                pred: IRExpr::comparison(
+                    prop("c", "slug"),
+                    CompOp::Eq,
+                    IRExpr::Literal(
+                        Literal::String("one".to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
                 ),
-            )],
-        }],
+                fails: false,
+            },
+        ],
         vec![prop("c", "body")],
         vec![],
     );
@@ -992,7 +996,7 @@ fn a_limit_hydrates_every_large_scan_but_not_a_key_lookup() {
     assert_eq!(root_hydration(&plan), None);
 
     let traversal = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("a", "slug"), prop("b", "body")],
         vec![],
     );
@@ -1015,18 +1019,23 @@ fn hydration_keeps_every_column_something_besides_the_output_reads() {
     let op = Operation::Query(Box::new(ReadShape {
         name: "q".to_string(),
         params: vec![],
-        pipeline: vec![PatternStep::NodeScan {
-            variable: "c".to_string(),
-            type_name: "T".to_string(),
-            filters: vec![IRExpr::comparison(
-                prop("c", "state"),
-                CompOp::Eq,
-                IRExpr::Literal(
-                    Literal::String("open".to_string()),
-                    value_type(ScalarType::String, false),
+        pipeline: vec![
+            PatternStep::NodeScan {
+                variable: "c".to_string(),
+                type_name: "T".to_string(),
+            },
+            PatternStep::Filter {
+                pred: IRExpr::comparison(
+                    prop("c", "state"),
+                    CompOp::Eq,
+                    IRExpr::Literal(
+                        Literal::String("open".to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
                 ),
-            )],
-        }],
+                fails: false,
+            },
+        ],
         return_exprs: vec![
             returned(prop("c", "slug"), None, "c.slug"),
             returned(prop("c", "rank"), None, "c.rank"),
@@ -1108,26 +1117,18 @@ fn negated_two_hops(
     k_filters: Vec<IRExpr>,
     inner_filters: Vec<PatternStep>,
 ) -> Operation {
-    let mut inner = vec![expand("a", "m", vec![]), expand("m", "k", k_filters)];
+    let mut inner = vec![expand("a", "m"), expand("m", "k")];
+    inner.extend(filters(k_filters));
     inner.extend(inner_filters);
-    let outer = PatternStep::NodeScan {
-        variable: "a".to_string(),
-        type_name: "T".to_string(),
-        filters: outer_filters,
-    };
-    ir(
-        vec![
-            outer,
-            PatternStep::AntiJoin {
-                fails: false,
-                outer_var: "a".to_string(),
-                inner,
-                predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
-            },
-        ],
-        vec![prop("a", "slug")],
-        vec![],
-    )
+    let mut pipeline = vec![scan("a")];
+    pipeline.extend(filters(outer_filters));
+    pipeline.push(PatternStep::AntiJoin {
+        fails: false,
+        outer_var: "a".to_string(),
+        inner,
+        predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
+    });
+    ir(pipeline, vec![prop("a", "slug")], vec![])
 }
 
 /// 1,000 `T` rows; `knows` fans out ten per source going out and `in_fanout`
@@ -1357,7 +1358,11 @@ fn key_set_starts_from_the_most_bounded_binding_and_the_first_on_a_tie() {
                 PatternStep::AntiJoin {
                     fails: false,
                     outer_var: "a".to_string(),
-                    inner: vec![expand("a", "m", m_filters), expand("m", "k", k_filters)],
+                    inner: [vec![expand("a", "m")], filters(m_filters)]
+                        .into_iter()
+                        .chain([vec![expand("m", "k")], filters(k_filters)])
+                        .flatten()
+                        .collect(),
                     predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
                 },
             ],

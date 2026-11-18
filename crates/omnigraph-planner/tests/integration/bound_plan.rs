@@ -78,7 +78,6 @@ fn query(order_by: IRExpr) -> ReadShape {
         pipeline: vec![PatternStep::NodeScan {
             variable: "d".to_string(),
             type_name: "Doc".to_string(),
-            filters: vec![],
         }],
         return_exprs: vec![IRProjection {
             expr: prop("d", "slug"),
@@ -400,7 +399,6 @@ fn doc_scan(variable: &str) -> PatternStep {
     PatternStep::NodeScan {
         variable: variable.to_string(),
         type_name: "Doc".to_string(),
-        filters: vec![],
     }
 }
 

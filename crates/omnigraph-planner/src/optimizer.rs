@@ -481,7 +481,6 @@ fn resolve_pipeline(
             PatternStep::NodeScan {
                 variable,
                 type_name,
-                filters,
             } => {
                 let NodeTypeSpec {
                     table,
@@ -510,9 +509,8 @@ fn resolve_pipeline(
                     },
                     schema.clone(),
                 );
-                let filtered = filter_over(plan, scan, filters, false, schema.clone());
                 match current {
-                    None => filtered,
+                    None => scan,
                     Some(left) => {
                         let joined = join_schema(
                             &schema_of(plan, left)?,
@@ -520,13 +518,7 @@ fn resolve_pipeline(
                             &schema,
                             Some(variable.as_str()),
                         );
-                        plan.add(
-                            LogicalNode::CrossJoin {
-                                left,
-                                right: filtered,
-                            },
-                            joined,
-                        )
+                        plan.add(LogicalNode::CrossJoin { left, right: scan }, joined)
                     }
                 }
             }
@@ -546,7 +538,6 @@ fn resolve_pipeline(
                 dst_type,
                 min_hops,
                 max_hops,
-                dst_filters,
                 edge_binding,
             } => {
                 let input = bound(current, "expand")?;
@@ -573,7 +564,7 @@ fn resolve_pipeline(
                     },
                     schema.clone(),
                 );
-                let destination = plan.add(
+                plan.add(
                     LogicalNode::TableScan {
                         input: Some(expand),
                         spec: Box::new(ScanSpec {
@@ -589,9 +580,8 @@ fn resolve_pipeline(
                             runtime_filter: None,
                         }),
                     },
-                    schema.clone(),
-                );
-                filter_over(plan, destination, dst_filters, false, schema)
+                    schema,
+                )
             }
             PatternStep::Rank {
                 key,

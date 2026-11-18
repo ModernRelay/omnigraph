@@ -1008,7 +1008,6 @@ mod tests {
             pipeline: vec![PatternStep::NodeScan {
                 variable: "d".into(),
                 type_name: "Doc".into(),
-                filters: vec![],
             }],
             return_exprs: vec![IRProjection {
                 expr: IRExpr::Variable(

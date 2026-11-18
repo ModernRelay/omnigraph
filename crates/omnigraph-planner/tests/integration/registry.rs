@@ -340,7 +340,6 @@ fn documents_query() -> Operation {
         pipeline: vec![PatternStep::NodeScan {
             variable: "d".to_string(),
             type_name: "Doc".to_string(),
-            filters: Vec::new(),
         }],
         return_exprs: vec![IRProjection {
             expr: IRExpr::Variable(

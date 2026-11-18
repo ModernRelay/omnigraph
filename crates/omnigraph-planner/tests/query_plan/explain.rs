@@ -16,15 +16,18 @@ fn expand_destination_filters_and_projection_belong_to_its_dependent_scan() {
                 dst_type: "T".to_string(),
                 min_hops: 1,
                 max_hops: Some(1),
-                dst_filters: vec![IRExpr::comparison(
+                edge_binding: None,
+            },
+            PatternStep::Filter {
+                pred: IRExpr::comparison(
                     prop("b", "state"),
                     CompOp::Eq,
                     IRExpr::Literal(
                         Literal::String("open".into()),
                         value_type(ScalarType::String, false),
                     ),
-                )],
-                edge_binding: None,
+                ),
+                fails: false,
             },
         ],
         vec![prop("a", "slug")],
@@ -89,7 +92,7 @@ fn physical_destination_scan_retains_its_input_and_does_not_claim_table_cardinal
         }],
     );
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -136,7 +139,7 @@ fn physical_destination_scan_retains_its_input_and_does_not_claim_table_cardinal
 fn physical_expand_carries_its_pinned_edge_version() {
     let source = source().with_edge_version("knows", 5);
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -188,7 +191,7 @@ fn physical_anti_join_predicate_reads_back_equal() {
             PatternStep::AntiJoin {
                 fails: false,
                 outer_var: "a".to_string(),
-                inner: vec![expand("a", "x", vec![])],
+                inner: vec![expand("a", "x")],
                 predicate: predicate.clone(),
             },
         ],
@@ -335,7 +338,7 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
 #[test]
 fn a_cross_join_left_side_is_a_build_pipeline_and_a_query_explain_has_pipelines() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![]), scan("c")],
+        vec![scan("a"), expand("a", "b"), scan("c")],
         vec![prop("b", "slug"), prop("c", "slug")],
         vec![],
     );

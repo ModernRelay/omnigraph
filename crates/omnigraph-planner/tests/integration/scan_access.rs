@@ -132,22 +132,29 @@ fn prop(binding: &str) -> IRExpr {
     }
 }
 fn query(two: bool) -> ReadShape {
-    let scan = |binding: &str| PatternStep::NodeScan {
-        variable: binding.into(),
-        type_name: "Doc".into(),
-        filters: vec![IRExpr::comparison(
-            prop(binding),
-            CompOp::Eq,
-            IRExpr::Literal(Literal::String("a".into()), prop(binding).ty().clone()),
-        )],
+    let scan = |binding: &str| {
+        [
+            PatternStep::NodeScan {
+                variable: binding.into(),
+                type_name: "Doc".into(),
+            },
+            PatternStep::Filter {
+                pred: IRExpr::comparison(
+                    prop(binding),
+                    CompOp::Eq,
+                    IRExpr::Literal(Literal::String("a".into()), prop(binding).ty().clone()),
+                ),
+                fails: false,
+            },
+        ]
     };
     ReadShape {
         name: "probe".into(),
         params: vec![],
         pipeline: if two {
-            vec![scan("a"), scan("b")]
+            [scan("a"), scan("b")].concat()
         } else {
-            vec![scan("a")]
+            scan("a").to_vec()
         },
         return_exprs: vec![IRProjection {
             expr: prop("a"),

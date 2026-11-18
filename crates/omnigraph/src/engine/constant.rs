@@ -188,15 +188,7 @@ fn fold_pipeline(
 ) -> Result<()> {
     for op in pipeline {
         match op {
-            PatternStep::NodeScan { filters, .. }
-            | PatternStep::Expand {
-                dst_filters: filters,
-                ..
-            } => {
-                for filter in filters {
-                    *filter = fold_expr(filter, params)?;
-                }
-            }
+            PatternStep::NodeScan { .. } | PatternStep::Expand { .. } => {}
             PatternStep::Filter { pred: filter, .. } => *filter = fold_expr(filter, params)?,
             PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
                 fold_pipeline(inner, declared, params)?

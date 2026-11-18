@@ -8,15 +8,14 @@
 //! becomes the leading rank key the ranked scan executes, the pattern under
 //! it the scan's prefilter. The shape is derived per plan and never stored.
 //!
-//! The pattern's facts (bindings with their filters, triples, filter
-//! clauses, blocks) are recovered from the term, then placed: the first
-//! binding of each connected component scans and the others are introduced
-//! by the expansion that reaches them, their filters going with it; a triple
-//! whose ends are both bound expands to a fresh name and filters on
-//! identity; the filter clauses follow, then the blocks. A core node the
-//! planner has no plan node for, or a shape outside this table, is
-//! [`Unlowered`]: the type checker refuses it (`T86`) at the construct the
-//! refusal names.
+//! The pattern's facts (bindings, triples, filter clauses, blocks) are
+//! recovered from the term, then placed: the first binding of each connected
+//! component scans and the others are introduced by the expansion that
+//! reaches them; a triple whose ends are both bound expands to a fresh name
+//! and filters on identity; the filter clauses follow, then the blocks. A
+//! core node the planner has no plan node for, or a shape outside this
+//! table, is [`Unlowered`]: the type checker refuses it (`T86`) at the
+//! construct the refusal names.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -156,8 +155,6 @@ pub enum PatternStep {
     NodeScan {
         variable: String,
         type_name: String,
-        /// The binding's filters over `variable`.
-        filters: Vec<IRExpr>,
     },
     Expand {
         src_var: String,
@@ -167,9 +164,6 @@ pub enum PatternStep {
         dst_type: String,
         min_hops: u32,
         max_hops: Option<u32>,
-        /// The filters of a binding the expansion introduces, applied as it
-        /// hydrates the destination.
-        dst_filters: Vec<IRExpr>,
         /// The edge variable: one output row per matching edge, its
         /// properties carried under this prefix.
         edge_binding: Option<String>,
@@ -179,7 +173,10 @@ pub enum PatternStep {
     /// fail where it is evaluated, the type checker's flag (A3); the
     /// planner's placement law moves only a conjunct that cannot, and
     /// nothing below one that can.
-    Filter { pred: IRExpr, fails: bool },
+    Filter {
+        pred: IRExpr,
+        fails: bool,
+    },
     /// A ranking drawn over the rows of the steps before it, its
     /// population, when it is not the read's leading `order` key cut by the
     /// read's `limit` (that ranking is `order_by`'s first key): `key` is the
@@ -257,7 +254,10 @@ pub enum PatternStep {
     /// for the `let`; every later read of `$v` reads that column. A value
     /// that can fail refuses the read there (A3), and no filter written
     /// after the `let` runs below this step.
-    Let { name: String, value: IRExpr },
+    Let {
+        name: String,
+        value: IRExpr,
+    },
     /// `from` an inline read (or a declared read's call) with its own
     /// aggregate, `distinct`, `order` or `limit`, the core's `Correlate`
     /// over its `Group`, `Order` and `Cut`: `inner` is the read's pattern and
@@ -3610,8 +3610,8 @@ impl<'a> Shaper<'a> {
     }
 
     /// The scope's traversals as expansions from the names already bound,
-    /// each introducing its other end with that binding's filters; a
-    /// traversal with neither end bound scans its source.
+    /// each introducing its other end; a traversal with neither end bound
+    /// scans its source.
     /// `optional_names` are the references null on a row an `optional` kept
     /// without a match: those an `optional` of the scope introduced, and
     /// those of an enclosing scope's that the scope reads.
@@ -3644,7 +3644,6 @@ impl<'a> Shaper<'a> {
                         dst_type: traversal.dst_type.clone(),
                         min_hops: traversal.min_hops,
                         max_hops: traversal.max_hops,
-                        dst_filters: vec![],
                         edge_binding,
                     });
                     let id = self.catalog.system_columns.id.to_string();
@@ -3691,7 +3690,6 @@ impl<'a> Shaper<'a> {
                         dst_type: traversal.src_type.clone(),
                         min_hops: traversal.min_hops,
                         max_hops: traversal.max_hops,
-                        dst_filters: Vec::new(),
                         edge_binding,
                     });
                     if traversal.src != "_" {
@@ -3711,7 +3709,6 @@ impl<'a> Shaper<'a> {
                         dst_type: traversal.dst_type.clone(),
                         min_hops: traversal.min_hops,
                         max_hops: traversal.max_hops,
-                        dst_filters: Vec::new(),
                         edge_binding,
                     });
                     if traversal.dst != "_" {
@@ -3725,7 +3722,6 @@ impl<'a> Shaper<'a> {
                 pipeline.push(PatternStep::NodeScan {
                     variable: t.src.clone(),
                     type_name: t.src_type.clone(),
-                    filters: Vec::new(),
                 });
                 bound_vars.insert(t.src.clone());
             }
@@ -3977,7 +3973,6 @@ impl<'a> Shaper<'a> {
                 pipeline.push(PatternStep::NodeScan {
                     variable: variable.to_string(),
                     type_name: type_name.to_string(),
-                    filters: Vec::new(),
                 });
                 bound_vars.insert(variable.to_string());
                 false
@@ -3988,7 +3983,6 @@ impl<'a> Shaper<'a> {
             pipeline.push(PatternStep::NodeScan {
                 variable: binding.variable.clone(),
                 type_name: binding.type_name.clone(),
-                filters: Vec::new(),
             });
             bound_vars.insert(binding.variable.clone());
         }
@@ -3996,7 +3990,6 @@ impl<'a> Shaper<'a> {
             pipeline.push(PatternStep::NodeScan {
                 variable: variable.to_string(),
                 type_name: type_name.to_string(),
-                filters: Vec::new(),
             });
             bound_vars.insert(variable.to_string());
         }
@@ -4542,16 +4535,10 @@ fn rename_inner_bindings(
     let mut pending: Vec<_> = pipeline.iter_mut().collect();
     while let Some(step) = pending.pop() {
         match step {
-            PatternStep::NodeScan {
-                variable, filters, ..
-            } => {
-                rename(variable);
-                expressions.extend(filters);
-            }
+            PatternStep::NodeScan { variable, .. } => rename(variable),
             PatternStep::Expand {
                 src_var,
                 dst_var,
-                dst_filters,
                 edge_binding,
                 ..
             } => {
@@ -4560,7 +4547,6 @@ fn rename_inner_bindings(
                 if let Some(binding) = edge_binding {
                     rename(binding);
                 }
-                expressions.extend(dst_filters);
             }
             PatternStep::Filter { pred, .. } => expressions.push(pred),
             PatternStep::Rank { binding, key, .. } => {

@@ -148,7 +148,7 @@ fn sibling_negations_keep_destination_scan_filters_in_their_scopes() {
         outer_var: "a".to_string(),
         predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
         inner: vec![
-            expand("a", "x", vec![]),
+            expand("a", "x"),
             PatternStep::Filter {
                 pred: IRExpr::comparison(
                     prop("x", "state"),
@@ -256,65 +256,39 @@ fn rejected_scalar_filters_stay_above_root_and_dependent_scans() {
         }
     }
     for dependent in [false, true] {
-        for embedded in [false, true] {
-            if !dependent && embedded {
-                continue;
+        let binding = if dependent { "b" } else { "a" };
+        let filter = IRExpr::comparison(
+            prop(binding, "state"),
+            CompOp::Eq,
+            IRExpr::Literal(
+                Literal::String("open".into()),
+                value_type(ScalarType::String, false),
+            ),
+        );
+        let mut pipeline = if dependent {
+            vec![scan("a"), expand("a", "b")]
+        } else {
+            vec![scan("a")]
+        };
+        pipeline.push(PatternStep::Filter {
+            pred: filter,
+            fails: false,
+        });
+        let op = ir(pipeline, vec![prop(binding, "slug")], vec![]);
+        let source = RefusingSource(source());
+        let mut plan = resolve(&op, &source).expect("query resolves");
+        rewrite(&mut plan, &source).expect("rewrite");
+        assert!(
+            plan.live()
+                .any(|(_, node)| matches!(node, LogicalNode::Filter { .. }))
+        );
+        for (_, node) in plan.live() {
+            if let LogicalNode::TableScan { spec, .. } = node {
+                assert!(spec.filter.is_none());
             }
-            let binding = if dependent { "b" } else { "a" };
-            let filter = IRExpr::comparison(
-                prop(binding, "state"),
-                CompOp::Eq,
-                IRExpr::Literal(
-                    Literal::String("open".into()),
-                    value_type(ScalarType::String, false),
-                ),
-            );
-            let mut pipeline = if dependent {
-                vec![
-                    scan("a"),
-                    expand(
-                        "a",
-                        "b",
-                        if embedded {
-                            vec![filter.clone()]
-                        } else {
-                            vec![]
-                        },
-                    ),
-                ]
-            } else {
-                vec![PatternStep::NodeScan {
-                    variable: "a".into(),
-                    type_name: "T".into(),
-                    filters: if embedded {
-                        vec![filter.clone()]
-                    } else {
-                        vec![]
-                    },
-                }]
-            };
-            if !embedded {
-                pipeline.push(PatternStep::Filter {
-                    pred: filter,
-                    fails: false,
-                });
-            }
-            let op = ir(pipeline, vec![prop(binding, "slug")], vec![]);
-            let source = RefusingSource(source());
-            let mut plan = resolve(&op, &source).expect("query resolves");
-            rewrite(&mut plan, &source).expect("rewrite");
-            assert!(
-                plan.live()
-                    .any(|(_, node)| matches!(node, LogicalNode::Filter { .. }))
-            );
-            for (_, node) in plan.live() {
-                if let LogicalNode::TableScan { spec, .. } = node {
-                    assert!(spec.filter.is_none());
-                }
-            }
-            // The `limit` cuts the tie rule's order, which reads the id.
-            let expected: &[&str] = &["__id", "slug", "state"];
-            assert_eq!(projection_of(&plan, binding), set(expected));
         }
+        // The `limit` cuts the tie rule's order, which reads the id.
+        let expected: &[&str] = &["__id", "slug", "state"];
+        assert_eq!(projection_of(&plan, binding), set(expected));
     }
 }

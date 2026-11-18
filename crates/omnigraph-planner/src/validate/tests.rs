@@ -484,7 +484,6 @@ fn an_optional_tests_its_conjuncts_inside_its_inner_tree() {
     let mut leaked = plan;
     let conjunct = fixture.ir.pipeline.iter().find_map(|step| match step {
         crate::PatternStep::Optional { inner, .. } => inner.iter().find_map(|step| match step {
-            crate::PatternStep::Expand { dst_filters, .. } => dst_filters.first().cloned(),
             crate::PatternStep::Filter { pred: filter, .. } => Some(filter.clone()),
             _ => None,
         }),
@@ -562,7 +561,6 @@ fn an_inline_read_with_its_own_cut_tests_its_conjuncts_under_the_cut() {
     let mut leaked = plan;
     let conjunct = fixture.ir.pipeline.iter().find_map(|step| match step {
         crate::PatternStep::Correlate { inner, .. } => inner.iter().find_map(|step| match step {
-            crate::PatternStep::Expand { dst_filters, .. } => dst_filters.first().cloned(),
             crate::PatternStep::Filter { pred: filter, .. } => Some(filter.clone()),
             _ => None,
         }),

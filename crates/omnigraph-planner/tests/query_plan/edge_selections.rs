@@ -36,7 +36,7 @@ fn issue_659_large_finite_bounds_stop_estimation_at_a_fixed_point() {
                         max_hops_cap: 6,
                     },
                 );
-            let mut named = expand("a", "b", vec![]);
+            let mut named = expand("a", "b");
             let PatternStep::Expand { max_hops, .. } = &mut named else {
                 unreachable!()
             };
@@ -219,7 +219,7 @@ fn member(name: &str, direction: Direction) -> EdgeMember {
 }
 
 fn selected(src: &str, dst: &str, edges: EdgeSelection) -> PatternStep {
-    let mut op = expand(src, dst, vec![]);
+    let mut op = expand(src, dst);
     let PatternStep::Expand { edges: value, .. } = &mut op else {
         unreachable!()
     };
@@ -245,7 +245,7 @@ fn correlated(edges: EdgeSelection) -> Operation {
     ir(
         vec![
             scan("a"),
-            expand("a", "b", vec![]),
+            expand("a", "b"),
             PatternStep::AntiJoin {
                 fails: false,
                 outer_var: "b".to_string(),
@@ -387,7 +387,7 @@ fn issue_659_selection_admission_precedes_lowering_of_outer_named_edges() {
 #[test]
 fn named_query_ignores_a_source_selection_allowance() {
     let query = query(ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     ));

@@ -133,7 +133,6 @@ pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<
             PatternStep::NodeScan {
                 variable,
                 type_name,
-                filters: _,
             } => {
                 out.insert(variable.clone(), type_name.clone());
             }
@@ -145,7 +144,6 @@ pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<
                 dst_type,
                 min_hops: _,
                 max_hops: _,
-                dst_filters: _,
                 edge_binding: _,
             } => {
                 out.insert(dst_var.clone(), dst_type.clone());

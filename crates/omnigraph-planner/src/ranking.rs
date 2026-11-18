@@ -219,7 +219,6 @@ mod tests {
             pipeline: vec![PatternStep::NodeScan {
                 variable: "d".to_string(),
                 type_name: "Doc".to_string(),
-                filters: vec![],
             }],
             return_exprs: vec![
                 returned(SCORE_COLUMN, true),

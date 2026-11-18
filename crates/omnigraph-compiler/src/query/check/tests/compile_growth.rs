@@ -306,8 +306,7 @@ fn shape_exprs(shape: &ReadShape) -> usize {
     fn steps(list: &[PatternStep]) -> usize {
         list.iter()
             .map(|step| match step {
-                PatternStep::NodeScan { filters, .. } => filters.iter().map(expr_nodes).sum(),
-                PatternStep::Expand { dst_filters, .. } => dst_filters.iter().map(expr_nodes).sum(),
+                PatternStep::NodeScan { .. } | PatternStep::Expand { .. } => 0,
                 PatternStep::Filter { pred, .. } => expr_nodes(pred),
                 PatternStep::Rank { key, .. } => expr_nodes(key),
                 PatternStep::Score { query, .. } => expr_nodes(query),

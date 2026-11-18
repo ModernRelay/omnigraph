@@ -126,15 +126,12 @@ fn own_eligibility(inner: &[PatternStep]) -> Vec<IRExpr> {
     let mut eligibility = Vec::new();
     for own in inner {
         match own {
-            PatternStep::NodeScan { filters, .. }
-            | PatternStep::Expand {
-                dst_filters: filters,
-                ..
-            } => push_conjuncts(&mut eligibility, filters),
             PatternStep::Filter { pred: filter, .. } => {
                 push_conjuncts(&mut eligibility, std::slice::from_ref(filter))
             }
-            PatternStep::Rank { .. }
+            PatternStep::NodeScan { .. }
+            | PatternStep::Expand { .. }
+            | PatternStep::Rank { .. }
             | PatternStep::Score { .. }
             | PatternStep::Let { .. }
             | PatternStep::AntiJoin { .. }
@@ -231,15 +228,7 @@ pub(crate) fn conjunct_regions(
                 nested
             };
             match step {
-                PatternStep::NodeScan { filters, .. }
-                | PatternStep::Expand {
-                    dst_filters: filters,
-                    ..
-                } => {
-                    let mut own = Vec::new();
-                    push_conjuncts(&mut own, filters);
-                    out.extend(own.into_iter().map(|conjunct| (conjunct, here.clone())));
-                }
+                PatternStep::NodeScan { .. } | PatternStep::Expand { .. } => {}
                 PatternStep::Filter { pred: filter, .. } => {
                     let mut own = Vec::new();
                     push_conjuncts(&mut own, std::slice::from_ref(filter));
@@ -634,7 +623,6 @@ impl Requirements {
                 PatternStep::NodeScan {
                     variable,
                     type_name,
-                    filters,
                 } => {
                     bindings.insert(
                         variable.clone(),
@@ -642,7 +630,6 @@ impl Requirements {
                             type_name: type_name.clone(),
                         },
                     );
-                    push_conjuncts(&mut eligibility, filters);
                 }
                 PatternStep::Filter { pred: filter, .. } => {
                     push_conjuncts(&mut eligibility, std::slice::from_ref(filter))
@@ -655,7 +642,6 @@ impl Requirements {
                     dst_type,
                     min_hops,
                     max_hops,
-                    dst_filters,
                     edge_binding,
                 } => {
                     if !made_up.contains(dst_var) {
@@ -685,7 +671,6 @@ impl Requirements {
                         max_hops: *max_hops,
                         edge_binding: edge_binding.clone(),
                     });
-                    push_conjuncts(&mut eligibility, dst_filters);
                 }
                 PatternStep::AntiJoin {
                     outer_var,

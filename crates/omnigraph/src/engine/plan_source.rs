@@ -732,7 +732,6 @@ async fn query_table_statistics(
                 PatternStep::NodeScan {
                     type_name,
                     variable: _,
-                    filters: _,
                 } => {
                     types.entry(format!("node:{type_name}")).or_insert(false);
                 }
@@ -744,7 +743,6 @@ async fn query_table_statistics(
                     dst_var: _,
                     min_hops: _,
                     max_hops: _,
-                    dst_filters: _,
                     edge_binding: _,
                 } => {
                     types.entry(format!("node:{src_type}")).or_insert(false);

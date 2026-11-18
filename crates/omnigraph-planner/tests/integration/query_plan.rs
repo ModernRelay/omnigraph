@@ -95,7 +95,6 @@ fn scan_of(variable: &str, type_name: &str) -> PatternStep {
     PatternStep::NodeScan {
         variable: variable.to_string(),
         type_name: type_name.to_string(),
-        filters: vec![],
     }
 }
 
@@ -241,7 +240,7 @@ fn object_columns() -> BTreeSet<String> {
     columns
 }
 
-fn expand(src: &str, dst: &str, dst_filters: Vec<IRExpr>) -> PatternStep {
+fn expand(src: &str, dst: &str) -> PatternStep {
     PatternStep::Expand {
         src_var: src.to_string(),
         dst_var: dst.to_string(),
@@ -254,8 +253,15 @@ fn expand(src: &str, dst: &str, dst_filters: Vec<IRExpr>) -> PatternStep {
         min_hops: 1,
         max_hops: Some(1),
         edge_binding: None,
-        dst_filters,
     }
+}
+
+/// The `where` conjuncts `preds` as filter steps, in order.
+fn filters(preds: Vec<IRExpr>) -> Vec<PatternStep> {
+    preds
+        .into_iter()
+        .map(|pred| PatternStep::Filter { pred, fails: false })
+        .collect()
 }
 
 use crate::fixture_bounds;
