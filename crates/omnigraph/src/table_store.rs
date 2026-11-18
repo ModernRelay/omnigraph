@@ -3309,12 +3309,9 @@ impl TableStore {
         segments: &[&IndexMetadata],
     ) -> Result<usize> {
         if !segments.is_empty()
-            && segments.iter().all(|segment| {
-                segment
-                    .fragment_bitmap
-                    .as_ref()
-                    .is_some_and(|bitmap| bitmap.is_empty())
-            })
+            && segments
+                .iter()
+                .all(|segment| crate::dataset_index::covers_no_fragment(segment))
         {
             return Ok(ENGINE_VECTOR_PARTITIONS);
         }
@@ -3446,16 +3443,16 @@ impl TableStore {
             else {
                 continue;
             };
+            let segments = existing
+                .iter()
+                .filter(|index| index.name == item.name)
+                .collect::<Vec<_>>();
             let mut ds_clone = ds.clone();
             let columns = [column.as_str()];
             let built = if item.vector {
                 // Keep the index's partition count: the engine builds one
                 // partition, but a partitioned index (Lance's split, or an
                 // explicit build) keeps its shape across folds.
-                let segments = existing
-                    .iter()
-                    .filter(|index| index.name == item.name)
-                    .collect::<Vec<_>>();
                 let partitions = Self::vector_partition_count(ds, &item.name, &segments).await?;
                 let params =
                     lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
@@ -3499,12 +3496,7 @@ impl TableStore {
                     new_idx.name, new_idx.dataset_version, read_version
                 )));
             }
-            removed_indices.extend(
-                existing
-                    .iter()
-                    .filter(|index| index.name == item.name)
-                    .cloned(),
-            );
+            removed_indices.extend(segments.into_iter().cloned());
             if item.vector {
                 crate::instrumentation::record_stage_vector_index();
             }

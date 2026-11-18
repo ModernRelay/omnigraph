@@ -2963,9 +2963,9 @@ query patch($v: Vector(4)?) {
     update D set { v: $v } where slug in ["k5", "k2"]
 }
 "#;
-    // The vector index's segments and how many current fragments they leave
-    // uncovered.
-    async fn vector_index(db: &Omnigraph) -> (usize, usize) {
+    // The vector index's segments, how many of them cover no fragment, and
+    // how many current fragments they leave uncovered.
+    async fn vector_index(db: &Omnigraph) -> (usize, usize, usize) {
         let ds = helpers::open_pinned_dataset_for_test(db, "main", "node:D").await;
         let field = ds.schema().field("v").unwrap().id;
         let indices = ds.load_indices().await.unwrap();
@@ -2973,6 +2973,15 @@ query patch($v: Vector(4)?) {
             .iter()
             .filter(|index| index.fields == [field])
             .collect::<Vec<_>>();
+        let empty = segments
+            .iter()
+            .filter(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.is_empty())
+            })
+            .count();
         let uncovered = ds
             .get_fragments()
             .iter()
@@ -2985,7 +2994,7 @@ query patch($v: Vector(4)?) {
                 })
             })
             .count();
-        (segments.len(), uncovered)
+        (segments.len(), empty, uncovered)
     }
 
     let dir = tempfile::tempdir().unwrap();
@@ -3007,7 +3016,7 @@ query patch($v: Vector(4)?) {
     db.optimize_as(None, OptimizeRequest::default())
         .await
         .unwrap();
-    assert_eq!(vector_index(&db).await, (1, 0));
+    assert_eq!(vector_index(&db).await, (1, 0, 0));
 
     mutate_main(
         &db,
@@ -3017,8 +3026,9 @@ query patch($v: Vector(4)?) {
     )
     .await
     .unwrap();
-    let (segments, uncovered) = vector_index(&db).await;
+    let (segments, empty, uncovered) = vector_index(&db).await;
     assert_eq!(segments, 1, "the patch keeps the index's definition");
+    assert_eq!(empty, 1, "the patch leaves no segment covering a fragment");
     assert!(uncovered > 0, "the patch withdraws the fragment it touched");
 
     let built = db.ensure_indices_on_as("main", None).await.unwrap();
@@ -3032,7 +3042,7 @@ query patch($v: Vector(4)?) {
         "{:?}",
         built.indexes
     );
-    assert_eq!(vector_index(&db).await, (1, 0));
+    assert_eq!(vector_index(&db).await, (1, 0, 0));
 
     // The same state reached again, then folded by optimize.
     mutate_main(
@@ -3043,7 +3053,13 @@ query patch($v: Vector(4)?) {
     )
     .await
     .unwrap();
-    assert_ne!(vector_index(&db).await.1, 0);
+    let (segments, empty, uncovered) = vector_index(&db).await;
+    assert_eq!(
+        (segments, empty),
+        (1, 1),
+        "the patch empties the index again"
+    );
+    assert_ne!(uncovered, 0);
     let optimized = db
         .optimize_as(None, OptimizeRequest::default())
         .await
@@ -3057,7 +3073,7 @@ query patch($v: Vector(4)?) {
             table.failure
         );
     }
-    assert_eq!(vector_index(&db).await, (1, 0));
+    assert_eq!(vector_index(&db).await, (1, 0, 0));
 
     let rows = helpers::query_main(
         &db,

@@ -3434,6 +3434,167 @@ query nearest_docs($q: Vector(2)) {
     )
 }
 
+/// `index build` of a vector index on a reopened handle, in the two lagging
+/// states it rebuilds. `VectorIndexRefreshEmptied`: an `update` of the vector
+/// beside an unassigned Blob is a column patch, which withdrew the index's
+/// only fragment, so no segment covers a fragment; the build rebuilds the
+/// vector index alone, with the engine's own partition count and without a
+/// statistics read (before, that read named no count and the build failed on
+/// every run). `VectorIndexRefreshLagging`, for comparison: a load appended a
+/// second fragment, so the build reads the index's statistics to keep its
+/// partition count and rebuilds it over both fragments, and also refreshes
+/// the id BTREE, which the append left lagging too. The setup is the one of
+/// the engine test
+/// `index_build_and_optimize_rebuild_a_vector_index_a_column_patch_left_empty`,
+/// whose carried columns make the patch cheaper than a row rewrite.
+fn vector_index_recovery_cost_rows(replay: &str) -> String {
+    const SCHEMA: &str = "node D {\n    slug: String @key\n    n: I64?\n    s: String?\n    b: Blob?\n    v: Vector(4)? @index\n}\n";
+    const PATCH: &str = r#"
+query patch($v: Vector(4)) {
+    update D set { v: $v } where slug in ["k2", "k5"]
+}
+"#;
+    const LABELS: [&str; 2] = ["VectorIndexRefreshLagging", "VectorIndexRefreshEmptied"];
+
+    struct VectorIndexRecoveryCost {
+        emptied: bool,
+    }
+
+    /// The segments of the vector index on `v`, and how many of them cover
+    /// a fragment.
+    async fn vector_segments(db: &Omnigraph) -> (usize, usize) {
+        let table = snapshot_main(db)
+            .await
+            .unwrap()
+            .open_dataset("node:D")
+            .await
+            .unwrap();
+        let field = table.schema().field("v").unwrap().id;
+        let indices = table.load_indices().await.unwrap();
+        let segments = indices
+            .iter()
+            .filter(|index| index.fields == [field])
+            .collect::<Vec<_>>();
+        let covering = segments
+            .iter()
+            .filter(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|bitmap| !bitmap.is_empty())
+            })
+            .count();
+        (segments.len(), covering)
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
+        for VectorIndexRecoveryCost
+    {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            use omnigraph::db::{BuiltIndex, BuiltIndexAction, BuiltIndexKind};
+            use omnigraph_compiler::query::ast::Literal;
+            omnigraph_dst::cost::set_label("_vector_recovery_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(
+                concat!(
+                    r#"{"type":"D","data":{"slug":"k2","v":null}}"#,
+                    "\n",
+                    r#"{"type":"D","data":{"slug":"k5","v":[1.0,-2.0,-2.0,-1.0]}}"#,
+                ),
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+            db.ensure_indices_as(None).await.unwrap();
+            assert_eq!(vector_segments(db.db()).await, (1, 1));
+            if self.emptied {
+                let mut params = omnigraph_compiler::ir::ParamMap::new();
+                params.insert(
+                    "v".to_string(),
+                    Literal::List(
+                        [2.0, 1.0, 0.5, 0.0]
+                            .into_iter()
+                            .map(Literal::Float)
+                            .collect(),
+                    ),
+                );
+                db.mutate("main", PATCH, "patch", &params).await.unwrap();
+                // The state this row measures: the index keeps its
+                // definition but no segment covers a fragment.
+                assert_eq!(vector_segments(db.db()).await, (1, 0));
+            } else {
+                db.load_jsonl(
+                    r#"{"type":"D","data":{"slug":"k7","v":[0.0,1.0,2.0,3.0]}}"#,
+                    LoadMode::Append,
+                )
+                .await
+                .unwrap();
+                assert_eq!(vector_segments(db.db()).await, (1, 1));
+            }
+            drop(db);
+            let db = session(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            );
+            let label = LABELS[usize::from(self.emptied)];
+            omnigraph_dst::cost::set_label(label);
+            let built = db.db().ensure_indices_on_as("main", None).await;
+            omnigraph_dst::cost::set_label("_vector_recovery_verify");
+            let built = built.unwrap();
+            let refreshed = |property: &str, kind| BuiltIndex {
+                type_key: "node:D".to_string(),
+                property: property.to_string(),
+                kind,
+                action: BuiltIndexAction::Refreshed,
+            };
+            let mut expected = vec![refreshed("v", BuiltIndexKind::Vector)];
+            if !self.emptied {
+                expected.insert(0, refreshed("__id", BuiltIndexKind::Btree));
+            }
+            assert_eq!(built.indexes, expected, "{label}");
+            assert!(
+                built.pending.iter().all(|pending| pending.property != "v"),
+                "{label}: {:?}",
+                built.pending
+            );
+            assert_eq!(vector_segments(db.db()).await, (1, 1), "{label}");
+            let again = db.db().ensure_indices_on_as("main", None).await.unwrap();
+            assert!(
+                again.indexes.iter().all(|index| index.property != "v"),
+                "{label}: the rebuilt vector index covers every fragment: {:?}",
+                again.indexes
+            );
+        }
+    }
+
+    let mut rows = String::new();
+    for emptied in [false, true] {
+        let label = LABELS[usize::from(emptied)];
+        rows.push_str(&labeled_cost_rows(
+            format!("shared-memory://dst-vector-index-recovery-cost-{replay}-{label}"),
+            &VectorIndexRecoveryCost { emptied },
+            label,
+        ));
+    }
+    rows
+}
+
 /// Where each warm-read call goes: per label, the calls by realm (the
 /// `__manifest` dataset, `__history`, a graph table, or the control-object
 /// adapter), Lance directory and verb, at several history depths. Prints
@@ -4457,6 +4618,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&update_patch_cost_rows("a"));
     table.push_str(&keyed_write_table_size_cost_rows("a"));
     table.push_str(&nearest_cost_rows("a"));
+    table.push_str(&vector_index_recovery_cost_rows("a"));
     table.push_str(&carried_write_cost_rows("a"));
     table.push_str(&writer_claim_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
@@ -4475,6 +4637,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&update_patch_cost_rows("b"));
     table2.push_str(&keyed_write_table_size_cost_rows("b"));
     table2.push_str(&nearest_cost_rows("b"));
+    table2.push_str(&vector_index_recovery_cost_rows("b"));
     table2.push_str(&carried_write_cost_rows("b"));
     table2.push_str(&writer_claim_cost_rows("b"));
     assert_eq!(
