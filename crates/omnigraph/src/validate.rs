@@ -22,17 +22,17 @@ pub(crate) mod plan;
 
 use std::collections::{HashMap, HashSet};
 
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::{Array, RecordBatch};
 use datafusion::prelude::{Expr, col, ident, lit};
 use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use lance::Dataset;
-use lance_table::format::Fragment;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::EdgeType;
 
 use crate::db::{Omnigraph, Snapshot};
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
+use crate::table_store::key_reads::{PROBE_CHUNK_KEYS, string_col, visit_key_matches};
 use crate::table_store::{ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, TableStore};
 use kernels::{CardPlan, HoldersByKey, card_affected, card_violations, match_unique_holders};
 use key_set::{IntKeySet, IntKeySetLayout, canonical_i64, key_bytes};
@@ -85,203 +85,8 @@ pub(crate) enum AccessPath {
     Scan,
 }
 
-/// Keys per batched committed probe: uniqueness holders and `@card` edges.
-/// Bounds the pushed-down filter size, since a merge delta is not row-capped
-/// and a load holds many keyed batches of `KEYED_WRITE_MAX_ROWS` rows.
-pub(crate) const PROBE_CHUNK_KEYS: usize = 8_192;
-
-/// How one node removal reads an edge table for the committed edges that
-/// touch its removed ids: the retained-edge check (an overwrite load, `load
-/// csv`, a branch merge) and the delete cascade both read through it.
-///
-/// Lance plans a pushed filter once per fragment that no index answers it on
-/// and gives each such fragment its own copy of the filter (Lance 13
-/// `FilteredReadExec`, `plan.filters.get(&fragment_id).map(|f| (**f).clone())`),
-/// building every copy before it reads. One `src IN (every removed id)` filter
-/// therefore held removed ids times uncovered fragments, and no allowance
-/// charged it (#1442). So the removed ids are pushed to every fragment only
-/// when a BTREE on every probed endpoint covers the whole table (Lance plans
-/// no copy; [`PROBE_CHUNK_KEYS`] ids per endpoint per filter), or when one
-/// filter holds them all and the fragments that BTREE leaves uncovered, times
-/// those ids, are at most [`PROBE_CHUNK_KEYS`] copied ids per endpoint.
-/// Otherwise only the covered fragments are probed, chunk by chunk, and the
-/// uncovered ones are read once, whole, and matched in memory against the
-/// removed ids ([`EndpointMatch`]), so no uncovered fragment is read once per
-/// chunk. Memory is then one chunk's filter, at most [`PROBE_CHUNK_KEYS`]
-/// copied ids per endpoint, the removed-id sets and one batch, whatever the
-/// fragment count.
-/// Coverage decides cost only: every fragment is read by exactly one of the
-/// two paths, and both test the same ids.
-pub(crate) struct RemovalEdgeReads<'a> {
-    src: (&'a str, &'a [String]),
-    dst: (&'a str, &'a [String]),
-    /// The fragments the filters are pushed to: `None` for every fragment,
-    /// an empty list for none.
-    probed: Option<Vec<Fragment>>,
-    /// The fragments read whole and matched in memory.
-    matched: Vec<Fragment>,
-}
-
-impl<'a> RemovalEdgeReads<'a> {
-    /// Plan the reads of `ds` for edges whose `src.0` column holds one of
-    /// `src.1` or whose `dst.0` column holds one of `dst.1`.
-    pub(crate) async fn plan(
-        ds: &Dataset,
-        src: (&'a str, &'a [String]),
-        dst: (&'a str, &'a [String]),
-    ) -> Result<Self> {
-        let probed_columns: Vec<&str> = [src, dst]
-            .into_iter()
-            .filter(|(_, ids)| !ids.is_empty())
-            .map(|(column, _)| column)
-            .collect();
-        let mut covered: Option<std::collections::BTreeSet<u64>> = None;
-        for column in &probed_columns {
-            let fragments = crate::dataset_index::key_column_covered_fragments(ds, column).await?;
-            covered = Some(match covered {
-                None => fragments,
-                Some(acc) => acc.intersection(&fragments).copied().collect(),
-            });
-        }
-        let covered = covered.unwrap_or_default();
-        let (covered, uncovered): (Vec<Fragment>, Vec<Fragment>) = ds
-            .fragments()
-            .iter()
-            .cloned()
-            .partition(|fragment| covered.contains(&fragment.id));
-        let ids = src.1.len().max(dst.1.len());
-        let push_everywhere = uncovered.is_empty()
-            || (ids <= PROBE_CHUNK_KEYS && uncovered.len().saturating_mul(ids) <= PROBE_CHUNK_KEYS);
-        Ok(if push_everywhere {
-            Self {
-                src,
-                dst,
-                probed: None,
-                matched: Vec::new(),
-            }
-        } else {
-            Self {
-                src,
-                dst,
-                probed: Some(covered),
-                matched: uncovered,
-            }
-        })
-    }
-
-    /// The pushed filters, one per [`PROBE_CHUNK_KEYS`] removed ids: the
-    /// `i`-th is `src IN (chunk i of the src ids) OR dst IN (chunk i of the
-    /// dst ids)`, leaving out an endpoint whose ids are used up, so a removal
-    /// of one chunk keeps the single filter it always had. Each is scanned on
-    /// [`Self::probe_fragments`]. None when no fragment is probed. An edge
-    /// whose endpoints fall in two chunks matches two filters; callers keep
-    /// it once.
-    pub(crate) fn probe_filters(&self) -> impl Iterator<Item = Expr> + '_ {
-        let probes = !self.probed.as_ref().is_some_and(Vec::is_empty);
-        let chunks = if probes {
-            self.src
-                .1
-                .len()
-                .max(self.dst.1.len())
-                .div_ceil(PROBE_CHUNK_KEYS)
-        } else {
-            0
-        };
-        let (src, dst) = (self.src, self.dst);
-        (0..chunks).map(move |chunk| {
-            let start = chunk * PROBE_CHUNK_KEYS;
-            [src, dst]
-                .into_iter()
-                .filter(|(_, ids)| start < ids.len())
-                .map(|(column, ids)| {
-                    let end = ids.len().min(start + PROBE_CHUNK_KEYS);
-                    col(column).in_list(
-                        ids[start..end].iter().map(|id| lit(id.clone())).collect(),
-                        false,
-                    )
-                })
-                .reduce(Expr::or)
-                .expect("a chunk below the longer list's count holds ids")
-        })
-    }
-
-    /// The fragments every probe filter is scanned on: `None` for the whole
-    /// table.
-    pub(crate) fn probe_fragments(&self) -> Option<Vec<Fragment>> {
-        self.probed.clone()
-    }
-
-    /// The fragments to read whole, with the matcher of their rows; `None`
-    /// when every fragment is probed.
-    pub(crate) fn matched(&self) -> Option<(Vec<Fragment>, EndpointMatch<'a>)> {
-        if self.matched.is_empty() {
-            return None;
-        }
-        let set = |ids: &'a [String]| ids.iter().map(String::as_str).collect::<HashSet<&str>>();
-        let src = (!self.src.1.is_empty()).then(|| (self.src.0, set(self.src.1)));
-        // A self-edge cascade tests both endpoints against one id list.
-        let dst = match (&src, self.dst.1.is_empty()) {
-            (_, true) => None,
-            (Some(_), false) if std::ptr::eq(self.src.1, self.dst.1) => Some((self.dst.0, None)),
-            (_, false) => Some((self.dst.0, Some(set(self.dst.1)))),
-        };
-        Some((self.matched.clone(), EndpointMatch { src, dst }))
-    }
-}
-
-/// The in-memory test of [`RemovalEdgeReads`] on the fragments it reads
-/// whole: an edge matches when its src is a removed src id or its dst a
-/// removed dst id, the rows the pushed filter selects elsewhere.
-pub(crate) struct EndpointMatch<'a> {
-    src: Option<(&'a str, HashSet<&'a str>)>,
-    /// `None` set: the src set holds the dst ids too.
-    dst: Option<(&'a str, Option<HashSet<&'a str>>)>,
-}
-
-impl EndpointMatch<'_> {
-    /// The columns a batch must carry for [`Self::keep`].
-    pub(crate) fn columns(&self) -> impl Iterator<Item = &str> + '_ {
-        self.src
-            .iter()
-            .map(|(column, _)| *column)
-            .chain(self.dst.iter().map(|(column, _)| *column))
-    }
-
-    /// The rows of `batch` whose endpoints match, in order.
-    pub(crate) fn keep(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let src = match &self.src {
-            Some((column, ids)) => Some((string_col(batch, column)?, ids)),
-            None => None,
-        };
-        let dst = match &self.dst {
-            Some((column, ids)) => Some((
-                string_col(batch, column)?,
-                ids.as_ref()
-                    .or(self.src.as_ref().map(|(_, ids)| ids))
-                    .expect("a shared dst set is the src set"),
-            )),
-            None => None,
-        };
-        let hit = |values: &StringArray, ids: &HashSet<&str>, row: usize| {
-            !values.is_null(row) && ids.contains(values.value(row))
-        };
-        let mask: arrow_array::BooleanArray = (0..batch.num_rows())
-            .map(|row| {
-                Some(
-                    src.is_some_and(|(values, ids)| hit(values, ids, row))
-                        || dst.is_some_and(|(values, ids)| hit(values, ids, row)),
-                )
-            })
-            .collect();
-        arrow_select::filter::filter_record_batch(batch, &mask).map_err(OmniError::arrow_internal)
-    }
-}
-
-/// Index-backed view of committed target state for the merge delta's lookups.
-/// Every method reads the (indexed) target table via a structured `filter_expr`
-/// so Lance serves it from the BTREE (index-search → take) rather than a full
-/// scan — with the documented uncovered-fragment-tail caveat (a stale index
-/// degrades to a tail scan; correctness is unaffected).
+/// The judge's committed view. Lookups may probe a scalar index, scan
+/// projected columns, or combine the two across a pinned dataset's fragments.
 pub(crate) struct CommittedState<'a> {
     /// The committed view for existence / uniqueness / cardinality lookups: the
     /// merge target snapshot, the write path's pinned base, or the loader's
@@ -538,96 +343,6 @@ impl<'a> CommittedState<'a> {
         Ok(holders)
     }
 
-    /// Committed edges `(id, src)` in `edge_table` whose id is one of `ids`,
-    /// probed in filtered scans of at most [`PROBE_CHUNK_KEYS`] ids each. An id
-    /// names at most one edge, so the result is bounded by `ids`.
-    async fn committed_edges_by_id(
-        &self,
-        edge_table: &str,
-        ids: &[String],
-        system_columns: SystemColumns,
-    ) -> Result<Vec<(String, String)>> {
-        // No keys, no open: on the write path an open refreshes the branch
-        // snapshot.
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let Some(ds) = self.open_cardinality(edge_table).await? else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::new();
-        for chunk in ids.chunks(PROBE_CHUNK_KEYS) {
-            let expr = col(system_columns.id)
-                .in_list(chunk.iter().map(|id| lit(id.clone())).collect(), false);
-            let batches =
-                scan_filtered(&ds, &[system_columns.id, system_columns.src], expr).await?;
-            for batch in &batches {
-                let ids = string_col(batch, system_columns.id)?;
-                let srcs = string_col(batch, system_columns.src)?;
-                for i in 0..batch.num_rows() {
-                    out.push((ids.value(i).to_string(), srcs.value(i).to_string()));
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Committed edges of `edge_table` per source among `srcs`, an edge whose
-    /// id `excluded` names (removed or re-placed by the change) left out.
-    /// The sources are probed in sorted filtered scans of at most
-    /// [`PROBE_CHUNK_KEYS`] each and the edges stream past batch by batch, so
-    /// memory holds one count per source, never the edges themselves.
-    async fn committed_source_counts(
-        &self,
-        edge_table: &str,
-        srcs: &HashSet<String>,
-        system_columns: SystemColumns,
-        excluded: impl Fn(&str) -> bool,
-    ) -> Result<HashMap<String, u32>> {
-        let mut counts = HashMap::new();
-        if srcs.is_empty() {
-            return Ok(counts);
-        }
-        let Some(ds) = self.open_cardinality(edge_table).await? else {
-            return Ok(counts);
-        };
-        let mut sorted: Vec<&String> = srcs.iter().collect();
-        sorted.sort();
-        for chunk in sorted.chunks(PROBE_CHUNK_KEYS) {
-            let expr = col(system_columns.src)
-                .in_list(chunk.iter().map(|src| lit((*src).clone())).collect(), false);
-            let projection = [system_columns.id, system_columns.src];
-            let mut stream = TableStore::scan_stream_with(
-                &ds,
-                Some(&projection),
-                None,
-                None,
-                false,
-                move |scanner| {
-                    scanner.filter_expr(expr);
-                    Ok(())
-                },
-            )
-            .await?;
-            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
-                let ids = string_col(&batch, system_columns.id)?;
-                let batch_srcs = string_col(&batch, system_columns.src)?;
-                for i in 0..batch.num_rows() {
-                    if excluded(ids.value(i)) {
-                        continue;
-                    }
-                    let count = counts
-                        .entry(batch_srcs.value(i).to_string())
-                        .or_insert(0u32);
-                    *count = count.checked_add(1).ok_or_else(|| {
-                        OmniError::manifest_internal("@card edge count overflows u32")
-                    })?;
-                }
-            }
-        }
-        Ok(counts)
-    }
-
     /// The smallest source in `edge_table`'s image before this write that
     /// `reject` names, read by one bounded scan of the src column: the
     /// replaced image of an overwritten table, which its committed view hides.
@@ -661,22 +376,15 @@ impl<'a> CommittedState<'a> {
         Ok(first)
     }
 
-    /// Committed edges `(id, src, dst)` of `edge_table` whose src is in
-    /// `src_nodes` or dst in `dst_nodes`, the edges a node removal would strand;
-    /// `limit_one` reads the first alone when no delta or deletion can exempt it.
-    /// Read through [`RemovalEdgeReads`]: the removed ids are pushed in
-    /// bounded chunks where an index answers them, and matched in memory on
-    /// the fragments it leaves uncovered, so neither memory nor the copies
-    /// Lance plans grow with removed ids times fragments (#1442). An edge two
-    /// reads find is returned once, from the first; under `limit_one` the
-    /// first read that finds an edge ends the reading.
+    /// Edges a node removal would strand. Both endpoints can match different
+    /// probe chunks, so only the first occurrence of each edge id is retained.
     async fn edges_referencing(
         &self,
         edge_table: &str,
-        src_nodes: &[String],
-        dst_nodes: &[String],
+        (src_nodes, dst_nodes): (&[&str], &[&str]),
         system_columns: SystemColumns,
         limit_one: bool,
+        scratch: &mut load::ByteAdmission<'_>,
         admit: &mut (dyn FnMut(&RecordBatch) -> Result<()> + Send),
     ) -> Result<Vec<(String, String, String)>> {
         if src_nodes.is_empty() && dst_nodes.is_empty() {
@@ -685,85 +393,33 @@ impl<'a> CommittedState<'a> {
         let Some(ds) = self.open(edge_table).await? else {
             return Ok(Vec::new());
         };
-        let reads = RemovalEdgeReads::plan(
+        let mut out = Vec::new();
+        let mut found = HashSet::new();
+        visit_key_matches(
             &ds,
+            &[system_columns.id, system_columns.src, system_columns.dst],
             (system_columns.src, src_nodes),
-            (system_columns.dst, dst_nodes),
+            Some((system_columns.dst, dst_nodes)),
+            limit_one,
+            scratch,
+            |batch| {
+                admit(batch)?;
+                let ids = string_col(batch, system_columns.id)?;
+                let srcs = string_col(batch, system_columns.src)?;
+                let dsts = string_col(batch, system_columns.dst)?;
+                for i in 0..batch.num_rows() {
+                    if limit_one || found.insert(ids.value(i).to_owned()) {
+                        out.push((
+                            ids.value(i).to_owned(),
+                            srcs.value(i).to_owned(),
+                            dsts.value(i).to_owned(),
+                        ));
+                    }
+                }
+                Ok(())
+            },
         )
         .await?;
-        let projection = [system_columns.id, system_columns.src, system_columns.dst];
-        let mut out = Vec::new();
-        let mut found: HashSet<String> = HashSet::new();
-        let mut keep = |batch: &RecordBatch| -> Result<bool> {
-            if batch.num_rows() == 0 {
-                return Ok(false);
-            }
-            admit(batch)?;
-            let ids = string_col(batch, system_columns.id)?;
-            let srcs = string_col(batch, system_columns.src)?;
-            let dsts = string_col(batch, system_columns.dst)?;
-            for i in 0..batch.num_rows() {
-                if !found.insert(ids.value(i).to_string()) {
-                    continue;
-                }
-                out.push((
-                    ids.value(i).to_string(),
-                    srcs.value(i).to_string(),
-                    dsts.value(i).to_string(),
-                ));
-            }
-            Ok(limit_one)
-        };
-        for expr in reads.probe_filters() {
-            let fragments = reads.probe_fragments();
-            let mut stream = TableStore::scan_stream_with(
-                &ds,
-                Some(&projection),
-                None,
-                None,
-                false,
-                move |scanner| {
-                    scanner.filter_expr(expr);
-                    if let Some(fragments) = fragments {
-                        scanner.with_fragments(fragments);
-                    }
-                    if limit_one {
-                        scanner.limit(1)?;
-                        scanner.batch_size(1);
-                        scanner.batch_size_bytes(ID_SCAN_BATCH_BYTES);
-                        scanner.batch_readahead(1);
-                    }
-                    Ok(())
-                },
-            )
-            .await?;
-            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
-                if keep(&batch)? {
-                    return Ok(out);
-                }
-            }
-        }
-        if let Some((fragments, matcher)) = reads.matched() {
-            let mut stream = TableStore::scan_stream_with(
-                &ds,
-                Some(&projection),
-                None,
-                None,
-                false,
-                move |scanner| {
-                    scanner.with_fragments(fragments);
-                    scanner.batch_size(ID_SCAN_BATCH_ROWS);
-                    scanner.batch_size_bytes(ID_SCAN_BATCH_BYTES);
-                    Ok(())
-                },
-            )
-            .await?;
-            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
-                if keep(&matcher.keep(&batch)?)? {
-                    return Ok(out);
-                }
-            }
-        }
         Ok(out)
     }
 }
@@ -913,13 +569,92 @@ fn push_int_ids(
     Ok(())
 }
 
-fn string_col<'b>(batch: &'b RecordBatch, name: &str) -> Result<&'b StringArray> {
-    batch
-        .column_by_name(name)
-        .ok_or_else(|| OmniError::manifest(format!("batch missing column '{name}'")))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest(format!("column '{name}' is not Utf8")))
+/// Add the committed source of each removed or replaced edge. The source set
+/// coalesces multiple old edges of one source as the cardinality check does.
+async fn committed_edge_sources(
+    ds: Option<&Dataset>,
+    plan: &CardPlan,
+    system_columns: SystemColumns,
+    admit: &mut load::ByteAdmission<'_>,
+) -> Result<HashSet<String>> {
+    let mut sources = HashSet::new();
+    let Some(ds) = ds else { return Ok(sources) };
+    let keys = plan
+        .delta_by_id
+        .len()
+        .saturating_add(plan.removed_ids.len());
+    if keys == 0 {
+        return Ok(sources);
+    }
+    let _keys = admit(keys.saturating_mul(size_of::<&String>()))?;
+    let mut ids: Vec<&String> = plan.delta_by_id.keys().chain(&plan.removed_ids).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    visit_key_matches(
+        ds,
+        &[system_columns.src],
+        (system_columns.id, &ids),
+        None,
+        false,
+        admit,
+        |batch| {
+            let rows = string_col(batch, system_columns.src)?;
+            for row in 0..rows.len() {
+                if !sources.contains(rows.value(row)) {
+                    sources.insert(rows.value(row).to_owned());
+                }
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    Ok(sources)
+}
+
+/// Count committed edges for the affected sources, excluding edges this change
+/// removes or replaces. Only one count per source survives a scan batch.
+async fn committed_source_counts(
+    ds: Option<&Dataset>,
+    srcs: &HashSet<String>,
+    system_columns: SystemColumns,
+    excluded: impl Fn(&str) -> bool,
+    admit: &mut load::ByteAdmission<'_>,
+) -> Result<HashMap<String, u32>> {
+    let mut counts = HashMap::<String, u32>::new();
+    let Some(ds) = ds.filter(|_| !srcs.is_empty()) else {
+        return Ok(counts);
+    };
+    let _keys = admit(srcs.len().saturating_mul(size_of::<&String>()))?;
+    let mut sorted: Vec<&String> = srcs.iter().collect();
+    sorted.sort_unstable();
+    visit_key_matches(
+        ds,
+        &[system_columns.id, system_columns.src],
+        (system_columns.src, &sorted),
+        None,
+        false,
+        admit,
+        |batch| {
+            let ids = string_col(batch, system_columns.id)?;
+            let batch_srcs = string_col(batch, system_columns.src)?;
+            for row in 0..batch.num_rows() {
+                if excluded(ids.value(row)) {
+                    continue;
+                }
+                let src = batch_srcs.value(row);
+                if let Some(count) = counts.get_mut(src) {
+                    *count = count.checked_add(1).ok_or_else(|| {
+                        OmniError::manifest_internal("@card edge count overflows u32")
+                    })?;
+                } else {
+                    counts.insert(src.to_owned(), 1);
+                }
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    Ok(counts)
 }
 
 /// `@card` for an edge type, scoped to the srcs the change affects: the one
@@ -943,6 +678,7 @@ async fn evaluate_cardinality<F>(
     deleted_src_nodes: &HashSet<String>,
     committed: &CommittedState<'_>,
     system_columns: SystemColumns,
+    admit: &mut load::ByteAdmission<'_>,
     sink: &mut F,
 ) -> Result<()>
 where
@@ -967,34 +703,26 @@ where
         .await;
     }
 
-    // Committed srcs of the edges this delta touches. `removed_edges` are the
-    // deleted ids (direct deletes; a node-delete cascade already lands those ids
-    // in `deleted_ids`). `moved_from` are the changed ids' OLD committed srcs: an
-    // upsert that moves an edge's src vacates its old src, which must be
-    // recounted or a drop below @card min is missed.
-    let removed_edges = committed
-        .committed_edges_by_id(edge_table, &plan.removed_ids, system_columns)
-        .await?;
-    let moved_from = committed
-        .committed_edges_by_id(edge_table, &plan.changed_ids, system_columns)
-        .await?;
-    let affected = card_affected(
-        plan,
-        &removed_edges,
-        &moved_from,
-        written,
-        deleted_src_nodes,
-    );
-    if affected.is_empty() {
+    if plan.delta_by_id.is_empty()
+        && plan.removed_ids.is_empty()
+        && written.is_subset(deleted_src_nodes)
+    {
         return Ok(());
     }
-
+    // A mutation needs the current branch image (#298), and every lookup in
+    // this count must refer to the same image. Open it once for both columns.
+    let ds = committed.open_cardinality(edge_table).await?;
+    let old_sources = committed_edge_sources(ds.as_ref(), plan, system_columns, admit).await?;
+    let affected = card_affected(plan, old_sources, written, deleted_src_nodes);
     let removed: HashSet<&str> = plan.removed_ids.iter().map(String::as_str).collect();
-    let committed_counts = committed
-        .committed_source_counts(edge_table, &affected, system_columns, |id| {
-            removed.contains(id) || plan.delta_by_id.contains_key(id)
-        })
-        .await?;
+    let committed_counts = committed_source_counts(
+        ds.as_ref(),
+        &affected,
+        system_columns,
+        |id| removed.contains(id) || plan.delta_by_id.contains_key(id),
+        admit,
+    )
+    .await?;
     card_violations(
         edge_table,
         edge_type,
@@ -1034,7 +762,7 @@ where
             !delta_sources.contains(src) && !deleted_src_nodes.contains(src)
         })
         .await?;
-    let mut affected = card_affected(plan, &[], &[], written, deleted_src_nodes);
+    let mut affected = card_affected(plan, HashSet::new(), written, deleted_src_nodes);
     affected.extend(emptied);
     card_violations(
         edge_table,
@@ -1048,178 +776,17 @@ where
 
 #[cfg(test)]
 mod endpoint_probe_tests {
-    use super::{PROBE_CHUNK_KEYS, RemovalEdgeReads};
-    use datafusion::prelude::{Expr, col, lit};
-    use datafusion::scalar::ScalarValue;
-
-    /// The probe filters of a removal whose every fragment is probed.
-    fn endpoint_probe_filters<'a>(
-        src: (&'a str, &'a [String]),
-        dst: (&'a str, &'a [String]),
-    ) -> Vec<Expr> {
-        RemovalEdgeReads {
-            src,
-            dst,
-            probed: None,
-            matched: Vec::new(),
-        }
-        .probe_filters()
-        .collect()
-    }
-
-    /// A removal's edge probes carry at most one chunk of ids per endpoint in
-    /// each filter, and together list every id once, in order; one chunk
-    /// keeps the single `src IN … OR dst IN …` filter.
-    #[test]
-    fn removed_id_probes_hold_one_chunk_per_filter_issue_1442() {
-        let src: Vec<String> = (0..2 * PROBE_CHUNK_KEYS + 1)
-            .map(|i| format!("s{i:07}"))
-            .collect();
-        let dst: Vec<String> = (0..PROBE_CHUNK_KEYS + 3)
-            .map(|i| format!("d{i:07}"))
-            .collect();
-        let mut shapes = Vec::new();
-        let mut listed: Vec<(String, String)> = Vec::new();
-        for filter in endpoint_probe_filters(("__src", &src), ("__dst", &dst)) {
-            let mut lists = Vec::new();
-            for test in or_terms(filter) {
-                let Expr::InList(in_list) = test else {
-                    panic!("an endpoint probe ORs IN lists: {test}");
-                };
-                assert!(!in_list.negated);
-                let Expr::Column(column) = *in_list.expr else {
-                    panic!("an endpoint probe tests a column");
-                };
-                lists.push((column.name.clone(), in_list.list.len()));
-                for item in in_list.list {
-                    let Expr::Literal(ScalarValue::Utf8(Some(id)), _) = item else {
-                        panic!("an endpoint probe lists string literals: {item}");
-                    };
-                    listed.push((column.name.clone(), id));
-                }
-            }
-            shapes.push(lists);
-        }
-        let full = PROBE_CHUNK_KEYS;
-        assert_eq!(
-            shapes,
-            vec![
-                vec![("__src".to_string(), full), ("__dst".to_string(), full)],
-                vec![("__src".to_string(), full), ("__dst".to_string(), 3)],
-                vec![("__src".to_string(), 1)],
-            ]
-        );
-        let src_listed: Vec<&String> = listed
-            .iter()
-            .filter(|(c, _)| c == "__src")
-            .map(|(_, id)| id)
-            .collect();
-        let dst_listed: Vec<&String> = listed
-            .iter()
-            .filter(|(c, _)| c == "__dst")
-            .map(|(_, id)| id)
-            .collect();
-        assert_eq!(src_listed, src.iter().collect::<Vec<_>>());
-        assert_eq!(dst_listed, dst.iter().collect::<Vec<_>>());
-
-        let one = vec!["a".to_string()];
-        let single: Vec<Expr> = endpoint_probe_filters(("__src", &one), ("__dst", &one));
-        assert_eq!(
-            single,
-            vec![
-                col("__src")
-                    .in_list(vec![lit("a")], false)
-                    .or(col("__dst").in_list(vec![lit("a")], false))
-            ]
-        );
-        assert!(endpoint_probe_filters(("__src", &[]), ("__dst", &[])).is_empty());
-        let none_probed = RemovalEdgeReads {
-            src: ("__src", &one),
-            dst: ("__dst", &one),
-            probed: Some(Vec::new()),
-            matched: Vec::new(),
-        };
-        assert_eq!(none_probed.probe_filters().count(), 0);
-    }
-
-    /// On the fragments read whole, a row is kept when its src is a removed
-    /// src id or its dst a removed dst id, null endpoints never; a self-edge
-    /// removal tests both endpoints against its one id list.
-    #[test]
-    fn matched_fragments_keep_the_rows_a_probe_selects_issue_1442() {
-        use arrow_array::{Array, RecordBatch, StringArray};
-        use std::sync::Arc;
-        let batch = RecordBatch::try_from_iter([
-            (
-                "__id",
-                Arc::new(StringArray::from(vec!["e0", "e1", "e2", "e3", "e4"])) as _,
-            ),
-            (
-                "__src",
-                Arc::new(StringArray::from(vec![
-                    Some("a"),
-                    Some("k"),
-                    Some("k"),
-                    None,
-                    Some("b"),
-                ])) as _,
-            ),
-            (
-                "__dst",
-                Arc::new(StringArray::from(vec![
-                    Some("k"),
-                    Some("b"),
-                    Some("k"),
-                    Some("a"),
-                    Some("a"),
-                ])) as _,
-            ),
-        ])
-        .unwrap();
-        let fragment = lance_table::format::Fragment::new(0);
-        let kept = |src: &[String], dst: &[String]| -> Vec<String> {
-            let reads = RemovalEdgeReads {
-                src: ("__src", src),
-                dst: ("__dst", dst),
-                probed: Some(Vec::new()),
-                matched: vec![fragment.clone()],
-            };
-            let (fragments, matcher) = reads.matched().expect("a fragment is read whole");
-            assert_eq!(fragments.len(), 1);
-            let kept = matcher.keep(&batch).unwrap();
-            let ids = kept
-                .column_by_name("__id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .clone();
-            (0..ids.len()).map(|i| ids.value(i).to_string()).collect()
-        };
-        let a = vec!["a".to_string()];
-        let b = vec!["b".to_string()];
-        assert_eq!(kept(&a, &[]), vec!["e0"]);
-        assert_eq!(kept(&[], &a), vec!["e3", "e4"]);
-        assert_eq!(kept(&a, &b), vec!["e0", "e1"]);
-        assert_eq!(kept(&a, &a), vec!["e0", "e3", "e4"]);
-        let every = RemovalEdgeReads {
-            src: ("__src", &a),
-            dst: ("__dst", &a),
-            probed: None,
-            matched: Vec::new(),
-        };
-        assert!(every.matched().is_none());
-    }
+    use super::PROBE_CHUNK_KEYS;
+    use crate::table_store::key_reads::{KeyReads, MAX_LITERAL_BYTES};
 
     /// The plan over a real edge table follows its live BTREE coverage: with
     /// no index every fragment is matched in memory, after `ensure_indices`
     /// every fragment is probed, and after one more append the indexed
     /// fragments are probed and only the new one is matched. A removal
-    /// whose one filter times the uncovered fragments stays within
-    /// [`PROBE_CHUNK_KEYS`] copied ids per endpoint keeps its filter on every
-    /// fragment.
+    /// with a single filter inside both the key-count and literal-byte
+    /// ceilings can probe every fragment.
     #[tokio::test]
-    async fn removal_reads_follow_the_edge_tables_live_coverage_issue_1442() {
+    async fn removal_reads_follow_live_coverage_and_literal_bytes_issue_1442_issue_1445() {
         use crate::db::{Omnigraph, ReadTarget};
         use crate::loader::LoadMode;
 
@@ -1245,13 +812,14 @@ mod endpoint_probe_tests {
         let append = || async {
             db.load(
                 "main",
-                r#"{"edge":"Link","from":"keep","to":"keep"}"#,
+                r#"{"edge":"Link","from":"keep","to":"keep"}
+{"edge":"Link","from":"keep","to":"keep"}"#,
                 LoadMode::Append,
             )
             .await
             .unwrap();
         };
-        // One edge per append, so every edge is its own fragment.
+        // Each append puts both matching rows in one fragment.
         append().await;
         append().await;
 
@@ -1264,7 +832,7 @@ mod endpoint_probe_tests {
             async move {
                 let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
                 let ds = snapshot.open_lance_dataset("edge:Link").await.unwrap();
-                let reads = RemovalEdgeReads::plan(&ds, ("__src", &ids), ("__dst", &ids))
+                let reads = KeyReads::plan(&ds, ("__src", &ids), Some(("__dst", &ids)))
                     .await
                     .unwrap();
                 (
@@ -1284,12 +852,48 @@ mod endpoint_probe_tests {
             (None, 0),
             "one id: its filter on every fragment"
         );
+        // One key on two endpoints is tiny by count but its copies on the
+        // two uncovered fragments exceed the probe's literal-byte ceiling.
+        let wide = vec!["x".repeat(MAX_LITERAL_BYTES / 8)];
+        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let committed = super::CommittedState {
+            committed: Some(&snapshot),
+            overwritten: Default::default(),
+            live: None,
+            opened: Default::default(),
+        };
+        let mut targets: Vec<_> = many.iter().map(String::as_str).collect();
+        targets.push("keep");
+        let mut admitted_rows = 0;
+        let retained = committed
+            .edges_referencing(
+                "edge:Link",
+                (&targets, &[]),
+                db.catalog().system_columns,
+                true,
+                &mut |_| Ok(Box::new(())),
+                &mut |batch| {
+                    admitted_rows += batch.num_rows();
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (split(&wide).await, retained.len(), admitted_rows),
+            ((Some(0), 2), 1, 1),
+            "wide keys scan the tail and a first-orphan check retains only its first matching row"
+        );
         db.ensure_indices_as(None).await.unwrap();
         assert_eq!(
             split(&many).await,
             (None, 0),
             "full coverage: every fragment probed"
         );
+        // Full coverage avoids the per-fragment copies, but even a
+        // fully indexed table scans when one literal cannot fit by itself.
+        assert_eq!(split(&wide).await, (None, 0));
+        assert_eq!(split(&["x".repeat(MAX_LITERAL_BYTES)]).await, (Some(0), 2));
         append().await;
         assert_eq!(
             split(&many).await,
@@ -1301,16 +905,5 @@ mod endpoint_probe_tests {
             (None, 0),
             "one id: its filter on every fragment"
         );
-    }
-
-    fn or_terms(expr: Expr) -> Vec<Expr> {
-        match expr {
-            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
-                let mut terms = or_terms(*binary.left);
-                terms.extend(or_terms(*binary.right));
-                terms
-            }
-            other => vec![other],
-        }
     }
 }

@@ -791,7 +791,6 @@ pub(crate) async fn judge_write_swept(
                     }
                     let delta_by_id = std::mem::take(&mut deltas[index].extracted.card);
                     let plan = CardPlan {
-                        changed_ids: delta_by_id.keys().cloned().collect(),
                         delta_by_id,
                         removed_ids: table.deleted_ids.clone(),
                     };
@@ -815,6 +814,7 @@ pub(crate) async fn judge_write_swept(
                         &deleted_sources,
                         &committed,
                         system_columns,
+                        &mut |bytes| admission.reserve_bytes(bytes),
                         &mut verdict.sink(),
                     )
                     .await?;
@@ -840,6 +840,7 @@ pub(crate) async fn judge_write_swept(
                         &deleted_sources,
                         &committed,
                         system_columns,
+                        &mut |bytes| admission.reserve_bytes(bytes),
                         &mut verdict.sink(),
                     )
                     .await?;
@@ -850,17 +851,17 @@ pub(crate) async fn judge_write_swept(
                         continue;
                     }
                     let edge_type = edge_type_of(catalog, edge_table)?;
-                    let gone_here: Vec<String> =
-                        gone[index].iter().map(|id| (*id).to_string()).collect();
-                    let deleted_at = |wanted: Endpoint| -> &[String] {
-                        let listed = checks.iter().any(|spec| {
+                    let mut gone_here: Vec<&str> = gone[index].iter().copied().collect();
+                    // Stable grouping gives the same byte reservations on every replay.
+                    gone_here.sort_unstable();
+                    let deleted_at = |wanted: Endpoint| {
+                        checks.iter().any(|spec| {
                             matches!(&spec.check, ValidateCheck::RetainedEdges { edge_table: table, endpoint }
                                 if table == edge_table && *endpoint == wanted)
-                        });
-                        if listed { gone_here.as_slice() } else { &[] }
+                        })
                     };
-                    let deleted_from = deleted_at(Endpoint::From);
-                    let deleted_to = deleted_at(Endpoint::To);
+                    let from = deleted_at(Endpoint::From);
+                    let to = deleted_at(Endpoint::To);
                     let empty = HashSet::new();
                     let delta_edge_ids = match judge.table_index(edge_table) {
                         Some(edge) => &deltas[edge].extracted.ids,
@@ -876,10 +877,16 @@ pub(crate) async fn judge_write_swept(
                     let retained = committed
                         .edges_referencing(
                             edge_table,
-                            deleted_from,
-                            deleted_to,
+                            (
+                                if from { &gone_here } else { &[] },
+                                if to { &gone_here } else { &[] },
+                            ),
                             system_columns,
                             limit_one,
+                            &mut |bytes| match &mut admission.bytes {
+                                Some(admit) => admit(bytes),
+                                None => Ok(Box::new(())),
+                            },
                             admission.retained,
                         )
                         .await?;
@@ -890,8 +897,8 @@ pub(crate) async fn judge_write_swept(
                         &retained,
                         delta_edge_ids,
                         &removed_edges,
-                        deleted_from,
-                        deleted_to,
+                        from.then_some(&gone[index]),
+                        to.then_some(&gone[index]),
                         system_columns,
                         &mut verdict.sink(),
                     )?;

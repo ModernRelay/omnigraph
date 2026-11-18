@@ -459,6 +459,87 @@ async fn merge_load_edge_src_move_rechecks_vacated_src_cardinality() {
     );
 }
 
+/// A bulk merge reads old edge ids and committed counts across both sides of
+/// partial index coverage. The peak-memory regression for the append workload
+/// is `cardinality_append_over_many_edge_fragments_stays_bounded_issue_1445`.
+#[tokio::test]
+async fn merge_load_recounts_edges_across_index_coverage_issue_1445() {
+    const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\nedge WorksAt: Person -> Company @card(1..2)\n";
+    let person =
+        |name: &str| serde_json::json!({"type": "Person", "data": {"name": name}}).to_string();
+    let edge = |id: &str, source: &str| {
+        serde_json::json!({"edge": "WorksAt", "id": id, "from": source, "to": "Acme"}).to_string()
+    };
+    let mut seed = vec![
+        r#"{"type":"Company","data":{"name":"Acme"}}"#.to_string(),
+        person("full"),
+        edge("full-old", "full"),
+    ];
+    let mut upserts = Vec::new();
+    for i in 0..1024 {
+        let name = format!("p{i}");
+        seed.push(person(&name));
+        let row = edge(&format!("e{i}"), &name);
+        seed.push(row.clone());
+        upserts.push(row);
+    }
+    let (dir, db) = init_with(SCHEMA, &seed.join("\n")).await;
+    db.ensure_indices_as(None).await.unwrap();
+
+    // Eight uncovered fragments × more than 1,024 lookup keys exceed a
+    // single probe's fan-out. `full` has one edge on each side of the split.
+    db.load_jsonl(&edge("full-new", "full"), LoadMode::Append)
+        .await
+        .unwrap();
+    let old_id = "wide-edge-id".repeat(384);
+    db.load_jsonl(
+        &[person("vacated"), edge(&old_id, "vacated")].join("\n"),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    for i in 1..=6 {
+        db.load_jsonl(
+            &edge(&format!("extra{i}"), &format!("p{i}")),
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+    }
+    let before = count_rows(&db, "edge:WorksAt").await;
+    let head = helpers::recovery::branch_head_commit_id(dir.path(), "main")
+        .await
+        .unwrap();
+    for (candidate, source, count) in [
+        (edge("extra-full", "full"), "full", 3),
+        (edge(&old_id, "p0"), "vacated", 0),
+    ] {
+        upserts.push(candidate);
+        let err = db
+            .load_jsonl(&upserts.join("\n"), LoadMode::Merge)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("@card violation")
+                && err.contains(source)
+                && err.contains(&format!("has {count}")),
+            "{err}"
+        );
+        upserts.pop();
+        assert_eq!(
+            helpers::recovery::branch_head_commit_id(dir.path(), "main")
+                .await
+                .unwrap(),
+            head
+        );
+    }
+    db.load_jsonl(&upserts.join("\n"), LoadMode::Merge)
+        .await
+        .expect("replacing the indexed edges under the same sources keeps every count");
+    assert_eq!(count_rows(&db, "edge:WorksAt").await, before);
+}
+
 /// Fix A: a Merge-load batch listing the same edge id twice with different srcs
 /// must be counted ONCE (commit dedupes by id, last-wins). Alice keeps her one
 /// committed edge and Bob gets the (deduped) E1, both within @card(0..1), so the
@@ -789,7 +870,7 @@ async fn overwrite_node_removal_rejects_retained_orphan_edge() {
 }
 
 /// The retained-edge check of a node overwrite reads the edge table through
-/// `validate::RemovalEdgeReads`, never with one filter over every removed id,
+/// the shared key lookup, never with one filter over every removed id,
 /// whose memory grew with removed ids times edge fragments (#1442): the
 /// removal holds more ids than one filter and no index covers the edges, so
 /// the fragments are read whole once and matched in memory. It still finds

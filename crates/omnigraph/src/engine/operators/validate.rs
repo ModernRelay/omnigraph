@@ -323,7 +323,7 @@ async fn judge_after_drain(
             };
         let mut admit_bytes = |bytes: usize| -> crate::error::Result<Box<dyn Send>> {
             let allocation = memory
-                .child("load integer endpoint keys")
+                .child("load validation scratch")
                 .map_err(|error| memory.error(error))?;
             allocation
                 .grow(bytes)
@@ -336,26 +336,15 @@ async fn judge_after_drain(
                 .and_then(|admitted| LoadReadReuse::new(db, judge.snapshot(), admitted))
         };
         let mut deleted = DeletedIdBudget::new(judge.write_budget);
-        // What the retained-edge check holds per removed id
-        // (`validate::RemovalEdgeReads`): the id itself and its entry in the
-        // src and dst membership sets. Its pushed filters list one chunk of
-        // ids per endpoint at a time, and the plan keeps the copies Lance
-        // makes of them to one chunk in all, so the first chunk of ids also
-        // charges those literals: a filter's and its copies', per endpoint.
-        let mut removed_ids = 0usize;
+        // The removed ids, their membership set and borrowed lookup keys live
+        // through judgment. Each read separately reserves its pushed literals
+        // or the borrowed-key membership set for its unindexed fragments.
         let mut admit_removed = |id: &str| {
             deleted.retain(id)?;
-            let in_first_chunk = removed_ids < crate::validate::PROBE_CHUNK_KEYS;
-            removed_ids += 1;
             let reserve = || -> DfResult<()> {
                 charged.entries::<String>(1)?;
                 charged.entries::<&str>(2)?;
-                charged.string(id.len())?;
-                if in_first_chunk {
-                    charged.entries::<Expr>(4)?;
-                    charged.string(id.len().saturating_mul(4))?;
-                }
-                Ok(())
+                charged.string(id.len())
             };
             reserve().map_err(|error| charged.error(error))
         };
@@ -945,14 +934,11 @@ fn admit_validation(
             .iter()
             .any(|spec| matches!(spec.check, ValidateCheck::SourceCardinality { .. }))
         {
-            // The affected set (a copy of the written ids), its sorted probe
-            // keys, one chunk of literals at most, and one committed count
-            // per written node: the probe streams the edges and keeps none.
+            // The affected set and one committed count per written node.
+            // Scratch for sorting and reading these keys is reserved at the read.
             memory.entries::<String>(rows)?;
-            memory.entries::<&String>(rows)?;
-            memory.entries::<Expr>(rows)?;
             memory.entries::<(String, u32)>(rows)?;
-            memory.string(id_bytes.saturating_mul(3))?;
+            memory.string(id_bytes.saturating_mul(2))?;
         }
     }
     Ok(())
@@ -1251,6 +1237,7 @@ mod tests {
             "load removed and retained rows",
             "load removed input",
             "load integer endpoint keys",
+            "load validation scratch",
             "load read reuse",
         ];
         let strangers: Vec<&str> = runs[0]

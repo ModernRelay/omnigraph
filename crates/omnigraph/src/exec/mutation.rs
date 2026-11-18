@@ -2293,7 +2293,7 @@ impl Omnigraph {
             // `affected_edges` counts the committed edges the cascade removes;
             // the staged delete removes them at end-of-query. Exact under D₂
             // (no staged inserts can add matches mid-query). The removed node
-            // ids are read through `RemovalEdgeReads`: pushed in bounded
+            // ids are read through `KeyReads`: pushed in bounded
             // chunks where an index answers them, matched in memory on the
             // fragments it leaves uncovered, never one filter over every id
             // copied per fragment (#1442). An edge that two reads find, or
@@ -2308,10 +2308,10 @@ impl Omnigraph {
                 txn.catalog.system_columns.src,
                 txn.catalog.system_columns.dst,
             );
-            let reads = crate::validate::RemovalEdgeReads::plan(
+            let reads = crate::table_store::key_reads::KeyReads::plan(
                 edge_ds.dataset(),
                 (src, probed(src)),
-                (dst, probed(dst)),
+                Some((dst, probed(dst))),
             )
             .await?;
             let scheduled = recorded_row_addrs(
@@ -2319,13 +2319,13 @@ impl Omnigraph {
                 &edge_table_key,
                 edge_ds.version(),
             )?;
-            for filter in reads.probe_filters() {
+            for probe in reads.probes() {
                 scan_deleted_ids(
                     self,
                     &edge_ds,
                     txn.catalog.system_columns.id,
                     DeletedRowsRead {
-                        filter: Some(filter),
+                        filter: Some(probe.filter()),
                         fragments: reads.probe_fragments(),
                         matcher: None,
                     },
@@ -2528,11 +2528,11 @@ async fn key_id_conjunct(
 
 /// The rows one scan of [`scan_deleted_ids`] reads: those `filter` selects on
 /// `fragments` (`None`: the whole table), or, with `matcher`, every row of
-/// `fragments` that it keeps (`crate::validate::RemovalEdgeReads`).
+/// `fragments` that it keeps (`crate::table_store::key_reads::KeyReads`).
 struct DeletedRowsRead<'r, 'm> {
     filter: Option<Expr>,
     fragments: Option<Vec<lance_table::format::Fragment>>,
-    matcher: Option<&'r crate::validate::EndpointMatch<'m>>,
+    matcher: Option<&'r crate::table_store::key_reads::KeyMatch<'m>>,
 }
 
 impl DeletedRowsRead<'_, '_> {
@@ -2573,7 +2573,7 @@ async fn scan_deleted_ids(
     let mut found = Vec::new();
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
         let batch = match read.matcher {
-            Some(matcher) => matcher.keep(&batch)?,
+            Some(matcher) => matcher.keep(&batch, false)?,
             None => batch,
         };
         let ids = batch

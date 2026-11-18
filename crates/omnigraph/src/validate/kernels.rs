@@ -516,21 +516,19 @@ pub(super) fn orphans_retained<F>(
     retained: &[(String, String, String)],
     delta_edge_ids: &HashSet<String>,
     removed: &HashSet<&String>,
-    deleted_from: &[String],
-    deleted_to: &[String],
+    deleted_from: Option<&HashSet<&str>>,
+    deleted_to: Option<&HashSet<&str>>,
     system_columns: SystemColumns,
     sink: &mut F,
 ) -> Result<()>
 where
     F: FnMut(Violation) -> Result<()>,
 {
-    let from_set: HashSet<&String> = deleted_from.iter().collect();
-    let to_set: HashSet<&String> = deleted_to.iter().collect();
     for (id, src, dst) in retained {
         if delta_edge_ids.contains(id) || removed.contains(id) {
             continue;
         }
-        if from_set.contains(src) {
+        if deleted_from.is_some_and(|keys| keys.contains(src.as_str())) {
             sink(orphan_violation(
                 edge_table,
                 id,
@@ -539,7 +537,7 @@ where
                 from_type,
             ))?;
         }
-        if to_set.contains(dst) {
+        if deleted_to.is_some_and(|keys| keys.contains(dst.as_str())) {
             sink(orphan_violation(
                 edge_table,
                 id,
@@ -560,8 +558,6 @@ pub(super) struct CardPlan {
     pub(super) delta_by_id: HashMap<String, String>,
     /// Ids the delta deletes.
     pub(super) removed_ids: Vec<String>,
-    /// Ids the delta adds or changes; a committed one may move off its src.
-    pub(super) changed_ids: Vec<String>,
 }
 
 /// The srcs a `@card` check counts: the new src of every delta edge, the old
@@ -570,15 +566,11 @@ pub(super) struct CardPlan {
 /// themselves deleted nodes.
 pub(super) fn card_affected(
     plan: &CardPlan,
-    removed_edges: &[(String, String)],
-    moved_from: &[(String, String)],
+    mut affected: HashSet<String>,
     written: &HashSet<String>,
     deleted_src_nodes: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut affected: HashSet<String> = plan.delta_by_id.values().cloned().collect();
-    for (_, src) in removed_edges.iter().chain(moved_from.iter()) {
-        affected.insert(src.clone());
-    }
+    affected.extend(plan.delta_by_id.values().cloned());
     affected.extend(written.iter().cloned());
     affected.retain(|src| !deleted_src_nodes.contains(src));
     affected
@@ -849,12 +841,11 @@ mod tests {
                 .map(|(id, src)| (id.to_string(), src.to_string()))
                 .collect(),
             removed_ids: vec!["e9".to_string()],
-            changed_ids: vec!["e1".to_string(), "e2".to_string()],
         };
 
-        let removed_edges = vec![("e9".to_string(), "s9".to_string())];
+        let old_sources = HashSet::from(["s9".to_string()]);
         let deleted_src: HashSet<String> = ["s3".to_string()].into_iter().collect();
-        let affected = card_affected(&plan, &removed_edges, &[], &HashSet::new(), &deleted_src);
+        let affected = card_affected(&plan, old_sources.clone(), &HashSet::new(), &deleted_src);
         assert_eq!(
             affected,
             ["s2".to_string(), "s9".to_string()].into_iter().collect()
@@ -863,7 +854,7 @@ mod tests {
         // A written source node with no delta edge is counted; a written
         // source that is also a deleted node is not.
         let written: HashSet<String> = ["s4".to_string(), "s3".to_string()].into_iter().collect();
-        let affected = card_affected(&plan, &removed_edges, &[], &written, &deleted_src);
+        let affected = card_affected(&plan, old_sources, &written, &deleted_src);
         assert_eq!(
             affected,
             ["s2".to_string(), "s4".to_string(), "s9".to_string()]

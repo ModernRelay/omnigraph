@@ -1204,7 +1204,7 @@ durable_calls! {
     ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("exec/blob_write.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
     // A delete cascade plans its edge-table reads from the edge table's index
-    // coverage (`validate::RemovalEdgeReads`); read-only metadata access.
+    // coverage at the pinned version. The handle supplies read-only metadata.
     ("exec/mutation.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     // Commit-change enumeration: pinned parent/child handles for the ordered
     // merge's typed row comparison. Read-only by construction — the enumerator

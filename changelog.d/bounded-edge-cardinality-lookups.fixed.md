@@ -1,0 +1,1 @@
+- Bulk appends bound filter memory when checking for duplicate IDs and enforcing edge cardinality, including on fragmented tables and with long IDs.

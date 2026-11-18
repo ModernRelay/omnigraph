@@ -4468,20 +4468,23 @@ fn overwrite_removal_cost_rows(replay: &str) -> String {
     )
 }
 
-/// A node removal's read of the edges touching its removed ids
-/// (`validate::RemovalEdgeReads`), on a reopened handle, for a delete's
-/// cascade and an overwrite's retained-edge check. The edge table holds two
-/// unindexed fragments, so 4 removed ids push one filter to both (`Probed`),
-/// and 8,193 removed ids, more than one filter holds, read both fragments
-/// once, whole, and match them in memory (`Matched`) (#1442).
-fn removal_edge_read_cost_rows(replay: &str) -> String {
-    struct RemovalEdgeReadCost {
-        removed: usize,
-        overwrite: bool,
+/// The edge reads for cascade, retained-edge validation and cardinality on a
+/// reopened handle. Four keys fit a filter on both unindexed fragments. The
+/// large cases read each fragment once per lookup and match the keys in memory.
+fn edge_key_read_cost_rows(replay: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum Operation {
+        Cascade,
+        Overwrite,
+        Append,
+    }
+    struct EdgeKeyReadCost {
+        keys: usize,
+        operation: Operation,
         label: &'static str,
     }
 
-    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for RemovalEdgeReadCost {
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for EdgeKeyReadCost {
         type Output = ();
 
         async fn run(
@@ -4489,8 +4492,13 @@ fn removal_edge_read_cost_rows(replay: &str) -> String {
             resources: &mut omnigraph_dst::memory::MemoryStorage,
             _workload_seed: u64,
         ) {
-            omnigraph_dst::cost::set_label("_removal_edge_read_setup");
-            let schema = "node Doc { slug: String @key } edge Link: Doc -> Doc";
+            omnigraph_dst::cost::set_label("_edge_key_read_setup");
+            let schema = match self.operation {
+                Operation::Append => {
+                    "node Doc { slug: String @key } edge Link: Doc -> Doc @card(0..2)"
+                }
+                _ => "node Doc { slug: String @key } edge Link: Doc -> Doc",
+            };
             let db = session(
                 Omnigraph::init_with_storage(
                     &resources.root,
@@ -4502,7 +4510,7 @@ fn removal_edge_read_cost_rows(replay: &str) -> String {
                 .unwrap(),
             );
             let docs: Vec<String> = std::iter::once("keep".to_string())
-                .chain((0..self.removed).map(|i| format!("d{i:05}")))
+                .chain((0..self.keys).map(|i| format!("d{i:05}")))
                 .map(|slug| format!(r#"{{"type":"Doc","data":{{"slug":"{slug}"}}}}"#))
                 .collect();
             db.load_jsonl(&docs.join("\n"), LoadMode::Overwrite)
@@ -4524,50 +4532,69 @@ fn removal_edge_read_cost_rows(replay: &str) -> String {
             ));
 
             omnigraph_dst::cost::set_label(self.label);
-            if self.overwrite {
-                let refused = db
-                    .load_jsonl(
-                        r#"{"type":"Doc","data":{"slug":"keep"}}"#,
-                        LoadMode::Overwrite,
-                    )
-                    .await;
-                omnigraph_dst::cost::set_label("_removal_edge_read_verify");
-                let refused = refused.expect_err("Link(keep->d00000) is retained");
-                assert!(
-                    refused.to_string().contains("'d00000' not found"),
-                    "{refused}"
-                );
-                assert_eq!(count_rows(&db, "node:Doc").await, self.removed + 1);
-            } else {
-                let result = db
-                    .mutate(
-                        "main",
-                        r#"query drop_docs() { delete Doc where slug != "keep" }"#,
-                        "drop_docs",
-                        &mixed_params(&[], &[]),
-                    )
-                    .await;
-                omnigraph_dst::cost::set_label("_removal_edge_read_verify");
-                let result = result.unwrap();
-                assert_eq!(result.affected_nodes, self.removed);
-                assert_eq!(result.affected_edges, 1);
-                assert_eq!(count_rows(&db, "edge:Link").await, 1);
+            match self.operation {
+                Operation::Append => {
+                    let edges = (0..self.keys)
+                        .map(|i| {
+                            format!(
+                                r#"{{"edge":"Link","id":"e{i:05}","from":"d{i:05}","to":"keep"}}"#
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let result = db.load_jsonl(&edges, LoadMode::Append).await;
+                    omnigraph_dst::cost::set_label("_edge_key_read_verify");
+                    assert_eq!(result.unwrap().edges_loaded["Link"], self.keys);
+                    assert_eq!(count_rows(&db, "edge:Link").await, self.keys + 2);
+                }
+                Operation::Overwrite => {
+                    let refused = db
+                        .load_jsonl(
+                            r#"{"type":"Doc","data":{"slug":"keep"}}"#,
+                            LoadMode::Overwrite,
+                        )
+                        .await;
+                    omnigraph_dst::cost::set_label("_edge_key_read_verify");
+                    let refused = refused.expect_err("Link(keep->d00000) is retained");
+                    assert!(
+                        refused.to_string().contains("'d00000' not found"),
+                        "{refused}"
+                    );
+                    assert_eq!(count_rows(&db, "node:Doc").await, self.keys + 1);
+                }
+                Operation::Cascade => {
+                    let result = db
+                        .mutate(
+                            "main",
+                            r#"query drop_docs() { delete Doc where slug != "keep" }"#,
+                            "drop_docs",
+                            &mixed_params(&[], &[]),
+                        )
+                        .await;
+                    omnigraph_dst::cost::set_label("_edge_key_read_verify");
+                    let result = result.unwrap();
+                    assert_eq!(result.affected_nodes, self.keys);
+                    assert_eq!(result.affected_edges, 1);
+                    assert_eq!(count_rows(&db, "edge:Link").await, 1);
+                }
             }
         }
     }
 
     let mut rows = String::new();
-    for (removed, overwrite, label) in [
-        (4, false, "RemovalCascadeProbed"),
-        (8_193, false, "RemovalCascadeMatched"),
-        (4, true, "RemovalOverwriteProbed"),
-        (8_193, true, "RemovalOverwriteMatched"),
+    for (keys, operation, label) in [
+        (4, Operation::Cascade, "RemovalCascadeProbed"),
+        (8_193, Operation::Cascade, "RemovalCascadeMatched"),
+        (4, Operation::Overwrite, "RemovalOverwriteProbed"),
+        (8_193, Operation::Overwrite, "RemovalOverwriteMatched"),
+        (4, Operation::Append, "CardinalityAppendProbed"),
+        (8_192, Operation::Append, "CardinalityAppendMatched"),
     ] {
         rows.push_str(&labeled_cost_rows(
-            format!("shared-memory://dst-removal-edge-read-cost-{replay}-{label}"),
-            &RemovalEdgeReadCost {
-                removed,
-                overwrite,
+            format!("shared-memory://dst-edge-key-read-cost-{replay}-{label}"),
+            &EdgeKeyReadCost {
+                keys,
+                operation,
                 label,
             },
             label,
@@ -4721,7 +4748,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&writer_buffer_cost_rows("a"));
     table.push_str(&overwrite_removal_cost_rows("a"));
     table.push_str(&endpoint_probe_cost_rows("a"));
-    table.push_str(&removal_edge_read_cost_rows("a"));
+    table.push_str(&edge_key_read_cost_rows("a"));
     table.push_str(&warm_read_cost_rows("a"));
     table.push_str(&graph_index_retention_cost_rows("a"));
     table.push_str(&update_patch_cost_rows("a"));
@@ -4741,7 +4768,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&writer_buffer_cost_rows("b"));
     table2.push_str(&overwrite_removal_cost_rows("b"));
     table2.push_str(&endpoint_probe_cost_rows("b"));
-    table2.push_str(&removal_edge_read_cost_rows("b"));
+    table2.push_str(&edge_key_read_cost_rows("b"));
     table2.push_str(&warm_read_cost_rows("b"));
     table2.push_str(&graph_index_retention_cost_rows("b"));
     table2.push_str(&update_patch_cost_rows("b"));
