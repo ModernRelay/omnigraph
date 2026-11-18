@@ -1415,6 +1415,15 @@ impl<'a> Interpreter<'a> {
                         }
                         Value::Str(out)
                     }
+                    // A list holding parameters: its elements' values, in
+                    // order, at the list's element type.
+                    ScalarFunc::List => typed(
+                        Value::List(vals),
+                        match e.ty() {
+                            ExprType::Value { scalar, .. } => Some(*scalar),
+                            _ => None,
+                        },
+                    ),
                     ScalarFunc::MatchTerms { mode } => {
                         let max_edits = self.max_edits(args.get(2), 0, row, env)?;
                         self.lexical(

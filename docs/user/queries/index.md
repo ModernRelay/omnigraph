@@ -154,10 +154,10 @@ query prolific($least: I64) {
 
 - `"rust" in $x.tags` tests membership when `tags` is a list.
 - `$x.number in $numbers` tests membership in a list parameter or literal
-  (`$x.number in ["A-1", "A-2"]`); the right side is a list of the value's
-  type (`T7`). On a matched binding's property it filters that binding's scan.
-  An empty list has no member: `in` keeps no row, `not (... in [])` keeps the
-  rows whose value is not null.
+  (`$x.number in ["A-1", "A-2"]`); the right side is a list of the value's type (`T7`).
+  A list literal holds literals (`[-1, 2]`) and non-null scalar parameters of one declared type, its element type (`[$a, $b, "A-3"]`); no element is cast (`T53`), a list or nullable parameter, a binding or a `let` name is `T7`, and `[-$a]` does not parse.
+  On a matched binding's property either list filters that binding's scan.
+  An empty list has no member: `in` keeps no row, `not (... in [])` keeps the rows whose value is not null.
 - `contains($x.title, "graph")` tests exact, case-sensitive substring
   containment when `title` is a String.
 - `starts_with($x.title, "Omni")` tests an exact, case-sensitive prefix.

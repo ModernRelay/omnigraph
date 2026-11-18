@@ -1516,6 +1516,7 @@ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<
     match expr {
         Expr::Literal(_)
         | Expr::Variable(_)
+        | Expr::List { .. }
         | Expr::Prop { .. }
         | Expr::Meta(_)
         | Expr::Ident(_) => {}
@@ -1569,7 +1570,7 @@ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<
 
 fn refuse_string_nearest(query: &Expr, params: &[Param]) -> Result<(), String> {
     let is_vector = match query {
-        Expr::Literal(Literal::List(_)) => true,
+        Expr::Literal(Literal::List(_)) | Expr::List { .. } => true,
         Expr::Variable(name) => {
             let name = name.trim_start_matches('$');
             params

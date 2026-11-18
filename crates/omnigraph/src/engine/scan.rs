@@ -1047,6 +1047,15 @@ fn typed_expr_to_df_expr(expr: &IRExpr, params: &ParamMap) -> Option<datafusion:
         IRExpr::PropAccess { property, .. } => Some(datafusion::prelude::ident(property)),
         IRExpr::Literal(literal, ty) => literal_to_expr(literal, ty),
         IRExpr::Param(name, ty) => literal_to_expr(params.get(name)?, ty),
+        // A list holding parameters is a constant once they are bound.
+        IRExpr::Call {
+            func: omnigraph_compiler::ir::expr::ScalarFunc::List,
+            ..
+        } if super::constant::is_constant(expr) => {
+            let array = super::constant::evaluate_constant_array(expr, params).ok()?;
+            let value = datafusion::scalar::ScalarValue::try_from_array(array.as_ref(), 0).ok()?;
+            Some(datafusion::prelude::lit(value))
+        }
         IRExpr::Nearest { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Aggregate { .. }

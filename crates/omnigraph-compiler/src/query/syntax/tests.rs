@@ -1205,6 +1205,46 @@ fn recognizers_shadow_only_ill_typed_text() {
     assert_eq!(element_refusal("let($a) in [1]").code.as_str(), "Q012");
 }
 
+/// Section 7's `list_elem`: a list literal holds literals, a negative number
+/// among them, and parameters. A list of literals alone stays a literal;
+/// unary minus over a parameter, an expression and a parameter default
+/// holding a parameter are refused.
+#[test]
+fn a_list_literal_holds_literals_and_parameters_only() {
+    let list = |text: &str| match where_expr(text) {
+        Expr::In { list, .. } => *list,
+        other => panic!("{text}: {other:?}"),
+    };
+    assert_eq!(
+        list("$x.a in [1, -2]"),
+        Expr::Literal(crate::query::value::Literal::List(vec![
+            crate::query::value::Literal::Integer(1),
+            crate::query::value::Literal::Integer(-2),
+        ]))
+    );
+    assert_eq!(
+        list("$x.a in [$a, - 1, 2.5, \"s\", $b]"),
+        Expr::List {
+            elements: vec![
+                Expr::Variable("a".into()),
+                Expr::Literal(crate::query::value::Literal::Integer(-1)),
+                Expr::Literal(crate::query::value::Literal::Float(2.5)),
+                Expr::Literal(crate::query::value::Literal::String("s".into())),
+                Expr::Variable("b".into()),
+            ],
+            at: SourceSpan::default(),
+        }
+    );
+    for refused in [
+        "query q() { match { $x: X } where $x.a in [-$a] return { 1 as one } }",
+        "query q() { match { $x: X } where $x.a in [$a + 1] return { 1 as one } }",
+        "query q() { match { $x: X } where $x.a in [$x.b, $a] return { 1 as one } }",
+        "query q($l: [I64] = [$a]) { match { $x: X } return { 1 as one } }",
+    ] {
+        assert!(parse_text(refused).is_err(), "{refused}");
+    }
+}
+
 #[test]
 fn reserved_words_in_where() {
     // `$a and $b` in `where` is the conjunction of two Boolean operands;
@@ -1432,6 +1472,7 @@ const SYNTAX_RULES: &[&str] = &[
     "limit_clause",
     "limit_neg_rec",
     "list_elem",
+    "list_item",
     "list_lit",
     "list_to_rows",
     "list_type",
@@ -1538,6 +1579,7 @@ const SYNTAX_RULES: &[&str] = &[
     "undirected_edge",
     "update_noset_rec",
     "update_stmt",
+    "value_list",
     "variable",
     "vector_type",
     "view_decl",

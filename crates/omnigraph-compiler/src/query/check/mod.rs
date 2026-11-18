@@ -4084,6 +4084,26 @@ impl Ctx<'_> {
                         ));
                     }
                 }
+                // A list holding parameters counts its elements as a
+                // literal list does.
+                Ty::Value(t)
+                    if t.list
+                        && t.scalar.is_numeric()
+                        && matches!(&q.kind, SKind::Call { func, .. } if func == "list") =>
+                {
+                    let SKind::Call { args, .. } = &q.kind else {
+                        unreachable!()
+                    };
+                    if args.len() as u32 != dim {
+                        return Err(err(
+                            T15,
+                            format!(
+                                "`{type_name}.{property}` is Vector({dim}); the query vector has {} elements",
+                                args.len()
+                            ),
+                        ));
+                    }
+                }
                 // A String is embedded with the field's recipe, or, on a
                 // field without `@embed`, the default one, as today (the
                 // RFC leaves the default recipe's `.pg` spelling open).
@@ -5133,6 +5153,139 @@ impl Ctx<'_> {
         }
     }
 
+    /// A list literal holding a parameter (section 7's `list_elem`): every
+    /// parameter element is a declared non-null scalar parameter, all of one
+    /// declared type, which is the list's element type; a literal element is
+    /// a value of that type. No element is cast. The typed list is the
+    /// internal `list` row, built when the parameters are bound.
+    fn list_value(
+        &mut self,
+        sc: &mut Scope,
+        elements: &[Expr],
+        written: &SourceSpan,
+        at: At,
+    ) -> R<SExpr> {
+        let refuse = |code: QueryCode, message: String| {
+            let mut d = QueryDiagnostic::typecheck(code, message);
+            if written.end > written.start {
+                d.position = Some(written.position);
+                d.end = Some(written.end_position);
+            }
+            E::D(d)
+        };
+        const ELEMENT: &str = "a list element is a literal or a declared non-null scalar parameter";
+        let mut element: Option<(String, PropType)> = None;
+        for e in elements {
+            let Expr::Variable(v) = e else { continue };
+            if let Some(c) = sc.local(v).or_else(|| sc.outer_col(v)) {
+                let what = match c.ty {
+                    Ty::Node { .. } | Ty::Edge { .. } => "a binding",
+                    Ty::Value(_) => "a value bound by `let` or a block",
+                };
+                return Err(refuse(
+                    T7,
+                    format!("the list element `${v}` is {what}, not a parameter; {ELEMENT}"),
+                ));
+            }
+            let Some(t) = sc.params.get(v).cloned() else {
+                if sc.rels.contains_key(v) {
+                    return Err(refuse(
+                        T7,
+                        format!(
+                            "the list element `${v}` is a relation, not a parameter; {ELEMENT}"
+                        ),
+                    ));
+                }
+                // An unknown name is refused as it is anywhere else.
+                return self.expr(sc, e, at);
+            };
+            if t.list || t.nullable || matches!(t.scalar, ScalarType::Vector(_) | ScalarType::Blob)
+            {
+                return Err(refuse(
+                    T7,
+                    format!(
+                        "the list element `${v}` is a parameter of type {}; {ELEMENT}",
+                        t.display_name()
+                    ),
+                ));
+            }
+            match &element {
+                None => element = Some((v.clone(), t)),
+                Some((first, ft)) if ft.scalar != t.scalar => {
+                    return Err(refuse(
+                        T53,
+                        format!(
+                            "the list element `${v}` is {}, but `${first}` is {}; every parameter element of a list has one type, and no element is cast",
+                            t.display_name(),
+                            ft.display_name()
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        let Some((first, ty)) = element else {
+            // A list of literals alone is a literal list.
+            let items = elements
+                .iter()
+                .map(|e| match e {
+                    Expr::Literal(l) => Ok(l.clone()),
+                    other => self.expr(sc, other, at).map(|_| Literal::Null),
+                })
+                .collect::<R<Vec<_>>>()?;
+            return self.expr(sc, &Expr::Literal(Literal::List(items)), at);
+        };
+        let mut args = Vec::with_capacity(elements.len());
+        for e in elements {
+            args.push(match e {
+                Expr::Variable(v) => SExpr::new(SKind::Param(v.clone()), Ty::Value(ty.clone())),
+                Expr::Literal(l) => {
+                    let lt = literal_type(l)?;
+                    let fits = match (l, ty.scalar) {
+                        (Literal::Integer(_), s) => s.is_numeric(),
+                        (Literal::Float(_), s) => matches!(s, ScalarType::F32 | ScalarType::F64),
+                        (Literal::Null, _) => false,
+                        _ => !lt.list && lt.scalar == ty.scalar,
+                    };
+                    let outside = if fits {
+                        literal::out_of_range(l, &ty).map(|r| format!(" ({r})"))
+                    } else {
+                        None
+                    };
+                    if !fits || outside.is_some() {
+                        return Err(refuse(
+                            T53,
+                            format!(
+                                "the list element `{}` is not a value of the list's element type {}, the type of `${first}`{}; no element is cast",
+                                crate::query::syntax::print::literal(l),
+                                ty.display_name(),
+                                outside.unwrap_or_default()
+                            ),
+                        ));
+                    }
+                    SExpr::new(SKind::Lit(l.clone()), Ty::Value(ty.clone()))
+                }
+                other => {
+                    return Err(refuse(
+                        T7,
+                        format!(
+                            "the list element `{}` is an expression; {ELEMENT}",
+                            crate::query::syntax::print::expr(other)
+                        ),
+                    ));
+                }
+            });
+        }
+        Ok(SExpr::new(
+            SKind::Call {
+                func: "list".into(),
+                args,
+                options: Vec::new(),
+            },
+            Ty::Value(PropType::list_of(ty.scalar, false)),
+        ))
+    }
+
     fn expr(&mut self, sc: &mut Scope, e: &Expr, at: At) -> R<SExpr> {
         self.typed_exprs += 1;
         let sub = at;
@@ -5155,6 +5308,10 @@ impl Ctx<'_> {
             }
             Expr::Literal(Literal::Null) => return Err(untyped_null_refusal()),
             Expr::Literal(l) => SExpr::new(SKind::Lit(l.clone()), Ty::Value(literal_type(l)?)),
+            Expr::List {
+                elements,
+                at: written,
+            } => self.list_value(sc, elements, written, sub)?,
             Expr::Variable(v) => {
                 if let Some(ty) = sc.col(v) {
                     SExpr::new(SKind::Col(v.clone()), ty)
@@ -7287,12 +7444,24 @@ fn literal_in_against_property(needle: &SExpr, list: &SExpr, written: &SourceSpa
         let element = SExpr::new(list.kind.clone(), Ty::Value(element_type));
         return literal_against_property(&element, needle, written, 0);
     }
-    let (SKind::Prop { prop: name, .. }, Ty::Value(expected), SKind::Lit(Literal::List(items))) =
-        (&needle.kind, &needle.ty, &list.kind)
-    else {
+    let (SKind::Prop { prop: name, .. }, Ty::Value(expected)) = (&needle.kind, &needle.ty) else {
         return Ok(());
     };
-    for (i, item) in items.iter().enumerate() {
+    // A written list's literal elements, by position: a list holding a
+    // parameter checks its literals as a literal list does.
+    let items: Vec<Option<&Literal>> = match &list.kind {
+        SKind::Lit(Literal::List(items)) => items.iter().map(Some).collect(),
+        SKind::Call { func, args, .. } if func == "list" => args
+            .iter()
+            .map(|a| match &a.kind {
+                SKind::Lit(l) => Some(l),
+                _ => None,
+            })
+            .collect(),
+        _ => return Ok(()),
+    };
+    for (i, item) in items.into_iter().enumerate() {
+        let Some(item) = item else { continue };
         if let Some(mismatch) = literal::compared_literal(item, expected, name) {
             return Err(literal_refusal(
                 mismatch,
@@ -8266,6 +8435,7 @@ fn for_each_child(e: &Expr, f: &mut dyn FnMut(&Expr)) {
             f(needle);
             f(list);
         }
+        Expr::List { elements, .. } => elements.iter().for_each(f),
     }
 }
 
@@ -8429,6 +8599,7 @@ fn expr_vars(e: &Expr, out: &mut Vec<String>) {
             expr_vars(needle, out);
             expr_vars(list, out);
         }
+        Expr::List { elements, .. } => elements.iter().for_each(|e| expr_vars(e, out)),
     }
 }
 

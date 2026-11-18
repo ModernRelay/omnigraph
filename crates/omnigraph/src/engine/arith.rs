@@ -10,9 +10,11 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, StringArray, builder::StringBuilder,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, ListArray, StringArray,
+    builder::StringBuilder,
 };
 use arrow_schema::{ArrowError, DataType};
+use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::compute::kernels::{boolean, numeric};
 use omnigraph_compiler::ir::expr::ScalarFunc;
 use omnigraph_compiler::query::codes::{E1, E2, E3};
@@ -146,6 +148,26 @@ pub(super) fn call(func: ScalarFunc, args: &[ArrayRef], ty: &ExprType) -> Result
                 }
             }
             Ok(Arc::new(out.finish()))
+        }
+        // Row i of the list holds row i of each argument, in order.
+        (ScalarFunc::List, [first, ..]) => {
+            let Some(DataType::List(field)) = ty.to_arrow() else {
+                return Err(OmniError::manifest_internal(
+                    "a list's result type is not a list",
+                ));
+            };
+            let rows = first.len();
+            let columns: Vec<&dyn Array> = args.iter().map(|arg| arg.as_ref()).collect();
+            let indices: Vec<(usize, usize)> = (0..rows)
+                .flat_map(|row| (0..args.len()).map(move |arg| (arg, row)))
+                .collect();
+            let values = arrow_select::interleave::interleave(&columns, &indices)
+                .map_err(OmniError::arrow_internal)?;
+            let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(args.len(), rows));
+            Ok(Arc::new(
+                ListArray::try_new(field, offsets, values, None)
+                    .map_err(OmniError::arrow_internal)?,
+            ))
         }
         (ScalarFunc::MatchTerms { .. }, _) => Err(OmniError::manifest_internal(
             "`match_terms` reaches no evaluator; the planner does not lower it",

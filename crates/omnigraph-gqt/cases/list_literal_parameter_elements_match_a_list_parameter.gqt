@@ -1,0 +1,154 @@
+# issue: none
+# notes: A list literal may hold declared non-null scalar parameters beside
+# notes: literals, a negative number among them: `[$a, $b]` is the list the
+# notes: parameters are bound to, so `$p.age in [$a, $b]` returns the rows
+# notes: `$p.age in $ages` returns with `$ages` bound to the same values. A
+# notes: literal element takes the parameters' type, and a list holding
+# notes: parameters is a value in `return` and in an assignment too.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32
+    tags: [String]?
+}
+
+--- seed
+{"type":"Person","data":{"handle":"ada","age":36,"tags":["math"]}}
+{"type":"Person","data":{"handle":"bob","age":-4,"tags":["chess"]}}
+{"type":"Person","data":{"handle":"cy","age":20,"tags":["math","chess"]}}
+{"type":"Person","data":{"handle":"di","age":51,"tags":[]}}
+
+--- query
+query parameter_elements($a: I32, $b: I32) {
+    match { $p: Person }
+    where $p.age in [$a, $b]
+    return { $p.handle }
+}
+
+--- params
+{"a": 36, "b": 20}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query list_parameter($ages: [I32]) {
+    match { $p: Person }
+    where $p.age in $ages
+    return { $p.handle }
+}
+
+--- params
+{"ages": [36, 20]}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query literals_beside_a_parameter($a: I32) {
+    match { $p: Person }
+    where $p.age in [51, $a, 99]
+    return { $p.handle }
+}
+
+--- params
+{"a": 20}
+
+--- expect unordered
+{"p.handle":"cy"}
+{"p.handle":"di"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query a_negative_literal_element($a: I32) {
+    match { $p: Person }
+    where $p.age in [$a, -4]
+    return { $p.handle }
+}
+
+--- params
+{"a": 36}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query string_elements_not_in($t: String) {
+    match { $p: Person }
+    where not $p.handle in [$t, "di"]
+    return { $p.handle }
+}
+
+--- params
+{"t": "ada"}
+
+--- expect unordered
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query a_list_returned($t: String) {
+    match { $p: Person }
+    where $p.handle = "ada"
+    return { $p.handle, [$t, "x", $t] as listed }
+}
+
+--- params
+{"t": "a"}
+
+--- expect unordered
+{"p.handle":"ada","listed":["a","x","a"]}
+
+--- expect shape
+p.handle: String
+listed: [String]
+
+--- mutate
+query tag($h: String, $t: String) {
+    match { $p: Person } where $p.handle = $h
+    update $p set { tags: [$t, "new"] }
+}
+
+--- params
+{"h": "di", "t": "fresh"}
+
+--- expect ok
+
+--- query
+query tags_after_the_update() {
+    match { $p: Person }
+    where $p.handle = "di"
+    return { $p.tags }
+}
+
+--- expect unordered
+{"p.tags":["fresh","new"]}
+
+--- expect shape
+p.tags: [String]?

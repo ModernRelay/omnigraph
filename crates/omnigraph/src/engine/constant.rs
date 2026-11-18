@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use datafusion::scalar::ScalarValue;
+use omnigraph_compiler::ir::expr::ScalarFunc;
 use omnigraph_compiler::ir::{IRExpr, IRParam, ParamMap};
 use omnigraph_compiler::query::value::{BinaryOp, Literal};
 use omnigraph_compiler::types::{ExprType, ScalarType};
@@ -302,6 +303,12 @@ fn fold_expr(expr: &IRExpr, params: &ParamMap) -> Result<IRExpr> {
 pub(super) fn is_constant(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
+        // A list holding parameters is fixed once they are bound.
+        IRExpr::Call {
+            func: ScalarFunc::List,
+            args,
+            ..
+        } => args.iter().all(is_constant),
         IRExpr::Binary {
             op: BinaryOp::Arith(_),
             ..

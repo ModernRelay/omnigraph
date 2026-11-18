@@ -1360,6 +1360,7 @@ pub enum ScalarFuncMirror {
     Coalesce,
     Concat,
     MatchTerms { all: bool },
+    List,
 }
 
 impl From<ScalarFunc> for ScalarFuncMirror {
@@ -1371,6 +1372,7 @@ impl From<ScalarFunc> for ScalarFuncMirror {
             ScalarFunc::MatchTerms { mode } => Self::MatchTerms {
                 all: mode == TermsMode::All,
             },
+            ScalarFunc::List => Self::List,
         }
     }
 }
@@ -1384,6 +1386,7 @@ impl From<ScalarFuncMirror> for ScalarFunc {
             ScalarFuncMirror::MatchTerms { all } => Self::MatchTerms {
                 mode: if all { TermsMode::All } else { TermsMode::Any },
             },
+            ScalarFuncMirror::List => Self::List,
         }
     }
 }

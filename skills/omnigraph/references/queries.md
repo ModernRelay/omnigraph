@@ -445,7 +445,13 @@ LABEL_LIST for `"x" in $p.tags`.
 
 `$m.number in $numbers` keeps the rows whose value is a member of a list
 parameter or literal, one query instead of one per candidate; the right side
-must be a list of the value's type.
+must be a list of the value's type. A list literal holds literals (`[-1, 2]`)
+and non-null scalar parameters of one declared type, the list's element type:
+`$m.number in [$a, $b, "A-3"]` is pushed down as `in $numbers` is. No element
+is cast, so `[$a, $b]` with `$a: I32` and `$b: I64`, or a literal of another
+type, is `T53`; a list or nullable parameter, a binding or a `let` name as an
+element is `T7`, and `[-$a]` does not parse. The same list may be a `nearest`
+or `distance` query vector, `[$x, $y, 0.0]`.
 
 ```gq fragment
 match { $p: Person }

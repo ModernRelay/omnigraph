@@ -1058,7 +1058,7 @@ fn typed_node(value: &Value) -> Result<TypedNode, String> {
         "fuzzy" => (2..=3).contains(&args.len()),
         "rrf" => (2..=4).contains(&args.len()),
         "if" => args.len() == 3,
-        "coalesce" | "concat" | "match_terms" => !args.is_empty(),
+        "coalesce" | "concat" | "match_terms" | "list" => !args.is_empty(),
         _ => false,
     };
     if !valid_arity {

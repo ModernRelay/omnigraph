@@ -292,6 +292,21 @@ fn a_parameter_reaches_its_leaves() {
     assert_eq!(out, vec![json!({"p.age": 30})]);
 }
 
+/// A list literal holding a parameter (section 7's `list_elem`) is the list
+/// of its elements' values, in order, whether tested for membership or
+/// returned.
+#[test]
+fn a_list_holding_a_parameter_is_its_elements_values() {
+    let (out, _) = run(
+        "query q($a: I32, $c: String) { match { $p: Person } where $p.age in [$a, -1] return { $p.name, [$c, \"x\", $c] as l } }",
+        &[
+            ("a", Literal::Integer(40)),
+            ("c", Literal::String("k".into())),
+        ],
+    );
+    assert_eq!(out, vec![json!({"p.name": "bob", "l": ["k", "x", "k"]})]);
+}
+
 #[test]
 fn integer_overflow_is_the_e1_refusal() {
     let catalog = catalog();

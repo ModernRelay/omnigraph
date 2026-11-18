@@ -34,7 +34,8 @@
 //! - literals: `null` as an operand, integers to `i64::MAX`, floats over every finite bit
 //!   pattern, infinity and the subnormals, Booleans, `date(…)` and
 //!   `datetime(…)`, and lists, nested, holding negative numbers (a list is
-//!   where the grammar reads `-` before a number as part of the literal);
+//!   where the grammar reads `-` before a number as part of the literal),
+//!   and lists holding a `$name` among those elements;
 //!   strings holding every escape the decoder reads (`\"`, `\\`, `\n`, `\r`,
 //!   `\t`), a backslash before an `n`, `//`, `/*` and `*/`, braces, raw
 //!   control characters and non-ASCII text;
@@ -255,9 +256,32 @@ fn literal() -> impl Strategy<Value = Literal> {
     ]
 }
 
+/// A list holding a parameter: literals (negative numbers and lists among
+/// them) and `$name`s, one at least, which only the type checker sorts.
+fn value_list() -> impl Strategy<Value = Expr> {
+    let element = prop_oneof![
+        2 => scalar(true).prop_map(Expr::Literal),
+        1 => list().prop_map(Expr::Literal),
+        2 => pick(VARS).prop_map(Expr::Variable),
+    ];
+    (
+        proptest::collection::vec(element, 0..3),
+        pick(VARS),
+        any::<proptest::sample::Index>(),
+    )
+        .prop_map(|(mut elements, variable, at)| {
+            elements.insert(at.index(elements.len() + 1), Expr::Variable(variable));
+            Expr::List {
+                elements,
+                at: SourceSpan::default(),
+            }
+        })
+}
+
 fn leaf() -> impl Strategy<Value = Expr> {
     prop_oneof![
         3 => literal().prop_map(Expr::Literal),
+        1 => value_list(),
         3 => pick(VARS).prop_map(Expr::Variable),
         3 => (pick(VARS), pick(PROPS)).prop_map(|(variable, property)| Expr::Prop { variable, property }),
         1 => (pick(VARS), pick(META)).prop_map(|(variable, m)| Expr::Prop { variable, property: format!("@{m}") }),

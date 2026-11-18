@@ -833,6 +833,8 @@ fn construct_name(rule: Rule) -> Option<&'static str> {
         | X::bool_lit
         | X::list_lit
         | X::list_elem
+        | X::value_list
+        | X::list_item
         | X::neg_number
         | X::meta_field => "an expression",
         X::call_args | X::call_option => "a call argument or `name: value` option",
@@ -3892,7 +3894,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                 .clone()
                 .into_inner()
                 .flatten()
-                .find(|p| p.as_rule() == Rule::list_lit)
+                .find(|p| matches!(p.as_rule(), Rule::list_lit | Rule::value_list))
             {
                 ranges.extend(items.into_inner().map(|item| written_range(&item)));
             }
@@ -4252,6 +4254,19 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
             }
         }
         Rule::literal => Ok(Expr::Literal(literal(inner)?)),
+        Rule::value_list => {
+            let mut at = source_span(&inner);
+            let mut elements = Vec::new();
+            for item in inner.into_inner() {
+                at.ranges.push(written_range(&item));
+                let element = item.into_inner().next().expect("grammar: a list item");
+                elements.push(match element.as_rule() {
+                    Rule::variable => Expr::Variable(element.as_str()[1..].to_string()),
+                    _ => Expr::Literal(list_value(element)?),
+                });
+            }
+            Ok(Expr::List { elements, at })
+        }
         Rule::type_prop_rec => {
             let mut parts = inner.clone().into_inner();
             let ty = parts.next().unwrap().as_str();
@@ -4443,7 +4458,11 @@ fn keyword_form(word: &str) -> String {
 /// A list literal's element: a literal, or a negative number, which inside
 /// a list is a literal rather than unary minus over one.
 fn list_elem(pair: Pair<Rule>) -> R<Literal> {
-    let inner = pair.into_inner().next().expect("grammar: a list element");
+    list_value(pair.into_inner().next().expect("grammar: a list element"))
+}
+
+/// A list element's literal: a `literal`, or a `neg_number`.
+fn list_value(inner: Pair<Rule>) -> R<Literal> {
     if inner.as_rule() != Rule::neg_number {
         return literal(inner);
     }

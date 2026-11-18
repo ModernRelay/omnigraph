@@ -371,6 +371,15 @@ impl ArithOp {
 pub enum Expr {
     Literal(Literal),
     Variable(String),
+    /// A list literal holding a parameter, `[$a, 2]`: each element an
+    /// `Expr::Literal` or an `Expr::Variable`. A list of literals alone is
+    /// an `Expr::Literal`.
+    List {
+        elements: Vec<Expr>,
+        /// Where it was written; `ranges` holds each element's byte range,
+        /// where a refusal naming the element points.
+        at: SourceSpan,
+    },
     /// `$x.name` or `$x.@id`.
     Prop {
         variable: String,

@@ -1642,9 +1642,35 @@ impl ReadGen<'_, '_, '_> {
             let m = json_string(ENUM_MEMBERS[self.c.below(3)]);
             match self.c.below(2) {
                 0 => format!("({prop} = {m})"),
+                // The list sometimes holds declared non-null String
+                // parameters beside the literal, drawn after it, so a read
+                // that does not take this branch keeps its choices.
+                _ if self.c.flag(40) => {
+                    let mut elements = vec![m];
+                    for _ in 0..1 + self.c.below(2) {
+                        let p = self.list_param();
+                        elements.insert(self.c.below(elements.len() + 1), p);
+                    }
+                    format!("({prop} in [{}])", elements.join(", "))
+                }
                 _ => format!("({prop} in [{m}])"),
             }
         })
+    }
+
+    /// A list literal's parameter element: a non-null `String` parameter,
+    /// declared now, bound to an enum member or to a value outside the enum.
+    fn list_param(&mut self) -> String {
+        let name = self.var("p");
+        let value = *self
+            .c
+            .pick(&[ENUM_MEMBERS[0], ENUM_MEMBERS[1], ENUM_MEMBERS[2], "purple"]);
+        self.params.push((
+            name.clone(),
+            format!("{name}: String"),
+            Some(Literal::String(value.to_string())),
+        ));
+        name
     }
 }
 

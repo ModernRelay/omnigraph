@@ -403,7 +403,7 @@ unary_minus = { "-" }
 // and the builder refuses it there with the foreign-word table's fix; it is
 // admitted only as a whole `order` key and inside the `where_stmt` predicate,
 // so the accepted texts are section 7's.
-operand    = { "(" ~ expr ~ ")" | block_value | agg_distinct | count_star_rec | case_rec | keyword_call_rec | literal | type_prop_rec | call | prop_method_rec | prop_chain_rec | prop_star_rec | prop_access | meta_field | variable | reserved_property | bare_name_rec }
+operand    = { "(" ~ expr ~ ")" | block_value | agg_distinct | count_star_rec | case_rec | keyword_call_rec | literal | value_list | type_prop_rec | call | prop_method_rec | prop_chain_rec | prop_star_rec | prop_access | meta_field | variable | reserved_property | bare_name_rec }
 // A block is an operand and nothing else: its elements and its own `where`
 // inside its braces.
 block_value = { (agg_name ~ ("(" ~ expr ~ ")")? | kw_exists) ~ "{" ~ block_body ~ "}" }
@@ -446,6 +446,11 @@ list_lit  = { "[" ~ (list_elem ~ ("," ~ list_elem)*)? ~ "]" }
 // follow its sign, as it may follow a unary minus (section 7).
 list_elem = { neg_number | literal }
 neg_number = { "-" ~ (exp_float_rec | float_lit | integer) }
+// A list literal that holds a parameter: tried after `literal`, so it is
+// reached only when an element is a variable. An element is a literal or a
+// parameter, never an expression, so `[-$a]` is no list (section 7).
+value_list = { "[" ~ list_item ~ ("," ~ list_item)* ~ "]" }
+list_item  = { neg_number | literal | variable }
 float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ (("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+)? ~ !(ASCII_ALPHANUMERIC | "_") }
 integer   = @{ ASCII_DIGIT+ ~ !(ASCII_ALPHANUMERIC | "_" | ".") }
 // `1e3`: an exponent needs a fraction.

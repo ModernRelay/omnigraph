@@ -1,0 +1,71 @@
+# issue: none
+# traversal: auto
+# notes: A list holding parameters is fixed when they are bound, so
+# notes: `$p.age in [$a, $b]` is pushed into the scan and probes the `age`
+# notes: index exactly as `$p.age in $ages` does, and a literal beside the
+# notes: parameters changes neither.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I32 @index
+}
+
+--- seed
+{"type":"Person","data":{"slug":"alpha","age":11}}
+{"type":"Person","data":{"slug":"beta","age":22}}
+{"type":"Person","data":{"slug":"gamma","age":33}}
+
+--- query
+query parameter_elements($a: I32, $b: I32) {
+    match { $p: Person } where $p.age in [$a, $b]
+    return { $p.slug }
+}
+--- params
+{"a": 11, "b": 33}
+--- expect unordered
+{"p.slug":"alpha"}
+{"p.slug":"gamma"}
+--- expect shape
+p.slug: String
+--- expect plan
+scan Person as $p: filter reads [p.age]
+scan Person as $p: access index_probe age
+
+--- query
+query list_parameter($ages: [I32]) {
+    match { $p: Person } where $p.age in $ages
+    return { $p.slug }
+}
+--- params
+{"ages": [11, 33]}
+--- expect unordered
+{"p.slug":"alpha"}
+{"p.slug":"gamma"}
+--- expect shape
+p.slug: String
+--- expect plan
+scan Person as $p: filter reads [p.age]
+scan Person as $p: access index_probe age
+
+--- query
+query a_literal_beside_a_parameter($a: I32) {
+    match { $p: Person } where $p.age in [$a, 22]
+    return { $p.slug }
+}
+--- params
+{"a": 11}
+--- expect unordered
+{"p.slug":"alpha"}
+{"p.slug":"beta"}
+--- expect shape
+p.slug: String
+--- expect plan
+scan Person as $p: filter reads [p.age]
+scan Person as $p: access index_probe age

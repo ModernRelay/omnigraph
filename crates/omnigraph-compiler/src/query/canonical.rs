@@ -189,6 +189,7 @@ fn expr(e: &Expr, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
     match e {
         Expr::Literal(_)
         | Expr::Variable(_)
+        | Expr::List { .. }
         | Expr::Prop { .. }
         | Expr::Meta(_)
         | Expr::Ident(_) => {}

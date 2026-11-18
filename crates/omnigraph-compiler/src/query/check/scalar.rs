@@ -268,10 +268,11 @@ fn call_to_ir(func: &str, args: &[SExpr], options: &[(String, SExpr)], ty: ExprT
                 ty,
             }
         }
-        "if" | "coalesce" | "concat" => IRExpr::Call {
+        "if" | "coalesce" | "concat" | "list" => IRExpr::Call {
             func: match func {
                 "if" => ScalarFunc::If,
                 "coalesce" => ScalarFunc::Coalesce,
+                "list" => ScalarFunc::List,
                 _ => ScalarFunc::Concat,
             },
             args: args.iter().map(SExpr::to_ir).collect(),

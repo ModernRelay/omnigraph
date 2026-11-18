@@ -364,6 +364,10 @@ pub fn expr(e: &Expr) -> String {
     match e {
         Expr::Literal(l) => literal(l),
         Expr::Variable(v) => format!("${v}"),
+        Expr::List { elements, .. } => format!(
+            "[{}]",
+            elements.iter().map(expr).collect::<Vec<_>>().join(", ")
+        ),
         Expr::Prop { variable, property } => format!("${variable}.{property}"),
         Expr::Meta(m) => format!("@{m}"),
         Expr::Ident(i) => i.clone(),

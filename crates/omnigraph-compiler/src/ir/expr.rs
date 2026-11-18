@@ -942,6 +942,21 @@ impl std::fmt::Display for IRExpr {
                     _ => write!(f, "match_terms(…)"),
                 }
             }
+            // A list prints as the list literal it was written as.
+            IRExpr::Call {
+                func: ScalarFunc::List,
+                args,
+                ..
+            } => {
+                f.write_str("[")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                f.write_str("]")
+            }
             IRExpr::Call { func, args, .. } => {
                 write!(f, "{}(", func.name())?;
                 for (i, arg) in args.iter().enumerate() {
@@ -1620,6 +1635,23 @@ fn check_call(func: ScalarFunc, args: &[IRExpr], ty: &ExprType) -> Result<()> {
                 return bad("the result is a String, nullable when any argument is");
             }
         }
+        ScalarFunc::List => {
+            let ExprType::Value {
+                scalar,
+                list: true,
+                nullable: false,
+            } = ty
+            else {
+                return bad("the result is a non-null list");
+            };
+            if args.is_empty()
+                || !args
+                    .iter()
+                    .all(|a| scalar_is(a.ty(), *scalar) && !a.ty().nullable())
+            {
+                return bad("every element is a non-null value of the list's element type");
+            }
+        }
         ScalarFunc::MatchTerms { .. } => {
             let [field, text, max_edits] = args else {
                 return bad("takes a field, a text and an edit budget");
@@ -1723,6 +1755,10 @@ pub enum ScalarFunc {
     /// `match_terms(field, terms(text, mode:, max_edits:))`: arguments are the
     /// field, the text and the edit budget.
     MatchTerms { mode: TermsMode },
+    /// A list literal holding a parameter, `[$a, 2]`: its elements, each a
+    /// literal or a declared non-null parameter of the list's element type,
+    /// in order. The list is built when the parameters are bound.
+    List,
 }
 
 /// How a `terms(…)` value matches: every term, or any one.
@@ -1740,6 +1776,7 @@ impl ScalarFunc {
             Self::Coalesce => "coalesce",
             Self::Concat => "concat",
             Self::MatchTerms { .. } => "match_terms",
+            Self::List => "list",
         }
     }
 }

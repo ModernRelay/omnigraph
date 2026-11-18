@@ -9,7 +9,7 @@ with `as`.
 
 | Function | Meaning |
 |---|---|
-| `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by the field's declared [distance](distances.md) (`l2` unless declared), with the exact distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
+| `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by the field's declared [distance](distances.md) (`l2` unless declared), with the exact distance as the score. `$q` may be a vector (a `Vector(n)` parameter, or a list literal of `n` numbers or numeric parameters, `[$x, $y, 0.0]`) or text that the configured embedding provider converts to a vector. |
 | `distance(rel, $d.embedding, $q)` | Every row of `rel` with the exact distance of its vector to `$q`, under the field's declared [distance](distances.md), as the score; a row whose vector is null is dropped. `$q` may be a vector or text, as for `nearest`. |
 | `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their [`bm25_v1`](analyzers.md#exact-matching-and-scoring) relevance, an `F64` over the whole field, as the score. `$q` is a String, which matches any of its terms, or a `terms(…)` value, which may ask for every term and an edit budget. |
 | `rrf(arm, arm, …, k: 60, weights: [w, …])` | 2 to 16 rankings of one node column fused with Reciprocal Rank Fusion: each arm is a ranking (`nearest`, `distance`, `bm25`, another `rrf`) or an inline read with an `order`, over a population of its own. The result has the ranked node column and the fused score, named by the `as` of the `from` that draws it, and nothing else. The default `k` is 60 and every weight defaults to 1.0. See [Fusion](fusion.md). |
