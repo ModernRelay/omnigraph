@@ -245,6 +245,7 @@ macro_rules! write_surfaces {
 }
 
 write_surfaces! {
+    "db/omnigraph/restore_birth.rs" => WriteProtocol::Exact("reserve an empty graph using its one native conditional birth claim") => ["reserve_restore_birth"],
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options", "init_with_storage"],
     "db/omnigraph/prepared_create.rs" => WriteProtocol::Bootstrap => ["apply_prepared_graph_create", "apply_prepared_graph_create_with_io_scope", "apply_prepared_graph_create_with_storage"],
     "db/omnigraph/prepared_create.rs" => WriteProtocol::Exact("quiesced birth settlement: exact init claim, bounded original empty tables, no published manifest or refs") => ["settle_prepared_graph_create_after_quiescence", "settle_prepared_graph_create_after_quiescence_with_storage"],
@@ -278,6 +279,7 @@ write_surfaces! {
 // name-independent: a newly named `transact`, `publish`, or `vacuum` method
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
+    ("db/omnigraph/restore_birth.rs", "check_restore_birth_claim"),
     ("db/omnigraph/prepared_create.rs", "prepare_graph_create"),
     (
         "db/omnigraph/prepared_create.rs",
@@ -304,6 +306,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "exists"),
     ("db/omnigraph.rs", "exists_with_storage"),
     ("db/omnigraph.rs", "manifest_has_external_base_paths"),
+    ("db/omnigraph/restore.rs", "verify_restored_history"),
     ("db/omnigraph/export.rs", "capture_served_export_cut"),
     (
         "db/omnigraph/export.rs",
@@ -1168,6 +1171,7 @@ durable_calls! {
     ("omnigraph-catalog/lib.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/unpublished.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("publication of an unpublished commit: its recorded changes through the ordinary publisher under the captured authority, required to allocate the candidate's own id")),
     ("db/omnigraph/table_ops.rs", ".commit_updates_with_actor_with_expected(", 2, WriteProtocol::TestOnly),
+    ("db/omnigraph/restore_birth.rs", ".write_text_if_absent(", 1, WriteProtocol::Exact("empty graph restore competes with ordinary initialization for one conditional birth claim")),
     ("db/omnigraph.rs", ".write_text_if_absent(", 2, WriteProtocol::Composed("bootstrap init claim + owned local-root create-if-absent probe")),
     ("db/omnigraph.rs", ".delete(", 2, WriteProtocol::Composed("bootstrap init claim release + owned local-root probe removal")),
     ("db/omnigraph.rs", "GraphCoordinator::init_commit_with_session(", 1, WriteProtocol::Bootstrap),

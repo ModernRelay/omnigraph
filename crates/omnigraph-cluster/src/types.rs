@@ -225,6 +225,9 @@ pub struct PlanChange {
     /// Removing a declared graph deletes its managed root and retained history.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delete_root: Option<String>,
+    /// Exact receipt of an explicitly staged full-history initial graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -410,6 +413,9 @@ pub(crate) struct ProvidersConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct GraphConfig {
     pub(crate) schema: PathBuf,
+    /// Content hash of an owner-sealed full-history receipt for first creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restore_from: Option<String>,
     #[serde(default)]
     pub(crate) queries: QueriesDecl,
     /// Optional reference to a top-level `providers.embedding.<name>` profile.

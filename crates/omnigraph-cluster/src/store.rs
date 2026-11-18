@@ -17,7 +17,9 @@ use omnigraph_storage::{
     redacted_storage_uri, storage_handle_for_uri, storage_kind_for_uri,
 };
 
-use crate::deployment::{DeploymentBundle, MAX_BUNDLE_BYTES, MAX_LEDGER_BYTES, validate_state};
+use crate::deployment::{
+    self, DeploymentBundle, MAX_BUNDLE_BYTES, MAX_LEDGER_BYTES, validate_state,
+};
 use crate::state_lock::{
     LOCK_RECORD_MAX_BYTES, StateLockAcquire, StateLockError, StateLockGuard, acquire_state_lock,
     release_settled_lock,
@@ -27,6 +29,7 @@ use crate::{
     ClusterState, Diagnostic, RecoverySidecar, ResourceKind, StateLockFile, StateObservations,
     sha256_hex,
 };
+use crate::{MAX_RESTORE_DESCRIPTOR_BYTES, PreparedGraphRestore, authorization};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClusterStore {
@@ -767,7 +770,7 @@ impl ClusterStore {
         .await
     }
 
-    async fn write_content_addressed(
+    pub(crate) async fn write_content_addressed(
         &self,
         relative: &str,
         digest: &str,
@@ -820,6 +823,63 @@ impl ClusterStore {
                 Diagnostic::error("deployment_bundle_write", CLUSTER_RESOURCES_DIR, err)
             })?;
         Ok(digest)
+    }
+
+    pub(crate) async fn has_restore_reservation(
+        &self,
+        digest: &str,
+        expected: &str,
+    ) -> Result<bool, Diagnostic> {
+        let key = self.uri(&format!("__cluster/restore-reservations/{digest}.json"));
+        match self
+            .adapter
+            .read_text_if_exists_bounded(&key, MAX_RESTORE_DESCRIPTOR_BYTES as u64)
+            .await
+        {
+            Ok(None) => Ok(false),
+            Ok(Some(bytes)) if bytes == expected => Ok(true),
+            Ok(Some(_)) => Err(deployment::refusal(
+                "restore_receipt_invalid",
+                "conflicting restore reservation",
+            )),
+            Err(err) => Err(deployment::refusal("restore_receipt_read", err.to_string())),
+        }
+    }
+
+    /// Both objects are content addressed. Only a completed, sealed stage
+    /// matching the original reservation can reach graph inspection.
+    pub(crate) async fn read_sealed_graph_restore(
+        &self,
+        digest: &str,
+    ) -> Result<PreparedGraphRestore, Diagnostic> {
+        if !authorization::valid_digest(digest) {
+            return Err(deployment::refusal(
+                "restore_receipt_invalid",
+                "invalid restore digest",
+            ));
+        }
+        let key = self.uri(&format!("__cluster/restores/{digest}.json"));
+        let sealed = self
+            .adapter
+            .read_text_if_exists_bounded(&key, MAX_RESTORE_DESCRIPTOR_BYTES as u64)
+            .await
+            .map_err(|error| deployment::refusal("restore_receipt_read", error.to_string()))?
+            .ok_or_else(|| {
+                deployment::refusal("restore_receipt_missing", "the staged restore has no seal")
+            })?;
+        if sha256_hex(sealed.as_bytes()) != digest {
+            return Err(deployment::refusal(
+                "restore_receipt_invalid",
+                "seal does not match its exact content hash",
+            ));
+        }
+        if !self.has_restore_reservation(digest, &sealed).await? {
+            return Err(deployment::refusal(
+                "restore_receipt_missing",
+                "the sealed restore has no matching reservation",
+            ));
+        }
+        PreparedGraphRestore::parse_exact(&sealed)
     }
 
     pub(crate) async fn read_deployment_bundle(

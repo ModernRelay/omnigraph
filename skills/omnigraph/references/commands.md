@@ -509,6 +509,10 @@ profiles cannot override it. Standalone targets own one auth provider; different
 identities use different targets. There is no `--auth` selector or last-used identity.
 `--config DIR` supplies deployment source and never routes a command.
 
+For a full-history restore, storage owners use `cluster verify-restore GRAPH`
+and `cluster prepare-restore --descriptor FILE` with an explicit cluster root.
+See [Restore a graph with its history](../../../docs/user/operations/restore-history.md).
+
 Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
 `optimize`/`index build`/`index rebuild`/`cleanup --graph`, with region

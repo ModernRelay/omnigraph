@@ -11,6 +11,7 @@ use omnigraph::db::{
 };
 
 mod execution;
+mod history_restore;
 pub use execution::*;
 mod bootstrap;
 pub use bootstrap::{
@@ -171,6 +172,8 @@ pub(crate) struct OutstandingDeployment {
 #[serde(deny_unknown_fields)]
 pub(crate) struct GraphDeployment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<VerifiedGraphRestore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create: Option<PreparedGraphCreate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete: Option<GraphDeletion>,
@@ -179,6 +182,15 @@ pub(crate) struct GraphDeployment {
     pub state: GraphDeploymentState,
     pub settlement: Option<PreparedSchemaSettlement>,
     pub recovery_executor: Option<DeploymentAuthority>,
+}
+
+/// The bounded projection retained after binding the full, immutable history
+/// receipt to staged graph heads. GraphDeployment records its main version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerifiedGraphRestore {
+    pub receipt_sha256: String,
+    pub contract: omnigraph::db::SchemaContractDigest,
 }
 
 /// Exact managed root accepted for deletion. This authority survives a partial
@@ -201,6 +213,11 @@ pub(crate) enum GraphDeploymentState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GraphDeploymentResult {
+    Restored {
+        receipt_sha256: String,
+        graph_manifest_version: u64,
+        contract: omnigraph::db::SchemaContractDigest,
+    },
     Deleted {
         contract: omnigraph::db::SchemaContractDigest,
     },
@@ -230,6 +247,7 @@ impl GraphDeploymentResult {
                     | SchemaApplySettlement::NoOp { .. }
             } | Self::QueryOnly { .. }
                 | Self::Created { .. }
+                | Self::Restored { .. }
                 | Self::Deleted { .. }
         )
     }
@@ -434,7 +452,7 @@ fn valid_contracts(
         })
 }
 
-fn valid_contract(contract: &omnigraph::db::SchemaContractDigest) -> bool {
+pub(crate) fn valid_contract(contract: &omnigraph::db::SchemaContractDigest) -> bool {
     authorization::valid_digest(&contract.source_hash)
         && contract
             .schema_ir_hash
@@ -635,6 +653,26 @@ pub(crate) fn validate_state(state: &ClusterState) -> Result<(), Diagnostic> {
                     graph_manifest_version,
                     contract,
                 } => *graph_manifest_version == 0 || !valid_contract(contract),
+                GraphDeploymentResult::Restored {
+                    receipt_sha256,
+                    graph_manifest_version,
+                    contract,
+                } => {
+                    *graph_manifest_version == 0
+                        || !valid_contract(contract)
+                        || !authorization::valid_digest(receipt_sha256)
+                        || id.sequence != 2
+                        || result.graphs.len() != 1
+                        || !result.base.schema_contracts.is_empty()
+                        || result.base.result_revision != 1
+                        || result.authority.kind != AuthorityKind::AuthenticatedIdentity
+                        || result
+                            .recovery_executors
+                            .get(graph)
+                            .is_some_and(|authority| {
+                                authority.kind != AuthorityKind::AuthenticatedIdentity
+                            })
+                }
                 GraphDeploymentResult::Deleted { contract } => {
                     !valid_contract(contract)
                         || result.base.schema_contracts.get(graph) != Some(contract)
@@ -704,7 +742,7 @@ pub(crate) fn validate_state(state: &ClusterState) -> Result<(), Diagnostic> {
             })
             || pending.graphs.iter().any(|(graph, entry)| {
                 !valid_resource_name(graph)
-                    || (entry.create.is_none()
+                    || (entry.create.is_none() && entry.restore.is_none()
                         && !state
                             .applied_revision
                             .resources
@@ -713,6 +751,19 @@ pub(crate) fn validate_state(state: &ClusterState) -> Result<(), Diagnostic> {
                         .create
                         .as_ref()
                         .is_some_and(|create| create.validate().is_err())
+                    || entry.restore.as_ref().is_some_and(|restore| {
+                        !authorization::valid_digest(&restore.receipt_sha256)
+                            || id.sequence != 2 || pending.graphs.len() != 1
+                            || !valid_contract(&restore.contract)
+                            || entry.create.is_some() || entry.delete.is_some() || entry.intent.is_some()
+                            || entry.observed_manifest_version == 0
+                            || !pending.authorization.base.schema_contracts.is_empty()
+                            || pending.authorization.base.result_revision != 1
+                            || pending.authorization.authority.kind != AuthorityKind::AuthenticatedIdentity
+                            || entry.recovery_executor.as_ref().is_some_and(|authority| authority.kind != AuthorityKind::AuthenticatedIdentity)
+                            || matches!(&entry.state, GraphDeploymentState::Settled { result } if !matches!(result.as_ref(), GraphDeploymentResult::Restored { receipt_sha256, contract, graph_manifest_version } if receipt_sha256 == &restore.receipt_sha256 && contract == &restore.contract && *graph_manifest_version == entry.observed_manifest_version))
+                    })
+                    || (entry.restore.is_none() && matches!(&entry.state, GraphDeploymentState::Settled { result } if matches!(result.as_ref(), GraphDeploymentResult::Restored { .. })))
                     || (entry.create.is_some()
                         && (entry.intent.is_some() || entry.delete.is_some() || entry.observed_manifest_version != 0))
                     || (entry.create.is_none() && entry.delete.is_none() && entry.observed_manifest_version == 0)

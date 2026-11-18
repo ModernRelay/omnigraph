@@ -63,8 +63,8 @@ reads and writes only objects under the root you opened.
   by another Lance tool can.
 - To move a graph between kinds of storage (local, S3, Azure), export it and
   load it into a new graph instead.
-- Restore a graph that a cluster manages at the location its cluster
-  declares; a cluster does not adopt a root at a new location.
+- For a new cluster, follow [Restore a graph with its history](../operations/restore-history.md)
+  to register an independently verified copy in the first deployment.
 - External Blob URIs still point where they pointed before the copy.
 - Omnigraph 0.14.0 and earlier read some branch files at the location the
   branch was created at. Open a copy at a new location with a later release.

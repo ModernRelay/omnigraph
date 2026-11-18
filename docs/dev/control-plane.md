@@ -215,7 +215,14 @@ Foreign, committed or advanced roots are preserved and refused. The durable
 claim remains until cleanup completes; interrupted cleanup is resumable.
 A later creation may reuse a bounded empty local directory tree left by cleanup,
 with engine preparation still proving an empty target. Files, symlinks and cloud
-markers refuse; this does not adopt existing graph contents.
+markers refuse.
+
+A full-history restore has its own first-deployment contract. A storage owner
+reserves an empty target, verifies the restored physical graph and seals the
+exact reservation. A configuration manager can then publish that graph through
+ordinary deployment. The destination has a new cluster ledger and the graph
+retains its original schema identity, branch heads and commits. An unsealed
+populated graph still fails ordinary creation. See [Restoring graph history](../user/operations/restore-history.md).
 
 Terminal results advance only the achieved resources. Partial convergence is a
 valid base for a corrective successor under the same owner or after a qualified

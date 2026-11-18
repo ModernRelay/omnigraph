@@ -317,7 +317,9 @@ operation resumes removal of the exact root. Editing the desired configuration
 does not cancel accepted deletion, and absence during recovery does not create a
 replacement graph.
 
-Importing an existing root, recreating a missing managed graph, accepting schema
+The ordinary create operation refuses populated graph roots. To register a
+verified history in a freshly bootstrapped cluster, see [full-history
+restore](../operations/restore-history.md). Recreating a missing managed graph, accepting schema
 drift and repairing catalog payloads are not apply modes. Restore missing or
 damaged authoritative data from a verified backup before deploying changes to
 that graph.

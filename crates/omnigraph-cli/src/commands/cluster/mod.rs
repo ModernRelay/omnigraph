@@ -48,6 +48,31 @@ pub(crate) async fn run(
     };
     let binding = crate::scope::capture_storage_binding(target)?;
     match command {
+        ClusterCommand::VerifyRestore { graph_id, json } => {
+            let history = core_deployment_result(
+                omnigraph_cluster::verify_restore_history(&binding, &graph_id).await,
+                json,
+                stdout,
+            )?;
+            write_json(&history, stdout)?;
+        }
+        ClusterCommand::PrepareRestore { descriptor, json } => {
+            use std::io::Read;
+            let mut content = String::new();
+            std::fs::File::open(&descriptor)?
+                .take(omnigraph_cluster::MAX_RESTORE_DESCRIPTOR_BYTES as u64 + 1)
+                .read_to_string(&mut content)?;
+            let digest = core_deployment_result(
+                omnigraph_cluster::prepare_graph_restore(&binding, &content).await,
+                json,
+                stdout,
+            )?;
+            let output = serde_json::json!({"restore_from":digest});
+            retain_delivery_identity(
+                write_json(&output, stdout).and_then(|_| Ok(stdout.flush()?)),
+                format!("Restore reservation: {digest}"),
+            )?;
+        }
         ClusterCommand::Plan { config, json, .. } => {
             let output = omnigraph_cluster::plan_config_dir_with_binding_as(
                 config

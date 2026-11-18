@@ -32,6 +32,12 @@ mod graph_read;
 mod lease;
 mod operations;
 mod policy_binding;
+mod restore;
+pub use restore::PreparedGraphRestore;
+mod restore_preparation;
+pub use restore_preparation::{
+    MAX_RESTORE_DESCRIPTOR_BYTES, prepare_graph_restore, verify_restore_history,
+};
 mod serve;
 mod state_lock;
 mod store;
@@ -351,7 +357,12 @@ async fn plan_config_dir_impl(
             Err(error) => Some(error.clone()),
         }
     });
-    if let Err(error) = annotate_plan_changes(&backend, &mut changes, scope_error.as_ref()) {
+    if let Err(error) = annotate_plan_changes(
+        &backend,
+        &mut changes,
+        bundle.as_ref().ok(),
+        scope_error.as_ref(),
+    ) {
         diagnostics.push(error);
     }
     if let Some(error) = scope_error {

@@ -1,3 +1,7 @@
+use super::history_restore::{
+    initial_restore_requests, restore_directives, settle_history_restore,
+    verify_staged_restore_heads,
+};
 use super::*;
 use crate::authorization::AppliedPolicies;
 use omnigraph_policy::PolicyAction;
@@ -723,6 +727,17 @@ fn validate_bundle_with_root(
         }
     }
     let graph_ids: BTreeSet<_> = bundle.graph_ids().into_iter().collect();
+    if raw
+        .graphs
+        .values()
+        .filter_map(|graph| graph.restore_from.as_deref())
+        .any(|digest| !authorization::valid_digest(digest))
+    {
+        return Err(refusal(
+            "restore_receipt_invalid",
+            "expected a lowercase SHA-256 receipt digest",
+        ));
+    }
     if graph_ids != raw.graphs.keys().cloned().collect() {
         return Err(refusal(
             "deployment_input_invalid",
@@ -1134,13 +1149,18 @@ pub(crate) fn reserve_completion(
         // occur in both the achieved resource map and resource status map.
         let mut terminal = state.clone();
         for (graph, entry) in &state.outstanding.as_ref().unwrap().graphs {
-            if let Some(create) = &entry.create {
+            if let Some(contract) = entry
+                .create
+                .as_ref()
+                .map(|create| create.desired_contract())
+                .or_else(|| entry.restore.as_ref().map(|restore| &restore.contract))
+            {
                 terminal
                     .applied_revision
                     .schema_contracts
                     .as_mut()
                     .unwrap()
-                    .insert(graph.clone(), create.desired_contract().clone());
+                    .insert(graph.clone(), contract.clone());
             }
         }
         terminal.outstanding = None;
@@ -1336,8 +1356,9 @@ fn verify_recorded_input(
     Ok(())
 }
 
-/// Runtime preview derived from captured control metadata, without graph opens
-/// or schema-gate acquisition. Full engine preparation follows request drainage.
+/// Runtime preview from captured control metadata. Only an explicit first-graph
+/// restore inspects sealed, unregistered graph data under read-only storage.
+#[derive(Debug)]
 pub struct DeploymentPreview {
     pub affected_graphs: Vec<String>,
     pub serving: ServingSnapshot,
@@ -1390,12 +1411,23 @@ async fn capture_deployment_preview(
     for graph in &affected_graphs {
         authorize_graph_change(&state, bundle, caller, &policy, graph)?;
     }
+    for (graph, digest) in initial_restore_requests(&state, bundle, caller)? {
+        verify_staged_restore_heads(
+            &store,
+            bundle,
+            &graph,
+            &digest,
+            state.ledger_id.as_deref().unwrap(),
+            state.next_sequence.unwrap(),
+        )
+        .await?;
+    }
     Ok((store, state, cas, affected_graphs))
 }
 
 /// Observe a captured deployment through the serving owner's existing handles.
-/// No graph is opened, no admission is closed, and no execution intent or
-/// sequence is reserved. Apply repeats physical eligibility after drainage.
+/// A first-graph restore also checks its sealed copy read-only. Planning leaves
+/// admission open and reserves no execution intent or sequence.
 pub async fn plan_captured_deployment(
     bundle: &CapturedDeployment,
     admission: &ClusterAdmission,
@@ -1473,7 +1505,7 @@ pub async fn plan_captured_deployment(
             change.migration = Some(migration);
         }
     }
-    annotate_plan_changes(&store, &mut changes, diagnostics.first())?;
+    annotate_plan_changes(&store, &mut changes, Some(bundle), diagnostics.first())?;
     let mut dependencies = BTreeSet::new();
     for (address, resource) in &bundle.resources {
         match resource_kind(address) {
@@ -1550,8 +1582,13 @@ pub async fn plan_captured_deployment(
 pub(crate) fn annotate_plan_changes(
     store: &ClusterStore,
     changes: &mut [PlanChange],
+    bundle: Option<&CapturedDeployment>,
     error: Option<&Diagnostic>,
 ) -> Result<(), Diagnostic> {
+    let mut restores = bundle
+        .map(restore_directives)
+        .transpose()?
+        .unwrap_or_default();
     for change in changes {
         change.disposition = Some(if error.is_some() {
             ApplyDisposition::Blocked
@@ -1563,6 +1600,11 @@ pub(crate) fn annotate_plan_changes(
             ApplyDisposition::Applied
         });
         change.reason = error.map(|error| error.code.clone());
+        if let ResourceKind::Graph(graph) = resource_kind(&change.resource)
+            && change.operation == PlanOperation::Create
+        {
+            change.restore_from = restores.remove(&graph);
+        }
         if let ResourceKind::Graph(graph) = resource_kind(&change.resource)
             && change.operation == PlanOperation::Delete
         {
@@ -1867,7 +1909,17 @@ pub(super) async fn execute_captured_deployment_in_store(
     seams::fail(&DEPLOYMENT_AFTER_ACCEPTANCE)?;
     install_catalog_payloads(store, &state, bundle).await?;
     for (graph, entry) in state.outstanding.as_ref().unwrap().graphs.clone() {
-        let result = if let Some(delete) = &entry.delete {
+        let result = if let Some(restore) = &entry.restore {
+            settle_history_restore(
+                store,
+                bundle,
+                &graph,
+                restore,
+                entry.observed_manifest_version,
+                &id,
+            )
+            .await?
+        } else if let Some(delete) = &entry.delete {
             state
                 .outstanding
                 .as_mut()
@@ -2160,6 +2212,7 @@ async fn prepare_graphs(
     }
     let mut graphs = BTreeMap::new();
     let mut migrations = BTreeMap::new();
+    let restore_requests = initial_restore_requests(state, bundle, caller)?;
     for graph in affected {
         authorize_graph_change(state, bundle, caller, policy, &graph)?;
         let existing = state
@@ -2168,6 +2221,7 @@ async fn prepare_graphs(
             .contains_key(&graph_address(&graph));
         let schema_address = schema_address(&graph);
         let mut entry = GraphDeployment {
+            restore: None,
             create: None,
             delete: None,
             intent: None,
@@ -2198,6 +2252,21 @@ async fn prepare_graphs(
                     "cluster_graph_root_mismatch",
                     "graph root is outside the admitted cluster's canonical graph layout",
                 ));
+            }
+            if let Some(digest) = restore_requests.get(&graph) {
+                let (restore, version) = verify_staged_restore_heads(
+                    store,
+                    bundle,
+                    &graph,
+                    digest,
+                    state.ledger_id.as_deref().unwrap(),
+                    state.next_sequence.unwrap(),
+                )
+                .await?;
+                entry.restore = Some(restore);
+                entry.observed_manifest_version = version;
+                graphs.insert(graph, entry);
+                continue;
             }
             if store
                 .graph_root_exists(&uri)
@@ -2354,6 +2423,14 @@ fn authorize_recovery(
     pending: &OutstandingDeployment,
 ) -> Result<(), Diagnostic> {
     for (graph, entry) in &pending.graphs {
+        if entry.restore.is_some()
+            && !matches!(caller, DeploymentCaller::AuthenticatedIdentity(identity) if !identity.has_bootstrap_authority())
+        {
+            return Err(refusal(
+                "policy_denied",
+                "settling a graph restore requires an authenticated configuration manager",
+            ));
+        }
         if entry.delete.is_some() {
             authorize_graph_deletion(policy, caller, graph)?;
             continue;
@@ -2615,6 +2692,7 @@ fn validate_pending_input(
 ) -> Result<(), Diagnostic> {
     let effects = preview_deployment_scope(state, bundle)?;
     let affected = affected_graphs(state, bundle, &effects);
+    let restores = restore_directives(bundle)?;
     if effects != pending.authorization.effects
         || affected != pending.graphs.keys().cloned().collect()
     {
@@ -2625,6 +2703,35 @@ fn validate_pending_input(
     }
     for (graph, entry) in &pending.graphs {
         let address = schema_address(graph);
+        if let Some(restore) = &entry.restore {
+            if restores.get(graph) != Some(&restore.receipt_sha256)
+                || bundle
+                    .resources
+                    .get(&address)
+                    .is_none_or(|schema| schema.digest != restore.contract.source_hash)
+                || pending.authorization.base.result_revision != 1
+                || !pending.authorization.base.schema_contracts.is_empty()
+                || bundle.graph_ids().len() != 1
+                || DeploymentId::parse(&pending.id)?.sequence != 2
+            {
+                return Err(refusal(
+                    "deployment_authority_changed",
+                    "prepared graph restore differs from original input",
+                ));
+            }
+            continue;
+        }
+        if restores.contains_key(graph)
+            && !state
+                .applied_revision
+                .resources
+                .contains_key(&graph_address(graph))
+        {
+            return Err(refusal(
+                "deployment_authority_changed",
+                "original graph restore intent is absent from accepted authority",
+            ));
+        }
         if let Some(create) = &entry.create {
             admission::admitted_graph_id(
                 &bundle.canonical_root,
@@ -2725,7 +2832,8 @@ async fn finish(
                 SchemaApplySettlement::Committed { contract, .. }
                 | SchemaApplySettlement::NoOp { contract, .. },
         }
-        | GraphDeploymentResult::Created { contract, .. } = outcome
+        | GraphDeploymentResult::Created { contract, .. }
+        | GraphDeploymentResult::Restored { contract, .. } = outcome
         {
             state
                 .applied_revision
@@ -2993,7 +3101,29 @@ async fn reconcile_deployment_in_store(
     validate_pending_input(&state, &pending, &bundle)?;
     install_catalog_payloads(&store, &state, &bundle).await?;
     for (graph, entry) in pending.graphs {
-        let result = if let Some(delete) = &entry.delete {
+        let result = if let Some(restore) = &entry.restore {
+            let restored = settle_history_restore(
+                &store,
+                &bundle,
+                &graph,
+                restore,
+                entry.observed_manifest_version,
+                id,
+            )
+            .await?;
+            if matches!(entry.state, GraphDeploymentState::Settled { .. }) {
+                continue;
+            }
+            state
+                .outstanding
+                .as_mut()
+                .unwrap()
+                .graphs
+                .get_mut(&graph)
+                .unwrap()
+                .recovery_executor = Some(caller.authority()?);
+            restored
+        } else if let Some(delete) = &entry.delete {
             if matches!(entry.state, GraphDeploymentState::Settled { .. }) {
                 continue;
             }

@@ -458,6 +458,50 @@ where
     chunks.flush().await
 }
 
+/// Hash the ordinary stable-ID-ordered logical export of one exact table. Refuse external
+/// Blob descriptors before dereferencing them: a portable restoration includes every byte.
+pub(super) async fn restored_table_digest(
+    db: &Omnigraph,
+    snapshot: &Snapshot,
+    catalog: &Catalog,
+    table: &crate::db::DatasetEntry,
+    total_bytes: &mut u64,
+    max_bytes: u64,
+) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    let mut rows = 0_u64;
+    export_selected_tables(
+        db,
+        snapshot,
+        catalog,
+        std::slice::from_ref(&table.type_key),
+        ExportRowOrder::ById,
+        RangedExternalBlobs::RequireManaged,
+        &mut |chunk: Vec<u8>| {
+            *total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+            rows += chunk.iter().filter(|&&b| b == b'\n').count() as u64;
+            digest.update(&chunk);
+            std::future::ready(if *total_bytes > max_bytes {
+                Err(OmniError::resource_limit(
+                    "restore_export_bytes",
+                    max_bytes,
+                    *total_bytes,
+                ))
+            } else {
+                Ok(())
+            })
+        },
+    )
+    .await?;
+    if rows != table.entity_count {
+        return Err(OmniError::manifest(
+            "restored table row count differs from its snapshot",
+        ));
+    }
+    Ok(digest.finalize().into())
+}
+
 fn export_type_keys(snapshot: &Snapshot, type_names: &[String]) -> Result<Vec<String>> {
     let available = snapshot
         .datasets()
@@ -680,6 +724,8 @@ pub(crate) enum RangedExternalBlobs {
     /// Return the exact reference as [`LogicalBlobValue::RangedExternal`],
     /// which the row renderers describe as `{"uri", "offset", "length"}`.
     Describe,
+    /// Full-history restoration requires every Blob to be owned by this graph.
+    RequireManaged,
 }
 
 /// The ranged external Blob cells of row `row` of `blob_values`, by property.
@@ -1214,6 +1260,9 @@ fn classify_blob_cells(
                     length,
                 };
                 ClassifiedBlobCell::Decided(Some(match (reference.whole_object_uri(), ranged) {
+                    (_, RangedExternalBlobs::RequireManaged) => {
+                        return Err(OmniError::manifest("full-history restore requires self-contained Blob data"));
+                    }
                     (Ok(_), _) => LogicalBlobValue::Text(reference.uri),
                     (Err(_), RangedExternalBlobs::Describe) => {
                         LogicalBlobValue::RangedExternal(reference)
