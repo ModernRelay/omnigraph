@@ -144,6 +144,13 @@ fn describe_core_operation(catalog: &Catalog, core: &CoreDecl) -> Result<QueryOp
 /// Every node type a term scans or expands to, and every edge type it
 /// traverses.
 fn collect_term_reads(term: &Term, reads: &mut BTreeSet<QueryGraphFact>) {
+    for node in term.stored_nodes() {
+        collect_term_reads_node(node, reads);
+    }
+}
+
+/// One node's part of [`collect_term_reads`].
+fn collect_term_reads_node(term: &Term, reads: &mut BTreeSet<QueryGraphFact>) {
     match term {
         Term::Scan { ty, .. } => match ty {
             crate::ir::core::Ty::Node { type_name, .. } => {
@@ -175,9 +182,6 @@ fn collect_term_reads(term: &Term, reads: &mut BTreeSet<QueryGraphFact>) {
             }
         }
         _ => {}
-    }
-    for child in term.children() {
-        collect_term_reads(child, reads);
     }
 }
 

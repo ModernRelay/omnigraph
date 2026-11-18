@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::catalog::Catalog;
 use crate::ir::core::{
-    Agg, Col, CoreNode, CoreRead, Count, Fresh, FreshRole, LexicalQuery, RRF_DEFAULT_K, ScoreKind,
+    Agg, Col, CoreRead, Count, Fresh, FreshRole, LexicalQuery, RRF_DEFAULT_K, ScoreKind,
     ScoreQuery, Term, Ty,
 };
 use crate::ir::{
@@ -448,6 +448,17 @@ impl ReadShape {
         Shaper::new(catalog, &read.name, &read.params, &read.fresh).read(read)
     }
 
+    /// [`ReadShape::of`], and the term nodes the shaper visited.
+    #[cfg(test)]
+    pub(crate) fn of_measured(
+        read: &CoreRead,
+        catalog: &Catalog,
+    ) -> (Result<Self, ShapeError>, usize) {
+        let shaper = Shaper::new(catalog, &read.name, &read.params, &read.fresh);
+        let shape = shaper.read(read);
+        (shape, shaper.visited.get())
+    }
+
     /// The shape of the read declared as `name` in `source`, checked against
     /// `catalog`; the refusal of any stage as text.
     pub fn of_source(catalog: &Catalog, source: &str, name: &str) -> Result<Self, String> {
@@ -628,6 +639,14 @@ struct Shaper<'a> {
     fresh: &'a Fresh,
     /// The names this shaper made up ([`Shaper::shaped`]).
     minted: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// The term nodes the shaper visited: the compile-cost growth tests
+    /// read it.
+    visited: std::cell::Cell<usize>,
+    /// Set while [`Shaper::holds_optional_or_union`] reads one scope's own
+    /// facts: a nested inline read is a scope of its own, which contributes
+    /// no `optional` or `union` to the scope it is written in, so the probe
+    /// does not read it.
+    probing: std::cell::Cell<bool>,
 }
 
 /// The pattern facts of one scope, in the order the term states them.
@@ -1106,6 +1125,8 @@ impl<'a> Shaper<'a> {
             params,
             fresh,
             minted: Default::default(),
+            visited: Default::default(),
+            probing: Default::default(),
         }
     }
 
@@ -1203,11 +1224,9 @@ impl<'a> Shaper<'a> {
 
     fn read(&self, read: &CoreRead) -> Result<ReadShape, ShapeError> {
         // A recursive read types to `Fix`, which stage Rec evaluates.
-        let mut nodes = Vec::new();
-        read.term.nodes(&mut nodes);
-        if nodes
-            .iter()
-            .any(|n| matches!(n, CoreNode::Fix | CoreNode::RecRef))
+        if read
+            .term
+            .any_node(|n| matches!(n, Term::Fix { .. } | Term::RecRef { .. }))
         {
             return Err(ShapeError::unlowered(
                 Unlowered::new(
@@ -2134,6 +2153,7 @@ impl<'a> Shaper<'a> {
 
     /// The facts of `term` into `facts`.
     fn facts(&self, term: &Term, facts: &mut Facts) -> Result<(), ShapeError> {
+        self.visited.set(self.visited.get() + 1);
         match term {
             Term::Unit | Term::Env(_) => Ok(()),
             Term::Scan {
@@ -2696,18 +2716,18 @@ impl<'a> Shaper<'a> {
         bindings: &[(String, IRExpr)],
         facts: &mut Facts,
     ) -> Result<(), ShapeError> {
-        if groups_or_cuts(input) {
+        if self.probing.get() {
+            return Ok(());
+        }
+        // An `optional` or a `union` is placed after its own scope's
+        // elements; joined into the outer scope it would be placed after the
+        // outer elements too. Such a read is drawn as a read of its own.
+        if groups_or_cuts(input) || self.holds_optional_or_union(input)? {
             return self.correlate_read(input, items, bindings, facts);
         }
         let outer: HashSet<String> = env_columns(input).into_iter().collect();
         let mut inner = Facts::default();
         self.facts(input, &mut inner)?;
-        // An `optional` or a `union` is placed after its own scope's
-        // elements; joined into the outer scope it would be placed after the
-        // outer elements too. Such a read is drawn as a read of its own.
-        if !inner.optionals.is_empty() || !inner.unions.is_empty() {
-            return self.correlate_read(input, items, bindings, facts);
-        }
         let inner_lets = std::mem::take(&mut inner.lets);
         inner.substitute(&inner_lets);
         let items: Vec<(String, IRExpr)> = items
@@ -2774,6 +2794,19 @@ impl<'a> Shaper<'a> {
         Ok(())
     }
 
+    /// Whether the scope of `input` states an `optional` or a `union` of its
+    /// own. The probe reads the scope's facts but no inline read nested in
+    /// it, which is a scope of its own, so shaping nested inline reads reads
+    /// each scope a bounded number of times.
+    fn holds_optional_or_union(&self, input: &Term) -> Result<bool, ShapeError> {
+        let was = self.probing.replace(true);
+        let mut probe = Facts::default();
+        let probed = self.facts(input, &mut probe);
+        self.probing.set(was);
+        probed?;
+        Ok(!probe.optionals.is_empty() || !probe.unions.is_empty())
+    }
+
     /// `from { match … return { … } order { … } limit n }` with an
     /// aggregate, `distinct`, an `order` or a `limit` of its own: the core's
     /// `Correlate` over the read's `Group`, `Order` and `Cut`, which the
@@ -2802,6 +2835,9 @@ impl<'a> Shaper<'a> {
         facts: &mut Facts,
         values: Option<&str>,
     ) -> Result<(), ShapeError> {
+        if self.probing.get() {
+            return Ok(());
+        }
         let at = || Construct::Element(FROM, None);
         let mut outer: HashSet<String> = env_columns(input).into_iter().collect();
         for (_, arg) in bindings {
@@ -2883,12 +2919,10 @@ impl<'a> Shaper<'a> {
             extended = items.clone();
             term = input;
         }
-        let mut ranked = Vec::new();
-        term.nodes(&mut ranked);
-        if ranked.iter().any(|node| {
+        if term.any_node(|node| {
             matches!(
                 node,
-                CoreNode::ApproxTopK | CoreNode::Score | CoreNode::Fuse
+                Term::ApproxTopK { .. } | Term::Score { .. } | Term::Fuse { .. }
             )
         }) {
             return Err(self.refuse_at(
@@ -4215,7 +4249,7 @@ fn optional_pattern(inner: &Term) -> Option<&Term> {
         return None;
     };
     (matches!(row.as_ref(), Term::Env(_) | Term::Unit)
-        && counted == left
+        && (std::sync::Arc::ptr_eq(counted, left) || counted == left)
         && keys.is_empty()
         && aggs.len() == 1)
         .then_some(left.as_ref())

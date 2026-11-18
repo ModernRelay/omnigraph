@@ -7,6 +7,7 @@
 //! the planner, the engine and the bound-plan mirror read one form.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::literal::literal_type;
 use crate::catalog::Catalog;
@@ -33,11 +34,20 @@ type Scope = HashMap<String, Bound>;
 
 struct Binder<'a> {
     catalog: &'a Catalog,
+    /// Each shared subterm bound so far, by the node it was before binding:
+    /// that node (kept alive, so its address is not reused while the walk
+    /// runs), the node bound, and its scope. A subterm two parents share (an
+    /// `optional`'s pattern) is bound once, and both parents keep sharing
+    /// the bound node; its binding reads only its own leaves.
+    bound: std::cell::RefCell<HashMap<*const Term, (Arc<Term>, Arc<Term>, Scope)>>,
 }
 
 /// Bind every expression of `decl` in place.
 pub(super) fn bind_decl(catalog: &Catalog, decl: &mut CoreDecl) -> Result<()> {
-    let binder = Binder { catalog };
+    let binder = Binder {
+        catalog,
+        bound: Default::default(),
+    };
     match decl {
         CoreDecl::Read(read) => binder.term(&mut read.term, &Scope::new()).map(|_| ()),
         CoreDecl::Write(write) => {
@@ -118,6 +128,21 @@ impl Binder<'_> {
     /// Bind `term`'s expressions, each in the scope of the rows it reads,
     /// and return the names `term`'s rows carry. `outer` is the scope a
     /// correlated term's `Env` leaf and a call's arguments read.
+    fn child(&self, child: &mut Arc<Term>, outer: &Scope) -> Result<Scope> {
+        let key = Arc::as_ptr(child);
+        if let Some((_, done, scope)) = self.bound.borrow().get(&key) {
+            *child = Arc::clone(done);
+            return Ok(scope.clone());
+        }
+        let before = Arc::clone(child);
+        let scope = self.term(Arc::make_mut(child), outer)?;
+        self.bound
+            .borrow_mut()
+            .insert(key, (before, Arc::clone(child), scope.clone()));
+        Ok(scope)
+    }
+
+    /// The scope `term` binds, its expressions bound in place.
     fn term(&self, term: &mut Term, outer: &Scope) -> Result<Scope> {
         Ok(match term {
             Term::Unit => Scope::new(),
@@ -133,7 +158,7 @@ impl Binder<'_> {
                 edge_var,
                 ..
             } => {
-                let mut scope = self.term(input, outer)?;
+                let mut scope = self.child(input, outer)?;
                 scope.insert(dst.clone(), Bound::Node);
                 if let Some(e) = edge_var {
                     scope.insert(e.clone(), Bound::Edge(edge_types(edges)));
@@ -141,14 +166,14 @@ impl Binder<'_> {
                 scope
             }
             Term::Filter { input, pred, .. } => {
-                let scope = self.term(input, outer)?;
+                let scope = self.child(input, outer)?;
                 *pred = self.expr(pred, &scope)?;
                 scope
             }
             Term::Project {
                 input, items, keep, ..
             } => {
-                let scope = self.term(input, outer)?;
+                let scope = self.child(input, outer)?;
                 for (_, e) in items.iter_mut() {
                     *e = self.expr(e, &scope)?;
                 }
@@ -156,7 +181,7 @@ impl Binder<'_> {
                 if *keep { merge(scope, out) } else { out }
             }
             Term::Group { input, keys, aggs } => {
-                let scope = self.term(input, outer)?;
+                let scope = self.child(input, outer)?;
                 for (_, e) in keys.iter_mut() {
                     *e = self.expr(e, &scope)?;
                 }
@@ -168,15 +193,15 @@ impl Binder<'_> {
                 projected(&scope, keys)
             }
             Term::Order { input, keys } => {
-                let scope = self.term(input, outer)?;
+                let scope = self.child(input, outer)?;
                 for (e, _) in keys {
                     *e = self.expr(e, &scope)?;
                 }
                 scope
             }
-            Term::Cut { input, .. } => self.term(input, outer)?,
+            Term::Cut { input, .. } => self.child(input, outer)?,
             Term::Score { input, query, .. } => {
-                let scope = self.term(input, outer)?;
+                let scope = self.child(input, outer)?;
                 match query {
                     ScoreQuery::Vector(e) => *e = self.expr(e, &scope)?,
                     ScoreQuery::Lexical(LexicalQuery {
@@ -189,20 +214,20 @@ impl Binder<'_> {
                 scope
             }
             Term::ApproxTopK { input, query, .. } => {
-                let scope = self.term(input, outer)?;
+                let scope = self.child(input, outer)?;
                 *query = self.expr(query, &scope)?;
                 scope
             }
             Term::Correlate {
                 outer: left, inner, ..
             } => {
-                let scope = self.term(left, outer)?;
-                let joined = self.term(inner, &scope)?;
+                let scope = self.child(left, outer)?;
+                let joined = self.child(inner, &scope)?;
                 merge(scope, joined)
             }
             Term::Union { left, right } => {
-                let l = self.term(left, outer)?;
-                let r = self.term(right, outer)?;
+                let l = self.child(left, outer)?;
+                let r = self.child(right, outer)?;
                 merge(l, r)
             }
             Term::Fuse { arms, .. } => {
@@ -218,9 +243,9 @@ impl Binder<'_> {
                 for (_, e) in bindings {
                     *e = self.expr(e, outer)?;
                 }
-                self.term(body, &Scope::new())?
+                self.child(body, &Scope::new())?
             }
-            Term::Fix { body, .. } => self.term(body, outer)?,
+            Term::Fix { body, .. } => self.child(body, outer)?,
         })
     }
 

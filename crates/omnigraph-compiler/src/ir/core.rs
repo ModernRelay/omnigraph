@@ -22,6 +22,8 @@
 //! whole terms. Names are deterministic (fresh names come from a counter per
 //! declaration, [`Fresh`]), so two spellings of one term compare equal.
 
+use std::sync::Arc;
+
 use super::expr::IRExpr;
 use crate::query::file::MutationWriteMode;
 use crate::query::value::{AggFunc, Literal};
@@ -199,7 +201,7 @@ pub enum Term {
         ty: Ty,
     },
     Expand {
-        input: Box<Term>,
+        input: Arc<Term>,
         src: String,
         dst: String,
         /// The node type `src` holds.
@@ -217,7 +219,7 @@ pub enum Term {
     /// A `where` conjunct in its written position, over every element of
     /// its scope, or a closing triple's identity test.
     Filter {
-        input: Box<Term>,
+        input: Arc<Term>,
         pred: IRExpr,
         /// The conjunct can fail where it is evaluated: its predicate or a
         /// block it reads (the type checker's one computation of it, A3).
@@ -229,7 +231,7 @@ pub enum Term {
     /// derived-forms table's `Extend` without an aggregate); otherwise the
     /// output is `items` alone.
     Project {
-        input: Box<Term>,
+        input: Arc<Term>,
         items: Vec<(String, IRExpr)>,
         keep: bool,
         /// An item can fail where it is evaluated: a `let` that can fail
@@ -237,34 +239,34 @@ pub enum Term {
         fails: bool,
     },
     Group {
-        input: Box<Term>,
+        input: Arc<Term>,
         keys: Vec<(String, IRExpr)>,
         aggs: Vec<(String, Agg)>,
     },
     /// The outer columns, then the inner term's new columns.
     Correlate {
-        outer: Box<Term>,
-        inner: Box<Term>,
+        outer: Arc<Term>,
+        inner: Arc<Term>,
         /// The inner term can fail where it is evaluated (a `from`, an
         /// `optional` or a block over a term that can fail): it runs on every
         /// outer row, and nothing moves below it.
         fails: bool,
     },
     Union {
-        left: Box<Term>,
-        right: Box<Term>,
+        left: Arc<Term>,
+        right: Arc<Term>,
     },
     Order {
-        input: Box<Term>,
+        input: Arc<Term>,
         /// (key, descending)
         keys: Vec<(IRExpr, bool)>,
     },
     Cut {
-        input: Box<Term>,
+        input: Arc<Term>,
         k: Count,
     },
     Score {
-        input: Box<Term>,
+        input: Arc<Term>,
         column: String,
         property: String,
         kind: ScoreKind,
@@ -274,7 +276,7 @@ pub enum Term {
         out: String,
     },
     ApproxTopK {
-        input: Box<Term>,
+        input: Arc<Term>,
         column: String,
         property: String,
         query: IRExpr,
@@ -296,7 +298,7 @@ pub enum Term {
     /// recursive relation through [`Term::RecRef`].
     Fix {
         name: String,
-        body: Box<Term>,
+        body: Arc<Term>,
         /// `@budget(rounds = n)`.
         rounds: Option<u64>,
         /// The column `min` or `max` orders, if any (the lattice columns).
@@ -311,13 +313,15 @@ pub enum Term {
     Call {
         name: String,
         bindings: Vec<(String, IRExpr)>,
-        body: Box<Term>,
+        body: Arc<Term>,
     },
 }
 
 impl Term {
-    pub fn boxed(self) -> Box<Self> {
-        Box::new(self)
+    /// The term as a child of another: shared, so a pattern the core
+    /// writes twice (an `optional`'s) is stored once.
+    pub fn boxed(self) -> Arc<Self> {
+        Arc::new(self)
     }
 
     /// Whether an expression of the term can fail where it is evaluated:
@@ -327,7 +331,7 @@ impl Term {
     /// `Group`'s or an `Order`'s own expressions are read here, since one
     /// appears only inside a `Correlate` or at the read's top.
     pub fn can_fail(&self) -> bool {
-        let own = match self {
+        self.any_node(|node| match node {
             Self::Filter { fails, .. }
             | Self::Project { fails, .. }
             | Self::Correlate { fails, .. } => *fails,
@@ -339,28 +343,81 @@ impl Term {
             }
             Self::Order { keys, .. } => keys.iter().any(|(e, _)| e.can_fail()),
             _ => false,
-        };
-        own || self.children().into_iter().any(Term::can_fail)
+        })
     }
 
-    /// The number of nodes in the expanded tree (the plan budget counts this,
-    /// not the shared graph).
-    pub fn size(&self) -> usize {
-        1 + match self {
-            Self::Unit | Self::Env(_) | Self::Scan { .. } | Self::RecRef { .. } => 0,
-            Self::Expand { input, .. }
-            | Self::Filter { input, .. }
-            | Self::Project { input, .. }
-            | Self::Group { input, .. }
-            | Self::Order { input, .. }
-            | Self::Cut { input, .. }
-            | Self::Score { input, .. }
-            | Self::ApproxTopK { input, .. } => input.size(),
-            Self::Correlate { outer, inner, .. } => outer.size() + inner.size(),
-            Self::Union { left, right } => left.size() + right.size(),
-            Self::Fuse { arms, .. } => arms.iter().map(Term::size).sum(),
-            Self::Fix { body, .. } | Self::Call { body, .. } => body.size(),
+    /// Every stored node of the term once, pre-order: a subterm two parents
+    /// share (an `optional`'s pattern) is listed where it is first reached.
+    /// The walk keeps its own stack.
+    pub fn stored_nodes(&self) -> Vec<&Term> {
+        let mut seen: std::collections::HashSet<*const Term> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let mut pending = vec![self];
+        while let Some(node) = pending.pop() {
+            if seen.insert(node as *const Term) {
+                out.push(node);
+                pending.extend(node.children().into_iter().rev());
+            }
         }
+        out
+    }
+
+    /// Whether `test` holds for a node of the term. Each stored node is
+    /// tested once, so a subterm two parents share (an `optional`'s
+    /// pattern) costs its size once, and the walk keeps its own stack.
+    pub fn any_node(&self, mut test: impl FnMut(&Term) -> bool) -> bool {
+        let mut seen: std::collections::HashSet<*const Term> = std::collections::HashSet::new();
+        let mut pending = vec![self];
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node as *const Term) {
+                continue;
+            }
+            if test(node) {
+                return true;
+            }
+            pending.extend(node.children());
+        }
+        false
+    }
+
+    /// The number of nodes the plan budget charges: the expanded tree, a
+    /// `Call`'s body at each call site as the RFC's `Call` rule expands it,
+    /// except that the subterm an `optional`'s desugaring writes twice (its
+    /// pattern, which `Union(p, …¬ exists p…)` both returns and tests for
+    /// absence) is stored once, shared by the `Union`'s two arms, and
+    /// charged once, as the one expansion it is. Linear in the stored
+    /// nodes, on a stack of its own.
+    pub fn size(&self) -> usize {
+        // Each pending node with the chain of `Union` left arms its
+        // right-arm ancestors share: a node that is one of them is the
+        // shared pattern, already charged under the left arm.
+        let mut shared: Vec<(*const Term, Option<usize>)> = Vec::new();
+        let mut pending: Vec<(&Term, Option<usize>)> = vec![(self, None)];
+        let mut size = 0;
+        while let Some((node, chain)) = pending.pop() {
+            let mut at = chain;
+            let mut charged = false;
+            while let Some(i) = at {
+                if shared[i].0 == node as *const Term {
+                    charged = true;
+                    break;
+                }
+                at = shared[i].1;
+            }
+            if charged {
+                continue;
+            }
+            size += 1;
+            match node {
+                Self::Union { left, right } => {
+                    shared.push((Arc::as_ptr(left), chain));
+                    pending.push((right, Some(shared.len() - 1)));
+                    pending.push((left, chain));
+                }
+                other => pending.extend(other.children().into_iter().map(|c| (c, chain))),
+            }
+        }
+        size
     }
 
     /// The node's kind.

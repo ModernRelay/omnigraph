@@ -398,10 +398,10 @@ fn scan_to_rec_ref(term: &mut Term, var: &str, name: &str) {
         | Term::Project { input, .. }
         | Term::Group { input, .. }
         | Term::Order { input, .. }
-        | Term::Cut { input, .. } => scan_to_rec_ref(input, var, name),
+        | Term::Cut { input, .. } => scan_to_rec_ref(std::sync::Arc::make_mut(input), var, name),
         Term::Correlate { outer, inner, .. } => {
-            scan_to_rec_ref(outer, var, name);
-            scan_to_rec_ref(inner, var, name);
+            scan_to_rec_ref(std::sync::Arc::make_mut(outer), var, name);
+            scan_to_rec_ref(std::sync::Arc::make_mut(inner), var, name);
         }
         _ => {}
     }
@@ -431,9 +431,9 @@ query step() { match { $q: Person, $q knows $r } return { $r as q } }";
     let mut read = (*base).clone();
     read.term = Term::Fix {
         name: "reachable".into(),
-        body: Box::new(Term::Union {
-            left: Box::new(base.term.clone()),
-            right: Box::new(step),
+        body: std::sync::Arc::new(Term::Union {
+            left: std::sync::Arc::new(base.term.clone()),
+            right: std::sync::Arc::new(step),
         }),
         rounds: None,
         lattice: Vec::new(),

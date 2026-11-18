@@ -777,10 +777,11 @@ fn a_run_of_optionals_grows_the_term_linearly() {
 }
 
 /// The plan budget is charged as the term is built: an expansion that
-/// doubles at each level, nested optionals (each writes its pattern twice,
-/// its rows and its emptiness test) or reads that each call the next one
-/// twice, stops at the first term over the budget instead of building all
-/// 2^30 nodes first.
+/// doubles at each level, reads that each call the next one twice, stops at
+/// the first term over the budget instead of building all 2^30 nodes first.
+/// Nested optionals do not double: each writes its pattern twice, its rows
+/// and its emptiness test, but stores it once and is charged once, so 30
+/// levels fit the budget.
 #[test]
 fn a_plan_budget_overrun_stops_as_the_term_is_built() {
     // How far the build went: the first term over the 4096-node budget, at
@@ -789,7 +790,6 @@ fn a_plan_budget_overrun_stops_as_the_term_is_built() {
     let largest = |source: &str| -> usize {
         let work = super::typing_work(&catalog(), source);
         let (_, first) = &work[0];
-        assert!(!first.accepted, "{source}");
         first.largest_term
     };
     let mut nested = String::from("$q30: Person, $q29 knows $q30");
@@ -802,10 +802,9 @@ fn a_plan_budget_overrun_stops_as_the_term_is_built() {
     let source = format!(
         "query q() {{ match {{ $q0: Person, optional {{ {nested} }} }} return {{ $q0.handle }} }}"
     );
-    let m = refused(&source, "T70");
-    assert!(m.contains("plan budget"), "{m}");
+    ok(&source);
     let built = largest(&source);
-    assert!((4096..3 * 4096).contains(&built), "{built}: {m}");
+    assert!(built < 1024, "30 nested optionals charge {built} nodes");
     let mut reads = vec!["query r30() { match { $p: Person } return { $p } }".to_string()];
     for i in (0..30).rev() {
         reads.push(format!(
@@ -818,6 +817,7 @@ fn a_plan_budget_overrun_stops_as_the_term_is_built() {
     let source = reads.join("\n");
     let m = refused(&source, "T70");
     assert!(m.contains("plan budget") && m.contains("r1 → r2"), "{m}");
+    assert!(!super::typing_work(&catalog(), &source)[0].1.accepted);
     let built = largest(&source);
     assert!((4096..3 * 4096).contains(&built), "{built}: {m}");
 }
@@ -857,16 +857,13 @@ fn a_called_read_is_typed_once_however_often_it_is_called() {
         "typing work is linear in the reads reached: {work:?}"
     );
     // A bound relation over the budget is refused although nothing draws it.
-    let mut nested = String::from("$q12: Person, $q11 knows $q12");
-    for i in (1..12).rev() {
-        nested = format!(
-            "$q{i}: Person, $q{} knows $q{i}, optional {{ {nested} }}",
-            i - 1
-        );
-    }
+    let optionals: Vec<String> = (1..=120)
+        .map(|i| format!("optional {{ $q{i}: Person, $q0 knows $q{i} }}"))
+        .collect();
     let m = refused(
         &format!(
-            "query q() @budget(plan = 1000) {{ match {{ $p: Person, let $r = {{ match {{ $q0: Person, optional {{ {nested} }} }} return {{ $q0 }} }} }} return {{ $p.handle }} }}"
+            "query q() @budget(plan = 1000) {{ match {{ $p: Person, let $r = {{ match {{ $q0: Person, {} }} return {{ $q0 }} }} }} return {{ $p.handle }} }}",
+            optionals.join(", ")
         ),
         "T70",
     );
@@ -900,7 +897,7 @@ fn guarded_blocks_are_typed_once_each_and_capture_no_name() {
                 let source = format!(
                     "query q() {{ match {{ $p: Person }} where {predicate} return {{ $p.handle }} }}"
                 );
-                let [(_, work)] = super::typing_work(&catalog(), &source)[..] else {
+                let [(_, ref work)] = super::typing_work(&catalog(), &source)[..] else {
                     panic!("one declaration");
                 };
                 assert!(work.accepted, "{form}: {source}");
@@ -2464,6 +2461,7 @@ fn a_type_error_carries_the_position_of_its_clause() {
 }
 
 mod compile_cost;
+mod compile_growth;
 mod components;
 mod desugaring;
 mod diagnostics;

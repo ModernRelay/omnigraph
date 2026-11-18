@@ -549,6 +549,13 @@ fn blob_property(catalog: &Catalog, target: &MutationTarget, property: &str) -> 
 /// from or reaches (an interface as each type implementing it), and every
 /// edge type it scans or traverses.
 fn tables_read(term: &Term, catalog: &Catalog, out: &mut BTreeSet<String>) {
+    for node in term.stored_nodes() {
+        tables_read_node(node, catalog, out);
+    }
+}
+
+/// One node's part of [`tables_read`].
+fn tables_read_node(term: &Term, catalog: &Catalog, out: &mut BTreeSet<String>) {
     let nodes = |name: &str, out: &mut BTreeSet<String>| {
         if catalog.node_types.contains_key(name) {
             out.insert(format!("node:{name}"));
@@ -587,9 +594,6 @@ fn tables_read(term: &Term, catalog: &Catalog, out: &mut BTreeSet<String>) {
             );
         }
         _ => {}
-    }
-    for child in term.children() {
-        tables_read(child, catalog, out);
     }
 }
 

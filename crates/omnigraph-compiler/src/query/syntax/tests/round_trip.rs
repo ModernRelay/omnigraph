@@ -1365,14 +1365,14 @@ fn drop_true_filters(term: &mut Term) {
         ..
     } = term
     {
-        *term = std::mem::replace(input.as_mut(), Term::Unit);
+        *term = std::sync::Arc::unwrap_or_clone(std::mem::replace(input, Term::Unit.boxed()));
         return drop_true_filters(term);
     }
     match term {
         Term::Filter { input, .. }
         | Term::Project { input, .. }
         | Term::Order { input, .. }
-        | Term::Cut { input, .. } => drop_true_filters(input),
+        | Term::Cut { input, .. } => drop_true_filters(std::sync::Arc::make_mut(input)),
         _ => {}
     }
 }

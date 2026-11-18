@@ -18,6 +18,7 @@
 //! columns, and the casts [`crate::ir::coerce`] chooses.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::catalog::Catalog;
 use crate::error::CompilerError;
@@ -324,13 +325,15 @@ fn typed_decl(catalog: &Catalog, unit: &HashMap<String, &Decl>, decl: &Decl) -> 
 
 /// The measured work of typing one declaration.
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct TypingWork {
     /// The expressions typed ([`Ctx::typed_exprs`]).
     pub exprs: usize,
     /// The largest term charged to the plan budget ([`Ctx::largest_charged`]).
     pub largest_term: usize,
     pub accepted: bool,
+    /// The checked declaration, when it is accepted.
+    pub core: Option<CoreDecl>,
 }
 
 /// The work typing each declaration of `source` took, by name.
@@ -354,6 +357,10 @@ pub(crate) fn typing_work(catalog: &Catalog, source: &str) -> Vec<(String, Typin
                     exprs: work.exprs,
                     largest_term: work.largest_term,
                     accepted: matches!(typed, Typed::Checked(_)),
+                    core: match typed {
+                        Typed::Checked(checked) => Some(checked.core),
+                        _ => None,
+                    },
                 },
             )
         })
@@ -6232,7 +6239,9 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
             // for each outer row, p's rows, or, when p has none, one row that
             // keeps the outer columns p reads and is null in each column p
             // adds. R is written once, so a run of optionals grows the tree
-            // linearly.
+            // linearly, and p is stored once, shared by the two arms, so
+            // nesting optionals does too.
+            let inner = inner.boxed();
             let col = "_opt".to_string();
             let row = if env.is_empty() {
                 Term::Unit
@@ -6244,7 +6253,7 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
                     outer: row.boxed(),
                     fails: inner.can_fail(),
                     inner: Term::Group {
-                        input: inner.clone().boxed(),
+                        input: Arc::clone(&inner),
                         keys: Vec::new(),
                         aggs: vec![(col.clone(), count_rows())],
                     }
@@ -6275,7 +6284,7 @@ fn apply(acc: Option<Term>, step: Step) -> Term {
             correlate(
                 Some(acc.unwrap_or(Term::Unit)),
                 Term::Union {
-                    left: inner.boxed(),
+                    left: inner,
                     right: Term::Project {
                         input: unmatched.boxed(),
                         items,
@@ -6359,7 +6368,7 @@ fn with_blocks(mut t: Term, blocks: Vec<BlockAgg>) -> Term {
 /// beside the columns it already read.
 fn condition_env(t: Term, guard: &str) -> Term {
     let boolean = Ty::scalar(ScalarType::Bool, false);
-    let step = |input: Box<Term>| Box::new(condition_env(*input, guard));
+    let step = |input: Arc<Term>| Arc::new(condition_env(Arc::unwrap_or_clone(input), guard));
     match t {
         Term::Env(mut cols) => {
             cols.push(Col {
@@ -6448,8 +6457,8 @@ impl Step {
             }
             Step::Let { blocks: b, .. } => blocks(b) + 1,
             // Correlate, Union, Project, Filter, Correlate, the row, Group,
-            // and the inner term twice.
-            Step::Optional { inner, .. } => 7 + 2 * inner.size(),
+            // and the inner term, which both arms of the `Union` share.
+            Step::Optional { inner, .. } => 7 + inner.size(),
         }
     }
 }
@@ -6481,8 +6490,7 @@ fn lazy_guard(e: &SExpr, when: bool, on_null: bool) -> SExpr {
 /// Whether `t` holds a recursive reference or a fixpoint, whose typing
 /// depends on the call frames it was typed under.
 fn reaches_recursion(t: &Term) -> bool {
-    matches!(t, Term::RecRef { .. } | Term::Fix { .. })
-        || t.children().into_iter().any(reaches_recursion)
+    t.any_node(|node| matches!(node, Term::RecRef { .. } | Term::Fix { .. }))
 }
 
 /// The column names a term produces (types are not needed by the fold).
@@ -6772,22 +6780,7 @@ fn t70(name: &str, construct: &str) -> E {
 }
 
 fn depends(t: &Term, name: &str) -> bool {
-    match t {
-        Term::RecRef { name: n, .. } => n == name,
-        Term::Unit | Term::Env(_) | Term::Scan { .. } => false,
-        Term::Expand { input, .. }
-        | Term::Filter { input, .. }
-        | Term::Project { input, .. }
-        | Term::Group { input, .. }
-        | Term::Order { input, .. }
-        | Term::Cut { input, .. }
-        | Term::Score { input, .. }
-        | Term::ApproxTopK { input, .. } => depends(input, name),
-        Term::Correlate { outer, inner, .. } => depends(outer, name) || depends(inner, name),
-        Term::Union { left, right } => depends(left, name) || depends(right, name),
-        Term::Fuse { arms, .. } => arms.iter().any(|a| depends(a, name)),
-        Term::Fix { body, .. } | Term::Call { body, .. } => depends(body, name),
-    }
+    t.any_node(|node| matches!(node, Term::RecRef { name: n, .. } if n == name))
 }
 
 fn reads_any(e: &IRExpr, cols: &HashSet<String>) -> bool {
@@ -6980,32 +6973,20 @@ fn is_exists_of(pred: &IRExpr, col: &str) -> bool {
 }
 
 fn call_chain(t: &Term, out: &mut Vec<String>) {
-    match t {
-        Term::Call { name, body, .. } => {
-            if !out.contains(name) {
-                out.push(name.clone());
-            }
-            call_chain(body, out);
+    // Pre-order, each stored node once: a shared subterm names its calls
+    // where it is first reached.
+    let mut seen: HashSet<*const Term> = HashSet::new();
+    let mut pending = vec![t];
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node as *const Term) {
+            continue;
         }
-        Term::Unit | Term::Env(_) | Term::Scan { .. } | Term::RecRef { .. } => {}
-        Term::Expand { input, .. }
-        | Term::Filter { input, .. }
-        | Term::Project { input, .. }
-        | Term::Group { input, .. }
-        | Term::Order { input, .. }
-        | Term::Cut { input, .. }
-        | Term::Score { input, .. }
-        | Term::ApproxTopK { input, .. } => call_chain(input, out),
-        Term::Correlate { outer, inner, .. } => {
-            call_chain(outer, out);
-            call_chain(inner, out);
+        if let Term::Call { name, .. } = node
+            && !out.contains(name)
+        {
+            out.push(name.clone());
         }
-        Term::Union { left, right } => {
-            call_chain(left, out);
-            call_chain(right, out);
-        }
-        Term::Fuse { arms, .. } => arms.iter().for_each(|a| call_chain(a, out)),
-        Term::Fix { body, .. } => call_chain(body, out),
+        pending.extend(node.children().into_iter().rev());
     }
 }
 

@@ -36,6 +36,10 @@ const CHECK: &str = "placement";
 struct Scope {
     conjuncts: Vec<(IRExpr, bool)>,
     bindings: BTreeSet<String>,
+    /// The scope lies in a subterm the term reaches twice (an `optional`'s
+    /// pattern, which its desugaring both returns and tests for absence):
+    /// each of its conjuncts is written twice, so none is unique.
+    shared: bool,
 }
 
 /// Holds `plan` to the placement of every scope of `core`.
@@ -46,7 +50,15 @@ pub(super) fn check(
     budget: &mut Budget,
 ) -> Result<(), ValidationError> {
     let mut scopes = Vec::new();
-    collect(&core.term, &core.fresh, &mut scopes);
+    let shared = shared_nodes(&core.term);
+    collect(
+        &core.term,
+        &core.fresh,
+        &shared,
+        false,
+        &mut BTreeSet::new(),
+        &mut scopes,
+    );
     let tested = tested(plan);
     budget.visit(u64::try_from(tested.len() * scopes.len().max(1)).unwrap_or(u64::MAX))?;
     let parents = parents(plan);
@@ -82,8 +94,10 @@ pub(super) fn check(
         })
         .collect();
     let mut counts: HashMap<&str, usize> = HashMap::new();
-    for (_, _, _, shape) in parts.iter().flatten() {
-        *counts.entry(shape.as_str()).or_default() += 1;
+    for (scope, parts) in scopes.iter().zip(&parts) {
+        for (_, _, _, shape) in parts {
+            *counts.entry(shape.as_str()).or_default() += if scope.shared { 2 } else { 1 };
+        }
     }
     let unique = |shape: &str| shape != "_" && counts.get(shape) == Some(&1);
     let found = |shape: &str| -> Vec<(NodeId, usize)> {
@@ -142,13 +156,41 @@ pub(super) fn check(
     Ok(())
 }
 
+/// The nodes `t` reaches by two paths: the pattern an `optional`'s
+/// desugaring writes twice is stored once and shared.
+fn shared_nodes(t: &Term) -> BTreeSet<*const Term> {
+    let mut seen = BTreeSet::new();
+    let mut shared = BTreeSet::new();
+    let mut pending = vec![t];
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node as *const Term) {
+            shared.insert(node as *const Term);
+            continue;
+        }
+        pending.extend(node.children());
+    }
+    shared
+}
+
 /// Every scope of `t`: a run of `where` conjuncts over the elements below
-/// them, with the blocks read as values and guard columns among them.
-fn collect(t: &Term, fresh: &Fresh, out: &mut Vec<Scope>) {
+/// them, with the blocks read as values and guard columns among them. A
+/// stored node is read once; a scope under a node in `shared` is marked so.
+fn collect(
+    t: &Term,
+    fresh: &Fresh,
+    shared: &BTreeSet<*const Term>,
+    mut under_shared: bool,
+    seen: &mut BTreeSet<*const Term>,
+    out: &mut Vec<Scope>,
+) {
+    if !seen.insert(t as *const Term) {
+        return;
+    }
+    under_shared |= shared.contains(&(t as *const Term));
     let Term::Filter { .. } = t else {
         t.children()
             .into_iter()
-            .for_each(|c| collect(c, fresh, out));
+            .for_each(|c| collect(c, fresh, shared, under_shared, seen, out));
         return;
     };
     let mut conjuncts = Vec::new();
@@ -160,7 +202,7 @@ fn collect(t: &Term, fresh: &Fresh, out: &mut Vec<Scope>) {
                 at = input;
             }
             Term::Correlate { outer, inner, .. } if is_block(inner, fresh) => {
-                collect(inner, fresh, out);
+                collect(inner, fresh, shared, under_shared, seen, out);
                 at = outer;
             }
             Term::Project {
@@ -183,10 +225,11 @@ fn collect(t: &Term, fresh: &Fresh, out: &mut Vec<Scope>) {
     out.push(Scope {
         conjuncts,
         bindings,
+        shared: under_shared,
     });
     at.children()
         .into_iter()
-        .for_each(|c| collect(c, fresh, out));
+        .for_each(|c| collect(c, fresh, shared, under_shared, seen, out));
 }
 
 /// A block read as a value: a `Group` of one aggregate and no key whose
@@ -196,19 +239,27 @@ fn is_block(inner: &Term, fresh: &Fresh) -> bool {
         if keys.is_empty() && aggs.len() == 1 && fresh.is(&aggs[0].0, FreshRole::Block))
 }
 
-/// The bindings `t`'s scans and expansions introduce.
+/// The bindings `t`'s scans and expansions introduce, each stored node
+/// read once.
 fn binds(t: &Term, out: &mut BTreeSet<String>) {
-    match t {
-        Term::Scan { var, .. } => {
-            out.insert(var.clone());
+    let mut seen: BTreeSet<*const Term> = BTreeSet::new();
+    let mut pending = vec![t];
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node as *const Term) {
+            continue;
         }
-        Term::Expand { dst, edge_var, .. } => {
-            out.insert(dst.clone());
-            out.extend(edge_var.iter().cloned());
+        match node {
+            Term::Scan { var, .. } => {
+                out.insert(var.clone());
+            }
+            Term::Expand { dst, edge_var, .. } => {
+                out.insert(dst.clone());
+                out.extend(edge_var.iter().cloned());
+            }
+            _ => {}
         }
-        _ => {}
+        pending.extend(node.children());
     }
-    t.children().into_iter().for_each(|c| binds(c, out));
 }
 
 /// Every conjunct the plan tests: its node, its position there, and its
