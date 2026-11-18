@@ -534,36 +534,7 @@ fn edge_insert_id(
     })
 }
 
-/// Rows a keyed insert run fills at a time: the stored rows of a run's keys
-/// are read in one scan.
-const KEEP_OMITTED_RUN_ROWS: usize = 1024;
-
-/// The properties a keyed insert row leaves unnamed: every property column
-/// but the identity and endpoint columns that it does not assign.
-fn insert_omitted_cells(
-    schema: &SchemaRef,
-    assignments: &HashMap<String, Literal>,
-    system_columns: SystemColumns,
-) -> super::keep_omitted::OmittedCells {
-    let mut omitted = super::keep_omitted::OmittedCells::default();
-    for field in schema.fields() {
-        let name = field.name().as_str();
-        if name == system_columns.id || name == system_columns.src || name == system_columns.dst {
-            continue;
-        }
-        if !assignments.contains_key(name) {
-            omitted.push(name, vec![true]);
-        }
-    }
-    omitted
-}
-
-/// Build a single-row RecordBatch from resolved assignments. With
-/// `omitted`, a keyed insert's row on [`keep_omitted::relaxed_schema`]: a
-/// property the statement does not name is a null placeholder the fill
-/// replaces from the stored row, or refuses when the key is new and the
-/// property required; without it, the row on `schema`, a missing required
-/// property refused here.
+/// Build a single-row RecordBatch from resolved assignments.
 fn build_insert_batch(
     schema: &SchemaRef,
     id: &str,
@@ -571,13 +542,8 @@ fn build_insert_batch(
     blob_properties: &HashSet<String>,
     system_columns: SystemColumns,
     write_budget: WriteBudget,
-    omitted: Option<&super::keep_omitted::OmittedCells>,
 ) -> Result<RecordBatch> {
     preflight_blob_assignments(assignments, blob_properties, 1, write_budget)?;
-    let schema = &match omitted {
-        Some(omitted) => super::keep_omitted::relaxed_schema(schema, omitted),
-        None => schema.clone(),
-    };
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields() {
@@ -2468,13 +2434,7 @@ impl Omnigraph {
         } else {
             (crate::db::MutationOpKind::Insert, PendingMode::StrictInsert)
         };
-        let system_columns = catalog.system_columns;
         let mut staged = 0usize;
-        // Keyed rows that omit a property wait here, a bounded run at a time,
-        // so the stored rows they keep values from are read once per run.
-        let mut keeping: Vec<RecordBatch> = Vec::new();
-        let mut keeping_ids: HashSet<String> = HashSet::new();
-        let mut keeping_omitted = super::keep_omitted::OmittedCells::default();
         for resolved in rows {
             refuse_null_on_required(target.type_name(), &schema, &resolved)?;
             let id = match target {
@@ -2485,20 +2445,13 @@ impl Omnigraph {
                     edge_insert_id(catalog, type_name, &resolved)?
                 }
             };
-            // A keyed insert is an upsert: on an existing key it keeps the
-            // properties it does not name. Every row of one statement names
-            // the same properties, so they share one relaxed shape.
-            let omitted = (mode == PendingMode::Upsert)
-                .then(|| insert_omitted_cells(&schema, &resolved, system_columns))
-                .filter(|omitted| !omitted.is_empty());
             let batch = build_insert_batch(
                 &schema,
                 &id,
                 &resolved,
                 blob_props,
-                system_columns,
+                catalog.system_columns,
                 staging.write_budget(),
-                omitted.as_ref(),
             )?;
             if staged == 0 {
                 let (_handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -2511,60 +2464,17 @@ impl Omnigraph {
                 )
                 .await?;
             }
-            staged += 1;
-            if let Some(omitted) = omitted {
-                // A run ends before a second row of one key, which must see
-                // the first, and after a row holding Blob bytes, so a run
-                // never holds more than one row's decoded payload.
-                if keeping_ids.contains(&id) {
-                    self.stage_keeping_omitted(
-                        target,
-                        &schema,
-                        &table_key,
-                        std::mem::take(&mut keeping),
-                        &keeping_omitted,
-                        system_columns.id,
-                        staging,
-                    )
-                    .await?;
-                    keeping_ids.clear();
-                }
-                let holds_payload = crate::table_store::write_batch_bytes(&batch)?.payload > 0;
-                keeping_omitted = omitted;
-                keeping.push(batch);
-                keeping_ids.insert(id);
-                if holds_payload || keeping.len() >= KEEP_OMITTED_RUN_ROWS {
-                    self.stage_keeping_omitted(
-                        target,
-                        &schema,
-                        &table_key,
-                        std::mem::take(&mut keeping),
-                        &keeping_omitted,
-                        system_columns.id,
-                        staging,
-                    )
-                    .await?;
-                    keeping_ids.clear();
-                }
-                continue;
-            }
             if mode == PendingMode::Upsert {
-                staging.append_successors(&table_key, schema.clone(), batch, system_columns.id)?;
+                staging.append_successors(
+                    &table_key,
+                    schema.clone(),
+                    batch,
+                    catalog.system_columns.id,
+                )?;
             } else {
                 staging.append_batch(&table_key, schema.clone(), mode, batch)?;
             }
-        }
-        if !keeping.is_empty() {
-            self.stage_keeping_omitted(
-                target,
-                &schema,
-                &table_key,
-                keeping,
-                &keeping_omitted,
-                system_columns.id,
-                staging,
-            )
-            .await?;
+            staged += 1;
         }
         Ok(match target {
             MutationTarget::Node { .. } => MutationResult {
@@ -2581,54 +2491,6 @@ impl Omnigraph {
                 }
             }
         })
-    }
-
-    /// Fill a run of keyed insert rows that omit properties from the rows
-    /// their keys replace and stage each as its key's next version.
-    async fn stage_keeping_omitted(
-        &self,
-        target: &MutationTarget,
-        schema: &SchemaRef,
-        table_key: &str,
-        rows: Vec<RecordBatch>,
-        omitted: &super::keep_omitted::OmittedCells,
-        id_column: &str,
-        staging: &mut MutationStaging,
-    ) -> Result<()> {
-        let Some(first) = rows.first() else {
-            return Ok(());
-        };
-        let run = arrow_select::concat::concat_batches(&first.schema(), &rows)
-            .map_err(OmniError::arrow_internal)?;
-        drop(rows);
-        let omitted = omitted.repeated(run.num_rows());
-        let type_name = target.type_name().to_string();
-        let filled = super::keep_omitted::keep_omitted_properties(
-            self,
-            staging,
-            table_key,
-            schema,
-            run,
-            &omitted,
-            id_column,
-            super::keep_omitted::EarlierEffects::Seen,
-            &|property, id, _omitted| {
-                OmniError::manifest(format!(
-                    "missing required property '{property}': {type_name} has no row with key \
-                     '{id}' to keep it from"
-                ))
-            },
-        )
-        .await?;
-        for row in 0..filled.num_rows() {
-            staging.append_successors(
-                table_key,
-                schema.clone(),
-                filled.slice(row, 1),
-                id_column,
-            )?;
-        }
-        Ok(())
     }
 
     async fn execute_update(

@@ -2333,7 +2333,7 @@ edge Refs: Note -> Note {
         .load_with_receipt(
             "main",
             concat!(
-                r#"{"type":"Note","data":{"slug":"note-a","body":null}}"#,
+                r#"{"type":"Note","data":{"slug":"note-a"}}"#,
                 "\n",
                 r#"{"type":"Note","data":{"slug":"note-b","body":"x"}}"#,
                 "\n",

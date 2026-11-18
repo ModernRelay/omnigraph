@@ -1,7 +1,5 @@
 # issue: none
-# notes: The compiler refuses an insert omitting a required property it can never keep, a key property here, with `T12`;
-# notes: nothing executes. A keyed insert omitting a required non-key property is an upsert that keeps the stored value,
-# notes: refused at run time only for a new key (issue_1278_keyed_insert_keeps_omitted_properties.gqt).
+# notes: The compiler refuses an insert omitting a required property with `T12`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -45,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- mutate
-query w() { insert Person { name: "A" } }
+query w() { insert Person { handle: "a" } }
 
 --- expect error: type error: T12:

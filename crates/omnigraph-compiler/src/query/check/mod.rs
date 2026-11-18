@@ -5028,16 +5028,8 @@ impl Ctx<'_> {
                     let assigned: HashSet<&str> =
                         assignments.iter().map(|a| a.property.as_str()).collect();
                     let mut missing = None;
-                    // A keyed insert is an upsert: on an existing key an
-                    // omitted property keeps its stored value, so only a new
-                    // key, known at run time, refuses a missing required one;
-                    // the key itself is always named.
-                    let kept_when_present = |p: &str| match &node.key {
-                        Some(key) => !key.iter().any(|k| k == p),
-                        None => false,
-                    };
                     for (p, t) in &node.properties {
-                        if kept_when_present(p) || t.nullable || assigned.contains(p.as_str()) {
+                        if t.nullable || assigned.contains(p.as_str()) {
                             continue;
                         }
                         if let Some(e) = node.embed_sources.get(p)
@@ -5125,14 +5117,7 @@ impl Ctx<'_> {
                         ));
                     }
                     for (p, t) in &edge.properties {
-                        let kept_when_present = edge
-                            .key
-                            .as_ref()
-                            .is_some_and(|key| !key.iter().any(|k| k == p));
-                        if !kept_when_present
-                            && !t.nullable
-                            && !assignments.iter().any(|a| &a.property == p)
-                        {
+                        if !t.nullable && !assignments.iter().any(|a| &a.property == p) {
                             return Err(err(
                                 T12,
                                 format!(

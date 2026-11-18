@@ -1204,9 +1204,6 @@ durable_calls! {
     // Blob live-branch recheck: lists the table's refs to prove a vanished
     // fork before the incarnation refusal; read-only access to the handle.
     ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    // A keyed upsert that omits properties reads which stored columns are
-    // Blobs before it fills the omitted cells; read-only schema access.
-    ("exec/keep_omitted.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("exec/blob_write.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
     // A delete cascade plans its edge-table reads from the edge table's index
     // coverage (`validate::RemovalEdgeReads`); read-only metadata access.
