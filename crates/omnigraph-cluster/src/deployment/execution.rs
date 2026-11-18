@@ -516,7 +516,7 @@ pub(super) fn empty_ledger() -> ClusterState {
 
 /// Initialize only an empty root; all graph effects then use the same v2
 /// deployment protocol as updates. Existing v1 state is never executed.
-async fn bootstrap_ledger(
+pub(super) async fn bootstrap_ledger(
     store: &ClusterStore,
     bundle: &DeploymentBundle,
     caller: &DeploymentCaller,
@@ -570,10 +570,8 @@ async fn bootstrap_ledger(
         .await
         .map_err(|error| retained_error(error, guard.lock_id()))?;
     // Only awaited control writes happened. No graph/native operation started.
-    store
-        .release_settled(guard.lock_id())
-        .await
-        .map_err(|error| retained_error(error, guard.lock_id()))
+    // A failed release states its own outcome; the lock may already be free.
+    store.release_settled(guard.lock_id()).await
 }
 
 async fn replace(
@@ -1721,14 +1719,16 @@ pub(super) async fn release_converged_deployment(
     admission: ClusterAdmission,
     deployment_id: &str,
 ) -> Result<(), Diagnostic> {
-    let lock_id = admission.lock_id().to_owned();
-    admission.release_after_settlement().await.map_err(|mut error| {
-        error.message = bounded_message(format!(
-            "deployment {deployment_id} converged. Could not confirm release of admission {lock_id}. Compare this ID with the current lock in cluster status --json. {}",
-            error.message
-        ));
-        error
-    })
+    admission
+        .release_after_settlement()
+        .await
+        .map_err(|mut error| {
+            error.message = bounded_message(format!(
+                "deployment {deployment_id} converged; {}",
+                error.message
+            ));
+            error
+        })
 }
 
 /// Execute under the existing sole writer. The server supplies its paused live
