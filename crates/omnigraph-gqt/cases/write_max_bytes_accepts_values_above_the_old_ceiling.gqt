@@ -1,14 +1,14 @@
 # issue: none
-# notes: `write_max_bytes` has no fixed maximum: a value above the old 33554432 ceiling is
-# notes: accepted and the write under it succeeds on embedded and served targets.
-# notes: A smaller allowance refuses a write without changing existing data.
+# notes: `write_max_bytes` has no fixed maximum on an embedded engine: a value above the
+# notes: old 33554432 ceiling is accepted and the write under it succeeds. A smaller
+# notes: allowance refuses a write without changing existing data. A served request cannot
+# notes: raise it above the server's ceiling (`data_routes::request_budgets_stop_at_the_server_ceiling`);
+# notes: `write_max_bytes.gqt` covers smaller allowances on both targets.
 
 --- runner
 timeout_ms: 10000
 environments:
   - target: omnigraph-engine
-    storage: local-filesystem
-  - target: omnigraph-server
     storage: local-filesystem
 
 --- schema

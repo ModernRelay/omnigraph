@@ -63,7 +63,7 @@ pub async fn fixture(dir: &tempfile::TempDir, sources: usize, payload_bytes: usi
             .await
             .unwrap();
     }
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     with_setting(&db, "engine", "v2")
 }
 

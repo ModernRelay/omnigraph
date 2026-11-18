@@ -30,3 +30,8 @@ workspace = true
 [features]
 # See the engine crate's `dst` feature doc (PR #527 review P1-5).
 dst = []
+# The read-through storage contract as test bodies over a caller's stores
+# (`read_through_contract`), so the local rows and the S3 rows of the engine's
+# integration tests are one text. Dev-dependency only; the name is the one the
+# engine's `forbidden_apis` scanner reads as the crate-boundary form of `cfg(test)`.
+test-util = []

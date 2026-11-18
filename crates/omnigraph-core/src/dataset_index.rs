@@ -222,6 +222,106 @@ pub async fn key_column_index_coverage(ds: &Dataset, column: &str) -> Result<Ind
     ))
 }
 
+/// The current fragments of `ds` that a `key_col IN (...)` filter reads by a
+/// filtered scan beside the BTREE, under [`key_column_index_coverage`]'s
+/// rule: `None` when Lance serves no part of the filter from a BTREE (no
+/// BTREE, another index kind on the column, unknown coverage, a fragment
+/// without `physical_rows`, or no fragment), else the widest tail one index
+/// on the column leaves uncovered. Lance plans the filter once per uncovered
+/// fragment, so `fragments` counts the copies of the IN list a probe holds.
+pub async fn key_column_uncovered_tail(
+    ds: &Dataset,
+    column: &str,
+) -> Result<Option<KeyColumnTail>> {
+    let Some(field_id) = ds.schema().field(column).map(|field| field.id) else {
+        return Ok(None);
+    };
+    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+    let Ok(tails) = key_column_tails(
+        &indices,
+        field_id,
+        column,
+        &current_fragments(ds),
+        ds.fragments()
+            .iter()
+            .all(|fragment| fragment.physical_rows.is_some()),
+    ) else {
+        return Ok(None);
+    };
+    let mut widest = KeyColumnTail {
+        fragments: 0,
+        data_file_bytes: Some(0),
+    };
+    for (_, tail) in tails {
+        let Ok(uncovered) = tail else {
+            return Ok(None);
+        };
+        let data_file_bytes = ds
+            .fragments()
+            .iter()
+            .filter(|fragment| uncovered.contains(&fragment.id))
+            .flat_map(|fragment| fragment.files.iter())
+            .try_fold(0u64, |total, file| {
+                file.file_size_bytes
+                    .get()
+                    .map(|size| total.saturating_add(size.get()))
+            });
+        widest = KeyColumnTail {
+            fragments: widest.fragments.max(uncovered.len()),
+            data_file_bytes: widest
+                .data_file_bytes
+                .zip(data_file_bytes)
+                .map(|(widest, bytes)| widest.max(bytes)),
+        };
+    }
+    Ok(Some(widest))
+}
+
+/// The current fragments of `ds` on which every index keyed on `column` is a
+/// BTREE that covers them, under [`key_column_index_coverage`]'s rule: on
+/// these Lance answers a `column IN (...)` test from the index and plans no
+/// filter, and on every other fragment it plans the filter, with its own copy
+/// of the key list. Empty when no BTREE can serve the column (none, another
+/// index kind, a segment that does not report its coverage, a fragment
+/// without `physical_rows`), since Lance then filters every fragment.
+pub async fn key_column_covered_fragments(ds: &Dataset, column: &str) -> Result<BTreeSet<u64>> {
+    let Some(field_id) = ds.schema().field(column).map(|field| field.id) else {
+        return Ok(BTreeSet::new());
+    };
+    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+    let current = current_fragments(ds);
+    let Ok(tails) = key_column_tails(
+        &indices,
+        field_id,
+        column,
+        &current,
+        ds.fragments()
+            .iter()
+            .all(|fragment| fragment.physical_rows.is_some()),
+    ) else {
+        return Ok(BTreeSet::new());
+    };
+    let mut covered = current;
+    for (_, tail) in tails {
+        let Ok(uncovered) = tail else {
+            return Ok(BTreeSet::new());
+        };
+        covered.retain(|fragment| !uncovered.contains(fragment));
+    }
+    Ok(covered)
+}
+
+/// The fragments a BTREE on a key column leaves uncovered, as
+/// [`key_column_uncovered_tail`] reports them: the largest count of such
+/// fragments one index leaves, and the largest total of their data-file
+/// sizes as the manifest records them, `None` when a file's size is not
+/// recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyColumnTail {
+    pub fragments: usize,
+    pub data_file_bytes: Option<u64>,
+}
+
 /// [`key_column_index_coverage`] over already-loaded metadata.
 pub fn key_column_coverage(
     indices: &[IndexMetadata],
@@ -230,7 +330,39 @@ pub fn key_column_coverage(
     current: &BTreeSet<u64>,
     physical_rows_known: bool,
 ) -> IndexCoverage {
-    let degraded = |reason: String| IndexCoverage::Degraded { reason };
+    match key_column_tails(indices, field_id, column, current, physical_rows_known) {
+        Err(reason) => IndexCoverage::Degraded { reason },
+        Ok(tails) => {
+            for (name, tail) in tails {
+                match tail {
+                    Err(reason) => return IndexCoverage::Degraded { reason },
+                    Ok(uncovered) if uncovered.is_empty() => {}
+                    Ok(uncovered) => {
+                        let uncovered = uncovered.len();
+                        return IndexCoverage::Degraded {
+                            reason: format!(
+                                "{uncovered} fragment(s) not covered by the index '{name}' on '{column}'"
+                            ),
+                        };
+                    }
+                }
+            }
+            IndexCoverage::Indexed
+        }
+    }
+}
+
+/// Each index keyed on `field_id`, in name order, with the current fragments
+/// it leaves uncovered or why it cannot serve the column; `Err`
+/// when no BTREE can serve it at all.
+#[allow(clippy::type_complexity)]
+fn key_column_tails<'a>(
+    indices: &'a [IndexMetadata],
+    field_id: i32,
+    column: &str,
+    current: &BTreeSet<u64>,
+    physical_rows_known: bool,
+) -> std::result::Result<Vec<(&'a str, std::result::Result<BTreeSet<u64>, String>)>, String> {
     let mut by_name = BTreeMap::<&str, Vec<&IndexMetadata>>::new();
     for index in indices
         .iter()
@@ -242,35 +374,39 @@ pub fn key_column_coverage(
         .values()
         .any(|segments| segments.iter().all(|segment| is_btree_index(segment)))
     {
-        return degraded(format!("no BTREE index on '{}'", column));
+        return Err(format!("no BTREE index on '{}'", column));
     }
     if !physical_rows_known {
-        return degraded("a fragment is missing physical_rows".to_string());
+        return Err("a fragment is missing physical_rows".to_string());
     }
     if current.is_empty() {
-        return degraded(format!("no fragment to index on '{}'", column));
+        return Err(format!("no fragment to index on '{}'", column));
     }
-    for (name, segments) in by_name {
-        if !segments.iter().all(|segment| is_btree_index(segment)) {
-            return degraded(format!("index '{}' on '{}' is not a BTREE", name, column));
-        }
-        let coverage = SegmentCoverage::of(segments, current);
-        if !coverage.known {
-            return degraded(format!(
-                "index '{}' on '{}' does not report its fragment coverage",
-                name, column
-            ));
-        }
-        if !coverage.covers_every(current) {
-            return degraded(format!(
-                "{} fragment(s) not covered by the index '{}' on '{}'",
-                current.len() - coverage.covered.len(),
+    Ok(by_name
+        .into_iter()
+        .map(|(name, segments)| {
+            if !segments.iter().all(|segment| is_btree_index(segment)) {
+                return (
+                    name,
+                    Err(format!("index '{}' on '{}' is not a BTREE", name, column)),
+                );
+            }
+            let coverage = SegmentCoverage::of(segments, current);
+            if !coverage.known {
+                return (
+                    name,
+                    Err(format!(
+                        "index '{}' on '{}' does not report its fragment coverage",
+                        name, column
+                    )),
+                );
+            }
+            (
                 name,
-                column
-            ));
-        }
-    }
-    IndexCoverage::Indexed
+                Ok(current.difference(&coverage.covered).copied().collect()),
+            )
+        })
+        .collect())
 }
 
 /// True if any non-system index on `ds` leaves at least one current
@@ -338,15 +474,22 @@ pub async fn has_fts_index_on(ds: &Dataset, column: &str) -> Result<bool> {
     }))
 }
 
+/// Whether index segment `index` covers no fragment: its fragment bitmap is
+/// present and empty, so it holds no rows. Lance uses the same test, for
+/// every index kind, when it reports a segment's statistics as an empty
+/// object. A segment without a bitmap has unknown coverage, not none.
+pub fn covers_no_fragment(index: &IndexMetadata) -> bool {
+    index
+        .fragment_bitmap
+        .as_ref()
+        .is_some_and(|bitmap| bitmap.is_empty())
+}
+
 /// Whether `index` is an untrained full-text segment: an empty fragment
 /// bitmap and no postings. It only declares a declared column's analyzer,
 /// which Lance applies to every row no segment covers, and indexes no row.
 pub fn is_untrained_full_text(index: &IndexMetadata) -> bool {
-    is_full_text_index(index)
-        && index
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(|bitmap| bitmap.is_empty())
+    is_full_text_index(index) && covers_no_fragment(index)
 }
 
 /// Whether a full-text segment on `column` holds postings: it covers a

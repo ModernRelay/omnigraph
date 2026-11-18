@@ -42,7 +42,7 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
     let uri = dir.path().to_str().unwrap();
     let db = session(Omnigraph::init(uri, SCHEMA).await.unwrap());
     db.load_jsonl(DATA, LoadMode::Overwrite).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open_dataset("node:Item").await.unwrap();
@@ -74,7 +74,7 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
     // Idempotence: a second run finds every declared index present and
     // publishes nothing (dual indexes must not re-plan as missing forever).
     let version_before = ds.published_dataset_version();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let snap2 = snapshot_main(&db).await.unwrap();
     let ds2 = snap2.open_dataset("node:Item").await.unwrap();
     assert_eq!(

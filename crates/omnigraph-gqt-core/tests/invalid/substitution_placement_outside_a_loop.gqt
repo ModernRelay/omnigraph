@@ -1,0 +1,18 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+--- seed
+{"type":"Person","data":{"name":"alice","age":1}}
+--- mutate
+query bump($n: I32) { update Person set { age: $n } where name = "alice" }
+--- params
+{"n": ${i}}
+--- expect affected: nodes=1 edges=0

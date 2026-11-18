@@ -129,17 +129,45 @@ mod tests {
         }
     }
 
+    /// `--help` offers only formats the command writes, each in plain words.
     #[test]
-    fn query_help_names_toon_in_plain_words() {
-        let error = command()
-            .try_get_matches_from(["omnigraph", "query", "--help"])
-            .expect_err("help");
-        let help = error.to_string();
+    fn read_help_names_each_format_it_writes_issue_1428() {
+        let help = |verb: &str| {
+            let error = command()
+                .try_get_matches_from(["omnigraph", verb, "--help"])
+                .expect_err("help");
+            // Normalized, so a wrapped line still matches.
+            error
+                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let query = help("query");
         assert!(
-            help.contains("Same document as json, in TOON (specification 4.4)"),
-            "{help}"
+            query.contains("Same document as json, in TOON (specification 4.4)"),
+            "{query}"
         );
-        assert!(!help.contains("Self::Json"), "{help}");
+        assert!(!query.contains("Self::Json"), "{query}");
+        assert!(
+            query.contains(
+                "arrow: The result's columns and rows as an Arrow IPC stream on stdout. \
+                 Direct targets only; refused when stdout is a terminal"
+            ),
+            "{query}"
+        );
+
+        // An alias answers a server's JSON, so it offers every other format.
+        let alias = help("alias");
+        assert!(alias.contains("- toon:"), "{alias}");
+        assert!(!alias.contains("arrow"), "{alias}");
+        let refused = parse_from(["omnigraph", "alias", "a", "--format", "arrow"]).unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::InvalidValue);
+        let parsed = parse_from(["omnigraph", "alias", "a", "--format", "toon"]).unwrap();
+        let crate::cli::Command::Alias(args) = parsed.cli.command else {
+            panic!("expected alias");
+        };
+        assert_eq!(args.format, Some(ReadOutputFormat::Toon));
     }
 
     #[test]

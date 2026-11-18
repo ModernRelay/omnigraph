@@ -175,6 +175,96 @@ precondition and the exact Lance transaction identity each pin records. A
 retryable pre-effect attempt discards all staged work, captures a new
 `WriteTxn`, and repeats boundedly; it never reuses batches against a new base.
 
+## Writer epoch
+
+A branch's writer epoch is the `writer_epoch` control-fact row of its own
+`__manifest` ([storage format v17](versioning.md)). A branch without the
+row, or with a row its fork source wrote, is at epoch 0. A process holds an
+epoch for a branch only after a claim it published landed there. The holder
+registry (`omnigraph-catalog/src/writer_epoch.rs`) is process-wide, keyed by
+root identity and branch name, and records the native ref of the claim; no
+reload raises an entry, a refusal clears it, the process's own delete of the
+branch drops it, and otherwise it ends with the process.
+
+Every publication that moves a branch's head asserts the epoch.
+`publish_attempts` runs the check on each attempt over the rows that attempt
+loaded, before `check_publish_precondition` and before the return of a
+publish that would write nothing. A mutation that stages nothing returns
+before it reaches the publisher, so the check does not refuse it; on a branch
+its process holds it probes the head before it answers (below). A process
+holding nothing proceeds on rows at epoch 0 and a process holding `E`
+proceeds on rows at `E`. Any other pair
+is refused as `WriterFenced { held, read, current }`, which is not retried
+and clears the refused entry. The check issues no request: it compares the
+loaded rows with the registry, and a process that holds no branch resolves
+no key. An entry whose native ref is not the loaded chain's is dropped, so
+what a process held on a deleted branch never counts on a branch created
+again under its name. `main` has no native ref: after a root is created
+again or restored while a process still holds its `main`, that entry is
+cleared by the first refusal it meets, and until then it counts whenever
+the root's epoch equals it.
+
+A process that holds its handle's bound branch does not probe that branch's
+head at the sites below: no other process's publication can land on it, and
+the writers the fence does not cover are listed under the
+[support boundary](invariants.md#current-support-boundaries). The holder
+entry records the `__manifest` version of the process's last publication on
+the branch, the claim included. A handle whose installed view is at or above
+that version reads and writes from the installed head with no request; a
+handle below it, one that did not run that publication, reloads first, also
+with no probe. The sites are a read that targets the branch
+(`ReadTarget::Branch`), `resolve_snapshot`, a write's open and its
+revalidation, which ask `GraphCoordinator::head_is_current`, and its probe
+beside staging, which asks `held_head`. A merge's authority capture and
+revalidation, a branch create's capture of its source and the change-feed
+poll still probe the bound branch. A publish attempt that returns an error,
+or whose future is dropped, withdraws the recorded version, and a claim
+withdraws it before its put: each may have landed, or met a head that moved,
+with no record of it. Every handle then probes as before until the process's
+next publication lands. A write that stages nothing reaches no publication,
+so when its open took the recorded version for the head it probes once
+before it answers; a head that is neither its view nor the version on record
+now is prepared again on a fresh view. A held branch that is not the handle's
+bound branch, and every branch the process holds nothing on, is probed as
+before.
+
+Two changes by another process reach the owner by no path but a probe, so
+its handle serves reads from its installed snapshot until a publish of its
+own loads the branch. After another process claims the branch, that publish
+is refused, which clears the holder; a write of the replaced owner that
+stages nothing probes and is prepared again on a fresh view. After another
+process deletes the branch, a ref delete that asserts no epoch, that publish
+finds the branch gone, or finds the branch created again under its name:
+there the entry's native ref is not the loaded chain's, so the entry is
+dropped and the publish proceeds at epoch 0. The process's own delete of a
+branch withdraws the recorded version before it retires the ref and drops the
+entry once the retire has landed, so its handles probe.
+
+`Omnigraph::claim_branch_writer_as` claims under `branch_claim` on the branch
+it names, the shared schema permit and the branch gate, through a
+coordinator it opens under those gates. The catalog's `claim_writer_epoch`
+writes the loaded rows with the row at `E + 1` and a fresh attempt id as the
+next `__manifest` version, under `PublishPrecondition::ExactBranchIdentity`:
+the branch's name and Lance-native identifier, with no head compare. A moved
+head does not refuse a claim and a branch recreated under its name does. The
+version records no graph commit and moves no head; it is the first
+publication of the control-fact kind, and a publication that changes `table`
+rows or the schema contract still requires lineage. The process that already
+holds the rows' epoch gets it back and writes nothing. A claim that loses its
+version to another publication loads again and asserts the epoch its first
+load read, so of two racing claims one holds `E + 1` and the other is refused
+with `read: E`. A put with no answer is settled from the version it
+attempted: the row carrying this claim's attempt id is the claim landed, and
+another publication there before any acknowledgement is the claim lost.
+When that version cannot be read, or holds another publication after an
+acknowledgement, the claim is in doubt, keyed by the attempt id, and holds
+nothing; the next claim settles it by landing above it.
+
+Detached candidate versions (an unpublished commit or an unattached snapshot
+before publication) carry the row and assert nothing. Writes outside the
+publisher are not fenced: Lance ref metadata and ref deletes, the collector's
+deletes, `optimize`'s configuration commit and the stamp-only upgrade route.
+
 ## Writer adapters
 
 All current graph-visible writers share the publication door but have different
@@ -217,7 +307,10 @@ since a manifest lists every fragment. `commit_all` enters the gates,
 revalidates the complete
 authority (for the handle's bound branch, the probe taken beside the staging
 puts serves when it answered current and no publish has installed on the
-handle since; for another branch, the captured manifest probe first: an
+handle since, and a process that holds the branch's
+[writer epoch](#writer-epoch) with its last publication on record probes
+nowhere; for another branch, the
+captured manifest probe first: an
 unchanged version and branch identifier keep the captured authority, a
 mismatch is a fresh coherent capture), and commits
 every participant as a detached version of its pinned
@@ -250,9 +343,9 @@ ever reached (`1` for a table created under v11), and every writer that
 rebuilds the row copies it forward (`TableVersionMetadata`,
 `crates/omnigraph-core/src/metadata.rs`). A writer whose captured snapshot predates another
 publication loses the CAS and reprepares (`ReadSetChanged`). Existing-table
-writes do not read linear HEAD; `repair` reports a foreign linear commit above
-`omnigraph.last_linear_version` as `foreign_drift`
-(`repair.rs`, `judge_against_last_linear_version`). Added-type admission can
+writes do not read linear HEAD; the collector lists a foreign linear commit
+above `omnigraph.last_linear_version` under `foreign_versions`
+(`collector.rs`, `foreign_versions`). Added-type admission can
 inspect an unregistered deterministic path's HEAD only to prove it remains
 its qualified original empty version 1; it never adopts an advanced HEAD.
 
@@ -265,22 +358,143 @@ still does, or when no `__manifest` version ever named it and the authority
 its transaction properties record is provably gone. Nothing defers a table's
 collection; see [Maintenance](../user/operations/maintenance.md#cleanup).
 
-Optimize plans each table's compaction from its pin
+Optimize plans each table's compaction once, from its pin
 (`TableStore::plan_table_compaction`): Lance's plan, plus a task of its own
 for every other fragment whose data or overlay files still list a field id the
-schema lacks, the values of a dropped column. The rewrite scans the current
-schema only, so its files hold no dropped value; this is how a drop is erased,
-deterministically, whatever Lance's size and deletion heuristics select. It
-stages the rewrite detached with fragment ids above the base's high-water
-mark, so it needs no `ReserveFragments`; a lagging scalar or vector index is
-rebuilt whole as a detached commit chained on the rewrite under its name
-(Lance 13 folds only through a linear commit), keeping a vector index's
-partition count; the batch publishes once with an exact CAS on every planned
-pin, and a pin a concurrent writer moved fails the run with a read-set
+schema lacks, the values of a dropped column. That plan is measured against
+the run's ceilings and handed to `stage_compaction`, which refuses a plan of
+another version. The rewrite scans the current schema only, so its files hold
+no dropped value; this is how a drop is erased, deterministically, whatever
+Lance's size and deletion heuristics select. It stages the rewrite detached
+with fragment ids above the base's high-water mark, so it needs no
+`ReserveFragments`; a lagging scalar or vector index is rebuilt whole as a
+detached commit chained on the rewrite under its name (Lance 13 folds only
+through a linear commit). A vector index keeps its partition count unless its
+segments cover no fragments, in which case it uses one partition, as a new
+declared index does. A declared index the table lacks is built as a third
+link. A definite index failure leaves completed links eligible for the batch
+publication, including an index build whose final coverage read failed. The
+table reports `optimized` with reason `index_failed` when it has a committed
+link. A definite failure before the first link commits fails the table.
+Uncertain effects fail the run. The batch publishes once with an exact CAS on
+every planned pin, and a pin a concurrent writer moved fails the run with a read-set
 conflict so the next run re-plans. A failure before publication leaves
-unpublished staging the collector reclaims once it is dead. A strict mutation
-prepared before Optimize's publication reports the same read-set conflict as
-it would after any other writer.
+unpublished staging the collector reclaims once it is dead.
+
+A mutation, load or Blob write prepared before such a publication is carried
+over it ([RFC](../rfcs/2026-11-10-writes-carried-over-row-preserving-publications.md)).
+Under its gates, when the head moved, `revalidate_write_txn_carrying` checks
+that the schema contract, the table set and every registration's identity,
+location, native ref and row count are unchanged, and that every moved pin
+reaches the captured one through `Rewrite` and `CreateIndex` commits alone
+(`table_store::row_preserving_chain`, at most
+`ROW_PRESERVING_CHAIN_MAX_LINKS` per table). The write is then re-anchored on
+the current head before any effect. A table it only read keeps its moved pin;
+a staged table goes through Lance's `TransactionRebase` over those commits
+(`table_store::rebase_staged_write`), records the current pin as its read
+version, and commits detached there, so the compaction stays and the table's
+history stays one chain. An insert, an append and an overwrite carry; an
+update, delete or upsert of a row in a fragment a rewrite replaced is a
+conflict Lance reports, and the attempt is sent back, as one overtaken by a
+row change is. So is one whose chain cannot be read: the links before a
+table's pinned tip are named by no `__manifest` version, and a `cleanup`
+between the write's capture and its gates deletes them, which is an
+unreadable chain and not a storage fault. A caller's `--if-commit` head and
+an unattached base are not
+carried. On a branch its process does not hold, neither is a publication by
+another handle that lands after the beside-staging probe: the publisher's CAS
+refuses that one, as above. On a branch the process holds, a write takes no
+probe, and a publication by any handle of the process is seen under the gates
+([writer epoch](#writer-epoch)), so it is carried.
+`QueryIoProbes::writes_carried_over_row_preserving` counts the attempts
+carried, each staged table rebased.
+
+A write sent back before its effects prepares again from its request,
+whatever its kind: it reruns its query, or rereads its input, on the current
+head, so an update or delete reads its rows as they are when it publishes,
+the write a caller resubmitting the request would make. A caller whose write
+must apply to the head it read names it (`--if-commit`), and a moved head is
+then a terminal `PreconditionFailed`. An attempt that sees a branch
+incarnation or accepted schema other than its write's first attempt saw
+returns `ReadSetChanged` for that member (`WriteAttempt::admit`): the request
+no longer means what it meant. The next attempt holds the branch's writer
+gates, the shared schema permit and the branch gate, from its
+capture through its publication (`db::reprepare::PreEffectReprepares`, the
+one owner of the mutation, load and Blob write loops). Every publisher on the
+branch in the process, optimize included, takes that branch gate, so nothing
+moves the branch under that attempt: a write finishes in at most two
+attempts, whatever sent it back and however often other writers or
+maintenance run, and no
+maintenance run waits for writers to get there. Preparation takes no gate
+of its own, which is what lets it run under them, since the gates are not
+reentrant; `commit_all` adds the table gates. The engine checks the rule:
+every attempt runs inside a preparation scope (`db::write_queue::preparing`,
+a task-local) that its commit point ends, and every writer-gate acquisition
+inside it refuses with an internal error instead of waiting on the attempt's
+own gate. `WriteAttempt::admit` refuses an attempt prepared outside the scope.
+The bound is the process's: another process's publication is refused
+by the publisher's CAS and prepares the write again, within
+`MAX_PRE_EFFECT_REPREPARES` (32).
+
+The gated attempt costs other writers more than its own branch. Writers on the
+branch wait for its one preparation. The shared schema permit it holds also
+makes a branch create, a schema apply or a system-column upgrade wait, since
+each takes the permit exclusively, and the schema gate is fair: while such a
+request waits, new shared requests wait behind it, so writers on every branch
+wait too. Each wait lasts one preparation, as a branch merge's planning under
+the same permit already does. For a large merge load on object storage that
+can be seconds.
+
+Optimize captures its write authority before it takes the shared schema,
+main-branch and table gates, and rechecks it under them. On the direct path
+(`AuthorityCapture::BeforeGates`, the default) a head that moved while the
+run waited refuses the run: outside a serving process no gate fences the
+writer that moved it. A served run (`AuthorityCapture::UnderGates`) captures
+its complete authority again under the held gates instead, because writers in
+the same process move main while a run waits and none can move it while the
+gates are held, so that capture is the attempt's one authority and never a
+mix of the two. Every refusal before the first table's staging, this one
+included, carries `CompletionEvidence::BeforeEffect`; a policy denial keeps
+its typed shape, as at every `_as` door.
+
+A run with `max_gate_hold` defers every table whose turn comes after the
+deadline, measured from gate acquisition, and publishes the tables it finished
+(`run_table_pipeline`). A table whose own planning or staging fails with
+definite evidence is reported `failed` and the others still publish; a
+failure whose evidence stays uncertain fails the run. A cancellation
+(`OptimizeRequest::with_cancellation`) is checked before every table's plan
+and rewrite and before the publication: it drops the tables in progress,
+defers every table as `cancelled` and publishes nothing; one that arrives
+after the last check lets the run finish, and the artifact refresh stops
+before its write, or, if the write had already started, completes.
+Per-table ceilings (`TableCeilings`) are measured from the table's compaction
+plan before its first write, fragments first, and only when set: rows from
+fragment metadata, bytes from recorded data-file sizes or a HEAD resolved by
+the collector's base rule (`collector::data_file_location`,
+`deletion_file_location`; Lance 13 records no deletion-file size), managed Blob
+bytes from the descriptor scan compaction sizing uses, and the table's rows
+when an index would be rebuilt or built. A table over one, or one whose size
+cannot be read, is `deferred(resource_limit)` with nothing written. The run
+byte budget (`run_source_bytes`, also the default table byte ceiling) defers
+the first table that would pass it, and every later one, as `byte_budget`.
+With `artifact_bytes`, the adjacency artifact is bounded twice: before the
+edge scan by a lower bound (`persist::fixed_bytes` at the shortest header plus
+8 bytes per live edge row), and during it by `GraphIndex::build_counted`, which
+reads one batch at a time, adds each batch's growth of the object to
+`persist::ArtifactCount` (from the widest header), and stops before keeping
+another batch or allocating the adjacency arrays. Either stop is
+`skipped(size_limit)` and writes nothing. The artifact write runs in a spawned
+task the run awaits, so a dropped run cannot drop an issued write on the
+mutable key. A caller's before-publish hook
+(`OptimizeRequest::with_before_publish`) belongs to the shared publication
+helper, `table_ops::commit_updates_on_branch_with_expected`: it runs once,
+after the updates are prepared and before the coordinator lock and the
+publisher's first attempt, with the lineage intent's nonce and the captured
+head. Its failure publishes nothing and is `Unpublished`. The helper's other
+callers pass no hook. The hook runs under every writer gate and has no bound
+of its own, so it is part of the publication in the writer wait a bounded run
+promises: `max_gate_hold`, plus one table's rewrite, plus the publication with
+its hook, plus the configuration clear.
 
 The index writer (`ensure_indices`, which `omnigraph index build` runs on any
 branch, and the explicit full-text rebuild) follows the same protocol: it
@@ -461,7 +675,22 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
 
 - strict insert probes the pinned parent and returns `KeyConflict` for an
   existing ID;
-- upsert updates or inserts without changing modes on retry;
+- upsert updates or inserts without changing modes on retry. With an id
+  BTREE it first runs the strict insert's exact-id probe, while the fragments
+  the BTREE leaves uncovered times the source ids stay within one keyed batch
+  (8,192), since Lance plans the probe's `IN` list once per uncovered
+  fragment. Rows all new stage through the absence-proven insert writer; rows
+  all present stage as a known-present update only while the BTREE covers
+  more fragments than it leaves and those uncovered fragments' recorded
+  data-file sizes are known and total at most 1 MiB
+  (`KNOWN_PRESENT_TAIL_MAX_BYTES`): that indexed merge scans each uncovered
+  fragment for every source column (Lance 13), so the fragment rule bounds
+  its requests and the byte budget bounds its bytes whatever the row width.
+  Otherwise the upsert takes Lance's full-table merge join
+  (`use_index(false)`), which builds the inserted-row key filter;
+- an `update` whose predicate has `<key> = v` on a single String `@key` adds
+  the derived `id = v` conjunct to its match scan when the table has an id
+  BTREE, as a node delete does, so the scan reads the index;
 - a bare Lance Append is not a production graph-table write;
 - one table's keyed input is bounded to 8,192 rows and the effective
   `write_max_bytes` (default 32 MiB) before its data is staged.
@@ -503,7 +732,17 @@ id scan also returns each matched row's address at the table's pin, and
 `stage_all` writes the deletion vectors for exactly those rows
 (`TableStore::stage_delete_rows`, Lance's `DeleteBuilder` after its scan), so
 a deleted table is scanned once; addresses from another version than the
-reopened pin take Lance's scanning delete. A node delete whose predicate has
+reopened pin take Lance's scanning delete. A node removal reads each edge
+table that references the type for the edges touching its removed ids (the
+delete cascade, and the retained-edge check of an Overwrite, `load csv` or a
+merge) through `validate::RemovalEdgeReads`. Lance gives every fragment that
+no index answers a pushed filter on its own copy of the filter, built before
+the scan reads. So the plan pushes the ids to every fragment, 8,192 per
+filter, only when a BTREE on each probed endpoint covers the table, or when
+one filter holds every id and the uncovered fragments times those ids stay at
+most 8,192; otherwise it probes the covered fragments and reads the uncovered
+ones once, whole, matching their rows against the removed ids in memory
+(#1442). A node delete whose predicate has
 a `<key> = v` conjunct on the type's single String `@key` also filters on the
 derived id when the pinned table has an id BTREE, as the read planner's key
 narrowing does. Mutation validation reads the write's pinned base through the
@@ -685,14 +924,16 @@ carried stored external reference the policy refuses fails as
 | Observation | Outcome |
 |---|---|
 | Parse, validation, policy, limit, or authority failure before effects | Typed error; no graph movement |
-| Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
-| Strict read-set movement | `ReadSetChanged` |
+| Authority movement before effects through publications that changed no row (optimize, index builds) | Carry the attempt over them: re-anchor on the current head, rebase each moved staged table with Lance's resolver; when Lance refuses a table, send the attempt back |
+| Any other authority movement before effects | Discard the complete attempt and prepare again from the request under the writer gates, whatever the write's kind, boundedly |
+| A later attempt sees another branch incarnation or accepted schema than the first, or the bound is reached | `ReadSetChanged` |
+| A publish or a claim on a branch whose writer epoch is not the one its process asserts | `WriterFenced { held, read, current }` before the manifest put; never retried; the process's holder for the branch is cleared, and a publish's detached staging stays unpublished for the collector |
 | Exact duplicate on strict insert | `KeyConflict` |
-| Mutation, load, Blob write or merge fails before publication, after detached effects | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob and merge writers mark the steps between, so a server does not treat that logical error as uncertain; native storage settlement is checked independently, and a typed refusal keeps its shape |
+| Mutation, load, Blob write, merge or optimize fails before publication, after detached effects | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob, merge and optimize writers mark the steps between (an optimize table's own failure, `BeforeEffect` in planning and `Unpublished` in staging, fails only that table), so a server does not treat that logical error as uncertain; native storage settlement is checked independently, and a typed refusal keeps its shape |
 | A manifest request no re-issue settles | The write is reported in doubt and nothing records it. The version is created only if absent, so the request lands before the branch's next publication or never: that publication either loads it as the head and builds on it, or takes the version first, after which the late request fails its precondition (a race between the two is the ordinary version-CAS retry). The attempt's detached effects stay unreachable unless it lands, and the collector keeps them while their recorded publication authority is current |
 | The publisher fails | Every publisher failure carries its evidence. Its reads, preparation and history archiving, and a manifest request that was never sent (a failed transaction-file put precedes it) or that the store refused outright, are `Unpublished`. A manifest request with an ambiguous answer is re-issued unchanged by the dataset's commit handler until the store answers it; Lance reads a held version back by its transaction. Lance deletes the attempt's transaction file only on a missing version the commit's own request record calls definitive, so a request that may still land keeps the file its manifest would name. A version that may hold the commit after that is read back, and only an outcome the read-back cannot settle is reported in doubt |
 | Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
-| A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
+| A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it and nothing adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions`, which `cleanup` reports per table |
 | A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |
 | `commit publish` of an unpublished commit whose target head moved past its captured parent, or whose target incarnation is retired | `PreconditionFailed` naming the captured parent and the current head, or not found; the proposal stays retained until `cleanup` releases its expired tag |
 | `commit publish` or `commit drop` of a published commit id | Publish answers the established published commit; drop is a conflict |
@@ -716,6 +957,13 @@ gate in the engine. The trusted server resolves the actor; direct embedded
 callers must pass one when a policy checker is installed. Actor attribution
 travels with the pre-minted graph lineage and is published with the same
 manifest CAS.
+
+Maintenance has no actor-less public form. `optimize_as`, `ensure_indices_as`,
+`ensure_indices_on_as` and `rebuild_full_text_indices_on_as` check `maintain`
+on the branch they maintain, `main` for optimize. `cleanup_as` checks `reclaim`
+with no branch.
+`forbidden_apis.rs::maintenance_entry_points_take_an_actor` keeps every
+registered maintenance surface an `_as` form with an `actor` parameter.
 
 Bearer authentication (`401 unauthorized`), the HTTP contract check
 (`400 api_contract_mismatch`) and policy (`403 forbidden`) refuse a served

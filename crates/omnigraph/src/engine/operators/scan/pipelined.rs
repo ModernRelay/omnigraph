@@ -94,8 +94,9 @@ impl ScanExec {
 /// gather under one charge until they reach the session's batch rows (or the
 /// `gather_rows` of a `Limit` over the scan) or the byte target and leave as
 /// one batch: Lance yields a batch per fragment, and a per-batch consumer (a
-/// traversal's index lookup) would otherwise pay once per fragment. `marked` scans record the runtime-filter counters,
-/// unfiltered reads too.
+/// traversal's index lookup) would otherwise pay once per fragment. On an
+/// unmarked read with no pushed filter, `gather_rows` is also Lance's limit.
+/// `marked` scans record the runtime-filter counters, unfiltered reads too.
 async fn stream_batches(
     read: NodeRead<'_>,
     filter: Option<&RuntimeFilter>,
@@ -110,8 +111,22 @@ async fn stream_batches(
         return Ok(());
     }
     let bytes = memory.batch_bytes();
+    // A `Limit` over an unfiltered, unsieved read also reaches Lance: with no
+    // filter and no ordering it plans only the fragments that hold the first
+    // live rows, from the manifest's counts, instead of opening up to its
+    // `fragment_readahead` fragments before the engine drops the stream. A
+    // pushed or runtime filter keeps the early stop alone (Lance pushes no
+    // limit through a filter, and the sieve runs after Lance).
+    let lance_limit = gather_rows
+        .filter(|_| filter.is_none() && !marked && read.reads_every_row())
+        .map(|rows| i64::try_from(rows).unwrap_or(i64::MAX));
     let plan = read
-        .plan(Some((lance_batch_rows(bytes), bytes)), |_| Ok(()))
+        .plan(Some((lance_batch_rows(bytes), bytes)), |scanner| {
+            if let Some(rows) = lance_limit {
+                scanner.limit(rows)?;
+            }
+            Ok(())
+        })
         .await
         .map_err(external)?;
     let (_plan, mut stream) = memory.stream(plan)?;

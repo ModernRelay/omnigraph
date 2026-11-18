@@ -347,7 +347,7 @@ pub async fn init_and_load_at(uri: &str, schema: &str) -> Session {
     db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
     // Mutation/load publish only exact data effects; physical indexes are
     // reconciled separately as derived state.
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db
 }
 

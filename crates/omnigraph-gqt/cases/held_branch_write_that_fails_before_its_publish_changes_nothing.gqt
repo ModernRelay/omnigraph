@@ -1,0 +1,52 @@
+# issue: none
+# notes: On a branch its process holds, a write that fails after its table commits and before it reaches the publisher
+# notes: publishes nothing: the owner reads the rows from before it, and its next write lands and is read back.
+# writer: held
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- seam
+at: mutation.post_finalize_pre_publisher
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+query add_bob() { insert Person { name: "bob" } }
+--- expect error: injected failpoint triggered: mutation.post_finalize_pre_publisher
+
+--- query
+query failed_write_is_not_read() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+--- expect shape
+p.name: String
+
+--- mutate
+query remove_nobody() { delete Person where name = "nobody" }
+--- expect affected: nodes=0 edges=0
+
+--- mutate
+query add_carol() { insert Person { name: "carol" } }
+--- expect affected: nodes=1 edges=0
+
+--- query
+query next_write_is_read() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"carol"}
+--- expect shape
+p.name: String

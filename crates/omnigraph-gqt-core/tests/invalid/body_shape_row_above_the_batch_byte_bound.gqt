@@ -1,0 +1,26 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+--- schema
+node Document {
+    name: String @key
+    body: Blob?
+}
+--- seed generate: v1 seed: 7
+tables:
+  - kind: node
+    name: Document
+    rows: 1
+    commits: 1
+    columns:
+      name: {kind: key, prefix: doc-, width: 2}
+      body: {kind: blob, byte: 0, length: 16777216}
+--- query
+query all() { match { $d: Document } return { $d.name } }
+--- expect unordered
+{"d.name":"doc-00"}
+--- expect shape
+d.name: String

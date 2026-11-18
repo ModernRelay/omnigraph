@@ -2505,33 +2505,6 @@ async fn _compile_compact_files_signature() -> lance::Result<()> {
     Ok(())
 }
 
-// --- Guard 7b: transaction history exposes repair's classification surface -
-//
-// `db/omnigraph/repair.rs` reads Lance transactions between manifest and HEAD
-// and treats only `ReserveFragments` + `Rewrite` as safe maintenance drift.
-// Compile-only.
-
-#[allow(
-    dead_code,
-    unreachable_code,
-    unused_variables,
-    unused_mut,
-    clippy::diverging_sub_expression
-)]
-async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()> {
-    let ds: Dataset = unimplemented!();
-    let tx = ds.read_transaction_by_version(1u64).await?;
-    if let Some(tx) = tx {
-        let operation = tx.operation;
-        let _name: &str = operation.name();
-        match operation {
-            Operation::Rewrite { .. } | Operation::ReserveFragments { .. } => {}
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 // --- Guard 8: DeleteBuilder::execute_uncommitted returns
 //     UncommittedDelete { transaction, affected_rows, num_deleted_rows } ---
 //
@@ -7575,6 +7548,209 @@ async fn rfc_0067_create_index_keeps_every_fragment_of_its_read_version() {
     assert_eq!(rfc0067_ids(&rebuilt).await, parent_ids, "rows unchanged");
 }
 
+/// The Lance rules a write carried over a row-preserving publication relies
+/// on (RFC 2026-11-10-writes-carried-over-row-preserving-publications,
+/// `table_store::rebase_staged_write`): `TransactionRebase` carries an append
+/// staged on a version over a compaction `Rewrite` of that version unchanged,
+/// and the append committed detached on the compacted version keeps the
+/// compaction, every row and unique row ids; a delete staged on the same
+/// version whose fragment the rewrite replaced is a retryable conflict. Red
+/// when Lance changes either rule: the carry then needs a design review.
+#[tokio::test]
+async fn transaction_rebase_carries_an_append_over_a_rewrite_and_refuses_an_overlapping_delete() {
+    use lance::dataset::DeleteBuilder;
+    use lance::io::commit::conflict_resolver::TransactionRebase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let v1 = rfc0067_create(uri).await;
+    let v2 = rfc0067_append(v1, &["b1"]).await;
+    let base = rfc0067_append(v2, &["c1"]).await;
+    assert_eq!(base.get_fragments().len(), 3, "three fragments to compact");
+
+    let append = rfc0067_staged_append(&base, &["d1"]).await;
+    let delete = DeleteBuilder::new(Arc::new(base.clone()), "id = 'a1'")
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+    let mut compacted = base.clone();
+    compact_files(&mut compacted, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(compacted.get_fragments().len(), 1, "the rewrite compacted");
+    let rewrite = compacted.read_transaction().await.unwrap().unwrap();
+    assert!(
+        matches!(rewrite.operation, Operation::Rewrite { .. }),
+        "compaction commits a Rewrite: {:?}",
+        rewrite.operation
+    );
+    assert_eq!(rewrite.read_version, base.version().version);
+    let rewrite_version = compacted.version().version;
+
+    let mut rebase = TransactionRebase::try_new(&base, append, None)
+        .await
+        .unwrap();
+    rebase.check_txn(&rewrite, rewrite_version).unwrap();
+    let mut carried = rebase.finish(&compacted).await.unwrap();
+    carried.read_version = rewrite_version;
+    let committed = CommitBuilder::new(Arc::new(compacted.clone()))
+        .with_detached(true)
+        .with_skip_auto_cleanup(true)
+        .execute(carried)
+        .await
+        .unwrap();
+    let committed = rfc0067_pinned(uri, committed.version().version).await;
+    assert_eq!(
+        committed
+            .read_transaction()
+            .await
+            .unwrap()
+            .unwrap()
+            .read_version,
+        rewrite_version,
+        "the carried append reads the compacted version"
+    );
+    assert_eq!(
+        committed.get_fragments().len(),
+        2,
+        "the compacted fragment and the append's own: the compaction stays"
+    );
+    assert_eq!(
+        rfc0067_ids(&committed).await,
+        vec!["a1", "a2", "b1", "c1", "d1"],
+        "every row, once"
+    );
+    let mut scanner = committed.scan();
+    scanner.with_row_id().project(&["id"]).unwrap();
+    let row_ids: Vec<u64> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("_rowid")
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(
+        row_ids.iter().collect::<HashSet<_>>().len(),
+        row_ids.len(),
+        "the appended row takes a fresh stable row id"
+    );
+
+    let mut rebase =
+        TransactionRebase::try_new(&base, delete.transaction, delete.affected_rows.as_ref())
+            .await
+            .unwrap();
+    let refused = rebase.check_txn(&rewrite, rewrite_version).unwrap_err();
+    assert!(
+        matches!(refused, lance::Error::RetryableCommitConflict { .. }),
+        "a delete of a rewritten fragment is a retryable conflict: {refused}"
+    );
+}
+
+/// The same carry for the operations the engine stages most: a keyed
+/// `merge_insert` (`Operation::Update`) and a load overwrite. Over a
+/// compaction `Rewrite` of the version they were staged on, `TransactionRebase`
+/// carries the insert of a new key and the overwrite, and refuses the upsert
+/// of a row whose fragment the rewrite replaced as a retryable conflict; the
+/// engine then prepares that write again under the writer gates. Red when
+/// Lance changes any of the three rules.
+#[tokio::test]
+async fn transaction_rebase_carries_keyed_inserts_and_overwrites_over_a_rewrite_and_refuses_an_overlapping_upsert()
+ {
+    use lance::io::commit::conflict_resolver::TransactionRebase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let v1 = rfc0067_create(uri).await;
+    let v2 = rfc0067_append(v1, &["b1"]).await;
+    let base = rfc0067_append(v2, &["c1"]).await;
+    let base_arc = Arc::new(base.clone());
+
+    let new_key = stage_pk_merge(
+        Arc::clone(&base_arc),
+        rfc0067_batch(&["e1"]),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    let upsert = stage_pk_merge(
+        Arc::clone(&base_arc),
+        rfc0067_batch(&["b1"]),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    assert!(
+        matches!(upsert.transaction.operation, Operation::Update { .. }),
+        "a keyed write stages an Update: {:?}",
+        upsert.transaction.operation
+    );
+    let overwrite = InsertBuilder::new(Arc::clone(&base_arc))
+        .with_params(&WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![rfc0067_batch(&["z1"])])
+        .await
+        .unwrap();
+
+    let mut compacted = base.clone();
+    compact_files(&mut compacted, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        compacted.get_fragments().len(),
+        1,
+        "every fragment rewritten"
+    );
+    let rewrite = compacted.read_transaction().await.unwrap().unwrap();
+    assert!(matches!(rewrite.operation, Operation::Rewrite { .. }));
+    let rewrite_version = compacted.version().version;
+
+    let mut rebase =
+        TransactionRebase::try_new(&base, new_key.transaction, new_key.affected_rows.as_ref())
+            .await
+            .unwrap();
+    rebase
+        .check_txn(&rewrite, rewrite_version)
+        .expect("the insert of a new key carries over the rewrite");
+    rebase.finish(&compacted).await.unwrap();
+
+    let mut rebase = TransactionRebase::try_new(&base, overwrite, None)
+        .await
+        .unwrap();
+    rebase
+        .check_txn(&rewrite, rewrite_version)
+        .expect("an overwrite carries over the rewrite");
+    rebase.finish(&compacted).await.unwrap();
+
+    let mut rebase =
+        TransactionRebase::try_new(&base, upsert.transaction, upsert.affected_rows.as_ref())
+            .await
+            .unwrap();
+    let refused = rebase.check_txn(&rewrite, rewrite_version).unwrap_err();
+    assert!(
+        matches!(refused, lance::Error::RetryableCommitConflict { .. }),
+        "an upsert of a rewritten row is a retryable conflict: {refused}"
+    );
+}
+
 /// RFC 0067 §Promotion: replaying the transaction recorded in a detached
 /// manifest linearly at its base lands an identical twin: same uuid, same
 /// fragment ids, same rows, and the linear row stamps the change feed and
@@ -9093,8 +9269,12 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
         );
     }
 
-    let stats = db.optimize().await.unwrap();
+    let stats = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     let person = stats
+        .datasets
         .iter()
         .find(|stat| stat.type_key == "node:Person")
         .expect("optimize reports the Person table");
@@ -9557,5 +9737,101 @@ async fn column_patch_keeps_blob_files_row_ids_and_key_index_coverage_issue_1264
             vec![(id.clone(), expected)],
             "{id}: the kept index finds the row once, with its patched value"
         );
+    }
+}
+
+// --- Guard: an untrainable vector column is `Error::Unprocessable` ---------
+//
+// `TableStore::stage_index_fold` rebuilds a lagging vector index
+// whole and skips, as pending index work, exactly the column Lance cannot
+// train: it matches the typed `lance::Error::Unprocessable` of the uncommitted
+// build and treats every other failure as an error, so a storage fault during
+// a rebuild is never reported as a column that "cannot train". Lance 13 raises
+// `Unprocessable` only from vector training (`train_kmeans` and the PQ
+// trainers), when the finite, non-null vectors are fewer than the centroids to
+// train; a column whose vectors are all null or all non-finite has none. A
+// column with at least one such vector builds, even with fewer vectors than
+// partitions. When this goes red the variant or the training rule moved:
+// re-derive the fold's skip from the new one before changing the test.
+#[tokio::test]
+async fn vector_index_build_without_trainable_vectors_is_unprocessable_lance_13() {
+    use arrow_array::{BooleanArray, FixedSizeListArray, Float32Array};
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    const DIMENSION: usize = 4;
+    const ROWS: usize = 8;
+
+    /// A nullable vector column whose first `valid` rows are non-null and
+    /// hold `value` in every component.
+    async fn vector_dataset(uri: &str, valid: usize, value: f32) -> Dataset {
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(item.clone(), DIMENSION as i32),
+                true,
+            ),
+        ]));
+        let validity = BooleanArray::from((0..ROWS).map(|row| row < valid).collect::<Vec<_>>());
+        let vectors = FixedSizeListArray::new(
+            item,
+            DIMENSION as i32,
+            Arc::new(Float32Array::from(vec![value; ROWS * DIMENSION])),
+            Some(validity.values().clone().into()),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    for (name, valid, value, partitions, trainable) in [
+        ("every vector null", 0, 1.0, 1, false),
+        ("every vector non-finite", ROWS, f32::NAN, 1, false),
+        ("one vector", 1, 1.0, 1, true),
+        ("fewer vectors than partitions", 3, 1.0, 4, true),
+    ] {
+        let uri = format!(
+            "{}/{}.lance",
+            dir.path().to_str().unwrap(),
+            name.replace(' ', "_")
+        );
+        let mut ds = vector_dataset(&uri, valid, value).await;
+        let params = VectorIndexParams::ivf_flat(partitions, MetricType::L2);
+        let built = ds
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("vector_idx".to_string())
+            .replace(true)
+            .execute_uncommitted()
+            .await;
+        match built {
+            Ok(_) => assert!(trainable, "{name}: Lance built an index it cannot train"),
+            Err(error) => {
+                assert!(!trainable, "{name}: {error}");
+                assert!(
+                    matches!(error, lance::Error::Unprocessable { .. }),
+                    "{name}: an untrainable column must surface as Unprocessable: {error:?}"
+                );
+            }
+        }
     }
 }

@@ -4501,6 +4501,11 @@ rules:
       actors: { group: slots }
       actions: [branch_create]
       target_branch_scope: unprotected
+  - id: maintain-protected
+    allow:
+      actors: { group: slots }
+      actions: [maintain]
+      branch_scope: protected
 "#,
     )
     .unwrap();
@@ -4516,7 +4521,7 @@ rules:
     for (query, actions) in [
         (
             "?branch=main&target_branch=feature",
-            json!(["schema_apply", "branch_create"]),
+            json!(["maintain", "schema_apply", "branch_create"]),
         ),
         (
             "?branch=feature&target_branch=main",
@@ -4566,7 +4571,8 @@ rules:
             "branch_merge",
             "commit_publish",
             "commit_drop",
-            "invoke_query"
+            "invoke_query",
+            "maintain"
         ])
     );
     assert_eq!(
@@ -4575,6 +4581,7 @@ rules:
             "read",
             "export",
             "change",
+            "maintain",
             "schema_apply",
             "branch_delete",
             "commit_publish",

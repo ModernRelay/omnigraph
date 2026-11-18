@@ -1,0 +1,141 @@
+# issue: none
+# notes: An outer `order` without `limit` holds its whole input under the query pool and sorts
+# notes: once (no spill), so a budget under the held input's cost refuses the query naming
+# notes: `query_memory_bytes` and a budget above it returns every row; with a `limit` the sort is a
+# notes: streaming top-k holding one batch and `limit` rows, so the same rows fit at a budget the
+# notes: held sort refuses. 64 rows with a 1 KiB key: refused at 262144 bytes, every row
+# notes: at 4194304, the top five at 262144.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item {
+    id: String @key
+    v: I64
+}
+
+--- seed
+{"type":"Item","data":{"id":"a","v":-100}}
+
+--- load generate: v1 seed: 3 mode: append
+tables:
+  - kind: node
+    name: Item
+    rows: 64
+    commits: 4
+    batch_rows: 16
+    columns:
+      id: {kind: key, prefix: kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk, width: 6}
+      v: {kind: ordinal, start: 0, step: 1}
+--- expect ok
+
+--- query
+set query_memory_bytes = 262144;
+query held_sort_refused() {
+    match { $i: Item }
+    return { $i.v }
+    order { $i.id desc }
+}
+
+--- expect error: resource limit exceeded for query_memory_bytes
+
+--- query
+set query_memory_bytes = 4194304;
+query held_sort_fits() {
+    match { $i: Item }
+    return { $i.v }
+    order { $i.id desc }
+}
+
+--- expect ordered
+{"i.v": 63}
+{"i.v": 62}
+{"i.v": 61}
+{"i.v": 60}
+{"i.v": 59}
+{"i.v": 58}
+{"i.v": 57}
+{"i.v": 56}
+{"i.v": 55}
+{"i.v": 54}
+{"i.v": 53}
+{"i.v": 52}
+{"i.v": 51}
+{"i.v": 50}
+{"i.v": 49}
+{"i.v": 48}
+{"i.v": 47}
+{"i.v": 46}
+{"i.v": 45}
+{"i.v": 44}
+{"i.v": 43}
+{"i.v": 42}
+{"i.v": 41}
+{"i.v": 40}
+{"i.v": 39}
+{"i.v": 38}
+{"i.v": 37}
+{"i.v": 36}
+{"i.v": 35}
+{"i.v": 34}
+{"i.v": 33}
+{"i.v": 32}
+{"i.v": 31}
+{"i.v": 30}
+{"i.v": 29}
+{"i.v": 28}
+{"i.v": 27}
+{"i.v": 26}
+{"i.v": 25}
+{"i.v": 24}
+{"i.v": 23}
+{"i.v": 22}
+{"i.v": 21}
+{"i.v": 20}
+{"i.v": 19}
+{"i.v": 18}
+{"i.v": 17}
+{"i.v": 16}
+{"i.v": 15}
+{"i.v": 14}
+{"i.v": 13}
+{"i.v": 12}
+{"i.v": 11}
+{"i.v": 10}
+{"i.v": 9}
+{"i.v": 8}
+{"i.v": 7}
+{"i.v": 6}
+{"i.v": 5}
+{"i.v": 4}
+{"i.v": 3}
+{"i.v": 2}
+{"i.v": 1}
+{"i.v": 0}
+{"i.v": -100}
+
+--- expect shape
+i.v: I64
+
+--- query
+set query_memory_bytes = 262144;
+query top_k_fits_where_the_held_sort_refused() {
+    match { $i: Item }
+    return { $i.v }
+    order { $i.id desc }
+    limit 5
+}
+
+--- expect ordered
+{"i.v": 63}
+{"i.v": 62}
+{"i.v": 61}
+{"i.v": 60}
+{"i.v": 59}
+
+--- expect shape
+i.v: I64

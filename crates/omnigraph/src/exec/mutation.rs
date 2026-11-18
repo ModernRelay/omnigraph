@@ -12,7 +12,7 @@ use crate::session::Session;
 use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle, WriteBudget};
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
-use lance_select::mask::RowAddrTreeMap;
+use lance_select::mask::{RowAddrTreeMap, RowSetOps};
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
@@ -819,48 +819,34 @@ pub(super) async fn open_table_for_mutation(
     Ok((opened.handle, opened.full_path, opened.table_branch))
 }
 
-/// Build the committed-snapshot filter used to COUNT a delete statement's
-/// `affected_*`, excluding rows a prior delete statement on the same table
-/// already scheduled for removal in this query.
+/// The rows earlier delete statements of this query already scheduled on
+/// `table_key`: their row addresses, recorded at `version`, or `None` when no
+/// statement has touched the table. A statement skips them when it counts its
+/// `affected_*`, so overlapping statements count each row once and their
+/// counts sum to the union the combined staged delete removes. Matching by
+/// address rather than re-evaluating the earlier predicates puts no earlier
+/// statement's test into this scan's filter: a cascade's predicate lists every
+/// removed id (#1442), and a row an earlier predicate left null-valued was not
+/// matched, so it has no address and is not skipped (#1277).
 ///
-/// Deletes stage — they no longer inline-commit — so every statement in a
-/// delete-only query scans the same unchanged committed snapshot. Counting each
-/// predicate independently would double-count overlapping statements (the old
-/// inline path did not, because each delete committed before the next ran). The
-/// combined staged delete actually removes the UNION `p₁ ∪ p₂ ∪ …`; excluding
-/// the prior predicates here makes each statement contribute `|pₙ \ (p₁ ∪ …)|`,
-/// whose sum is exactly that distinct count. `base` (the original predicate) is
-/// still what gets recorded — only the count uses this exclusion.
-///
-/// LOAD-BEARING on D₂: this exclusion assumes the committed snapshot is
-/// invariant across the query's statements, which holds only because D₂
-/// (`enforce_no_mixed_destructive_constructive`) forbids mixing inserts/updates
-/// with deletes — so a delete-touched table never has pending writes that would
-/// shift what a later statement sees. If D₂ is ever relaxed, this dedup must be
-/// revisited (a later delete would then need to see prior in-query writes).
-///
-/// The exclusion uses `IS NOT TRUE`, not `NOT`, because of SQL three-valued
-/// logic: a prior predicate referencing a column that is NULL for some row
-/// (e.g. `age > 30` on a row with NULL `age`) evaluates to UNKNOWN, and
-/// `NOT UNKNOWN` is still UNKNOWN — which a `WHERE` treats as not-matched, so
-/// the row would be wrongly dropped from this statement's scan even though the
-/// prior delete never matched it (dropping it from `deleted_ids` skips its
-/// cascade, or — if it is the only match — leaves the node undeleted). Only
-/// rows a prior predicate matched as definitely TRUE should be excluded:
-/// `(prior) IS NOT TRUE` keeps both FALSE and UNKNOWN rows.
-///
-/// Each prior predicate gets its own `IS NOT TRUE` (`(p1 OR p2) IS NOT TRUE`
-/// is `p1 IS NOT TRUE AND p2 IS NOT TRUE`). An `OR` of the priors would put
-/// their tests side by side, where Lance's simplifier folds two disjoint
-/// `NOT IN` tests of one nullable column to `true` and so excludes the rows
-/// whose value is null (#1277); `IS NOT TRUE` has no rewrite there.
-fn dedup_delete_filter(base: &Expr, prior: &[Expr]) -> Expr {
-    prior
-        .iter()
-        .cloned()
-        .fold(base.clone(), |filter, excluded| {
-            filter.and(excluded.is_not_true())
-        })
+/// LOAD-BEARING on D₂: every statement of a delete-only query reads the same
+/// committed snapshot, because `enforce_no_mixed_destructive_constructive`
+/// leaves a delete-touched table no pending writes, so one address names one
+/// row across statements. If D₂ is ever relaxed, this must be revisited.
+/// Addresses recorded at another version would name other rows, an internal
+/// contract failure as in `MutationStaging::record_deleted_row_addrs`.
+fn recorded_row_addrs<'a>(
+    recorded: &'a HashMap<String, (u64, RowAddrTreeMap)>,
+    table_key: &str,
+    version: u64,
+) -> Result<Option<&'a RowAddrTreeMap>> {
+    match recorded.get(table_key) {
+        None => Ok(None),
+        Some((recorded_version, addrs)) if *recorded_version == version => Ok(Some(addrs)),
+        Some((recorded_version, _)) => Err(OmniError::manifest_internal(format!(
+            "delete row addresses for '{table_key}' captured at versions {recorded_version} and {version}"
+        ))),
+    }
 }
 
 /// D₂ parse-time check: a single mutation query is either insert/update-only
@@ -920,6 +906,14 @@ decide_seam! {
     /// first writer here, commit a conflicting second writer, then prove the
     /// first attempt is discarded and validation is rerun from a fresh token.
     pub static MUTATION_POST_STAGE_PRE_EFFECT_GATE = ("mutation.post_stage_pre_effect_gate", Mutation, [Fail]);
+}
+
+decide_seam! {
+    /// After a mutation has executed and staged its rows in memory, before
+    /// validation judges them. Tests park a conditional writer here so another
+    /// writer publishes between its precondition check and its live `@card`
+    /// count (#1424).
+    pub static MUTATION_POST_EXECUTE_PRE_VALIDATE = ("mutation.post_execute_pre_validate", Mutation, [Fail]);
 }
 
 decide_seam! {
@@ -1255,6 +1249,7 @@ impl Omnigraph {
             committed: JudgedSide::Live {
                 base,
                 branch: txn.branch.clone(),
+                caller_head: txn.caller_expected_graph_head.clone(),
             },
             write_budget,
             catalog: Arc::clone(&txn.catalog),
@@ -1293,47 +1288,35 @@ impl Omnigraph {
         write_budget: WriteBudget,
         route: &WriteRoute,
     ) -> Result<crate::MutationReceipt> {
-        const MAX_PRE_EFFECT_REPREPARES: usize = 32;
-
         // Resolve request-scoped values such as now() once so a safe
         // pre-effect retry does not change the logical input.
         let resolved_params = enrich_mutation_params(params)?;
-        for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
-            let mut retryable = false;
-            match self
-                .mutate_one_attempt(
-                    branch,
-                    query_source,
-                    query_name,
-                    &resolved_params,
-                    actor_id,
-                    expected_head,
-                    stage_write_concurrency,
-                    history_release_bytes,
-                    attempt == 0,
-                    &mut retryable,
-                    write_budget,
-                    route,
-                )
-                .await
-            {
-                Err(err)
-                    if retryable
-                        && err.is_read_set_changed()
-                        && attempt < MAX_PRE_EFFECT_REPREPARES =>
-                {
-                    tracing::debug!(
-                        attempt = attempt + 1,
-                        branch,
-                        "prepared mutation authority changed before effects; repreparing"
-                    );
-                    crate::instrumentation::record_mutation_reprepare();
-                    self.refresh_coordinator_only().await?;
+        let mut reprepares =
+            crate::db::reprepare::PreEffectReprepares::begin(self, Some(branch), "mutation");
+        loop {
+            let first_attempt = reprepares.is_first();
+            let result = crate::db::write_queue::preparing(self.mutate_one_attempt(
+                branch,
+                query_source,
+                query_name,
+                &resolved_params,
+                actor_id,
+                expected_head,
+                stage_write_concurrency,
+                history_release_bytes,
+                first_attempt,
+                write_budget,
+                route,
+                reprepares.attempt(),
+            ))
+            .await;
+            match result {
+                Err(err) if reprepares.may_prepare_again(&err) => {
+                    reprepares.prepare_again().await?;
                 }
                 result => return result,
             }
         }
-        unreachable!("bounded mutation retry loop always returns")
     }
 
     async fn mutate_one_attempt(
@@ -1347,9 +1330,9 @@ impl Omnigraph {
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         first_attempt: bool,
-        retryable: &mut bool,
         write_budget: WriteBudget,
         route: &WriteRoute,
+        attempt: &mut crate::db::reprepare::WriteAttempt,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
         let addressed = requested.as_deref().unwrap_or("main").to_string();
@@ -1403,7 +1386,18 @@ impl Omnigraph {
         // Lower + validate up front so the touched-dataset set is known before
         // execution. A lowering/validation error returns exactly as it did
         // when this happened inside execute_named_mutation.
-        let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
+        // An update or delete selects existing rows; an insert-only mutation
+        // only adds them (`WriteAttempt::admit`). A query that no longer
+        // lowers is judged as one that selects rows, so a schema changed under
+        // a later attempt is reported as that change.
+        let lowered = self.lower_named_mutation(&txn.catalog, query_source, query_name);
+        let selects_rows = lowered.as_ref().map_or(true, |ir| {
+            !ir.ops
+                .iter()
+                .all(|op| matches!(op, MutationOpIR::Insert { .. }))
+        });
+        attempt.admit(&txn, selects_rows)?;
+        let ir = lowered?;
         debug_assert!(
             route.agrees_with(&ir.write_mode),
             "the lowered write mode {:?} disagrees with the pre-parsed route",
@@ -1411,14 +1405,6 @@ impl Omnigraph {
         );
         fill_declared_params(&mut resolved_params, &ir.params)?;
         validate_params(&resolved_params, &ir.params)?;
-        // Only an insert-only mutation is safe to replay automatically after a
-        // pre-effect authority mismatch. Update/Delete keep strict caller-visible
-        // `ReadSetChanged`; replaying their stale read-modify-write plan would be
-        // a semantic rebase rather than a fresh execution contract.
-        *retryable = ir
-            .ops
-            .iter()
-            .all(|op| matches!(op, MutationOpIR::Insert { .. }));
 
         let exec_result = self
             .execute_named_mutation(
@@ -1433,6 +1419,13 @@ impl Omnigraph {
         match exec_result {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => {
+                if !self.unpublished_view_is_current(&txn).await? {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("manifest_version:{addressed}"),
+                        Some(txn.manifest_probe.captured().version.to_string()),
+                        None,
+                    ));
+                }
                 if txn.caller_expected_graph_head.is_some() {
                     fail(&MUTATION_POST_NO_EFFECT_PRE_GATE)?;
                     // A no-op has no table transaction, so it never reaches
@@ -1441,11 +1434,14 @@ impl Omnigraph {
                     // ordering as effectful writes (shared permit — this pass
                     // only reads the accepted view), revalidate the complete
                     // authority and map a moved caller head to terminal 412.
-                    let _schema_permit = self.write_queue().acquire_schema_shared().await;
-                    let _branch_guard = self
-                        .write_queue()
-                        .acquire_branch(requested.as_deref())
-                        .await;
+                    let _gates = match attempt.admitted_gates()? {
+                        Some(held) => held,
+                        None => {
+                            self.write_queue()
+                                .acquire_branch_write_gates(requested.as_deref())
+                                .await?
+                        }
+                    };
                     self.revalidate_write_txn(&txn).await?;
                 }
                 Ok(crate::MutationReceipt {
@@ -1456,6 +1452,7 @@ impl Omnigraph {
                 })
             }
             Ok(total) => {
+                fail(&MUTATION_POST_EXECUTE_PRE_VALIDATE)?;
                 let mut committed = self
                     .commit_staged_mutation(
                         staging,
@@ -1463,6 +1460,7 @@ impl Omnigraph {
                         actor_id,
                         stage_write_concurrency,
                         history_release_bytes,
+                        attempt,
                     )
                     .await?;
                 let plans = std::mem::take(&mut committed.plans);
@@ -1492,6 +1490,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
+        attempt: &mut crate::db::reprepare::WriteAttempt,
     ) -> Result<CommittedStagedMutation> {
         let requested = txn.branch.as_deref();
         let plans = self.validate_staged_mutation(&staging, txn).await?;
@@ -1510,7 +1509,7 @@ impl Omnigraph {
             .await
             .map_err(OmniError::unpublished)?;
         let committed = staged
-            .commit_all(self, requested, txn, early)
+            .commit_all(self, requested, txn, early, attempt)
             .await
             .map_err(OmniError::unpublished)?;
         Ok(CommittedStagedMutation {
@@ -1536,10 +1535,14 @@ impl Omnigraph {
                     expected_versions,
                     detached: _,
                     gates: _held_gates,
+                    carried_txn,
                 },
             lineage_intent,
             plans: _,
         } = committed;
+        // A write carried over row-preserving publications publishes on the
+        // head it was re-anchored on.
+        let txn = carried_txn.as_ref().unwrap_or(txn);
         // `_held_gates` holds the shared schema permit, branch effect gate,
         // and sorted table gates acquired by `commit_all`. They remain held
         // through manifest publication, covering the complete same-process
@@ -1851,7 +1854,7 @@ impl Omnigraph {
                 };
                 staging.append_batch(&table_key, schema, mode, batch)?;
 
-                self.invalidate_graph_index().await;
+                self.invalidate_graph_index_for([table_key.as_str()]).await;
 
                 Ok(MutationResult {
                     affected_nodes: 0,
@@ -1950,6 +1953,13 @@ impl Omnigraph {
         // Update is a STRICT op, so collapse #1 never skips its open — the
         // handle is always `Some` (and it's needed for the committed scan below).
         let ds = handle.expect("strict Update op always opens its dataset");
+        // As for a delete: a `<key> = v` conjunct also selects the derived
+        // `id = v`, so with an id BTREE the match scan narrows through the
+        // index instead of reading the key column of every fragment.
+        let pred_expr = match key_id_conjunct(self, &ds, type_name, predicate, params, txn).await? {
+            Some(id_conjunct) => pred_expr.and(id_conjunct),
+            None => pred_expr,
+        };
 
         if let Some(plan) = sole_write
             .then(|| {
@@ -2198,20 +2208,23 @@ impl Omnigraph {
         // the index instead of reading the key column of every fragment.
         // The recorded predicate stays the written one.
         let scan_predicate =
-            match delete_key_id_conjunct(self, &ds, type_name, predicate, params, txn).await? {
+            match key_id_conjunct(self, &ds, type_name, predicate, params, txn).await? {
                 Some(id_conjunct) => pred_expr.clone().and(id_conjunct),
                 None => pred_expr.clone(),
             };
-        let scan_filter = dedup_delete_filter(
-            &scan_predicate,
-            staging.recorded_delete_predicates(&table_key),
-        );
-        let (deleted_ids, deleted_addrs) = scan_deleted_ids(
+        // A row an earlier delete statement on this table already matched is
+        // skipped by its recorded row address, so it is counted once.
+        let mut deleted_ids = Vec::new();
+        let mut deleted_addrs = RowAddrTreeMap::new();
+        scan_deleted_ids(
             self,
             &ds,
             txn.catalog.system_columns.id,
-            scan_filter,
+            DeletedRowsRead::filtered(scan_predicate),
+            recorded_row_addrs(&staging.deleted_row_addrs, &table_key, ds.version())?,
             &mut staging.deleted_id_budget,
+            &mut deleted_ids,
+            &mut deleted_addrs,
         )
         .await?;
 
@@ -2236,6 +2249,7 @@ impl Omnigraph {
         staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
 
         let mut affected_edges = 0usize;
+        let mut cascaded_edge_tables: Vec<String> = Vec::new();
 
         let edge_info: Vec<(String, String, String)> = txn
             .catalog
@@ -2245,21 +2259,22 @@ impl Omnigraph {
             .collect();
 
         for (edge_name, from_type, to_type) in &edge_info {
-            let mut cascade_filters = Vec::new();
+            let mut endpoints = Vec::new();
             if from_type == type_name {
-                cascade_filters.push(id_in_list_expr(
-                    &deleted_ids,
-                    txn.catalog.system_columns.src,
-                ));
+                endpoints.push(txn.catalog.system_columns.src);
             }
             if to_type == type_name {
-                cascade_filters.push(id_in_list_expr(
-                    &deleted_ids,
-                    txn.catalog.system_columns.dst,
-                ));
+                endpoints.push(txn.catalog.system_columns.dst);
             }
-            let Some(cascade_filter) = cascade_filters.into_iter().reduce(Expr::or) else {
+            if endpoints.is_empty() {
                 continue;
+            }
+            let probed = |column: &str| -> &[String] {
+                if endpoints.contains(&column) {
+                    &deleted_ids
+                } else {
+                    &[]
+                }
             };
 
             let edge_table_key = format!("edge:{}", edge_name);
@@ -2275,35 +2290,81 @@ impl Omnigraph {
             // Delete is a STRICT op, so collapse #1 never skips its open.
             let edge_ds = edge_handle.expect("strict Delete op always opens its dataset");
 
-            // `affected_edges` was the post-inline-commit `deleted_rows`; with
-            // staged deletes the rows aren't removed until end-of-query, so
-            // count the matching committed edges now. Exact under D₂ (no staged
-            // inserts can add matches mid-query), and bounded by the cascade
-            // working set. Exclude edges a prior delete statement (a prior
-            // cascade, or an explicit edge delete) on this table already
-            // scheduled, so an edge incident to two deleted nodes — or matched
-            // by both a cascade and an explicit `delete <Edge>` — is counted
-            // once. Record the ORIGINAL cascade filter (the combined staged
-            // delete removes the union); skip only when nothing NEW matches.
-            let count_filter = dedup_delete_filter(
-                &cascade_filter,
-                staging.recorded_delete_predicates(&edge_table_key),
+            // `affected_edges` counts the committed edges the cascade removes;
+            // the staged delete removes them at end-of-query. Exact under D₂
+            // (no staged inserts can add matches mid-query). The removed node
+            // ids are read through `RemovalEdgeReads`: pushed in bounded
+            // chunks where an index answers them, matched in memory on the
+            // fragments it leaves uncovered, never one filter over every id
+            // copied per fragment (#1442). An edge that two reads find, or
+            // that an earlier delete statement on this table (a prior cascade
+            // or an explicit `delete <Edge>`) already scheduled, is skipped by
+            // its row address, so it is counted once. Scan (not count) the
+            // removed edge ids so validation recounts the OTHER endpoint's
+            // @card after the cascade; `len()` is the affected count.
+            let mut matched_ids = Vec::new();
+            let mut matched_addrs = RowAddrTreeMap::new();
+            let (src, dst) = (
+                txn.catalog.system_columns.src,
+                txn.catalog.system_columns.dst,
             );
-            // Scan (not count) the cascade-removed edge ids so validation
-            // recounts the OTHER endpoint's @card after the cascade; `len()` is
-            // the affected count.
-            let (matched_ids, matched_addrs) = scan_deleted_ids(
-                self,
-                &edge_ds,
-                txn.catalog.system_columns.id,
-                count_filter,
-                &mut staging.deleted_id_budget,
+            let reads = crate::validate::RemovalEdgeReads::plan(
+                edge_ds.dataset(),
+                (src, probed(src)),
+                (dst, probed(dst)),
             )
             .await?;
+            let scheduled = recorded_row_addrs(
+                &staging.deleted_row_addrs,
+                &edge_table_key,
+                edge_ds.version(),
+            )?;
+            for filter in reads.probe_filters() {
+                scan_deleted_ids(
+                    self,
+                    &edge_ds,
+                    txn.catalog.system_columns.id,
+                    DeletedRowsRead {
+                        filter: Some(filter),
+                        fragments: reads.probe_fragments(),
+                        matcher: None,
+                    },
+                    scheduled,
+                    &mut staging.deleted_id_budget,
+                    &mut matched_ids,
+                    &mut matched_addrs,
+                )
+                .await?;
+            }
+            if let Some((fragments, matcher)) = reads.matched() {
+                scan_deleted_ids(
+                    self,
+                    &edge_ds,
+                    txn.catalog.system_columns.id,
+                    DeletedRowsRead {
+                        filter: None,
+                        fragments: Some(fragments),
+                        matcher: Some(&matcher),
+                    },
+                    scheduled,
+                    &mut staging.deleted_id_budget,
+                    &mut matched_ids,
+                    &mut matched_addrs,
+                )
+                .await?;
+            }
             let matched = matched_ids.len();
             affected_edges += matched;
 
             if matched > 0 {
+                // The staged delete removes exactly the recorded addresses;
+                // the predicate is the transaction's recorded text.
+                let cascade_filter = endpoints
+                    .iter()
+                    .map(|column| id_in_list_expr(&deleted_ids, column))
+                    .reduce(Expr::or)
+                    .expect("a cascade has at least one endpoint");
+                cascaded_edge_tables.push(edge_table_key.clone());
                 staging.record_deleted_ids(&edge_table_key, matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
                 staging.record_deleted_row_addrs(
@@ -2316,9 +2377,8 @@ impl Omnigraph {
 
         staging.record_deleted_ids(&table_key, deleted_ids);
 
-        if affected_edges > 0 {
-            self.invalidate_graph_index().await;
-        }
+        self.invalidate_graph_index_for(cascaded_edge_tables.iter().map(String::as_str))
+            .await;
 
         Ok(MutationResult {
             affected_nodes,
@@ -2358,21 +2418,26 @@ impl Omnigraph {
         // Count matching committed edges now (the staged delete won't remove
         // them until end-of-query). Exact under D₂; exclude edges a prior delete
         // statement on this table (an earlier cascade or edge delete) already
-        // scheduled, so overlapping statements don't double-count. Record the
-        // ORIGINAL predicate below (the combined staged delete removes the
-        // union); only record when something NEW matches.
-        let count_filter =
-            dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
+        // scheduled, by its recorded row address, so overlapping statements
+        // don't double-count. Record the ORIGINAL predicate below (the combined
+        // staged delete removes the union); only record when something NEW
+        // matches.
+        //
         // Scan the matched edge ids (not just count): the ids feed validation so
         // a delete emptying a src below @card min is rejected; `len()` is the
         // affected count. One scan replaces the former count-here + resolve-at-
         // validation re-scan.
-        let (deleted_ids, deleted_addrs) = scan_deleted_ids(
+        let mut deleted_ids = Vec::new();
+        let mut deleted_addrs = RowAddrTreeMap::new();
+        scan_deleted_ids(
             self,
             &ds,
             txn.catalog.system_columns.id,
-            count_filter,
+            DeletedRowsRead::filtered(pred_expr.clone()),
+            recorded_row_addrs(&staging.deleted_row_addrs, &table_key, ds.version())?,
             &mut staging.deleted_id_budget,
+            &mut deleted_ids,
+            &mut deleted_addrs,
         )
         .await?;
         let affected = deleted_ids.len();
@@ -2381,7 +2446,7 @@ impl Omnigraph {
             staging.record_deleted_ids(&table_key, deleted_ids);
             staging.record_delete(&table_key, pred_expr.clone());
             staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
-            self.invalidate_graph_index().await;
+            self.invalidate_graph_index_for([table_key.as_str()]).await;
         }
 
         Ok(MutationResult {
@@ -2391,14 +2456,14 @@ impl Omnigraph {
     }
 }
 
-/// The derived-id conjunct of a node delete whose predicate has a top-level
-/// `<key> = <String literal or parameter>` conjunct on the type's single
-/// String `@key`: every write derives a keyed node's id from its key
+/// The derived-id conjunct of a node update or delete whose predicate has a
+/// top-level `<key> = <String literal or parameter>` conjunct on the type's
+/// single String `@key`: every write derives a keyed node's id from its key
 /// (`loader::canonical_key_id`), so `key = v` implies `id = derive(v)` and
 /// adding the conjunct selects the same rows. The read planner narrows the
 /// same shape (`scan_access::narrow_key`). Only when the pinned table has an
 /// id BTREE: without one the extra column would only add bytes.
-async fn delete_key_id_conjunct(
+async fn key_id_conjunct(
     db: &Omnigraph,
     ds: &SnapshotHandle,
     type_name: &str,
@@ -2461,23 +2526,56 @@ async fn delete_key_id_conjunct(
     ))
 }
 
-/// Walk the exact typed predicate a batch at a time, admitting each id against
+/// The rows one scan of [`scan_deleted_ids`] reads: those `filter` selects on
+/// `fragments` (`None`: the whole table), or, with `matcher`, every row of
+/// `fragments` that it keeps (`crate::validate::RemovalEdgeReads`).
+struct DeletedRowsRead<'r, 'm> {
+    filter: Option<Expr>,
+    fragments: Option<Vec<lance_table::format::Fragment>>,
+    matcher: Option<&'r crate::validate::EndpointMatch<'m>>,
+}
+
+impl DeletedRowsRead<'_, '_> {
+    fn filtered(filter: Expr) -> Self {
+        Self {
+            filter: Some(filter),
+            fragments: None,
+            matcher: None,
+        }
+    }
+}
+
+/// Walk the rows `read` selects a batch at a time, admitting each id against
 /// `budget` before copying it, and keep each matched row's address so the
-/// staged delete removes exactly these rows without scanning again.
+/// staged delete removes exactly these rows without scanning again. The ids
+/// and addresses accumulate into `removed` and `addrs` across a statement's
+/// reads; a row already in `addrs` (an earlier read of this statement) or in
+/// `scheduled` (an earlier statement's rows) is skipped before it is charged.
 async fn scan_deleted_ids(
     db: &Omnigraph,
     snapshot: &SnapshotHandle,
     id_column: &str,
-    filter: Expr,
+    read: DeletedRowsRead<'_, '_>,
+    scheduled: Option<&RowAddrTreeMap>,
     budget: &mut DeletedIdBudget,
-) -> Result<(Vec<String>, RowAddrTreeMap)> {
+    removed: &mut Vec<String>,
+    addrs: &mut RowAddrTreeMap,
+) -> Result<()> {
+    // The id column first: the walk reads it as column 0.
+    let projection: Vec<&str> = std::iter::once(id_column)
+        .chain(read.matcher.iter().flat_map(|matcher| matcher.columns()))
+        .collect();
     let mut stream = db
         .storage()
-        .scan_filtered_row_addrs(snapshot, &[id_column], filter)
+        .scan_filtered_row_addrs(snapshot, &projection, read.filter, read.fragments)
         .await?;
-    let mut removed = Vec::new();
-    let mut addrs = RowAddrTreeMap::new();
+    let mut scanned = RowAddrTreeMap::new();
+    let mut found = Vec::new();
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        let batch = match read.matcher {
+            Some(matcher) => matcher.keep(&batch)?,
+            None => batch,
+        };
         let ids = batch
             .column(0)
             .as_any()
@@ -2495,17 +2593,25 @@ async fn scan_deleted_ids(
             ));
         }
         for i in 0..ids.len() {
-            let id = ids.value(i);
-            budget.retain(id)?;
-            removed.push(id.to_owned());
-            if !addrs.insert(row_addrs.value(i)) {
+            let addr = row_addrs.value(i);
+            if !scanned.insert(addr) {
                 return Err(OmniError::manifest_internal(
                     "delete id scan returned one row address twice",
                 ));
             }
+            if addrs.contains(addr) || scheduled.is_some_and(|rows| rows.contains(addr)) {
+                continue;
+            }
+            let id = ids.value(i);
+            budget.retain(id)?;
+            removed.push(id.to_owned());
+            found.push(addr);
         }
     }
-    Ok((removed, addrs))
+    for addr in found {
+        addrs.insert(addr);
+    }
+    Ok(())
 }
 
 /// Concat the matched batches from `scan_with_pending` into a single batch.
@@ -2748,26 +2854,5 @@ edge Shared: Endpoint -> Endpoint { label: String }
         assert!(staging.is_empty());
         assert!(staging.paths.is_empty());
         assert!(staging.deleted_ids.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod delete_filter_tests {
-    use super::dedup_delete_filter;
-    use crate::engine::lance_filter_support::selected_rows;
-    use datafusion::prelude::{col, lit, not};
-
-    /// A later statement selects `k = "a"`, the row whose `s` is null; the
-    /// earlier statements' disjoint `NOT IN` tests are null there, so they
-    /// did not match it and must not exclude it.
-    #[test]
-    fn earlier_disjoint_not_in_statements_do_not_exclude_a_null_row_issue_1277() {
-        let prior = [
-            not(col("s").in_list(vec![lit("y")], false)),
-            not(col("s").in_list(vec![lit("x")], false)),
-        ];
-        let filter = dedup_delete_filter(&col("k").eq(lit("a")), &prior);
-        assert_eq!(selected_rows(filter.clone(), false), vec![0]);
-        assert_eq!(selected_rows(filter, true), vec![0]);
     }
 }

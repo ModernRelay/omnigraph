@@ -1,19 +1,25 @@
 //! One engine operation selected from a frozen GQT program. Dataset building,
 //! process supervision, result assertions and archive work are outside its clock.
-use crate::case::Backend;
+use crate::case::{Backend, ResetMode};
 use crate::counting::LogicalCallCounter;
 use crate::dataset_cache::DatasetManifestV1;
 use crate::gqt_case::{
     BoundGqt, DatasetBuildPlan, PlannedGqt, SERVED_READ_KINDS, Target, engine_preparation,
 };
-use crate::gqt_evidence::{PreparationProofV2, RepetitionInputV2};
+use crate::gqt_evidence::{
+    CloneInput, LocalRoute, LocalRouteKind, PreparationProofV2, RepetitionInputV2,
+};
 use crate::gqt_served::{ServedInput, ServerDeploymentReceiptV1};
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
-use crate::reset::{MetadataDigest, PhysicalDigest, TraversalLimits, verify_metadata_shape};
+use crate::record::ObservedBackendV1;
+use crate::reset::{
+    MetadataDigest, PhysicalDigest, TraversalLimits, verify_metadata_shape_skipping,
+};
 use crate::runner::{
     BuildEvidence, ControlCallObservation, ControlSnapshot, LogicalStoreCallObservation,
     MeasurementSignals, RunnerError, RunnerResult, WallClockSummary,
 };
+use crate::store::{BaseManifestV1, FixtureStore, StorageFormatV1, StoreLocation};
 use futures::{FutureExt, future::BoxFuture};
 use lance::io::WrappingObjectStore;
 use omnigraph::db::Omnigraph;
@@ -116,6 +122,10 @@ pub struct GqtRepObservation {
     pub server_receipt_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_peak_rss_bytes: Option<u64>,
+    /// The digest of the frozen base's manifest a `--store` repetition read
+    /// through; absent on the other routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_manifest_sha256: Option<String>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
@@ -125,6 +135,36 @@ pub struct RunOptions {
     pub no_build: bool,
     pub fixture_bindings: Vec<String>,
     pub served: Option<ServedInput>,
+    /// How each embedded repetition reaches its fixture. Anything but
+    /// [`LocalRouteKind::Direct`] is a comparison run and is not archived.
+    pub local_route: LocalRouteKind,
+    /// The fixture store of a clone-reset run: a local directory or an
+    /// `s3://` prefix holding the frozen bases; each repetition runs the
+    /// product's `omnigraph` over an empty clone of the point's base.
+    pub store: Option<String>,
+    /// The declared S3 backend of an `s3://` store; the record carries it
+    /// as declared, nothing probes it.
+    pub backend: Option<Backend>,
+    /// The product binary a clone-reset run measures; `omnigraph` beside the
+    /// worker executable when unset.
+    pub product: Option<PathBuf>,
+    /// The commit `run --at` resolved the product from, recorded beside what
+    /// the binary says of itself.
+    pub product_commit: Option<String>,
+}
+/// The product binary a clone-reset run measured: what `omnigraph version
+/// --json` said about it and the digest of the file that said it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProductBinary {
+    pub path: PathBuf,
+    pub package_version: String,
+    pub http_contract: String,
+    pub internal_schema_writes: u32,
+    pub executable_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_commit: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunExecution {
@@ -146,6 +186,15 @@ pub struct RunExecution {
     pub dataset_cache_hit: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_receipt: Option<ServerDeploymentReceiptV1>,
+    /// The frozen base of a clone-reset run, as the store published it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<BaseManifestV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product: Option<ProductBinary>,
+    /// The declared backend of a clone-reset run over an `s3://` store; a
+    /// local store's backend is probed into `environment` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_backend: Option<ObservedBackendV1>,
     pub samples: Vec<GqtRepObservation>,
     pub wall_clock: WallClockSummary,
     pub durable_record: bool,
@@ -162,8 +211,43 @@ struct Generation {
     counts: Arc<StorageReadCounts>,
     gate: Option<PreparationWriteGate>,
 }
-fn generation(uri: &str, guarded: bool) -> RunnerResult<Generation> {
-    let storage = omnigraph::storage::storage_for_uri(uri).map_err(|e| failure(e.to_string()))?;
+/// Run `future` to completion on a thread of its own with timers and I/O
+/// enabled, for a caller that is not async and may be on a runtime's thread.
+pub(crate) fn block_on_own_thread<T: Send>(
+    future: impl Future<Output = T> + Send,
+) -> RunnerResult<T> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map(|runtime| runtime.block_on(future))
+            })
+            .join()
+    })
+    .map_err(|_| failure("storage task panicked"))?
+    .map_err(failure)
+}
+fn generation(uri: &str, route: &LocalRoute, guarded: bool) -> RunnerResult<Generation> {
+    let storage = match route {
+        LocalRoute::Direct => omnigraph::storage::storage_for_uri(uri),
+        LocalRoute::ObjectStore => omnigraph::storage::storage_for_uri_scoped(
+            uri,
+            omnigraph::storage::StorageIoScope::new(),
+        ),
+        LocalRoute::ReadThrough { base_root } => {
+            let base_uri = base_root
+                .to_str()
+                .ok_or_else(|| failure("the template's path is not UTF-8"))?;
+            block_on_own_thread(omnigraph::storage::storage_read_through_scoped(
+                base_uri,
+                uri,
+                omnigraph::storage::StorageIoScope::new(),
+            ))?
+        }
+    }
+    .map_err(|e| failure(e.to_string()))?;
     let (storage, gate) = if guarded {
         let (s, g) = guard_preparation_writes(storage, uri);
         (s, Some(g))
@@ -180,6 +264,7 @@ fn generation(uri: &str, guarded: bool) -> RunnerResult<Generation> {
 struct LocalInstrumentation {
     root: PathBuf,
     uri: String,
+    route: LocalRoute,
     metadata: MetadataDigest,
     generation: Generation,
     baseline: Option<ControlSnapshot>,
@@ -207,6 +292,9 @@ struct HostState {
     /// The `commit` record of the operation in flight, by ordinal: taken
     /// into the step receipt when the operation finishes.
     published: BTreeMap<usize, bool>,
+    /// The measured child's peak resident set on the process route, from
+    /// its `--stats` document.
+    engine_rss: Option<u64>,
 }
 impl HostState {
     fn new(local: Option<LocalInstrumentation>) -> Self {
@@ -228,6 +316,7 @@ impl HostState {
             ready: false,
             settled: false,
             merge: None,
+            engine_rss: None,
         }
     }
 }
@@ -253,11 +342,9 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
             return Err(failure("overlapping operation callbacks"));
         }
         let preparing = state.elapsed.is_none();
-        if kind == StepKind::Restart {
-            let local = state
-                .local
-                .as_mut()
-                .ok_or_else(|| failure("served restart is unsupported"))?;
+        if kind == StepKind::Restart
+            && let Some(local) = state.local.as_mut()
+        {
             if preparing {
                 local
                     .generation
@@ -267,7 +354,7 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
                     .validate_preparation()
                     .map_err(failure)?;
             }
-            local.generation = generation(&local.uri, preparing)?;
+            local.generation = generation(&local.uri, &local.route, preparing)?;
         }
         if ordinal == self.selected {
             if !preparing {
@@ -279,8 +366,19 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
                 ));
             }
             if let Some(local) = &state.local {
-                verify_metadata_shape(&local.root, &local.metadata, TraversalLimits::default())
-                    .map_err(failure)?;
+                let skip = match local.route {
+                    LocalRoute::ReadThrough { .. } => {
+                        Some(omnigraph::storage::ReadThroughMount::RESERVED_DIRECTORY)
+                    }
+                    LocalRoute::Direct | LocalRoute::ObjectStore => None,
+                };
+                verify_metadata_shape_skipping(
+                    &local.root,
+                    &local.metadata,
+                    TraversalLimits::default(),
+                    skip,
+                )
+                .map_err(failure)?;
             }
             self.signals.lock().unwrap().ready()?;
             state.ready = true;
@@ -433,6 +531,27 @@ impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
                     s.published.insert(current, published);
                 }
             }
+            omnigraph_gqt_core::PROCESS_STATS_RECORD => {
+                let document = value();
+                if document["ordinal"].as_u64() != Some(self.selected as u64) {
+                    return;
+                }
+                let mut s = self.state.lock().unwrap();
+                match process_stats(&document["stats"]) {
+                    Ok((logical, rss)) => {
+                        s.logical = Some(match s.logical.take() {
+                            Some(previous) => sum_logical_calls(previous, logical),
+                            None => logical,
+                        });
+                        s.engine_rss = s.engine_rss.max(rss);
+                    }
+                    Err(message) => {
+                        if s.error.is_none() {
+                            s.error = Some(RunnerError::new("gqt_measure_failed", message));
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -460,6 +579,7 @@ impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
 pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
     repetition: u32,
     root: &Path,
+    route: &LocalRoute,
     input: &PhysicalDigest,
     metadata: &MetadataDigest,
     bound: &BoundGqt,
@@ -479,7 +599,7 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
         ..Default::default()
     };
     with_query_io_probes(probes, async {
-        let generation = generation(uri, true)?;
+        let generation = generation(uri, route, true)?;
         let db = tokio::time::timeout(
             Duration::from_millis(case.runner.timeout_ms),
             Omnigraph::open_with_storage(uri, generation.storage.clone()),
@@ -502,6 +622,7 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
             state: Mutex::new(HostState::new(Some(LocalInstrumentation {
                 root: root.into(),
                 uri: uri.into(),
+                route: route.clone(),
                 metadata: metadata.clone(),
                 generation,
                 baseline: None,
@@ -574,7 +695,12 @@ pub(crate) async fn execute_served_rep_signaled<S: MeasurementSignals + Send>(
     };
     let result = tokio::time::timeout(
         Duration::from_millis(case.runner.timeout_ms),
-        omnigraph_gqt_core::execute_steps_served(&case, &input.target, &host),
+        omnigraph_gqt_core::execute_measured_served(
+            &case,
+            &input.target,
+            &host,
+            bound.plan.definition.workload.measured_step.ordinal,
+        ),
     )
     .await
     .unwrap_or_else(|_| Err("queries whole-file timeout exceeded".into()))
@@ -583,6 +709,190 @@ pub(crate) async fn execute_served_rep_signaled<S: MeasurementSignals + Send>(
         server_receipt_sha256: input.receipt.digest().map_err(failure)?,
     };
     finish_execution(&host, result, bound, repetition, &proof)
+}
+
+/// One measured step may run as several children (a generated load, one per
+/// batch): their documents sum per plane.
+fn sum_logical_calls(
+    a: LogicalStoreCallObservation,
+    b: LogicalStoreCallObservation,
+) -> LogicalStoreCallObservation {
+    fn plane(
+        a: omnigraph::instrumentation::LogicalCallCounts,
+        b: omnigraph::instrumentation::LogicalCallCounts,
+    ) -> omnigraph::instrumentation::LogicalCallCounts {
+        omnigraph::instrumentation::LogicalCallCounts {
+            get: a.get.saturating_add(b.get),
+            put: a.put.saturating_add(b.put),
+            put_part: a.put_part.saturating_add(b.put_part),
+            head: a.head.saturating_add(b.head),
+            list: a.list.saturating_add(b.list),
+            delete: a.delete.saturating_add(b.delete),
+            copy: a.copy.saturating_add(b.copy),
+            rename: a.rename.saturating_add(b.rename),
+            multipart_complete: a.multipart_complete.saturating_add(b.multipart_complete),
+            multipart_abort: a.multipart_abort.saturating_add(b.multipart_abort),
+        }
+    }
+    LogicalStoreCallObservation {
+        manifest: plane(a.manifest, b.manifest),
+        table: plane(a.table, b.table),
+        physical_attempts_observed: a.physical_attempts_observed || b.physical_attempts_observed,
+    }
+}
+
+/// The measured child's `--stats` document as the sample's logical store
+/// calls (its two Lance planes) and its peak resident set.
+fn process_stats(
+    stats: &serde_json::Value,
+) -> Result<(LogicalStoreCallObservation, Option<u64>), String> {
+    #[derive(Deserialize)]
+    struct Planes {
+        manifest: omnigraph::instrumentation::LogicalCallCounts,
+        table: omnigraph::instrumentation::LogicalCallCounts,
+    }
+    #[derive(Deserialize)]
+    struct Stats {
+        storage: Planes,
+        peak_rss_bytes: Option<u64>,
+    }
+    let stats: Stats = serde_json::from_value(stats.clone()).map_err(|e| {
+        format!("the measured step's --stats document has an unexpected shape: {e}")
+    })?;
+    Ok((
+        LogicalStoreCallObservation {
+            manifest: stats.storage.manifest,
+            table: stats.storage.table,
+            physical_attempts_observed: false,
+        },
+        stats.peak_rss_bytes,
+    ))
+}
+
+/// The names a `--store` run's child processes inherit from the run: what
+/// the object-store client, Lance and the locale read; everything else is
+/// cleared so the product sees one declared environment.
+pub const CHILD_ENVIRONMENT: [&str; 24] = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_S3",
+    "AWS_ALLOW_HTTP",
+    "AWS_S3_FORCE_PATH_STYLE",
+    "AWS_PROFILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "AWS_VIRTUAL_HOSTED_STYLE_REQUEST",
+    "LANCE_MEM_POOL_SIZE",
+    "LC_ALL",
+    "LANG",
+    "PATH",
+    "HOME",
+];
+
+fn child_environment() -> Vec<(String, String)> {
+    CHILD_ENVIRONMENT
+        .iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| (name.to_string(), value))
+        })
+        .collect()
+}
+
+/// One `--store` repetition: the product's `omnigraph` once per step over
+/// the clone the parent handed out, judged like the served route, its
+/// measured child's `--stats` document the sample's counts and memory.
+pub(crate) async fn execute_clone_rep_signaled<S: MeasurementSignals + Send>(
+    repetition: u32,
+    bound: &BoundGqt,
+    input: &CloneInput,
+    scratch: &Path,
+    signals: &mut S,
+) -> RunnerResult<GqtRepObservation> {
+    bound.revalidate().map_err(failure)?;
+    if bound.identity.environment.target != Target::Engine
+        || bound.plan.definition.protocol.reset != ResetMode::Clone
+    {
+        return Err(failure(
+            "clone input requires an embedded point under the clone reset level",
+        ));
+    }
+    let digest = sha256_file(&input.product)?;
+    if digest != input.product_sha256 {
+        return Err(RunnerError::new(
+            "worker_identity_mismatch",
+            format!(
+                "product binary {} has digest {digest}, the run attested {}",
+                input.product.display(),
+                input.product_sha256
+            ),
+        ));
+    }
+    let case = bound.plan.queries.parse().map_err(failure)?;
+    let host = BenchHost {
+        signals: Mutex::new(signals),
+        selected: bound.plan.definition.workload.measured_step.ordinal,
+        kinds: case
+            .steps()
+            .into_iter()
+            .map(|s| (s.ordinal, s.kind))
+            .collect(),
+        expected_reads: bound.plan.cache_condition.iterations,
+        attribution: bound.plan.definition.protocol.attribution,
+        state: Mutex::new(HostState::new(None)),
+    };
+    let mut environment = input.environment.clone();
+    environment.push((
+        "TMPDIR".to_string(),
+        scratch
+            .to_str()
+            .ok_or_else(|| failure("non-UTF8 worker scratch path"))?
+            .to_string(),
+    ));
+    let target = omnigraph_gqt_core::ProcessTarget {
+        executable: input.product.clone(),
+        target: input.clone.uri.clone(),
+        base: input.base_root_uri.clone(),
+        scratch: scratch.to_path_buf(),
+        environment,
+    };
+    let result = tokio::time::timeout(
+        Duration::from_millis(case.runner.timeout_ms),
+        omnigraph_gqt_core::execute_measured_process(
+            &case,
+            &target,
+            &host,
+            bound.plan.definition.workload.measured_step.ordinal,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| Err("queries whole-file timeout exceeded".into()));
+    let proof = PreparationProofV2::Clone {
+        base_manifest_sha256: input.base_manifest_sha256.clone(),
+    };
+    finish_execution(&host, result, bound, repetition, &proof)
+}
+
+fn sha256_file(path: &Path) -> RunnerResult<String> {
+    use sha2::Digest as _;
+    let bytes = std::fs::read(path).map_err(|e| {
+        RunnerError::new(
+            "product_binary_unreadable",
+            format!("{}: {e}", path.display()),
+        )
+    })?;
+    Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
 }
 
 fn finish_execution<S: MeasurementSignals + Send>(
@@ -601,19 +911,22 @@ fn finish_execution<S: MeasurementSignals + Send>(
     let Some(elapsed_us) = state.elapsed else {
         return Err(error.unwrap_or_else(|| failure("selected operation never executed")));
     };
-    let (physical, receipt) = match proof {
+    let (physical, receipt, base) = match proof {
         PreparationProofV2::Embedded {
             physical_digest, ..
-        } => (Some(physical_digest.digest_sha256.clone()), None),
+        } => (Some(physical_digest.digest_sha256.clone()), None, None),
         PreparationProofV2::Served {
             server_receipt_sha256,
-        } => (None, Some(server_receipt_sha256.clone())),
+        } => (None, Some(server_receipt_sha256.clone()), None),
+        PreparationProofV2::Clone {
+            base_manifest_sha256,
+        } => (None, None, Some(base_manifest_sha256.clone())),
     };
     let mut sample = GqtRepObservation {
         repetition,
         input_physical_digest_sha256: physical,
         elapsed_us,
-        peak_rss_bytes: None,
+        peak_rss_bytes: state.engine_rss.take(),
         outcome: if error.is_some() {
             "verification-failed"
         } else {
@@ -631,6 +944,7 @@ fn finish_execution<S: MeasurementSignals + Send>(
         },
         server_receipt_sha256: receipt,
         client_peak_rss_bytes: None,
+        base_manifest_sha256: base,
     };
     if let Some(error) = error {
         return Err(if state.settled {
@@ -676,10 +990,12 @@ fn validate_evidence(
     parent: bool,
     failed: bool,
 ) -> RunnerResult<()> {
+    let clone = bound.plan.definition.protocol.reset == ResetMode::Clone;
     if !matches!(
-        (input, bound.identity.environment.target),
-        (PreparationProofV2::Embedded { .. }, Target::Engine)
-            | (PreparationProofV2::Served { .. }, Target::Server)
+        (input, bound.identity.environment.target, clone),
+        (PreparationProofV2::Embedded { .. }, Target::Engine, false)
+            | (PreparationProofV2::Served { .. }, Target::Server, false)
+            | (PreparationProofV2::Clone { .. }, Target::Engine, true)
     ) {
         return Err(failure("sample proof target mismatch"));
     }
@@ -778,6 +1094,7 @@ pub(crate) fn sample_evidence_matches(
                     .is_some_and(|c| !c.physical_attempts_observed)
                 && sample.control_store_calls.is_some()
                 && sample.server_receipt_sha256.is_none()
+                && sample.base_manifest_sha256.is_none()
                 && sample.client_peak_rss_bytes.is_none()
                 && rss_matches(sample.peak_rss_bytes)
         }
@@ -786,6 +1103,7 @@ pub(crate) fn sample_evidence_matches(
         } => {
             sample.server_receipt_sha256.as_ref() == Some(server_receipt_sha256)
                 && sample.input_physical_digest_sha256.is_none()
+                && sample.base_manifest_sha256.is_none()
                 && sample.logical_store_calls.is_none()
                 && sample.control_store_calls.is_none()
                 && sample.peak_rss_bytes.is_none()
@@ -793,12 +1111,28 @@ pub(crate) fn sample_evidence_matches(
                 && rss_matches(sample.client_peak_rss_bytes)
                 && sample.steps.iter().all(served_receipt_admitted)
         }
+        PreparationProofV2::Clone {
+            base_manifest_sha256,
+        } => {
+            sample.base_manifest_sha256.as_ref() == Some(base_manifest_sha256)
+                && sample.input_physical_digest_sha256.is_none()
+                && sample.server_receipt_sha256.is_none()
+                && sample
+                    .logical_store_calls
+                    .as_ref()
+                    .is_some_and(|c| !c.physical_attempts_observed)
+                && sample.control_store_calls.is_none()
+                && sample.merge.is_none()
+                && sample.peak_rss_bytes.is_some_and(|n| n > 0)
+                && rss_matches(sample.client_peak_rss_bytes)
+        }
     }
 }
 
 /// A served receipt is a read, an unpublished write (its commit advanced no
-/// head), or the drop of such a commit: the mirror of
-/// `gqt_case::served_step_refusal` over what actually executed.
+/// head), the drop of such a commit, or the no-op restart after the measured
+/// step: the mirror of `gqt_case::served_step_refusal` over what actually
+/// executed.
 pub(crate) fn served_receipt_admitted(step: &GqtStepObservation) -> bool {
     if SERVED_READ_KINDS
         .into_iter()
@@ -808,7 +1142,7 @@ pub(crate) fn served_receipt_admitted(step: &GqtStepObservation) -> bool {
     }
     match step.kind {
         GqtOperationKind::Mutate | GqtOperationKind::BranchMerge => step.published == Some(false),
-        GqtOperationKind::CommitDrop => step.published.is_none(),
+        GqtOperationKind::CommitDrop | GqtOperationKind::Restart => step.published.is_none(),
         _ => false,
     }
 }
@@ -939,6 +1273,7 @@ pub(crate) fn sample_byte_upper_bound(plan: &PlannedGqt) -> RunnerResult<usize> 
         }),
         server_receipt_sha256: Some("0".repeat(64)),
         client_peak_rss_bytes: Some(u64::MAX),
+        base_manifest_sha256: Some("0".repeat(64)),
         steps,
         verification: GqtVerification {
             selected_assertion_passed: false,
@@ -1014,6 +1349,9 @@ fn execute_owned(
     if let Some(input) = &options.served {
         return execute_served_owned(run, plan, &options, input);
     }
+    if let Some(store) = &options.store {
+        return execute_clone_owned(run, plan, &options, store);
+    }
     let cache = options
         .dataset_cache
         .clone()
@@ -1061,7 +1399,10 @@ fn execute_owned(
     let mut build = None;
     let acquisition = (|| -> RunnerResult<()> {
         for repetition in 1..=run.repetitions {
-            let metadata = lease.restore()?;
+            let metadata = match options.local_route {
+                LocalRouteKind::ReadThrough => lease.empty_active()?,
+                LocalRouteKind::Direct | LocalRouteKind::ObjectStore => lease.restore()?,
+            };
             let scratch = lease.root.join(format!("worker-scratch-{repetition:08}"));
             std::fs::create_dir(&scratch).map_err(|e| failure(e.to_string()))?;
             let input = crate::gqt_supervisor::SupervisionInput {
@@ -1077,6 +1418,7 @@ fn execute_owned(
                     repetition_root: lease.active.clone(),
                     physical_digest: lease.physical().clone(),
                     metadata_digest: metadata.clone(),
+                    route: options.local_route.over(&lease.template),
                 },
                 deadline: plan
                     .definition
@@ -1123,6 +1465,9 @@ fn execute_owned(
                 }
             }
         }
+        if options.local_route == LocalRouteKind::ReadThrough {
+            lease.verify_template_bytes()?;
+        }
         lease.verify()?;
         Ok(())
     })();
@@ -1146,6 +1491,9 @@ fn execute_owned(
         fixture: Some(lease.manifest.clone()),
         dataset_cache_hit: Some(lease.cache_hit),
         server_receipt: None,
+        base: None,
+        product: None,
+        observed_backend: None,
         samples,
         wall_clock,
         durable_record: false,
@@ -1162,11 +1510,49 @@ fn execute_owned(
 pub fn validate_run_options(plan: &PlannedGqt, options: &RunOptions) -> RunnerResult<()> {
     plan.revalidate().map_err(failure)?;
     match (plan.definition.environment.target, &options.served) {
-        (Target::Engine, None) => Ok(()),
+        (Target::Engine, None) => {
+            let clone = plan.definition.protocol.reset == ResetMode::Clone;
+            let s3 = matches!(plan.definition.environment.backend, Backend::S3 { .. });
+            match (&options.store, clone) {
+                (Some(store), true) => {
+                    if options.local_route != LocalRouteKind::Direct {
+                        return Err(failure(
+                            "a clone-reset run reaches its base through the product binary; a local route applies to the restored-copy reset levels only",
+                        ));
+                    }
+                    if store.starts_with("s3://") != s3 {
+                        return Err(failure(
+                            "an s3:// store declares an S3 backend (--backend) and a local store a local one",
+                        ));
+                    }
+                    Ok(())
+                }
+                (None, false) => {
+                    if options.backend.is_some() || options.product.is_some() {
+                        return Err(failure("--backend and --product describe a --store run"));
+                    }
+                    Ok(())
+                }
+                (Some(_), false) => Err(failure(
+                    "--store runs the clone reset level; this point resets another way",
+                )),
+                (None, true) => Err(failure("the clone reset level requires --store")),
+            }
+        }
         (Target::Server, Some(input)) => {
+            if options.store.is_some() || options.backend.is_some() || options.product.is_some() {
+                return Err(failure(
+                    "served graphs are pre-provisioned; a fixture store does not apply",
+                ));
+            }
             if options.no_build || !options.fixture_bindings.is_empty() {
                 return Err(failure(
                     "served graphs are pre-provisioned; local dataset acquisition options do not apply",
+                ));
+            }
+            if options.local_route != LocalRouteKind::Direct {
+                return Err(failure(
+                    "served graphs are reached through their server; a local route applies to engine-target scenarios only",
                 ));
             }
             let bound = input.receipt.bind(plan).map_err(failure)?;
@@ -1295,6 +1681,389 @@ fn execute_served_owned(
         fixture: None,
         dataset_cache_hit: None,
         server_receipt: Some(input.receipt.clone()),
+        base: None,
+        product: None,
+        observed_backend: None,
+        samples,
+        wall_clock,
+        durable_record: false,
+    };
+    match acquisition {
+        Ok(()) => Ok(execution),
+        Err(mut error) => {
+            error.context.gqt_partial_run = Some(Box::new(execution));
+            Err(error)
+        }
+    }
+}
+
+/// The product binary of a `--store` run (`--product`, else `omnigraph`
+/// beside the worker executable), inspected once so the record names what it
+/// measured and a binary writing another storage format is refused.
+fn resolve_product(
+    options: &RunOptions,
+    environment: &[(String, String)],
+) -> RunnerResult<ProductBinary> {
+    let path = match &options.product {
+        Some(path) => path.clone(),
+        None => options
+            .worker_executable
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|directory| directory.join("omnigraph"))
+            .ok_or_else(|| {
+                failure("--product or a worker executable with a directory is required")
+            })?,
+    };
+    inspect_product(&path, options.product_commit.clone(), environment)
+}
+
+/// How long a product's `version --json` may take before the binary is
+/// unreadable.
+const PRODUCT_VERSION_DEADLINE: Duration = Duration::from_secs(30);
+
+/// `Command::output` with a deadline: the child is killed when it outlives
+/// it, and the error names the deadline.
+fn output_within(
+    mut command: std::process::Command,
+    deadline: Duration,
+) -> std::io::Result<std::process::Output> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let started = Instant::now();
+    while child.try_wait()?.is_none() {
+        if started.elapsed() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("did not exit within {} s", deadline.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output()
+}
+
+/// What a product binary says of itself: `version --json` once, the file's
+/// digest, a refusal when it writes a storage format the store's bases (built
+/// by this harness) are not in, and a refusal when the commit it was built
+/// from is not the one the run names; a binary that names no commit (a
+/// development build) is admitted under any ref.
+pub fn inspect_product(
+    path: &Path,
+    requested_commit: Option<String>,
+    environment: &[(String, String)],
+) -> RunnerResult<ProductBinary> {
+    if let Some(commit) = &requested_commit
+        && !crate::record::valid_lower_hex(commit, &[40, 64])
+    {
+        return Err(failure(format!(
+            "`{commit}` is not a full lowercase commit sha"
+        )));
+    }
+    let path = std::fs::canonicalize(path).map_err(|e| {
+        RunnerError::new(
+            "product_binary_unreadable",
+            format!("{}: {e}", path.display()),
+        )
+    })?;
+    let executable_sha256 = sha256_file(&path)?;
+    let mut command = std::process::Command::new(&path);
+    command
+        .args(["version", "--json"])
+        .env_clear()
+        .envs(environment.iter().map(|(k, v)| (k, v)));
+    let output = output_within(command, PRODUCT_VERSION_DEADLINE).map_err(|e| {
+        RunnerError::new(
+            "product_binary_unreadable",
+            format!("could not run `{} version --json`: {e}", path.display()),
+        )
+    })?;
+    if !output.status.success() {
+        return Err(RunnerError::new(
+            "product_binary_unreadable",
+            format!(
+                "`{} version --json` exited {}; stderr: {}",
+                path.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    #[derive(Deserialize)]
+    struct InternalSchema {
+        writes: u32,
+    }
+    #[derive(Deserialize)]
+    struct Version {
+        version: String,
+        commit: Option<String>,
+        http_contract: String,
+        internal_schema: InternalSchema,
+    }
+    let version: Version = serde_json::from_slice(&output.stdout).map_err(|e| {
+        RunnerError::new(
+            "product_binary_unreadable",
+            format!(
+                "`{} version --json` exited {} without a version document: {e}; stderr: {}",
+                path.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    })?;
+    let expected = StorageFormatV1::current().internal_schema_version;
+    if version.internal_schema.writes != expected {
+        return Err(RunnerError::new(
+            "product_schema_mismatch",
+            format!(
+                "{} writes internal schema v{}; the store's bases are built by this harness at v{expected}",
+                path.display(),
+                version.internal_schema.writes
+            ),
+        ));
+    }
+    if let (Some(requested), Some(built)) = (&requested_commit, &version.commit)
+        && requested != built
+    {
+        return Err(RunnerError::new(
+            "product_commit_mismatch",
+            format!(
+                "{} says it was built from {built}; the run names {requested}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(ProductBinary {
+        path,
+        package_version: version.version,
+        http_contract: version.http_contract,
+        internal_schema_writes: version.internal_schema.writes,
+        executable_sha256,
+        source_commit: version.commit,
+        requested_commit,
+    })
+}
+
+/// The environment a `--store` run's children and the product's `version`
+/// call inherit from this process.
+pub fn product_environment() -> Vec<(String, String)> {
+    child_environment()
+}
+
+/// A `--store` run: the point's frozen base acquired from the store (built
+/// there when absent), then one empty clone per repetition handed to a worker
+/// that drives the product binary over it and deleted once its sample holds.
+fn execute_clone_owned(
+    run: crate::suite::ResolvedRun,
+    plan: PlannedGqt,
+    options: &RunOptions,
+    store_text: &str,
+) -> RunnerResult<RunExecution> {
+    if plan.definition.protocol.reset != ResetMode::Clone {
+        return Err(failure("--store runs the clone reset level only"));
+    }
+    let scratch = options
+        .scratch_root
+        .as_ref()
+        .or(options.dataset_cache.as_ref())
+        .ok_or_else(|| failure("a clone-reset run requires a scratch directory"))?;
+    std::fs::create_dir_all(scratch).map_err(failure)?;
+    let scratch = scratch.canonicalize().map_err(failure)?;
+    let workspace = tempfile::Builder::new()
+        .prefix("gqt-clone-")
+        .tempdir_in(scratch)
+        .map_err(failure)?;
+    let worker = crate::runner::stage_bound_worker(
+        crate::runner::resolve_bound_worker(
+            options
+                .worker_executable
+                .as_deref()
+                .ok_or_else(|| failure("worker executable required"))?,
+        )?,
+        workspace.path(),
+    )?;
+    let store = FixtureStore::open(store_text)?;
+    let (environment, observed_backend) =
+        match (&plan.definition.environment.backend, store.location()) {
+            (
+                Backend::LocalFs {
+                    filesystem,
+                    storage_class,
+                },
+                StoreLocation::Local { path },
+            ) => (
+                Some(
+                    crate::environment::verify_local_environment(path, *filesystem, *storage_class)
+                        .map_err(failure)?,
+                ),
+                None,
+            ),
+            (
+                Backend::S3 {
+                    implementation,
+                    implementation_version,
+                    region,
+                    storage_class,
+                    versioning,
+                    image_digest,
+                },
+                StoreLocation::S3 { .. },
+            ) => (
+                None,
+                Some(ObservedBackendV1::S3 {
+                    implementation: *implementation,
+                    implementation_version: implementation_version.clone(),
+                    region: region.clone(),
+                    storage_class: storage_class.clone(),
+                    versioning: *versioning,
+                    image_digest: image_digest.clone(),
+                    probe: "declared".into(),
+                }),
+            ),
+            _ => {
+                return Err(failure(
+                    "the store's kind and the point's declared backend disagree",
+                ));
+            }
+        };
+    let child_environment = child_environment();
+    let product = resolve_product(options, &child_environment)?;
+    let binding = binding(&plan.dataset, &options.fixture_bindings)?;
+    let build_plan = plan.dataset_build_plan().map_err(failure)?;
+    let base = block_on_own_thread(store.acquire_base(
+        &build_plan,
+        workspace.path(),
+        binding,
+        options.no_build,
+    ))??;
+    let base_manifest_sha256 = crate::model::typed_sha256(&base.manifest).map_err(failure)?;
+    let bound = plan
+        .bind(
+            &base.manifest.summary.logical_content_sha256,
+            &base.manifest.summary.algorithm,
+        )
+        .map_err(failure)?;
+    let run_id = ulid::Ulid::new().to_string();
+    let mut samples = Vec::new();
+    let mut machine = None;
+    let mut build = None;
+    let mut contained = true;
+    let acquisition = (|| -> RunnerResult<()> {
+        for repetition in 1..=run.repetitions {
+            let clone = block_on_own_thread(store.empty_clone(&run_id, repetition))??;
+            let worker_scratch_root = workspace
+                .path()
+                .join(format!("worker-scratch-{repetition:08}"));
+            std::fs::create_dir(&worker_scratch_root).map_err(failure)?;
+            let execution = RepetitionInputV2::Clone {
+                input: Box::new(CloneInput {
+                    store_uri: store.uri(),
+                    base_root_uri: base.root_uri.clone(),
+                    base_manifest_sha256: base_manifest_sha256.clone(),
+                    clone: clone.clone(),
+                    product: product.path.clone(),
+                    product_sha256: product.executable_sha256.clone(),
+                    environment: child_environment.clone(),
+                }),
+            };
+            let proof = execution.proof().map_err(failure)?;
+            let observed = crate::gqt_supervisor::supervise_repetition(
+                crate::gqt_supervisor::SupervisionInput {
+                    worker_executable: worker.executable.clone(),
+                    expected_worker_executable_sha256: worker.executable_sha256.clone(),
+                    expected_machine: machine.clone(),
+                    repetition,
+                    case: bound.clone(),
+                    execution,
+                    worker_scratch_root: worker_scratch_root.clone(),
+                    deadline: plan
+                        .definition
+                        .protocol
+                        .deadline_seconds
+                        .map(Duration::from_secs),
+                    #[cfg(test)]
+                    auxiliary_deadline_override: None,
+                },
+            );
+            match observed {
+                Ok(observed) => {
+                    validate_sample(
+                        &observed.sample,
+                        &bound,
+                        repetition,
+                        &proof,
+                        observed.sample.elapsed_us,
+                        true,
+                    )?;
+                    machine = Some(observed.machine);
+                    build = Some(observed.worker_build);
+                    samples.push(observed.sample);
+                    std::fs::remove_dir_all(worker_scratch_root).map_err(failure)?;
+                    block_on_own_thread(store.delete_clone(&clone))??;
+                }
+                Err(mut error) => {
+                    contained = crate::dataset_cache::contained(&error);
+                    if contained {
+                        if let Err(removal) =
+                            block_on_own_thread(store.delete_clone(&clone)).and_then(|inner| inner)
+                        {
+                            error.message.push_str(&format!(
+                                "; clone {} could not be removed: {}",
+                                clone.uri, removal.message
+                            ));
+                        }
+                    } else {
+                        if let Err(marker) = crate::dataset_cache::quarantine_directory(
+                            workspace.path(),
+                            &error.message,
+                        ) {
+                            error.message.push_str(&format!(
+                                "; quarantine marker failed: {}",
+                                marker.message
+                            ));
+                        }
+                        error
+                            .message
+                            .push_str(&format!("; clone {} is left for inspection", clone.uri));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        block_on_own_thread(store.verify_base(&base))??;
+        Ok(())
+    })();
+    if !contained {
+        let _ = workspace.keep();
+    }
+    if samples.is_empty() {
+        return Err(acquisition
+            .err()
+            .unwrap_or_else(|| failure("empty acquisition")));
+    }
+    let wall_clock = summarize_wall_clock(&samples);
+    let execution = RunExecution {
+        runner_output_version: 1,
+        case_id: plan.definition.id.clone(),
+        case_path: run.case_path,
+        point_id: bound.point_id.clone(),
+        point_name: bound.point_name.clone(),
+        requested_repetitions: run.repetitions,
+        bound,
+        build: crate::runner::build_evidence(build.as_ref())?,
+        machine: machine.ok_or_else(|| failure("no worker identity"))?,
+        environment,
+        fixture: None,
+        dataset_cache_hit: Some(base.cache_hit),
+        server_receipt: None,
+        base: Some(base.manifest),
+        product: Some(product),
+        observed_backend,
         samples,
         wall_clock,
         durable_record: false,

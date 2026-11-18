@@ -139,7 +139,7 @@ impl FrozenSource {
         if self.text.len() > MAX_SOURCE_BYTES || sha256_bytes(self.text.as_bytes()) != self.sha256 {
             return Err("GQT source digest or size does not match frozen input".into());
         }
-        omnigraph_gqt_core::parse_case(&self.stem, &self.text)
+        omnigraph_gqt_core::parse_case(&self.stem, &self.text).map_err(String::from)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +229,7 @@ fn validate_recipe(recipe: &DatasetRecipe) -> Result<Case, String> {
         }
     };
     admit_environment(&case)?;
+    case.admit_lasting_store()?;
     Ok(case)
 }
 pub fn dataset_file(
@@ -354,10 +355,11 @@ impl PlannedGqt {
         validate_definition(&self.definition)?;
         let queries = self.queries.parse()?;
         let dataset = validate_recipe(&self.dataset)?;
-        let condition = admit_target_queries(
+        let condition = admit_point_queries(
             &queries,
             &self.definition.workload.measured_step,
             self.definition.environment.target,
+            self.definition.protocol.reset,
         )?;
         if self.definition.environment.target == Target::Server {
             if matches!(self.dataset, DatasetRecipe::Registered { .. }) || self.needs_indices {
@@ -418,8 +420,10 @@ pub fn validate_definition(c: &GqtCaseV1) -> Result<(), String> {
             "gqt-v1 requires a manual local reset and a null or 1..=3600 second deadline".into(),
         );
     }
-    if !matches!(c.environment.backend, Backend::LocalFs { .. }) {
-        return Err("gqt-v1 supports local-filesystem only".into());
+    if matches!(c.environment.backend, Backend::S3 { .. })
+        && (c.environment.target != Target::Engine || c.protocol.reset != ResetMode::Clone)
+    {
+        return Err("gqt-v1 reaches an S3 store embedded and under reset: clone only".into());
     }
     match c.environment.target {
         Target::Engine => {
@@ -510,10 +514,11 @@ pub fn load_with_root(
         planned_sha256: String::new(),
         case_digest: typed_sha256(&definition).map_err(|e| e.to_string())?,
         recipe_sha256: recipe_hash(&dataset)?,
-        cache_condition: admit_target_queries(
+        cache_condition: admit_point_queries(
             &parsed_queries,
             &definition.workload.measured_step,
             definition.environment.target,
+            definition.protocol.reset,
         )?,
         needs_indices: parsed_queries.needs_indices || parsed_dataset.needs_indices,
         definition,
@@ -579,16 +584,35 @@ pub(crate) fn admit_target_queries(
     selected: &MeasuredStep,
     target: Target,
 ) -> Result<CacheCondition, String> {
+    admit_point_queries(case, selected, target, ResetMode::None)
+}
+/// [`admit_target_queries`] for a point whose reset level is known: under
+/// the clone reset every step is its own `omnigraph` process, which the
+/// process route's admission and the derived cache condition both state.
+pub(crate) fn admit_point_queries(
+    case: &Case,
+    selected: &MeasuredStep,
+    target: Target,
+    reset: ResetMode,
+) -> Result<CacheCondition, String> {
     admit_target_environment(case, target)?;
+    let process = match (target, reset) {
+        (Target::Server, _) => ProcessLifecycle::LongRunningServer,
+        (Target::Engine, ResetMode::Clone) => ProcessLifecycle::FreshPerStep,
+        (Target::Engine, _) => ProcessLifecycle::FreshPerRepetition,
+    };
+    if process == ProcessLifecycle::FreshPerStep {
+        omnigraph_gqt_core::admit_process_workload(case, selected.ordinal)?;
+    }
     if target == Target::Server {
-        omnigraph_gqt_core::admit_served(case)?;
+        omnigraph_gqt_core::admit_served_workload(case, selected.ordinal)?;
         workload_steps(case)?;
         for step in case.items.iter().flat_map(|item| match item {
             Item::Step(step) => std::slice::from_ref(step),
             Item::Loop { steps, .. } => steps.as_slice(),
         }) {
             let ordinal = step.ordinal();
-            if let Some(refusal) = served_step_refusal(step) {
+            if let Some(refusal) = served_step_refusal(step, selected.ordinal) {
                 return Err(format!(
                     "step {ordinal} ({}) {refusal}",
                     served_step_label(step)
@@ -604,6 +628,7 @@ pub(crate) fn admit_target_queries(
             }
         }
     }
+    case.admit_lasting_store()?;
     if case.fixture.is_some() {
         return Err("queries must omit schema and seed".into());
     }
@@ -682,10 +707,6 @@ pub(crate) fn admit_target_queries(
             "queries require explicit verification steps after the measured operation".into(),
         );
     }
-    let process = match target {
-        Target::Engine => ProcessLifecycle::FreshPerRepetition,
-        Target::Server => ProcessLifecycle::LongRunningServer,
-    };
     Ok(CacheCondition {
         process,
         engine: engine_preparation(reopened, reads, process),
@@ -725,10 +746,11 @@ pub fn override_sources(
         DatasetRecipe::Gqt { source } => source.parse()?,
         DatasetRecipe::Registered { preparation, .. } => preparation.parse()?,
     };
-    plan.cache_condition = admit_target_queries(
+    plan.cache_condition = admit_point_queries(
         &parsed,
         &plan.definition.workload.measured_step,
         plan.definition.environment.target,
+        plan.definition.protocol.reset,
     )?;
     plan.needs_indices = dataset.needs_indices || parsed.needs_indices;
     plan.recipe_sha256 = recipe_hash(&plan.dataset)?;
@@ -767,13 +789,15 @@ fn served_step_label(step: &Step) -> &'static str {
 /// graph is provisioned once and shared by every repetition, so a step may
 /// read, write an unpublished commit (`as commit`, which advances no head),
 /// or drop a commit this workload bound; anything that moves a head, loads,
-/// or publishes would change the graph for the next repetition.
-pub(crate) fn served_step_refusal(step: &Step) -> Option<String> {
+/// or publishes would change the graph for the next repetition. A restart
+/// after the measured step is the long-running lifecycle's no-op.
+pub(crate) fn served_step_refusal(step: &Step, measured: usize) -> Option<String> {
     let kind = step.operation_kind();
     if SERVED_READ_KINDS.contains(&kind) {
         return None;
     }
     match kind {
+        StepKind::Restart if step.ordinal() > measured => None,
         StepKind::Mutate | StepKind::BranchMerge if step.as_commit() => None,
         StepKind::Mutate | StepKind::BranchMerge => Some(
             "advances a branch head; reset:none admits a served write only as an unpublished commit (`as commit`), verified at its snapshot and dropped".into(),
@@ -795,10 +819,14 @@ pub(crate) fn engine_preparation(
     process: ProcessLifecycle,
 ) -> EnginePreparation {
     match (reopened, reads, process) {
-        (true, _, _) => EnginePreparation::ReopenedAfterProgram,
+        (true, _, _) | (false, 1.., ProcessLifecycle::FreshPerStep) => {
+            EnginePreparation::ReopenedAfterProgram
+        }
         (false, 1.., _) => EnginePreparation::WarmedByProgram,
         (false, 0, ProcessLifecycle::LongRunningServer) => EnginePreparation::Uncontrolled,
-        (false, 0, ProcessLifecycle::FreshPerRepetition) => EnginePreparation::PreparationOnly,
+        (false, 0, ProcessLifecycle::FreshPerRepetition | ProcessLifecycle::FreshPerStep) => {
+            EnginePreparation::PreparationOnly
+        }
     }
 }
 
@@ -863,6 +891,22 @@ pub fn validate_point_spec(spec: &GqtPointIdentityV1) -> Result<(), String> {
                         WarmupProgram::GqtReadSetV1,
                         1..=4096
                     )
+            )
+    } else if spec.protocol.reset == ResetMode::Clone {
+        c.process == ProcessLifecycle::FreshPerStep
+            && matches!(
+                (c.engine, c.page_cache, c.program, c.iterations),
+                (
+                    EnginePreparation::PreparationOnly,
+                    PageCacheCondition::Uncontrolled,
+                    WarmupProgram::None,
+                    0,
+                ) | (
+                    EnginePreparation::ReopenedAfterProgram,
+                    PageCacheCondition::ProgramConditioned,
+                    WarmupProgram::GqtReadSetV1,
+                    1..=4096,
+                )
             )
     } else {
         c.process == ProcessLifecycle::FreshPerRepetition
@@ -975,10 +1019,11 @@ pub fn explicit_pair_in_environment(
         case_digest: typed_sha256(&definition).map_err(|e| e.to_string())?,
         recipe_sha256: recipe_hash(&recipe)?,
         planned_sha256: String::new(),
-        cache_condition: admit_target_queries(
+        cache_condition: admit_point_queries(
             &query_case,
             &definition.workload.measured_step,
             definition.environment.target,
+            definition.protocol.reset,
         )?,
         needs_indices: query_case.needs_indices || dataset_case.needs_indices,
         definition,
@@ -990,6 +1035,8 @@ pub fn explicit_pair_in_environment(
     Ok(plan)
 }
 
+/// The admitted embedded pairs: the two restore levels on their filesystem,
+/// and `clone` on any local filesystem or S3 store.
 fn validate_backend_reset(backend: &Backend, reset: ResetMode) -> Result<(), String> {
     use crate::case::{LocalFilesystem, LocalStorageClass};
     if !matches!(
@@ -1006,9 +1053,14 @@ fn validate_backend_reset(backend: &Backend, reset: ResetMode) -> Result<(), Str
                 storage_class: LocalStorageClass::NvmeSsd
             },
             ResetMode::PlainCopy
+        ) | (
+            Backend::LocalFs { .. } | Backend::S3 { .. },
+            ResetMode::Clone
         )
     ) {
-        return Err("reset and declared backend do not match an admitted local environment".into());
+        return Err(
+            "reset and declared backend do not match an admitted embedded environment".into(),
+        );
     }
     Ok(())
 }

@@ -310,7 +310,7 @@ struct DeploymentId {
     sequence: u64,
 }
 
-fn canonical_ulid(part: &str) -> bool {
+pub(crate) fn canonical_ulid(part: &str) -> bool {
     part.parse::<Ulid>().is_ok_and(|id| id.to_string() == part)
 }
 
@@ -518,6 +518,9 @@ fn validate_projection(state: &ClusterState) -> Result<(), Diagnostic> {
             ResourceKind::Unknown => unreachable!("address was validated"),
         }
     }
+    // One bundle per scope, never both kinds in one: the rule every reader
+    // selects a bundle by, so a v2 ledger that breaks it is not read at all.
+    crate::policy_binding::PolicyBindings::of(resources)?;
     let mut diagnostics = Vec::new();
     if !validate_state_graph_resource_digests(state, &mut diagnostics) {
         return Err(diagnostics.remove(0));

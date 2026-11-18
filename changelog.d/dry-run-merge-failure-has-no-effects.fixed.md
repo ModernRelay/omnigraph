@@ -1,0 +1,1 @@
+- A `branch merge --dry-run` whose answer is lost, such as to a client deadline, now reports `effects: none` and exits 1, as a read does, instead of `effects: unknown` with `reconcile`.

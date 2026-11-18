@@ -180,7 +180,7 @@ async fn execute_fixture_request(request: FixtureRequestV1) -> FixtureResultV1 {
                 frozen.metadata_digest().clone(),
             )
         }
-        ResetMode::PlainCopy => {
+        ResetMode::PlainCopy | ResetMode::Clone => {
             let frozen = match freeze_plain_copy_template(
                 &request.active_root,
                 &request.template_root,
@@ -763,7 +763,7 @@ pub(crate) async fn build_dataset(
                 .await
                 .map_err(|e| e.to_string())?;
             let session = case_session(db, &case, Engine::V2)?;
-            seed_case(&session, &fixture.seed, plan.needs_indices).await?;
+            seed_case(&session, fixture, plan.needs_indices).await?;
             (session, case, None)
         }
         DatasetRecipe::Registered {
@@ -803,7 +803,10 @@ pub(crate) async fn build_dataset(
                 Engine::V2,
             )?;
             if plan.needs_indices {
-                session.ensure_indices().await.map_err(|e| e.to_string())?;
+                session
+                    .ensure_indices_as(None)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             (session, case, Some(exact))
         }

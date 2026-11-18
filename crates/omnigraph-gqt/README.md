@@ -73,6 +73,25 @@ such a run still does not replay, since the root is not frozen by the report.
 Direct-engine memory storage and cloud fixture initialization fail admission
 explicitly.
 
+`--base <URI>` beside `--store` opens the store root as a shallow clone of the
+graph at the base (`Omnigraph::open_clone`, the graph shallow clone RFC): the
+root starts empty, or as the clone an earlier run left there, every read of an
+object it does not hold falls through to the base, every write and every
+delete marker lands under the root, and the base is never written. Both are
+roots of one backend, `file://` directories or `s3://` prefixes of one
+endpoint. The root is the caller's to get right: a root that holds another
+graph, or a clone root built over another base, is not detected (the RFC,
+What a caller observes) and answers from what it holds. It is admitted on the
+direct engine only: `--base` without `--store`,
+beside `--server`, or with a DST environment selected is refused. A
+`--- restart` reopens the root over the same base. The cases under
+`tests/fixtures/runner/clone/` are the RFC's first four observations run with
+both options over a base that holds a branch beside `main` (the first case,
+run with `--store` alone, gives it that branch): a clone reads the branch,
+deletes it, and after a restart still lacks it, while the base and a second
+clone keep it; `runner_dispatch` runs them over a local base and, with
+`OMNIGRAPH_S3_TEST_BUCKET`, against a bucket.
+
 With `--server <URL> --graph <ID>` (plus `--token <TOKEN>` on a
 token-protected deployment), the declared `omnigraph-server` environments run
 against that server and nothing else is selected: each step travels to the
@@ -94,7 +113,7 @@ runner implements it. The declared `storage` is recorded, not checked: no
 route reports the server's backend. Refused before any request, by name: `--- restart`,
 `--- concurrent`, seam directives, settings steps and settings prefixes on a
 control or `show` step, `--- expect plan`, `--- expect same as v1`, the
-`# traversal:` pin, and queries that need indices (`search`, `fuzzy`,
+`# traversal:` pin, the `# writer:` pin, and queries that need indices (`search`, `fuzzy`,
 `nearest`, `rrf`). The `--- expect shape` section is not judged under a
 server target: it holds the executor's Arrow schema against the compiler's,
 which no wire answer carries. `--server` is exclusive with `--store`, and a
@@ -265,6 +284,35 @@ in generator bodies and headers is refused. Seed headers require an explicit
 unsigned 64-bit seed and `generate: v1`; load headers additionally require a
 mode. A load requires at least one nonempty batch; empty recipes are admitted
 only as seeds. Unknown, repeated or inapplicable arguments are refused.
+
+A third fixture section may follow the seed. `--- branches generate: v1
+seed: <u64> count: <n> prefix: <name> [from: <branch>]` declares `count`
+branches named `<prefix>0` to `<prefix><count-1>`, forked from `from`
+(default `main`) after the seed has loaded and, under a `# traversal:` pin,
+after its indexes are built, each then loaded with the
+section's recipe in append mode, `${branch}` in the recipe bound to that
+branch's name; an empty body forks bare branches, and a recipe that loads
+nothing is refused as a load's is. `${branch}` is replaced as text before
+the recipe is read as YAML, so inside a flow mapping it is quoted as the
+YAML needs. It is state the case
+declares, built before step 1 on every route, so no step, label, report
+row, measure row or DST observation names it; a failure is a setup failure
+as a seed's is. `count` is in `1..=10000`, the loop's cap. `${branch}` is
+the only marker the body admits, and the recipe is validated once with the
+longest name substituted; a `${` in the header is refused as on any header
+line. The section is refused before `--- seed`, after any step, and twice:
+
+```yaml
+--- branches generate: v1 seed: 0 count: 64 prefix: w from: main
+tables:
+  - kind: node
+    name: Chunk
+    rows: 4
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: ${branch}-, width: 3}
+      n: {kind: ordinal, start: 0, step: 1}
+```
 
 Each table requires `kind: node|edge`, `name`, `rows`, `commits` and `columns`.
 `start` defaults to zero; row `i` has ordinal `start + i`. Optional `wrap`
@@ -657,6 +705,19 @@ overwrite chunk holds before a Lance writer takes it, Lance's file target
 fragments before its last record is judged and pins what a late refusal leaves
 behind. An in-process pin: a server target refuses it.
 
+The optional `# writer: held` header makes the case's process the writer of
+`main`: the runner claims the branch's writer epoch through
+`Omnigraph::claim_branch_writer` once the fixture has loaded and before the
+first step, so every step runs on a held branch, and a `--- restart` reopens
+a handle of the process that still holds it. `held` is the only value. The
+claim is one `__manifest` version outside every step: it moves no head and
+no measured step carries its requests; under `--measure` they are the `setup`
+label's. The pin runs on the case's own schema and seed only: `--store`
+refuses it, and so do a bench dataset recipe and a bench workload file,
+because the claim would stay in a store the case does not own and no command
+claims a branch back in this release. An in-process pin: no route claims, so a
+server target refuses it.
+
 An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`
@@ -836,7 +897,47 @@ cargo run --bin omnigraph-gqt -- --replay ../../target/gqt-artifacts/invocation-
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --trace
 cargo run --bin omnigraph-gqt -- --store file:///path/to/graph /path/to/queries.gqt
+cargo run --bin omnigraph-gqt -- --check cases/dst_restart_preserves_rows.gqt
+cargo run --bin omnigraph-gqt -- --check --json cases/
+cargo run --bin omnigraph-gqt -- --explain missing_expect
+cargo run --bin omnigraph-gqt -- --grammar
+cargo run --bin omnigraph-gqt -- --version
 ```
+
+`--check <case.gqt|dir>...` parses every case named and runs nothing: it
+prints every format error the case carries, one `path:line: code: message`
+line per error with the source line quoted under it and the fix under that,
+`ok <path>` for a clean case, and exits 1 when any file has an error. Beside
+the parser's rules it applies the corpus admission the runner would refuse on
+(`timeout_ms` above 10000 under `cases/`, for a case named there or resolved
+there through a link). It reads a case as a run does, so a file the run
+refuses to read (not a regular file, over 256 MiB, not UTF-8) is one error
+under its path. A directory that holds no case is one error under its own
+path; the other paths are still checked, and the exit is 1. `--json` prints
+one JSON object per file or refused path,
+`{"gqt_format", "path", "errors": [{"code", "line", "source", "message", "fix"}]}`,
+for tools. The refusal of a run (`refused: …`) carries the same text, one
+`invalid_case:` line per error. `--corpus` reads every named case as a
+member of the required corpus wherever it lives, so a case drafted outside
+`cases/` hears the corpus cap before it moves in.
+
+Every error carries a code, the stable name of the rule it breaks, and a
+fix, the line to write. `--explain <code>` prints the rule and, beside a
+source tree, the case under `crates/omnigraph-gqt-core/tests/invalid/` that
+demonstrates it with the errors `--check` reports for it. That directory is
+the negative corpus: one case per rule, broken on purpose at a known line,
+and a library test holds the (code, line) pairs each one must report, so a
+rule that moves, drops or misnames its error is a red test, and a new code
+without a case is one too.
+
+`--grammar` prints the surface of the case format: its version, the header
+keys, the section kinds, the expect modes, the corpus cap and every rule
+under its code. `crates/omnigraph-gqt-core/tests/grammar/v<N>.txt` pins that
+text, so a change to the surface is a diff in review; a change a case
+written for the previous version would not survive is a new version.
+`--version` names the binary's crate version and the format version it
+reads, and every `--check --json` object carries the latter as
+`gqt_format`.
 
 `--store` may precede or follow the case paths. External-store reports retain
 the URI and step evidence, but cannot replay: the report does not freeze the

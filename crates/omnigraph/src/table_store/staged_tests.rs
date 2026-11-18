@@ -856,6 +856,264 @@ async fn keyed_upsert_stamps_no_by_source_delete_marker_and_persists_it() {
     );
 }
 
+/// Issue #1248: with an id BTREE, an upsert whose rows are all new stages the
+/// join-free absence-proven insert and one whose rows are all present stages a
+/// known-present update; neither pays Lance's full-table merge join. A mixed
+/// batch, or a table without the BTREE, keeps the join.
+#[tokio::test]
+async fn upsert_skips_the_merge_join_when_the_id_btree_decides_its_rows_issue_1248() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let mut ds = TableStore::write_dataset(
+        &uri,
+        person_pk_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+    )
+    .await
+    .unwrap();
+
+    let upsert = |ds: Dataset, rows: &'static [(&'static str, Option<i32>)]| {
+        let probes = MergeWriteProbes::default();
+        let staged = with_merge_write_probes(
+            probes.clone(),
+            store.stage_keyed_write(
+                ds,
+                "Person",
+                person_pk_batch(rows),
+                KeyedWriteSemantics::Upsert,
+                SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
+            ),
+        );
+        async move { (staged.await.unwrap(), probes) }
+    };
+    let routes = |probes: &MergeWriteProbes| {
+        (
+            probes.stage_merge_insert_calls(),
+            probes.stage_fenced_insert_calls(),
+            probes.stage_known_present_update_calls(),
+        )
+    };
+
+    let (_, unindexed) = upsert(ds.clone(), &[("carol", Some(40))]).await;
+    assert_eq!(
+        routes(&unindexed),
+        (1, 0, 0),
+        "without the BTREE the probe would read every id, so the join stays"
+    );
+
+    ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("id_idx".to_string())
+        .await
+        .unwrap();
+
+    let (staged, all_new) = upsert(ds.clone(), &[("carol", Some(40))]).await;
+    assert_eq!(routes(&all_new), (0, 1, 0), "all new: the fenced insert");
+    assert!(
+        super::has_insert_absence_certificate(&staged.transaction),
+        "the all-new upsert carries the absence certificate"
+    );
+
+    let (_, all_present) = upsert(ds.clone(), &[("alice", Some(31)), ("bob", Some(26))]).await;
+    assert_eq!(
+        routes(&all_present),
+        (0, 0, 1),
+        "all present: the known-present update"
+    );
+
+    let (_, mixed) = upsert(ds.clone(), &[("alice", Some(32)), ("dave", Some(50))]).await;
+    assert_eq!(routes(&mixed), (1, 0, 0), "a mixed batch keeps the join");
+}
+
+/// Issue #1248: Lance's indexed merge route scans each fragment the id BTREE
+/// leaves uncovered for every source column, so an all-present upsert takes
+/// it only while that tail's recorded data files fit
+/// `KNOWN_PRESENT_TAIL_MAX_BYTES`. A wide tail keeps the id join, whose read
+/// does not grow with the row width; a narrow tail of the same fragment count
+/// still switches.
+#[tokio::test]
+async fn all_present_upsert_keeps_the_join_over_a_wide_uncovered_tail_issue_1248() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    // Two covered fragments, then one uncovered fragment of `tail` rows.
+    let table = |name: &'static str, tail: Vec<String>| {
+        let uri = format!("{}/{name}.lance", dir.path().to_str().unwrap());
+        async move {
+            let ds = TableStore::write_dataset(
+                &uri,
+                person_pk_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+            )
+            .await
+            .unwrap();
+            let mut ds = TableStore::append_or_create_batch(
+                &uri,
+                Some(ds),
+                person_pk_batch(&[("erin", Some(20))]),
+            )
+            .await
+            .unwrap();
+            ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+                .name("id_idx".to_string())
+                .await
+                .unwrap();
+            let ds = Dataset::open(&uri).await.unwrap();
+            let rows: Vec<(&str, Option<i32>)> =
+                tail.iter().map(|id| (id.as_str(), Some(1))).collect();
+            TableStore::append_or_create_batch(&uri, Some(ds), person_pk_batch(&rows))
+                .await
+                .unwrap()
+        }
+    };
+    let route = |ds: Dataset| {
+        let probes = MergeWriteProbes::default();
+        let staged = with_merge_write_probes(
+            probes.clone(),
+            store.stage_keyed_write(
+                ds,
+                "Person",
+                person_pk_batch(&[("alice", Some(31))]),
+                KeyedWriteSemantics::Upsert,
+                SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
+            ),
+        );
+        async move {
+            staged.await.unwrap();
+            (
+                probes.stage_merge_insert_calls(),
+                probes.stage_fenced_insert_calls(),
+                probes.stage_known_present_update_calls(),
+            )
+        }
+    };
+    // Ids of pseudo-random hex, so the data files stay above the budget
+    // after Lance compresses them.
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let wide: Vec<String> = (0..3_000)
+        .map(|row| {
+            let mut id = format!("wide-{row}-");
+            while id.len() < 1_024 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                id.push_str(&format!("{seed:016x}"));
+            }
+            id
+        })
+        .collect();
+
+    let narrow = table("narrow", vec!["frank".to_string()]).await;
+    let tail = crate::dataset_index::key_column_uncovered_tail(&narrow, "id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.fragments, 1);
+    assert!(tail.data_file_bytes.unwrap() <= super::KNOWN_PRESENT_TAIL_MAX_BYTES);
+    assert_eq!(
+        route(narrow).await,
+        (0, 0, 1),
+        "a narrow tail: the known-present update"
+    );
+
+    let wide = table("wide", wide).await;
+    let tail = crate::dataset_index::key_column_uncovered_tail(&wide, "id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.fragments, 1);
+    assert!(
+        tail.data_file_bytes.unwrap() > super::KNOWN_PRESENT_TAIL_MAX_BYTES,
+        "the wide tail holds {:?} bytes",
+        tail.data_file_bytes
+    );
+    assert_eq!(
+        route(wide).await,
+        (1, 0, 0),
+        "a tail above the byte budget keeps the join"
+    );
+}
+
+/// Issue #1225: Lance plans the upsert probe's `IN` list once per fragment
+/// the id BTREE leaves uncovered, so the probe runs only while those copies
+/// hold at most one keyed batch of ids. One id past that edge keeps the join.
+#[tokio::test]
+async fn upsert_probe_runs_only_while_its_in_list_copies_fit_one_keyed_batch_issue_1225() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let mut ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("id_idx".to_string())
+        .await
+        .unwrap();
+    let ds = Dataset::open(&uri).await.unwrap();
+    let ds = TableStore::append_or_create_batch(&uri, Some(ds), person_pk_batch(&[("x1", None)]))
+        .await
+        .unwrap();
+    let ds = TableStore::append_or_create_batch(&uri, Some(ds), person_pk_batch(&[("x2", None)]))
+        .await
+        .unwrap();
+    let uncovered = crate::dataset_index::key_column_uncovered_tail(&ds, "id")
+        .await
+        .unwrap()
+        .unwrap()
+        .fragments;
+    assert_eq!(uncovered, 2);
+
+    let route = |count: usize| {
+        let ids: Vec<String> = (0..count).map(|row| format!("new-{row}")).collect();
+        let probes = MergeWriteProbes::default();
+        let ds = ds.clone();
+        let store = &store;
+        async move {
+            let rows: Vec<(&str, Option<i32>)> = ids.iter().map(|id| (id.as_str(), None)).collect();
+            with_merge_write_probes(
+                probes.clone(),
+                store.stage_keyed_write(
+                    ds,
+                    "Person",
+                    person_pk_batch(&rows),
+                    KeyedWriteSemantics::Upsert,
+                    SYSTEM_COLUMNS_LEGACY,
+                    WriteBudget::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            (
+                probes.stage_merge_insert_calls(),
+                probes.stage_fenced_insert_calls(),
+                probes.stage_known_present_update_calls(),
+            )
+        }
+    };
+    let edge = KEYED_WRITE_MAX_ROWS / uncovered;
+    assert_eq!(
+        route(edge).await,
+        (0, 1, 0),
+        "at the edge the probe runs and the new rows take the fenced insert"
+    );
+    assert_eq!(
+        route(edge + 1).await,
+        (1, 0, 0),
+        "one id past the edge skips the probe and keeps the join"
+    );
+}
+
 #[tokio::test]
 async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode_issue_1261() {
     let dir = tempfile::tempdir().unwrap();
@@ -3395,19 +3653,37 @@ fn compaction_blob_batch_rows_bounds_one_batch() {
 
 /// Lance applies a per-run source budget only to the tasks its own planner
 /// returns, so the dropped-column tasks the graph planner appends would run
-/// outside it: options that set any budget are refused before planning.
+/// outside it: options that set any budget are refused before planning. A
+/// plan is executed against the version it was made for: optimize plans a
+/// table once, measures that plan and hands it to staging, which refuses a
+/// plan of any other version instead of rewriting fragments it never chose.
 #[tokio::test]
 async fn table_compaction_planning_refuses_source_budgets() {
+    use crate::table_store::OptimizeStepLimit;
     use lance::dataset::optimize::CompactionOptions;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+    let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
         .await
         .unwrap();
 
     let unbudgeted = TableStore::plan_table_compaction(&ds, &CompactionOptions::default()).await;
     assert!(unbudgeted.is_ok(), "{unbudgeted:?}");
+    let stale = unbudgeted.unwrap();
+    let planned_at = ds.manifest.version;
+    lance_append_inline_local(&mut ds, person_batch(&[("bob", Some(31))])).await;
+    assert_ne!(ds.manifest.version, planned_at);
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    match store
+        .stage_compaction(&ds, stale, &OptimizeStepLimit::new(1))
+        .await
+    {
+        Err(OmniError::Manifest(manifest))
+            if manifest.kind == crate::error::ManifestErrorKind::Internal => {}
+        Err(other) => panic!("a plan of another version must be refused, got {other}"),
+        Ok(_) => panic!("a plan of another version was staged"),
+    }
 
     let budgets = [
         CompactionOptions {
@@ -3748,5 +4024,308 @@ async fn segments_of_one_btree_cover_together_issue_1298() {
         !crate::dataset_index::has_unindexed_fragments(&ds)
             .await
             .unwrap()
+    );
+}
+
+/// #1384: a table's compaction tasks run at once, as Lance's own
+/// `compact_files` runs them, instead of one after another. Each task waits
+/// at a two-party rendezvous inside its execution, so tasks that never
+/// overlap time out instead of passing on equal results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
+    use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
+    use crate::table_store::OptimizeStepLimit;
+    use lance::dataset::optimize::CompactionOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let mut ds = TableStore::write_dataset(&uri, person_batch(&[("p0", Some(0))]))
+        .await
+        .unwrap();
+    for id in 1..4 {
+        lance_append_inline_local(&mut ds, person_batch(&[(&format!("p{id}"), Some(id))])).await;
+    }
+    assert_eq!(ds.get_fragments().len(), 4);
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    // Two rows per output fragment: Lance plans two tasks of two fragments.
+    let options = CompactionOptions {
+        target_rows_per_fragment: 2,
+        ..CompactionOptions::default()
+    };
+    let plan = TableStore::plan_table_compaction(&ds, &options)
+        .await
+        .unwrap();
+    assert_eq!(plan.num_tasks(), 2, "the layout plans two tasks");
+
+    let probes = OptimizeStepProbes::rendezvous(2);
+    let staged = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        with_optimize_step_probes(
+            probes.clone(),
+            store.stage_compaction(&ds, plan.clone(), &OptimizeStepLimit::new(2)),
+        ),
+    )
+    .await
+    .expect("a table's two compaction tasks never ran at the same time")
+    .unwrap()
+    .expect("the plan has work");
+    assert_eq!(probes.entered(), 2);
+    assert_eq!(probes.peak_in_flight(), 2);
+
+    // Fragment ids follow task order, as when the tasks ran one by one.
+    let Operation::Rewrite { groups, .. } = &staged.staged.transaction.operation else {
+        panic!("compaction stages a Rewrite");
+    };
+    let old = groups
+        .iter()
+        .map(|group| group.old_fragments.iter().map(|f| f.id).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let new = groups
+        .iter()
+        .map(|group| group.new_fragments.iter().map(|f| f.id).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(old, vec![vec![0, 1], vec![2, 3]]);
+    assert_eq!(new, vec![vec![4], vec![5]]);
+
+    // A budget of one, the served path's, still runs them one at a time.
+    let probes = OptimizeStepProbes::rendezvous(1);
+    with_optimize_step_probes(
+        probes.clone(),
+        store.stage_compaction(&ds, plan, &OptimizeStepLimit::new(1)),
+    )
+    .await
+    .unwrap()
+    .expect("the plan has work");
+    assert_eq!(probes.entered(), 2);
+    assert_eq!(probes.peak_in_flight(), 1);
+}
+
+/// #1384: one `OptimizeStepLimit` bounds every heavy step taken through it,
+/// not only compaction tasks. Two tables' compaction tasks (two each) and two
+/// other tables' index links (each the fold of a lagging index) run within
+/// one budget of two, and never more than two execute at once. Each step
+/// waits at a two-party rendezvous, so a budget that serialized the steps
+/// would time out, and a step outside the budget (or a budget per table)
+/// would raise the peak above two. This test wires the steps itself; that
+/// optimize takes each table's compaction tasks, index fold and index build
+/// through its run's one budget is owned by
+/// `db::omnigraph::optimize::tests::optimize_takes_every_tables_heavy_steps_through_one_budget_issue_1384`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
+    use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
+    use crate::table_store::OptimizeStepLimit;
+    use lance::dataset::optimize::CompactionOptions;
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let store = TableStore::new(root, test_session());
+    // Four one-row fragments: two compaction tasks of two fragments each.
+    let compactable = |name: &'static str| async move {
+        let uri = format!("{root}/{name}.lance");
+        let mut ds = TableStore::write_dataset(&uri, person_batch(&[("p0", Some(0))]))
+            .await
+            .unwrap();
+        for id in 1..4 {
+            lance_append_inline_local(&mut ds, person_batch(&[(&format!("p{id}"), Some(id))]))
+                .await;
+        }
+        ds
+    };
+    // An id BTREE over the first fragment, then an appended fragment it does
+    // not cover: the fold rebuilds it.
+    let lagging = |name: &'static str| async move {
+        let uri = format!("{root}/{name}.lance");
+        let mut ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("id_idx".to_string())
+            .await
+            .unwrap();
+        let ds = Dataset::open(&uri).await.unwrap();
+        TableStore::append_or_create_batch(&uri, Some(ds), person_pk_batch(&[("bob", None)]))
+            .await
+            .unwrap()
+    };
+    let (first, second) = (compactable("first").await, compactable("second").await);
+    let (third, fourth) = (lagging("third").await, lagging("fourth").await);
+    let options = CompactionOptions {
+        target_rows_per_fragment: 2,
+        ..CompactionOptions::default()
+    };
+    let mut plans = Vec::new();
+    for ds in [&first, &second] {
+        let plan = TableStore::plan_table_compaction(ds, &options)
+            .await
+            .unwrap();
+        assert_eq!(plan.num_tasks(), 2, "the layout plans two tasks");
+        plans.push(plan);
+    }
+    let second_plan = plans.pop().unwrap();
+    let first_plan = plans.pop().unwrap();
+
+    let limit = OptimizeStepLimit::new(2);
+    let probes = OptimizeStepProbes::rendezvous(2);
+    let (first, second, third, fourth) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        with_optimize_step_probes(probes.clone(), async {
+            tokio::join!(
+                store.stage_compaction(&first, first_plan, &limit),
+                store.stage_compaction(&second, second_plan, &limit),
+                limit.run(store.stage_index_fold(&third)),
+                limit.run(store.stage_index_fold(&fourth)),
+            )
+        }),
+    )
+    .await
+    .expect("the run's steps never ran two at a time");
+    assert!(first.unwrap().is_some() && second.unwrap().is_some());
+    assert!(third.unwrap().staged.is_some() && fourth.unwrap().staged.is_some());
+    assert_eq!(probes.entered(), 6, "four compaction tasks and two folds");
+    assert_eq!(
+        probes.peak_in_flight(),
+        2,
+        "the steps of every table share the budget of two"
+    );
+}
+
+/// A lagging vector index is rebuilt whole. A column Lance cannot train (no
+/// finite, non-null vector left to train on: its typed `Unprocessable`) is
+/// skipped and reported, with the other lagging indexes still staged; any
+/// other failure of the rebuild is an error, so a storage fault is never
+/// reported as a column that cannot train.
+#[tokio::test]
+async fn index_fold_skips_only_a_vector_column_that_cannot_train() {
+    use arrow_array::{BooleanArray, FixedSizeListArray, Float32Array};
+    use arrow_schema::FieldRef;
+    use lance::index::DatasetIndexExt;
+    use lance::index::vector::VectorIndexParams;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    const DIMENSION: usize = 4;
+    let item: FieldRef = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(item.clone(), DIMENSION as i32),
+            true,
+        ),
+    ]));
+    // Rows `first..first + rows`, with a vector when `with_vectors`.
+    let batch = |first: usize, rows: usize, with_vectors: bool| {
+        let ids = StringArray::from(
+            (first..first + rows)
+                .map(|row| format!("v{row}"))
+                .collect::<Vec<_>>(),
+        );
+        let validity = BooleanArray::from(vec![with_vectors; rows]);
+        let vectors = FixedSizeListArray::new(
+            item.clone(),
+            DIMENSION as i32,
+            Arc::new(Float32Array::from(
+                (0..rows * DIMENSION)
+                    .map(|value| (first * DIMENSION + value) as f32)
+                    .collect::<Vec<_>>(),
+            )),
+            Some(validity.values().clone().into()),
+        );
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vectors)]).unwrap()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let store = TableStore::new(root, test_session());
+    // An embedding vector index (and, with `btree`, an id BTREE) over the
+    // first fragment, then an appended fragment no index covers: each lags.
+    let lagging = |name: &'static str, btree: bool, appended_vectors: bool| {
+        let batch = &batch;
+        async move {
+            let uri = format!("{root}/{name}.lance");
+            let mut ds = TableStore::write_dataset(&uri, batch(0, 8, true))
+                .await
+                .unwrap();
+            if btree {
+                ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+                    .name("id_idx".to_string())
+                    .await
+                    .unwrap();
+            }
+            ds.create_index_builder(
+                &["embedding"],
+                IndexType::Vector,
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+            )
+            .name("embedding_idx".to_string())
+            .await
+            .unwrap();
+            let ds = Dataset::open(&uri).await.unwrap();
+            let ds =
+                TableStore::append_or_create_batch(&uri, Some(ds), batch(8, 4, appended_vectors))
+                    .await
+                    .unwrap();
+            (uri, ds)
+        }
+    };
+
+    // The indexed rows are deleted and the appended ones hold no vector: the
+    // vector index lags over a column with nothing to train on.
+    let (uri, mut untrainable) = lagging("untrainable", true, false).await;
+    let indexed = (0..8)
+        .map(|row| format!("'v{row}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    untrainable
+        .delete(&format!("id IN ({indexed})"))
+        .await
+        .unwrap();
+    let untrainable = Dataset::open(&uri).await.unwrap();
+    assert_eq!(untrainable.count_rows(None).await.unwrap(), 4);
+    let reconciliation = store
+        .stage_index_reconciliation(&untrainable, &[])
+        .await
+        .unwrap();
+    assert_eq!(reconciliation.skipped.len(), 1, "the vector column");
+    let (column, reason) = &reconciliation.skipped[0];
+    assert_eq!(column, "embedding");
+    assert!(reason.contains("KMeans cannot train"), "{reason}");
+    assert_eq!(
+        reconciliation.refreshed,
+        vec![super::RefreshedIndex {
+            column: "id".to_string(),
+            vector: false,
+        }],
+        "the lagging BTREE is still rebuilt"
+    );
+    assert!(reconciliation.staged.is_some());
+
+    // A lagging vector index alone, over trainable vectors, with the
+    // appended fragment's data file gone: the rebuild fails on the read, and
+    // that is an error of the vector index's own rebuild.
+    let (uri, faulted) = lagging("faulted", false, true).await;
+    let appended = faulted
+        .get_fragments()
+        .into_iter()
+        .max_by_key(|fragment| fragment.id())
+        .unwrap();
+    let data_file = appended.metadata().files[0].path.clone();
+    std::fs::remove_file(format!("{uri}/data/{data_file}")).unwrap();
+    let error = match store.stage_index_reconciliation(&faulted, &[]).await {
+        Ok(reconciliation) => panic!(
+            "a rebuild that could not read its rows was reported as skipped {:?}",
+            reconciliation.skipped
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("stage_index_fold: fold index 'embedding_idx'"),
+        "{error}"
     );
 }

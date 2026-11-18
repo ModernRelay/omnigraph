@@ -36,13 +36,16 @@ pub(super) async fn graph_index_for_resolved(
         .await
 }
 
-pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<IndexBuildResult> {
+pub(super) async fn ensure_indices_as(
+    db: &Omnigraph,
+    actor: Option<&str>,
+) -> Result<IndexBuildResult> {
     let current_branch = db
         .coordinator
         .load_full()
         .current_branch()
         .map(str::to_string);
-    ensure_indices_on_as(db, current_branch.as_deref().unwrap_or("main"), None).await
+    ensure_indices_on_as(db, current_branch.as_deref().unwrap_or("main"), actor).await
 }
 
 pub(super) async fn ensure_indices_on_as(
@@ -53,7 +56,7 @@ pub(super) async fn ensure_indices_on_as(
     let branch = normalize_branch_name(branch)?;
     let public_branch = branch.as_deref().unwrap_or("main");
     db.enforce(
-        omnigraph_policy::PolicyAction::Change,
+        omnigraph_policy::PolicyAction::Maintain,
         &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
         actor,
     )?;
@@ -168,7 +171,7 @@ pub(super) async fn rebuild_full_text_indices_on_as(
     let branch = normalize_branch_name(branch)?;
     let public_branch = branch.as_deref().unwrap_or("main");
     db.enforce(
-        omnigraph_policy::PolicyAction::Change,
+        omnigraph_policy::PolicyAction::Maintain,
         &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
         actor,
     )?;
@@ -477,12 +480,12 @@ async fn maintain_indices_for_branch(
         .iter()
         .map(|target| (target.table_key.clone(), active_branch.clone()))
         .collect();
-    let _schema_permit = db.write_queue().acquire_schema_shared().await;
+    let _schema_permit = db.write_queue().acquire_schema_shared().await?;
     let _branch_guard = db
         .write_queue()
         .acquire_branch(active_branch.as_deref())
-        .await;
-    let _queue_guards = db.write_queue().acquire_many(&queue_keys).await;
+        .await?;
+    let _queue_guards = db.write_queue().acquire_many(&queue_keys).await?;
 
     let live_snapshot = db.revalidate_write_txn(&txn).await?;
     for target in &targets {
@@ -616,6 +619,7 @@ async fn maintain_indices_for_branch(
             &txn,
             lineage,
             Publication::Publish,
+            None,
         )
         .await?;
         Some(published.graph_commit_id)
@@ -715,6 +719,11 @@ fn full_text_columns(specs: &[crate::storage_layer::IndexBuildSpec]) -> Vec<&str
         .collect()
 }
 
+decide_seam! {
+    /// The metadata read used to report pending full-text coverage.
+    pub static FULL_TEXT_COVERAGE_READ = ("index.full_text_coverage_read", Unreachable, [Fail]);
+}
+
 /// Full-text coverage index maintenance leaves to the explicit rebuild: a
 /// full-text index whose segments leave a current fragment uncovered, or
 /// whose coverage is unknown. It is observable status, never folded
@@ -732,6 +741,7 @@ pub(super) async fn append_deferred_full_text_indexes(
 ) -> Result<()> {
     use lance::index::DatasetIndexInternalExt;
 
+    fail(&FULL_TEXT_COVERAGE_READ)?;
     let ds = snapshot.dataset();
     let indices = ds.load_indices().await.map_err(OmniError::storage)?;
     let full_text: std::collections::BTreeMap<_, _> = indices
@@ -1573,10 +1583,28 @@ async fn publish_prepared(
     }
 }
 
+/// What a publication's before-publish hook learns: the lineage intent's
+/// nonce, which every attempt's history id carries
+/// (`omnigraph_core::graph_commit_id::commit_id_answers` matches one to it),
+/// and the head every attempt must read.
+#[derive(Debug, Clone)]
+pub(crate) struct PublicationIntent {
+    pub(crate) nonce: String,
+    pub(crate) input_commit: Option<String>,
+    pub(crate) input_manifest_version: u64,
+}
+
+/// A hook the shared publication helper calls once before publishing.
+pub(crate) type BeforePublishHook<'a> = &'a (
+        dyn Fn(PublicationIntent) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync
+    );
+
 /// Commit updates with a publisher-level OCC fence. The
 /// `expected_table_versions` map asserts the manifest's pre-write per-table
 /// versions; mismatches surface as `ManifestConflictDetails::PublishedDatasetVersionMismatch`.
 /// `publication` chooses the head-advancing publish or an unpublished commit.
+/// `before_publish`, when given, runs once after the updates are prepared and
+/// before the publisher's first attempt; its failure publishes nothing.
 pub(super) async fn commit_updates_on_branch_with_expected(
     db: &Omnigraph,
     branch: Option<&str>,
@@ -1586,6 +1614,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     txn: &crate::db::WriteTxn,
     lineage_intent: crate::db::manifest::LineageIntent,
     publication: Publication,
+    before_publish: Option<BeforePublishHook<'_>>,
 ) -> Result<crate::db::GraphCommit> {
     if branch != txn.branch.as_deref() {
         return Err(OmniError::manifest_internal(
@@ -1598,6 +1627,25 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn))
         .await
         .map_err(OmniError::unpublished)?;
+
+    // Once, not per attempt: every attempt reads the same head and carries
+    // the same nonce, so another call would record no new fact. The hook runs
+    // before the coordinator lock, and the publisher has not been called, so
+    // whatever the hook's own error says, the graph did not move.
+    if let Some(before_publish) = before_publish {
+        before_publish(PublicationIntent {
+            nonce: lineage_intent.graph_commit_id.clone(),
+            input_commit: txn.authority.graph_head.clone(),
+            input_manifest_version: txn.base.graph_manifest_version(),
+        })
+        .await
+        .map_err(|error| {
+            error
+                .into_completion_evidence()
+                .0
+                .with_completion_evidence(crate::error::CompletionEvidence::Unpublished)
+        })?;
+    }
 
     debug_assert_eq!(lineage_intent.actor_id.as_deref(), actor_id);
     let changes = prepared
@@ -1759,8 +1807,4 @@ async fn demote_superseded_handles(
                 .await;
         }
     }
-}
-
-pub(super) async fn invalidate_graph_index(db: &Omnigraph) {
-    db.runtime_cache.invalidate_all().await;
 }

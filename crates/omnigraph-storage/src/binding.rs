@@ -403,6 +403,7 @@ impl CapturedStorageBinding {
                     omit_read_etag: false,
                     #[cfg(test)]
                     omit_write_etag: false,
+                    read_through: None,
                 };
                 Ok(match scope {
                     Some(scope) => adapter.with_scope(scope),

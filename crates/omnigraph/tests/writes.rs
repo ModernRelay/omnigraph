@@ -8,10 +8,9 @@
 //! What this file covers:
 //! - No `__run__*` branches are created by load or mutate.
 //! - Cancellation of a mutation future leaves no graph-level state.
-//! - A pre-effect branch-authority change makes an upsert mutation/load discard
-//!   and fully reprepare with a bounded retry; strict insert conflicts return
-//!   `KeyConflict`, while Update/Delete/Overwrite authority movement surfaces
-//!   `ReadSetChanged`. Post-effect failures require recovery.
+//! - A pre-effect branch-authority change makes a mutation or load of any kind
+//!   discard and fully reprepare with a bounded retry; strict insert conflicts
+//!   return `KeyConflict`. Post-effect failures require recovery.
 //! - Failed mutations and loads leave the target unchanged.
 //! - Multi-statement mutations are atomic (one commit per query).
 //! - actor_id propagates through to the commit graph.
@@ -3612,6 +3611,92 @@ query cascade_then_explicit($name: String, $other: String) {
         post_knows, 0,
         "both cascade + explicit delete must complete (Bob→Diana would survive if op-2 no-op'd)",
     );
+}
+
+/// A node delete's cascade reads the edge table through
+/// `validate::RemovalEdgeReads`: never one filter over every removed id,
+/// whose memory grew with removed ids times edge fragments (#1442). The
+/// removal holds more ids than one filter, so with no index every fragment
+/// is read whole once and matched in memory; after `ensure_indices`, the
+/// indexed fragments are probed one chunk of 8,192 ids per scan and the two
+/// appended since are matched. Either way: an edge whose
+/// deleted endpoint sits in the last chunk is found, an edge with both
+/// endpoints deleted (first chunk as `src`, last chunk as `dst`) is counted
+/// once, and a later `delete <Edge>` statement that selects that edge again
+/// skips it by its recorded row address.
+/// The scale symptom, peak RSS, is guarded by the `heavy-repro:` tests in
+/// `integration/repro_issue_1442.rs`.
+#[tokio::test]
+async fn delete_cascade_across_removed_id_chunks_counts_each_edge_once_issue_1442() {
+    const SCHEMA: &str = "\
+node Doc { slug: String @key }
+edge Link: Doc -> Doc
+";
+    const QUERY: &str = r#"
+query drop_docs($first: String) {
+    delete Doc where slug != "keep"
+    delete Link where from = $first
+}
+"#;
+    let removed = 2 * 8_192 + 5;
+    let first = format!("d{:07}", 0);
+    let middle = format!("d{:07}", 8_192 + 3);
+    let last = format!("d{:07}", removed - 1);
+
+    for indexed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = helpers::session(
+            Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+                .await
+                .unwrap(),
+        );
+        let mut input = vec![serde_json::json!({"type":"Doc","data":{"slug":"keep"}}).to_string()];
+        input.extend((0..removed).map(|i| {
+            serde_json::json!({"type":"Doc","data":{"slug":format!("d{i:07}")}}).to_string()
+        }));
+        db.load_jsonl(&input.join("\n"), LoadMode::Overwrite)
+            .await
+            .unwrap();
+        // One edge per append, so every edge is its own fragment.
+        let append = |from: &str, to: &str| {
+            serde_json::json!({"edge":"Link","from":from,"to":to}).to_string()
+        };
+        for (from, to) in [("keep", last.as_str()), (first.as_str(), last.as_str())] {
+            db.load_jsonl(&append(from, to), LoadMode::Append)
+                .await
+                .unwrap();
+        }
+        if indexed {
+            db.ensure_indices_as(None).await.unwrap();
+        }
+        for (from, to) in [("keep", middle.as_str()), ("keep", "keep")] {
+            db.load_jsonl(&append(from, to), LoadMode::Append)
+                .await
+                .unwrap();
+        }
+
+        let result = db
+            .mutate(
+                "main",
+                QUERY,
+                "drop_docs",
+                &params(&[("$first", first.as_str())]),
+            )
+            .await
+            .expect("a cascade over several removed-id chunks must succeed");
+        assert_eq!(result.affected_nodes, removed, "indexed: {indexed}");
+        assert_eq!(
+            result.affected_edges, 3,
+            "keep->{last}, {first}->{last} and keep->{middle} are cascaded once each; \
+             the explicit delete adds nothing (indexed: {indexed})"
+        );
+        assert_eq!(count_rows(&db, "node:Doc").await, 1);
+        assert_eq!(
+            count_rows(&db, "edge:Link").await,
+            1,
+            "only keep->keep survives (indexed: {indexed})"
+        );
+    }
 }
 
 /// The engine cardinality path must enforce `min` bounds. Pre-fix the

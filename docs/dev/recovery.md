@@ -36,10 +36,9 @@ leaves a table effect nothing to finish, so no writer, `cleanup` or open runs
 a reconciler over pins.
 
 A linear commit above `omnigraph.last_linear_version` is foreign: no read or
-write resolves it, `repair` reports the table as `foreign_drift` and never
-adopts it (`repair.rs`, `judge_against_last_linear_version`), and the
-collector deletes neither its manifest nor its files and lists it under
-`foreign_versions`.
+write resolves it and nothing adopts it, and the collector deletes neither its
+manifest nor its files and lists it under `foreign_versions`
+(`collector.rs`, `foreign_versions`), which `cleanup` reports per table.
 
 ## Schema contract publication
 
@@ -79,7 +78,7 @@ do not introduce historical schema-language semantics. See
 
 ## Pending storage conversion
 
-The offline upgrade to stamp 16, from stamp 8, 9 or 13, sets `UPGRADE_PENDING_KEY`
+The offline upgrade to stamp 17, from stamp 8, 9 or 13, sets `UPGRADE_PENDING_KEY`
 (`omnigraph:storage_upgrade_pending`) on main's `__manifest` from its fence
 commit to its activation commit; the value is the `UpgradeIntent`, whose
 `source_format` names the route. Ordinary

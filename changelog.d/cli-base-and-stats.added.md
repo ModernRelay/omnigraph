@@ -1,0 +1,1 @@
+- `omnigraph --base <root>` opens a graph shallow clone of a direct target over its frozen base; `--stats <path>` writes one document per invocation with its store calls, exit code and peak RSS.

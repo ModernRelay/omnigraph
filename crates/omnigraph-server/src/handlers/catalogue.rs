@@ -37,6 +37,7 @@ impl AppState {
                 .set(id, &value)
                 .map_err(|error| ApiError::bad_request(error.to_string()))?;
         }
+        crate::refuse_raised_budgets(scope.settings(), &self.process_defaults.settings)?;
         Ok(scope)
     }
 
@@ -70,7 +71,7 @@ pub(crate) async fn catalogue_query(
         )));
     }
     let file = classify(&request.query)?;
-    refuse_process_settings(&file.settings)?;
+    refuse_process_settings(&file.settings, &state.process_defaults.settings)?;
     refuse_empty_file(&file)?;
     let queries = match file.body {
         FileBody::Queries(queries) => queries,
