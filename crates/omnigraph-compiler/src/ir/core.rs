@@ -20,7 +20,7 @@
 //!
 //! Every node derives `PartialEq`: the desugaring-uniqueness test compares
 //! whole terms. Names are deterministic (fresh names come from a counter per
-//! declaration), so two spellings of one term compare equal.
+//! declaration, [`Fresh`]), so two spellings of one term compare equal.
 
 use super::expr::IRExpr;
 use crate::query::file::MutationWriteMode;
@@ -473,6 +473,8 @@ pub struct CoreRead {
     pub result: RelTy,
     /// `@budget(plan = n)`, or the compiler's constant.
     pub plan_budget: usize,
+    /// The names the type checker made up, with their roles.
+    pub fresh: Fresh,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -523,6 +525,8 @@ pub struct CoreWrite {
     pub groups: Vec<WriteGroup>,
     pub class: WriteClass,
     pub write_mode: MutationWriteMode,
+    /// As [`CoreRead::fresh`].
+    pub fresh: Fresh,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -599,14 +603,81 @@ impl MutationTarget {
     }
 }
 
-/// Whether `variable` is a name the type checker made up: an anonymous `_`
-/// endpoint or a fresh column. The query declares no such binding, so its
-/// identity orders nothing a reader can see.
-pub fn is_fresh_variable(variable: &str) -> bool {
-    variable.starts_with(ANON_PREFIX) || variable.starts_with(FRESH_PREFIX)
+/// What a name the type checker made up stands for. The planner and the
+/// shaper read a made-up name's role here, never from its spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FreshRole {
+    /// An anonymous triple end, `$_`.
+    Anonymous,
+    /// The fresh destination a triple whose ends are both bound expands to,
+    /// tied to the bound end by an identity filter.
+    Closing,
+    /// The column a block read as a value fills (its `Correlate`'s `Group`).
+    Block,
+    /// The column a guarded block's guard is computed into.
+    Guard,
+    /// A return item's or a hidden aggregate's column beside the match
+    /// columns, spelled `^name`, which no written name is.
+    Item,
 }
 
-/// The prefix of an anonymous triple end's binding.
-pub const ANON_PREFIX: &str = "__anon_";
-/// The prefix of every other name the type checker makes up.
-pub const FRESH_PREFIX: &str = "__temp_";
+impl FreshRole {
+    /// The leading word of a name of this role. It starts with an
+    /// uppercase letter, which no written variable, alias, property or
+    /// parameter does (section 7's `ident`), so a made-up name never
+    /// collides with a written one.
+    fn word(self) -> &'static str {
+        match self {
+            Self::Anonymous => "Anon",
+            Self::Closing => "Closing",
+            Self::Block => "Block",
+            Self::Guard => "Guard",
+            Self::Item => "^",
+        }
+    }
+}
+
+/// The names the type checker made up for one declaration, each with its
+/// role: the typed record a consumer reads to tell a made-up column from a
+/// written one, in place of a test of the name's spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Fresh {
+    roles: std::collections::BTreeMap<String, FreshRole>,
+    count: u32,
+}
+
+impl Fresh {
+    /// A new name of `role`, recorded.
+    pub fn mint(&mut self, role: FreshRole) -> String {
+        self.count += 1;
+        let name = format!("{}{}", role.word(), self.count);
+        self.roles.insert(name.clone(), role);
+        name
+    }
+
+    /// Record `name`, which the type checker spelled itself, under `role`.
+    pub fn record(&mut self, name: &str, role: FreshRole) {
+        self.roles.insert(name.to_string(), role);
+    }
+
+    /// The role of `name`, when the type checker made it up.
+    pub fn role(&self, name: &str) -> Option<FreshRole> {
+        self.roles.get(name).copied()
+    }
+
+    /// Whether `name` was made up with `role`.
+    pub fn is(&self, name: &str, role: FreshRole) -> bool {
+        self.role(name) == Some(role)
+    }
+
+    /// Whether `name` was made up: the query declares no such binding, so
+    /// its identity orders nothing a reader can see.
+    pub fn made_up(&self, name: &str) -> bool {
+        self.roles.contains_key(name)
+    }
+
+    /// Every made-up name.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.roles.keys().map(String::as_str)
+    }
+}

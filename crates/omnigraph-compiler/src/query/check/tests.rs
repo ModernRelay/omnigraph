@@ -980,7 +980,7 @@ fn a_step_counts_the_nodes_it_adds() {
     ];
     for step in steps {
         let added = step.added();
-        let built = apply(Some(Term::Unit), step, &mut 0).size() - 1;
+        let built = apply(Some(Term::Unit), step).size() - 1;
         assert_eq!(added, built);
     }
 }

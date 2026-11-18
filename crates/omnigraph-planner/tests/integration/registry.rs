@@ -360,6 +360,7 @@ fn documents_query() -> Operation {
         limit: None,
         limit_param: None,
         written_columns: Vec::new(),
+        made_up: Default::default(),
     }))
 }
 

@@ -18,7 +18,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::catalog::Catalog;
-use crate::ir::core::{ANON_PREFIX, FRESH_PREFIX, Ty};
+use crate::ir::core::{Fresh, Ty};
 use crate::query::codes::T81;
 use crate::query::diagnostic::{Applicability, QueryDiagnostic, Suggestion, TextEdit};
 use crate::query::syntax::print;
@@ -199,6 +199,7 @@ impl Parts {
         catalog: &Catalog,
         sc: &Scope,
         pattern: &Pattern,
+        made_up: &Fresh,
     ) -> Option<QueryDiagnostic> {
         let pins = key_pins(pattern, sc);
         let unpinned: Vec<Vec<usize>> = self
@@ -210,7 +211,7 @@ impl Parts {
         let [first, second, ..] = unpinned.as_slice() else {
             return None;
         };
-        Some(self.diagnose(first, second, catalog, sc, pattern))
+        Some(self.diagnose(first, second, catalog, sc, pattern, made_up))
     }
 
     /// A component is key-pinned when it is one node binding whose every
@@ -263,6 +264,7 @@ impl Parts {
         catalog: &Catalog,
         sc: &Scope,
         pattern: &Pattern,
+        made_up: &Fresh,
     ) -> QueryDiagnostic {
         let text = |component: &[usize]| {
             component
@@ -284,8 +286,8 @@ impl Parts {
             d.position = Some(span.position);
             d.end = Some(span.end_position);
         }
-        let triples = self.triples(first, second, catalog, sc);
-        let named = self.named_relation(second, sc, pattern);
+        let triples = self.triples(first, second, catalog, sc, made_up);
+        let named = self.named_relation(second, sc, pattern, made_up);
         let named_text = named.as_ref().map(|(text, _)| text.as_str());
         let fix = match (triples.as_slice(), named_text) {
             ([one], Some(named)) => format!(
@@ -339,12 +341,13 @@ impl Parts {
         second: &[usize],
         catalog: &Catalog,
         sc: &Scope,
+        made_up: &Fresh,
     ) -> Vec<String> {
         let nodes = |component: &[usize]| -> Vec<(String, String)> {
             let mut out: Vec<(String, String)> = Vec::new();
             for &p in component {
                 for v in &self.producers[p].vars {
-                    if v.starts_with(ANON_PREFIX) || v.starts_with(FRESH_PREFIX) {
+                    if made_up.made_up(v) {
                         continue;
                     }
                     let col = sc.local(v).or_else(|| sc.outer_col(v));
@@ -393,13 +396,12 @@ impl Parts {
         component: &[usize],
         sc: &Scope,
         pattern: &Pattern,
+        made_up: &Fresh,
     ) -> Option<(String, Vec<TextEdit>)> {
         let mut returned: Vec<String> = Vec::new();
         for &p in component {
             for b in &self.producers[p].bound {
-                if !(b.starts_with(ANON_PREFIX) || b.starts_with(FRESH_PREFIX))
-                    && !returned.contains(b)
-                {
+                if !made_up.made_up(b) && !returned.contains(b) {
                     returned.push(b.clone());
                 }
             }

@@ -238,13 +238,13 @@ fn knows_q_from_env() -> Term {
         expand(
             corr(env(&[("p", node("Person"))]), scan("q", "Person")),
             "p",
-            "__temp_t1",
+            "Closing1",
             "Person",
             &[("Knows", Direction::Out)],
         ),
         cmp(
             CompOp::Eq,
-            prop("__temp_t1", "__id", val(ScalarType::String, false)),
+            prop("Closing1", "__id", val(ScalarType::String, false)),
             prop("q", "__id", val(ScalarType::String, false)),
         ),
     )
@@ -277,8 +277,8 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             "count { p } as a value: Correlate(R, Group(p, [], [agg])), the aggregate column",
             "query f() { match { $p: Person, let $n = count { $q: Person, $p knows $q } } return { $n } }",
             Term::Project {
-                input: block(scan("p", "Person"), knows_q_from_env(), "__temp_b2").boxed(),
-                items: vec![("n".into(), col("__temp_b2", val(ScalarType::I64, false)))],
+                input: block(scan("p", "Person"), knows_q_from_env(), "Block2").boxed(),
+                items: vec![("n".into(), col("Block2", val(ScalarType::I64, false)))],
                 keep: true,
             },
         ),
@@ -286,16 +286,16 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             "exists { p }: count { p } > 0",
             "query f() { match { $p: Person } where exists { $q: Person, $p knows $q } return { $p } }",
             filter(
-                block(scan("p", "Person"), knows_q_from_env(), "__temp_b2"),
-                exists("__temp_b2"),
+                block(scan("p", "Person"), knows_q_from_env(), "Block2"),
+                exists("Block2"),
             ),
         ),
         (
             "not exists { p }: Filter(¬ exists { p })",
             "query f() { match { $p: Person } where not exists { $q: Person, $p knows $q } return { $p } }",
             filter(
-                block(scan("p", "Person"), knows_q_from_env(), "__temp_b2"),
-                not(exists("__temp_b2")),
+                block(scan("p", "Person"), knows_q_from_env(), "Block2"),
+                not(exists("Block2")),
             ),
         ),
         (
@@ -310,13 +310,13 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
                         expand(
                             corr(env(&[("p", node("Person"))]), scan("c", "Company")),
                             "p",
-                            "__temp_t1",
+                            "Closing1",
                             "Company",
                             &[("WorksAt", Direction::Out)],
                         ),
                         cmp(
                             CompOp::Eq,
-                            prop("__temp_t1", "__id", val(ScalarType::String, false)),
+                            prop("Closing1", "__id", val(ScalarType::String, false)),
                             prop("c", "__id", val(ScalarType::String, false)),
                         ),
                     )
@@ -350,7 +350,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
                                 // padding row is null in the fresh column
                                 // `p`'s triple adds too.
                                 (
-                                    "__temp_t1".into(),
+                                    "Closing1".into(),
                                     IRExpr::Literal(
                                         Literal::Null,
                                         ExprType::Node {

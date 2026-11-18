@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::read_shape::{ArmRank, PatternStep, ReadShape};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, is_fresh_variable};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_compiler::query::codes::{P002, P004};
 use omnigraph_compiler::query::file::LoadStmtMode;
 use omnigraph_compiler::query::value::AggFunc;
@@ -309,6 +309,7 @@ fn resolve_query(
     ir: &ReadShape,
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
+    plan.set_made_up(ir.made_up.clone());
     if ir.has_edge_selections() {
         let limit = source.traversal_work_limit().ok_or_else(|| {
             PlanError::refused(
@@ -341,6 +342,7 @@ fn resolve_query(
         limit,
         limit_param,
         written_columns,
+        made_up: _,
     } = ir;
     if let (Some(param), None) = (limit_param, limit) {
         return Err(PlanError::Internal(format!(
@@ -1297,7 +1299,7 @@ fn scope_tiebreaks(
         .into_iter()
         .filter(|(binding, _)| !hidden.contains(binding))
         .collect();
-    bindings.sort_by_key(|(binding, _)| is_fresh_variable(binding));
+    bindings.sort_by_key(|(binding, _)| plan.made_up(binding));
     let mut out = Vec::new();
     for (binding, (id_column, selected_edge)) in bindings {
         if selected_edge {
@@ -1337,7 +1339,7 @@ fn tie_rule(
     let (mut named, rest): (Vec<_>, Vec<_>) = columns
         .entries
         .into_iter()
-        .partition(|entry| own || entry.is_named());
+        .partition(|entry| own || entry.is_named(plan));
     // The named references come in written column order, which the plan's
     // steps need not keep: an `optional` or a `union` runs after the
     // scope's traversals.
@@ -1386,8 +1388,8 @@ enum TieColumn {
 
 impl TieColumn {
     /// A reference the query names, which leads the rule.
-    fn is_named(&self) -> bool {
-        matches!(self, Self::Identity { binding, .. } if !is_fresh_variable(binding))
+    fn is_named(&self, plan: &LogicalPlan) -> bool {
+        matches!(self, Self::Identity { binding, .. } if !plan.made_up(binding))
     }
 
     fn binding(&self) -> &str {

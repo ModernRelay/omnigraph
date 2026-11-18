@@ -1066,6 +1066,7 @@ fn hydration_keeps_every_column_something_besides_the_output_reads() {
         limit: Some(5),
         limit_param: None,
         written_columns: Vec::new(),
+        made_up: Default::default(),
     }));
     let (plan, fired) = physical(&op, &source_with_rows(Some(1_000)));
     assert!(fired.contains(&"late_materialization"), "{fired:?}");

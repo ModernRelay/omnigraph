@@ -261,6 +261,7 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
         limit: Some(10),
         limit_param: None,
         written_columns: Vec::new(),
+        made_up: Default::default(),
     }));
     let (logical, _) = planned(&op);
     assert!(matches!(

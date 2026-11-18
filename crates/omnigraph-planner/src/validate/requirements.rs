@@ -12,7 +12,6 @@
 use std::collections::BTreeMap;
 
 use crate::read_shape::{ArmRank, PatternStep};
-use omnigraph_compiler::ir::is_fresh_variable;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
 use omnigraph_compiler::query::value::{DISTANCE_COLUMN, Literal, RRF_COLUMN, SCORE_COLUMN};
 use omnigraph_compiler::traversal::EdgeSelection;
@@ -338,8 +337,8 @@ impl TieColumn {
     }
 
     /// A reference the query names, which leads the rule.
-    pub(crate) fn is_named(&self) -> bool {
-        matches!(self, Self::Identity { binding, .. } if !is_fresh_variable(binding))
+    pub(crate) fn is_named(&self, made_up: &std::collections::BTreeSet<String>) -> bool {
+        matches!(self, Self::Identity { binding, .. } if !made_up.contains(binding))
     }
 }
 
@@ -441,6 +440,8 @@ pub(crate) fn tie_columns(steps: &[PatternStep], out: &mut Vec<TieColumn>) {
 /// What every plan for one checked declaration must preserve.
 #[derive(Debug, Clone)]
 pub struct Requirements {
+    /// The names the query declares none of (`ReadShape::made_up`).
+    pub(crate) made_up: std::collections::BTreeSet<String>,
     /// The named bindings of the top-level scope and their types.
     pub(crate) bindings: BTreeMap<String, BoundVariable>,
     /// The columns of the top-level rows in column order, for the tie rule.
@@ -525,12 +526,13 @@ impl Requirements {
             &ir.order_by,
             ir.distinct,
             ir.limit,
+            &ir.made_up,
             budget,
         )?;
         // The tie rule takes the named references in written column order,
         // which the steps' run order need not keep.
         required.tie_columns.sort_by_key(|column| match column {
-            TieColumn::Identity { binding, .. } if column.is_named() => ir
+            TieColumn::Identity { binding, .. } if column.is_named(&ir.made_up) => ir
                 .written_columns
                 .iter()
                 .position(|name| name == binding)
@@ -549,6 +551,7 @@ impl Requirements {
         order_by: &[IROrdering],
         distinct: bool,
         limit: Option<u64>,
+        made_up: &std::collections::BTreeSet<String>,
         budget: &mut Budget,
     ) -> Result<Self, ValidationError> {
         let mut eligibility = Vec::new();
@@ -614,7 +617,7 @@ impl Requirements {
                     for arm in arms {
                         required.push((
                             arm.rank,
-                            Self::scope(&arm.steps, &[], &[], false, None, budget)?,
+                            Self::scope(&arm.steps, &[], &[], false, None, made_up, budget)?,
                         ));
                     }
                     fuse = Some(FuseRequirements {
@@ -651,7 +654,7 @@ impl Requirements {
                     dst_filters,
                     edge_binding,
                 } => {
-                    if !is_fresh_variable(dst_var) {
+                    if !made_up.contains(dst_var) {
                         bindings.insert(
                             dst_var.clone(),
                             BoundVariable::Node {
@@ -735,6 +738,7 @@ impl Requirements {
         let mut regions = Vec::new();
         conjunct_regions(pipeline, &[], &mut regions);
         Ok(Self {
+            made_up: made_up.clone(),
             regions,
             bindings,
             tie_columns: columns,

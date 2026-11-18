@@ -1867,7 +1867,7 @@ impl Requirements {
         let (named, rest): (Vec<_>, Vec<_>) = self
             .tie_columns
             .iter()
-            .partition(|column| column.is_named());
+            .partition(|column| column.is_named(&self.made_up));
         let mut expected = Vec::new();
         for column in named.into_iter().chain(rest) {
             match column {

@@ -1012,6 +1012,7 @@ mod tests {
             limit: None,
             limit_param: None,
             written_columns: Vec::new(),
+            made_up: Default::default(),
         };
         let source = source.with_explain_dump_dir(dir.path().to_path_buf());
         EXPLAIN_RENDERS.with(|count| count.set(0));

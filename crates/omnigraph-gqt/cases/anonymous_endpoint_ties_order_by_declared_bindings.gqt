@@ -59,4 +59,4 @@ query all_by_rank() {
 p.name: String
 
 --- expect plan
-sort tiebreak [$p.@id, $__anon_1.@id]
+sort tiebreak [$p.@id, $ShapedAnon1.@id]

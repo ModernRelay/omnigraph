@@ -10,7 +10,7 @@ pub mod fold;
 pub mod load;
 pub mod write;
 
-pub use core::is_fresh_variable;
+pub use core::{Fresh, FreshRole};
 pub use expr::{
     BlockAggregateExpr, IRExpr, IROrdering, IRProjection, RRF_MAX_WEIGHT, SubqueryPredicate,
     rrf_weight_values, rrf_weights_expr,

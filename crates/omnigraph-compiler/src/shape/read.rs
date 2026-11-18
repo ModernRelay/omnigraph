@@ -22,8 +22,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::catalog::Catalog;
 use crate::ir::core::{
-    ANON_PREFIX, Agg, Col, CoreNode, CoreRead, Count, FRESH_PREFIX, LexicalQuery, RRF_DEFAULT_K,
-    ScoreKind, ScoreQuery, Term, Ty,
+    Agg, Col, CoreNode, CoreRead, Count, Fresh, FreshRole, LexicalQuery, RRF_DEFAULT_K, ScoreKind,
+    ScoreQuery, Term, Ty,
 };
 use crate::ir::{
     BlockAggregateExpr, IRExpr, IROrdering, IRParam, IRProjection, SubqueryPredicate,
@@ -61,6 +61,12 @@ pub struct ReadShape {
     /// steps' run order need not keep (an `optional` and a `union` run after
     /// the scope's traversals). The tie rule orders reference columns by it.
     pub written_columns: Vec<String>,
+    /// Every name the type checker or the shaper made up (an anonymous
+    /// triple end, a closing triple's destination, a block's or an inline
+    /// read's hidden column): the query declares none of them, so the tie
+    /// rule orders their identities after the declared ones. A made-up name
+    /// starts with an uppercase letter or `^`, which no written name does.
+    pub made_up: std::collections::BTreeSet<String>,
 }
 
 /// The columns `term` adds to its rows, in the order the core term adds
@@ -427,7 +433,7 @@ impl ReadShape {
     /// The shape of `read`, or the term this release's planner does not
     /// lower.
     pub fn of(read: &CoreRead, catalog: &Catalog) -> Result<Self, ShapeError> {
-        Shaper::new(catalog, &read.name, &read.params).read(read)
+        Shaper::new(catalog, &read.name, &read.params, &read.fresh).read(read)
     }
 
     /// The shape of the read declared as `name` in `source`, checked against
@@ -594,6 +600,10 @@ struct Shaper<'a> {
     catalog: &'a Catalog,
     name: &'a str,
     params: &'a [(String, PropType)],
+    /// The names the type checker made up, with their roles.
+    fresh: &'a Fresh,
+    /// The names this shaper made up ([`Shaper::shaped`]).
+    minted: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 /// The pattern facts of one scope, in the order the term states them.
@@ -1030,18 +1040,6 @@ fn is_reference(expr: &IRExpr) -> bool {
     )
 }
 
-fn is_anon(name: &str) -> bool {
-    name.starts_with(ANON_PREFIX)
-}
-
-fn is_block_column(name: &str) -> bool {
-    name.starts_with(FRESH_PREFIX) && name[FRESH_PREFIX.len()..].starts_with('b')
-}
-
-fn is_semi(name: &str) -> bool {
-    name.starts_with(FRESH_PREFIX) && name[FRESH_PREFIX.len()..].starts_with('t')
-}
-
 /// The variable every leaf of `e` reads, when it reads exactly one.
 fn single_variable(e: &IRExpr) -> Option<String> {
     let mut cols = Vec::new();
@@ -1053,12 +1051,44 @@ fn single_variable(e: &IRExpr) -> Option<String> {
 }
 
 impl<'a> Shaper<'a> {
-    fn new(catalog: &'a Catalog, name: &'a str, params: &'a [(String, PropType)]) -> Self {
+    fn new(
+        catalog: &'a Catalog,
+        name: &'a str,
+        params: &'a [(String, PropType)],
+        fresh: &'a Fresh,
+    ) -> Self {
         Self {
             catalog,
             name,
             params,
+            fresh,
+            minted: Default::default(),
         }
+    }
+
+    /// A name this shaper makes up, `Shaped` and then `suffix`: it starts
+    /// with an uppercase letter, so it collides with no written name, and
+    /// the word keeps it apart from the type checker's (`Fresh`).
+    fn shaped(&self, suffix: impl std::fmt::Display) -> String {
+        let name = format!("Shaped{suffix}");
+        self.minted.borrow_mut().insert(name.clone());
+        name
+    }
+
+    /// Whether `name` is an anonymous triple end.
+    fn is_anon(&self, name: &str) -> bool {
+        self.fresh.is(name, FreshRole::Anonymous)
+    }
+
+    /// Whether `name` is the column a block read as a value fills.
+    fn is_block_column(&self, name: &str) -> bool {
+        self.fresh.is(name, FreshRole::Block)
+    }
+
+    /// Whether `name` is the fresh destination of a triple closing on two
+    /// bound ends.
+    fn is_semi(&self, name: &str) -> bool {
+        self.fresh.is(name, FreshRole::Closing)
     }
 
     /// A parameter's declared type.
@@ -1530,6 +1560,13 @@ impl<'a> Shaper<'a> {
             limit,
             limit_param,
             written_columns: written,
+            made_up: read
+                .fresh
+                .names()
+                .map(str::to_string)
+                .chain(self.minted.borrow().iter().cloned())
+                .chain(fresh.minted)
+                .collect(),
         })
     }
 
@@ -2075,8 +2112,8 @@ impl<'a> Shaper<'a> {
                 let edge = self.catalog.lookup_edge_by_name(type_name).ok_or_else(|| {
                     ShapeError::Internal(format!("`${var}` scans `{type_name}`, no edge type"))
                 })?;
-                let src = format!("{FRESH_PREFIX}e{}_{var}_src", facts.inlined);
-                let dst = format!("{FRESH_PREFIX}e{}_{var}_dst", facts.inlined);
+                let src = self.shaped(format_args!("e{}_{var}_src", facts.inlined));
+                let dst = self.shaped(format_args!("e{}_{var}_dst", facts.inlined));
                 facts.inlined += 1;
                 facts.types.insert(src.clone(), edge.from_type.clone());
                 facts.bindings.push(BindingFact {
@@ -2221,7 +2258,7 @@ impl<'a> Shaper<'a> {
         let introduced: Vec<String> = inner
             .names()
             .into_iter()
-            .filter(|name| !outer_columns.contains(name) && !is_anon(name))
+            .filter(|name| !outer_columns.contains(name) && !self.is_anon(name))
             .collect();
         // A `let` inside an `optional` is a column of its matches, null on an
         // outer row with none. Read after it, its value is taken where a node
@@ -2231,7 +2268,7 @@ impl<'a> Shaper<'a> {
         // matches nothing outside it reads.
         let mut exported: Vec<(&String, &IRExpr)> = inner_lets
             .iter()
-            .filter(|(name, _)| !is_block_column(name))
+            .filter(|(name, _)| !self.is_block_column(name))
             .collect();
         exported.sort_by(|a, b| a.0.cmp(b.0));
         if !exported.is_empty() {
@@ -2377,13 +2414,13 @@ impl<'a> Shaper<'a> {
                 .names()
                 .into_iter()
                 .filter(|name| {
-                    !exposed.contains(name) && !is_anon(name) && !arm_outer.contains(name)
+                    !exposed.contains(name) && !self.is_anon(name) && !arm_outer.contains(name)
                 })
                 .collect();
             hidden.sort();
             hidden.dedup();
             for name in hidden {
-                let fresh = format!("{FRESH_PREFIX}f{}_{name}", inner.inlined);
+                let fresh = self.shaped(format_args!("f{}_{name}", inner.inlined));
                 inner.inlined += 1;
                 renames.insert(name, fresh);
             }
@@ -2417,7 +2454,7 @@ impl<'a> Shaper<'a> {
         inner
             .types
             .extend(columns.iter().map(|(name, ty)| (name.clone(), ty.clone())));
-        let values = format!("{FRESH_PREFIX}r{}", facts.inlined);
+        let values = self.shaped(format_args!("r{}", facts.inlined));
         facts.inlined += 1;
         let read = InnerRead {
             values,
@@ -2462,7 +2499,7 @@ impl<'a> Shaper<'a> {
         facts: &mut Facts,
     ) -> Result<(), ShapeError> {
         let at = || Construct::Element(FROM, None);
-        let values = format!("{FRESH_PREFIX}r{}", facts.inlined);
+        let values = self.shaped(format_args!("r{}", facts.inlined));
         facts.inlined += 1;
         let Some((_, first, _)) = parts.first() else {
             return Err(ShapeError::Internal("a union has no arm".to_string()));
@@ -2641,12 +2678,12 @@ impl<'a> Shaper<'a> {
         let mut hidden: Vec<String> = inner
             .names()
             .into_iter()
-            .filter(|name| !outer.contains(name) && !exposed.contains(name) && !is_anon(name))
+            .filter(|name| !outer.contains(name) && !exposed.contains(name) && !self.is_anon(name))
             .collect();
         hidden.sort();
         hidden.dedup();
         for name in hidden {
-            let fresh = format!("{FRESH_PREFIX}f{}_{name}", facts.inlined);
+            let fresh = self.shaped(format_args!("f{}_{name}", facts.inlined));
             facts.inlined += 1;
             renames.insert(name, fresh);
         }
@@ -2775,7 +2812,9 @@ impl<'a> Shaper<'a> {
                 items,
                 keep: true,
             } = term
-            && items.iter().all(|(name, _)| name.starts_with('^'))
+            && items
+                .iter()
+                .all(|(name, _)| self.fresh.is(name, FreshRole::Item))
         {
             extended = items.clone();
             term = input;
@@ -2822,7 +2861,7 @@ impl<'a> Shaper<'a> {
         let values = match values {
             Some(values) => values.to_string(),
             None => {
-                let values = format!("{FRESH_PREFIX}r{}", inner.inlined);
+                let values = self.shaped(format_args!("r{}", inner.inlined));
                 inner.inlined += 1;
                 values
             }
@@ -2916,12 +2955,12 @@ impl<'a> Shaper<'a> {
         let mut hidden: Vec<String> = inner
             .names()
             .into_iter()
-            .filter(|name| !outer.contains(name) && !exposed.contains(name) && !is_anon(name))
+            .filter(|name| !outer.contains(name) && !exposed.contains(name) && !self.is_anon(name))
             .collect();
         hidden.sort();
         hidden.dedup();
         for name in hidden {
-            let fresh = format!("{FRESH_PREFIX}f{}_{name}", inner.inlined);
+            let fresh = self.shaped(format_args!("f{}_{name}", inner.inlined));
             inner.inlined += 1;
             renames.insert(name, fresh);
         }
@@ -2987,7 +3026,7 @@ impl<'a> Shaper<'a> {
 
     fn traversal(&self, facts: &mut Facts, mut t: TraversalFact) {
         for end in [&mut t.src, &mut t.dst] {
-            if is_anon(end) {
+            if self.is_anon(end) {
                 *end = "_".to_string();
             }
         }
@@ -3014,7 +3053,7 @@ impl<'a> Shaper<'a> {
             max_hops,
             edge_var,
         } = input
-            && is_semi(dst)
+            && self.is_semi(dst)
             && let Some((left, CompOp::Eq, IRExpr::PropAccess { variable: end, .. })) =
                 pred.comparison_parts()
             && matches!(left, IRExpr::PropAccess { variable, .. } if variable == dst)
@@ -3038,7 +3077,7 @@ impl<'a> Shaper<'a> {
         // A predicate over block columns: the blocks under it.
         let mut cols = Vec::new();
         pred.columns(&mut cols);
-        if cols.iter().any(|c| is_block_column(c)) {
+        if cols.iter().any(|c| self.is_block_column(c)) {
             return self.blocks(input, pred, facts);
         }
         self.facts(input, facts)?;
@@ -3115,7 +3154,7 @@ impl<'a> Shaper<'a> {
                 block_comparison(pred, column).filter(|(_, right)| {
                     let mut read = Vec::new();
                     right.columns(&mut read);
-                    !read.iter().any(|c| is_block_column(c)) && !holds_lexical_call(right)
+                    !read.iter().any(|c| self.is_block_column(c)) && !holds_lexical_call(right)
                 })
             })
             .collect();
@@ -3195,13 +3234,13 @@ impl<'a> Shaper<'a> {
         let mut hidden: Vec<String> = inner_facts
             .names()
             .into_iter()
-            .filter(|name| !outer.contains(name) && !is_anon(name))
+            .filter(|name| !outer.contains(name) && !self.is_anon(name))
             .collect();
         hidden.sort();
         hidden.dedup();
         let mut renames = HashMap::new();
         for name in hidden {
-            let fresh = format!("{FRESH_PREFIX}f{}_{name}", inner_facts.inlined);
+            let fresh = self.shaped(format_args!("f{}_{name}", inner_facts.inlined));
             inner_facts.inlined += 1;
             renames.insert(name, fresh);
         }
@@ -3211,7 +3250,7 @@ impl<'a> Shaper<'a> {
                 *variable = name.clone();
             }
         };
-        let values = format!("{FRESH_PREFIX}r{}", inner_facts.inlined);
+        let values = self.shaped(format_args!("r{}", inner_facts.inlined));
         inner_facts.inlined += 1;
         facts.inlined = inner_facts.inlined;
         // Counting a node binding, or a block's rows, counts the rows: a
@@ -4179,17 +4218,23 @@ fn find_outer_var(facts: &Facts, outer_bound: &HashSet<String>) -> Option<String
 struct FreshNames {
     anon: usize,
     temp: usize,
+    /// Every name minted, which the shape records as made up.
+    minted: Vec<String>,
 }
 
 impl FreshNames {
     fn anon(&mut self) -> String {
         self.anon += 1;
-        format!("{ANON_PREFIX}{}", self.anon)
+        let name = format!("ShapedAnon{}", self.anon);
+        self.minted.push(name.clone());
+        name
     }
 
     fn temp(&mut self, dst: &str) -> String {
         self.temp += 1;
-        format!("{FRESH_PREFIX}{}_{}", dst, self.temp)
+        let name = format!("Shaped{}_{}", dst, self.temp);
+        self.minted.push(name.clone());
+        name
     }
 }
 

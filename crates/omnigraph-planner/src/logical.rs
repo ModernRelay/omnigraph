@@ -896,11 +896,24 @@ pub struct LogicalPlan {
     schemas: Vec<Option<SchemaRef>>,
     root: LogicalId,
     traversal_work_limit: Option<u64>,
+    /// The bindings the query declares none of, which the type checker or
+    /// the shaper made up (`ReadShape::made_up`): the tie rule orders their
+    /// identities after the declared ones.
+    made_up: std::collections::BTreeSet<String>,
 }
 
 impl LogicalPlan {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the query declares no binding `name`.
+    pub(crate) fn made_up(&self, name: &str) -> bool {
+        self.made_up.contains(name)
+    }
+
+    pub(crate) fn set_made_up(&mut self, names: std::collections::BTreeSet<String>) {
+        self.made_up = names;
     }
 
     /// Query-wide policy captured before any rewrite or physical choice.

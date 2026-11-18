@@ -510,6 +510,7 @@ fn lower_selected(
         term,
         result: RelTy::default(),
         plan_budget: DEFAULT_PLAN_BUDGET,
+        fresh: write.fresh.clone(),
     };
     // The selection's refusals point into the group's `match`; the
     // projection above it is this function's and lowers.

@@ -382,7 +382,7 @@ fn typed_decl_measured(
     let mut ctx = Ctx {
         catalog,
         unit,
-        fresh: 0,
+        made_up: Fresh::default(),
         frames: Vec::new(),
         assume: HashMap::new(),
         rec_hits: HashSet::new(),
@@ -418,6 +418,7 @@ fn typed_decl_measured(
                 term: r.rel.term,
                 result: r.rel.ty,
                 plan_budget: r.budget,
+                fresh: ctx.made_up.clone(),
             }))
         }),
         DeclBody::Write(w) => ctx.write_decl(decl, w).map(CoreDecl::Write),
@@ -1180,7 +1181,8 @@ fn is_registry_name(name: &str) -> bool {
 struct Ctx<'a> {
     catalog: &'a Catalog,
     unit: &'a HashMap<String, &'a Decl>,
-    fresh: u32,
+    /// The names the pass made up, with their roles ([`Fresh`]).
+    made_up: Fresh,
     /// The declared reads being inlined, outermost first.
     frames: Vec<Frame>,
     /// The assumed type of a recursive read during its fixpoint passes.
@@ -1448,11 +1450,11 @@ impl Scope {
 
     /// Every name in scope with its type, as a refusal of an unknown one
     /// lists them: the columns, the parameters and the named relations.
-    fn names_in_scope(&self) -> Vec<(String, String)> {
+    fn names_in_scope(&self, made_up: &Fresh) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = self
             .visible()
             .into_iter()
-            .filter(|c| !c.name.starts_with("__"))
+            .filter(|c| !made_up.made_up(&c.name))
             .map(|c| (format!("${}", c.name), c.ty.display()))
             .collect();
         out.extend(
@@ -1805,15 +1807,19 @@ fn annotation(a: &Annotation, budget: &mut Budget) -> R<()> {
 }
 
 impl Ctx<'_> {
-    /// A name no declaration can collide with in practice: an anonymous
-    /// triple end (`a`) under [`ANON_PREFIX`], every other made-up column
-    /// under [`FRESH_PREFIX`].
-    fn fresh(&mut self, prefix: &str) -> String {
-        self.fresh += 1;
-        match prefix {
-            "a" => format!("{ANON_PREFIX}{}", self.fresh),
-            other => format!("{FRESH_PREFIX}{other}{}", self.fresh),
-        }
+    /// A name no declaration can collide with: [`Fresh::mint`] spells it
+    /// with a leading uppercase letter, which no written name has, and
+    /// records its role.
+    fn fresh(&mut self, role: FreshRole) -> String {
+        self.made_up.mint(role)
+    }
+
+    /// `^name`: a return item's or an aggregate's column beside the match
+    /// columns, recorded as one.
+    fn item(&mut self, name: &str) -> String {
+        let item = format!("^{name}");
+        self.made_up.record(&item, FreshRole::Item);
+        item
     }
 
     /// A recovery point: a refusal is recorded at its span
@@ -2140,6 +2146,7 @@ impl Ctx<'_> {
             groups,
             class: class.map_or(WriteClass::Constructive, |(c, _)| c),
             write_mode: decl.write_mode.clone(),
+            fresh: self.made_up.clone(),
         })
     }
 
@@ -2253,7 +2260,7 @@ impl Ctx<'_> {
                 let ty = match it {
                     Some((_, e)) => e.ty.clone(),
                     None => {
-                        let n = format!("^{}", names[i]);
+                        let n = self.item(&names[i]);
                         match aggs.iter().find(|(a, _)| *a == n) {
                             Some((_, a)) => a.ty.clone(),
                             None => post.iter().find(|(a, _)| *a == n).unwrap().1.ty.clone(),
@@ -2265,7 +2272,7 @@ impl Ctx<'_> {
                     ty,
                 });
             }
-            ext_names = names.iter().map(|n| format!("^{n}")).collect();
+            ext_names = names.iter().map(|n| self.item(n)).collect();
             // Order keys over the groups: a key item's expression, or an
             // alias.
             let mut order = Vec::new();
@@ -2293,10 +2300,9 @@ impl Ctx<'_> {
                 let e = key_columns(e.to_ir(), &keys);
                 let mut read = Vec::new();
                 e.columns(&mut read);
-                if let Some(c) = read
-                    .iter()
-                    .find(|c| !c.starts_with('^') && !keys.iter().any(|(k, _)| k == *c))
-                {
+                if let Some(c) = read.iter().find(|c| {
+                    !self.made_up.is(c, FreshRole::Item) && !keys.iter().any(|(k, _)| k == *c)
+                }) {
                     // A refused item may be the key that groups by it.
                     sc.refused = true;
                     if !refused_items.is_empty() {
@@ -2468,7 +2474,7 @@ impl Ctx<'_> {
         post: &mut Vec<(String, SExpr)>,
     ) -> R<()> {
         if let Some(agg) = self.aggregate(sc, &p.expr)? {
-            aggs.push((format!("^{name}"), agg));
+            aggs.push((self.item(&name), agg));
             items.push(None);
         } else if contains_agg(&p.expr) {
             // An expression over aggregates (`count($p) > 3 as big`): the
@@ -2490,7 +2496,7 @@ impl Ctx<'_> {
                 ));
             }
             aggs.extend(hidden);
-            post.push((format!("^{name}"), e));
+            post.push((self.item(&name), e));
             items.push(None);
         } else {
             let e = self.expr(sc, &p.expr, At::Value)?;
@@ -2507,7 +2513,7 @@ impl Ctx<'_> {
                     "a comparison in return needs an alias; write `… as <name>`",
                 ));
             }
-            items.push(Some((format!("^{name}"), e)));
+            items.push(Some((self.item(&name), e)));
         }
         Ok(())
     }
@@ -2529,11 +2535,11 @@ impl Ctx<'_> {
         Ok(match &o.expr {
             Expr::Ident(alias) if names.contains(alias) => {
                 let i = names.iter().position(|n| n == alias).unwrap();
-                SExpr::new(SKind::Col(format!("^{alias}")), out_cols[i].ty.clone())
+                SExpr::new(SKind::Col(self.item(alias)), out_cols[i].ty.clone())
             }
             _ if same_item.is_some() => {
                 let i = same_item.unwrap();
-                SExpr::new(SKind::Col(format!("^{}", names[i])), out_cols[i].ty.clone())
+                SExpr::new(SKind::Col(self.item(&names[i])), out_cols[i].ty.clone())
             }
             e if self.probe_aggregate(sc, e) => {
                 let a = self.aggregate(sc, e)?.unwrap();
@@ -2588,8 +2594,7 @@ impl Ctx<'_> {
         hidden: &mut Vec<(String, Agg)>,
     ) -> R<Expr> {
         if let Some(a) = self.aggregate(sc, e)? {
-            self.fresh += 1;
-            let n = format!("^_ag{}", self.fresh);
+            let n = self.fresh(FreshRole::Item);
             hidden.push((n.clone(), a));
             return Ok(Expr::Variable(n));
         }
@@ -2740,7 +2745,7 @@ impl Ctx<'_> {
             None => 0,
             Some(_) => *size + step.added(),
         };
-        let term = apply(acc, step, &mut self.fresh);
+        let term = apply(acc, step);
         if *size == 0 {
             *size = term.size();
         }
@@ -2848,7 +2853,7 @@ impl Ctx<'_> {
         // The product rule is a typing rule: a refused element is of the
         // error type and passes it, joining the components it names, and a
         // refused conjunct passes the key-pin check.
-        if let Some(refusal) = parts.refusal(self.catalog, sc, pattern) {
+        if let Some(refusal) = parts.refusal(self.catalog, sc, pattern, &self.made_up) {
             self.guard::<()>(sc.recover, Err(E::D(refusal)))?;
         }
         Ok(())
@@ -3057,7 +3062,7 @@ impl Ctx<'_> {
         let mut t = t.clone();
         for end in [&mut t.src, &mut t.dst] {
             if end == "_" {
-                *end = self.fresh("a");
+                *end = self.fresh(FreshRole::Anonymous);
             }
         }
         // `<e>` matches either direction, so its ends are read in one order,
@@ -3239,7 +3244,7 @@ impl Ctx<'_> {
             resolved.dst_type.clone()
         };
         let both = src_bound && dst_bound;
-        let semi = both.then(|| self.fresh("t"));
+        let semi = both.then(|| self.fresh(FreshRole::Closing));
         let mut binds = Vec::new();
         if !both {
             binds.push(Col {
@@ -3277,7 +3282,6 @@ impl Ctx<'_> {
                     },
                 }),
                 expand,
-                &mut self.fresh,
             );
             binds.insert(
                 0,
@@ -5212,7 +5216,7 @@ impl Ctx<'_> {
                         T6,
                         format!(
                             "variable `${v}` is not bound{}",
-                            nearest::listing(&format!("${v}"), sc.names_in_scope())
+                            nearest::listing(&format!("${v}"), sc.names_in_scope(&self.made_up))
                         ),
                     ));
                 }
@@ -5232,7 +5236,10 @@ impl Ctx<'_> {
                         T6,
                         format!(
                             "variable `${variable}` is not bound{}",
-                            nearest::listing(&format!("${variable}"), sc.names_in_scope())
+                            nearest::listing(
+                                &format!("${variable}"),
+                                sc.names_in_scope(&self.made_up)
+                            )
                         ),
                     ));
                 };
@@ -5308,7 +5315,7 @@ impl Ctx<'_> {
                         "an exists or aggregate block must reference an outer-bound variable",
                     ));
                 }
-                let col = self.fresh("b");
+                let col = self.fresh(FreshRole::Block);
                 // The block evaluates its inner term and, over its rows, its
                 // aggregate's argument; either can fail.
                 let can_fail = term.can_fail() || arg.as_ref().is_some_and(|a| a.can_fail);
@@ -5353,7 +5360,7 @@ impl Ctx<'_> {
                                 Ty::scalar(ScalarType::Bool, false),
                             )
                         })
-                        .map(|g| (self.fresh("g"), g))
+                        .map(|g| (self.fresh(FreshRole::Guard), g))
                 } else {
                     None
                 };
@@ -6008,7 +6015,7 @@ enum RelArg<'a> {
 // ---------------------------------------------------------------------------
 // Folding steps into terms.
 
-fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
+fn apply(acc: Option<Term>, step: Step) -> Term {
     let correlate = |acc: Option<Term>, t: Term| match acc {
         None => t,
         Some(a) => Term::Correlate {
