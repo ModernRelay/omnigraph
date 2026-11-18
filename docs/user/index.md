@@ -32,7 +32,7 @@ deployment.
 - [CLI guide](cli/index.md)
 - [CLI reference](cli/reference.md)
 - [Operator profiles, targets and credentials](cli/targets.md)
-- [Open Studio on a server target](cli/studio.md)
+- [Open Studio on a server or managed cluster target](cli/studio.md)
 - [Managed data credentials and queries](cli/managed-data.md)
 - [Sign in to a managed profile](cli/login.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
