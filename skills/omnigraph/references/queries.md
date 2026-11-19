@@ -531,7 +531,7 @@ remain null even when its source is present.
 
 ```gq
 query link_signal_forms_pattern($signal: String, $pattern: String) {
-    insert FormsPattern { from: $signal, to: $pattern }
+    insert FormsPattern { @src: $signal, @dst: $pattern }
 }
 ```
 
@@ -568,7 +568,7 @@ query remove_signal($slug: String) {
 query add_and_link($slug: String, $pattern: String, $createdAt: DateTime, $updatedAt: DateTime) {
     insert Signal { slug: $slug, name: $slug, brief: $slug,
                     stagingTimestamp: $createdAt, createdAt: $createdAt, updatedAt: $updatedAt }
-    insert FormsPattern { from: $slug, to: $pattern }
+    insert FormsPattern { @src: $slug, @dst: $pattern }
 }
 ```
 

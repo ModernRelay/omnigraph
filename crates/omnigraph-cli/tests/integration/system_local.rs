@@ -77,7 +77,7 @@ fn add_friend_query(graph: &SystemGraph, name: &str) -> std::path::PathBuf {
         name,
         r#"
 query add_friend($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 "#,
     )

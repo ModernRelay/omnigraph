@@ -28,7 +28,7 @@ edge Knows: Person -> Person
 query w() {
     insert Person { id: 500, code: 900 }
     insert Person { id: 501, code: 901 }
-    insert Knows { from: "500", to: "501" }
+    insert Knows { @src: "500", @dst: "501" }
 }
 --- expect ok
 

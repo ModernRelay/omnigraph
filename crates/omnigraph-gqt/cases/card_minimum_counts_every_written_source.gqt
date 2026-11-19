@@ -40,7 +40,7 @@ query hire_without_employer() {
 query hire_two_with_one_employer() {
     insert Person { name: "bob" }
     insert Person { name: "carol" }
-    insert WorksAt { from: "carol", to: "acme" }
+    insert WorksAt { @src: "carol", @dst: "acme" }
 }
 
 --- expect error: @card violation on edge WorksAt: source 'bob' has 0 edges (min 1)
@@ -48,7 +48,7 @@ query hire_two_with_one_employer() {
 --- mutate
 query hire_with_employer() {
     insert Person { name: "bob" }
-    insert WorksAt { from: "bob", to: "acme" }
+    insert WorksAt { @src: "bob", @dst: "acme" }
 }
 
 --- expect affected: nodes=1 edges=1

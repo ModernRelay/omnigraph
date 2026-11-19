@@ -49,7 +49,7 @@ query update_empty() {
 
 --- mutate
 query insert_edge_empty() {
-    insert E { from: "a", to: "b", ints: [] }
+    insert E { @src: "a", @dst: "b", ints: [] }
 }
 --- expect affected: nodes=0 edges=1
 

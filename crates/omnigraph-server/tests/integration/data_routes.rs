@@ -2201,7 +2201,7 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
     const ATOMIC: &str = r#"query atomic() {
         insert Person { name: "Owned", age: 41 }
         insert Company { name: "OwnedCo" }
-        insert WorksAt { from: "Owned", to: "OwnedCo" }
+        insert WorksAt { @src: "Owned", @dst: "OwnedCo" }
     }"#;
     const BATCH: &str = concat!(
         "{\"type\":\"Person\",\"data\":{\"name\":\"Owned\",\"age\":41}}\n",

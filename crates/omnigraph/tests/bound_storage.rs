@@ -94,7 +94,7 @@ query insert_person($name: String, $age: I32) {
     insert Person { name: $name, age: $age }
 }
 query employ($person: String, $company: String) {
-    insert WorksAt { from: $person, to: $company }
+    insert WorksAt { @src: $person, @dst: $company }
 }
 "#;
 

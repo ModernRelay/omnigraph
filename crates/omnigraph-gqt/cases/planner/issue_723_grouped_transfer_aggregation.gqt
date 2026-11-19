@@ -115,8 +115,8 @@ sent: F64?
 
 --- mutate
 query add_direction_boundaries() {
-    insert AccountTransferAccount { from: "a", to: "a", amount: 5 }
-    insert AccountTransferAccount { from: "sink", to: "a", amount: 3 }
+    insert AccountTransferAccount { @src: "a", @dst: "a", amount: 5 }
+    insert AccountTransferAccount { @src: "sink", @dst: "a", amount: 3 }
 }
 --- expect affected: nodes=0 edges=2
 

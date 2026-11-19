@@ -95,7 +95,7 @@ c.name: String
 query hire_by_key() {
     insert Person { name: "cy", city: "lima" }
     match { $c: Company } where $c.slug = "acme"
-    insert WorksAt { from: "cy", to: $c }
+    insert WorksAt { @src: "cy", @dst: $c }
 }
 --- expect affected: nodes=1 edges=1
 

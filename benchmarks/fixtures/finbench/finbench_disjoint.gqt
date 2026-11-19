@@ -51,7 +51,7 @@ branch create "bench-source" from main
 query prepare_src() {
     insert Account { accountId: "omnigraph-bench-fin-v1-src-a", createTime: datetime("2020-01-01T00:00:00Z"), isBlocked: false, accountType: "internet_account", freqLoginType: "ipv4", accountLevel: "basic" }
     insert Account { accountId: "omnigraph-bench-fin-v1-src-b", createTime: datetime("2020-01-01T00:00:00Z"), isBlocked: false, accountType: "internet_account", freqLoginType: "ipv4", accountLevel: "basic" }
-    insert AccountTransferAccount { from: "omnigraph-bench-fin-v1-src-a", to: "omnigraph-bench-fin-v1-src-b", amount: 1.25, createTime: datetime("2020-01-01T00:00:00Z"), orderNum: "omnigraph-bench-fin-v1-src-order", payType: "bank_transfer", goodsType: "bank_transfer" }
+    insert AccountTransferAccount { @src: "omnigraph-bench-fin-v1-src-a", @dst: "omnigraph-bench-fin-v1-src-b", amount: 1.25, createTime: datetime("2020-01-01T00:00:00Z"), orderNum: "omnigraph-bench-fin-v1-src-order", payType: "bank_transfer", goodsType: "bank_transfer" }
 }
 --- expect affected: nodes=2 edges=1
 
@@ -122,7 +122,7 @@ branch create "bench-target" from main
 query prepare_tgt() {
     insert Account { accountId: "omnigraph-bench-fin-v1-tgt-a", createTime: datetime("2020-01-01T00:00:01Z"), isBlocked: false, accountType: "internet_account", freqLoginType: "ipv4", accountLevel: "basic" }
     insert Account { accountId: "omnigraph-bench-fin-v1-tgt-b", createTime: datetime("2020-01-01T00:00:01Z"), isBlocked: false, accountType: "internet_account", freqLoginType: "ipv4", accountLevel: "basic" }
-    insert AccountTransferAccount { from: "omnigraph-bench-fin-v1-tgt-a", to: "omnigraph-bench-fin-v1-tgt-b", amount: 2.5, createTime: datetime("2020-01-01T00:00:01Z"), orderNum: "omnigraph-bench-fin-v1-tgt-order", payType: "bank_transfer", goodsType: "bank_transfer" }
+    insert AccountTransferAccount { @src: "omnigraph-bench-fin-v1-tgt-a", @dst: "omnigraph-bench-fin-v1-tgt-b", amount: 2.5, createTime: datetime("2020-01-01T00:00:01Z"), orderNum: "omnigraph-bench-fin-v1-tgt-order", payType: "bank_transfer", goodsType: "bank_transfer" }
 }
 --- expect affected: nodes=2 edges=1
 

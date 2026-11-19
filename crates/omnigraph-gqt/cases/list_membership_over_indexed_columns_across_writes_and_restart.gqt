@@ -153,8 +153,8 @@ pass predicate_pushdown
 query append_tail() {
     insert Item { slug: "tail", code: 7, day: date("2024-07-07"), word: "theta" }
     insert Item { slug: "tail_miss", code: 8, day: date("2024-08-08"), word: "other" }
-    insert Holds { from: "root", to: "tail" }
-    insert Holds { from: "root", to: "tail_miss" }
+    insert Holds { @src: "root", @dst: "tail" }
+    insert Holds { @src: "root", @dst: "tail_miss" }
 }
 
 --- expect affected: nodes=2 edges=2

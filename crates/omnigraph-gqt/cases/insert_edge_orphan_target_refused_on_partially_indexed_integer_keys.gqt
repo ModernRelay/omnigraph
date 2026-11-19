@@ -35,7 +35,7 @@ tables:
 --- expect ok
 
 --- mutate
-query ins() { insert Knows { from: "2", to: "99" } }
+query ins() { insert Knows { @src: "2", @dst: "99" } }
 
 --- expect error: __dst '99' not found in Person
 

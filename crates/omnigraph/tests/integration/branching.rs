@@ -68,7 +68,7 @@ const EDGE_UNIQUE_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
 
 const EDGE_UNIQUE_MUTATIONS: &str = r#"
 query add_knows($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 "#;
 
@@ -90,7 +90,7 @@ const CARDINALITY_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
 
 const CARDINALITY_MUTATIONS: &str = r#"
 query add_employment($person: String, $company: String) {
-    insert WorksAt { from: $person, to: $company }
+    insert WorksAt { @src: $person, @dst: $company }
 }
 "#;
 
@@ -4328,7 +4328,7 @@ async fn branch_merge_reports_cardinality_violation_conflict() {
 async fn merge_main_into_branch_validates_adopted_edge_against_branch_node_delete() {
     const MUTATIONS: &str = r#"
 query add_knows($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 
 query delete_person($name: String) {
@@ -5174,11 +5174,11 @@ const EDGE_KEY_MERGE_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
 
 const EDGE_KEY_MERGE_MUTATIONS: &str = r#"
 query add_knows($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 
 query add_knows_since($from: String, $to: String, $since: String) {
-    insert Knows { from: $from, to: $to, since: $since }
+    insert Knows { @src: $from, @dst: $to, since: $since }
 }
 "#;
 

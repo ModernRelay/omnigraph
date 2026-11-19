@@ -33,14 +33,14 @@ branch create feature
 
 --- mutate branch: feature
 query add_b_c() {
-    insert Knows { from: "b", to: "c" }
+    insert Knows { @src: "b", @dst: "c" }
 }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: feature
 query add_c_a() {
-    insert Knows { from: "c", to: "a" }
+    insert Knows { @src: "c", @dst: "a" }
 }
 
 --- expect affected: nodes=0 edges=1
@@ -52,7 +52,7 @@ branch merge feature
 
 --- mutate
 query add_a_c_on_main() {
-    insert Knows { from: "a", to: "c" }
+    insert Knows { @src: "a", @dst: "c" }
 }
 
 --- expect affected: nodes=0 edges=1

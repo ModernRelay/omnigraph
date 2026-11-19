@@ -165,8 +165,8 @@
     "bound_point_id": "75b32416fb1b9d01e413265fcf1d9332b8d27416406d23d92c4eb39ad2dd6cda"
   },
   "finbench-disjoint-merge": {
-    "planned_sha256": "2edf51d688f554bd6b6cf45f817a8295653b0eb1b9bf16daa59e4ea48ba0346e",
-    "recipe_sha256": "945249a00f23a7d3274b9d92ddbca4b3f6672f9c4e496ce579c88a2d81b554fc",
+    "planned_sha256": "e6558b672c696418ef3addbff4abba759bcffb9173e929c2f73e0f42a929774a",
+    "recipe_sha256": "99292ccc64de8520d3b87152060410e2b031f6af01c300e826d78d8acf52c643",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -195,7 +195,7 @@
       "timer": "monotonic"
     },
     "repetitions": 5,
-    "bound_point_id": "1af69323bea424d7b441a4e95201f161d9dd1c6f0d58431526c7faaee7dd89b8"
+    "bound_point_id": "fef4353bd41e67fc75b0b2394a5e2dddfb280cf9f7f32bbe3bcc37bad2c6852c"
   },
   "hot-table-idle-base": {
     "planned_sha256": "e08db8f9b78419d303622852cfbf00108103ee2a28c24d769a2d07b3451a654c",

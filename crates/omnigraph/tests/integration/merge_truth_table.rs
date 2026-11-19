@@ -93,7 +93,7 @@ query delete_person($name: String) {
 }
 
 query insert_knows($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 
 query delete_knows_from($from: String) {

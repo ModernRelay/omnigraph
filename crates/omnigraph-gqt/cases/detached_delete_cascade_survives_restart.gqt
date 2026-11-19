@@ -86,7 +86,7 @@ query reinsert_bob() { insert Person { name: "bob" } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: work
-query add_fresh_edge() { insert Knows { from: "alice", to: "bob" } }
+query add_fresh_edge() { insert Knows { @src: "alice", @dst: "bob" } }
 
 --- expect affected: nodes=0 edges=1
 

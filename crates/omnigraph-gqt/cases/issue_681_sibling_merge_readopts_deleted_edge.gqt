@@ -35,7 +35,7 @@ branch create b1
 
 --- mutate branch: b0
 query readd() {
-    insert Knows { from: "alice", to: "bob" }
+    insert Knows { @src: "alice", @dst: "bob" }
 }
 
 --- expect affected: nodes=0 edges=1

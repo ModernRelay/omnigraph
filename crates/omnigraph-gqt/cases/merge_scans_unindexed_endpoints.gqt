@@ -29,7 +29,7 @@ branch create b
 --- expect ok
 
 --- mutate branch: b
-query ins_b() { insert Knows { from: "p000000", to: "p000001" } }
+query ins_b() { insert Knows { @src: "p000000", @dst: "p000001" } }
 --- expect affected: nodes=0 edges=1
 
 --- mutate

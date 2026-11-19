@@ -65,7 +65,7 @@ query zero($s: String, $e: Vector(2)) {
 --- expect error: Doc.embedding declares the cosine distance, which a zero vector leaves undefined
 
 --- mutate
-query cite($e: Vector(2)) { insert Cites { from: "b", to: "a", signal: $e } }
+query cite($e: Vector(2)) { insert Cites { @src: "b", @dst: "a", signal: $e } }
 
 --- params
 {"e": [0.0, 0.0]}

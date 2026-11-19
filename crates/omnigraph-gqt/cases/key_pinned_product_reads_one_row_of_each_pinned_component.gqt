@@ -93,7 +93,7 @@ c.name: String
 query hire($h: String, $s: String) {
     match { $p: Person, $c: Company }
     where $p.handle = $h and $c.slug = $s
-    insert WorksAt { from: $p, to: $c }
+    insert WorksAt { @src: $p, @dst: $c }
 }
 
 --- params

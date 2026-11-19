@@ -24,7 +24,7 @@ tables:
       id: {kind: key, prefix: p, width: 6}
 
 --- mutate
-query ins() { insert Knows { from: "p000099", to: "p000003" } }
+query ins() { insert Knows { @src: "p000099", @dst: "p000003" } }
 
 --- expect error: __src 'p000099' not found in Person
 

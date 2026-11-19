@@ -1727,7 +1727,7 @@ async fn insert_edge_with_property() {
     // Knows has `since: Date?` property
     let queries = r#"
 query add_friend_since($from: String, $to: String, $since: Date) {
-    insert Knows { from: $from, to: $to, since: $since }
+    insert Knows { @src: $from, @dst: $to, since: $since }
 }
 "#;
     let mut p = params(&[("$from", "Diana"), ("$to", "Bob")]);

@@ -30,7 +30,7 @@ branch create b0
 --- expect ok
 
 --- mutate branch: b0
-query duplicate_inherited_edge() { insert Knows { from: "Alice", to: "Bob" } }
+query duplicate_inherited_edge() { insert Knows { @src: "Alice", @dst: "Bob" } }
 
 --- expect affected: nodes=0 edges=1
 
@@ -40,12 +40,12 @@ branch merge b0
 --- expect ok
 
 --- mutate branch: b0
-query write_on_merged_branch() { insert Knows { from: "Charlie", to: "Diana" } }
+query write_on_merged_branch() { insert Knows { @src: "Charlie", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: main
-query write_on_main() { insert Knows { from: "Bob", to: "Charlie" } }
+query write_on_main() { insert Knows { @src: "Bob", @dst: "Charlie" } }
 
 --- expect affected: nodes=0 edges=1
 

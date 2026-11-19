@@ -28,7 +28,7 @@ edge Link: Link -> Link {
 
 --- mutate
 query link_edge() {
-    insert Link { from: "a", to: "b", weight: 3 }
+    insert Link { @src: "a", @dst: "b", weight: 3 }
 }
 --- expect affected: nodes=0 edges=1
 

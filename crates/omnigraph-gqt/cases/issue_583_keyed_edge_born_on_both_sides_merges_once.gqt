@@ -32,14 +32,14 @@ branch create s
 
 --- mutate branch: s
 query link_on_s() {
-    insert Knows { from: "a", to: "c", since: 1 }
+    insert Knows { @src: "a", @dst: "c", since: 1 }
 }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate
 query link_on_main() {
-    insert Knows { from: "a", to: "c", since: 1 }
+    insert Knows { @src: "a", @dst: "c", since: 1 }
 }
 
 --- expect affected: nodes=0 edges=1

@@ -29,7 +29,7 @@ branch create b0
 --- expect ok
 
 --- mutate branch: b0
-query duplicate_inherited_edge() { insert Knows { from: "Bob", to: "Diana" } }
+query duplicate_inherited_edge() { insert Knows { @src: "Bob", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 

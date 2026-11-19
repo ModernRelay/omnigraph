@@ -26,7 +26,7 @@ scope: next_step
 --- mutate
 query add_after_lost_ack() {
     insert Person { name: "bob" }
-    insert Knows { from: "alice", to: "alice" }
+    insert Knows { @src: "alice", @dst: "alice" }
 }
 --- expect affected: nodes=1 edges=1
 

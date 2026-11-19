@@ -1873,7 +1873,7 @@ async fn single_edge_query_builds_only_referenced_edge() {
 async fn write_keeps_graph_index_of_untouched_edge_tables() {
     const HIRE: &str = r#"
 query hire($person: String, $company: String) {
-    insert WorksAt { from: $person, to: $company }
+    insert WorksAt { @src: $person, @dst: $company }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();

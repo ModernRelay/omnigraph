@@ -31,7 +31,7 @@ scope: next_step
 --- mutate
 query ambiguous_write() {
     insert Person { name: "bob" }
-    insert Knows { from: "alice", to: "alice" }
+    insert Knows { @src: "alice", @dst: "alice" }
 }
 --- expect error: outcome is in doubt
 

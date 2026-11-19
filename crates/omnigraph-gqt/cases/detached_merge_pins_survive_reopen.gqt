@@ -21,7 +21,7 @@ branch create source
 --- expect ok
 
 --- mutate branch: source
-query add_source() { insert Person { name: "bob" } insert Knows { from: "bob", to: "alice" } }
+query add_source() { insert Person { name: "bob" } insert Knows { @src: "bob", @dst: "alice" } }
 --- expect affected: nodes=1 edges=1
 
 --- mutate branch: main
@@ -88,7 +88,7 @@ p.name: String
 q.name: String
 
 --- mutate branch: main
-query after_merge() { insert Person { name: "diana" } insert Knows { from: "diana", to: "carol" } }
+query after_merge() { insert Person { name: "diana" } insert Knows { @src: "diana", @dst: "carol" } }
 --- expect affected: nodes=1 edges=1
 
 --- restart

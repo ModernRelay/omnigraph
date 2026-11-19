@@ -29,7 +29,7 @@ branch create b0
 
 --- mutate branch: b0
 query add_b_c() {
-    insert Knows { from: "b", to: "c" }
+    insert Knows { @src: "b", @dst: "c" }
 }
 
 --- expect affected: nodes=0 edges=1

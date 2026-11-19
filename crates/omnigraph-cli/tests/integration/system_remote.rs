@@ -1539,7 +1539,7 @@ query insert_person($name: String, $age: I32) {
 }
 
 query add_friend($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 "#,
     )

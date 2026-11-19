@@ -3170,7 +3170,7 @@ const CARD_RACE_SEED: &str = r#"{"type":"Task","data":{"name":"task-0"}}
 
 const CARD_RACE_MUTATIONS: &str = r#"
 query hold($task: String, $agent: String) {
-    insert HeldBy { from: $task, to: $agent }
+    insert HeldBy { @src: $task, @dst: $agent }
 }
 "#;
 

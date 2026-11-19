@@ -44,7 +44,7 @@ query add_side() {
 
 --- mutate
 query link_side() {
-    insert Knows { from: "start", to: "side" }
+    insert Knows { @src: "start", @dst: "side" }
 }
 --- expect affected: nodes=0 edges=1
 

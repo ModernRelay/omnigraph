@@ -29,7 +29,7 @@ scope: next_step
 query add_all() {
     insert Person { name: "bob" }
     insert Marker { name: "after" }
-    insert Knows { from: "alice", to: "eve" }
+    insert Knows { @src: "alice", @dst: "eve" }
 }
 --- expect error: injected failpoint triggered: mutation.post_table_commit
 
@@ -85,7 +85,7 @@ q.name: String
 query add_all() {
     insert Person { name: "bob" }
     insert Marker { name: "after" }
-    insert Knows { from: "alice", to: "eve" }
+    insert Knows { @src: "alice", @dst: "eve" }
 }
 --- expect affected: nodes=2 edges=1
 

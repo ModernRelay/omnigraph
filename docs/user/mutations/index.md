@@ -5,8 +5,8 @@ Mutation statements live inside a named `.gq` query; run it with `omnigraph muta
 ```gq
 query hire($person_id: String, $company_id: String, $role: String) {
   insert WorksAt {
-    from: $person_id,
-    to: $company_id,
+    @src: $person_id,
+    @dst: $company_id,
     role: $role
   }
 }

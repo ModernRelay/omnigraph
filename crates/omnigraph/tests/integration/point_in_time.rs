@@ -746,7 +746,7 @@ async fn negation_insert_shrinks_antijoin_result() {
         &db,
         r#"
 query hire($from: String, $to: String) {
-    insert WorksAt { from: $from, to: $to }
+    insert WorksAt { @src: $from, @dst: $to }
 }
 "#,
         "hire",

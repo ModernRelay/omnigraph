@@ -279,7 +279,7 @@ query update_node_id_property() { match { $x: Person } where $x.@id = "alice"  u
 --- expect error: T11: type `Person` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 
 --- mutate
-query insert_edge_id_property() { insert Bare { from: "alice", to: "bob", id: "x" } }
+query insert_edge_id_property() { insert Bare { @src: "alice", @dst: "bob", id: "x" } }
 
 --- expect error: T11: type `Bare` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 

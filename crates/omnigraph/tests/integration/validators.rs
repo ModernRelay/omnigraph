@@ -85,7 +85,7 @@ const CARDINALITY_SEED: &str = r#"{"type":"Person","data":{"name":"Alice"}}
 
 const CARDINALITY_MUTATIONS: &str = r#"
 query add_employment($person: String, $company: String) {
-    insert WorksAt { from: $person, to: $company }
+    insert WorksAt { @src: $person, @dst: $company }
 }
 "#;
 
@@ -987,11 +987,11 @@ const EDGE_KEY_SEED: &str = r#"{"type":"Person","data":{"name":"Alice"}}
 
 const EDGE_KEY_MUTATIONS: &str = r#"
 query add_knows($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 
 query add_knows_since($from: String, $to: String, $since: String) {
-    insert Knows { from: $from, to: $to, since: $since }
+    insert Knows { @src: $from, @dst: $to, since: $since }
 }
 "#;
 

@@ -38,7 +38,7 @@ scope: next_step
 query w() {
     insert Person { name: "bob" }
     insert Company { name: "globex" }
-    insert WorksAt { from: "bob", to: "globex" }
+    insert WorksAt { @src: "bob", @dst: "globex" }
 }
 --- expect error: injected failpoint triggered: mutation.post_table_commit
 
@@ -98,7 +98,7 @@ c.name: String
 query w() {
     insert Person { name: "bob" }
     insert Company { name: "globex" }
-    insert WorksAt { from: "bob", to: "globex" }
+    insert WorksAt { @src: "bob", @dst: "globex" }
 }
 --- expect affected: nodes=2 edges=1
 

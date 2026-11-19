@@ -31,7 +31,7 @@ query add_node() { insert Person { id: 100 } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: b
-query add_edge() { insert Knows { from: "0", to: "100" } }
+query add_edge() { insert Knows { @src: "0", @dst: "100" } }
 --- expect affected: nodes=0 edges=1
 
 --- mutate

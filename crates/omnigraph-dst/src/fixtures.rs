@@ -102,7 +102,7 @@ query get_person($name: String) {
 }
 
 query add_friend($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 
 query remove_friendships_from($from: String) {

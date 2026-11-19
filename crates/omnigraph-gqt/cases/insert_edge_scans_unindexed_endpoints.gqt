@@ -25,7 +25,7 @@ tables:
       id: {kind: key, prefix: p, width: 6}
 
 --- mutate
-query ins() { insert Knows { from: "p000000", to: "p000001" } }
+query ins() { insert Knows { @src: "p000000", @dst: "p000001" } }
 --- expect affected: nodes=0 edges=1
 --- expect plan
 load route: pipeline

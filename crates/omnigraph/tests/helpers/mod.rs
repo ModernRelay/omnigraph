@@ -50,7 +50,7 @@ query insert_person($name: String, $age: I32) {
 }
 
 query add_friend($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 
 query set_age($name: String, $age: I32) {
@@ -70,7 +70,7 @@ query remove_friendship($from: String) {
 
 query insert_person_and_friend($name: String, $age: I32, $friend: String) {
     insert Person { name: $name, age: $age }
-    insert Knows { from: $name, to: $friend }
+    insert Knows { @src: $name, @dst: $friend }
 }
 "#;
 

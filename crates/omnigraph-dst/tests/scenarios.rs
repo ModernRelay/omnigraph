@@ -3351,7 +3351,7 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
     async fn run(&self, resources: &mut omnigraph_dst::memory::MemoryStorage, _workload_seed: u64) {
         const HIRE: &str = r#"
 query hire($person: String, $company: String) {
-    insert WorksAt { from: $person, to: $company }
+    insert WorksAt { @src: $person, @dst: $company }
 }
 "#;
         let [cold, warm, after_other, after_branch, after_own] = GRAPH_INDEX_RETENTION_LABELS;

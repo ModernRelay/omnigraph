@@ -113,7 +113,7 @@ p.age: I32?
 --- mutate
 query mentor_from_a_read() {
   match { from { match { $p: Person, $c: Company, $p worksAt $c } where $c.slug = "acme" return { $p } }, $x: Person } where $x.name = "di"
-  insert Mentors { from: $x, to: $p }
+  insert Mentors { @src: $x, @dst: $p }
 }
 
 --- expect affected: nodes=0 edges=2

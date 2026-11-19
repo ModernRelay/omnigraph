@@ -109,7 +109,7 @@ p.name: String
 
 --- mutate
 query add_reverse() {
-    insert Knows { from: "Diana", to: "Bob" }
+    insert Knows { @src: "Diana", @dst: "Bob" }
 }
 
 --- expect affected: nodes=0 edges=1

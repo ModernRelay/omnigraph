@@ -22,8 +22,8 @@ edge Knows: Person -> Person
 
 --- mutate
 query two_loops() {
-    insert Knows { from: "a", to: "a" }
-    insert Knows { from: "a", to: "a" }
+    insert Knows { @src: "a", @dst: "a" }
+    insert Knows { @src: "a", @dst: "a" }
 }
 
 --- expect affected: nodes=0 edges=2

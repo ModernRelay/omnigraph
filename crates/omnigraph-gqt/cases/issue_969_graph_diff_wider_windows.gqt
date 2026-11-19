@@ -93,7 +93,7 @@ query carol_returns_older() {
 
 --- mutate
 query carol_knows_erin() {
-    insert Knows { from: "carol", to: "erin", since: 2024 }
+    insert Knows { @src: "carol", @dst: "erin", since: 2024 }
 }
 
 --- expect affected: nodes=0 edges=1

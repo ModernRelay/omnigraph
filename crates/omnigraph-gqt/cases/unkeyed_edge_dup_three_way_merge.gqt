@@ -31,22 +31,22 @@ branch create b0
 --- expect ok
 
 --- mutate branch: main
-query add_loop_on_main() { insert Knows { from: "Diana", to: "Diana" } }
+query add_loop_on_main() { insert Knows { @src: "Diana", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query add_loop_on_branch() { insert Knows { from: "Diana", to: "Diana" } }
+query add_loop_on_branch() { insert Knows { @src: "Diana", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query duplicate_branch_loop() { insert Knows { from: "Diana", to: "Diana" } }
+query duplicate_branch_loop() { insert Knows { @src: "Diana", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query duplicate_inherited_edge() { insert Knows { from: "Alice", to: "Bob" } }
+query duplicate_inherited_edge() { insert Knows { @src: "Alice", @dst: "Bob" } }
 
 --- expect affected: nodes=0 edges=1
 
