@@ -67,7 +67,7 @@ impl Session {
         params: &ParamMap,
     ) -> Result<(QueryResult, Option<String>)> {
         let settings = self.effective(query_source)?;
-        let (resolved, catalog) = self.capture_read_view(target).await?;
+        let (resolved, catalog) = self.capture_query_view(target).await?;
 
         let compiled = self.compile_named_query(&catalog, query_source, query_name, &settings)?;
         admit_wildcard_target(
@@ -145,7 +145,7 @@ impl Session {
         params: &ParamMap,
     ) -> Result<serde_json::Value> {
         let settings = self.effective(query_source)?;
-        let (resolved, catalog) = self.capture_read_view(target).await?;
+        let (resolved, catalog) = self.capture_query_view(target).await?;
         let compiled = self.compile_named_query(&catalog, query_source, query_name, &settings)?;
         admit_wildcard_target(
             matches!(&resolved.requested, ReadTarget::Snapshot(_)),
@@ -227,7 +227,7 @@ impl Session {
         params: &ParamMap,
     ) -> Result<engine::Executed> {
         let settings = self.effective(query_source)?;
-        let (resolved, catalog) = self.capture_read_view(target).await?;
+        let (resolved, catalog) = self.capture_query_view(target).await?;
         let CompiledRead::Query(query) =
             self.compile_named_query(&catalog, query_source, query_name, &settings)?
         else {
@@ -304,7 +304,7 @@ impl Session {
             omnigraph_planner::ValidationLimits::DEFAULT,
         )
         .map_err(engine::replay_refused)?;
-        let (resolved, catalog) = self.capture_read_view(target).await?;
+        let (resolved, catalog) = self.capture_query_view(target).await?;
         let plan = &envelope.plan.plan;
         let has_wildcard = plan.assumptions().has_wildcard_traversal || plan.live().any(|(_, node)| {
             matches!(node, omnigraph_planner::PhysicalNode::Expand { edges, .. } if edges.is_wildcard())
@@ -438,7 +438,11 @@ impl Omnigraph {
             CompiledRead::Query(query)
         };
         crate::instrumentation::record_query_compile();
-        cache.insert(catalog, key, compiled.clone());
+        // A historical catalog is built per read; caching against it would
+        // only evict the live entry for the same source.
+        if catalog.historical().is_none() {
+            cache.insert(catalog, key, compiled.clone());
+        }
         Ok(compiled)
     }
 }

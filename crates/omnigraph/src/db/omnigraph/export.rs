@@ -197,7 +197,9 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
             actual: 2,
         }
     })?;
-    let (resolved, catalog) = db.capture_read_view(target).await?;
+    // A read like any other: at an explicit commit, the current schema as
+    // that commit holds it.
+    let (resolved, catalog) = db.capture_query_view(target).await?;
     let selected_tables = export_type_keys(&resolved.snapshot, type_names)?;
     let mut emit =
         |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));

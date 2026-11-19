@@ -1,4 +1,5 @@
 pub mod catalogue;
+pub mod historical;
 pub mod schema_ir;
 pub mod schema_plan;
 pub mod schema_shape;
@@ -36,6 +37,9 @@ pub struct Catalog {
     /// `node_types`, so schema apply, validation and stored identity never
     /// see them.
     pub catalogue: HashMap<String, NodeType>,
+    /// Set only on the catalog a read at an earlier commit plans against
+    /// ([`Catalog::at_commit`]): the commit and what it leaves out.
+    pub historical: Option<Arc<historical::HistoricalView>>,
 }
 
 impl Catalog {
@@ -735,6 +739,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
         system_columns,
         identity: CatalogIdentity::SourceUnbound,
         catalogue: catalogue::catalogue_node_types(system_columns),
+        historical: None,
     })
 }
 
@@ -1059,6 +1064,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
         system_columns,
         identity: CatalogIdentity::Bound(Arc::new(ir.clone())),
         catalogue: catalogue::catalogue_node_types(system_columns),
+        historical: None,
     })
 }
 

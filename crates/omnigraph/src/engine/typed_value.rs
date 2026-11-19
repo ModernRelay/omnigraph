@@ -7,10 +7,7 @@ use datafusion::scalar::ScalarValue;
 use omnigraph_compiler::ir::IRParam;
 use omnigraph_compiler::types::ExprType;
 
-use crate::error::{
-    missing_graph_property_at_snapshot, renamed_graph_property_at_snapshot,
-    unwitnessed_graph_property_at_snapshot,
-};
+use crate::error::{missing_graph_property_at_snapshot, unwitnessed_graph_property_at_snapshot};
 
 /// Bind each omitted declaration to its declared default, an omitted
 /// nullable one without a default to null, and refuse an omitted required
@@ -449,13 +446,15 @@ fn check_stored_fields<'a>(
 /// A property is its persisted stable property id, never its name. Where the
 /// accepted contract was published with the opened version, its names name
 /// that version's columns, and a column that is not the declared lifetime is
-/// an integrity failure. A historical version is read under the current
-/// contract, so the column of the declared name may be a dropped property's
-/// (a same-name re-add) and the declared property may sit under an earlier
-/// name (a rename since) or nowhere (an addition since): each refuses like a
-/// type absent at the snapshot. A column written before 0.10 carries no id
-/// and proves no lifetime, so a historical version refuses it, as Blob reads
-/// do. System columns carry no id and resolve by name.
+/// an integrity failure. A historical read opens each table under its
+/// property view (`Snapshot::set_property_views`), so a property renamed
+/// since reads under its current name and a dropped property's column is
+/// hidden; a declared property the opened version does not hold refuses like
+/// a type absent at the snapshot, which only a commit whose schema was not
+/// recorded can reach, since the type checker refuses the others. A column
+/// written before 0.10 carries no id and proves no lifetime, so a historical
+/// version refuses it, as Blob reads do. System columns carry no id and
+/// resolve by name.
 fn stored_field<'s>(
     stored: &'s Schema,
     expected: &Field,
@@ -489,16 +488,9 @@ fn stored_field<'s>(
     if contract_covers {
         return Err(internal());
     }
-    let renamed = stored.fields().iter().find(|field| {
-        field
-            .metadata()
-            .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
-            == Some(declared_id)
-    });
-    Err(OmniError::manifest(match renamed {
-        Some(field) => renamed_graph_property_at_snapshot(table, name, field.name()),
-        None => missing_graph_property_at_snapshot(table, name),
-    }))
+    Err(OmniError::manifest(missing_graph_property_at_snapshot(
+        table, name,
+    )))
 }
 
 /// A pushed filter consumes physical columns directly, so validate its stored
@@ -1225,9 +1217,12 @@ mod tests {
             refusal(&stored, "note"),
             "property 'note' of node type 'Doc' does not exist at this snapshot"
         );
+        // A rename since is resolved by the historical read's property view,
+        // which opens the table with `memo` named `remark`; a table read
+        // without it holds no `remark`.
         assert_eq!(
             refusal(&stored, "remark"),
-            "property 'remark' of node type 'Doc' is named 'memo' at this snapshot; a historical query cannot read a property across a rename"
+            "property 'remark' of node type 'Doc' does not exist at this snapshot"
         );
         assert_eq!(
             refusal(&stored, "age"),
