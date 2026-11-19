@@ -1,0 +1,1 @@
+- `omnigraph-bench --store s3://bucket/prefix`, on `run` and `report`, admits a colon in a prefix segment, the shape of an EC2 instance role's `${aws:userid}` (`<role id>:<instance id>`).
