@@ -2656,7 +2656,7 @@ async fn run_json_load(
 /// Compatibility-load NDJSON data through a JSON envelope.
 ///
 /// `data` is NDJSON with one record per line. `mode` controls behavior on
-/// existing entities: `replace` writes each record's whole row (default),
+/// existing entities: `replace` writes each record as the whole entity (default),
 /// `upsert` sets the properties a record names, `insert` creates and refuses
 /// an existing id with `key_conflict`, and `overwrite` replaces type data;
 /// `append` and `merge` are refused with their fix. Branch creation is opt-in by
