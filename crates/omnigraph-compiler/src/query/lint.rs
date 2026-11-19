@@ -372,18 +372,9 @@ fn lint_update_coverage(
 /// as the fix: `L203` and `L206` to `L211` keep the typed IR, `L204` and
 /// `L205` only the rows.
 fn lint_canonical_forms(query_source: &str) -> Vec<QueryLintFinding> {
-    use crate::query::syntax::{Body, Decl};
-    let Ok(file) = crate::query::syntax::parse::parse_source(query_source) else {
-        return Vec::new();
-    };
-    let decls: Vec<&Decl> = match &file.body {
-        Body::Decls(d) => d.iter().collect(),
-        Body::Explain { before, decl } => before.iter().chain([decl.as_ref()]).collect(),
-        Body::Statement(_) => Vec::new(),
-    };
-    let mut findings = Vec::new();
-    for decl in decls {
-        for form in crate::query::canonical::canonical_forms(decl) {
+    crate::query::canonical::source_canonical_forms(query_source)
+        .into_iter()
+        .map(|(decl, form)| {
             let position = form
                 .position
                 .map(|at| format!("line {}, column {}: ", at.line, at.column))
@@ -399,22 +390,21 @@ fn lint_canonical_forms(query_source: &str) -> Vec<QueryLintFinding> {
                     form.written, form.fix
                 )
             };
-            findings.push(QueryLintFinding {
+            QueryLintFinding {
                 severity: QueryLintSeverity::Info,
                 code: form.code.to_string(),
                 message,
                 fix: Some(form.fix),
                 type_name: None,
                 property: None,
-                query_names: vec![decl.name.clone()],
+                query_names: vec![decl],
                 suggestion: form.edit.map(|edit| Suggestion {
                     applicability: Applicability::MachineApplicable,
                     edits: vec![edit],
                 }),
-            });
-        }
-    }
-    findings
+            }
+        })
+        .collect()
 }
 
 fn findings_cmp(left: &QueryLintFinding, right: &QueryLintFinding) -> std::cmp::Ordering {

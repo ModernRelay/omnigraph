@@ -63,6 +63,7 @@ pub use query::diagnostic::{
     Stage, Suggestion, TextEdit,
 };
 
+pub use query::fix::{FixOptions, FixOutcome, FixReport, FixStatus, MAX_FIX_PASSES, fix_source};
 pub use query::lint::{
     QueryLintFinding, QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult,
     QueryLintSchemaSource, QueryLintSchemaSourceKind, QueryLintSeverity, QueryLintStatus,

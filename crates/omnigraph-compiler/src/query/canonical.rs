@@ -98,6 +98,29 @@ pub(crate) fn canonical_forms(decl: &Decl) -> Vec<CanonicalForm> {
     out
 }
 
+/// Every non-canonical form of every declaration of `source`, each with the
+/// name of the declaration it stands in, in declaration order; nothing for a
+/// source that does not parse.
+pub(crate) fn source_canonical_forms(source: &str) -> Vec<(String, CanonicalForm)> {
+    use crate::query::syntax::Body;
+    let Ok(file) = crate::query::syntax::parse::parse_source(source) else {
+        return Vec::new();
+    };
+    let decls: Vec<&Decl> = match &file.body {
+        Body::Decls(d) => d.iter().collect(),
+        Body::Explain { before, decl } => before.iter().chain([decl.as_ref()]).collect(),
+        Body::Statement(_) => Vec::new(),
+    };
+    decls
+        .into_iter()
+        .flat_map(|decl| {
+            canonical_forms(decl)
+                .into_iter()
+                .map(|form| (decl.name.clone(), form))
+        })
+        .collect()
+}
+
 /// The byte range a parsed node was written at; `None` for a node built
 /// rather than parsed.
 fn range(at: &SourceSpan) -> Option<(usize, usize)> {

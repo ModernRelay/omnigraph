@@ -5,6 +5,7 @@ pub mod depth;
 pub mod descriptor;
 pub mod diagnostic;
 pub mod file;
+pub mod fix;
 pub mod lint;
 pub mod parser;
 pub mod syntax;
