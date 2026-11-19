@@ -268,10 +268,10 @@ never overwrites an initialized graph or purges Lance datasets.
 
 ```bash
 # bare load: operates on an existing branch (default main); --mode is required
-omnigraph load --data seed.jsonl --mode merge --target $REPO
+omnigraph load --data seed.jsonl --mode replace --target $REPO
 
 # --from forks a missing branch from <base>, then loads onto it (one-shot review branch)
-omnigraph load --data delta.jsonl --branch feature-x --from main --mode merge --target $REPO
+omnigraph load --data delta.jsonl --branch feature-x --from main --mode replace --target $REPO
 ```
 
 `--mode` is **required** (no default): `merge`, `append`, or `overwrite`.

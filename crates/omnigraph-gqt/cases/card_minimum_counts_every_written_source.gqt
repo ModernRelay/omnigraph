@@ -61,7 +61,7 @@ query retitle() {
 
 --- expect affected: nodes=1 edges=0
 
---- load generate: v1 seed: 0 mode: append
+--- load generate: v1 seed: 0 mode: insert
 tables:
   - kind: node
     name: Person

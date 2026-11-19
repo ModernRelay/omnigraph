@@ -89,7 +89,7 @@ from,to,w
 p3,p1,9
 
 --- mutate
-load csv "knows_more.csv" into edge:Knows mode append header
+load csv "knows_more.csv" into edge:Knows mode insert header
 
 --- expect ok
 
@@ -98,7 +98,7 @@ load route: pipeline
 load validate edge_ri edge:Knows from Person: access scan
 load validate edge_ri edge:Knows from Person: probe judged
 load validate removal edge:Knows: none
-load write: append strict_insert
+load write: insert strict_insert
 load executed: partitions 1 rows 1
 
 --- csv people_more.csv
@@ -106,7 +106,7 @@ id,email
 p4,d@x
 
 --- mutate
-load csv "people_more.csv" into node:Person mode merge header
+load csv "people_more.csv" into node:Person mode replace header
 
 --- expect ok
 
@@ -114,7 +114,7 @@ load csv "people_more.csv" into node:Person mode merge header
 load route: pipeline
 load validate unique node:Person unique [email]: access scan
 load validate removal node:Person: none
-load write: merge upsert
+load write: replace upsert
 load executed: partitions 1 rows 1
 
 --- query

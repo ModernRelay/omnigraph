@@ -1225,7 +1225,7 @@ async fn merge_all_changed(args: &Args) -> serde_json::Value {
             "}}
 ",
         );
-        db.load("main", &jsonl, LoadMode::Merge)
+        db.load("main", &jsonl, LoadMode::Replace)
             .await
             .expect("diverge main");
     }
@@ -1283,7 +1283,7 @@ async fn load_vector_rows(
             push_vector_json(&mut jsonl, &seeded_vector(seed, &slug, args.dims, pole));
             jsonl.push_str("}}\n");
         }
-        db.load(branch, &jsonl, LoadMode::Merge)
+        db.load(branch, &jsonl, LoadMode::Replace)
             .await
             .expect("load batch");
         row = end;
@@ -1816,7 +1816,7 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
             );
             jsonl.push_str("}}\n");
         }
-        db.load("main", &jsonl, LoadMode::Merge)
+        db.load("main", &jsonl, LoadMode::Replace)
             .await
             .expect("load batch");
         row = end;
@@ -1964,7 +1964,7 @@ async fn rrf_gate(args: &Args) -> serde_json::Value {
             for a in 0..ARTIFACTS {
                 let _ = writeln!(head, r#"{{"type":"Artifact","data":{{"slug":"art-{a:04}"}}}}"#);
             }
-            db.load("main", &head, LoadMode::Merge).await.expect("load artifacts");
+            db.load("main", &head, LoadMode::Replace).await.expect("load artifacts");
 
             let chunk_batch_rows = (24 * 1024 * 1024 / args.text_bytes.max(1)).clamp(1, 4_000);
             let mut chunk_batch = String::new();
@@ -1974,7 +1974,7 @@ async fn rrf_gate(args: &Args) -> serde_json::Value {
                     r#"{{"type":"Chunk","data":{{"slug":"chunk-{c:06}","text":"{text}"}}}}"#
                 );
                 if (c + 1) % chunk_batch_rows == 0 || c + 1 == args.rows {
-                    db.load("main", &chunk_batch, LoadMode::Merge)
+                    db.load("main", &chunk_batch, LoadMode::Replace)
                         .await
                         .expect("load chunks");
                     chunk_batch.clear();
@@ -1996,14 +1996,14 @@ async fn rrf_gate(args: &Args) -> serde_json::Value {
                     );
                     edge_rows += 1;
                     if edge_rows == EDGE_BATCH_ROWS {
-                        db.load("main", &edges, LoadMode::Merge).await.expect("load edges");
+                        db.load("main", &edges, LoadMode::Replace).await.expect("load edges");
                         edges.clear();
                         edge_rows = 0;
                     }
                 }
             }
             if edge_rows > 0 {
-                db.load("main", &edges, LoadMode::Merge).await.expect("load edges");
+                db.load("main", &edges, LoadMode::Replace).await.expect("load edges");
             }
             let seed_ms = seed_start.elapsed().as_millis() as u64;
 

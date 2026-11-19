@@ -554,7 +554,7 @@ query packed_title_after_patch() {
 d.slug: String
 d.title: String
 
---- load generate: v1 seed: 0 mode: append
+--- load generate: v1 seed: 0 mode: insert
 tables:
   - kind: node
     name: Apart

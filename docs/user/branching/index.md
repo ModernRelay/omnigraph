@@ -10,7 +10,7 @@ review a multi-step change without exposing intermediate results on `main`.
 omnigraph branch create review/add-benchmark --from main --target ./graph.omni
 
 # Write and inspect it.
-omnigraph load --data benchmark.jsonl --mode append \
+omnigraph load --data benchmark.jsonl --mode insert \
   --branch review/add-benchmark --target ./graph.omni
 omnigraph query sources_for_claim --query queries.gq \
   --params '{"claim":"lower-latency"}' \

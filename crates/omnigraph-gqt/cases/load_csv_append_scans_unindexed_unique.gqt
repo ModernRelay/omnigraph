@@ -30,7 +30,7 @@ id,email
 q000001,e900001
 
 --- mutate
-load csv "people.csv" into node:Person mode append header
+load csv "people.csv" into node:Person mode insert header
 --- expect ok
 --- expect plan
 load route: pipeline
@@ -43,7 +43,7 @@ id,email
 q000002,e000003
 
 --- mutate
-load csv "repeat.csv" into node:Person mode append header
+load csv "repeat.csv" into node:Person mode insert header
 --- expect error: @unique violation on Person.email: value 'e000003' held by 'p000003' and 'q000002'
 
 --- query

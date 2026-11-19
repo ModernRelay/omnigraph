@@ -19,7 +19,7 @@ occurrence: 1
 action: fail
 scope: next_step
 
---- load generate: v1 seed: 42 mode: append
+--- load generate: v1 seed: 42 mode: insert
 tables:
   - kind: node
     name: Person
@@ -37,7 +37,7 @@ query unchanged() { match { $p: Person } return { $p.name } }
 --- expect shape
 p.name: String
 
---- load generate: v1 seed: 42 mode: append
+--- load generate: v1 seed: 42 mode: insert
 tables:
   - kind: node
     name: Person

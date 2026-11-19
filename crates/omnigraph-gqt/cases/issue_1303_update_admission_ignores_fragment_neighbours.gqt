@@ -68,7 +68,7 @@ node ApartDocTwice {
 
 --- seed
 
---- load generate: v1 seed: 0 mode: append
+--- load generate: v1 seed: 0 mode: insert
 tables:
   - kind: node
     name: Shared
@@ -129,7 +129,7 @@ tables:
 
 --- expect ok
 
---- load generate: v1 seed: 0 mode: append
+--- load generate: v1 seed: 0 mode: insert
 tables:
   - kind: node
     name: Apart

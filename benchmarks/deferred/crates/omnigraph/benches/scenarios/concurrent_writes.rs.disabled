@@ -366,7 +366,7 @@ pub(super) async fn run(args: &Args) -> serde_json::Value {
         args.rows,
         plan.batch_rows,
         &patterns,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await;
     let aging = rfc023_scenarios::age_fixture(&db, args).await;

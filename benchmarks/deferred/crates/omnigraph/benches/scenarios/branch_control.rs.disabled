@@ -188,13 +188,13 @@ pub(super) async fn setup(args: &Args) -> serde_json::Value {
         args.rows,
         plan.batch_rows,
         &patterns,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await;
     for table in 1..args.tables {
         let row = format!("{{\"type\":\"Extra{table}\",\"data\":{{\"slug\":\"base\"}}}}\n");
         let loaded = db
-            .load("main", &row, LoadMode::Append)
+            .load("main", &row, LoadMode::Insert)
             .await
             .expect("populate scalar table");
         assert_eq!(loaded.nodes_loaded.values().sum::<usize>(), 1);
@@ -207,7 +207,7 @@ pub(super) async fn setup(args: &Args) -> serde_json::Value {
     }
     if args.scenario == "branch-pointer-adopt-owned" {
         db.branch_create(TARGET).await.unwrap();
-        db.load(TARGET, &one_row(args, "owner-only"), LoadMode::Append)
+        db.load(TARGET, &one_row(args, "owner-only"), LoadMode::Insert)
             .await
             .unwrap();
     }
@@ -230,7 +230,7 @@ pub(super) async fn setup(args: &Args) -> serde_json::Value {
         1,
         1,
         &patterns,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await;
     if args.scenario == "branch-pointer-adopt-lazy" {
@@ -253,12 +253,12 @@ pub(super) async fn setup(args: &Args) -> serde_json::Value {
             1,
             1,
             &patterns,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await;
         for table in 1..args.tables {
             let row = format!("{{\"type\":\"Extra{table}\",\"data\":{{\"slug\":\"victim\"}}}}\n");
-            db.load(TARGET, &row, LoadMode::Append)
+            db.load(TARGET, &row, LoadMode::Insert)
                 .await
                 .expect("own victim scalar table");
         }
@@ -393,7 +393,7 @@ pub(super) async fn operation(args: &Args) -> serde_json::Value {
             None
         }
         "branch-first-write" => {
-            db.load(TARGET, &payload, LoadMode::Append).await.expect("measured first-touch write");
+            db.load(TARGET, &payload, LoadMode::Insert).await.expect("measured first-touch write");
             None
         }
         "branch-cleanup" => {
@@ -746,7 +746,7 @@ async fn prepare_cleanup(args: &Args, db: &Session, fixture: &mut Fixture) {
         db.load(
             "control-garbage",
             &one_row(args, "garbage-only"),
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -759,7 +759,7 @@ async fn prepare_cleanup(args: &Args, db: &Session, fixture: &mut Fixture) {
     db.load(
         "control-retained-parent",
         &one_row(args, "parent-only"),
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -777,7 +777,7 @@ async fn prepare_cleanup(args: &Args, db: &Session, fixture: &mut Fixture) {
     db.load(
         "control-retained-child",
         &one_row(args, "child-only"),
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -788,7 +788,7 @@ async fn prepare_cleanup(args: &Args, db: &Session, fixture: &mut Fixture) {
             .outcome,
         MergeOutcome::FastForward
     );
-    db.load("main", &one_row(args, "main-only"), LoadMode::Append)
+    db.load("main", &one_row(args, "main-only"), LoadMode::Insert)
         .await
         .unwrap();
     assert_eq!(
@@ -943,7 +943,7 @@ async fn verify_content(args: &Args, db: &Session, fixture: &Fixture) -> serde_j
     if is_pointer_adoption(args) {
         let source = db.snapshot_of(ReadTarget::branch(SOURCE)).await.unwrap();
         let old_target = chunk_view(db, TARGET).await;
-        db.load(TARGET, &one_row(args, "verify-only"), LoadMode::Append)
+        db.load(TARGET, &one_row(args, "verify-only"), LoadMode::Insert)
             .await
             .unwrap();
         let written = chunk_view(db, TARGET).await;

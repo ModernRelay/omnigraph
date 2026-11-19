@@ -65,9 +65,9 @@ omnigraph export --target production --graph knowledge \
 For `load --from <base> --branch <review>`, inspect the review branch rather
 than assuming branch creation means the load landed. Strict inserts of unkeyed
 nodes and edges can duplicate on a blind retry. Mutation `insert` and
-`load --mode merge` upsert keyed nodes and keyed edges (`@key(@src, @dst, …)`)
+`load --mode replace` upsert keyed nodes and keyed edges (`@key(@src, @dst, …)`)
 by their derived logical IDs;
-`load --mode append` remains strict and reports an ID collision. Verification
+`load --mode insert` remains strict and reports an ID collision. Verification
 is still safer when the requested value matters.
 
 ## Conditional mutations

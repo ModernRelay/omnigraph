@@ -134,7 +134,7 @@ reports `key_conflict` on an already-committed pair, `merge` upserts it, and
 a supplied top-level `id` must equal the derivation exactly.
 
 ```bash
-omnigraph load --data batch.jsonl --mode merge --target ./graph.omni
+omnigraph load --data batch.jsonl --mode replace --target ./graph.omni
 ```
 
 One load request is one graph commit. Use `--branch <name> --from <base>` to
@@ -153,11 +153,11 @@ it runs wherever a `branch create` statement runs: `omnigraph mutate -e`, a
 when omitted). It is the one CSV surface: `omnigraph load` reads JSONL only.
 
 ```gq
-load csv "s3://imports/person.csv" into node:Person mode append delimiter "|" header
+load csv "s3://imports/person.csv" into node:Person mode insert delimiter "|" header
 ```
 
 ```gq
-load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" header columns (from, to, creationDate)
+load csv "s3://imports/knows.csv" into edge:Knows mode insert delimiter "|" header columns (from, to, creationDate)
 ```
 
 - `mode` is required: `overwrite`, `append`, or `merge`, with the meanings of
@@ -218,8 +218,8 @@ byte. See [Explaining a load statement](../queries/explain-load.md).
 #### CLI and HTTP requests
 
 ```bash
-omnigraph mutate --target ./graph.omni -e 'load csv "file:///data/person_0_0.csv" into node:Person mode append delimiter "|" header'
-omnigraph mutate --target dev -e 'load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" header'
+omnigraph mutate --target ./graph.omni -e 'load csv "file:///data/person_0_0.csv" into node:Person mode insert delimiter "|" header'
+omnigraph mutate --target dev -e 'load csv "s3://imports/knows.csv" into edge:Knows mode insert delimiter "|" header'
 ```
 
 The CLI uses `--branch`; HTTP uses the request `branch`, with `main` as the
@@ -236,7 +236,7 @@ curl -sS http://localhost:8080/graphs/knowledge/mutate \
   -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
-  -d '{"query":"load csv \"s3://imports/person.csv\" into node:Person mode append delimiter \"|\" header","branch":"main"}'
+  -d '{"query":"load csv \"s3://imports/person.csv\" into node:Person mode insert delimiter \"|\" header","branch":"main"}'
 ```
 
 The HTTP body carries the statement; the server reads its source under the

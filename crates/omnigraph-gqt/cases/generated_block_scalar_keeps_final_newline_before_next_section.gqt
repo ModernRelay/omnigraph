@@ -24,7 +24,7 @@ tables:
         kind: literal
         value: |
           alpha
---- load generate: v1 seed: 1 mode: append
+--- load generate: v1 seed: 1 mode: insert
 tables:
   - kind: node
     name: Doc

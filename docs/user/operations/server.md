@@ -315,7 +315,7 @@ batch; it is not a durable stream or an unbounded ingestion session. Split a
 larger feed into batches and wait for each response before acknowledging it
 upstream.
 
-HTTP loading defaults to `mode=merge` and branch `main`. A missing target branch
+HTTP loading defaults to `mode=replace` and branch `main`. A missing target branch
 is an error unless the request supplies `from`. This differs from the CLI,
 where `--mode` is always required.
 

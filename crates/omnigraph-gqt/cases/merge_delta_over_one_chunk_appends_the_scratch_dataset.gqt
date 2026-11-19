@@ -22,7 +22,7 @@ branch create work
 
 --- expect ok
 
---- load generate: v1 seed: 7 mode: append branch: work
+--- load generate: v1 seed: 7 mode: insert branch: work
 tables:
   - kind: node
     name: Person

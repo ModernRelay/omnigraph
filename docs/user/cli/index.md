@@ -66,7 +66,7 @@ the selected backend's registry.
 
 ```bash
 omnigraph branch create review/new-data --from main --target ./graph.omni
-omnigraph load --target ./graph.omni --data batch.jsonl --mode merge \
+omnigraph load --target ./graph.omni --data batch.jsonl --mode replace \
   --branch review/new-data
 omnigraph query inspect --target ./graph.omni --query review.gq \
   --branch review/new-data

@@ -238,7 +238,7 @@ id|firstName
 2|bob
 
 --- mutate branch: work
-load csv "person.csv" into node:Person mode append delimiter "|" header
+load csv "person.csv" into node:Person mode insert delimiter "|" header
 
 --- expect ok
 ```
@@ -259,8 +259,8 @@ single_scan`; `load validate value <table> [a, b]`; `load validate unique
 edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`; `load validate
 cardinality <edge> <from|to> <Node>`; `load validate retained_edges <node>
 <edge> <from|to>: access <delta|probe|scan>`; `load validate source_cardinality
-<node> <edge>: access <delta|probe|scan>`; `load write: <overwrite fragments|append strict_insert|
-merge upsert>`; `load executed: partitions <n> rows <m>`. The validate lines
+<node> <edge>: access <delta|probe|scan>`; `load write: <overwrite fragments|insert strict_insert|
+upsert upsert|replace upsert>`; `load executed: partitions <n> rows <m>`. The validate lines
 are the one `Validate` node's checks. Tables are qualified (`node:Person`, `edge:Knows`);
 an endpoint's referenced type is bare. A served environment refuses the
 section at admission, since the wire answer carries no plan.
@@ -280,7 +280,7 @@ An ordinary `--- seed` contains JSONL and loads with overwrite semantics.
 one table batch per commit in recipe order. Later steps reuse that recipe:
 
 ```yaml
---- load generate: v1 seed: 42 mode: merge branch: work
+--- load generate: v1 seed: 42 mode: replace branch: work
 tables:
   - kind: node
     name: Person
@@ -296,8 +296,9 @@ tables:
 --- expect ok
 ```
 
-The schema declares the types and keys. A load requires `mode: append` or
-`mode: merge`; `branch:` defaults to `main` and must already exist. Its expect
+The schema declares the types and keys. A load requires `mode: insert`,
+`mode: upsert` or `mode: replace` (`append` and `merge` are refused with
+`insert` and `replace` as their fixes); `branch:` defaults to `main` and must already exist. Its expect
 is `ok` or `error: <substring>`, with no params, affected-count, row or shape
 section. Table batches publish independently; a later failure does not undo
 earlier batches. A node batch therefore carries no edges, and a node type that
@@ -822,8 +823,8 @@ load validate retained_edges <node-table> <edge-table> from|to: access delta|pro
 load validate source_cardinality <node-table> <edge-table>: access delta|probe|scan
 load validate removal <table>: scan|none
 load write: overwrite fragments
-load write: append strict_insert
-load write: merge upsert
+load write: insert strict_insert
+load write: replace upsert
 load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]
 load executed: partitions <n> rows <m>
 load executed <Node>: rows <m>

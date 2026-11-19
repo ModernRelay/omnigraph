@@ -244,7 +244,7 @@ scenarios:
   measured_step:
     ordinal: 1
     text: |
-      --- load generate: v1 seed: 0 mode: append
+      --- load generate: v1 seed: 0 mode: insert
       tables:
         - kind: node
           name: Item
@@ -432,7 +432,7 @@ scenarios:
   measured_step:
     ordinal: 1
     text: |
-      --- load generate: v1 seed: 0 mode: merge branch: main
+      --- load generate: v1 seed: 0 mode: replace branch: main
       tables:
         - kind: node
           name: Chunk

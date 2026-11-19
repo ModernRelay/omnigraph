@@ -1,7 +1,7 @@
 {
   "branch-merge-d50-process-cold": {
-    "planned_sha256": "a5f1ace413b271d3e818f53f20b980c8900f32c3f4c61a93db61c0006096b26c",
-    "recipe_sha256": "4dbf7c3a5f3ea7184ef144ec187cd3cab11fcf5c1e96c6d7b835096fe7863f7c",
+    "planned_sha256": "0761f7873d3dc567d63eca12a388c3da05ddbbe3d1c135488ec665eb6cdbe81a",
+    "recipe_sha256": "e8acdd4f999a44236f917de6a511b8b8b9180ceb55983f901ba18121b083faaa",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -30,11 +30,11 @@
       "timer": "monotonic"
     },
     "repetitions": 5,
-    "bound_point_id": "ec6b43210cb8e7c6a2c2ce6886156b0154621081df2050f8505b4c884b19f206"
+    "bound_point_id": "308d6a7779d40d8bbc4defd5589b431bb06257bd0b801037c50f88a29d10ba3d"
   },
   "branch-merge-d50-warm": {
-    "planned_sha256": "6d580fa944cbe4d19a53dc725375889259325ece76430aca4bbf8e848b5c85da",
-    "recipe_sha256": "4dbf7c3a5f3ea7184ef144ec187cd3cab11fcf5c1e96c6d7b835096fe7863f7c",
+    "planned_sha256": "a341795a3b1dcd46dba8ac47c42695ac775b2f0bac54bae6af4a93a29b58ee8f",
+    "recipe_sha256": "e8acdd4f999a44236f917de6a511b8b8b9180ceb55983f901ba18121b083faaa",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -63,11 +63,11 @@
       "timer": "monotonic"
     },
     "repetitions": 5,
-    "bound_point_id": "115c4fb1c2438cbf16abd6d33f6f3c12a790628688703b72547fb1118e3cc022"
+    "bound_point_id": "06f82c2687d58da8836ca781359eb23df165e9f829de60cee56e979d03e90bd0"
   },
   "equal-current-narrow-one-batch": {
-    "planned_sha256": "944da755d2f8bba63769c901d2fe8a6507cf8448b39c60c6a0037131d373c901",
-    "recipe_sha256": "7628893a2bd794a4e2bd2250c24a61c0fc948032f1b06771bd3d4fc5161c6e69",
+    "planned_sha256": "adf4aa3c783a19b82df8cad71bda111058bfeca3501667dc8f1ee75687095165",
+    "recipe_sha256": "d3161a2d6ee25cc8aa13479c8d5dd8511ae440f16674587af28a2ffc4ddce540",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -96,11 +96,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "e0bb1c2effb7c90fc153fc0148e5b14038973b9aa663237c72e9a165fa9a3d00"
+    "bound_point_id": "5e07cf0175e638839d22f952a19eba17c76054cfc97f092ccce3ffc031768a94"
   },
   "equal-current-wide-four-batches": {
-    "planned_sha256": "7c733a8d16f7faddf0baf1bac0f14e0c13de2ab409d4bbec62a770b1f77d938b",
-    "recipe_sha256": "b6d202f55ff66dbaa80de913c9c3873240df659d6c6395003997d2ad67966795",
+    "planned_sha256": "9321a13ba772d90a6e2ad89ec68121d67466139083bdfab078b44c49805999c1",
+    "recipe_sha256": "0fb5cdd5794c53b124804b166004b38bfae123a5ca3ef6ac6038d8dfa4f6b6e0",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -129,11 +129,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "f03599f77637072742bd06b1abb397b69bc5547c3002330198a4f126b2d918ec"
+    "bound_point_id": "8762b7a0edc01cce4ea5d2369d1d55a97b1a75633096b6a4ca33291f3f0e20eb"
   },
   "equal-current-wide-one-batch": {
-    "planned_sha256": "11e4f0979b96e09251f0630b1b294fa441703e382fbed87c5821543337a9ca50",
-    "recipe_sha256": "ed6bdf9e457b79db751b006d11bd61ff7e5f9c89af65d906c835e51135861522",
+    "planned_sha256": "a03518d260deffc014a5df608743e69c0123012412a724b5fb853d501618530a",
+    "recipe_sha256": "0d4d54a44785d2ed655e16d89891019c99cda53a4a6ffb76c41f945b22c2ddd5",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -162,7 +162,7 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "75b32416fb1b9d01e413265fcf1d9332b8d27416406d23d92c4eb39ad2dd6cda"
+    "bound_point_id": "0e31e2c3d19922dccbec86fdf2aade0fb0d27c3b3fd5f017163d9dcd867fb0b5"
   },
   "finbench-disjoint-merge": {
     "planned_sha256": "e6558b672c696418ef3addbff4abba759bcffb9173e929c2f73e0f42a929774a",
@@ -759,7 +759,7 @@
     "bound_point_id": "cff4d6a67a719eaa7172bc9de183c61b879e2f282f8ad0ca1932e131bf02f3fe"
   },
   "tiny-load": {
-    "planned_sha256": "47231690406745afee59fad8a61237be68aa2accac36c8c2fe166a6eff89abf3",
+    "planned_sha256": "94ec1e608a2376431eb52cebcccc4ba47b96d22991099ca720fdf317a0479b9f",
     "recipe_sha256": "1d10330d0bb50c068ec5e433870473b6ddee6e5e2613e31fb6504e40826c0b9f",
     "needs_indices": false,
     "cache_condition": {
@@ -769,10 +769,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "4abdf63aedfc03580b6375ef27f049c9dd1f8789e9678ba29254cfd355049eaa",
+    "workload_sha256": "a9459c95b7ee9d80b05521f372a6fe4375a71278a3464e81d89a3ce2b29c9f13",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- load generate: v1 seed: 0 mode: append\ntables:\n  - kind: node\n    name: Item\n    rows: 1\n    commits: 1\n    batch_rows: 1\n    columns:\n      key: {kind: key, prefix: c, width: 1}\n      val: {kind: literal, value: 3}\n"
+      "text": "--- load generate: v1 seed: 0 mode: insert\ntables:\n  - kind: node\n    name: Item\n    rows: 1\n    commits: 1\n    batch_rows: 1\n    columns:\n      key: {kind: key, prefix: c, width: 1}\n      val: {kind: literal, value: 3}\n"
     },
     "environment": {
       "backend": {
@@ -789,7 +789,7 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "241e592a3046118b0c496292201f834143fbd10af2f0687cebd590905322880d"
+    "bound_point_id": "0bb13fbc8a39f95ca2100786e6a91a4f9c9d79238d1645bf08c83e0c6feec30d"
   },
   "tiny-mutate": {
     "planned_sha256": "053419882a5a0e8695c2877bf132c7704d844b340b165045fb484d2458ecc9ef",

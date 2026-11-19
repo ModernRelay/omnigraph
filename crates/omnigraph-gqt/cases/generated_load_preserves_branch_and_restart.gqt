@@ -29,7 +29,7 @@ tables:
 branch create work from main
 --- expect ok
 
---- load generate: v1 seed: 42 mode: merge branch: work
+--- load generate: v1 seed: 42 mode: replace branch: work
 tables:
   - kind: node
     name: Person
@@ -43,7 +43,7 @@ tables:
       embedding: {kind: vector, dimensions: 3}
 --- expect ok
 
---- load generate: v1 seed: 42 mode: append branch: work
+--- load generate: v1 seed: 42 mode: insert branch: work
 tables:
   - kind: node
     name: Person
@@ -82,7 +82,7 @@ p.name: String
 p.val: I64
 p.bucket: I64
 
---- load generate: v1 seed: 42 mode: append branch: absent
+--- load generate: v1 seed: 42 mode: insert branch: absent
 tables:
   - kind: node
     name: Person

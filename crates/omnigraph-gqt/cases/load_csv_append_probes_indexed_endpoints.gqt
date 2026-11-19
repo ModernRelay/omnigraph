@@ -30,7 +30,7 @@ p000000,p000001
 p000002,p000003
 
 --- mutate
-load csv "edges.csv" into edge:Knows mode append header
+load csv "edges.csv" into edge:Knows mode insert header
 --- expect ok
 --- expect plan
 load route: pipeline

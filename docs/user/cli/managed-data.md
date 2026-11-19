@@ -158,8 +158,8 @@ graph and mode. The native CLI sends the exact UTF-8 NDJSON body to the
 authenticated data endpoint; it does not write storage directly.
 
 ```bash
-omnigraph load --target production --graph knowledge --data batch-01.jsonl --mode append --branch review --from main --json
-omnigraph load --target production --graph knowledge --data batch-02.jsonl --mode append --branch review --json
+omnigraph load --target production --graph knowledge --data batch-01.jsonl --mode insert --branch review --from main --json
+omnigraph load --target production --graph knowledge --data batch-02.jsonl --mode insert --branch review --json
 ```
 
 Every load requires `change` for that graph. `--from` additionally requires

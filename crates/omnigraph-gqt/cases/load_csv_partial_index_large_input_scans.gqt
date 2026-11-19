@@ -24,7 +24,7 @@ tables:
     columns:
       id: {kind: key, prefix: p, width: 6}
 
---- load generate: v1 seed: 43 mode: append
+--- load generate: v1 seed: 43 mode: insert
 tables:
   - kind: node
     name: Person

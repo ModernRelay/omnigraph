@@ -80,7 +80,7 @@ node Chunk { slug: String @key embedding: Vector(4) }
 branch create "source" from "main"
 --- expect ok
 
---- load generate: v1 seed: 0 mode: append branch: source
+--- load generate: v1 seed: 0 mode: insert branch: source
 tables:
   - kind: node
     name: Chunk

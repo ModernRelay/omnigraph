@@ -360,7 +360,7 @@ async fn build_fixture(store: &Path, rows: usize) -> Result<Expected, Box<dyn Er
             );
         }
         setup
-            .load_jsonl(&lines.join("\n"), LoadMode::Append)
+            .load_jsonl(&lines.join("\n"), LoadMode::Insert)
             .await?;
     }
     for hub in 0..HUBS {
@@ -372,7 +372,7 @@ async fn build_fixture(store: &Path, rows: usize) -> Result<Expected, Box<dyn Er
             })
             .collect();
         setup
-            .load_jsonl(&lines.join("\n"), LoadMode::Append)
+            .load_jsonl(&lines.join("\n"), LoadMode::Insert)
             .await?;
     }
     setup.ensure_indices().await?;

@@ -32,7 +32,7 @@ tables:
       weight: {kind: ordinal, start: 0, step: 1}
 
 --- loop $i 0 2
---- load generate: v1 seed: 42 mode: merge
+--- load generate: v1 seed: 42 mode: replace
 tables:
   - kind: edge
     name: Knows

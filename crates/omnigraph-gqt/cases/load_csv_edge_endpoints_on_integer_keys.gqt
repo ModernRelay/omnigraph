@@ -76,7 +76,7 @@ load csv "absent_dst.csv" into edge:SmallLink mode overwrite header
 --- expect error: '8' not found in Small
 
 --- mutate
-load csv "absent_dst.csv" into edge:SmallLink mode append header
+load csv "absent_dst.csv" into edge:SmallLink mode insert header
 --- expect error: '8' not found in Small
 
 --- csv absent_both.csv
@@ -113,7 +113,7 @@ load csv "padded_small.csv" into edge:SmallLink mode overwrite header
 --- expect error: '007' not found in Small
 
 --- mutate
-load csv "padded_small.csv" into edge:SmallLink mode append header
+load csv "padded_small.csv" into edge:SmallLink mode insert header
 --- expect error: '007' not found in Small
 
 --- csv padded_large.csv
@@ -141,7 +141,7 @@ query large_rows() { match { $a: Large, $a largeLink $b } return { $a.id, $b.id 
 --- expect shape
 a.id: I64
 b.id: I64
---- load generate: v1 seed: 43 mode: append
+--- load generate: v1 seed: 43 mode: insert
 tables:
   - kind: node
     name: Large

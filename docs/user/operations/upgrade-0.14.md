@@ -120,7 +120,7 @@ Prefix these commands with `omnigraph`:
 | Before | After |
 |---|---|
 | `query people --store ./graph.omni --query queries.gq` | `query people --target ./graph.omni --query queries.gq` |
-| `load ./graph.omni --data batch.jsonl --mode merge` | `load --target ./graph.omni --data batch.jsonl --mode merge` |
+| `load ./graph.omni --data batch.jsonl --mode replace` | `load --target ./graph.omni --data batch.jsonl --mode replace` |
 | `query people --server prod --graph knowledge` | `query people --target prod --graph knowledge` |
 | `query people --profile NAME` | `query people --target NAME` after recreating that binding as a target |
 | `alias experts databases` | `alias experts --params '{"topic":"databases"}'` after updating the alias below |

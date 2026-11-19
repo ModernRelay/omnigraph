@@ -18,7 +18,7 @@ node Person {
 {"type":"Person","data":{"id":1,"name":"alice"}}
 
 --- mutate
-load csv "s3://bucket/imports/people.csv" into node:Person mode append header
+load csv "s3://bucket/imports/people.csv" into node:Person mode insert header
 
 --- expect error: ingress is denied for this graph
 

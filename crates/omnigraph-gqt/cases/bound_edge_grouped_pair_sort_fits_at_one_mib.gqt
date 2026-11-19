@@ -24,7 +24,7 @@ edge Knows: Person -> Person {
 {"type":"Person","data":{"name":"a0"}}
 {"type":"Person","data":{"name":"b0"}}
 
---- load generate: v1 seed: 1 mode: append
+--- load generate: v1 seed: 1 mode: insert
 tables:
   - kind: edge
     name: Knows

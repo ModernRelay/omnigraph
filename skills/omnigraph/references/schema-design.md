@@ -158,7 +158,7 @@ things.
 
 **In Omnigraph:** use `@key` on a semantic slug or a composite `@key(a, b)`;
 give edges `@key(@src, @dst[, prop])` so repeated inserts upsert instead of
-duplicating, and load with `--mode merge`. Put an `@embed` vector on text that
+duplicating, and load with `--mode replace`. Put an `@embed` vector on text that
 agents must deduplicate, populate it with `omnigraph embed`, and have writers
 run a `nearest(...)` lookup before inserting. Use `@rename_from` so a rename
 keeps identity and history.

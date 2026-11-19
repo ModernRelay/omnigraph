@@ -238,7 +238,7 @@ told you or from files they point you to. Nodes and edges can share a file:
 ```
 
 ```bash
-omnigraph load --data seed.jsonl --mode merge --target ./graph.omni
+omnigraph load --data seed.jsonl --mode replace --target ./graph.omni
 ```
 
 `--mode` is required; `merge` upserts by key. See [data changes](data.md) for
@@ -263,7 +263,7 @@ positional argument, so they address the graph with `--target`:
 
 ```bash
 omnigraph load --data more.jsonl --from main --branch review/first-change \
-  --mode merge --target ./graph.omni
+  --mode replace --target ./graph.omni
 omnigraph branch diff review/first-change --into main --target ./graph.omni
 omnigraph branch merge review/first-change --into main --target ./graph.omni
 ```
@@ -416,7 +416,7 @@ before the server starts.
 mkdir served
 omnigraph cluster apply --target ./served --config . --json
 omnigraph cluster force-unlock <LOCK_ID> --target ./served
-omnigraph load --data seed.jsonl --mode merge --target ./served --graph knowledge
+omnigraph load --data seed.jsonl --mode replace --target ./served --graph knowledge
 omnigraph cluster force-unlock <LOCK_ID> --target ./served
 ```
 

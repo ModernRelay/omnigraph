@@ -20,11 +20,11 @@ edits.
 | Task | Command | Why |
 |------|---------|-----|
 | Add/update a single entity | `mutate` with a named mutation | typechecked, parameterized, auditable |
-| Bulk upsert by logical entity ID | `load --mode merge` | replaces each matched row whole (an omitted property becomes null); preserves rows not in the file; keyed node and edge IDs derive from `@key` |
-| Additive-only bulk | `load --mode append` | fails on key collision |
+| Bulk upsert by logical entity ID | `load --mode replace` | replaces each matched row whole (an omitted property becomes null); preserves rows not in the file; keyed node and edge IDs derive from `@key` |
+| Additive-only bulk | `load --mode insert` | fails on key collision |
 | Replace complete batches by type | `load --mode overwrite` | **destructive for represented types**; absent types remain |
-| Bulk load onto a fresh review branch | `load --from main --mode merge --branch <name>` | forks `<name>` from `main`, loads onto it, leaves it for review |
-| Load one CSV object into one type | `mutate -e 'load csv "<uri>" into node:<Type> mode merge header'` | typed by the `.pg`; `omnigraph load` reads JSONL only; the source must sit under the graph's external Blob policy (a direct run admits its own `file://` directory) and within `load_source_max_bytes` |
+| Bulk load onto a fresh review branch | `load --from main --mode replace --branch <name>` | forks `<name>` from `main`, loads onto it, leaves it for review |
+| Load one CSV object into one type | `mutate -e 'load csv "<uri>" into node:<Type> mode replace header'` | typed by the `.pg`; `omnigraph load` reads JSONL only; the source must sit under the graph's external Blob policy (a direct run admits its own `file://` directory) and within `load_source_max_bytes` |
 
 > **`--mode` is required** — there is no default. Overwrite is destructive, so
 > the CLI never picks a mode for you.
@@ -122,7 +122,7 @@ and omits null-valued property keys; change images keep explicit nulls.
 Load command:
 
 ```bash
-omnigraph load --data seed.jsonl --mode merge --target ./spike-intel.omni
+omnigraph load --data seed.jsonl --mode replace --target ./spike-intel.omni
 ```
 
 `--from <base>` forks a missing `--branch` from `<base>` before loading (the
@@ -179,7 +179,7 @@ REPO=./spike-intel.omni
 omnigraph branch create --from main staging-2026-04-14 --target $REPO
 
 # 2. Load delta onto the branch (merge mode is typical for review)
-omnigraph load --data delta.jsonl --branch staging-2026-04-14 --mode merge --target $REPO
+omnigraph load --data delta.jsonl --branch staging-2026-04-14 --mode replace --target $REPO
 
 # 3. Verify on the branch (reads can target --branch or --snapshot)
 omnigraph query recent_signals --query queries/signals.gq --branch staging-2026-04-14 --target $REPO

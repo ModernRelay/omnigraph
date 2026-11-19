@@ -34,7 +34,7 @@ id|firstName|birthday|creationDate|score|active
 3|carol|2000-06-15|2012-07-04T12:00:00.100Z|0|
 
 --- mutate
-load csv "person.csv" into node:Person mode append delimiter "|" header
+load csv "person.csv" into node:Person mode insert delimiter "|" header
 
 --- expect ok
 
@@ -44,7 +44,7 @@ Person.id|Person.id|creationDate
 2|3|2012-01-02T00:00:00.000Z
 
 --- mutate
-load csv "knows.csv" into edge:Knows mode append delimiter "|" header
+load csv "knows.csv" into edge:Knows mode insert delimiter "|" header
 
 --- expect ok
 

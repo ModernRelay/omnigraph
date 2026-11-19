@@ -45,7 +45,7 @@ node Counter {
 query count_above_max() { replace Counter { name: "count_above", count: 9007199254740993 } }
 --- expect error: @range violation on Counter.count: value 9007199254740993 > max 9007199254740992
 
---- load generate: v1 seed: 0 mode: append
+--- load generate: v1 seed: 0 mode: insert
 tables:
   - kind: node
     name: Counter
@@ -56,7 +56,7 @@ tables:
       count: {kind: literal, value: 9007199254740993}
 --- expect error: @range violation on Counter.count: value 9007199254740993 > max 9007199254740992
 
---- load generate: v1 seed: 0 mode: append
+--- load generate: v1 seed: 0 mode: insert
 tables:
   - kind: node
     name: Counter
