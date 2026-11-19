@@ -69,14 +69,14 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
 | `schema show` | Read the accepted schema | direct or served |
-| `schema apply` | Apply a schema to a standalone graph | direct |
-| `schema plan` | Preview a schema migration | direct |
+| `schema apply` | Apply a schema to a standalone graph; a plan with no step publishes nothing, and `one_way_constructs` names what a binary before GQ 3 cannot read back ([Schemas](../queries/upgrading-to-gq3.md#schemas)) | direct |
+| `schema plan` | Preview a schema migration, with its `one_way_constructs` | direct |
 | `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
-| `lint` | Validate `.gq` source; `--fix` applies the compiler's printed fixes to a file, a directory or a configuration's stored-query files ([Lint](../queries/lint.md#fix)) | local schema, direct graph or configuration directory |
+| `lint` | Validate `.gq` source; `--json` gives each refusal and canonical form its `fix` and byte-range `suggestion.edits`, the edits `--fix` applies to a file, a directory or a configuration's stored-query files ([Lint](../queries/lint.md#fix)) | local schema, direct graph or configuration directory |
 | `upgrade` | Convert a v8, v9 or v13 graph's storage to the format this binary serves, offline; `--check` writes nothing | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes on `main`; a server target runs it as a [recorded operation](../operations/recorded-operations.md), waiting for its record unless `--no-wait` | direct or served |
 | `index build` | Build a branch's missing declared indexes and refresh lagging scalar and vector coverage ([Maintenance](../operations/maintenance.md#build-indexes)) | direct |
-| `index rebuild --kind full-text` | Replace full-text indexes on one branch; `rebuild-full-text-indexes` is its deprecated spelling | direct |
+| `index rebuild --kind full-text` | Replace full-text indexes on one branch, after which a binary before GQ 3 refuses full-text reads until its own rebuild; `rebuild-full-text-indexes` is its deprecated spelling | direct |
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
 | `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list` | List stored queries: a cluster root's registry (`--graph` narrows it to one graph), or one served graph's catalog, whose `--json` is the body of `GET /graphs/{id}/queries` | cluster or served |
@@ -98,7 +98,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `organization list` | List the organizations you are an active member of, marking the profile's ([your organizations](managed-team.md#find-your-organizations)) | profile |
 | `organization members/invitations` | List members, set service roles, offboard and manage invitations; see [team access](managed-team.md) | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
-| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
+| `version` | Print the package version, HTTP contract, query language and storage formats; `--json` includes `version`, `http_contract`, `query_language` (`gq3`), `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
 ## Query inputs and output
 
@@ -232,7 +232,9 @@ addressing are refused; see [storage upgrade](../operations/upgrade.md#storage-u
 | `overwrite` | Each node or edge type represented in the batch is replaced; other types remain | Initial load or import of a complete export |
 
 `append` and `merge`, edition 2's names, are refused with `insert` and
-`replace` as the fixes. A job that retries a load after an uncertain outcome
+`replace` as the fixes, before anything is read; with `--json` the refusal is a
+`bad_request` error whose `diagnostic` is `Q004` with the fix `--mode insert` or
+`--mode replace`, as `load csv` and the HTTP route refuse them. A job that retries a load after an uncertain outcome
 uses `upsert` or `replace`.
 
 `--branch <NAME>` selects an existing branch. Add `--from <BASE>` to create a

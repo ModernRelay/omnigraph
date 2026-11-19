@@ -108,13 +108,10 @@ outcome) costs only its speedup. Optimize builds it after releasing the writer
 gates, and only when the run advanced an edge dataset or no artifact exists; a
 build skipped for its size is counted again, up to the limit, by each such run.
 
-Existing full-text indexes are preserved rather than incrementally merged.
-Unindexed rows remain searchable, but a growing uncovered tail can cost more to
-scan. Use `index rebuild --kind full-text` to refresh that coverage or replace
-an index built with another analysis, an earlier release's or another profile's. Optimize reports uncovered full-text coverage under
-`pending_indexes` with this remedy. Deferred coverage alone creates no graph
-commit or maintenance work. A vector index whose property has no usable vectors
-also stays pending; run optimize again after loading or generating vectors.
+Existing full-text indexes are preserved, not merged. No query reads one, so
+their coverage is never pending and optimize never recommends the one-way
+[full-text rebuild](upgrade.md#query-language-gq-3). A vector index with no
+usable vectors stays pending; run optimize again once vectors exist.
 
 ## Build indexes
 
@@ -132,8 +129,8 @@ one graph commit on that branch; other branches and snapshots keep their
 indexes, and a branch with nothing to do publishes nothing. The default branch
 is `main`. As with optimize, a write that lands on a table while its batch is
 staged fails the run with a read-set conflict; run it again. Vector properties
-with no vectors yet and full-text coverage stay pending: only `index rebuild
---kind full-text` refreshes full-text coverage, which no query reads. A vector
+with no vectors yet stay pending. Full-text coverage, which no query reads, is
+not pending, and the build never recommends `index rebuild --kind full-text`. A vector
 rebuild that fails for a reason other than nothing to train on, such as a
 storage failure, fails the command. Up to four BTREEs build at once across
 tables; a BITMAP, LABEL_LIST, NGRAM, full-text or vector build runs alone.
@@ -162,7 +159,9 @@ default English one, including already indexed entities. It builds
 declared node full-text indexes and replaces existing physical full-text indexes
 on nodes or edges; it does not create edge-property indexes from declarations.
 External custom tokenizer settings are not preserved. Completed rebuilds warn
-on stderr, or in the JSON `warnings` array, that those settings were replaced.
+on stderr, or in the JSON `warnings` array, that those settings were replaced,
+and that binaries before this release refuse full-text reads on the graph from
+then on; such a binary's own `index rebuild --kind full-text` restores them.
 
 All rebuilt datasets become visible in one graph commit. JSON reports `branch`,
 `graph_commit_id`, and `rebuilt_indexes` with each `type_key` and `property`.

@@ -40,8 +40,12 @@ binary:
    stopped serving), then start the new server. The old server never reads
    a GQ 3 source.
 
-A stored query that still fails to compile does not stop its graph. The new
-server serves the graph with that query alone unavailable: `GET
+A stored query that still fails to compile does not stop its graph. Each
+declaration of a stored file compiles on its own: one the new binary refuses
+is unavailable with its own diagnostic, placed in its file; one that calls an
+unavailable declaration of its file is unavailable naming it; the others in
+the file serve. The new server serves the graph with those queries alone
+unavailable: `GET
 /graphs/{graph_id}/queries`, `omnigraph queries list` and the MCP `queries`
 tool list it under `unavailable` with its diagnostic, `GET /graphs` reports
 it per graph and `GET /readyz` counts it, and invoking it answers HTTP 409
@@ -54,8 +58,9 @@ stored query unavailable: error[CODE] at line L, column C: MESSAGE; fix: FIX; ed
 
 Fix the source and apply it through the running server. An operator who
 wants the whole graph refused instead sets `OMNIGRAPH_STRICT_STORED_QUERIES=1`:
-the graph is then blocked with `invalid_stored_queries`, as before this
-release, and with `--require-all-graphs` the server refuses to start.
+the graph is then blocked with `invalid_stored_queries` when any declaration
+of a stored file fails, as before this release, and with
+`--require-all-graphs` the server refuses to start.
 
 ## The respelling map
 
@@ -79,7 +84,7 @@ fix.
 | `$x.tags contains "rust"` (a list) | `"rust" in $x.tags` | `T7` |
 | `$x.title starts_with "O"` | `starts_with($x.title, "O")` | `T7` |
 | `search($x.t, $q)`, `match_text($x.t, $q)` | `match_terms($x.t, terms($q, mode: any))` | `T6` |
-| `fuzzy($x.t, $q)`, `fuzzy($x.t, $q, n)` | `match_terms($x.t, terms($q, mode: any, max_edits: 2))`, or `max_edits: n` | `T6` |
+| `fuzzy($x.t, $q)`, `fuzzy($x.t, $q, n)` | `match_terms($x.t, terms($q, mode: any, max_edits: 2))`, or `max_edits: n` for the third argument (none for `0`); every removed lexical call's fix is a machine edit | `T6` |
 | `delete T where φ` | `match { $x: T } where φ′  delete $x`: each bare property is written `$x.p`, and an edge's `from` and `to` are `$x.@src` and `$x.@dst` | `Q008` |
 | `update T set { … } where φ` | `match { $x: T } where φ′  update $x set { … }`, a bare property in an assignment written `$x.p` | `Q008` |
 | a body of several statements | one group per statement, in order, each opening with its `match`; consecutive statements with no `match` between them stay one group | `Q008` |
@@ -212,10 +217,29 @@ refuses a `sum`, `avg`, `min`, `max` or `collect` block without its argument.
   that property. In a type that also declares a property named `fulltext` it
   is refused as ambiguous; write `@index` on the property the index is for.
   Before, it declared an index on the property `fulltext`.
-- A schema whose full-text index names an analyzer or a scorer
-  (`@index(fulltext, analyzer = …)`), or whose vector declares a distance
-  other than `l2` (`Vector(n, distance = "cosine")`; an explicit `l2` is
-  stored as an omitted one), is refused by earlier binaries ("schema
-  feature … is unknown to this build"). Upgrade every binary that opens the
-  graph before applying such a schema
-  ([analyzers](../search/analyzers.md)).
+- A graph stores its schema text, and an earlier binary parses it again on
+  every open. A schema apply that stores one of these constructs makes every
+  earlier binary refuse the whole graph, every read, write, export and index
+  pass, and only the backup taken before the upgrade restores it:
+
+  | Construct | `construct` |
+  |---|---|
+  | an explicit `distance` on a Vector, `l2` included | `vector_distance` |
+  | `@index` on a List property | `list_index` |
+  | `@index(fulltext)`, with or without options | `full_text_index` |
+  | an `analyzer` in `@index(fulltext, …)` | `full_text_analyzer` |
+  | a `scorer` in `@index(fulltext, …)` | `full_text_scorer` |
+
+  `schema plan`, `schema apply` and `cluster plan` name each one the schema
+  holds, under `one_way_constructs`, with the line `binaries before this
+  release refuse the whole graph after this apply, and only a backup taken
+  before the upgrade restores it`. They report only; nothing gates the apply.
+  Upgrade every binary that opens the graph before applying such a schema
+  ([analyzers](../search/analyzers.md)). A body-level `@index(tags)` over a
+  list, a plain `@index` on a String and an added property or type are not
+  one-way.
+- A schema apply whose plan has no step publishes nothing: the stored text
+  and the graph head stay as they were, so an explicit `distance = "l2"` over
+  an omitted one, or an edited comment, is never stored. A cluster refuses
+  such a text-only change of a graph's schema file (`schema_preflight_failed`);
+  keep the file equal to `omnigraph schema show`.
