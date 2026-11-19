@@ -73,6 +73,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
         version: crate::api::build::reported_version(SERVER_VERSION),
         internal_schema_version: SERVER_INTERNAL_SCHEMA_VERSION,
         source_version: crate::api::build::SOURCE_COMMIT.map(str::to_string),
+        query_language: Some(omnigraph_compiler::QUERY_LANGUAGE.to_string()),
     })
 }
 

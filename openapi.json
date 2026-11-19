@@ -15946,6 +15946,13 @@
             "description": "The internal-schema (storage-format) version this binary writes, the\nhighest it serves. Normal open serves every version from the binary's\nlowest supported one up to this one; a graph below that range is\nrefused until it is upgraded offline or rebuilt, and a graph above it\nneeds a newer binary.",
             "minimum": 0
           },
+          "query_language": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The query language this server compiles, `gq3`. A server before the\nGQ 3 break omits the field."
+          },
           "source_version": {
             "type": [
               "string",

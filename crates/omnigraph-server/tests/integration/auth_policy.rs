@@ -582,6 +582,8 @@ async fn healthz_succeeds_after_startup() {
         Some(source_version) => assert_eq!(body["source_version"], source_version),
         None => assert!(body.get("source_version").is_none()),
     }
+    // The query language tells this server from one before the GQ 3 break.
+    assert_eq!(body["query_language"], "gq3");
 
     for path in ["/healthz", "/readyz", "/openapi.json"] {
         for method in [Method::GET, Method::HEAD] {

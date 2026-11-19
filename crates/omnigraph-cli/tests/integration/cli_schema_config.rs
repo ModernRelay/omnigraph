@@ -33,13 +33,15 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
     };
 
     // The first two lines keep their earlier text and position; the contract
-    // line follows them, then the commit of a packaged build.
+    // line follows them, then the query language, then the commit of a
+    // packaged build.
     let output = output_success(cli().arg("version"));
     let stdout = stdout_string(&output);
     let mut expected = vec![
         format!("omnigraph {version}"),
         format!("internal-schema {WRITES} (serves v{LOWEST} to v{WRITES})"),
         format!("http-contract {HTTP_API_CONTRACT}"),
+        "query-language gq3".to_string(),
     ];
     expected.extend(commit.map(|commit| format!("commit {commit}")));
     assert_eq!(stdout.lines().collect::<Vec<_>>(), expected);
@@ -62,6 +64,7 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
             "channel": channel,
             "commit": commit,
             "http_contract": HTTP_API_CONTRACT,
+            "query_language": "gq3",
             "protocols": {"studio": 1, "target": 2, "credential": 2, "access": 2},
             "internal_schema": { "writes": WRITES, "serves": [LOWEST, WRITES] },
         }),

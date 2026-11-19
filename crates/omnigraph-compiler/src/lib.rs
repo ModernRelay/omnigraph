@@ -1,4 +1,9 @@
 #[cfg(any(test, feature = "test-util"))]
+/// The query language this build compiles: `omnigraph version` and
+/// `/healthz` name it, so an operator can tell this binary from one that
+/// speaks edition 2, which names none.
+pub const QUERY_LANGUAGE: &str = "gq3";
+
 pub mod arbitrary;
 pub mod budget;
 pub mod catalog;
