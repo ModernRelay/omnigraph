@@ -574,17 +574,29 @@ fn infix_string(op: InfixStringOp, at: &SourceSpan, list: bool) -> QueryDiagnost
 fn removed_lexical_call(c: &Call) -> QueryDiagnostic {
     use crate::query::syntax::print;
     let name = c.name.as_str();
-    let budget = match c.options.as_slice() {
-        [] if name == "fuzzy" => Some(Some("2".to_string())),
-        [] => Some(None),
-        [(o, v)] if name == "fuzzy" && o == "max_edits" => Some(match v {
-            Expr::Literal(Literal::Integer(0)) => None,
-            v => Some(print::expr(v)),
-        }),
+    // The edit budget, written as edition 2's positional third argument of
+    // `fuzzy` or as its option; a budget of 0 is exact membership.
+    let budget_of = |v: &Expr| match v {
+        Expr::Literal(Literal::Integer(0)) => None,
+        v => Some(print::expr(v)),
+    };
+    let positional = match c.args.as_slice() {
+        [_, _, Arg::Expr(n)] if name == "fuzzy" => Some(n),
+        _ => None,
+    };
+    let budget = match (c.options.as_slice(), positional) {
+        ([], None) if name == "fuzzy" => Some(Some("2".to_string())),
+        ([], None) => Some(None),
+        ([], Some(n)) => Some(budget_of(n)),
+        ([(o, v)], None) if name == "fuzzy" && o == "max_edits" => Some(budget_of(v)),
         _ => None,
     };
     let operands = match c.args.as_slice() {
-        [Arg::Expr(field), Arg::Expr(query)] => Some((print::expr(field), print::expr(query))),
+        [Arg::Expr(field), Arg::Expr(query)] | [Arg::Expr(field), Arg::Expr(query), _]
+            if c.args.len() == 2 || positional.is_some() =>
+        {
+            Some((print::expr(field), print::expr(query)))
+        }
         _ => None,
     };
     let message = format!(

@@ -1991,6 +1991,34 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
 }"#,
         r#"query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 1)) return { $d.title } }"#,
     ),
+    // Edition 2's budget is a positional third argument: the fix keeps it.
+    (
+        r#"fuzzy with a positional budget"#,
+        "T6",
+        r#"query q($s: String) {
+  match { $d: Doc } where fuzzy($d.body, $s, 1)
+  return { $d.title }
+}"#,
+        r#"query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 1)) return { $d.title } }"#,
+    ),
+    (
+        r#"fuzzy with a positional parameter budget"#,
+        "T6",
+        r#"query q($s: String, $n: I64) {
+  match { $d: Doc } where fuzzy($d.body, $s, $n)
+  return { $d.title }
+}"#,
+        r#"query q($s: String, $n: I64) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: $n)) return { $d.title } }"#,
+    ),
+    (
+        r#"fuzzy with a positional budget of zero"#,
+        "T6",
+        r#"query q($s: String) {
+  match { $d: Doc } where fuzzy($d.body, $s, 0)
+  return { $d.title }
+}"#,
+        r#"query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any)) return { $d.title } }"#,
+    ),
     (
         r#"an unknown annotation"#,
         "T80",
