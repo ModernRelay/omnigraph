@@ -1213,6 +1213,7 @@ jobs:
           echo "EDITION_2_SOURCE_COMMIT=$EDITION_2_SOURCE_COMMIT" >> "$GITHUB_ENV"
           echo "OMNIGRAPH_EDITION_2_GQT_BIN=$e2_bin" >> "$GITHUB_ENV"
           echo "OMNIGRAPH_EDITION_2_BIN=$e2_cli" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_EDITION_2_TREE=$e2_source" >> "$GITHUB_ENV"
 
       - name: Build the current GQT runner
         run: cargo build --locked --package omnigraph-gqt --bin omnigraph-gqt
@@ -1252,6 +1253,20 @@ jobs:
           cargo test --locked -p omnigraph-gqt --test integration \
             law_two_editions:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/two-editions.log"
           grep -F "test law_two_editions::edition_2_and_edition_3_answer_generated_reads_alike ... ok" "$RUNNER_TEMP/two-editions.log"
+
+      # `omnigraph lint --fix`'s loop over every edition-2 text of the pinned
+      # tree: the printed fixes converge, and what they write has the typed
+      # IR of the hand rewrite in this tree or a row of
+      # crates/omnigraph-gqt/lint-fix-edition-2.tsv (docs/dev/testing.md,
+      # Cross-edition comparison).
+      - name: Respell the edition-2 corpus with the printed fixes
+        env:
+          OMNIGRAPH_REQUIRE_EDITION_2: '1'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p omnigraph-gqt --test integration \
+            fix_edition_2:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/lint-fix-edition-2.log"
+          grep -F "test fix_edition_2::printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite ... ok" "$RUNNER_TEMP/lint-fix-edition-2.log"
 
       - name: Retain the cross-edition report
         if: always()

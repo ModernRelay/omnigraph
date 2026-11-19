@@ -4,6 +4,7 @@
 mod effective_settings;
 mod fix_convergence;
 mod fix_coverage;
+mod fix_edition_2;
 mod law_canonical_forms;
 mod law_engine_reference;
 mod law_refusal_soundness;

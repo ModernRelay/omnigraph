@@ -170,8 +170,9 @@ through both manifests as the storage job does, builds the current runner,
 runs `scripts/cross-edition.py run` over every case both commits hold, once
 for rows and once under `--measure` for store requests, then
 runs the two-edition generated law (`law_two_editions`) with the edition-2
-CLI and `OMNIGRAPH_REQUIRE_EDITION_2=1`. A missing runner or CLI fails the
-job; nothing skips. `GQT slow nightly` builds the same commit's CLI for the
+CLI and `OMNIGRAPH_REQUIRE_EDITION_2=1`, and the `lint --fix` corpus proof
+(`fix_edition_2`) over the commit's worktree (`OMNIGRAPH_EDITION_2_TREE`). A
+missing runner, CLI or tree fails the job; nothing skips. `GQT slow nightly` builds the same commit's CLI for the
 law's nightly breadth; the self-test holds the two pins equal. The comparison, the table it reads and what passes are in
 [testing](testing.md#cross-edition-comparison); the report is kept as the
 `cross-edition-report` artifact. The pin moves only with the edition-2

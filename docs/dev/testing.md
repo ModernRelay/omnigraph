@@ -746,6 +746,20 @@ every changed step's requests and class deltas under `costs`.
 `--case <path>` (repeatable) selects cases; `--reuse` compares the traces an
 earlier run left under `--work`.
 
+`fix_edition_2::printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite`
+in `omnigraph-gqt`'s `integration` binary is the gate for `omnigraph lint
+--fix`: it gives every query step edition 2 ran in the commit's tree
+(`OMNIGRAPH_EDITION_2_TREE`; the GQT and benchmark corpora and the `.gq`
+files beside a `.pg`) to the fix loop with review fixes applied, requires
+every one whose refusals print fixes to converge, and compares each
+declaration's typed IR with the hand rewrite of the same case and name in
+this tree. A difference passes as a row of
+`crates/omnigraph-gqt/lint-fix-edition-2.tsv` naming a reason (`REASONS` in
+the test; an `open:` reason prints a warning), and a row that matches nothing
+fails; a keyed `insert` the fix leaves, where the hand rewrite wrote the
+respelling map's `replace`, is recognized by applying that row. Without the
+tree it skips; `OMNIGRAPH_REQUIRE_EDITION_2=1` fails instead.
+
 Fix coverage over edition-2 text is an instrument beside it,
 `fix_coverage::fix_coverage_over_edition_2_text` in `omnigraph-gqt`'s
 `integration` binary (`#[ignore = "instrument: …"]`): point

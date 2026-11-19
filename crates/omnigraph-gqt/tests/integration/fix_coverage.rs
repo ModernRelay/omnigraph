@@ -8,22 +8,20 @@
 //! less the steps edition 2 refused itself; or a
 //! directory of stored queries exported beside their schema as
 //! `<name>.pg` and `<name>.gq`, or both) and prints counts only, never query
-//! text, so it can run over a private registry. Each query is compiled; while
-//! it is refused, every suggestion of the pass (machine-applicable or for
-//! review) is applied at once, up to `PASSES` passes. A query converges when a
-//! pass compiles it; it is stuck at the first refusal of the pass that
-//! printed no applicable suggestion, counted by code and by the message's
-//! leading words, its shape.
+//! text, so it can run over a private registry. Each query goes through the
+//! loop `omnigraph lint --fix --review-fixes` runs
+//! ([`omnigraph_compiler::fix_source`], every printed suggestion applied,
+//! for review included). A query converges when the loop reaches a compiling
+//! text, counted by the passes it took; it is stuck at the first refusal
+//! that printed no applicable suggestion, counted by code and by the
+//! message's leading words, its shape.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use omnigraph_compiler::catalog::build_catalog;
-use omnigraph_compiler::query::check::check_source_all;
-use omnigraph_compiler::query::syntax::parse::apply_edits;
 use omnigraph_compiler::schema::parser::parse_schema;
-
-const PASSES: usize = 6;
+use omnigraph_compiler::{FixOptions, FixStatus, fix_source};
 
 fn files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -134,51 +132,29 @@ fn fix_coverage_over_edition_2_text() {
             continue;
         };
         for query in queries {
-            let mut text = query;
-            let mut outcome = None;
-            for pass in 0..=PASSES {
-                let refusals = check_source_all(&catalog, &text);
-                // `OMNIGRAPH_FIX_COVERAGE_CODES=1` prints each pass's codes,
-                // never text.
-                if std::env::var("OMNIGRAPH_FIX_COVERAGE_CODES").as_deref() == Ok("1") {
-                    let codes: Vec<String> = refusals.iter().map(|d| d.code.to_string()).collect();
-                    println!("pass {pass}: {codes:?}");
-                }
-                if refusals.is_empty() {
-                    outcome = Some(Ok(pass));
-                    break;
-                }
-                let mut edits: Vec<_> = refusals
-                    .iter()
-                    .filter_map(|d| d.suggestion.as_deref())
-                    .flat_map(|s| s.edits.iter().cloned())
-                    .collect();
-                edits.sort_by_key(|e| (e.start, e.end));
-                // Overlapping edits cannot apply in one pass; keep the first.
-                let mut kept: Vec<omnigraph_compiler::TextEdit> = Vec::new();
-                for e in edits {
-                    if kept.last().is_none_or(|k| k.end <= e.start) {
-                        kept.push(e);
-                    }
-                }
-                if kept.is_empty() || pass == PASSES {
-                    let first = &refusals[0];
+            // The loop `omnigraph lint --fix --review-fixes` runs.
+            let out = fix_source(&catalog, &query, FixOptions { review: true });
+            // `OMNIGRAPH_FIX_COVERAGE_CODES=1` prints the codes applied,
+            // never text.
+            if std::env::var("OMNIGRAPH_FIX_COVERAGE_CODES").as_deref() == Ok("1") {
+                println!("{:?}: {:?}", out.report.status, out.report.applied);
+            }
+            match out.report.status {
+                FixStatus::Unchanged => coverage.compiled_as_written += 1,
+                FixStatus::Fixed => *coverage.converged.entry(out.report.passes).or_default() += 1,
+                FixStatus::Unfixed | FixStatus::DoesNotConverge => {
+                    let (code, message) = match out.report.unfixed.first() {
+                        Some(first) => (first.code.to_string(), shape(&first.message)),
+                        None => ("none".to_string(), "does not converge".to_string()),
+                    };
                     // `OMNIGRAPH_FIX_COVERAGE_SHOW=1` prints the text that
                     // stopped, for a corpus whose text may be shown; never
                     // set it over a private registry.
                     if std::env::var("OMNIGRAPH_FIX_COVERAGE_SHOW").as_deref() == Ok("1") {
-                        println!("--- stuck at {}: {}\n{text}", first.code, first.message);
+                        println!("--- stuck at {code}: {message}\n{query}");
                     }
-                    outcome = Some(Err((first.code.to_string(), shape(&first.message))));
-                    break;
+                    *coverage.stuck.entry((code, message)).or_default() += 1;
                 }
-                text = apply_edits(&text, &kept);
-            }
-            match outcome {
-                Some(Ok(0)) => coverage.compiled_as_written += 1,
-                Some(Ok(passes)) => *coverage.converged.entry(passes).or_default() += 1,
-                Some(Err(key)) => *coverage.stuck.entry(key).or_default() += 1,
-                None => {}
             }
         }
     }
