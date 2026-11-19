@@ -8,9 +8,10 @@ open work in issues.
 
 Before every task and every change:
 
-1. Read [the contract and the work](docs/dev/contract.md): the work Omnigraph
-   is built for, the observable contract it targets, and where it stands
-   today. Name the clause a change keeps and the workload row it serves.
+1. Read [the contract](docs/dev/contract.md): what each kind of operation
+   promises its caller, where the engine differs today, and the direction the
+   work asks for. For a non-trivial change, name the statements it keeps,
+   closes, decides or changes.
 2. Read [architectural invariants](docs/dev/invariants.md). Apply the hard
    invariants and deny-list to implementation and review work.
 3. Consult the domain map in [Lance alignment](docs/dev/lance.md). Fetch and
@@ -92,7 +93,8 @@ authority model.
 |---|---|
 | Use Omnigraph | [User guide](docs/user/index.md) |
 | Change Omnigraph | [Developer guide](docs/dev/index.md) |
-| State the contract and the workload | [The contract and the work](docs/dev/contract.md) |
+| See what each operation promises | [The contract](docs/dev/contract.md) |
+| See the work Omnigraph is built for | [The work](docs/dev/workload.md) |
 | Review architectural rules | [Invariants](docs/dev/invariants.md) |
 | Align with Lance | [Lance guide](docs/dev/lance.md) and [compatibility fences](docs/dev/lance-fences.md) |
 | Find test ownership | [Testing guide](docs/dev/testing.md) and [test ownership](docs/dev/test-ownership.md) |
@@ -119,9 +121,9 @@ Reason about Omnigraph from first principles, not from database categories. A
 database is **an observable contract, implemented by physical mechanisms
 optimized for an expected distribution of work**. State which contract and
 which distribution of work a change serves, and what it trades away. Read
-[first principles of data systems](docs/dev/systems.md) for the method and
-[the contract and the work](docs/dev/contract.md) for Omnigraph's own target
-clauses, workload hypothesis and where the engine stands today.
+[first principles of data systems](docs/dev/systems.md) for the method,
+[the contract](docs/dev/contract.md) for what each operation promises, and
+[the work](docs/dev/workload.md) for the workload hypothesis.
 
 The full rules live in [invariants](docs/dev/invariants.md). Keep these in
 working memory:
@@ -210,12 +212,11 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 
 ## Change discipline
 
-- Check every design, RFC and non-trivial change against
-  [the contract](docs/dev/contract.md) before building it: name the clauses
-  it keeps or extends and the workload row it serves, and say whether it
-  moves a row of the page's today table toward its target. A design that
-  weakens a clause, adds a deviation or assumes a different workload says so
-  and updates that page in the same pull request.
+- Give every design, RFC and non-trivial change its
+  [contract line](docs/dev/contract.md#citing): the statements it keeps, the
+  gaps it closes, the decisions it settles and the statements it changes. A
+  changed statement needs an RFC first. A change tuned for a different
+  workload revises [the work](docs/dev/workload.md) in the same pull request.
 - Preserve unrelated work in a dirty tree. Never discard user changes.
 - Make the smallest coherent change that closes the behavior and test surface.
 - For a bug, reproduce the predicted failure at the tier the regression rule
