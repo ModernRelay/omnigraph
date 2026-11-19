@@ -349,6 +349,56 @@ const FLOATS: [&str; 8] = [
     "0.0", "-0.0", "0.5", "1.5", "-2.25", "3.0", "100.0", "1.5e3",
 ];
 const STRS: [&str; 6] = ["a", "b", "ab", "graph search", "Search", ""];
+/// Strings the registry rows meet (the GQ 3 RFC, section 2): Unicode
+/// whitespace around a value and alone (U+00A0, U+2003, a tab), case
+/// mappings that change a value's length or need context (`ß`, `İ`, `Σ`),
+/// and texts `cast` reads or refuses as a number or a Boolean.
+const TEXTS: [&str; 19] = [
+    " a ",
+    "\u{a0}ab\u{2003}",
+    "\tb",
+    "  ",
+    "\u{2003}",
+    "ß",
+    "İ",
+    "ΑΣ",
+    "Σ",
+    "12",
+    "+3",
+    "1e3",
+    " 1",
+    "1.5",
+    "inf",
+    "NaN",
+    "true",
+    "TRUE",
+    "yes",
+];
+/// The texts a `cast` to a number reads or refuses.
+const NUMBER_TEXTS: [&str; 11] = [
+    "12",
+    "+3",
+    "1e3",
+    " 1",
+    "1.5",
+    "inf",
+    "NaN",
+    "-0.0",
+    "-7",
+    "2147483648",
+    "",
+];
+/// The texts a `cast` to `Bool` reads or refuses.
+const BOOL_TEXTS: [&str; 5] = ["true", "TRUE", "False", "yes", "1"];
+
+/// A string value: mostly a plain one, sometimes one of [`TEXTS`].
+fn str_value(c: &mut Choices) -> &'static str {
+    if c.flag(30) {
+        TEXTS[c.below(TEXTS.len())]
+    } else {
+        STRS[c.below(STRS.len())]
+    }
+}
 const DATES: [&str; 3] = ["2024-01-01", "2023-12-31", "2024-02-29"];
 const DATETIMES: [&str; 3] = [
     "2024-01-01T00:00:00Z",
@@ -372,7 +422,7 @@ fn json_value(c: &mut Choices, sc: Sc) -> String {
             .to_string(),
         Sc::F32 | Sc::F64 => FLOATS[c.below(FLOATS.len())].to_string(),
         Sc::Bool => (c.below(2) == 1).to_string(),
-        Sc::Str => json_string(STRS[c.below(STRS.len())]),
+        Sc::Str => json_string(str_value(c)),
         Sc::Date => json_string(DATES[c.below(DATES.len())]),
         Sc::DateTime => json_string(DATETIMES[c.below(DATETIMES.len())]),
     }
@@ -618,6 +668,17 @@ struct ReadGen<'s, 'c, 'd> {
     /// Nodes an `optional` introduces, which a read does not return whole
     /// yet (`T86`).
     nullable_nodes: Vec<String>,
+    /// Draw no term that can fail (arithmetic, unary minus, a numeric row,
+    /// a `cast` to a number or from a String, `left`, `right`,
+    /// `substring`): the shaper's fixed element order runs a later triple
+    /// before an uncorrelated grouped `from` and a block a `let` binds, so
+    /// where the triple matches nothing they never run, and the engine
+    /// computes a block in `return` on rows the `where` removes, defects
+    /// pinned as hunts (law_engine_reference.rs).
+    pure: bool,
+    /// A block drawn now is pure: the expression is a `let`'s value or a
+    /// `return` item.
+    pure_blocks: bool,
 }
 
 impl GenRead {
@@ -629,6 +690,8 @@ impl GenRead {
             fresh: 0,
             params: Vec::new(),
             nullable_nodes: Vec::new(),
+            pure: false,
+            pure_blocks: false,
         };
         let (body, ordered) = g.read_body();
         let decls: Vec<String> = g.params.iter().map(|(_, d, _)| d.clone()).collect();
@@ -682,7 +745,8 @@ impl ReadGen<'_, '_, '_> {
                 .map(|_| {
                     let a = self.c.pick(&aliases).clone();
                     let dir = *self.c.pick(&["", " asc", " desc"]);
-                    format!("{a}{dir}")
+                    let nulls = *self.c.pick(&["", "", " nulls first", " nulls last"]);
+                    format!("{a}{dir}{nulls}")
                 })
                 .collect();
             let _ = write!(text, "\n  order {{ {} }}", keys.join(", "));
@@ -741,13 +805,23 @@ impl ReadGen<'_, '_, '_> {
         }
         let leaf = self.c.pick(&ints).clone();
         let lit = int_literal(INTS[1 + self.c.below(6)]);
-        match self.c.below(3) {
+        match self.c.below(7) {
             0 => format!(
                 "(({lit} / {leaf}) > {})",
                 int_literal(INTS[self.c.below(7)])
             ),
             1 => format!("(({lit} % {leaf}) = 0)"),
-            _ => format!("(({leaf} * {}) > {lit})", int_literal(INTS[8])),
+            2 => format!("(({leaf} * {}) > {lit})", int_literal(INTS[8])),
+            // Registry rows that can fail over a stored value: the root of
+            // a negative and the logarithm of a non-positive (`E5`), a
+            // negative count (`E5`), a value no `I32` holds (`E6`).
+            3 => format!("(sqrt({leaf}) > 1.0)"),
+            4 => format!("(ln({leaf}) < 2.0)"),
+            // A count is an integer: a property, not a `let` or a `from`'s
+            // `sum`, which may be an `F64`.
+            5 if leaf.contains('.') => format!("(left(\"ab\", {leaf}) = \"a\")"),
+            5 => format!("(sqrt({leaf}) > 1.0)"),
+            _ => format!("(cast(({leaf} * {}), I32) > {lit})", int_literal(INTS[6])),
         }
     }
 
@@ -932,7 +1006,10 @@ impl ReadGen<'_, '_, '_> {
         };
         items.push(format!("count({x}) as {}", &kname[1..]));
         let w = if self.c.flag(40) {
-            format!(" where {}", self.expr(Class::Bool, &inner, 1))
+            self.pure = true;
+            let w = self.expr(Class::Bool, &inner, 1);
+            self.pure = false;
+            format!(" where {w}")
         } else {
             String::new()
         };
@@ -1010,11 +1087,14 @@ impl ReadGen<'_, '_, '_> {
             2 => -1.0,
             _ => 0.5,
         };
-        let v = vec![
-            Literal::Float(f(self.c)),
-            Literal::Float(f(self.c)),
-            Literal::Float(f(self.c)),
-        ];
+        let mut v = [f(self.c), f(self.c), f(self.c)];
+        // A zero query vector on a `cosine` field is refused before the
+        // read runs, which the reference does only where it scores a row,
+        // a defect pinned as a hunt (law_engine_reference.rs).
+        if v.iter().all(|x| *x == 0.0) {
+            v[0] = 1.0;
+        }
+        let v = v.into_iter().map(Literal::Float).collect();
         self.params.push((
             name.clone(),
             format!("{name}: Vector(3)"),
@@ -1048,7 +1128,9 @@ impl ReadGen<'_, '_, '_> {
                     .c
                     .pick(&[Class::Int, Class::Float, Class::Str, Class::Bool]);
                 let v = self.var("l");
+                self.pure_blocks = true;
                 let e = self.expr(ty, scope, depth);
+                self.pure_blocks = false;
                 elements.push(format!("let {v} = {e}"));
                 // The checker types the value; the generator only needs a
                 // class it can read back: comparisons and arithmetic
@@ -1065,7 +1147,10 @@ impl ReadGen<'_, '_, '_> {
             }
             3 if self.options.nesting && self.options.aggregates => {
                 let v = self.var("l");
-                if let Some(block) = self.block(Class::Int, scope, depth) {
+                self.pure_blocks = true;
+                let block = self.block(Class::Int, scope, depth);
+                self.pure_blocks = false;
+                if let Some(block) = block {
                     elements.push(format!("let {v} = {block}"));
                     scope.push(Var {
                         name: v,
@@ -1250,6 +1335,14 @@ impl ReadGen<'_, '_, '_> {
         if depth == 0 {
             return None;
         }
+        let pure = self.pure;
+        self.pure |= self.pure_blocks;
+        let block = self.block_body(class, scope, depth);
+        self.pure = pure;
+        block
+    }
+
+    fn block_body(&mut self, class: Class, scope: &[Var], depth: u32) -> Option<String> {
         let (t, new) = self.traversal(scope, false, true, true)?;
         let mut inner = scope.to_vec();
         inner.extend(new.clone());
@@ -1315,6 +1408,7 @@ impl ReadGen<'_, '_, '_> {
         let mut aliases = Vec::new();
         let n = 1 + self.c.below(3);
         let aggregate = self.options.aggregates && self.c.flag(30);
+        self.pure_blocks = true;
         for i in 0..n {
             let alias = format!("c{i}");
             let item = if aggregate && (i > 0 || self.c.flag(30)) {
@@ -1355,6 +1449,7 @@ impl ReadGen<'_, '_, '_> {
             items.push(format!("{item} as {alias}"));
             aliases.push(alias);
         }
+        self.pure_blocks = false;
         let distinct = !aggregate
             && !items
                 .iter()
@@ -1373,6 +1468,14 @@ impl ReadGen<'_, '_, '_> {
     /// `collect(x) { … }`, a block value: the list of a correlated
     /// pattern's values per outer row.
     fn collect_block(&mut self, scope: &[Var]) -> Option<String> {
+        let pure = self.pure;
+        self.pure |= self.pure_blocks;
+        let block = self.collect_block_body(scope);
+        self.pure = pure;
+        block
+    }
+
+    fn collect_block_body(&mut self, scope: &[Var]) -> Option<String> {
         let (t, new) = self.traversal(scope, false, true, true)?;
         let mut inner = scope.to_vec();
         inner.extend(new);
@@ -1493,7 +1596,7 @@ impl ReadGen<'_, '_, '_> {
                     Literal::Float(FLOATS[self.c.below(FLOATS.len())].parse().unwrap())
                 }
                 Sc::Bool => Literal::Bool(self.c.below(2) == 1),
-                Sc::Str => Literal::String(STRS[self.c.below(STRS.len())].to_string()),
+                Sc::Str => Literal::String(str_value(self.c).to_string()),
                 Sc::Date => Literal::Date(DATES[self.c.below(DATES.len())].to_string()),
                 Sc::DateTime => {
                     Literal::DateTime(DATETIMES[self.c.below(DATETIMES.len())].to_string())
@@ -1519,7 +1622,7 @@ impl ReadGen<'_, '_, '_> {
                 }
             }
             Class::Bool => ["false", "true"][self.c.below(2)].to_string(),
-            Class::Str => json_string(STRS[self.c.below(STRS.len())]),
+            Class::Str => json_string(str_value(self.c)),
             Class::Date => format!("date({})", json_string(DATES[self.c.below(3)])),
             Class::DateTime => format!("datetime({})", json_string(DATETIMES[self.c.below(3)])),
         }
@@ -1541,8 +1644,9 @@ impl ReadGen<'_, '_, '_> {
         }
         let d = depth - 1;
         match class {
-            Class::Int | Class::Float => match self.c.below(9) {
+            Class::Int | Class::Float => match self.c.below(12) {
                 0..=2 => self.leaf(class, scope),
+                3..=5 if self.pure => self.leaf(class, scope),
                 3 | 4 => {
                     let op = *self.c.pick(&["+", "-", "*", "/", "%"]);
                     let (l, r) = if class == Class::Float {
@@ -1572,14 +1676,17 @@ impl ReadGen<'_, '_, '_> {
                     self.expr(class, scope, d),
                     self.expr(class, scope, d)
                 ),
-                _ => match self.options.nesting && self.options.aggregates {
+                8 => match self.options.nesting && self.options.aggregates {
                     true => self
                         .block(class, scope, depth)
                         .unwrap_or_else(|| self.leaf(class, scope)),
                     false => self.leaf(class, scope),
                 },
+                9 | 10 if !self.pure => self.numeric_row(class, scope, d),
+                11 if !self.pure => self.cast(class, scope, d),
+                _ => self.leaf(class, scope),
             },
-            Class::Str => match self.c.below(6) {
+            Class::Str => match self.c.below(10) {
                 0..=2 => self.leaf(class, scope),
                 3 => format!(
                     "concat({}, {})",
@@ -1592,21 +1699,27 @@ impl ReadGen<'_, '_, '_> {
                     self.expr(class, scope, d),
                     self.expr(class, scope, d)
                 ),
-                _ => format!(
+                5 => format!(
                     "coalesce({}, {})",
                     self.expr(class, scope, d),
                     self.expr(class, scope, d)
                 ),
+                6 | 7 if !self.pure => self.string_row(scope, d),
+                8 if !self.pure => self.substring(scope, d),
+                // A cast to String converts every value.
+                9 => self.cast(class, scope, d),
+                _ => self.leaf(class, scope),
             },
-            Class::Date | Class::DateTime => match self.c.below(4) {
+            Class::Date | Class::DateTime => match self.c.below(5) {
                 0..=2 => self.leaf(class, scope),
-                _ => format!(
+                3 => format!(
                     "coalesce({}, {})",
                     self.expr(class, scope, d),
                     self.expr(class, scope, d)
                 ),
+                _ => self.cast(class, scope, d),
             },
-            Class::Bool => match self.c.below(12) {
+            Class::Bool => match self.c.below(13) {
                 0 => self.leaf(class, scope),
                 1..=3 => {
                     let (l, r) = *self.c.pick(&[
@@ -1668,14 +1781,186 @@ impl ReadGen<'_, '_, '_> {
                 10 => self
                     .membership(scope)
                     .unwrap_or_else(|| self.leaf(class, scope)),
-                _ => match self.options.nesting {
+                11 => match self.options.nesting {
                     true => self
                         .block(Class::Bool, scope, depth)
                         .unwrap_or_else(|| self.leaf(class, scope)),
                     false => self.leaf(class, scope),
                 },
+                _ => self.cast(class, scope, d),
             },
         }
+    }
+
+    /// A numeric registry row (the GQ 3 RFC, section 2): `abs`, `floor`,
+    /// `ceil` and `round` (with and without `digits:`) keep their operand's
+    /// type; an integer is also a String's `length` or a list's `size`, a
+    /// float also `sqrt`, `exp`, `ln`, `log10` or `power` of any number.
+    /// `round`'s digits, the roots and logarithms of negatives and zero and
+    /// an `exp` or `power` that overflows can fail; most operands do not.
+    fn numeric_row(&mut self, class: Class, scope: &[Var], d: u32) -> String {
+        match self.c.below(4) {
+            0 => {
+                let f = *self.c.pick(&["abs", "floor", "ceil"]);
+                format!("{f}({})", self.expr(class, scope, d))
+            }
+            1 => {
+                let x = self.expr(class, scope, d);
+                let digits = match self.c.below(7) {
+                    0 | 1 => String::new(),
+                    2 => ", digits: 0".to_string(),
+                    3 => ", digits: 1".to_string(),
+                    4 => ", digits: 2".to_string(),
+                    5 => ", digits: (-1)".to_string(),
+                    _ => format!(", digits: {}", self.int_arg(scope)),
+                };
+                format!("round({x}{digits})")
+            }
+            2 if class == Class::Int => {
+                let lists = self.list_leaves(scope);
+                if !lists.is_empty() && self.c.flag(50) {
+                    format!("size({})", self.c.pick(&lists))
+                } else {
+                    format!("length({})", self.expr(Class::Str, scope, d))
+                }
+            }
+            3 if class == Class::Int => format!("length({})", self.expr(Class::Str, scope, d)),
+            2 => {
+                let f = *self.c.pick(&["sqrt", "exp", "ln", "log10"]);
+                let operand = *self.c.pick(&[Class::Int, Class::Float]);
+                let x = self.expr(operand, scope, d);
+                // Mostly an operand in the row's domain.
+                match self.c.flag(50) {
+                    true => format!("{f}(abs({x}))"),
+                    false => format!("{f}({x})"),
+                }
+            }
+            _ => {
+                let (b, e) = *self.c.pick(&[
+                    (Class::Float, Class::Int),
+                    (Class::Int, Class::Int),
+                    (Class::Float, Class::Float),
+                ]);
+                let base = self.expr(b, scope, d);
+                let exponent = match self.c.flag(60) {
+                    true => (*self.c.pick(&["0", "1", "2", "0.5", "(-1)"])).to_string(),
+                    false => self.expr(e, scope, d),
+                };
+                format!("power({base}, {exponent})")
+            }
+        }
+    }
+
+    /// A String registry row: `lower`, `upper` (Unicode case mapping),
+    /// `trim`, `ltrim`, `rtrim` (Unicode whitespace), `left` and `right`
+    /// (a negative count fails).
+    fn string_row(&mut self, scope: &[Var], d: u32) -> String {
+        match self.c.below(2) {
+            0 => {
+                let f = *self.c.pick(&["lower", "upper", "trim", "ltrim", "rtrim"]);
+                format!("{f}({})", self.expr(Class::Str, scope, d))
+            }
+            _ => {
+                let f = *self.c.pick(&["left", "right"]);
+                let s = self.expr(Class::Str, scope, d);
+                let n = self.count(scope);
+                format!("{f}({s}, {n})")
+            }
+        }
+    }
+
+    /// `substring(s, start, len)`: a start before, at or past the String's
+    /// ends (clipped), a length that is mostly not negative.
+    fn substring(&mut self, scope: &[Var], d: u32) -> String {
+        let s = self.expr(Class::Str, scope, d);
+        let start = match self.c.flag(20) {
+            true => self.int_arg(scope),
+            false => (*self.c.pick(&["1", "2", "0", "4", "(-1)"])).to_string(),
+        };
+        let len = self.count(scope);
+        format!("substring({s}, {start}, {len})")
+    }
+
+    /// A count of characters: mostly a small literal, sometimes negative
+    /// (`E5`), sometimes an integer in scope.
+    fn count(&mut self, scope: &[Var]) -> String {
+        match self.c.flag(20) {
+            true => self.int_arg(scope),
+            false => (*self.c.pick(&["1", "2", "0", "3", "5", "(-1)"])).to_string(),
+        }
+    }
+
+    /// An operand an integer argument accepts: an integer property, an
+    /// integer parameter or literal. An integer-class expression may be an
+    /// `F64` (a block's `sum`, a `let` of one), which `left`, `substring`,
+    /// `round`'s digits and a `cast` to `Bool` refuse.
+    fn int_arg(&mut self, scope: &[Var]) -> String {
+        let props: Vec<String> = self
+            .leaves(Class::Int, scope)
+            .into_iter()
+            .filter(|l| l.contains('.'))
+            .collect();
+        match self.c.below(3) {
+            0 if !props.is_empty() => self.c.pick(&props).clone(),
+            1 => self.param(Class::Int),
+            _ => self.literal(Class::Int),
+        }
+    }
+
+    /// `cast(x, T)` to a type of `class`, from a class `cast_converts`
+    /// admits: numbers between each other, a Bool and an integer, a String
+    /// and anything, a Date and a DateTime. A String read as another type is
+    /// mostly a text `cast` reads or refuses ([`NUMBER_TEXTS`],
+    /// [`BOOL_TEXTS`], a date literal or a date that does not exist).
+    fn cast(&mut self, class: Class, scope: &[Var], d: u32) -> String {
+        use Class::*;
+        let (target, sources): (&str, &[Class]) = match class {
+            Int => (*self.c.pick(&["I64", "I32"]), &[Int, Float, Bool, Str]),
+            Float => (*self.c.pick(&["F64", "F32"]), &[Int, Float, Str]),
+            Str => ("String", &[Int, Float, Bool, Str, Date, DateTime]),
+            Bool => ("Bool", &[Int, Bool, Str]),
+            Date => ("Date", &[Date, DateTime, Str]),
+            DateTime => ("DateTime", &[DateTime, Date, Str]),
+        };
+        let mut from = *self.c.pick(sources);
+        // A `Bool` from an integer, a `Date` from a `DateTime` and the
+        // reverse convert every value.
+        if self.pure && from == Str && class != Str {
+            from = sources[0];
+        }
+        let x = if from == Int && class == Bool {
+            self.int_arg(scope)
+        } else if from == Str && class != Str && self.c.flag(60) {
+            let text = match class {
+                Int | Float => *self.c.pick(&NUMBER_TEXTS),
+                Bool => *self.c.pick(&BOOL_TEXTS),
+                Date => *self
+                    .c
+                    .pick(&[DATES[0], DATES[2], DATETIMES[0], "2023-02-29"]),
+                _ => *self
+                    .c
+                    .pick(&[DATETIMES[0], DATETIMES[1], DATES[0], "2024-01-01T25:00:00Z"]),
+            };
+            json_string(text)
+        } else {
+            self.expr(from, scope, d)
+        };
+        format!("cast({x}, {target})")
+    }
+
+    /// The list properties of the nodes in scope.
+    fn list_leaves(&self, scope: &[Var]) -> Vec<String> {
+        let mut out = Vec::new();
+        for v in scope {
+            if let VarKind::Node(t) = v.kind {
+                for p in &self.schema.nodes[t].props {
+                    if p.ty == PropTy::ListStr {
+                        out.push(format!("{}.{}", v.name, p.name));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// A string or enum membership test against a list or enum property.
@@ -1754,6 +2039,8 @@ pub fn scalar_expr(
         fresh: 0,
         params: Vec::new(),
         nullable_nodes: Vec::new(),
+        pure: false,
+        pure_blocks: false,
     };
     let scope = vec![Var {
         name: "$x".into(),
@@ -1761,6 +2048,250 @@ pub fn scalar_expr(
     }];
     let e = g.expr(class, &scope, depth);
     (e, g.params)
+}
+
+// ---------------------------------------------------------------- spellings
+
+/// A non-canonical spelling the GQ 3 RFC admits (section 3, "Added:
+/// arithmetic"), each of which lowers to its canonical form's tree and is
+/// on lint's canonical-forms list (section 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spelling {
+    /// `case when c then a else b end` for `if(c, a, b)`, the simple
+    /// `case x when v then a else b end` for `if(x = v, a, b)`, and no
+    /// `else` for `if(c, a, null)` (`L212`).
+    Case,
+    /// `(a) || (b) || …` for `concat(a, b, …)` (`L213`).
+    Bars,
+    /// `<>` for `!=` (`L214`).
+    NotEqual,
+    /// A single-quoted string for a double-quoted one (`L215`).
+    SingleQuote,
+    /// A keyword or registry name in upper or mixed case (`L216`).
+    LetterCase,
+}
+
+impl Spelling {
+    pub const ALL: [Spelling; 5] = [
+        Spelling::Case,
+        Spelling::Bars,
+        Spelling::NotEqual,
+        Spelling::SingleQuote,
+        Spelling::LetterCase,
+    ];
+
+    /// Lint's code for the spelling.
+    pub fn code(self) -> &'static str {
+        match self {
+            Spelling::Case => "L212",
+            Spelling::Bars => "L213",
+            Spelling::NotEqual => "L214",
+            Spelling::SingleQuote => "L215",
+            Spelling::LetterCase => "L216",
+        }
+    }
+}
+
+/// `text` written with the non-canonical spellings of `forms` at places a
+/// seeded stream picks, each of which parses to the tree its canonical
+/// form does: some keywords and registry names in upper or mixed case,
+/// `<>` for `!=`, single-quoted strings, `||` for a `concat` of two or more
+/// arguments, and `case` for a three-argument `if` (the simple form for an
+/// equality condition, no `else` for a `null` one). Driven by the parse
+/// tree, so a property, edge or alias name that is a keyword keeps its
+/// spelling. Returns the text and the forms it wrote; `text` itself when it
+/// does not parse.
+pub fn respell_spellings(text: &str, seed: u64, forms: &[Spelling]) -> (String, Vec<Spelling>) {
+    use crate::query::syntax::{QueryParser, Rule};
+    use pest::Parser as _;
+    // SplitMix64, so a small seed draws as evenly as a large one.
+    let mut state = seed;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let Ok(pairs) = QueryParser::parse(Rule::query_file, text) else {
+        return (text.to_string(), Vec::new());
+    };
+    let on = |form: Spelling| forms.contains(&form);
+    let positionals = |call: &pest::iterators::Pair<Rule>| -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        for args in call
+            .clone()
+            .into_inner()
+            .filter(|p| p.as_rule() == Rule::call_args)
+        {
+            for a in args.into_inner() {
+                match a.as_rule() {
+                    Rule::positional => {
+                        let v = a.into_inner().next()?;
+                        if v.as_rule() != Rule::expr {
+                            return None;
+                        }
+                        out.push(v.as_str().trim().to_string());
+                    }
+                    Rule::missing_comma_rec => {}
+                    _ => return None,
+                }
+            }
+        }
+        Some(out)
+    };
+    // Every `=` comparison, by its text: the condition a simple `case`
+    // writes as its operand and its `when` value.
+    let equalities: Vec<(String, String, String)> = pairs
+        .clone()
+        .flatten()
+        .filter(|p| p.as_rule() == Rule::comparison)
+        .filter_map(|p| {
+            let parts: Vec<_> = p.clone().into_inner().collect();
+            match parts.as_slice() {
+                [l, op, r] if op.as_rule() == Rule::comp_op && op.as_str() == "=" => Some((
+                    p.as_str().trim().to_string(),
+                    l.as_str().trim().to_string(),
+                    r.as_str().trim().to_string(),
+                )),
+                _ => None,
+            }
+        })
+        .collect();
+    let equality = |condition: &str| {
+        let mut c = condition.trim();
+        loop {
+            if let Some((_, l, r)) = equalities.iter().find(|(whole, _, _)| whole == c) {
+                return Some((l.clone(), r.clone()));
+            }
+            match c.strip_prefix('(').and_then(|c| c.strip_suffix(')')) {
+                Some(inner) => c = inner.trim(),
+                None => return None,
+            }
+        }
+    };
+    // A call that is a `from`'s relation is no expression to respell.
+    let relations: Vec<usize> = pairs
+        .clone()
+        .flatten()
+        .filter(|p| p.as_rule() == Rule::relation_expr)
+        .map(|p| p.as_span().start())
+        .collect();
+    let mut edits: Vec<(usize, usize, String, Spelling)> = Vec::new();
+    for p in pairs.flatten() {
+        let (start, end) = (p.as_span().start(), p.as_span().end());
+        let word = p.as_str();
+        let rule = p.as_rule();
+        let replacement = match rule {
+            Rule::call if relations.contains(&start) => None,
+            Rule::call => {
+                let name = p
+                    .clone()
+                    .into_inner()
+                    .find(|n| n.as_rule() == Rule::call_name)
+                    .map(|n| n.as_str().to_string());
+                match (name.as_deref(), positionals(&p)) {
+                    (Some("concat"), Some(args))
+                        if on(Spelling::Bars) && args.len() >= 2 && next() % 2 == 0 =>
+                    {
+                        Some((
+                            format!(
+                                "({})",
+                                args.iter()
+                                    .map(|a| format!("({a})"))
+                                    .collect::<Vec<_>>()
+                                    .join(" || ")
+                            ),
+                            Spelling::Bars,
+                        ))
+                    }
+                    (Some("if"), Some(args))
+                        if on(Spelling::Case) && args.len() == 3 && next() % 2 == 0 =>
+                    {
+                        let otherwise = if args[2] == "null" && next() % 2 == 0 {
+                            String::new()
+                        } else {
+                            format!(" else ({})", args[2])
+                        };
+                        Some((
+                            match equality(&args[0]) {
+                                Some((x, v)) if next() % 2 == 0 => format!(
+                                    "(case ({x}) when ({v}) then ({}){otherwise} end)",
+                                    args[1]
+                                ),
+                                _ => format!(
+                                    "(case when ({}) then ({}){otherwise} end)",
+                                    args[0], args[1]
+                                ),
+                            },
+                            Spelling::Case,
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+            Rule::comp_op if on(Spelling::NotEqual) && word == "!=" && next() % 2 == 0 => {
+                Some(("<>".to_string(), Spelling::NotEqual))
+            }
+            Rule::string_lit
+                if on(Spelling::SingleQuote) && word.starts_with('"') && next() % 3 == 0 =>
+            {
+                crate::error::decode_string_literal(word).ok().map(|value| {
+                    let mut out = String::from("'");
+                    for ch in value.chars() {
+                        match ch {
+                            '\'' => out.push_str("\\'"),
+                            '\\' => out.push_str("\\\\"),
+                            '\n' => out.push_str("\\n"),
+                            '\r' => out.push_str("\\r"),
+                            '\t' => out.push_str("\\t"),
+                            other => out.push(other),
+                        }
+                    }
+                    out.push('\'');
+                    (out, Spelling::SingleQuote)
+                })
+            }
+            _ if on(Spelling::LetterCase) => {
+                let keyword = matches!(
+                    rule,
+                    Rule::agg_name
+                        | Rule::order_dir
+                        | Rule::bool_lit
+                        | Rule::stmt_keyword
+                        | Rule::load_kind
+                        | Rule::load_mode_name
+                ) || format!("{rule:?}").starts_with("kw_")
+                    || (rule == Rule::call_name && crate::query::check::is_registry_name(word));
+                (keyword && next() % 4 == 0).then(|| {
+                    let respelled = if next() % 2 == 0 {
+                        word.to_ascii_uppercase()
+                    } else {
+                        let mut w = word.to_string();
+                        w[..1].make_ascii_uppercase();
+                        w
+                    };
+                    (respelled, Spelling::LetterCase)
+                })
+            }
+            _ => None,
+        };
+        if let Some((r, form)) = replacement
+            && r != word
+            && edits.last().is_none_or(|(_, e, _, _)| *e <= start)
+        {
+            edits.push((start, end, r, form));
+        }
+    }
+    let mut out = text.to_string();
+    let mut written = Vec::new();
+    for (start, end, r, form) in edits.into_iter().rev() {
+        out.replace_range(start..end, &r);
+        if !written.contains(&form) {
+            written.push(form);
+        }
+    }
+    (out, written)
 }
 
 // ---------------------------------------------------------------- scalar laws
@@ -1825,6 +2356,69 @@ pub enum ScalarExpr {
     Or(Box<ScalarExpr>, Box<ScalarExpr>),
     Not(Box<ScalarExpr>),
     IsNull(Box<ScalarExpr>, bool),
+    /// A one-argument registry row: `lower`, `upper`, `trim`, `ltrim`,
+    /// `rtrim`, `length`, `abs`, `floor`, `ceil`, `sqrt`, `exp`, `ln`,
+    /// `log10`.
+    Row(&'static str, Box<ScalarExpr>),
+    /// `left(s, n)` or `right(s, n)`.
+    Count(&'static str, Box<ScalarExpr>, Box<ScalarExpr>),
+    /// `substring(s, start, len)`.
+    Substring(Box<ScalarExpr>, Box<ScalarExpr>, Box<ScalarExpr>),
+    /// `round(x)` or `round(x, digits: n)`.
+    Round(Box<ScalarExpr>, Option<Box<ScalarExpr>>),
+    /// `power(base, exponent)`.
+    Power(Box<ScalarExpr>, Box<ScalarExpr>),
+    /// `cast(x, T)`.
+    Cast(Box<ScalarExpr>, Sc),
+}
+
+/// The String literals and inputs of the scalar laws: plain values and
+/// [`TEXTS`].
+const SCALAR_STRS: [&str; 16] = [
+    "",
+    "a",
+    "ab",
+    "b",
+    " a ",
+    "\u{a0}ab\u{2003}",
+    "\tb",
+    "  ",
+    "ß",
+    "İ",
+    "ΑΣ",
+    "12",
+    "+3",
+    "1e3",
+    " 1",
+    "1.5",
+];
+const SCALAR_STR_TEXTS: [&str; 6] = ["inf", "NaN", "true", "TRUE", "yes", "-0.0"];
+
+/// The types a `cast` of the scalar laws reaches from each class:
+/// `cast_converts`' pairs over the laws' inputs.
+fn cast_targets(class: Class) -> &'static [Sc] {
+    match class {
+        Class::Int => &[
+            Sc::I32,
+            Sc::I64,
+            Sc::U32,
+            Sc::F32,
+            Sc::F64,
+            Sc::Str,
+            Sc::Bool,
+        ],
+        Class::Float => &[Sc::I32, Sc::I64, Sc::U32, Sc::F32, Sc::F64, Sc::Str],
+        Class::Bool => &[Sc::I32, Sc::I64, Sc::U32, Sc::Str, Sc::Bool],
+        _ => &[
+            Sc::I32,
+            Sc::I64,
+            Sc::U32,
+            Sc::F32,
+            Sc::F64,
+            Sc::Str,
+            Sc::Bool,
+        ],
+    }
 }
 
 /// How an expression's inputs are spelled.
@@ -1858,7 +2452,10 @@ impl ScalarExpr {
                     _ => ScalarExpr::Input(Sc::Bool),
                 },
                 _ => match c.below(3) {
-                    0 => ScalarExpr::Str(c.pick(&["", "a", "ab", "b"])),
+                    0 => ScalarExpr::Str(match c.flag(20) {
+                        true => c.pick(&SCALAR_STR_TEXTS),
+                        false => c.pick(&SCALAR_STRS),
+                    }),
                     _ => ScalarExpr::Input(Sc::Str),
                 },
             }
@@ -1868,8 +2465,23 @@ impl ScalarExpr {
         }
         let d = depth - 1;
         let sub = |c: &mut Choices, class: Class| Box::new(Self::generate(c, class, d));
+        // A cast to a type of `class` from any class that converts to it.
+        let cast = |c: &mut Choices, class: Class| {
+            let targets: Vec<Sc> = SCALAR_INPUTS
+                .iter()
+                .copied()
+                .filter(|t| t.class() == class)
+                .collect();
+            let target = *c.pick(&targets);
+            let from = *c.pick(&[Class::Int, Class::Float, Class::Bool, Class::Str]);
+            if cast_targets(from).contains(&target) {
+                ScalarExpr::Cast(sub(c, from), target)
+            } else {
+                ScalarExpr::Cast(sub(c, Class::Str), target)
+            }
+        };
         match class {
-            Class::Int | Class::Float => match c.below(7) {
+            Class::Int | Class::Float => match c.below(12) {
                 0 | 1 => leaf(c, class),
                 2 | 3 => {
                     let op = *c.pick(&["+", "-", "*", "/", "%"]);
@@ -1885,9 +2497,38 @@ impl ScalarExpr {
                 }
                 4 => ScalarExpr::Neg(sub(c, class)),
                 5 => ScalarExpr::If(sub(c, Class::Bool), sub(c, class), sub(c, class)),
-                _ => ScalarExpr::Coalesce(sub(c, class), sub(c, class)),
+                6 => ScalarExpr::Coalesce(sub(c, class), sub(c, class)),
+                7 => ScalarExpr::Row(c.pick(&["abs", "floor", "ceil"]), sub(c, class)),
+                8 => {
+                    let x = sub(c, class);
+                    let digits = match c.below(3) {
+                        0 => None,
+                        _ => Some(Box::new(match c.flag(70) {
+                            true => match c.below(5) {
+                                4 => ScalarExpr::Neg(Box::new(ScalarExpr::Int(*c.pick(&[1, 2])))),
+                                n => ScalarExpr::Int(n as i64),
+                            },
+                            false => Self::generate(c, Class::Int, d),
+                        })),
+                    };
+                    ScalarExpr::Round(x, digits)
+                }
+                9 if class == Class::Int => ScalarExpr::Row("length", sub(c, Class::Str)),
+                9 => match c.below(5) {
+                    4 => {
+                        let b = *c.pick(&[Class::Float, Class::Int]);
+                        let e = *c.pick(&[Class::Int, Class::Float]);
+                        ScalarExpr::Power(sub(c, b), sub(c, e))
+                    }
+                    _ => {
+                        let f = *c.pick(&["sqrt", "exp", "ln", "log10"]);
+                        let operand = *c.pick(&[Class::Int, Class::Float]);
+                        ScalarExpr::Row(f, sub(c, operand))
+                    }
+                },
+                _ => cast(c, class),
             },
-            Class::Bool => match c.below(8) {
+            Class::Bool => match c.below(9) {
                 0 => leaf(c, class),
                 1 | 2 => {
                     let (l, r) = *c.pick(&[
@@ -1907,17 +2548,73 @@ impl ScalarExpr {
                     let class = *c.pick(&[Class::Int, Class::Float, Class::Str]);
                     ScalarExpr::IsNull(sub(c, class), c.below(2) == 1)
                 }
-                _ => ScalarExpr::If(
+                7 => ScalarExpr::If(
                     sub(c, Class::Bool),
                     sub(c, Class::Bool),
                     sub(c, Class::Bool),
                 ),
+                _ => cast(c, class),
             },
-            _ => match c.below(4) {
+            _ => match c.below(8) {
                 0 | 1 => leaf(c, class),
                 2 => ScalarExpr::If(sub(c, Class::Bool), sub(c, class), sub(c, class)),
-                _ => ScalarExpr::Coalesce(sub(c, class), sub(c, class)),
+                3 => ScalarExpr::Coalesce(sub(c, class), sub(c, class)),
+                4 => ScalarExpr::Row(
+                    c.pick(&["lower", "upper", "trim", "ltrim", "rtrim"]),
+                    sub(c, class),
+                ),
+                5 => ScalarExpr::Count(
+                    c.pick(&["left", "right"]),
+                    sub(c, class),
+                    sub(c, Class::Int),
+                ),
+                6 => ScalarExpr::Substring(sub(c, class), sub(c, Class::Int), sub(c, Class::Int)),
+                _ => cast(c, class),
             },
+        }
+    }
+
+    /// Whether the tree reads an unsigned value: a `U32` input or a cast to
+    /// `U32`.
+    fn reads_unsigned(&self) -> bool {
+        let mut inputs = Vec::new();
+        self.inputs(&mut inputs);
+        inputs.contains(&Sc::U32) || self.casts_to_unsigned()
+    }
+
+    fn casts_to_unsigned(&self) -> bool {
+        match self {
+            ScalarExpr::Cast(_, Sc::U32) => true,
+            _ => self.children().iter().any(|e| e.casts_to_unsigned()),
+        }
+    }
+
+    /// The direct operands.
+    fn children(&self) -> Vec<&ScalarExpr> {
+        match self {
+            ScalarExpr::Arith(_, l, r)
+            | ScalarExpr::Cmp(_, l, r)
+            | ScalarExpr::And(l, r)
+            | ScalarExpr::Or(l, r)
+            | ScalarExpr::Coalesce(l, r)
+            | ScalarExpr::Count(_, l, r)
+            | ScalarExpr::Power(l, r) => vec![l, r],
+            ScalarExpr::If(a, b, c) | ScalarExpr::Substring(a, b, c) => vec![a, b, c],
+            ScalarExpr::Neg(e)
+            | ScalarExpr::Not(e)
+            | ScalarExpr::IsNull(e, _)
+            | ScalarExpr::Row(_, e)
+            | ScalarExpr::Cast(e, _) => vec![e],
+            ScalarExpr::Round(x, digits) => {
+                let mut out: Vec<&ScalarExpr> = vec![x];
+                out.extend(digits.as_deref());
+                out
+            }
+            ScalarExpr::Input(_)
+            | ScalarExpr::Int(_)
+            | ScalarExpr::Float(_)
+            | ScalarExpr::Bool(_)
+            | ScalarExpr::Str(_) => Vec::new(),
         }
     }
 
@@ -1926,9 +2623,7 @@ impl ScalarExpr {
     /// refusal of the checker the generator does not aim for, the second a
     /// literal rule the RFC leaves open for `-0` beside `U32`.
     pub fn negates_unsigned(&self) -> bool {
-        let mut inputs = Vec::new();
-        self.inputs(&mut inputs);
-        if inputs.contains(&Sc::U32) && self.text(Inputs::Props).contains("(-") {
+        if self.reads_unsigned() && self.text(Inputs::Props).contains("(-") {
             return true;
         }
         match self {
@@ -1947,11 +2642,7 @@ impl ScalarExpr {
                     || l.negates_unsigned()
                     || r.negates_unsigned()
             }
-            ScalarExpr::If(c, a, b) => {
-                c.negates_unsigned() || a.negates_unsigned() || b.negates_unsigned()
-            }
-            ScalarExpr::Not(e) | ScalarExpr::IsNull(e, _) => e.negates_unsigned(),
-            _ => false,
+            other => other.children().iter().any(|e| e.negates_unsigned()),
         }
     }
 
@@ -1978,6 +2669,15 @@ impl ScalarExpr {
             ScalarExpr::IsNull(e, negated) => {
                 format!("({} is {}null)", t(e), if *negated { "not " } else { "" })
             }
+            ScalarExpr::Row(f, e) => format!("{f}({})", t(e)),
+            ScalarExpr::Count(f, s, n) => format!("{f}({}, {})", t(s), t(n)),
+            ScalarExpr::Substring(s, start, len) => {
+                format!("substring({}, {}, {})", t(s), t(start), t(len))
+            }
+            ScalarExpr::Round(x, None) => format!("round({})", t(x)),
+            ScalarExpr::Round(x, Some(d)) => format!("round({}, digits: {})", t(x), t(d)),
+            ScalarExpr::Power(b, e) => format!("power({}, {})", t(b), t(e)),
+            ScalarExpr::Cast(x, to) => format!("cast({}, {})", t(x), to.spelling()),
         }
     }
 
@@ -1989,21 +2689,11 @@ impl ScalarExpr {
                     out.push(*sc);
                 }
             }
-            ScalarExpr::Arith(_, l, r)
-            | ScalarExpr::Cmp(_, l, r)
-            | ScalarExpr::And(l, r)
-            | ScalarExpr::Or(l, r)
-            | ScalarExpr::Coalesce(l, r) => {
-                l.inputs(out);
-                r.inputs(out);
+            other => {
+                for e in other.children() {
+                    e.inputs(out);
+                }
             }
-            ScalarExpr::If(c, a, b) => {
-                c.inputs(out);
-                a.inputs(out);
-                b.inputs(out);
-            }
-            ScalarExpr::Neg(e) | ScalarExpr::Not(e) | ScalarExpr::IsNull(e, _) => e.inputs(out),
-            _ => {}
         }
     }
 
@@ -2049,6 +2739,33 @@ impl ScalarExpr {
             }
             ScalarExpr::Not(e) => (Some(Sc::Bool), e.rfc_type().1),
             ScalarExpr::IsNull(_, _) => (Some(Sc::Bool), false),
+            // The registry rows (section 2): a String row is a String, or
+            // an `I64` for `length`; `abs`, `floor`, `ceil` and `round`
+            // keep their operand's type, an integer literal's being `I64`;
+            // the roots, logarithms, `exp` and `power` are `F64`; a `cast`
+            // is its target. Each is null where an argument is.
+            ScalarExpr::Row(f, e) => {
+                let (t, n) = e.rfc_type();
+                let t = match *f {
+                    "length" => Sc::I64,
+                    "lower" | "upper" | "trim" | "ltrim" | "rtrim" => Sc::Str,
+                    "sqrt" | "exp" | "ln" | "log10" => Sc::F64,
+                    _ => t.unwrap_or(Sc::I64),
+                };
+                (Some(t), n)
+            }
+            ScalarExpr::Count(_, s, k) => (Some(Sc::Str), s.rfc_type().1 || k.rfc_type().1),
+            ScalarExpr::Substring(s, a, b) => (
+                Some(Sc::Str),
+                s.rfc_type().1 || a.rfc_type().1 || b.rfc_type().1,
+            ),
+            ScalarExpr::Round(x, digits) => {
+                let (t, n) = x.rfc_type();
+                let digits_null = digits.as_ref().is_some_and(|d| d.rfc_type().1);
+                (Some(t.unwrap_or(Sc::I64)), n || digits_null)
+            }
+            ScalarExpr::Power(b, e) => (Some(Sc::F64), b.rfc_type().1 || e.rfc_type().1),
+            ScalarExpr::Cast(x, to) => (Some(*to), x.rfc_type().1),
         }
     }
 }
@@ -2110,7 +2827,10 @@ pub fn scalar_input_value(c: &mut Choices, sc: Sc) -> Option<(String, Literal)> 
             (v.to_string(), Literal::Bool(v))
         }
         Sc::Str => {
-            let v = *c.pick(&["", "a", "ab", "b"]);
+            let v = match c.flag(25) {
+                true => *c.pick(&SCALAR_STR_TEXTS),
+                false => *c.pick(&SCALAR_STRS),
+            };
             (json_string(v), Literal::String(v.to_string()))
         }
         Sc::Date | Sc::DateTime => unreachable!("no temporal input"),
@@ -2142,6 +2862,7 @@ mod tests {
         let refusals: std::cell::RefCell<std::collections::BTreeMap<String, (usize, String)>> =
             Default::default();
         let total = std::cell::Cell::new(0usize);
+        let drawn: std::cell::RefCell<std::collections::BTreeMap<&str, usize>> = Default::default();
         runner
             .run(&(choices(64), choices(512)), |(s, q)| {
                 let schema = GenSchema::generate(&mut Choices::new(&s), SchemaOptions::default());
@@ -2149,6 +2870,11 @@ mod tests {
                 let read =
                     GenRead::generate(&mut Choices::new(&q), &schema, ReadOptions::default());
                 total.set(total.get() + 1);
+                for spelling in DRAWN {
+                    if read.source.contains(spelling) {
+                        *drawn.borrow_mut().entry(spelling).or_default() += 1;
+                    }
+                }
                 let outcome = check_source(&catalog, &read.source)
                     .and_then(|mut decls| decls.pop().unwrap().1.map(|_| ()));
                 if let Err(d) = outcome {
@@ -2169,7 +2895,41 @@ mod tests {
             eprintln!("{code}: {n}/{}\n{example}\n", total.get());
         }
         assert!(refusals.is_empty(), "{} codes refused", refusals.len());
+        let drawn = drawn.into_inner();
+        eprintln!("reads drawing each row of {}: {drawn:?}", total.get());
+        let missing: Vec<&&str> = DRAWN.iter().filter(|s| !drawn.contains_key(*s)).collect();
+        assert!(missing.is_empty(), "no generated read draws {missing:?}");
     }
+
+    /// The registry rows and order placements the generator must reach.
+    const DRAWN: [&str; 26] = [
+        "lower(",
+        "upper(",
+        "trim(",
+        "ltrim(",
+        "rtrim(",
+        "length(",
+        "left(",
+        "right(",
+        "substring(",
+        "abs(",
+        "floor(",
+        "ceil(",
+        "round(",
+        "digits: ",
+        "sqrt(",
+        "power(",
+        "exp(",
+        "ln(",
+        "log10(",
+        "size(",
+        "cast(",
+        "stddev(",
+        "percentile(",
+        " nulls first",
+        " nulls last",
+        "\u{a0}",
+    ];
 
     #[test]
     fn generated_reads_type_check_at_the_gate() {

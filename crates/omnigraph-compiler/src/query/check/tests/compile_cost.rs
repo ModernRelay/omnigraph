@@ -3,8 +3,11 @@
 //!
 //! A generated read (`crate::arbitrary`) is grown by one construct family,
 //! one unit at a time: a run of `optional`s, a chain of `let`s, a nested
-//! guard (`if` and `coalesce`), a run of blocks bound by `let`, and a chain
-//! of declared reads each calling the next once. Two deterministic counts
+//! guard (`if` and `coalesce`), a nested chain of the registry's scalar
+//! rows (`trim`, `upper`, `length`, `cast`, `abs`, `sqrt`, `round` with
+//! `digits:`), a `case` growing by one `when` (lowered to nested `if`), a
+//! run of blocks bound by `let`, and a chain of declared reads each calling
+//! the next once. Two deterministic counts
 //! are measured per size: the expressions the checker types for the read,
 //! each called read typed once, and the term nodes the read's plan budget
 //! is charged with, its expanded tree ([`crate::budget`]). The law: from the second unit on, each unit adds exactly
@@ -32,14 +35,18 @@ enum Family {
     Optionals,
     Lets,
     Guards,
+    Rows,
+    Cases,
     Blocks,
     Calls,
 }
 
-const FAMILIES: [Family; 5] = [
+const FAMILIES: [Family; 7] = [
     Family::Optionals,
     Family::Lets,
     Family::Guards,
+    Family::Rows,
+    Family::Cases,
     Family::Blocks,
     Family::Calls,
 ];
@@ -87,6 +94,21 @@ fn grown(
                 e = format!("coalesce(if(({v}.k = \"a\"), \"b\", {e}), \"c\")");
             }
             elements.push(format!("let $zg = {e}"));
+        }
+        Family::Rows => {
+            let mut e = format!("{v}.k");
+            for _ in 1..=n {
+                e = format!(
+                    "cast(round(sqrt(abs(cast(length(upper(trim({e}))), F64))), digits: 2), String)"
+                );
+            }
+            elements.push(format!("let $zr = {e}"));
+        }
+        Family::Cases => {
+            let whens: String = (1..=n)
+                .map(|i| format!(" when ({v}.k = \"{i}\") then \"w{i}\""))
+                .collect();
+            elements.push(format!("let $zc = case{whens} else {v}.k end"));
         }
         Family::Blocks => {
             let (e, dst) = edge?;

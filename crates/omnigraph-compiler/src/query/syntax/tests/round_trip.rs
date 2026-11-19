@@ -819,142 +819,6 @@ fn respell(text: &str, seed: u64) -> String {
     out
 }
 
-/// `text` written with the non-canonical spellings section 3 admits, each of
-/// which parses to the tree its canonical form does: some keywords and
-/// registry names in upper or mixed case, `<>` for `!=`, single-quoted
-/// strings, `||` for a `concat` of two or more arguments, and `case` for a
-/// three-argument `if` (the simple form for an equality condition, no
-/// `else` for a `null` one). Driven by the parse tree, so a property, edge
-/// or alias name that is a keyword keeps its spelling.
-pub(crate) fn respell_spellings(text: &str, seed: u64) -> String {
-    let mut state = seed.rotate_left(17) | 1;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
-    let Ok(pairs) = QueryParser::parse(Rule::query_file, text) else {
-        return text.to_string();
-    };
-    let positionals = |call: &pest::iterators::Pair<Rule>| -> Option<Vec<String>> {
-        let mut out = Vec::new();
-        for args in call
-            .clone()
-            .into_inner()
-            .filter(|p| p.as_rule() == Rule::call_args)
-        {
-            for a in args.into_inner() {
-                match a.as_rule() {
-                    Rule::positional => {
-                        let v = a.into_inner().next()?;
-                        if v.as_rule() != Rule::expr {
-                            return None;
-                        }
-                        out.push(v.as_str().trim().to_string());
-                    }
-                    Rule::missing_comma_rec => {}
-                    _ => return None,
-                }
-            }
-        }
-        Some(out)
-    };
-    // A call that is a `from`'s relation is no expression to respell.
-    let relations: Vec<usize> = pairs
-        .clone()
-        .flatten()
-        .filter(|p| p.as_rule() == Rule::relation_expr)
-        .map(|p| p.as_span().start())
-        .collect();
-    let mut edits: Vec<(usize, usize, String)> = Vec::new();
-    for p in pairs.flatten() {
-        let (start, end) = (p.as_span().start(), p.as_span().end());
-        let word = p.as_str();
-        let rule = p.as_rule();
-        let replacement = match rule {
-            Rule::call if relations.contains(&start) => None,
-            Rule::call => {
-                let name = p
-                    .clone()
-                    .into_inner()
-                    .find(|n| n.as_rule() == Rule::call_name)
-                    .map(|n| n.as_str().to_string());
-                match (name.as_deref(), positionals(&p)) {
-                    (Some("concat"), Some(args)) if args.len() >= 2 && next() % 2 == 0 => {
-                        Some(format!(
-                            "({})",
-                            args.iter()
-                                .map(|a| format!("({a})"))
-                                .collect::<Vec<_>>()
-                                .join(" || ")
-                        ))
-                    }
-                    (Some("if"), Some(args)) if args.len() == 3 && next() % 2 == 0 => {
-                        let otherwise = if args[2] == "null" && next() % 2 == 0 {
-                            String::new()
-                        } else {
-                            format!(" else ({})", args[2])
-                        };
-                        Some(format!(
-                            "(case when ({}) then ({}){otherwise} end)",
-                            args[0], args[1]
-                        ))
-                    }
-                    _ => None,
-                }
-            }
-            Rule::comp_op if word == "!=" && next() % 2 == 0 => Some("<>".to_string()),
-            Rule::string_lit if word.starts_with('"') && next() % 3 == 0 => {
-                crate::error::decode_string_literal(word).ok().map(|value| {
-                    let mut out = String::from("'");
-                    for ch in value.chars() {
-                        match ch {
-                            '\'' => out.push_str("\\'"),
-                            '\\' => out.push_str("\\\\"),
-                            '\n' => out.push_str("\\n"),
-                            other => out.push(other),
-                        }
-                    }
-                    out.push('\'');
-                    out
-                })
-            }
-            _ => {
-                let keyword = matches!(
-                    rule,
-                    Rule::agg_name
-                        | Rule::order_dir
-                        | Rule::bool_lit
-                        | Rule::stmt_keyword
-                        | Rule::load_kind
-                        | Rule::load_mode_name
-                ) || format!("{rule:?}").starts_with("kw_")
-                    || (rule == Rule::call_name && crate::query::check::is_registry_name(word));
-                (keyword && next() % 4 == 0).then(|| {
-                    if next() % 2 == 0 {
-                        word.to_ascii_uppercase()
-                    } else {
-                        let mut w = word.to_string();
-                        w[..1].make_ascii_uppercase();
-                        w
-                    }
-                })
-            }
-        };
-        if let Some(r) = replacement
-            && edits.last().is_none_or(|(_, e, _)| *e <= start)
-        {
-            edits.push((start, end, r));
-        }
-    }
-    let mut out = text.to_string();
-    for (start, end, r) in edits.into_iter().rev() {
-        out.replace_range(start..end, &r);
-    }
-    out
-}
-
 /// One round trip: `Ok` when the reparse of the printed text and of its
 /// respelling are the tree and printing the reparse gives the text back,
 /// `Err` with the text otherwise.
@@ -969,7 +833,10 @@ pub(crate) fn round_trip(file: &SourceFile, seed: u64) -> Result<(), String> {
     if again != text {
         return Err(format!("printing is not a fixed point\n{text}\n{again}"));
     }
-    let respelled = respell(&respell_spellings(&text, seed), seed);
+    let respelled = respell(
+        &crate::arbitrary::respell_spellings(&text, seed, &crate::arbitrary::Spelling::ALL).0,
+        seed,
+    );
     match parse_source(&respelled) {
         Ok(other) if other == *file => Ok(()),
         Ok(other) => Err(format!(
@@ -1236,7 +1103,15 @@ fn every_grammar_rule_the_generator_is_meant_to_cover_is_produced() {
             .current();
         for text in [
             print_file(&f),
-            respell(&respell_spellings(&print_file(&f), seed), seed),
+            respell(
+                &crate::arbitrary::respell_spellings(
+                    &print_file(&f),
+                    seed,
+                    &crate::arbitrary::Spelling::ALL,
+                )
+                .0,
+                seed,
+            ),
         ] {
             let pairs = QueryParser::parse(Rule::query_file, &text)
                 .unwrap_or_else(|e| panic!("the grammar refuses a generated text: {e}\n{text}"));
