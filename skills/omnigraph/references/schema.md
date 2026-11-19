@@ -141,7 +141,10 @@ commit (merging a branch releases nothing), then run `cleanup` with a
 retention that excludes the commits before the optimize, for example
 `--keep 1 --confirm`. No flag makes a drop destructive at apply. Re-adding a
 dropped name starts a new property, so historical reads never see the old
-values through it. The HTTP server has no `POST /graphs/{id}/schema/apply`
+values through it. A read at an earlier commit (`--snapshot <id>`) sees the
+schema accepted there under current names: a property renamed since reads,
+`return { $p }` holds only the properties that commit has, and naming one it
+lacks (added since, or dropped and re-added) is `T6` naming the commit. The HTTP server has no `POST /graphs/{id}/schema/apply`
 route; evolve a served graph through `cluster plan` and `cluster apply`.
 
 ### Apply is main-only

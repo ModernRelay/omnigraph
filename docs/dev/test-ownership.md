@@ -537,8 +537,9 @@ locator codecs and legacy read arms are owned by the `legacy_` tests of
 the predecessor unnoticed only because the genuine journey is required; change
 both together. Keep ordinary-open refusal for all pre-v14 stamps.
 `schema_apply.rs`, `system_column_upgrade.rs` and historical-read owners cover
-atomic contract publication, first-touch retry and current-contract historical
-reads. The catalog tests own row uniqueness, projection and validation;
+atomic contract publication, first-touch retry and historical reads under
+the schema accepted at their commit (`point_in_time.rs`, beside the GQT cases
+that apply a schema between commits). The catalog tests own row uniqueness, projection and validation;
 `lance_surface_guards.rs` owns the filtered packed-record scan. See the
 [support matrix](versioning.md#storage-upgrade-support-matrix).
 

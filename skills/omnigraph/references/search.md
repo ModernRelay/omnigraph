@@ -267,8 +267,9 @@ tokenizer) and keep tokens of any length. `"run"` matches
 `"Runners were RUNNING"` under `english_v1` only; `"cafe"` matches `"Café"`
 under `standard_folded_v1` and `english_v1`. `english_v1`'s stop list holds
 NLTK's 198 English stop words and each one's stem, so `only` and `very` match
-nothing and `"human beings"` analyzes to `human`; a query of only stop words is
-`T20` when the read runs. `scorer = "none"` keeps the field matchable and
+nothing and `"human beings"` analyzes to `human`; a query of only stop words
+matches nothing (`match_terms` false, `bm25` no row), never an error. Only an
+empty or punctuation-only literal is `T20`. `scorer = "none"` keeps the field matchable and
 makes `bm25` over it `T87`, also as an `rrf` arm;
 use a `where` filter there. No call takes an analyzer (`terms(…)` with one is
 `T71`).
