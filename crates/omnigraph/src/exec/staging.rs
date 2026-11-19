@@ -646,7 +646,8 @@ impl MutationStaging {
                 }
             }
         }
-        let concurrency = concurrency.min(stage_inputs.len()).max(1);
+        let requested_concurrency = concurrency;
+        let write_concurrency = requested_concurrency.min(stage_inputs.len()).max(1);
         let mut staged_entries: Vec<StagedTableEntry> =
             futures::stream::iter(stage_inputs.into_iter().enumerate().map(
                 |(stage_idx, (table_key, table, path, expected))| async move {
@@ -668,7 +669,7 @@ impl MutationStaging {
                     .await
                 },
             ))
-            .buffered(concurrency)
+            .buffered(write_concurrency)
             .collect::<Vec<Result<Option<StagedTableEntry>>>>()
             .await
             .into_iter()
@@ -712,7 +713,7 @@ impl MutationStaging {
         }
 
         if !delete_inputs.is_empty() {
-            let delete_concurrency = concurrency.min(delete_inputs.len()).max(1);
+            let delete_concurrency = requested_concurrency.min(delete_inputs.len()).max(1);
             let staged_deletes: Vec<StagedTableEntry> =
                 futures::stream::iter(delete_inputs.into_iter().map(
                     |(table_key, combined, path, expected, removed_ids, row_addrs)| async move {
