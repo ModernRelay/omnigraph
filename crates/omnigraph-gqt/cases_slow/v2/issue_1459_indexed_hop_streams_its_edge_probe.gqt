@@ -5,9 +5,12 @@
 # notes: endpoint columns, Lance answers each `key IN (...)` probe with one batch per
 # notes: contiguous row range; uniform random endpoints scatter the matches, so a probe
 # notes: held whole kept many decode buffers alive and the pool charged each by capacity.
-# notes: The pool setting is specific to this shape: the pool size also sets the scan
-# notes: batch size, so main is refused here at 32 and 48 MiB but answers at 16, 64 and
-# notes: 128 MiB. Rust twin, which main fails even at 128 MiB:
+# notes: Main needs about 1.5 times this pool. With the same 1 MiB scan batches, main is
+# notes: refused at every pool from 32 to 48 MiB and answers from 52 MiB up. A refusal
+# notes: names only the first reservation over the limit, so `actual` is under 1% over at
+# notes: each of those pools and changes between runs. It does not show the margin. At
+# notes: 16 MiB the scan batches are smaller and main answers, so the 32 MiB setting is
+# notes: specific to this shape. Rust twin, which main fails even at 128 MiB:
 # notes: engine_v2_memory::hub_traversal_fits_one_pool_before_and_after_indexing_issue_1459.
 
 --- runner
