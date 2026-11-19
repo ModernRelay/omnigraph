@@ -6003,13 +6003,12 @@ node Embedding {
         "pending-only vector status must remain visible"
     );
     assert!(
-        embedding.pending_indexes.iter().any(|index| {
-            index.property == "name"
-                && index
-                    .reason
-                    .contains("omnigraph index rebuild --kind full-text")
-        }),
-        "the deferred FTS tail must name its explicit rebuild remedy"
+        embedding
+            .pending_indexes
+            .iter()
+            .all(|index| index.property != "name"
+                && !index.reason.contains("index rebuild --kind full-text")),
+        "a full-text tail no read uses is not pending and never names the one-way rebuild"
     );
 }
 

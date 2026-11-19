@@ -152,9 +152,7 @@ pub(crate) fn write_full_text_rebuild(
     let warnings = if result.rebuilt_indexes.is_empty() {
         Vec::new()
     } else {
-        vec![
-            "Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced.",
-        ]
+        FULL_TEXT_REBUILD_WARNINGS.to_vec()
     };
     if json {
         write_json(

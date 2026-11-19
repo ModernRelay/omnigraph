@@ -1102,7 +1102,8 @@ fn optimize_json_succeeds_on_local_graph() {
     assert_eq!(
         rebuilt["warnings"],
         serde_json::json!([
-            "Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced."
+            "Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced.",
+            "Binaries before this release refuse full-text reads on this graph from now on; that binary's own `omnigraph index rebuild --kind full-text` restores them."
         ])
     );
     assert_eq!(
@@ -1135,6 +1136,10 @@ fn optimize_json_succeeds_on_local_graph() {
     let stderr = String::from_utf8(human_output.stderr).unwrap();
     assert!(
         stderr.contains("warning: Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced."),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("warning: Binaries before this release refuse full-text reads on this graph from now on; that binary's own `omnigraph index rebuild --kind full-text` restores them."),
         "{stderr}"
     );
     assert!(
@@ -1286,16 +1291,13 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
             {"type_key": "node:Tag", "property": "slug", "kind": "btree", "action": "built"},
         ])
     );
-    let pending = built["pending_indexes"].as_array().unwrap();
-    assert_eq!(pending.len(), 1, "{built}");
-    assert_eq!(pending[0]["type_key"], "node:Person");
-    assert_eq!(pending[0]["property"], "name");
-    let reason = pending[0]["reason"].as_str().unwrap();
+    // `Person.name`'s full-text index lags the branch's rows, but no read
+    // uses it, so it is not pending and the one-way full-text rebuild is not
+    // recommended.
+    assert_eq!(built["pending_indexes"], serde_json::json!([]), "{built}");
     assert!(
-        reason.contains(
-            "omnigraph index rebuild --kind full-text --target <target> --branch feature"
-        ),
-        "{reason}"
+        !built.to_string().contains("rebuild --kind full-text"),
+        "{built}"
     );
     let commit_id = built["graph_commit_id"].as_str().unwrap();
     let commit = parse_stdout_json(&output_success(
@@ -1323,10 +1325,7 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
         human.contains("branch feature, 0 indexes built or refreshed"),
         "{human}"
     );
-    assert!(
-        human.contains("index pending on node type 'Person', property 'name'"),
-        "{human}"
-    );
+    assert!(!human.contains("index pending"), "{human}");
     assert!(
         human.contains("no-op; no graph commit published"),
         "{human}"

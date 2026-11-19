@@ -1503,18 +1503,15 @@ node Doc {
         IndexCoverage::Indexed,
         "rank BTREE must cover all fragments after optimize"
     );
+    // No read uses a full-text index, so its partial coverage is no pending
+    // work, and optimize never names the full-text rebuild, which binaries
+    // before this release cannot read back.
     let deferred = &stats
         .iter()
         .find(|stat| stat.type_key == "node:Doc")
         .unwrap()
         .pending_indexes;
-    assert_eq!(deferred.len(), 1);
-    assert_eq!(deferred[0].property, "slug");
-    assert!(
-        deferred[0]
-            .reason
-            .contains("omnigraph index rebuild --kind full-text")
-    );
+    assert!(deferred.is_empty(), "{deferred:?}");
     let commits_before = db.list_commits(None).await.unwrap().len();
     for _ in 0..2 {
         let repeated = db
@@ -1527,8 +1524,7 @@ node Doc {
             .find(|stat| stat.type_key == "node:Doc")
             .unwrap();
         assert!(!doc.committed(), "deferred FTS alone is not optimize work");
-        assert_eq!(doc.pending_indexes.len(), 1);
-        assert_eq!(doc.pending_indexes[0].property, "slug");
+        assert!(doc.pending_indexes.is_empty());
         assert_same_dataset_entry(
             snap.dataset("node:Doc").unwrap(),
             snapshot_main(&db)
@@ -3015,9 +3011,9 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
 /// An index build on a branch builds the declared indexes a type whose first
 /// rows landed there lacks, rebuilds each BTREE and NGRAM whose coverage lags
 /// the branch's new rows in its own family, and publishes both in one commit
-/// on that branch, attributed to its actor. Full-text coverage is pending with the rebuild that refreshes
-/// it; main keeps its registrations and history; a second run publishes
-/// nothing.
+/// on that branch, attributed to its actor. Full-text coverage no read uses
+/// is not pending; main keeps its registrations and history; a second run
+/// publishes nothing.
 #[tokio::test]
 async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() {
     use omnigraph::db::{BuiltIndex, BuiltIndexAction, BuiltIndexKind};
@@ -3144,16 +3140,10 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
             ),
         ]
     );
-    assert_eq!(result.pending.len(), 1, "{:?}", result.pending);
-    assert_eq!(result.pending[0].type_key, "node:Person");
-    assert_eq!(result.pending[0].property, "name");
-    assert!(
-        result.pending[0]
-            .reason
-            .contains(&omnigraph::error::FULL_TEXT_REBUILD_COMMAND.replace("<branch>", "feature")),
-        "{}",
-        result.pending[0].reason
-    );
+    // The partially covered full-text index no read uses is not pending: the
+    // build never recommends the full-text rebuild, which binaries before
+    // this release cannot read back.
+    assert!(result.pending.is_empty(), "{:?}", result.pending);
 
     let feature_after = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
     let tag = feature_after.open_dataset("node:Tag").await.unwrap();

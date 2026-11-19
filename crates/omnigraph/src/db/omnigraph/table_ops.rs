@@ -821,6 +821,9 @@ pub(super) async fn append_deferred_full_text_indexes(
         .collect();
     let remedy = crate::error::FULL_TEXT_REBUILD_COMMAND.replace("<branch>", branch);
     for (name, index) in full_text {
+        if !full_text_index_serves_reads(index) {
+            continue;
+        }
         let coverage_unknown = indices
             .iter()
             .any(|segment| segment.name == name && segment.fragment_bitmap.is_none());
@@ -849,6 +852,16 @@ pub(super) async fn append_deferred_full_text_indexes(
         }
     }
     Ok(())
+}
+
+/// Whether a read uses the full-text index `index`. None does: the exact
+/// lexical scan answers every lexical call until a read is admitted to a
+/// certified index (lance-fences.md, full-text compatibility). An index no
+/// read uses is no pending work, so maintenance never recommends the
+/// full-text rebuild for it, a step binaries before this release cannot
+/// read back.
+fn full_text_index_serves_reads(_index: &lance_table::format::IndexMetadata) -> bool {
+    false
 }
 
 /// The columns of `table_key` that carry a declared full-text index: every
