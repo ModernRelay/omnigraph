@@ -1,0 +1,456 @@
+# issue: none
+# traversal: auto
+# notes: Lance indexes columns, not expressions (the GQ 3 RFC, section 2), and no registry
+# notes: call is pushed into a Lance scan, so a predicate over a function of a column takes the
+# notes: scan while the same predicate over the bare column probes the column's index:
+# notes: `lower($x.slug) = $q` scans and `$x.slug = $q` probes the key; `abs($x.n) < 3` scans
+# notes: and `$x.n < 3` probes the BTREE; `abs($x.f) = 0.0` scans and `$x.f = 0.0` probes the
+# notes: BTREE; `contains(lower($x.name), $q)` scans, since Lance's text query parser accepts
+# notes: only a bare column, and `contains($x.name, $q)` probes the NGRAM. The equality twin is
+# notes: on the key: an equality on a plain `@index` String takes the scan under Lance 13,
+# notes: whose NGRAM parser takes the column before its BTREE (`name_equality`). Every step's
+# notes: rows equal the reference interpreter's, and the three pairs' rows an unindexed twin's,
+# notes: over an empty string, a whitespace-only string, non-ASCII letters, nulls and a
+# notes: negative zero, which equals zero under a comparison, through the index too.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item {
+    slug: String @key
+    name: String? @index
+    n: I64? @index
+    f: F64? @index
+}
+node PlainItem {
+    slug: String @key
+    name: String?
+    n: I64?
+    f: F64?
+}
+
+--- seed
+{"type":"Item","data":{"slug":"Alpha","name":"Alpha Beta","n":2,"f":2.5}}
+{"type":"Item","data":{"slug":"alpha","name":"alphabet","n":-2,"f":-2.5}}
+{"type":"Item","data":{"slug":"ÄLPHA","name":"ÄLPHA soup","n":5,"f":-0.0}}
+{"type":"Item","data":{"slug":"","name":"","n":-5,"f":0.0}}
+{"type":"Item","data":{"slug":"   ","name":"   ","n":0,"f":3.0}}
+{"type":"Item","data":{"slug":"straße","name":"Straße ALPHA","n":3,"f":-3.0}}
+{"type":"Item","data":{"slug":"none"}}
+{"type":"PlainItem","data":{"slug":"Alpha","name":"Alpha Beta","n":2,"f":2.5}}
+{"type":"PlainItem","data":{"slug":"alpha","name":"alphabet","n":-2,"f":-2.5}}
+{"type":"PlainItem","data":{"slug":"ÄLPHA","name":"ÄLPHA soup","n":5,"f":-0.0}}
+{"type":"PlainItem","data":{"slug":"","name":"","n":-5,"f":0.0}}
+{"type":"PlainItem","data":{"slug":"   ","name":"   ","n":0,"f":3.0}}
+{"type":"PlainItem","data":{"slug":"straße","name":"Straße ALPHA","n":3,"f":-3.0}}
+{"type":"PlainItem","data":{"slug":"none"}}
+
+--- query
+query lower_key_equality($q: String) {
+    match { $x: Item } where lower($x.slug) = $q
+    return { $x.slug }
+}
+
+--- params
+{"q": "alpha"}
+
+--- expect unordered
+{"x.slug":"Alpha"}
+{"x.slug":"alpha"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access sequential
+filter reads [x.slug]
+
+--- query
+query lower_key_equality_unindexed($q: String) {
+    match { $x: PlainItem } where lower($x.slug) = $q
+    return { $x.slug }
+}
+
+--- params
+{"q": "alpha"}
+
+--- expect unordered
+{"x.slug":"Alpha"}
+{"x.slug":"alpha"}
+
+--- expect shape
+x.slug: String
+
+--- query
+query lower_key_equality_non_ascii($q: String) {
+    match { $x: Item } where lower($x.slug) = $q
+    return { $x.slug }
+}
+
+--- params
+{"q": "älpha"}
+
+--- expect unordered
+{"x.slug":"ÄLPHA"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access sequential
+filter reads [x.slug]
+
+--- query
+query key_equality($q: String) {
+    match { $x: Item } where $x.slug = $q
+    return { $x.slug }
+}
+
+--- params
+{"q": "alpha"}
+
+--- expect unordered
+{"x.slug":"alpha"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access index_probe __id
+pass key_to_id
+
+--- query
+query key_equality_empty($q: String) {
+    match { $x: Item } where $x.slug = $q
+    return { $x.slug }
+}
+
+--- params
+{"q": ""}
+
+--- expect unordered
+{"x.slug":""}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access index_probe __id
+
+--- query
+query trimmed_key_is_empty($q: String) {
+    match { $x: Item } where trim($x.slug) = $q
+    return { $x.slug }
+}
+
+--- params
+{"q": ""}
+
+--- expect unordered
+{"x.slug":"   "}
+{"x.slug":""}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access sequential
+filter reads [x.slug]
+
+--- query
+query trimmed_key_is_empty_unindexed($q: String) {
+    match { $x: PlainItem } where trim($x.slug) = $q
+    return { $x.slug }
+}
+
+--- params
+{"q": ""}
+
+--- expect unordered
+{"x.slug":"   "}
+{"x.slug":""}
+
+--- expect shape
+x.slug: String
+
+--- query
+query name_equality($q: String) {
+    match { $x: Item } where $x.name = $q
+    return { $x.slug }
+}
+
+--- params
+{"q": "alphabet"}
+
+--- expect unordered
+{"x.slug":"alpha"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access sequential
+
+--- query
+query abs_range() {
+    match { $x: Item } where abs($x.n) < 3
+    return { $x.slug, $x.n }
+}
+
+--- expect unordered
+{"x.n":-2,"x.slug":"alpha"}
+{"x.n":0,"x.slug":"   "}
+{"x.n":2,"x.slug":"Alpha"}
+
+--- expect shape
+x.slug: String
+x.n: I64
+
+--- expect plan
+scan Item as $x: access sequential
+filter reads [x.n]
+
+--- query
+query abs_range_unindexed() {
+    match { $x: PlainItem } where abs($x.n) < 3
+    return { $x.slug, $x.n }
+}
+
+--- expect unordered
+{"x.n":-2,"x.slug":"alpha"}
+{"x.n":0,"x.slug":"   "}
+{"x.n":2,"x.slug":"Alpha"}
+
+--- expect shape
+x.slug: String
+x.n: I64
+
+--- query
+query column_range() {
+    match { $x: Item } where $x.n < 3
+    return { $x.slug, $x.n }
+}
+
+--- expect unordered
+{"x.n":-2,"x.slug":"alpha"}
+{"x.n":-5,"x.slug":""}
+{"x.n":0,"x.slug":"   "}
+{"x.n":2,"x.slug":"Alpha"}
+
+--- expect shape
+x.slug: String
+x.n: I64
+
+--- expect plan
+scan Item as $x: access index_probe n btree
+scan Item as $x: filter reads [x.n]
+
+--- query
+query column_range_unindexed() {
+    match { $x: PlainItem } where $x.n < 3
+    return { $x.slug, $x.n }
+}
+
+--- expect unordered
+{"x.n":-2,"x.slug":"alpha"}
+{"x.n":-5,"x.slug":""}
+{"x.n":0,"x.slug":"   "}
+{"x.n":2,"x.slug":"Alpha"}
+
+--- expect shape
+x.slug: String
+x.n: I64
+
+--- query
+query float_zero_through_abs() {
+    match { $x: Item } where abs($x.f) = 0.0
+    return { $x.slug }
+}
+
+--- expect unordered
+{"x.slug":""}
+{"x.slug":"ÄLPHA"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access sequential
+filter reads [x.f]
+
+--- query
+query float_zero_on_the_column() {
+    match { $x: Item } where $x.f = 0.0
+    return { $x.slug }
+}
+
+--- expect unordered
+{"x.slug":""}
+{"x.slug":"ÄLPHA"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access index_probe f btree
+
+--- query
+query float_zero_on_the_column_unindexed() {
+    match { $x: PlainItem } where $x.f = 0.0
+    return { $x.slug }
+}
+
+--- expect unordered
+{"x.slug":""}
+{"x.slug":"ÄLPHA"}
+
+--- expect shape
+x.slug: String
+
+--- query
+query float_negative_zero_on_the_column($z: F64) {
+    match { $x: Item } where $x.f = $z
+    return { $x.slug }
+}
+
+--- params
+{"z": -0.0}
+
+--- expect unordered
+{"x.slug":""}
+{"x.slug":"ÄLPHA"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access index_probe f btree
+
+--- query
+query float_range_around_zero() {
+    match { $x: Item } where $x.f >= 0.0 and $x.f <= 0.0
+    return { $x.slug }
+}
+
+--- expect unordered
+{"x.slug":""}
+{"x.slug":"ÄLPHA"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access index_probe f btree
+
+--- query
+query contains_over_lower($q: String) {
+    match { $x: Item } where contains(lower($x.name), $q)
+    return { $x.slug }
+}
+
+--- params
+{"q": "alpha"}
+
+--- expect unordered
+{"x.slug":"Alpha"}
+{"x.slug":"alpha"}
+{"x.slug":"straße"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access sequential
+filter reads [x.name]
+
+--- query
+query contains_over_lower_unindexed($q: String) {
+    match { $x: PlainItem } where contains(lower($x.name), $q)
+    return { $x.slug }
+}
+
+--- params
+{"q": "alpha"}
+
+--- expect unordered
+{"x.slug":"Alpha"}
+{"x.slug":"alpha"}
+{"x.slug":"straße"}
+
+--- expect shape
+x.slug: String
+
+--- query
+query contains_over_lower_non_ascii($q: String) {
+    match { $x: Item } where contains(lower($x.name), $q)
+    return { $x.slug }
+}
+
+--- params
+{"q": "straße"}
+
+--- expect unordered
+{"x.slug":"straße"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access sequential
+filter reads [x.name]
+
+--- query
+query contains_over_the_column($q: String) {
+    match { $x: Item } where contains($x.name, $q)
+    return { $x.slug }
+}
+
+--- params
+{"q": "alpha"}
+
+--- expect unordered
+{"x.slug":"alpha"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access index_probe name ngram
+scan Item as $x: filter reads [x.name]
+
+--- query
+query contains_over_the_column_unindexed($q: String) {
+    match { $x: PlainItem } where contains($x.name, $q)
+    return { $x.slug }
+}
+
+--- params
+{"q": "alpha"}
+
+--- expect unordered
+{"x.slug":"alpha"}
+
+--- expect shape
+x.slug: String
+
+--- query
+query contains_over_upper_column($q: String) {
+    match { $x: Item } where contains($x.name, $q)
+    return { $x.slug }
+}
+
+--- params
+{"q": "ALPHA"}
+
+--- expect unordered
+{"x.slug":"straße"}
+
+--- expect shape
+x.slug: String
+
+--- expect plan
+scan Item as $x: access index_probe name ngram

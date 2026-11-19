@@ -1,0 +1,331 @@
+# issue: none
+# notes: The non-canonical spellings the GQ 3 RFC admits (section 3, "Added: arithmetic")
+# notes: each lower to their canonical form's term, so each step here is written both ways
+# notes: and the two answer the same rows with the same shape: `case when … end` is a nested
+# notes: `if` (a missing `else` is `null`), `case x when v then …` compares `x = v`, so a null
+# notes: `x` takes the `else`; `a || b || c` is one `concat`; `<>` is `!=`, so a null operand
+# notes: keeps the row out; a single-quoted string is the double-quoted one, a backslash
+# notes: escaping its quote and a double quote standing as itself; keywords and registry names
+# notes: are read in any letter case, in a read and in a write. `case`, `when`, `then`,
+# notes: `else` and `end` are contextual: as a property, a binding or an alias they are names.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node P {
+    slug: String @key
+    name: String?
+    age: I32?
+    case: String?
+}
+
+--- seed
+{"type":"P","data":{"slug":"ada","name":"Ada","age":70,"case":"open"}}
+{"type":"P","data":{"slug":"bob","name":"Bob","age":30,"case":"closed"}}
+{"type":"P","data":{"slug":"cy","name":"Cy","age":12}}
+{"type":"P","data":{"slug":"di","age":45}}
+{"type":"P","data":{"slug":"eve","name":"it's \"Eve\""}}
+
+--- query
+query searched_case() {
+    match { $p: P }
+    return { $p.slug, case when $p.age >= 65 then "senior" when $p.age >= 18 then "adult" else "minor" end as band }
+}
+
+--- expect unordered
+{"band":"adult","p.slug":"bob"}
+{"band":"adult","p.slug":"di"}
+{"band":"minor","p.slug":"cy"}
+{"band":"minor","p.slug":"eve"}
+{"band":"senior","p.slug":"ada"}
+
+--- expect shape
+p.slug: String
+band: String
+
+--- query
+query searched_case_canonical() {
+    match { $p: P }
+    return { $p.slug, if($p.age >= 65, "senior", if($p.age >= 18, "adult", "minor")) as band }
+}
+
+--- expect unordered
+{"band":"adult","p.slug":"bob"}
+{"band":"adult","p.slug":"di"}
+{"band":"minor","p.slug":"cy"}
+{"band":"minor","p.slug":"eve"}
+{"band":"senior","p.slug":"ada"}
+
+--- expect shape
+p.slug: String
+band: String
+
+--- query
+query case_without_else() {
+    match { $p: P }
+    return { $p.slug, case when $p.age > 40 then "older" end as band }
+}
+
+--- expect unordered
+{"band":"older","p.slug":"ada"}
+{"band":"older","p.slug":"di"}
+{"p.slug":"bob"}
+{"p.slug":"cy"}
+{"p.slug":"eve"}
+
+--- expect shape
+p.slug: String
+band: String?
+
+--- query
+query case_without_else_canonical() {
+    match { $p: P }
+    return { $p.slug, if($p.age > 40, "older", null) as band }
+}
+
+--- expect unordered
+{"band":"older","p.slug":"ada"}
+{"band":"older","p.slug":"di"}
+{"p.slug":"bob"}
+{"p.slug":"cy"}
+{"p.slug":"eve"}
+
+--- expect shape
+p.slug: String
+band: String?
+
+--- query
+query simple_case() {
+    match { $p: P }
+    return { $p.slug, case $p.name when "Ada" then 1 when "Bob" then 2 else 0 end as rank }
+}
+
+--- expect unordered
+{"p.slug":"ada","rank":1}
+{"p.slug":"bob","rank":2}
+{"p.slug":"cy","rank":0}
+{"p.slug":"di","rank":0}
+{"p.slug":"eve","rank":0}
+
+--- expect shape
+p.slug: String
+rank: I64
+
+--- query
+query simple_case_canonical() {
+    match { $p: P }
+    return { $p.slug, if($p.name = "Ada", 1, if($p.name = "Bob", 2, 0)) as rank }
+}
+
+--- expect unordered
+{"p.slug":"ada","rank":1}
+{"p.slug":"bob","rank":2}
+{"p.slug":"cy","rank":0}
+{"p.slug":"di","rank":0}
+{"p.slug":"eve","rank":0}
+
+--- expect shape
+p.slug: String
+rank: I64
+
+--- query
+query bars_run() {
+    match { $p: P }
+    return { $p.slug, $p.slug || ":" || $p.name || "!" as label }
+}
+
+--- expect unordered
+{"label":"ada:Ada!","p.slug":"ada"}
+{"label":"bob:Bob!","p.slug":"bob"}
+{"label":"cy:Cy!","p.slug":"cy"}
+{"label":"eve:it's \"Eve\"!","p.slug":"eve"}
+{"p.slug":"di"}
+
+--- expect shape
+p.slug: String
+label: String?
+
+--- query
+query bars_run_canonical() {
+    match { $p: P }
+    return { $p.slug, concat($p.slug, ":", $p.name, "!") as label }
+}
+
+--- expect unordered
+{"label":"ada:Ada!","p.slug":"ada"}
+{"label":"bob:Bob!","p.slug":"bob"}
+{"label":"cy:Cy!","p.slug":"cy"}
+{"label":"eve:it's \"Eve\"!","p.slug":"eve"}
+{"p.slug":"di"}
+
+--- expect shape
+p.slug: String
+label: String?
+
+--- query
+query angle_not_equal() {
+    match { $p: P } where $p.age <> 30
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug":"ada"}
+{"p.slug":"cy"}
+{"p.slug":"di"}
+
+--- expect shape
+p.slug: String
+
+--- query
+query angle_not_equal_canonical() {
+    match { $p: P } where $p.age != 30
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug":"ada"}
+{"p.slug":"cy"}
+{"p.slug":"di"}
+
+--- expect shape
+p.slug: String
+
+--- query
+query single_quotes() {
+    match { $p: P } where $p.name = 'it\'s "Eve"' or $p.name = 'Ada'
+    return { $p.slug, 'say "hi"' as said }
+}
+
+--- expect unordered
+{"p.slug":"ada","said":"say \"hi\""}
+{"p.slug":"eve","said":"say \"hi\""}
+
+--- expect shape
+p.slug: String
+said: String
+
+--- query
+query single_quotes_canonical() {
+    match { $p: P } where $p.name = "it's \"Eve\"" or $p.name = "Ada"
+    return { $p.slug, "say \"hi\"" as said }
+}
+
+--- expect unordered
+{"p.slug":"ada","said":"say \"hi\""}
+{"p.slug":"eve","said":"say \"hi\""}
+
+--- expect shape
+p.slug: String
+said: String
+
+--- query
+QUERY shouted_keywords() {
+    MATCH { $p: P } WHERE $p.age IS NOT NULL AND NOT $p.age < 18 Or $p.name = "Cy"
+    RETURN DISTINCT { LOWER($p.slug) AS s, COALESCE($p.name, 'none') AS n, Upper($p.case) AS c }
+    ORDER { s DESC }
+    LIMIT 3
+}
+
+--- expect ordered
+{"n":"none","s":"di"}
+{"n":"Cy","s":"cy"}
+{"c":"CLOSED","n":"Bob","s":"bob"}
+
+--- expect shape
+s: String
+n: String
+c: String?
+
+--- query
+query shouted_keywords_canonical() {
+    match { $p: P } where $p.age is not null and not $p.age < 18 or $p.name = "Cy"
+    return distinct { lower($p.slug) as s, coalesce($p.name, "none") as n, upper($p.case) as c }
+    order { s desc }
+    limit 3
+}
+
+--- expect ordered
+{"n":"none","s":"di"}
+{"n":"Cy","s":"cy"}
+{"c":"CLOSED","n":"Bob","s":"bob"}
+
+--- expect shape
+s: String
+n: String
+c: String?
+
+--- query
+query shouted_count() {
+    MATCH { $p: P } WHERE $p.name IS NULL OR $p.age = 70 OR TRUE = False
+    RETURN { COUNT($p) AS n, MAX(IF($p.age > 60, NULL, $p.age)) AS m }
+}
+
+--- expect unordered
+{"m":45,"n":2}
+
+--- expect shape
+n: I64
+m: I32
+
+--- query
+query shouted_count_canonical() {
+    match { $p: P } where $p.name is null or $p.age = 70 or true = false
+    return { count($p) as n, max(if($p.age > 60, null, $p.age)) as m }
+}
+
+--- expect unordered
+{"m":45,"n":2}
+
+--- expect shape
+n: I64
+m: I32
+
+--- query
+query contextual_words_are_names() {
+    match { $case: P } where $case.case is not null
+    return { $case.slug as end, $case.case as when, case when $case.case = "open" then 'yes' else 'no' end as then }
+}
+
+--- expect unordered
+{"end":"ada","then":"yes","when":"open"}
+{"end":"bob","then":"no","when":"closed"}
+
+--- expect shape
+end: String
+when: String
+then: String
+
+--- mutate
+QUERY add() {
+    INSERT P { slug: 'zed', name: 'Zed', age: 21, case: 'new' }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+Query rename() {
+    Match { $p: P } Where $p.slug = 'zed' And $p.age <> 99
+    Update $p Set { name: Upper($p.name) || '!', age: CASE WHEN $p.age > 20 THEN $p.age + 1 ELSE 0 END }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query after_writes() {
+    match { $p: P } where $p.slug = "zed"
+    return { $p.name, $p.age, $p.case }
+}
+
+--- expect unordered
+{"p.age":22,"p.case":"new","p.name":"ZED!"}
+
+--- expect shape
+p.name: String
+p.age: I32
+p.case: String
