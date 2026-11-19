@@ -72,7 +72,6 @@ bare_node_projection_search_scan.gqt	2	requests	cost.exact-lexical-scan	The exac
 bm25_distinct_scores_rank_descending.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 bm25_ties_after_traversal.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 expression_type_errors.gqt	8	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
-expression_type_errors.gqt	13	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
 filtered_nearest_no_match_is_empty.gqt	1	requests	open:concurrent-index-searches-reread-a-page	An index search of this filter rereads a page that its concurrent sub-searches both missed in Lance's cache; edition 2 read no such index for this text.
 issue_566_order_key_binds_to_return_item.gqt	6	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
 issue_640_search_score_projection.gqt	5	requests	open:index-probe-where-edition-2-scanned	The read probes a scalar index the edition-2 plan did not read, whose two requests exceed what edition 2's scan read on this one-fragment table.

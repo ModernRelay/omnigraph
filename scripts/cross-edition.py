@@ -103,6 +103,16 @@ OPEN = {
     "open:block-binding-scans-its-type": "The respelled block binds its inner node (`$k: Person`), which lowers to a dependent scan of that type reading its data file again, where edition 2's text bound no node there.",
 }
 
+# A failed step's label is its kind followed by a prefix of its text, cut at
+# a fixed length, and the respelling changes the text (edition 2's keyed
+# `insert` is `replace`), so two failures are the same when their messages
+# are equal and their steps are of one kind.
+def same_failure(old: tuple[str, str] | None, new: tuple[str, str] | None) -> bool:
+    if not old or not new:
+        return False
+    return old[1] == new[1] and old[0].split(":", 1)[0] == new[0].split(":", 1)[0]
+
+
 DIAGNOSTIC_CODE = re.compile(r"\b([QTPL]\d{1,3})\b")
 
 
@@ -599,7 +609,7 @@ def run(args: argparse.Namespace) -> int:
                     "its requests are not compared"
                 )
                 continue
-            if old.status == new.status == "failed" and old.failure and old.failure == new.failure:
+            if old.status == new.status == "failed" and same_failure(old.failure, new.failure):
                 shared_failures.append(
                     f"{case}: both editions fail step {old.failure[0]} under simulation with "
                     f"`{short(old.failure[1], 200)}`; the steps after it are not compared"
