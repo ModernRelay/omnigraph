@@ -52,8 +52,9 @@ omnigraph queries list --target prod --graph dev --json # a server's GET /graphs
   `OMNIGRAPH_STRICT_STORED_QUERIES=1` instead quarantines the graph
   (`invalid_stored_queries`); startup is fatal when no healthy graph remains
   or `--require-all-graphs` is set. To upgrade across GQ 3: validate with the
-  new binary, rewrite the failing sources from their fixes, and apply the
-  rewritten registry in the same step as the binary switch.
+  new binary, rewrite the failing sources from their fixes (`omnigraph lint
+  --fix --config <dir>` applies them), and apply the rewritten registry in the
+  same step as the binary switch.
 - Both commands take a local cluster root `--target LOCAL_PATH`; `--graph` narrows the
   operation to one declared graph. `queries list` also takes a server or managed target,
   where `--graph` or the target's `default_graph` selects the graph and `--json`

@@ -40,9 +40,13 @@ Lint returns:
 - `"status": "ok"` — all queries passed
 - `"errors": N` — count of type errors (exit 1 when nonzero)
 - `"warnings": N` — count of `L201` warnings (a nullable property that no update query sets)
-- `"infos": N` — the canonical forms, each finding with its `fix`: `L203` (`count { } > 0` → `exists`), `L206` (nested `union` → flat), `L207` (`<e>` ends and alternation members in name order), `L208` (drop `asc`), `L209` (drop an alias equal to its column), `L210` (options in registry order, defaults dropped), `L211` (`bm25` over `terms(q, mode: any)` → the String); `L204`/`L205` (`count { } >= 1` / `= 0`: same rows as `exists` / `not exists`, your choice). Write the canonical form
+- `"infos": N` — the canonical forms, each finding with its `fix`: `L203` (`count { } > 0` → `exists`), `L206` (nested `union` → flat), `L207` (`<e>` ends and alternation members in name order), `L208` (drop `asc`), `L209` (drop an alias equal to its column), `L210` (options in registry order, defaults dropped), `L211` (`bm25` over `terms(q, mode: any)` → the String), `L212` (`case … end` → nested `if`), `L213` (`a || b` → `concat(a, b)`), `L214` (`<>` → `!=`), `L215` (`'x'` → `"x"`), `L216` (`WHERE`, `LOWER(…)` → lower case); `L204`/`L205` (`count { } >= 1` / `= 0`: same rows as `exists` / `not exists`, your choice). Write the canonical form
 
 Run lint after every `.gq` or `.pg` edit. Wire into precommit.
+`omnigraph lint --fix --query queries/ --schema schema.pg` writes the printed
+fixes and canonical forms into the files (`--dry-run` to preview, `--config
+<dir>` for a cluster's stored queries); it leaves a refusal with no fix, and
+a `needs_review` fix unless `--review-fixes` is given.
 
 ## Parameterization
 
@@ -91,14 +95,15 @@ nothing. Such a product is refused (`T81`, at the second component) unless
 every component but one is a single node binding whose `@key`, or `@id`, a
 top-level `where` conjunct equates with a literal or parameter, as in a write that links two
 nodes (`match { $p: Person, $c: Company } where $p.handle = $h and $c.slug = $s`).
-Otherwise join the components with a triple, which the diagnostic inserts
-when exactly one edge type connects them, or write the intended product as a
-named relation: `let $cs = { match { $c: Company } return { $c } }, from $cs`.
+Otherwise join the components with a triple, which the fix names when
+exactly one edge type connects them, or write the intended product as a
+named relation: `let $cs = { match { $c: Company } return { $c } }, from $cs`
+(the suggestion writes this one, for review).
 
 `let $v = expr` names a value for `where`, `return`, `order` and later
-elements; a value that can fail (arithmetic) runs on every row before
-`where`, as does a `from` or an `optional` over one, so it fails (`E1`,
-`E2`) on rows `where` removes: guard it with
+elements; a value that can fail (arithmetic, a function such as `sqrt` or
+`cast`) runs on every row before `where`, as does a `from` or an `optional`
+over one, so it fails (`E1`, `E2`, `E3`, `E5`, `E6`) on rows `where` removes: guard it with
 `if(cond, value, 0)` or write it in `return`, which runs after `where`.
 Arithmetic (`+ - * / %`, unary `-`), `if` and `coalesce` widen two numeric
 types to their common one: the wider integer, `I64` for `U32` with a signed
@@ -134,6 +139,11 @@ query recent_signals() {
     limit 50
 }
 ```
+
+An order key's nulls come first ascending and last descending; write
+`nulls first` or `nulls last` after the key to place them
+(`order { $s.score desc nulls first }`). Only that key's nulls move: rows
+whose key is null fall to the later keys.
 
 ### Edge traversal (lowerCamelCase)
 
@@ -400,7 +410,14 @@ query friend_counts() {
 }
 ```
 
-Supported: `count`, `sum`, `avg`, `min`, `max`, `collect`. Grouping is implicit on non-aggregated return fields.
+Supported: `count`, `sum`, `avg`, `min`, `max`, `collect`, `stddev`, `percentile`. Grouping is implicit on non-aggregated return fields.
+`stddev($x.n)` is the sample standard deviation (null below two values) and
+`percentile($x.n, 0.5)` the exact percentile with linear interpolation (null
+over none), both a nullable `F64` over numeric values held in
+`query_memory_bytes`; `p` is a literal from 0 to 1 (`T8` outside) or a
+numeric parameter (`E5` when bound outside or to null), and neither takes
+`distinct` (`T57`). Both work as block values too:
+`percentile($s.amount, 0.5) { $s: Sale, $h sells $s } as median`.
 `count(distinct $f)` counts distinct nodes (distinct edges over an edge
 binding `$k`) and `count(distinct $f.city)`
 distinct non-null values; `distinct` under another aggregate but `collect` is refused
@@ -451,6 +468,22 @@ index, and an index never changes their rows: a String `@index` (not a `@key` al
 `contains` to candidates checked exactly (a needle under three characters, or with no run of
 three letters or digits, reads every row) and a BTREE for `starts_with`; a list `@index` builds a
 LABEL_LIST for `"x" in $p.tags`.
+
+Scalar functions, null when an argument is null (`if` and `coalesce` aside):
+`if(c, a, b)`, `coalesce(a, …)`, `concat(a, …)`; strings `lower`, `upper`
+(Unicode case mapping), `trim`, `ltrim`, `rtrim` (Unicode whitespace),
+`length` (characters, `I64`), `left(s, n)`, `right(s, n)`,
+`substring(s, start, len)` (1-based, clipped; a negative count or length is
+`E5`); numbers `abs`, `floor`, `ceil` and `round(x, digits: n)` (half away
+from zero) in the operand's type, `sqrt`, `exp`, `ln`, `log10`,
+`power(b, e)` as `F64` (`E5` outside the domain, `E3` for a result that is
+not finite); `size(list)`; `cast(x, T)` between scalar types (`E6` for text
+that is not a literal of `T` or a number out of range). A function of a
+column is tested on each row the scan reads, never through an index
+(`lower($p.email) = $q`, `contains(lower($d.title), $q)`), so compare the
+bare column (`$p.email = $q`, `contains($d.title, $q)`) where
+an index should answer. Full semantics: the user guide's "Functions and
+operators" page.
 
 `$m.number in $numbers` keeps the rows whose value is a member of a list
 parameter or literal, one query instead of one per candidate; the right side
@@ -655,10 +688,14 @@ Outcome and receipt semantics differ from data mutations; see
 
 ## Upgrading from the Older Syntax
 
-The release parses GQ 3 only; nothing converts old text. A stored query that
-no longer compiles keeps its graph from serving, and the boot log, `queries
+The release parses GQ 3 only. A stored query that no longer compiles is
+unavailable while the rest of its graph serves, and the boot log, `queries
 validate --json` and `cluster plan --json` give its code, position, fix and
-byte edits. Rewrite from the fix and this map:
+byte edits. `omnigraph lint --fix` applies those fixes to files, a directory
+or `--config <dir>`; it leaves a refusal with no fix, a `needs_review` fix
+(unless `--review-fixes`) and a keyed `insert` an older release meant as
+`replace` (it compiles, and fails with `key_conflict` on an existing key).
+Rewrite what it leaves from the fix and this map:
 
 | Older form | GQ 3 | Code |
 |---|---|---|
@@ -684,8 +721,8 @@ are `T6`; list equality in braces `T3` is `T7`; an aggregate call in a filter
 is `T7`; a bare edge binding returned (`T23`) and a full-text call in
 `return` (`T35`) are `T86`; `T32`/`T33`/`T54` are `T65`; `T58` is `T9`;
 `T59` is `T75`; a bare name (`T45`, `T36`) is `Q018`; `lint` parse refusals
-carry their own `Q…` code instead of `Q000`. A read named after a function or
-element keyword is `T74`; over grouped rows every order key must be returned
+carry their own `Q…` code instead of `Q000`. A read named after a function
+(`lower`, `length`, `round`, …) or an element keyword is `T74`; over grouped rows every order key must be returned
 (`T42`). The full map is the user guide's "Upgrading queries to GQ 3" page.
 
 ## Naming Convention

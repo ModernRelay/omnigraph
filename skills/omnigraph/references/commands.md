@@ -235,9 +235,13 @@ executing.
 omnigraph lint --schema schema.pg --query queries/foo.gq --json
 # or against a live repo:
 omnigraph lint --query queries/foo.gq --target $REPO --json
+# write the printed fixes and canonical forms into the files:
+omnigraph lint --fix --query queries/ --schema schema.pg --dry-run
 ```
 
-`lint` is the single query-validation command. See `references/queries.md`.
+`lint` is the single query-validation command; `--fix` applies its fixes
+(`--config <dir>` for a cluster's stored queries, `--review-fixes` to apply
+`needs_review` ones). See `references/queries.md`.
 
 ## Embed
 
