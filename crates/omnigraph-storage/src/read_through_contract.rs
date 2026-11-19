@@ -176,8 +176,10 @@ pub async fn a_durable_store_keeps_its_whiteouts_out_of_sight(fixture: &dyn Fixt
         .unwrap();
     store.delete(&graph("c.txt")).await.unwrap();
     store.delete(&graph("a.txt")).await.unwrap();
+    let mut layer_keys = keys(layer.as_ref(), Some("graph/__clone")).await;
+    layer_keys.sort();
     assert_eq!(
-        keys(layer.as_ref(), Some("graph/__clone")).await,
+        layer_keys,
         vec!["graph/__clone/created", "graph/__clone/deleted/a.txt"],
         "the created object and one whiteout per deleted base object, nothing for a clone-root key"
     );
