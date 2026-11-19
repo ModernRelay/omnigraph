@@ -82,7 +82,7 @@ pub fn admit_process_workload(case: &Case, measured: usize) -> Result<(), String
                 ));
             }
             Step::Restart { .. } => {}
-            Step::Settings(_) | Step::Concurrent(_) => {
+            Step::Settings(_) | Step::Concurrent(_) | Step::ApplySchema(_) => {
                 refused.push(format!("step {ordinal} ({})", step_kind(step)));
             }
             Step::Query(query) => {
@@ -220,10 +220,12 @@ async fn execute_process_inner<H: ExecutionHost>(
                         });
                         Ok(())
                     }
-                    Step::Settings(_) | Step::Concurrent(_) => Err(StepFail::new(
-                        step_label(ordinal, step_kind(step), binding),
-                        "unsupported_environment: refused by process admission".into(),
-                    )),
+                    Step::Settings(_) | Step::Concurrent(_) | Step::ApplySchema(_) => {
+                        Err(StepFail::new(
+                            step_label(ordinal, step_kind(step), binding),
+                            "unsupported_environment: refused by process admission".into(),
+                        ))
+                    }
                 };
                 host.measure_step_end(ordinal as u64);
                 host.record("assertion", || match &outcome {

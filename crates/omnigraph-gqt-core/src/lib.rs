@@ -224,6 +224,7 @@ pub fn step_kind(step: &Step) -> &'static str {
         Step::BranchRead(_) => "branch read",
         Step::Restart { .. } => "restart",
         Step::Concurrent(_) => "concurrent",
+        Step::ApplySchema(_) => "apply schema",
     }
 }
 
@@ -252,6 +253,15 @@ pub enum Step {
         ordinal: usize,
     },
     Concurrent(ConcurrentStep),
+    ApplySchema(ApplySchemaStep),
+}
+
+/// `--- apply schema`: the section's body is the whole desired `.pg`
+/// schema, applied to the graph as `schema apply` does, which must succeed.
+#[derive(Debug)]
+pub struct ApplySchemaStep {
+    ordinal: usize,
+    pub source: String,
 }
 
 impl Step {
@@ -267,6 +277,7 @@ impl Step {
             Self::BranchRead(s) => s.ordinal,
             Self::Restart { ordinal } => *ordinal,
             Self::Concurrent(s) => s.ordinal,
+            Self::ApplySchema(s) => s.ordinal,
         }
     }
 
@@ -283,7 +294,8 @@ impl Step {
             | Step::Control(_)
             | Step::Settings(_)
             | Step::Restart { .. }
-            | Step::Concurrent(_) => None,
+            | Step::Concurrent(_)
+            | Step::ApplySchema(_) => None,
         }
     }
 
@@ -298,7 +310,8 @@ impl Step {
             | Step::Control(_)
             | Step::Settings(_)
             | Step::Restart { .. }
-            | Step::Concurrent(_) => None,
+            | Step::Concurrent(_)
+            | Step::ApplySchema(_) => None,
         }
     }
 }
@@ -1230,6 +1243,21 @@ pub fn bound_snapshot(step: &QueryStep, bindings: &Bindings) -> Result<Option<St
 }
 
 /// A query step's read target: its bound snapshot, else its branch.
+/// The catalog a read query on `target` type-checks against: at an explicit
+/// commit, the current schema as that commit holds it.
+pub async fn read_catalog(
+    session: &Session,
+    target: &ReadTarget,
+) -> Result<Arc<omnigraph_compiler::catalog::Catalog>, String> {
+    match target {
+        ReadTarget::Snapshot(_) => session
+            .query_catalog(target.clone())
+            .await
+            .map_err(|error| format!("the read target's catalog failed: {error}")),
+        ReadTarget::Branch(_) => Ok(session.catalog()),
+    }
+}
+
 pub fn read_target(step: &QueryStep, bindings: &Bindings) -> Result<ReadTarget, String> {
     Ok(match bound_snapshot(step, bindings)? {
         Some(id) => ReadTarget::snapshot(SnapshotId::new(id)),
@@ -2322,7 +2350,7 @@ fn complete_decl_step(
 }
 
 /// The section kinds a header may name, for a near miss.
-const SECTION_KINDS: [&str; 18] = [
+const SECTION_KINDS: [&str; 19] = [
     "runner",
     "schema",
     "seed",
@@ -2336,6 +2364,7 @@ const SECTION_KINDS: [&str; 18] = [
     "expect",
     "bind",
     "restart",
+    "apply",
     "loop",
     "foreach",
     "endloop",
@@ -2857,7 +2886,10 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             errors.push(error.located(section.header_line + 1, &lines));
         }
         let outcome: Result<(), CaseError> = (|| {
-            if matches!(kind, "query" | "mutate" | "load" | "restart" | "concurrent") {
+            if matches!(
+                kind,
+                "query" | "mutate" | "load" | "restart" | "concurrent" | "apply"
+            ) {
                 source_lines.insert(ordinal + 1, section.header_line + 1);
                 cursor.awaiting_seam_step = false;
             }
@@ -3719,6 +3751,42 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                     ordinal += 1;
                     push_step(&mut items, &mut loops, Step::Restart { ordinal });
                 }
+                "apply" => {
+                    if rest != "schema" {
+                        return Err(CaseError::new(
+                            CaseErrorCode::BodyShape,
+                            format!(
+                                "`--- apply {rest}` is refused; the step is `--- apply schema`"
+                            ),
+                        )
+                        .fix(
+                            "write `--- apply schema` with the whole desired schema as its body",
+                        ));
+                    }
+                    if cursor.pending.is_some() {
+                        return Err(missing_previous_expect());
+                    }
+                    let source = section
+                        .body
+                        .iter()
+                        .map(|(_, line)| *line)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if source.trim().is_empty() {
+                        return Err(CaseError::new(
+                            CaseErrorCode::BodyShape,
+                            "`--- apply schema` has no schema",
+                        )
+                        .fix("write the whole desired `.pg` schema under `--- apply schema`"));
+                    }
+                    refuse_embed_schema(&source, section.header_line + 2)?;
+                    ordinal += 1;
+                    push_step(
+                        &mut items,
+                        &mut loops,
+                        Step::ApplySchema(ApplySchemaStep { ordinal, source }),
+                    );
+                }
                 "loop" | "foreach" => {
                     if cursor.pending.is_some() {
                         return Err(missing_previous_expect());
@@ -4511,7 +4579,8 @@ async fn run_query_step(
             ) = (&step.plan, &inspection)
                 && host.checks_plans()
             {
-                validate_plan_columns(&plan.lines, &session.catalog()).map_err(&fail)?;
+                let catalog = read_catalog(session, &target).await.map_err(&fail)?;
+                validate_plan_columns(&plan.lines, &catalog).map_err(&fail)?;
                 let report = report.as_ref().ok();
                 if let Some(mismatch) = plan_mismatch(&plan.lines, explain, report) {
                     return Err(fail(format!(
@@ -4520,7 +4589,7 @@ async fn run_query_step(
                     )));
                 }
             }
-            let catalog = session.catalog();
+            let catalog = read_catalog(session, &target).await.map_err(&fail)?;
             let inferred = check_query_decl(&catalog, &step.decl)
                 .and_then(|core| match core {
                     CoreDecl::Read(read) => result_schema(&catalog, &read),
@@ -4687,7 +4756,18 @@ async fn compare_with_reference(
     params: &omnigraph_compiler::ParamMap,
     engine: EngineOutcome<'_>,
 ) -> Result<(), String> {
-    let catalog = session.catalog();
+    // A target whose catalog cannot be read is input the reference cannot
+    // read, as a target its export cannot read is.
+    let catalog = match read_catalog(session, target).await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let engine = match engine {
+                EngineOutcome::Refused(refusal) => Err(refusal),
+                EngineOutcome::Rows { .. } => return Err(format!("reference comparison: {error}")),
+            };
+            return judge_reference(&Err(ReferenceRefusal::Input(error)), &engine);
+        }
+    };
     let read = match check_query_decl(&catalog, &step.decl) {
         Ok(CoreDecl::Read(read)) => read,
         Ok(CoreDecl::Write(_)) => {
@@ -4920,6 +5000,23 @@ async fn run_load_step(
             check_error_expect(host, needle, outcome, "load succeeded").map_err(fail)
         }
     }
+}
+
+/// Apply the step's schema, which must succeed.
+async fn run_apply_schema_step(
+    host: &impl ExecutionHost,
+    session: &Session,
+    step: &ApplySchemaStep,
+    binding: Option<(&str, &str)>,
+) -> Result<(), StepFail> {
+    let label = step_label(step.ordinal, "apply schema", binding);
+    let fail = |message: String| StepFail::new(label.clone(), message);
+    operation(host, step.ordinal, session.db().apply_schema(&step.source))
+        .await
+        .map_err(&fail)?
+        .inspect_err(|error| host.observe_fault(error))
+        .map(|_| ())
+        .map_err(|error| fail(format!("schema apply failed: {error}")))
 }
 
 async fn run_list_step(
@@ -5882,6 +5979,7 @@ async fn execute_steps_inner<H: ExecutionHost>(
                         run_branch_read_step(host, &session, r, binding, &bindings).await
                     }
                     Step::Concurrent(c) => host.concurrent_step(&session, case, c).await,
+                    Step::ApplySchema(a) => run_apply_schema_step(host, &session, a, binding).await,
                     Step::Restart { ordinal } => {
                         generation += 1;
                         host.observe(|| format!("lifetime: reopen generation {generation}"));
@@ -6046,6 +6144,7 @@ fn expectation_evidence(step: &Step) -> Value {
         Step::Show(s) => read_expect_evidence(&s.expect),
         Step::BranchRead(r) => read_expect_evidence(&r.expect),
         Step::Restart { .. } => serde_json::json!({"kind": "restart", "storage": "preserved"}),
+        Step::ApplySchema(_) => serde_json::json!({"kind": "apply schema", "expectation": "Ok"}),
         Step::Concurrent(c) => serde_json::json!({
             "kind": "concurrent",
             "sessions": c.sessions.iter().map(|s| serde_json::json!({"label": s.label, "branch": s.branch, "kind": s.kind.name(), "expect": format!("{:?}", s.expect)})).collect::<Vec<_>>(),
@@ -6154,6 +6253,7 @@ pub enum StepKind {
     BranchRead,
     Restart,
     Concurrent,
+    ApplySchema,
 }
 
 #[derive(Clone, Debug)]
@@ -6229,7 +6329,8 @@ impl Step {
             | Self::Show(_)
             | Self::BranchRead(_)
             | Self::Restart { .. }
-            | Self::Concurrent(_) => false,
+            | Self::Concurrent(_)
+            | Self::ApplySchema(_) => false,
         }
     }
 
@@ -6267,6 +6368,7 @@ impl Step {
             Self::BranchRead(_) => StepKind::BranchRead,
             Self::Restart { .. } => StepKind::Restart,
             Self::Concurrent(_) => StepKind::Concurrent,
+            Self::ApplySchema(_) => StepKind::ApplySchema,
         }
     }
 }

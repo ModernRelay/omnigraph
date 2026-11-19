@@ -1,0 +1,266 @@
+# issue: 1058
+# red_on: 9e29620f, `historical_query_binds_properties_by_identity_not_name` in the engine's point_in_time suite: a whole-node `return { $p }` at a commit before an added property refused with `does not exist at this snapshot`, and a property renamed since refused with `cannot read a property across a rename`
+# notes: A read at an earlier commit sees the schema accepted there (RFC GQ 3, A2). `$c0` is on main and `$w` on
+# notes: the branch `work`, merged and deleted before the schema changes, since schema apply needs a graph with only
+# notes: main. Since both: `age` added, `memo` renamed `remark`, `note` and the edge's `since` dropped, then added
+# notes: again as new properties. At either commit a whole node holds `name` and, under its current name, `remark`;
+# notes: naming `age`, `note` or `since` there is a type error naming the commit. At `$c3`, after the re-add, and at
+# notes: `$w3`, written on the branch `fresh` after it, the new `note` is there.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    note: String?
+    memo: String?
+}
+
+edge Knows: Person -> Person {
+    since: I32?
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","note":"secret","memo":"kept"}}
+{"type":"Person","data":{"name":"bob"}}
+{"edge":"Knows","from":"alice","to":"bob","data":{"since":2020}}
+
+--- mutate
+query add_carol() {
+    replace Person { name: "carol", note: "old", memo: "c" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $c0
+
+--- mutate
+branch create work
+
+--- expect ok
+
+--- mutate branch: work
+query add_dana() {
+    replace Person { name: "dana", note: "dn", memo: "dm" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $w
+
+--- mutate
+branch merge work into main
+
+--- expect ok
+
+--- mutate
+branch delete work
+
+--- expect ok
+
+--- apply schema
+node Person {
+    name: String @key
+    note: String?
+    remark: String? @rename_from("memo")
+    age: I32?
+}
+
+edge Knows: Person -> Person {
+    since: I32?
+}
+
+--- apply schema
+node Person {
+    name: String @key
+    remark: String?
+    age: I32?
+}
+
+edge Knows: Person -> Person
+
+--- apply schema
+node Person {
+    name: String @key
+    remark: String?
+    age: I32?
+    note: String?
+}
+
+edge Knows: Person -> Person {
+    since: I32?
+}
+
+--- mutate
+query renote() {
+    match { $p: Person } where $p.name = "alice"
+    update $p set { note: "fresh", age: 40 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $c3
+
+--- query snapshot: $c0
+query whole() {
+    match { $p: Person }
+    return { $p }
+}
+
+--- expect unordered
+{"p": {"@id": "alice", "name": "alice", "remark": "kept"}}
+{"p": {"@id": "bob", "name": "bob"}}
+{"p": {"@id": "carol", "name": "carol", "remark": "c"}}
+
+--- expect shape
+p: Person
+
+--- query snapshot: $c0
+query renamed() {
+    match { $p: Person } where $p.remark = "kept"
+    return { $p.name, $p.remark }
+}
+
+--- expect unordered
+{"p.name": "alice", "p.remark": "kept"}
+
+--- expect shape
+p.name: String
+p.remark: String?
+
+--- query snapshot: $c0
+query added_since() {
+    match { $p: Person }
+    return { $p.age }
+}
+
+--- expect error: `Person` has no property `age` at commit
+
+--- query snapshot: $c0
+query added_again_since() {
+    match { $p: Person }
+    return { $p.note }
+}
+
+--- expect error: the `note` that commit holds was dropped since, and `note` was added again as a new property
+
+--- query snapshot: $c0
+query edge_added_again_since() {
+    match { $p: Person, $p $k:knows $f }
+    return { $f.name, $k.since }
+}
+
+--- expect error: `Knows` has no property `since` at commit
+
+--- query snapshot: $c0
+query edge_traversal() {
+    match { $p: Person, $p knows $f }
+    return { $p.name, $f.name }
+}
+
+--- expect unordered
+{"p.name": "alice", "f.name": "bob"}
+
+--- expect shape
+p.name: String
+f.name: String
+
+--- query snapshot: $w
+query whole_on_the_branch() {
+    match { $p: Person }
+    return { $p }
+}
+
+--- expect unordered
+{"p": {"@id": "alice", "name": "alice", "remark": "kept"}}
+{"p": {"@id": "bob", "name": "bob"}}
+{"p": {"@id": "carol", "name": "carol", "remark": "c"}}
+{"p": {"@id": "dana", "name": "dana", "remark": "dm"}}
+
+--- expect shape
+p: Person
+
+--- query snapshot: $w
+query renamed_on_the_branch() {
+    match { $p: Person } where $p.name = "dana"
+    return { $p.remark }
+}
+
+--- expect unordered
+{"p.remark": "dm"}
+
+--- expect shape
+p.remark: String?
+
+--- query snapshot: $w
+query added_since_on_the_branch() {
+    match { $p: Person }
+    return { $p.name }
+    order { $p.age }
+}
+
+--- expect error: `Person` has no property `age` at commit
+
+--- query snapshot: $w
+query added_again_since_on_the_branch() {
+    match { $p: Person } where $p.note = "dn"
+    return { $p.name }
+}
+
+--- expect error: the `note` that commit holds was dropped since
+
+--- query snapshot: $c3
+query readded() {
+    match { $p: Person }
+    return { $p }
+}
+
+--- expect unordered
+{"p": {"@id": "alice", "name": "alice", "remark": "kept", "age": 40, "note": "fresh"}}
+{"p": {"@id": "bob", "name": "bob"}}
+{"p": {"@id": "carol", "name": "carol", "remark": "c"}}
+{"p": {"@id": "dana", "name": "dana", "remark": "dm"}}
+
+--- expect shape
+p: Person
+
+--- mutate
+branch create fresh
+
+--- expect ok
+
+--- mutate branch: fresh
+query renote_dana() {
+    match { $p: Person } where $p.name = "dana"
+    update $p set { note: "new" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $w3
+
+--- mutate branch: fresh
+query renote_bob() {
+    match { $p: Person } where $p.name = "bob"
+    update $p set { note: "later" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query snapshot: $w3
+query readded_on_the_branch() {
+    match { $p: Person } where $p.note != ""
+    return { $p.name, $p.note }
+}
+
+--- expect unordered
+{"p.name": "alice", "p.note": "fresh"}
+{"p.name": "dana", "p.note": "new"}
+
+--- expect shape
+p.name: String
+p.note: String?

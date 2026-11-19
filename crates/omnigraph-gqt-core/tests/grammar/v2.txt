@@ -1,6 +1,6 @@
 gqt format 2
 header keys: issue, red_on, notes, traversal, csv_slice_bytes, overwrite_chunk_rows, writer, layout
-sections: runner, schema, seed, branches, csv, load, query, mutate, concurrent, params, expect, bind, restart, loop, foreach, endloop, seam, reference
+sections: runner, schema, seed, branches, csv, load, query, mutate, concurrent, params, expect, bind, restart, apply, loop, foreach, endloop, seam, reference
 expect modes: ok, unordered, ordered, error:, affected:, outcome:, shape, plan
 corpus timeout_ms: at most 10000
 rules:

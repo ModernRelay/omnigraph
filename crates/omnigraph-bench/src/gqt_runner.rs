@@ -54,6 +54,7 @@ pub enum GqtOperationKind {
     BranchRead,
     Restart,
     Concurrent,
+    ApplySchema,
 }
 impl From<StepKind> for GqtOperationKind {
     fn from(kind: StepKind) -> Self {
@@ -72,6 +73,7 @@ impl From<StepKind> for GqtOperationKind {
             StepKind::BranchRead => Self::BranchRead,
             StepKind::Restart => Self::Restart,
             StepKind::Concurrent => Self::Concurrent,
+            StepKind::ApplySchema => Self::ApplySchema,
         }
     }
 }

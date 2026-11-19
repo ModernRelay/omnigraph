@@ -109,7 +109,7 @@ in-process verdict and the same served verdict; `gqt_served_count.rs` totals
 the served and skipped cases and refuses an empty served set. A declared
 `omnigraph-server-dst` environment is refused at admission on every run: no
 runner implements it. The declared `storage` is recorded, not checked: no
-route reports the server's backend. Refused before any request, by name: `--- restart`,
+route reports the server's backend. Refused before any request, by name: `--- restart`, `--- apply schema`,
 `--- concurrent`, seam directives, settings steps and settings prefixes on a
 control or `show` step, `--- expect plan`, the
 `# traversal:` pin, the `# writer:` pin, and queries that need indices (`search`, `fuzzy`,
@@ -166,6 +166,14 @@ parse is a step only under `expect error:` (any other expectation refuses the
 case with the parse error); it runs through the engine's door like any query
 and fails there with the same refusal. The cases under `cases/diagnostics/` use this:
 one per code the parser and type checker raise.
+
+`--- apply schema` applies its body, the whole desired `.pg` schema, to the
+graph as `omnigraph schema apply` does, through the same session, and must
+succeed; it takes no expect section. Schema apply needs a graph with only
+`main`, so a case deletes its branches before the step. With `--- bind
+commit` and `--- query snapshot:`, it is how a case reads a commit made under
+an earlier schema. The served and per-step process paths refuse it by name,
+so a case that holds one declares no `omnigraph-server` environment.
 
 A write's commit id can be bound for the rest of the case (RFC "Unpublished
 graph commits"): `--- bind commit $name`, an empty section directly after the

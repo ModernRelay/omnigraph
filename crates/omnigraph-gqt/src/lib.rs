@@ -136,7 +136,12 @@ impl ExecutionHost for GqtHost {
                 Ok(export) => export,
                 Err(e) => return Ok(Err(ReferenceRefusal::Input(format!("export failed: {e}")))),
             };
-            let catalog = session.catalog();
+            // At an explicit commit the read, and the export, see the
+            // current schema as the commit holds it.
+            let catalog = match omnigraph_gqt_core::read_catalog(session, target).await {
+                Ok(catalog) => catalog,
+                Err(e) => return Ok(Err(ReferenceRefusal::Input(e))),
+            };
             let params = params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             Ok(omnigraph_reference::Graph::from_export(&catalog, &export)
                 .and_then(|graph| {

@@ -3950,3 +3950,36 @@ async fn every_read_step_is_compared_with_the_reference() {
     let error = with_reference(&stale, alice()).await.unwrap_err();
     assert!(error.contains("does not reach"), "{error}");
 }
+
+/// `--- apply schema` is a step whose body is the whole desired schema; any
+/// other argument, an empty body or an `@embed` schema refuses the case, and
+/// the served path refuses the step by name.
+#[test]
+fn apply_schema_is_a_step_with_a_schema_body() {
+    let apply = "--- apply schema\nnode Person {\n    name: String @key\n    age: I32?\n}\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{apply}{QUERY}{EXPECT}");
+    let case = parse_case("apply_schema", &text).unwrap();
+    assert_eq!(case.steps()[0].kind, StepKind::ApplySchema);
+    let [
+        Item::Step(Step::ApplySchema(step)),
+        Item::Step(Step::Query(_)),
+    ] = case.items.as_slice()
+    else {
+        panic!("expected an apply schema step, then a query");
+    };
+    assert!(step.source.contains("age: I32?"));
+    for (from, to) in [
+        ("--- apply schema\n", "--- apply schemas\n"),
+        ("--- apply schema\n", "--- apply\n"),
+        (
+            "--- apply schema\nnode Person {\n    name: String @key\n    age: I32?\n}\n",
+            "--- apply schema\n\n",
+        ),
+        ("age: I32?", "e: Vector(2) @embed(\"name\")"),
+    ] {
+        assert!(
+            parse_case("apply_schema", &text.replace(from, to)).is_err(),
+            "{from} -> {to}"
+        );
+    }
+}
