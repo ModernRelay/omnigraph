@@ -770,3 +770,78 @@ query none() {
     );
     assert_eq!(output.status, QueryLintStatus::Ok);
 }
+
+/// Every diagnostic `lint` reports carries its fix and, where the fix is
+/// machine-applicable, its byte-range edits: a parse refusal of an edition-2
+/// form, a type refusal of a removed call and a canonical form alike. The
+/// edits are exactly what `lint --fix` (`fix_source`) applies: applying the
+/// reported edits gives the text `fix_source` writes.
+#[test]
+fn every_reported_fix_carries_the_edits_lint_fix_applies() {
+    use crate::query::diagnostic::TextEdit;
+    use crate::query::fix::{FixOptions, fix_source};
+    let catalog = catalog("node Person { name: String @key\n age: I32? }\n");
+    for (label, source, code) in [
+        (
+            "an edition-2 filter in match",
+            "query q() { match { $p: Person  $p.age > 30 } return { $p.name } }",
+            "Q017",
+        ),
+        (
+            "fuzzy with a positional budget",
+            "query q($s: String) { match { $p: Person } where fuzzy($p.name, $s, 1) return { $p.name } }",
+            "T6",
+        ),
+        (
+            "a canonical form",
+            "query q() { match { $p: Person } return { $p.name } order { $p.name asc } }",
+            "L208",
+        ),
+    ] {
+        let out = lint_query_file(
+            &catalog,
+            source,
+            "q.gq",
+            QueryLintSchemaSource::file("s.pg"),
+        );
+        let mut reported: Vec<(String, Option<String>, Vec<TextEdit>)> = out
+            .findings
+            .iter()
+            .map(|f| {
+                (
+                    f.code.clone(),
+                    f.fix.clone(),
+                    f.suggestion
+                        .as_ref()
+                        .map(|s| s.edits.clone())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        reported.extend(out.results.iter().flat_map(|r| &r.diagnostics).map(|d| {
+            (
+                d.code.as_str().to_string(),
+                d.fix.clone(),
+                d.suggestion
+                    .as_deref()
+                    .map(|s| s.edits.clone())
+                    .unwrap_or_default(),
+            )
+        }));
+        assert_eq!(reported.len(), 1, "{label}: {reported:?}");
+        let (reported_code, fix, mut edits) = reported.remove(0);
+        assert_eq!(reported_code, code, "{label}");
+        assert!(fix.is_some(), "{label}: no fix");
+        assert!(!edits.is_empty(), "{label}: no edits");
+        edits.sort_by_key(|e| std::cmp::Reverse(e.start));
+        let mut text = source.to_string();
+        for edit in edits {
+            text.replace_range(edit.start..edit.end, &edit.replacement);
+        }
+        assert_eq!(
+            fix_source(&catalog, source, FixOptions::default()).fixed,
+            Some(text),
+            "{label}"
+        );
+    }
+}

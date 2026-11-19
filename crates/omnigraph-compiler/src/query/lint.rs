@@ -138,7 +138,7 @@ pub fn lint_query_file(
         Ok(file) => file
             .body
             .into_read_declarations()
-            .map_err(|message| vec![(Q004.as_str().to_string(), message, None)]),
+            .map_err(|message| vec![(Q004.as_str().to_string(), message, None, None)]),
         Err(diagnostic) => Err(diagnostic
             .all()
             .into_iter()
@@ -236,11 +236,11 @@ pub fn lint_query_file(
             results: Vec::new(),
             findings: refusals
                 .into_iter()
-                .map(|(code, message, suggestion)| QueryLintFinding {
+                .map(|(code, message, fix, suggestion)| QueryLintFinding {
                     severity: QueryLintSeverity::Error,
                     code,
                     message,
-                    fix: None,
+                    fix,
                     type_name: None,
                     property: None,
                     query_names: Vec::new(),
@@ -256,9 +256,13 @@ pub fn lint_query_file(
 /// line is reported where it stands; a spanless diagnostic keeps its
 /// message. A parse refusal keeps its code and its message; a refusal the
 /// front door raises for the whole source unit (`T83`, one per repeated
-/// name) keeps its code and its rendered form.
-fn front_door_finding(diagnostic: QueryDiagnostic) -> (String, String, Option<Suggestion>) {
+/// name) keeps its code and its rendered form. Its fix and the fix's
+/// byte-range edits ride along, as the diagnostic carries them.
+fn front_door_finding(
+    diagnostic: QueryDiagnostic,
+) -> (String, String, Option<String>, Option<Suggestion>) {
     let suggestion = diagnostic.suggestion.as_deref().cloned();
+    let fix = diagnostic.fix.clone();
     let (code, message) = match diagnostic.kind {
         QueryDiagnosticKind::Parse => (
             diagnostic.code.as_str().to_string(),
@@ -270,7 +274,7 @@ fn front_door_finding(diagnostic: QueryDiagnostic) -> (String, String, Option<Su
         Some(at) => format!("line {}, column {}: {message}", at.line, at.column),
         None => message,
     };
-    (code, message, suggestion)
+    (code, message, fix, suggestion)
 }
 
 fn query_kind(query: &QueryDecl) -> QueryLintQueryKind {

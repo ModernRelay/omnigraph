@@ -2052,6 +2052,32 @@ fn lint_fix_rewrites_the_files_of_a_directory_in_place() {
     let current = dir.join("nested/current.gq");
     let compiles = "query names() { match { $p: Person } return { $p.name } }\n";
     write_query_file(&current, compiles);
+
+    // `lint --json` reports each refusal with the fix and the byte-range
+    // edits `--fix` applies.
+    let report: Value = serde_json::from_slice(
+        &output_failure(
+            cli()
+                .args(["lint", "--json", "--query"])
+                .arg(&respelled)
+                .arg("--schema")
+                .arg(&schema_path),
+        )
+        .stdout,
+    )
+    .unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert!(!findings.is_empty(), "{report}");
+    for finding in findings {
+        assert!(finding["fix"].is_string(), "{finding}");
+        assert!(
+            !finding["suggestion"]["edits"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{finding}"
+        );
+    }
     let unknown = dir.join("nested/unknown.gq");
     let refused = "query ages() { match { $p: Person } return { $p.years } }\n";
     write_query_file(&unknown, refused);
