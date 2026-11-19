@@ -274,12 +274,12 @@ omnigraph load --data seed.jsonl --mode replace --target $REPO
 omnigraph load --data delta.jsonl --branch feature-x --from main --mode replace --target $REPO
 ```
 
-`--mode` is **required** (no default): `merge`, `append`, or `overwrite`.
+`--mode` is **required** (no default): `insert`, `upsert`, `replace` or `overwrite`, each the write statement of its name; `append` and `merge` are refused with `insert` and `replace` as fixes.
 Address either direct storage or a served graph. See [`data.md`](data.md).
 
 `omnigraph load` reads JSONL only. Load one CSV object into one type with a
 `load csv` statement: `omnigraph mutate --target $REPO -e 'load csv
-"file:///data/person.csv" into node:Person mode append header'` (optional
+"file:///data/person.csv" into node:Person mode insert header'` (optional
 `delimiter "|"`, `columns (…)`, `--branch`). A served graph reads only `s3://`
 sources its external Blob policy admits. See
 [CSV loading](../../../docs/user/mutations/index.md#csv-loading).

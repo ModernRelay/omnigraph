@@ -71,6 +71,10 @@ fix.
 | `delete T where φ` | `match { $x: T } where φ′  delete $x`: each bare property is written `$x.p`, and an edge's `from` and `to` are `$x.@src` and `$x.@dst` | `Q008` |
 | `update T set { … } where φ` | `match { $x: T } where φ′  update $x set { … }`, a bare property in an assignment written `$x.p` | `Q008` |
 | a body of several statements | one group per statement, in order, each opening with its `match`; consecutive statements with no `match` between them stay one group | `Q008` |
+| `insert T { … }` over a type with `@key` | `replace T { … }`, which means what that `insert` meant; narrow it to `insert` where only creation is meant, or `upsert` where only the named properties should change | none: it compiles, and on an existing key fails at run time with `key_conflict`, naming `upsert` and `replace`, changing no data |
+| `from:` and `to:` in an edge insert | `@src:` and `@dst:` | `T11` |
+| `omnigraph load --mode append`, `load csv … mode append` | `insert` | the CLI's and HTTP's mode refusal, `Q004` |
+| `--mode merge`, `mode merge` | `replace` | the same |
 | a quoted edge name, `$d "in" $x` | the bare name, `$d in $x` (the quoted name is still accepted) | none |
 
 The fix for `$x` picks a name the declaration does not use. A rewrite reads
@@ -167,6 +171,12 @@ refuses a `sum`, `avg`, `min`, `max` or `collect` block without its argument.
 - `lint --json` reports every refusal of a refused query in that result's
   `diagnostics`, each with its own code, position and suggestion; a parse
   refusal is no longer `Q000` ([Lint](lint.md)).
+- Writes name their intent: `insert` creates and fails on an existing key,
+  `upsert` (new) sets only the named properties, `replace` writes the whole
+  row, and `update` now takes an edge variable as well as a node one; an
+  `update` assigning a key or an endpoint is `T93`, and `upsert` or `replace`
+  on a type with no `@key` is `T92`. The load modes are `insert`, `upsert`,
+  `replace` and `overwrite` ([Mutations and loads](../mutations/index.md#statements)).
 - A bound plan saved by an earlier release is refused with "unsupported bound
   plan version …; regenerate the saved plan": regenerate it from the query
   ([Explain](explain.md)).

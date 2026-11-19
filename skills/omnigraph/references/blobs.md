@@ -89,7 +89,7 @@ in a stored URI.
 Ownership depends on the write:
 
 - `load --mode overwrite` preserves an allowed external reference;
-- insert, update, append/merge load, and branch merge copy allowed source bytes
+- insert, upsert, replace, update, keyed loads, and branch merge copy allowed source bytes
   into graph-managed storage;
 - a previously stored external reference remains readable if new external
   ingress is later disabled, and exportable when it names its whole object.

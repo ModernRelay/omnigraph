@@ -166,8 +166,8 @@ type's declared identity:
   derived id as the entity id (for `@key(@src, @dst)` a JSON array such as
   `["Alice","Bob"]`; the elements are the endpoint node ids, so they are
   generated ids when the endpoint type declares no key). Reconcile it like any divergent insert: align the
-  property on one branch (insert the same key again with the agreed
-  values; the insert upserts), then merge again.
+  property on one branch (`replace` the same key with the agreed values, or
+  `update` the edge), then merge again.
 
 ## Merge classification mode
 

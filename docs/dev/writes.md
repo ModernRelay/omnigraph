@@ -429,7 +429,7 @@ the current head before any effect. A table it only read keeps its moved pin;
 a staged table goes through Lance's `TransactionRebase` over those commits
 (`table_store::rebase_staged_write`), records the current pin as its read
 version, and commits detached there, so the compaction stays and the table's
-history stays one chain. An insert, an append and an overwrite carry; an
+history stays one chain. An insert, an `insert` load and an overwrite carry; an
 update, delete or upsert of a row in a fragment a rewrite replaced is a
 conflict Lance reports, and the attempt is sent back, as one overtaken by a
 row change is. So is one whose chain cannot be read: the links before a
@@ -478,7 +478,7 @@ makes a branch create, a schema apply or a system-column upgrade wait, since
 each takes the permit exclusively, and the schema gate is fair: while such a
 request waits, new shared requests wait behind it, so writers on every branch
 wait too. Each wait lasts one preparation, as a branch merge's planning under
-the same permit already does. For a large merge load on object storage that
+the same permit already does. For a large `replace` load on object storage that
 can be seconds.
 
 Optimize captures its write authority before it takes the shared schema,
@@ -754,10 +754,35 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
   the derived `id = v` conjunct to its match scan when the table has an id
   BTREE, as a node delete does, so the scan reads the index;
 - a bare Lance Append is not a production graph-table write;
+- the three keyed statements (GQ 3 RFC, "Keyed writes") and the load modes of
+  the same names map onto these two adapters. `insert` is the strict insert:
+  a key the write staged earlier is refused from the pending image, a
+  committed one by the probe, and when another statement made the table an
+  upsert, the ids `insert` staged there (`PendingTable::strict_ids`) are
+  probed against the pinned table before staging; `KeyConflict`'s message
+  carries `KEY_CONFLICT_FIX`, which names `upsert` and `replace`. `replace`
+  is the whole-row upsert above. `upsert` fills the cells a row omits first
+  (`exec::keep_omitted`): one id scan per run of up to 1,024 rows
+  (`KEEP_OMITTED_RUN_ROWS`) reads only the omitted columns of the keys it
+  matches, from the pinned table and, for a statement, the pending image
+  (`EarlierEffects::Seen`; a load reads committed rows only), refuses a
+  required property still null on a new key, and stages the whole row
+  through the same upsert adapter. Lance 13's partial-schema merge-insert
+  would keep omitted columns unread, but it takes one source schema per call
+  and has no per-row "not supplied" marker, while records may name different
+  properties and the pending image needs whole rows. A row naming every
+  property reads nothing extra; the DST golden's `UpsertKeepScalars` (11
+  gets) against `ReplaceBlob1M` (9) is the scan, and `UpsertKeepBlob1M` (15
+  gets, 8 puts) adds reading and rewriting the omitted 1 MiB Blob;
+- an `update` stages only the rows whose assigned values differ from the
+  matched row under the fixed value order (`rows_that_change`), so one that
+  changes nothing stages nothing and publishes no commit; an unchanged
+  `upsert` or `replace` still publishes, since proving it unchanged would read
+  the named (or every) column of the stored row;
 - one table's keyed input is bounded to 8,192 rows and the effective
   `write_max_bytes` (default 32 MiB) before its data is staged.
 
-Insert/update mutations and keyed Append/Merge loads also cap the sum of
+Insert/update mutations and keyed `insert`, `upsert` and `replace` loads also cap the sum of
 retained row data across tables at `write_max_bytes`
 (`retained keyed batch bytes per operation`). Admission starts with
 `get_array_memory_size`, subtracting only typed logical Blob payload buffer

@@ -73,8 +73,8 @@ search output carries those columns. A graph whose schema already declared
 either name before this reservation keeps opening; only new schemas are
 refused.
 
-On edge types the names `from` and `to` are also reserved: they are the
-insert parameters that name the endpoints. A node type and an edge type may share a name; an insert's endpoint assignments then select the edge type ([mutations](../mutations/index.md)).
+On edge types the names `from` and `to` are also reserved, since edition 2
+assigned endpoints with them; a write assigns them as `@src` and `@dst`. A node type and an edge type may share a name; a write's `@src`/`@dst` assignments then select the edge type ([mutations](../mutations/index.md)).
 
 ## Constraints
 

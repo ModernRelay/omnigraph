@@ -71,7 +71,7 @@ omnigraph embed --seed embed-config.yaml --select "Chunk:chunk_index=42"
 ```
 
 Changing source text, source-property metadata, or model requires generating
-replacement vectors; neither `merge` nor `overwrite` does that automatically.
+replacement vectors; no load mode does that automatically.
 
 ## Search Functions in Queries
 

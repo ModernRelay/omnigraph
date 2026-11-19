@@ -178,7 +178,7 @@ expected format instead, without an edit.
 | `Q001` | The source does not match the grammar at the reported position; `expected` names the grammar rules the parser could accept there. |
 | `Q002` | A query declaration is missing its parameter list. |
 | `Q003` | A settings statement is refused: unknown setting, value outside its row, or a process setting in a request. |
-| `Q004` | A branch, commit, show or explain statement is misplaced or malformed. |
+| `Q004` | A branch, commit, show or explain statement is misplaced or malformed, or a `load csv` names a removed mode (`append` or `merge`; the fix is `insert` or `replace`). |
 | `Q005` | A declaration body is refused; `expected` names the construct. |
 | `Q006` | The source nests too deeply, checked before the grammar runs: more than 2,048 levels of brackets, `case`s and adjacent prefix operators (`not`, `!`, unary `-`), or an expression deeper than 16,384 levels when each `and`/`or` of a chain and each operator of an arithmetic or comparison chain also counts one. Each expression is measured alone, so sibling write groups, arguments and assignments never add up. Write a long `or` chain over one property as `$p.name in [...]`. |
 | `Q007` | A traversal is written with an arrow; the fix is the triple. |

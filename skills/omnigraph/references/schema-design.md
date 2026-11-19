@@ -171,7 +171,7 @@ node Customer {
     name: String
     name_embedding: Vector(3072)? @embed("name")   // writers run nearest() on it before inserting
 }
-edge Attended: Person -> Meeting { @key(@src, @dst) }   // recording the same attendance twice upserts
+edge Attended: Person -> Meeting { @key(@src, @dst) }   // a `replace` of the same attendance twice writes one edge
 ```
 
 ### 2. Kinds are types; roles are edges

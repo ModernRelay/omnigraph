@@ -179,8 +179,8 @@ edge. They work in filters, projections, and orderings (`$p.@id = $who`,
 whatever the stored column is called; a write reads them through its binding
 too (`$x.@src = $who`), and a bare `@id` is `T6`. A bare `id` (`$p.id`, or
 `id: ...` in an assignment) always names a user property called `id`; where none is declared
-it is the unknown-property error, which names the meta-field. Edge inserts
-address endpoints as `from` and `to`. `$e.@type` returns the bound edge's
+it is the unknown-property error, which names the meta-field. Edge writes
+assign endpoints as `@src` and `@dst`. `$e.@type` returns the bound edge's
 canonical schema type name as a non-null `String`, including on ordinary named
 traversals; it is synthesized query metadata and cannot be written. `@src` and
 `@dst` preserve stored orientation, including when the query traverses in

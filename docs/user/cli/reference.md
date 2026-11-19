@@ -60,7 +60,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `catalogue` | Query this binary's engine registries with `-e` or `--query`; optional `--json` | local, no operator config or graph storage |
 | `query` | Run a read query, or a branch read (`branch list`, `diff`, `merge-base`, `merge … dry run`), `show`, or `explain` statement | direct or served |
 | `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
-| `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
+| `load` | Load graph JSONL in `insert`, `upsert`, `replace` or `overwrite` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
 | `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `list --detailed` adds each branch's head, start and times, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
@@ -222,13 +222,18 @@ addressing are refused; see [storage upgrade](../operations/upgrade.md#storage-u
 
 ## Load modes
 
-`load --mode` is required:
+`load --mode` is required; each mode is the [write statement](../mutations/index.md#statements) of its name:
 
 | Mode | Existing entities | Typical use |
 |---|---|---|
+| `insert` | Kept; an existing ID fails the load with `key_conflict` and nothing publishes | Strict batch insertion |
+| `upsert` | Sets the properties a record names; an absent property key keeps its value, an explicit `null` clears | Idempotent patching from partial records |
+| `replace` | Replaced whole by ID; a property a record omits becomes null | Idempotent synchronization of complete records |
 | `overwrite` | Each node or edge type represented in the batch is replaced; other types remain | Initial load or import of a complete export |
-| `append` | Kept; duplicate IDs fail | Strict batch insertion |
-| `merge` | Replaced whole by ID; an omitted property becomes null | Idempotent synchronization |
+
+`append` and `merge`, edition 2's names, are refused with `insert` and
+`replace` as the fixes. A job that retries a load after an uncertain outcome
+uses `upsert` or `replace`.
 
 `--branch <NAME>` selects an existing branch. Add `--from <BASE>` to create a
 missing branch from an explicit base. Overwrite is destructive and may require

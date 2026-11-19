@@ -61,8 +61,9 @@ key). Name rules depend on the graph's vintage:
   `__src`/`__dst` on edges, and Lance's virtual column names (`_rowid`,
   `_rowaddr`, …). Other `_` names are still accepted there, but they block
   `schema upgrade-system-columns`.
-- **All vintages:** `from` and `to` are reserved edge property names (insert
-  endpoints), and `_distance`/`_score` are refused as property names.
+- **All vintages:** `from` and `to` are reserved edge property names (edition
+  2's endpoint assignments; writes assign `@src` and `@dst`), and
+  `_distance`/`_score` are refused as property names.
 
 Inspect `system_columns` in `schema show --json` rather than inferring the
 graph vintage from the binary. Writing bare `src` in an edge constraint on a

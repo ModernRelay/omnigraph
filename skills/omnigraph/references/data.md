@@ -29,7 +29,7 @@ edits.
 > **`--mode` is required** — there is no default. Overwrite is destructive, so
 > the CLI never picks a mode for you.
 
-> **Per-load bounds.** One keyed load (`append`/`merge`)
+> **Per-load bounds.** One keyed load (`insert`/`upsert`/`replace`)
 > stages at most **8,192 entities and 32 MiB of Arrow memory per touched type**; a larger
 > batch is refused up front (HTTP 413, typed `resource_limit`) with no durable
 > effect — split it into chunks, each an atomic graph commit. Two further
@@ -135,16 +135,23 @@ one-shot review-branch flow below). Without `--from`, the target `--branch`
   edge type present in the batch; types absent from the batch stay unchanged.
   The loader validates constraints and referential integrity before publication.
   Use a review branch for an established graph.
-- **`merge`** (upsert) — inserts or replaces each row by logical entity `id`
-  (derived from the typed `@key` tuple for keyed nodes and keyed edges). A
-  matched row is replaced whole: a property the record omits becomes null,
-  Blob and vector included, so send complete records; to change only named
-  properties, use an `update` mutation. Rows not in the file are preserved.
-  An unkeyed edge without a supplied `id` never matches an existing row, so
-  re-running the same merge file duplicates it; declare `@key(@src, @dst)` when
-  creating the edge type if repeated loads must converge.
-- **`append`** (strict insert) — fails on entity-ID collision. Use when you're
-  certain every row is new.
+Each mode is the write statement of its name, matched by logical entity `id`
+(derived from the typed `@key` tuple for keyed nodes and keyed edges); rows not
+in the file are preserved:
+
+- **`insert`** (strict) — fails on an entity-ID collision with `key_conflict`,
+  publishing nothing. Use when every row is new.
+- **`upsert`** (patch) — creates, or sets the properties a record names: an
+  absent property key keeps its stored value, an explicit `null` clears it
+  (in CSV, a property with no column keeps its value, an empty field clears).
+- **`replace`** (whole row) — creates, or replaces a matched row whole: a
+  property the record omits becomes null, Blob and vector included.
+
+A job that retries a load uses `upsert` or `replace`. `append` and `merge`,
+edition 2's names, are refused with `insert` and `replace` as the fixes. An
+unkeyed edge without a supplied `id` never matches an existing row, so re-running
+a file duplicates it; declare `@key(@src, @dst)` when creating the edge type if
+repeated loads must converge.
 
 With `--json`, an effectful `mutate` or `load` returns the exact published
 `commit`; a no-op mutation returns `commit: null`. For compare-and-swap writes,
@@ -156,7 +163,7 @@ branch operation had no effect. See [branch outcome details](changes.md#branch-s
 
 ### Embeddings are explicit input
 
-`@embed` does not populate vectors during `merge` or `overwrite`. Supply
+`@embed` does not populate vectors during any load mode. Supply
 vectors in the JSONL, or run the offline `omnigraph embed` file transformation
 and load its output. See [`search.md`](search.md).
 
@@ -219,7 +226,7 @@ HTTP `409`). The same edge inserted on both branches depends on its identity:
 unkeyed edges are both kept; `@unique(@src, @dst)` reports `unique_violation`;
 `@key(@src, @dst)` converges identical inserts to one row and reports
 `divergent_insert` (with the derived id) when non-key properties differ —
-re-insert the agreed values on one branch, then merge again. A branch both
+`replace` the key with the agreed values on one branch, then merge again. A branch both
 sides merged earlier stays their merge base after it is deleted, and `cleanup`
 keeps the history that base needs.
 

@@ -241,7 +241,7 @@ told you or from files they point you to. Nodes and edges can share a file:
 omnigraph load --data seed.jsonl --mode replace --target ./graph.omni
 ```
 
-`--mode` is required; `merge` upserts by key. See [data changes](data.md) for
+`--mode` is required; `replace` writes each record's whole row by key. See [data changes](data.md) for
 the other modes and for `mutate`.
 
 ## 6. Query it

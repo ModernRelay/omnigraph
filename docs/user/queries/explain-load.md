@@ -109,10 +109,10 @@ shows while the keyed adapters write. Such a document has two nodes:
 | `Validate` | as above: `table`, `checks` with each check's `access`, `removal` |
 | `DeltaSource` | `table`, `version` (the committed version the write pins, or `null` for a table new in the base), `rows` (the staged rows, exact), `delta` and `deletes` |
 
-`delta` is what the write does to the table's rows: `insert` (a strict
-insert, an append), `upsert` (a keyed upsert, a merge load, a staged
-mutation, a branch merge's effects), `replace` (an overwrite's whole new
-image) or `removal` (no rows: the write only removes ids). `deletes` says
+`delta` is what the write does to the table's rows: `insert` (an `insert`
+statement or load), `upsert` (an `upsert` or `replace` statement or load,
+whose rows reach the keyed upsert adapter whole, a staged mutation, a branch
+merge's effects), `replace` (an overwrite's whole new image) or `removal` (no rows: the write only removes ids). `deletes` says
 whether the write removes ids from the table (a `delete`, a branch merge's
 deletions); a removed node may strand committed edges, so a node table with
 `deletes` carries the `retained_edges` checks an overwrite carries, and an

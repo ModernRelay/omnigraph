@@ -105,9 +105,9 @@ route.
   unchanged retry need not succeed. Use `--if-commit` to refuse a write when
   the head moved. Commit conflicts use generic `conflict`,
   so HTTP `409` alone does not identify a retryable case.
-- `key_conflict`: an append or strict insert found an existing id. Decide
-  whether that entity is the intended one; do not silently turn the operation
-  into an upsert.
+- `key_conflict`: an `insert` statement or load found an existing id. Decide
+  whether that entity is the intended one; a retried job should have used
+  `upsert` or `replace`, but do not switch silently.
 - `writer_fenced` (HTTP `409` with `writer_fenced: {held?, read?, current}`):
   the branch's writer epoch refused the writing process, because another
   process claimed the branch or the serving one holds no claim. Nothing was

@@ -474,12 +474,12 @@ where $p.age > 30
 
 ## Mutations
 
-> **No `mutation` keyword.** Agents trained on GraphQL reflexively write `mutation { insert T { ... } }` or `mutation name(...)` — both are parse errors (`Q009` for the keyword). Every executable block in a `.gq` file is a named `query`; a body that ends in statements (`insert` / `update` / `delete`) is a write. Dispatch via `omnigraph mutate` (not `query`).
+> **No `mutation` keyword.** Agents trained on GraphQL reflexively write `mutation { insert T { ... } }` or `mutation name(...)` — both are parse errors (`Q009` for the keyword). Every executable block in a `.gq` file is a named `query`; a body that ends in statements (`insert` / `upsert` / `replace` / `update` / `delete`) is a write. Dispatch via `omnigraph mutate` (not `query`).
 
 A write body is one or more groups. A group selects its rows with the same
 `match { … }` and `where` a read writes, `match { $x: Signal } where $x.slug = $slug`,
 and its statements follow and run once per row: `update $x set { … }`,
-`delete $x`. An `insert T { … }` with no `match` runs once; a later group opens
+`delete $x`. An `insert`, `upsert` or `replace T { … }` with no `match` runs once; a later group opens
 with its own `match`. Every group selects on the graph the write started from,
 never on an earlier group's effects, so a group whose selection reads a type an
 earlier group changes is refused (`T91`): use a second write, or several
@@ -491,12 +491,31 @@ properties through the binding (`$x.slug`, `$x.@src`). A statement takes no
 traversals, edge bindings, blocks, `let` and `from`, and runs as a read of the
 graph the write started from:
 `match { $c: Company, $p $k:worksAt $c } where $c.slug = $slug  delete $k`.
-Assignments may read the row (`city: $c.city`; an endpoint as `to: $c`), and
-an `insert` runs once per row. A `Blob` read from a row is refused
+Assignments may read the row (`city: $c.city`; an endpoint as `@dst: $c`), and
+an `insert`, `upsert` or `replace` runs once per row. A `Blob` read from a row is refused
 (`T86`); rows of one statement giving one entity's property two values are
 refused (`E4`).
 
-### Insert
+### Insert, upsert and replace
+
+Five statements write, one per intent; three name their target by key:
+
+| Statement | Key absent | Key present |
+|---|---|---|
+| `insert T { … }` | creates | fails with `key_conflict`; nothing publishes |
+| `upsert T { … }` | creates | sets the named properties; the others, Blob and vector included, keep their values |
+| `replace T { … }` | creates | writes the whole row; an omitted nullable property becomes null |
+| `update $x set { … }` | selects nothing | sets the named properties of each selected node or edge |
+| `delete $x` | selects nothing | removes each selected node or edge, and a node's incident edges |
+
+`null` clears in every statement. A job that may retry after an uncertain
+outcome uses `upsert` or `replace`, which are idempotent; a retried `insert`
+whose first attempt landed fails with `key_conflict`, whose message names the
+other two. On a type with no `@key`, `insert` always creates and `upsert` or
+`replace` is `T92` (use `insert`). `upsert` reads the stored values of the
+properties a row omits (Blob bytes included); a row naming every property
+reads nothing more. An `update` that changes no stored value publishes no
+commit; an unchanged `upsert` or `replace` still publishes one.
 
 ```gq
 query add_signal($slug: String, $name: String, $brief: String,
@@ -512,8 +531,9 @@ query add_signal($slug: String, $name: String, $brief: String,
 }
 ```
 
-**Every non-nullable property must be provided.** Lint normally catches missing
-ones as:
+**Creating needs every non-nullable property.** For `insert` and `replace`,
+lint catches a missing one as below; an `upsert` names only the key and what
+it sets, and is refused at run time if it would create without one:
 
 ```
 type error: T12: insert for `Signal` must provide non-nullable property `brief`
@@ -535,9 +555,10 @@ query link_signal_forms_pattern($signal: String, $pattern: String) {
 }
 ```
 
-A propertyless edge needs only `from` and `to`, which are logical endpoint IDs.
-GQ has no nested `data {}` block. These assignments are distinct from the
-endpoint meta-fields used in a `where`: `match { $x: FormsPattern } where $x.@src = $signal  delete $x`.
+A propertyless edge needs only `@src` and `@dst`, the logical endpoint IDs or
+bound references; edition 2's `from:` and `to:` are refused (`T11`) with that
+fix. GQ has no nested `data {}` block. A `where` reads the same names:
+`match { $x: FormsPattern } where $x.@src = $signal  delete $x`.
 
 ### Update
 
@@ -548,8 +569,8 @@ query retitle_signal($slug: String, $new_title: String) {
 }
 ```
 
-An `update` cannot assign a `@key` property (refused when it runs, not by
-`lint`): delete and re-insert instead. `null` as a value (`note: null`)
+`update` takes a node or an edge variable. It cannot assign a `@key` property
+or an edge endpoint (`T93`): delete and insert instead, in two writes. `null` as a value (`note: null`)
 clears a nullable property; a null assigned to a non-nullable property is
 refused before any row is matched.
 
@@ -572,15 +593,15 @@ query add_and_link($slug: String, $pattern: String, $createdAt: DateTime, $updat
 }
 ```
 
-There is no `upsert` keyword: `insert` on a node or edge with `@key` upserts
-the derived identity and replaces an existing row whole: a property the insert
-omits becomes null, Blob and vector included, and a missing required property
-is refused. Use `update` to change only named properties. Without a key, `insert` is strict; inserting an unkeyed
-edge twice creates two edges. Use `load --mode replace` for bulk upsert. Edge
-`update` is unsupported; reinsert a keyed edge to change non-key properties,
-or delete and reinsert an unkeyed edge.
+`replace` writes a keyed row whole and `upsert` sets only what it names; the
+`FormsPattern` edge above uses `insert`: without a key it always creates, so
+inserting it twice creates two edges; on an edge type with `@key(@src, @dst)` a
+second `insert` fails with `key_conflict`, and `replace` makes it repeatable.
+`load --mode upsert` and `--mode replace` are the bulk forms. `update $k set { … }`
+changes an edge's non-key properties; to move an edge, delete it and insert
+another, in two writes.
 
-> **Insert/update-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`update` in the same query is a type error (`T76`) that `lint` reports. The split is deliberate: one mutation query is constructive XOR destructive. Split a delete-then-insert into two separate mutations.
+> **Constructive-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts, upserts, replaces and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`upsert`/`replace`/`update` in the same query is a type error (`T76`) that `lint` reports. The split is deliberate: one mutation query is constructive XOR destructive. Split a delete-then-insert into two separate mutations.
 
 A write's filter may compare at most four properties more than once each with `=`, `!=` or `in` (for example `$x.s in ["a"] or $x.s in ["b"]` compares `s` twice). One that compares more is refused before any effect; split the condition across groups or simplify it.
 
