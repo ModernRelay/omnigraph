@@ -254,6 +254,18 @@ fn a_predicate_inside_match_prints_the_where_after_the_braces() {
             "Q012",
             "query q() { match { $p: Person } where not coalesce($p.age > 20 and $p.name = \"a\", false) return { $p } }",
         ),
+        // An `exists` block holding only filters binds nothing to test:
+        // its filter held, a null one excluded, nested blocks kept.
+        (
+            "query q() { match { $p: Person } where exists { $p.age > 20  exists { $p knows $q } } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where coalesce($p.age > 20 and exists { $p knows $q }, false) return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where exists { $p.age > 20 } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where coalesce($p.age > 20, false) return { $p } }",
+        ),
         (
             "query q() { match { $p: Person $p knows $q } return { $q } }",
             "Q016",

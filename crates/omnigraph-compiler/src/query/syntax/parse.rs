@@ -4344,6 +4344,27 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
         match inner.as_rule() {
             Rule::expr => expr(inner),
             Rule::block_value => {
+                // A block holding only filters of outer names binds nothing
+                // to test: `exists { φ }` held on the rows its filter held
+                // on, a null one excluded, as `not { φ }` is
+                // `not coalesce(φ, false)`. Moving the filter to the block's
+                // own `where` would leave a block of no element.
+                if child(&inner, Rule::kw_exists).is_some()
+                    && let Some(preds) = only_filters(&inner)
+                {
+                    return Err(refusal(
+                        input,
+                        Q017,
+                        "a block holding only filters tests no pattern: `exists { φ }` is `coalesce(φ, false)`",
+                        span,
+                        vec![edit(
+                            span.0,
+                            span.1,
+                            format!("coalesce({}, false)", preds.join(" and ")),
+                        )],
+                        MACHINE,
+                    ));
+                }
                 let at = source_span(&inner);
                 let mut func = None;
                 let mut arg = None;
