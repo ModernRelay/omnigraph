@@ -182,10 +182,10 @@ fn property_syntax(prop: Pair<'_, Rule>) -> (String, PropertySyntax) {
                         .collect(),
                 );
             }
-            Rule::annotation => {
-                if item.into_inner().next().map(|n| n.as_str()) == Some("index") {
-                    syntax.plain_index = true;
-                }
+            Rule::annotation
+                if item.clone().into_inner().next().map(|n| n.as_str()) == Some("index") =>
+            {
+                syntax.plain_index = true;
             }
             _ => {}
         }

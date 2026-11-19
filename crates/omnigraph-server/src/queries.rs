@@ -197,7 +197,7 @@ impl QueryRegistry {
                     errors.push(LoadError {
                         query: Some(name.to_string()),
                         message: refusal.0.clone(),
-                        diagnostic: refusal.1.clone().map(Box::new),
+                        diagnostic: refusal.1.clone(),
                     });
                 }
             }
@@ -308,7 +308,7 @@ impl QueryRegistry {
                 Err((message, diagnostic)) => errors.push(LoadError {
                     query: Some(spec.name.clone()),
                     message,
-                    diagnostic: diagnostic.map(Box::new),
+                    diagnostic,
                 }),
             }
         }
@@ -366,7 +366,7 @@ impl QueryRegistry {
 
 /// A refusal: its message and, when it carries one, the compiler's
 /// diagnostic.
-type Refusal = (String, Option<omnigraph_compiler::QueryDiagnostic>);
+type Refusal = (String, Option<Box<omnigraph_compiler::QueryDiagnostic>>);
 
 /// One stored-query file, each declaration compiled on its own.
 ///
@@ -522,7 +522,8 @@ impl FileUnits {
 
 /// The declarations of `source`, or its refusal.
 fn declarations_of(source: &str) -> Result<Vec<QueryDecl>, Refusal> {
-    let file = parse_query(source).map_err(|err| (err.to_string(), err.diagnostic().cloned()))?;
+    let file = parse_query(source)
+        .map_err(|err| (err.to_string(), err.diagnostic().cloned().map(Box::new)))?;
     if !file.settings.is_empty() {
         return Err((STORED_QUERY_CARRIES_NO_SETTINGS.to_string(), None));
     }
