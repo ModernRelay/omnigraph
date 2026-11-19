@@ -1,5 +1,5 @@
 # issue: none
-# notes: Known gap: a same-value Company update in the first fast forward keeps main's Company registration, so the repeat merge is merged.
+# notes: A same-value Company update changes no stored value, so it stages nothing and leaves b0's Company registration main's; the repeat merge is a fast forward too.
 
 --- runner
 timeout_ms: 10000
@@ -34,7 +34,7 @@ query insert_b() { replace Person { name: "b" } }
 
 --- mutate
 branch merge b0
---- expect outcome: merged
+--- expect outcome: fast_forward
 
 --- query
 query main_people() { match { $p: Person } return { $p.name } }

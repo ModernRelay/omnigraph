@@ -1031,6 +1031,58 @@ impl RowValues {
     }
 }
 
+/// The rows of `updated` that change a stored value: those where an assigned
+/// column (`resolved`, or a per-row property of `values`) holds a value other
+/// than the `matched` row's, under the fixed value order (a null equals a
+/// null, `-0.0` differs from `0.0`). An update stages only these, so a write
+/// whose updates change nothing stages nothing and publishes no commit. A row
+/// whose assigned column the match did not read is kept: an assigned Blob is
+/// left out of the match scan, and proving it unchanged would read its stored
+/// bytes, which the update does not otherwise do.
+fn rows_that_change(
+    matched: &RecordBatch,
+    updated: RecordBatch,
+    resolved: &HashMap<String, Literal>,
+    values: Option<&RowValues>,
+) -> Result<RecordBatch> {
+    if matched.num_rows() != updated.num_rows() || updated.num_rows() == 0 {
+        return Ok(updated);
+    }
+    let mut comparators = Vec::new();
+    for field in updated.schema().fields() {
+        let name = field.name();
+        if !(resolved.contains_key(name) || values.is_some_and(|v| v.assigns(name))) {
+            continue;
+        }
+        let (Some(before), Some(after)) =
+            (matched.column_by_name(name), updated.column_by_name(name))
+        else {
+            return Ok(updated);
+        };
+        match arrow_ord::ord::make_comparator(
+            before.as_ref(),
+            after.as_ref(),
+            arrow_schema::SortOptions::default(),
+        ) {
+            Ok(comparator) => comparators.push(comparator),
+            Err(_) => return Ok(updated),
+        }
+    }
+    let changed: arrow_array::BooleanArray = (0..updated.num_rows())
+        .map(|row| {
+            Some(
+                comparators
+                    .iter()
+                    .any(|compare| compare(row, row) != std::cmp::Ordering::Equal),
+            )
+        })
+        .collect();
+    if changed.true_count() == updated.num_rows() {
+        return Ok(updated);
+    }
+    arrow_select::filter::filter_record_batch(&updated, &changed).map_err(OmniError::arrow_internal)
+}
+
 /// `batch` with each per-row property of `values` set, row by row, to the
 /// value its entity takes; `batch` itself when the update has none.
 fn apply_row_values(
@@ -2939,6 +2991,7 @@ impl Omnigraph {
                         staging.write_budget(),
                     )?;
                     let updated = apply_row_values(updated, row_values, id_column)?;
+                    let updated = rows_that_change(&matched, updated, &resolved, row_values)?;
                     staging.append_column_patch(&table_key, updated, plan.patch_columns.clone())
                 };
             match matches.mode {
@@ -2958,6 +3011,7 @@ impl Omnigraph {
                         staging.write_budget(),
                     )?;
                     let updated = apply_row_values(updated, row_values, id_column)?;
+                    let updated = rows_that_change(&matched, updated, &resolved, row_values)?;
                     let updated_schema = updated.schema();
                     // A refused row rewrite takes the patch, so admission
                     // never depends on the mode (`append_batch` refuses before
@@ -3053,6 +3107,7 @@ impl Omnigraph {
             staging.write_budget(),
         )?;
         let updated = apply_row_values(updated, row_values, id_column)?;
+        let updated = rows_that_change(&matched, updated, &resolved, row_values)?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
         // The updated rows replace their ids' earlier pending versions, so

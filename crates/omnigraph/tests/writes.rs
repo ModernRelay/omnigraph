@@ -167,6 +167,122 @@ async fn traversal_selection_publishes_once_or_not_at_all() {
     assert_eq!(head_commit_id(uri).await, commit.graph_commit_id);
 }
 
+/// An update that changes no stored value stages nothing, so a write of
+/// only such updates publishes no commit, while it still reports the entities
+/// it selected. Equality is the fixed value order: a null equals a null and
+/// `-0.0` differs from `0.0`. Covered: the sole update's column patch, an
+/// update whose value reads the row, two updates of one selection (the
+/// pending-union path), an edge update, and a selection where only some rows
+/// change, which stages and publishes just those.
+#[tokio::test]
+async fn an_update_that_changes_no_stored_value_publishes_nothing() {
+    use base64::Engine as _;
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    n: I64?
+    x: F64?
+    tags: [String]?
+    emb: Vector(3)?
+    note: String?
+    file: Blob?
+}
+edge Cites: Doc -> Doc { w: I64? }
+"#;
+    const WRITES: &str = r#"
+query same_scalars() {
+    match { $d: Doc } where $d.slug = "d1"
+    update $d set { n: 1, x: 0.0, tags: ["a"], emb: [1.0, 2.0, 3.0], note: null }
+}
+query copy_n() {
+    match { $d: Doc } where $d.slug = "d1"
+    update $d set { n: $d.n }
+}
+query two_statements() {
+    match { $d: Doc } where $d.slug = "d1"
+    update $d set { n: 1 }
+    update $d set { note: null }
+}
+query same_weight() {
+    match { $a: Doc, $a $k:cites $b }
+    update $k set { w: 5 }
+}
+query negative_zero() {
+    match { $d: Doc } where $d.slug = "d1"
+    update $d set { x: -0.0 }
+}
+query every_n_one() {
+    match { $d: Doc }
+    update $d set { n: 1 }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+    let file = format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(vec![7_u8; 64])
+    );
+    let data = [
+        serde_json::json!({"type": "Doc", "data": {"slug": "d1", "n": 1, "x": 0.0,
+            "tags": ["a"], "emb": [1.0, 2.0, 3.0], "file": file}}),
+        serde_json::json!({"type": "Doc", "data": {"slug": "d2", "n": 2}}),
+        serde_json::json!({"edge": "Cites", "from": "d1", "to": "d2", "data": {"w": 5}}),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join("\n");
+    db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
+
+    for (name, nodes, edges) in [
+        ("same_scalars", 1, 0),
+        ("copy_n", 1, 0),
+        ("two_statements", 2, 0),
+        ("same_weight", 0, 1),
+    ] {
+        let head = head_commit_id(uri).await;
+        let receipt = db
+            .mutate_with_receipt("main", WRITES, name, &params(&[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            (receipt.result.affected_nodes, receipt.result.affected_edges),
+            (nodes, edges),
+            "{name} reports the entities it selected"
+        );
+        assert!(
+            receipt.commit.is_none(),
+            "{name} changes no stored value and publishes nothing"
+        );
+        assert_eq!(head_commit_id(uri).await, head, "{name} moved the head");
+    }
+
+    // `-0.0` is a different stored value from `0.0`.
+    let head = head_commit_id(uri).await;
+    let receipt = db
+        .mutate_with_receipt("main", WRITES, "negative_zero", &params(&[]))
+        .await
+        .unwrap();
+    let commit = receipt.commit.expect("-0.0 over 0.0 changes the value");
+    assert_eq!(commit.parent_commit_id.as_deref(), Some(head.as_str()));
+
+    // Only d2 changes: the write publishes once and reports both selected.
+    let head = head_commit_id(uri).await;
+    let receipt = db
+        .mutate_with_receipt("main", WRITES, "every_n_one", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(receipt.result.affected_nodes, 2);
+    let commit = receipt.commit.expect("d2's n changes");
+    assert_eq!(commit.parent_commit_id.as_deref(), Some(head.as_str()));
+    let again = db
+        .mutate_with_receipt("main", WRITES, "every_n_one", &params(&[]))
+        .await
+        .unwrap();
+    assert!(again.commit.is_none(), "a repeat of it changes nothing");
+}
+
 /// A failed mutation (validation error mid-query) leaves the target branch's
 /// observable state unchanged. There is nothing for cleanup to delete.
 #[tokio::test]
