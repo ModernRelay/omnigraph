@@ -13,7 +13,18 @@
 //! - `L209`: an alias equal to its item's column name dropped;
 //! - `L210`: a call's options in the registry's order, those equal to their
 //!   default dropped;
-//! - `L211`: `bm25` over `terms(q, mode: any)` is `bm25` over the String `q`.
+//! - `L211`: `bm25` over `terms(q, mode: any)` is `bm25` over the String `q`;
+//! - `L212`: `case … end` is nested `if`, a missing `else` meaning `null`;
+//! - `L213`: `a || b` is `concat(a, b)`;
+//! - `L214`: `<>` is `!=`;
+//! - `L215`: a single-quoted string is the double-quoted one;
+//! - `L216`: a keyword or registry name in another letter case is the
+//!   lowercase one.
+//!
+//! The parser records `L212` to `L216` as it lowers them
+//! ([`crate::query::syntax::Respelling`]); the others are read from the tree.
+//! Every form carries its fix as one byte-range edit of the source, which
+//! `omnigraph lint --fix` applies.
 //!
 //! Two rewrites have the rows of their canonical form but another typed IR,
 //! so they are the author's choice rather than canonical forms: `L204`,
@@ -21,11 +32,11 @@
 //! `not exists { P }`.
 
 use crate::query::check::{OptionDefault, REGISTRY_OPTIONS, item_name};
-use crate::query::diagnostic::Position;
+use crate::query::diagnostic::{Position, TextEdit};
 use crate::query::syntax::print;
 use crate::query::syntax::{
     Arg, Block, BlockFunc, Call, Decl, DeclBody, EdgeSelector, Element, Expr, LetValue, Pattern,
-    ReadBody, RelExpr, Stmt,
+    ReadBody, RelExpr, SourceSpan, Stmt,
 };
 use crate::query::value::{AggFunc, CompOp, Literal};
 
@@ -40,11 +51,28 @@ pub(crate) struct CanonicalForm {
     /// Whether the fix keeps the typed IR (a canonical form) or only the
     /// rows (`L204`, `L205`).
     pub same_ir: bool,
+    /// The fix as a byte-range edit of the source; `None` for a tree built
+    /// rather than parsed.
+    pub edit: Option<TextEdit>,
 }
 
 /// Every non-canonical form of `decl`, in written order.
 pub(crate) fn canonical_forms(decl: &Decl) -> Vec<CanonicalForm> {
     let mut out = Vec::new();
+    for r in &decl.respellings.0 {
+        out.push(CanonicalForm {
+            code: r.code,
+            position: Some(r.position),
+            written: r.written.clone(),
+            fix: r.fix.clone(),
+            same_ir: true,
+            edit: Some(TextEdit {
+                start: r.start,
+                end: r.end,
+                replacement: r.fix.clone(),
+            }),
+        });
+    }
     match &decl.body {
         DeclBody::Read(body) => read_body(body, &mut out),
         DeclBody::Write(body) => {
@@ -62,7 +90,18 @@ pub(crate) fn canonical_forms(decl: &Decl) -> Vec<CanonicalForm> {
             }
         }
     }
+    out.sort_by_key(|f| {
+        f.edit
+            .as_ref()
+            .map_or((usize::MAX, 0), |e| (e.start, e.end))
+    });
     out
+}
+
+/// The byte range a parsed node was written at; `None` for a node built
+/// rather than parsed.
+fn range(at: &SourceSpan) -> Option<(usize, usize)> {
+    (at.end > at.start).then_some((at.start, at.end))
 }
 
 fn push(
@@ -72,13 +111,20 @@ fn push(
     written: String,
     fix: String,
     same_ir: bool,
+    at: Option<(usize, usize)>,
 ) {
+    let edit = at.map(|(start, end)| TextEdit {
+        start,
+        end,
+        replacement: fix.clone(),
+    });
     out.push(CanonicalForm {
         code,
         position,
         written,
         fix,
         same_ir,
+        edit,
     });
 }
 
@@ -97,6 +143,7 @@ fn read_body(body: &ReadBody, out: &mut Vec<CanonicalForm>) {
                 format!("{} as {alias}", print::expr(&p.expr)),
                 print::expr(&p.expr),
                 true,
+                body.spans.projections.get(i).and_then(range),
             );
         }
     }
@@ -104,13 +151,19 @@ fn read_body(body: &ReadBody, out: &mut Vec<CanonicalForm>) {
         let at = body.spans.order.get(i).map(|s| s.position);
         expr(&o.expr, at, out);
         if o.descending == Some(false) {
+            let nulls = match o.nulls_first {
+                None => "",
+                Some(true) => " nulls first",
+                Some(false) => " nulls last",
+            };
             push(
                 out,
                 "L208",
                 at,
-                format!("{} asc", print::expr(&o.expr)),
-                print::expr(&o.expr),
+                format!("{} asc{nulls}", print::expr(&o.expr)),
+                format!("{}{nulls}", print::expr(&o.expr)),
                 true,
+                body.spans.order.get(i).and_then(range),
             );
         }
     }
@@ -118,15 +171,20 @@ fn read_body(body: &ReadBody, out: &mut Vec<CanonicalForm>) {
 
 fn pattern(p: &Pattern, out: &mut Vec<CanonicalForm>) {
     for (i, e) in p.elements.iter().enumerate() {
-        let at = p.spans.elements.get(i).map(|s| s.position);
-        element(e, at, out);
+        let span = p.spans.elements.get(i);
+        element(e, span.map(|s| s.position), span.and_then(range), out);
     }
     if let Some(w) = &p.predicate {
         expr(w, p.spans.predicate.as_ref().map(|s| s.position), out);
     }
 }
 
-fn element(e: &Element, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
+fn element(
+    e: &Element,
+    at: Option<Position>,
+    written_at: Option<(usize, usize)>,
+    out: &mut Vec<CanonicalForm>,
+) {
     crate::stack::deep(|| match e {
         Element::Let { value, .. } => match value {
             LetValue::Relation(body) => read_body(body, out),
@@ -155,6 +213,7 @@ fn element(e: &Element, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
                     print::element(e),
                     print::element(&Element::Traversal(canonical)),
                     true,
+                    written_at,
                 );
             }
         }
@@ -165,7 +224,10 @@ fn expr(e: &Expr, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
     crate::stack::deep(|| {
         // A block's own position is more exact than its enclosing clause's.
         if let Expr::Compare {
-            op, left, right, ..
+            op,
+            left,
+            right,
+            at: compare_at,
         } = e
             && let (Expr::Block(b), Expr::Literal(Literal::Integer(n))) =
                 (left.as_ref(), right.as_ref())
@@ -184,7 +246,15 @@ fn expr(e: &Expr, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
                 _ => None,
             };
             if let Some((code, fix, same_ir)) = found {
-                push(out, code, Some(b.at.position), print::expr(e), fix, same_ir);
+                push(
+                    out,
+                    code,
+                    Some(b.at.position),
+                    print::expr(e),
+                    fix,
+                    same_ir,
+                    range(compare_at),
+                );
             }
         }
         match e {
@@ -238,11 +308,27 @@ fn call(c: &Call, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
                 let inner_args = inner.args.clone();
                 flat.args.splice(0..1, inner_args);
             }
-            push(out, "L206", at, print::call(c), print::call(&flat), true);
+            push(
+                out,
+                "L206",
+                at,
+                print::call(c),
+                print::call(&flat),
+                true,
+                range(&c.at),
+            );
         }
         let ordered = canonical_options(c);
         if ordered.options != c.options {
-            push(out, "L210", at, print::call(c), print::call(&ordered), true);
+            push(
+                out,
+                "L210",
+                at,
+                print::call(c),
+                print::call(&ordered),
+                true,
+                range(&c.at),
+            );
         }
         // `bm25` over `terms(q, mode: any)` is `bm25` over the String `q`.
         if c.name == "bm25"
@@ -260,6 +346,7 @@ fn call(c: &Call, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
                 print::call(c),
                 print::call(&over_string),
                 true,
+                range(&c.at),
             );
         }
         for a in &c.args {

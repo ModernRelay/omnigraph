@@ -1002,20 +1002,73 @@ fn a_write_groups_elements_are_in_its_match() {
     assert!(parse_text("query q() { match { $p: P } where $p.a = null return { $p } }").is_ok());
 }
 
+/// The non-canonical spellings section 3 admits parse to their canonical
+/// form's tree, and each records its lint code and canonical text
+/// (section 6): `||`, `case` in both forms with and without `else`, `<>`,
+/// a single-quoted string and a keyword or registry name in another case.
 #[test]
-fn other_respellings_print_their_fix() {
-    for (src, fix) in [
-        ("$a || $b = \"x\"", "concat($a, $b)"),
+fn non_canonical_spellings_parse_to_the_canonical_tree_and_name_their_fix() {
+    for (written, canonical, codes) in [
         (
-            "case when $d.year > 1 then 1 else 2 end = 1",
-            "if($d.year > 1, 1, 2)",
+            "where $a || $b || $c = \"x\"",
+            "where concat($a, $b, $c) = \"x\"",
+            &["L213"][..],
+        ),
+        (
+            "where ($a || $b) || $c = \"x\"",
+            "where concat(concat($a, $b), $c) = \"x\"",
+            &["L213", "L213"][..],
+        ),
+        (
+            "where case when $d.year > 1 then 1 else 2 end = 1",
+            "where if($d.year > 1, 1, 2) = 1",
+            &["L212"][..],
+        ),
+        (
+            "where case when $d.year > 1 then 1 when $d.year < 0 then 3 end = 1",
+            "where if($d.year > 1, 1, if($d.year < 0, 3, null)) = 1",
+            &["L212"][..],
+        ),
+        (
+            "where case $d.year when 1 then \"a\" when 2 then \"b\" else \"c\" end = \"a\"",
+            "where if($d.year = 1, \"a\", if($d.year = 2, \"b\", \"c\")) = \"a\"",
+            &["L212"][..],
+        ),
+        ("where $d.year <> 1", "where $d.year != 1", &["L214"][..]),
+        (
+            "where $d.title = 'it\\'s \"x\"'",
+            "where $d.title = \"it's \\\"x\\\"\"",
+            &["L215"][..],
+        ),
+        (
+            "WHERE $d.year IS NOT NULL AND LOWER($d.title) = \"x\" OR $d.ok = TRUE",
+            "where $d.year is not null and lower($d.title) = \"x\" or $d.ok = true",
+            &["L216"; 8][..],
         ),
     ] {
-        let e = refusal_of(&format!(
-            "query q() {{ match {{ $d: Doc }} where {src} return {{ $d }} }}"
-        ));
-        assert_eq!(e.code.as_str(), "Q012", "{src}");
-        assert_eq!(e.fix.as_deref(), Some(fix), "{src}");
+        let full = |w: &str| format!("query q() {{ match {{ $d: Doc }} {w} return {{ $d }} }}");
+        let got = parse_source(&full(written)).unwrap_or_else(|e| panic!("{written}: {e:?}"));
+        assert_eq!(got, parsed(&full(canonical)), "{written}");
+        let Body::Decls(decls) = &got.body else {
+            panic!("a declaration")
+        };
+        let found: Vec<&str> = decls[0].respellings.0.iter().map(|r| r.code).collect();
+        assert_eq!(found, codes, "{written}");
+        // Applying every fix gives the canonical text, which records none.
+        let src = full(written);
+        let mut fixed = src.clone();
+        let mut fixes: Vec<_> = decls[0].respellings.0.clone();
+        fixes.retain(|r| {
+            !decls[0]
+                .respellings
+                .0
+                .iter()
+                .any(|o| o != r && o.start <= r.start && r.end <= o.end)
+        });
+        for r in fixes.iter().rev() {
+            fixed.replace_range(r.start..r.end, &r.fix);
+        }
+        assert_eq!(parsed(&fixed), parsed(&full(canonical)), "{fixed}");
     }
     for (src, fix) in [
         ("let $x in $r", "from $r"),
@@ -1368,7 +1421,8 @@ const SYNTAX_RULES: &[&str] = &[
     "call_keyword_word",
     "call_name",
     "call_option",
-    "case_rec",
+    "call_word",
+    "case_expr",
     "catalogue_edge",
     "chained_rec",
     "commit_drop",
@@ -1426,11 +1480,8 @@ const SYNTAX_RULES: &[&str] = &[
     "fw_between",
     "fw_by",
     "fw_call",
-    "fw_case",
     "fw_create",
     "fw_detach",
-    "fw_else",
-    "fw_end",
     "fw_ends",
     "fw_filter",
     "fw_group",
@@ -1441,8 +1492,6 @@ const SYNTAX_RULES: &[&str] = &[
     "fw_optional",
     "fw_retrieve",
     "fw_starts",
-    "fw_then",
-    "fw_when",
     "fw_with",
     "group_by_rec",
     "having_rec",
@@ -1462,6 +1511,7 @@ const SYNTAX_RULES: &[&str] = &[
     "kw_and",
     "kw_as",
     "kw_branch",
+    "kw_case",
     "kw_columns",
     "kw_commit",
     "kw_create",
@@ -1474,8 +1524,11 @@ const SYNTAX_RULES: &[&str] = &[
     "kw_distinct",
     "kw_drop",
     "kw_dry",
+    "kw_else",
+    "kw_end",
     "kw_exists",
     "kw_explain",
+    "kw_first",
     "kw_for",
     "kw_from",
     "kw_header",
@@ -1483,6 +1536,7 @@ const SYNTAX_RULES: &[&str] = &[
     "kw_insert",
     "kw_into",
     "kw_is",
+    "kw_last",
     "kw_let",
     "kw_limit",
     "kw_list",
@@ -1494,6 +1548,7 @@ const SYNTAX_RULES: &[&str] = &[
     "kw_mutation",
     "kw_not",
     "kw_null",
+    "kw_nulls",
     "kw_on",
     "kw_optional",
     "kw_or",
@@ -1507,12 +1562,14 @@ const SYNTAX_RULES: &[&str] = &[
     "kw_run",
     "kw_set",
     "kw_show",
+    "kw_then",
     "kw_to",
     "kw_unattached",
     "kw_unwind",
     "kw_update",
     "kw_upsert",
     "kw_view",
+    "kw_when",
     "kw_where",
     "let_clause",
     "like_rec",
@@ -1552,6 +1609,7 @@ const SYNTAX_RULES: &[&str] = &[
     "not_in_rec",
     "null_test",
     "null_value",
+    "nulls_placement",
     "offset_rec",
     "operand",
     "optional_block",
@@ -1600,6 +1658,7 @@ const SYNTAX_RULES: &[&str] = &[
     "setting_stmt",
     "setting_value",
     "show_stmt",
+    "sq_string_char",
     "sql_alias_rec",
     "star_item_rec",
     "star_mark",
@@ -1618,6 +1677,7 @@ const SYNTAX_RULES: &[&str] = &[
     "trailing_match_rec",
     "traversal",
     "traversal_bounds",
+    "type_arg",
     "type_name",
     "type_prop_rec",
     "type_ref",
@@ -1993,24 +2053,6 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query q() { match { from { match { $p worksAt $c } return { $p, $c } } } return { $a.name } }"#,
     ),
     (
-        r#"CASE … END"#,
-        "Q012",
-        r#"query q() {
-  match { $p: Person }
-  return { $p.name, CASE WHEN $p.age > 65 THEN "senior" ELSE "active" END as band }
-}"#,
-        r#"query q() { match { $p: Person } return { $p.name, if($p.age > 65, "senior", "active") as band } }"#,
-    ),
-    (
-        r#"|| concatenation"#,
-        "Q012",
-        r#"query q() {
-  match { $p: Person }
-  return { $p.name || " " || $p.handle as label }
-}"#,
-        r#"query q() { match { $p: Person } return { concat($p.name, " ", $p.handle) as label } }"#,
-    ),
-    (
         r#"a chained comparison"#,
         "Q012",
         r#"query q() {
@@ -2093,15 +2135,6 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query q() { match { $p: Person } where $p.age > 30 return { $p.name } }"#,
     ),
     (
-        r#"an uppercase WHERE after match"#,
-        "Q014",
-        r#"query q() {
-  match { $p: Person } WHERE $p.age > 30
-  return { $p.name }
-}"#,
-        r#"query q() { match { $p: Person } where $p.age > 30 return { $p.name } }"#,
-    ),
-    (
         r#"ORDER BY"#,
         "Q014",
         r#"query q() {
@@ -2129,15 +2162,6 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
   return { $c.name }
 }"#,
         r#"query q() { match { from { match { $p worksAt $c } return { $c, count($p) as n } } } where $n > 3 return { $c.name } }"#,
-    ),
-    (
-        r#"an uppercase COALESCE"#,
-        "Q014",
-        r#"query q() {
-  match { $p: Person }
-  return { COALESCE($p.city, "none") as c }
-}"#,
-        r#"query q() { match { $p: Person } return { coalesce($p.city, "none") as c } }"#,
     ),
     (
         r#"STARTS WITH"#,
@@ -2202,31 +2226,11 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query q() { match { $p: Person, from { match { $p knows $q } return { $q } } } return { $q.name } }"#,
     ),
     (
-        r#"<>"#,
-        "Q014",
-        r#"query q() {
-  match { $p: Person }
-  where $p.city <> "Berlin"
-  return { $p.name }
-}"#,
-        r#"query q() { match { $p: Person } where $p.city != "Berlin" return { $p.name } }"#,
-    ),
-    (
         r#"=="#,
         "Q014",
         r#"query q() {
   match { $p: Person }
   where $p.city == "Berlin"
-  return { $p.name }
-}"#,
-        r#"query q() { match { $p: Person } where $p.city = "Berlin" return { $p.name } }"#,
-    ),
-    (
-        r#"single quotes"#,
-        "Q014",
-        r#"query q() {
-  match { $p: Person }
-  where $p.city = 'Berlin'
   return { $p.name }
 }"#,
         r#"query q() { match { $p: Person } where $p.city = "Berlin" return { $p.name } }"#,

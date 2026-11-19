@@ -120,10 +120,10 @@ fn each_write_statement_is_checked() {
 /// parsing accepted.
 #[test]
 fn a_parse_refusal_stops_the_pass_at_parsing() {
-    let src = "query q() { match { $p: Persn } where $p.name = 'x' return { $p.nme } }";
+    let src = "query q() { match { $p: Persn } where $p.name == \"x\" return { $p.nme } }";
     let got = pass(src);
     assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(spanned(src, &got[0]), "where $p.name = 'x'");
+    assert_eq!(spanned(src, &got[0]), "where $p.name == \"x\"");
 }
 
 /// The parser resumes at the next element, item, statement or declaration

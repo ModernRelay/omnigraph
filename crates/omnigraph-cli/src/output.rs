@@ -2532,6 +2532,7 @@ mod tests {
                 type_name: None,
                 property: None,
                 query_names: Vec::new(),
+                suggestion: None,
             })
             .collect(),
         };

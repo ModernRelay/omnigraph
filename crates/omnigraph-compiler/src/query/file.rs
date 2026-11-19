@@ -495,6 +495,7 @@ impl QueryDecl {
                     limit: None,
                     spans: Default::default(),
                 }),
+                respellings: Default::default(),
             }]),
         };
         Self {

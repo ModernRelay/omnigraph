@@ -172,10 +172,17 @@ pub fn read_body(body: &ReadBody) -> String {
         let keys: Vec<String> = body
             .order
             .iter()
-            .map(|o| match o.descending {
-                None => expr(&o.expr),
-                Some(true) => format!("{} desc", expr(&o.expr)),
-                Some(false) => format!("{} asc", expr(&o.expr)),
+            .map(|o| {
+                let key = match o.descending {
+                    None => expr(&o.expr),
+                    Some(true) => format!("{} desc", expr(&o.expr)),
+                    Some(false) => format!("{} asc", expr(&o.expr)),
+                };
+                match o.nulls_first {
+                    None => key,
+                    Some(true) => format!("{key} nulls first"),
+                    Some(false) => format!("{key} nulls last"),
+                }
             })
             .collect();
         let _ = write!(out, " order {{ {} }}", keys.join(", "));
@@ -460,7 +467,7 @@ pub fn literal(l: &Literal) -> String {
     }
 }
 
-fn string(s: &str) -> String {
+pub(crate) fn string(s: &str) -> String {
     let mut out = String::from("\"");
     for ch in s.chars() {
         match ch {

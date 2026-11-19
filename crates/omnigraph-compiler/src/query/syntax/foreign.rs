@@ -2,16 +2,18 @@
 //! (the GQ 3 RFC, section 5).
 //!
 //! Some habits an agent brings from other languages are lexical: a grammar
-//! rule cannot hold them without admitting them (a single-quoted string,
-//! `<>`, `==`, `&&`, `!`, an uppercase keyword, `?x`, an uppercase variable,
-//! a `--` or `#` comment, a `;` after a declaration, a `::` segment). When the
+//! rule cannot hold them without admitting them (`==`, `&&`, `!`, `?x`, an
+//! uppercase variable, a `--` or `#` comment, a `;` after a declaration, a
+//! `::` segment). A single-quoted string, `<>`, `||`, `case` and a keyword
+//! in another letter case are admitted as non-canonical spellings that lint
+//! names (section 6), so they are no habits here. When the
 //! structural parse refuses a source, [`with_habits`] scans it for these,
 //! applies their edits, and reparses. If the result parses, the refusal is the
 //! first habit, with every habit's edit as the suggestion. If it is refused
 //! with a suggestion of its own, the two edit sets are composed into one
 //! suggestion over the original source, so a text that mixes habits with a
-//! structural respelling (`ORDER BY $p.age DESC`, `WHERE $p.city = 'x'`) gets
-//! one fix.
+//! structural respelling (`$p.age == 3 && $q`, `!exists { … }`) gets one
+//! fix.
 
 use pest::Parser;
 
@@ -19,17 +21,6 @@ use super::parse::{Refusal, apply_edits, refusal, refusal_note};
 use super::{QueryParser, Rule};
 use crate::query::codes::{Q012, Q014, Q015};
 use crate::query::diagnostic::{Applicability, QueryCode, TextEdit};
-
-/// Words an uppercase spelling of which is lowercased: GQ's own keywords and
-/// the foreign words the grammar's recognizers hold.
-const KEYWORDS: &[&str] = &[
-    "match", "return", "order", "by", "limit", "as", "asc", "desc", "distinct", "is", "not",
-    "null", "and", "or", "in", "let", "from", "optional", "exists", "delete", "insert", "update",
-    "set", "where", "filter", "with", "call", "detach", "case", "when", "then", "else", "end",
-    "coalesce", "count", "sum", "avg", "min", "max", "collect", "starts", "ends", "between",
-    "like", "create", "merge", "having", "group", "offset", "skip", "true", "false", "union",
-    "unwind", "for", "query", "contains", "if", "concat",
-];
 
 /// Registry names, so `!name(…)` is `not name(…)` and not a Datalog atom.
 const FUNCTIONS: &[&str] = &[
@@ -50,6 +41,28 @@ const FUNCTIONS: &[&str] = &[
     "union",
     "is_null",
     "is_not_null",
+    "lower",
+    "upper",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "length",
+    "left",
+    "right",
+    "substring",
+    "abs",
+    "floor",
+    "ceil",
+    "round",
+    "sqrt",
+    "power",
+    "exp",
+    "ln",
+    "log10",
+    "size",
+    "cast",
+    "stddev",
+    "percentile",
 ];
 
 #[derive(Debug, Clone)]
@@ -119,28 +132,16 @@ fn scan(input: &str) -> Vec<Habit> {
             }
             b'{' => depth += 1,
             b'}' => depth -= 1,
+            // A single-quoted string is a string: its text holds no habit.
             b'\'' => {
-                if let Some(len) = input[i + 1..].find(['\'', '\n']) {
-                    if b[i + 1 + len] == b'\'' {
-                        let body = &input[i + 1..i + 1 + len];
-                        let replacement = format!("\"{}\"", body.replace('"', "\\\""));
-                        out.push(habit(
-                            (i, i + len + 2),
-                            &replacement,
-                            "a string is double-quoted in GQ",
-                        ));
-                        i += len + 2;
-                        continue;
+                i += 1;
+                while i < b.len() && b[i] != b'\'' {
+                    if b[i] == b'\\' {
+                        i += 1;
                     }
+                    i += 1;
                 }
-            }
-            b'<' if b.get(i + 1) == Some(&b'>') => {
-                out.push(habit(
-                    (i, i + 2),
-                    "!=",
-                    "`<>` is SQL's; GQ's inequality is `!=`",
-                ));
-                i += 2;
+                i += 1;
                 continue;
             }
             b'=' if b.get(i + 1) == Some(&b'=') => {
@@ -314,16 +315,6 @@ fn scan(input: &str) -> Vec<Habit> {
                         code: Q015,
                         applicability: Applicability::NeedsReview,
                     });
-                } else if word.len() >= 2
-                    && word.bytes().all(|c| c.is_ascii_uppercase() || c == b'_')
-                    && !matches!(prev, b'.' | b'$' | b'@' | b':')
-                    && KEYWORDS.contains(&word.to_ascii_lowercase().as_str())
-                {
-                    out.push(habit(
-                        (i, end),
-                        &word.to_ascii_lowercase(),
-                        format!("GQ keywords are lowercase: `{}`", word.to_ascii_lowercase()),
-                    ));
                 }
                 i = end;
                 continue;

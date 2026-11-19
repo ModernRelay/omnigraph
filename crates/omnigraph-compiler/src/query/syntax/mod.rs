@@ -68,6 +68,39 @@ pub struct Decl {
     pub annotations: Vec<Annotation>,
     pub write_mode: MutationWriteMode,
     pub body: DeclBody,
+    /// The non-canonical spellings the parser admitted in the declaration,
+    /// each with its canonical text (section 6). No part of tree equality.
+    pub respellings: Respellings,
+}
+
+/// A non-canonical spelling the parser admits and lowers to its canonical
+/// form's typed IR (the GQ 3 RFC, sections 3 and 6): `case` for nested
+/// `if`, `||` for `concat`, `<>` for `!=`, a single-quoted string, and a
+/// keyword or registry name in another letter case. Lint names each one with
+/// `fix` replacing `start..end` as its byte-range fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Respelling {
+    /// The lint code (`L212` to `L216`).
+    pub code: &'static str,
+    pub start: usize,
+    pub end: usize,
+    pub position: Position,
+    /// The text as written.
+    pub written: String,
+    /// The canonical text that replaces it.
+    pub fix: String,
+}
+
+/// The respellings of one declaration, in source order. Like
+/// [`SourceSpan`], they take no part in tree equality, so a respelled text
+/// and its canonical form parse to equal trees.
+#[derive(Debug, Clone, Default)]
+pub struct Respellings(pub Vec<Respelling>);
+
+impl PartialEq for Respellings {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -170,6 +203,9 @@ pub struct ReadSpans {
     pub match_inner: Option<SourceSpan>,
     /// One per return item, the item without its alias.
     pub items: Vec<SourceSpan>,
+    /// One per return item, the item with its alias: where lint's fix of
+    /// an alias equal to its column name writes.
+    pub projections: Vec<SourceSpan>,
     /// One per order key, its direction included.
     pub order: Vec<SourceSpan>,
     /// The `limit` value.
@@ -193,6 +229,9 @@ pub struct Ordering {
     pub expr: Expr,
     /// `None`: no direction written.
     pub descending: Option<bool>,
+    /// `nulls first` (`Some(true)`) or `nulls last` (`Some(false)`); `None`:
+    /// the fixed value order's placement, nulls first ascending.
+    pub nulls_first: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

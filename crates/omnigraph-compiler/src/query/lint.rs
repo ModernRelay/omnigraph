@@ -6,7 +6,7 @@ use crate::catalog::Catalog;
 use crate::ir::core::{CoreDecl, MutationTarget, Sink};
 use crate::query::codes::Q004;
 use crate::query::descriptor::{QueryOperationDescriptor, describe_query_operation};
-use crate::query::diagnostic::{QueryDiagnostic, QueryDiagnosticKind};
+use crate::query::diagnostic::{Applicability, QueryDiagnostic, QueryDiagnosticKind, Suggestion};
 use crate::query::file::QueryDecl;
 use crate::query::parser::parse_query_diagnostic;
 
@@ -102,6 +102,10 @@ pub struct QueryLintFinding {
     pub property: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub query_names: Vec<String>,
+    /// The fix as byte-range edits of the source, which `lint --fix`
+    /// applies: a refusal's printed suggestion, or a canonical form's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<Suggestion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -134,7 +138,7 @@ pub fn lint_query_file(
         Ok(file) => file
             .body
             .into_read_declarations()
-            .map_err(|message| vec![(Q004.as_str().to_string(), message)]),
+            .map_err(|message| vec![(Q004.as_str().to_string(), message, None)]),
         Err(diagnostic) => Err(diagnostic
             .all()
             .into_iter()
@@ -232,7 +236,7 @@ pub fn lint_query_file(
             results: Vec::new(),
             findings: refusals
                 .into_iter()
-                .map(|(code, message)| QueryLintFinding {
+                .map(|(code, message, suggestion)| QueryLintFinding {
                     severity: QueryLintSeverity::Error,
                     code,
                     message,
@@ -240,6 +244,7 @@ pub fn lint_query_file(
                     type_name: None,
                     property: None,
                     query_names: Vec::new(),
+                    suggestion,
                 })
                 .collect(),
         },
@@ -252,7 +257,8 @@ pub fn lint_query_file(
 /// message. A parse refusal keeps its code and its message; a refusal the
 /// front door raises for the whole source unit (`T83`, one per repeated
 /// name) keeps its code and its rendered form.
-fn front_door_finding(diagnostic: QueryDiagnostic) -> (String, String) {
+fn front_door_finding(diagnostic: QueryDiagnostic) -> (String, String, Option<Suggestion>) {
+    let suggestion = diagnostic.suggestion.as_deref().cloned();
     let (code, message) = match diagnostic.kind {
         QueryDiagnosticKind::Parse => (
             diagnostic.code.as_str().to_string(),
@@ -264,7 +270,7 @@ fn front_door_finding(diagnostic: QueryDiagnostic) -> (String, String) {
         Some(at) => format!("line {}, column {}: {message}", at.line, at.column),
         None => message,
     };
-    (code, message)
+    (code, message, suggestion)
 }
 
 fn query_kind(query: &QueryDecl) -> QueryLintQueryKind {
@@ -354,6 +360,7 @@ fn lint_update_coverage(
                 type_name: Some(type_name.clone()),
                 property: Some(property_name),
                 query_names: type_coverage.query_names.iter().cloned().collect(),
+                suggestion: None,
             });
         }
     }
@@ -400,6 +407,10 @@ fn lint_canonical_forms(query_source: &str) -> Vec<QueryLintFinding> {
                 type_name: None,
                 property: None,
                 query_names: vec![decl.name.clone()],
+                suggestion: form.edit.map(|edit| Suggestion {
+                    applicability: Applicability::MachineApplicable,
+                    edits: vec![edit],
+                }),
             });
         }
     }

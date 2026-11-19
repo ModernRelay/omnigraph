@@ -28,20 +28,20 @@ commit_stmt   = { kw_commit ~ (commit_publish | commit_drop) }
 // Every option is a keyword so a `.pg` property may carry any of these names.
 load_stmt      = { kw_load ~ kw_csv ~ string_lit ~ kw_into ~ load_target ~ load_option* }
 load_target    = { load_kind ~ ":" ~ type_name }
-load_kind      = @{ ("node" | "edge") ~ !(ASCII_ALPHANUMERIC | "_") }
+load_kind      = @{ (^"node" | ^"edge") ~ !(ASCII_ALPHANUMERIC | "_") }
 load_option    = { load_mode | load_delimiter | load_header | load_columns }
 load_mode      = { kw_mode ~ load_mode_name }
 // `append` and `merge` are edition 2's names, recognised to print their fix.
-load_mode_name = @{ ("overwrite" | "insert" | "upsert" | "replace" | "append" | "merge") ~ !(ASCII_ALPHANUMERIC | "_") }
+load_mode_name = @{ (^"overwrite" | ^"insert" | ^"upsert" | ^"replace" | ^"append" | ^"merge") ~ !(ASCII_ALPHANUMERIC | "_") }
 load_delimiter = { kw_delimiter ~ string_lit }
 load_header    = { kw_header }
 load_columns   = { kw_columns ~ "(" ~ ident ~ ("," ~ ident)* ~ ")" }
-kw_load      = @{ "load" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_csv       = @{ "csv" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_mode      = @{ "mode" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_delimiter = @{ "delimiter" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_header    = @{ "header" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_columns   = @{ "columns" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_load      = @{ ^"load" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_csv       = @{ ^"csv" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_mode      = @{ ^"mode" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_delimiter = @{ ^"delimiter" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_header    = @{ ^"header" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_columns   = @{ ^"columns" ~ !(ASCII_ALPHANUMERIC | "_") }
 branch_create = { kw_create ~ branch_name ~ (kw_from ~ (create_from_commit | branch_name))? }
 // `from commit "<id>"`: the new branch starts at that graph commit. A bare
 // `commit` with no quoted id after it names a branch called `commit`.
@@ -71,32 +71,32 @@ as_commit_clause = { kw_as ~ kw_commit }
 // unattached snapshot (a quoted id or a `String` parameter).
 as_unattached_clause = { kw_as ~ kw_unattached ~ kw_branch ~ (kw_on ~ (string_lit | variable))? }
 
-kw_branch = @{ "branch" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_explain = @{ "explain" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_create = @{ "create" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_delete = @{ "delete" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_merge  = @{ "merge" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_merge_base = @{ "merge-base" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_diff   = @{ "diff" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_to     = @{ "to" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_after  = @{ "after" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_page   = @{ "page" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_limit  = @{ "limit" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_dry    = @{ "dry" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_run    = @{ "run" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_list   = @{ "list" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_from   = @{ "from" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_into   = @{ "into" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_set    = @{ "set" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_reset  = @{ "reset" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_show   = @{ "show" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_all    = @{ "all" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_as     = @{ "as" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_commit = @{ "commit" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_unattached = @{ "unattached" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_on     = @{ "on" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_publish = @{ "publish" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_drop   = @{ "drop" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_branch = @{ ^"branch" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_explain = @{ ^"explain" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_create = @{ ^"create" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_delete = @{ ^"delete" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_merge  = @{ ^"merge" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_merge_base = @{ ^"merge-base" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_diff   = @{ ^"diff" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_to     = @{ ^"to" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_after  = @{ ^"after" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_page   = @{ ^"page" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_limit  = @{ ^"limit" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_dry    = @{ ^"dry" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_run    = @{ ^"run" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_list   = @{ ^"list" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_from   = @{ ^"from" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_into   = @{ ^"into" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_set    = @{ ^"set" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_reset  = @{ ^"reset" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_show   = @{ ^"show" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_all    = @{ ^"all" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_as     = @{ ^"as" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_commit = @{ ^"commit" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_unattached = @{ ^"unattached" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_on     = @{ ^"on" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_publish = @{ ^"publish" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_drop   = @{ ^"drop" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 
 
@@ -118,17 +118,17 @@ traversal_bounds = { "{" ~ digits ~ "," ~ digits? ~ "}" }
 
 
 
-kw_distinct = @{ "distinct" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_distinct = @{ ^"distinct" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 
 
 null_test         = { kw_is ~ kw_not? ~ kw_null }
-kw_and            = @{ "and" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_or             = @{ "or" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_not            = @{ "not" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_is             = @{ "is" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_null           = @{ "null" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_in             = @{ "in" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_and            = @{ ^"and" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_or             = @{ ^"or" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_not            = @{ ^"not" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_is             = @{ ^"is" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_null           = @{ ^"null" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_in             = @{ ^"in" ~ !(ASCII_ALPHANUMERIC | "_") }
 reserved          = { kw_and | kw_or | kw_not | kw_is | kw_null | kw_in }
 reserved_property = { reserved }
 reserved_alias    = { reserved }
@@ -140,7 +140,8 @@ expr_ident        = @{ !reserved ~ ident }
 meta_field = @{ "@" ~ ident }
 
 
-comp_op = { ">=" | "<=" | "!=" | ">" | "<" | "=" }
+// `<>` is `!=`, a non-canonical spelling lint names (section 6).
+comp_op = { ">=" | "<=" | "!=" | "<>" | ">" | "<" | "=" }
 
 // Terminals
 variable = @{ "$" ~ (ident_chars | "_") }
@@ -150,11 +151,17 @@ ident_chars = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 // engine-owned like the `@` meta-fields; a user schema cannot declare one.
 type_name = @{ "@"? ~ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
 ident = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+// A registry row in any letter case (`LOWER(…)`, section 7); the builder
+// reads it in lower case and lint names the spelling.
+call_word = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
-string_lit = @{ "\"" ~ string_char* ~ "\"" }
+// Single or double quotes, with the same escapes (section 7); a
+// single-quoted string is a non-canonical spelling lint names.
+string_lit = @{ "\"" ~ string_char* ~ "\"" | "'" ~ sq_string_char* ~ "'" }
 string_char = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
+sq_string_char = @{ !("'" | "\\") ~ ANY | "\\" ~ ANY }
 digits = @{ ASCII_DIGIT+ }
-bool_lit = @{ ("true" | "false") ~ !(ASCII_ALPHANUMERIC | "_") }
+bool_lit = @{ (^"true" | ^"false") ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // ===========================================================================
 // Declarations and their bodies (section 7). Rules whose name ends in `_rec`
@@ -239,9 +246,14 @@ star_item_rec = { "*" }
 order_clause = { kw_order ~ "{" ~ ordering ~ (("," | missing_comma_rec) ~ ordering)* ~ ","? ~ "}" }
 // A bare name in `order` is a return alias, and only a whole key may be one;
 // the builder refuses a bare name anywhere else.
-ordering = { dir_first_rec | expr ~ order_dir? }
+ordering = { dir_first_rec | expr ~ order_dir? ~ nulls_placement? }
+// `nulls first` or `nulls last` over the fixed value order's placement.
+nulls_placement = { kw_nulls ~ (kw_first | kw_last) }
+kw_nulls = @{ ^"nulls" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_first = @{ ^"first" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_last  = @{ ^"last" ~ !(ASCII_ALPHANUMERIC | "_") }
 dir_first_rec = { order_dir ~ !(expr_ident ~ ("," | "}" | order_dir)) ~ expr }
-order_dir = @{ ("asc" | "desc") ~ !(ASCII_ALPHANUMERIC | "_") }
+order_dir = @{ (^"asc" | ^"desc") ~ !(ASCII_ALPHANUMERIC | "_") }
 order_by_rec = { kw_order ~ fw_by ~ ordering ~ ("," ~ ordering)* }
 limit_clause = { kw_limit ~ (integer | variable) }
 offset_rec = { fw_offset ~ (integer | variable) }
@@ -349,7 +361,7 @@ write_element = _{ detach_rec | element }
 // statement start are refused as statements with `insert`, `upsert` or
 // `update` as the fix. No element can begin with those words, so the
 // accepted texts are section 7's.
-stmt_keyword   = @{ ("insert" | "upsert" | "replace" | "update" | "delete" | "create" | "merge" | "set") ~ !(ASCII_ALPHANUMERIC | "_") }
+stmt_keyword   = @{ (^"insert" | ^"upsert" | ^"replace" | ^"update" | ^"delete" | ^"create" | ^"merge" | ^"set") ~ !(ASCII_ALPHANUMERIC | "_") }
 mutation_stmt = { where_stmt | create_rec | set_rec | delete_multi_rec | delete_type_rec | insert_paren_rec | update_noset_rec | stmt_var_rec | insert_stmt | update_stmt | delete_stmt }
 // `insert $b`, `update $b` with no `set`.
 stmt_var_rec = { (kw_insert | kw_update) ~ variable ~ !(kw_set | "{") }
@@ -396,11 +408,12 @@ between_rec = { fw_between ~ sum ~ kw_and ~ sum }
 like_rec = { fw_like ~ sum }
 starts_with_words_rec = { (fw_starts | fw_ends) ~ fw_with ~ sum }
 // Infix `contains` / `starts_with`, word-bounded and not touching `(`.
-infix_string_op = @{ ("contains" | "starts_with") ~ !(ASCII_ALPHANUMERIC | "_" | "(") }
+infix_string_op = @{ (^"contains" | ^"starts_with") ~ !(ASCII_ALPHANUMERIC | "_" | "(") }
 // A negative number is unary minus over a literal, so `$n -1` and `$n - 1`
 // are one subtraction.
 sum        = { product ~ (sum_op ~ product)* }
 sum_op     = { "+" | "-" | concat_bars }
+// `a || b` is `concat(a, b)`, a non-canonical spelling lint names.
 concat_bars = { "||" }
 product    = { unary ~ (product_op ~ unary)* }
 product_op  = { "*" | "/" | "%" }
@@ -411,11 +424,11 @@ unary_minus = { "-" }
 // and the builder refuses it there with the foreign-word table's fix; it is
 // admitted only as a whole `order` key and inside the `where_stmt` predicate,
 // so the accepted texts are section 7's.
-operand    = { "(" ~ expr ~ ")" | block_value | agg_distinct | count_star_rec | case_rec | keyword_call_rec | literal | value_list | type_prop_rec | call | prop_method_rec | prop_chain_rec | prop_star_rec | prop_access | meta_field | variable | reserved_property | bare_name_rec }
+operand    = { "(" ~ expr ~ ")" | block_value | agg_distinct | count_star_rec | case_expr | keyword_call_rec | literal | value_list | type_prop_rec | call | prop_method_rec | prop_chain_rec | prop_star_rec | prop_access | meta_field | variable | reserved_property | bare_name_rec }
 // A block is an operand and nothing else: its elements and its own `where`
 // inside its braces.
 block_value = { (agg_name ~ ("(" ~ expr ~ ")")? | kw_exists) ~ "{" ~ block_body ~ "}" }
-agg_name    = @{ ("count" | "sum" | "avg" | "min" | "max" | "collect") ~ !(ASCII_ALPHANUMERIC | "_") }
+agg_name    = @{ (^"count" | ^"sum" | ^"avg" | ^"min" | ^"max" | ^"collect") ~ !(ASCII_ALPHANUMERIC | "_") }
 agg_distinct = { agg_name ~ "(" ~ kw_distinct ~ expr ~ ")" }
 count_star_rec = { agg_name ~ "(" ~ "*" ~ ")" }
 // A call's name is never a reserved word or a keyword of a declaration
@@ -423,18 +436,28 @@ count_star_rec = { agg_name ~ "(" ~ "*" ~ ")" }
 // `and`, …, so `where(…)` is refused with its fix rather than read as an
 // unknown call.
 call        = { call_name ~ "(" ~ call_args? ~ ")" }
-call_name   = @{ !call_keyword ~ ident }
+call_name   = @{ !call_keyword ~ call_word }
 call_keyword = _{ reserved | kw_let | kw_from | kw_optional | kw_exists | kw_where | kw_match | kw_return | kw_order | kw_limit | kw_distinct | kw_as | kw_query | kw_insert | kw_update | kw_delete | kw_set }
 // Section 7's `call_args` (positionals, then options), written as one
 // comma-separated list the builder checks, so an option before a positional
 // and a missing comma are refused with a fix.
 call_args   = { call_arg ~ (("," | missing_comma_rec) ~ call_arg)* }
 call_arg    = _{ call_option | positional }
-positional  = { !(ident ~ ":") ~ (inline_read | expr) }
+// A scalar type name is `cast`'s second argument, `cast($x.n, I64)`.
+positional  = { !(ident ~ ":") ~ (inline_read | expr | type_arg) }
+type_arg    = @{ ("String" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32" | "F64" | "DateTime" | "Date") ~ !(ASCII_ALPHANUMERIC | "_") }
 call_option = { ident ~ ":" ~ expr }
 keyword_call_rec = { call_keyword_word ~ "(" ~ call_args? ~ ")" }
 call_keyword_word = { call_keyword }
-case_rec = { fw_case ~ (fw_when ~ expr ~ fw_then ~ expr)+ ~ (fw_else ~ expr)? ~ fw_end }
+// `case when c then a … else e end` and `case x when v then a … end`:
+// nested `if`, a missing `else` meaning `null`; non-canonical, lint names
+// it. The words are contextual, recognised only at operand start.
+case_expr = { kw_case ~ (!kw_when ~ expr)? ~ (kw_when ~ expr ~ kw_then ~ expr)+ ~ (kw_else ~ expr)? ~ kw_end }
+kw_case = @{ ^"case" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_when = @{ ^"when" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_then = @{ ^"then" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_else = @{ ^"else" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_end  = @{ ^"end" ~ !(ASCII_ALPHANUMERIC | "_") }
 type_prop_rec = { type_name ~ "." ~ ident }
 prop_method_rec = { prop_method_head ~ call_args? ~ ")" }
 prop_method_head = ${ variable ~ "." ~ ident ~ "(" }
@@ -446,9 +469,9 @@ bare_name_rec = { expr_ident }
 literal   = { list_lit | datetime_lit | date_lit | string_lit | exp_float_rec | float_lit | integer | bool_lit }
 // `date("…")` is the literal, not a call.
 date_lit     = { kw_date ~ "(" ~ string_lit ~ ")" }
-kw_date      = @{ "date" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_date      = @{ ^"date" ~ !(ASCII_ALPHANUMERIC | "_") }
 datetime_lit = { kw_datetime ~ "(" ~ string_lit ~ ")" }
-kw_datetime  = @{ "datetime" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_datetime  = @{ ^"datetime" ~ !(ASCII_ALPHANUMERIC | "_") }
 list_lit  = { "[" ~ (list_elem ~ ("," ~ list_elem)*)? ~ "]" }
 // A list holds literals, and a negative number is one there; whitespace may
 // follow its sign, as it may follow a unary minus (section 7).
@@ -464,22 +487,22 @@ integer   = @{ ASCII_DIGIT+ ~ !(ASCII_ALPHANUMERIC | "_" | ".") }
 // `1e3`: an exponent needs a fraction.
 exp_float_rec = @{ ASCII_DIGIT+ ~ ("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+ ~ !(ASCII_ALPHANUMERIC | "_") }
 
-kw_query    = @{ "query" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_mutation = @{ "mutation" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_view     = @{ "view" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_match    = @{ "match" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_return   = @{ "return" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_order    = @{ "order" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_let      = @{ "let" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_optional = @{ "optional" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_exists   = @{ "exists" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_insert   = @{ "insert" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_upsert   = @{ "upsert" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_replace  = @{ "replace" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_update   = @{ "update" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_where    = @{ "where" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_for      = @{ "for" ~ !(ASCII_ALPHANUMERIC | "_") }
-kw_unwind   = @{ "unwind" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_query    = @{ ^"query" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_mutation = @{ ^"mutation" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_view     = @{ ^"view" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_match    = @{ ^"match" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_return   = @{ ^"return" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_order    = @{ ^"order" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_let      = @{ ^"let" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_optional = @{ ^"optional" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_exists   = @{ ^"exists" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_insert   = @{ ^"insert" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_upsert   = @{ ^"upsert" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_replace  = @{ ^"replace" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_update   = @{ ^"update" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_where    = @{ ^"where" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_for      = @{ ^"for" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_unwind   = @{ ^"unwind" ~ !(ASCII_ALPHANUMERIC | "_") }
 // Foreign words: case-insensitive, word-bounded; `where(…)` and the like stay
 // calls.
 fw_filter   = @{ ^"filter" ~ !(ASCII_ALPHANUMERIC | "_" | "(") }
@@ -498,8 +521,3 @@ fw_between  = @{ ^"between" ~ !(ASCII_ALPHANUMERIC | "_") }
 fw_like     = @{ ^"like" ~ !(ASCII_ALPHANUMERIC | "_") }
 fw_starts   = @{ ^"starts" ~ !(ASCII_ALPHANUMERIC | "_") }
 fw_ends     = @{ ^"ends" ~ !(ASCII_ALPHANUMERIC | "_") }
-fw_case     = @{ ^"case" ~ !(ASCII_ALPHANUMERIC | "_") }
-fw_when     = @{ ^"when" ~ !(ASCII_ALPHANUMERIC | "_") }
-fw_then     = @{ ^"then" ~ !(ASCII_ALPHANUMERIC | "_") }
-fw_else     = @{ ^"else" ~ !(ASCII_ALPHANUMERIC | "_") }
-fw_end      = @{ ^"end" ~ !(ASCII_ALPHANUMERIC | "_") }

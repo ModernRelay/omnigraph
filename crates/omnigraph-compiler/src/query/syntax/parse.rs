@@ -323,6 +323,96 @@ thread_local! {
     static RECOVERED: RefCell<Vec<Refusal>> = const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// The non-canonical spellings of the current [`structural`] parse not
+    /// yet given to their declaration: the lexical ones the normalizing pass
+    /// found, then each `||` and `case` the builder lowers.
+    static RESPELLINGS: RefCell<Vec<Respelling>> = const { RefCell::new(Vec::new()) };
+}
+
+fn respelled(code: &'static str, input: &str, span: (usize, usize), fix: String) {
+    RESPELLINGS.with(|r| {
+        r.borrow_mut().push(Respelling {
+            code,
+            start: span.0,
+            end: span.1,
+            position: Position::at(input, span.0),
+            written: input[span.0..span.1].to_string(),
+            fix,
+        })
+    });
+}
+
+/// The respellings recorded within `span`, in source order, taken.
+fn respellings_within(span: (usize, usize)) -> Respellings {
+    RESPELLINGS.with(|r| {
+        let mut all = r.borrow_mut();
+        let mut mine = Vec::new();
+        all.retain(|x| {
+            let inside = span.0 <= x.start && x.end <= span.1;
+            if inside {
+                mine.push(x.clone());
+            }
+            !inside
+        });
+        mine.sort_by_key(|x| (x.start, x.end));
+        Respellings(mine)
+    })
+}
+
+/// The lexical non-canonical spellings of a source the grammar accepted
+/// (the GQ 3 RFC, section 7): a keyword or registry name in another letter
+/// case, `<>` and a single-quoted string. Each is recorded with its
+/// canonical text, and the source is returned with its keywords lowercased
+/// and `<>` written `!=`, edits of the same length, so the builder reads one
+/// spelling at the same byte offsets.
+fn lexical_respellings(input: &str, file: &Pair<Rule>) -> String {
+    let mut normalized = input.as_bytes().to_vec();
+    let mut found: Vec<(&'static str, (usize, usize), String)> = Vec::new();
+    for p in file.clone().into_inner().flatten() {
+        let (s, e) = (p.as_span().start(), p.as_span().end());
+        let text = p.as_str();
+        let rule = p.as_rule();
+        let keyword = matches!(
+            rule,
+            Rule::agg_name
+                | Rule::order_dir
+                | Rule::bool_lit
+                | Rule::stmt_keyword
+                | Rule::load_kind
+                | Rule::load_mode_name
+                | Rule::infix_string_op
+        ) || format!("{rule:?}").starts_with("kw_")
+            || (rule == Rule::call_name
+                && crate::query::check::is_registry_name(&text.to_ascii_lowercase()));
+        match rule {
+            _ if keyword && text.bytes().any(|b| b.is_ascii_uppercase()) => {
+                // An annotation's name is `@` and a word; only a registry
+                // or keyword spelling is lowered.
+                if rule == Rule::annotation_name {
+                    continue;
+                }
+                found.push(("L216", (s, e), text.to_ascii_lowercase()));
+                normalized[s..e].make_ascii_lowercase();
+            }
+            Rule::comp_op if text == "<>" => {
+                found.push(("L214", (s, e), "!=".to_string()));
+                normalized[s..e].copy_from_slice(b"!=");
+            }
+            Rule::string_lit if text.starts_with('\'') => {
+                if let Ok(value) = crate::error::decode_string_literal(text) {
+                    found.push(("L215", (s, e), print::string(&value)));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (code, span, fix) in found {
+        respelled(code, input, span, fix);
+    }
+    String::from_utf8(normalized).expect("ASCII case and `<>` edits keep UTF-8")
+}
+
 /// A boundary of the builder (a declaration, an element, a return item, an
 /// order key, a `where` predicate, a statement, a parameter, an
 /// annotation): a refusal is recorded and the builder goes on with the next
@@ -652,7 +742,21 @@ fn structural_scoped(input: &str) -> std::result::Result<(SourceFile, Vec<DeclNa
     let outer_ends = TOKEN_ENDS.with(|ends| std::mem::take(&mut *ends.borrow_mut()));
     // The habit pass reparses inside a parse: each parse records its own.
     let outer = RECOVERED.with(|r| std::mem::take(&mut *r.borrow_mut()));
-    let built = build_file(input, file);
+    let outer_respellings = RESPELLINGS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    // The builder reads one spelling of each lexical form: the source with
+    // its keywords lowercased and `<>` written `!=` parses to the same
+    // pairs at the same offsets.
+    let normalized = lexical_respellings(input, &file);
+    let built = if normalized == input {
+        build_file(input, file)
+    } else {
+        let pairs =
+            crate::stack::with_room(room, || QueryParser::parse(Rule::query_file, &normalized))
+                .map_err(|error| Refused::Grammar(grammar_error(input, error)))?;
+        let file = pairs.into_iter().next().expect("grammar: one query_file");
+        LineIndex::scope(&normalized, || build_file(&normalized, file))
+    };
+    RESPELLINGS.with(|r| *r.borrow_mut() = outer_respellings);
     let mut refusals = RECOVERED.with(|r| std::mem::replace(&mut *r.borrow_mut(), outer));
     TOKEN_ENDS.with(|ends| *ends.borrow_mut() = outer_ends);
     match built {
@@ -1014,6 +1118,7 @@ fn collect_ctx(pair: &Pair<Rule>) -> Ctx {
 
 fn decl(pair: Pair<Rule>) -> R<Decl> {
     let input = input_of(&pair);
+    let decl_span = (pair.as_span().start(), pair.as_span().end());
     let ctx = collect_ctx(&pair);
     with_ctx(|c| *c = ctx);
     let mut name = None;
@@ -1100,6 +1205,7 @@ fn decl(pair: Pair<Rule>) -> R<Decl> {
         annotations,
         write_mode,
         body,
+        respellings: respellings_within(decl_span),
     })
 }
 
@@ -1363,6 +1469,7 @@ fn read_body_built(pair: Pair<Rule>) -> R<ReadBody> {
                                     {
                                         body.spans.items.push(source_span(&e));
                                     }
+                                    body.spans.projections.push(source_span(&p));
                                     body.projections.extend(recovered(projection(p)));
                                 }
                             }
@@ -1613,8 +1720,22 @@ fn ordering(pair: Pair<Rule>) -> R<Ordering> {
         Some(name) => Expr::Ident(name.as_str().to_string()),
         None => expr(key)?,
     };
-    let descending = parts.next().map(|d| d.as_str() == "desc");
-    Ok(Ordering { expr, descending })
+    let mut descending = None;
+    let mut nulls_first = None;
+    for part in parts {
+        match part.as_rule() {
+            Rule::order_dir => descending = Some(part.as_str() == "desc"),
+            Rule::nulls_placement => {
+                nulls_first = Some(part.into_inner().any(|w| w.as_rule() == Rule::kw_first))
+            }
+            other => unreachable!("grammar: ordering holds no {other:?}"),
+        }
+    }
+    Ok(Ordering {
+        expr,
+        descending,
+        nulls_first,
+    })
 }
 
 fn projection(pair: Pair<Rule>) -> R<Projection> {
@@ -3711,6 +3832,8 @@ fn call(pair: Pair<Rule>) -> R<Call> {
                             let v = a.into_inner().next().unwrap();
                             args.push(match v.as_rule() {
                                 Rule::inline_read => Arg::Inline(Box::new(inline_read(v)?)),
+                                // A scalar type name, `cast`'s target.
+                                Rule::type_arg => Arg::Expr(Expr::Ident(v.as_str().to_string())),
                                 _ => Arg::Expr(expr(v)?),
                             });
                         }
@@ -3993,7 +4116,11 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
             Rule::like_rec => {
                 let pat = op.clone().into_inner().nth(1).unwrap();
                 let text = pat.as_str().trim();
-                let inner = text.strip_prefix('"').and_then(|t| t.strip_suffix('"'));
+                let inner = text
+                    .strip_prefix('"')
+                    .and_then(|t| t.strip_suffix('"'))
+                    .or_else(|| text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')))
+                    .filter(|t| !t.contains(['"', '\\']));
                 let fix = inner.and_then(|t| {
                     let body = t.trim_start_matches('%').trim_end_matches('%');
                     if body.contains('%') || body.contains('_') {
@@ -4069,38 +4196,45 @@ fn arithmetic(input: &str, pair: Pair<Rule>) -> R<Expr> {
     crate::stack::deep(|| {
         let span = (pair.as_span().start(), tend(input, &pair));
         let parts: Vec<Pair<Rule>> = pair.into_inner().collect();
-        // `a || b || c`: one concat call over the flattened chain.
-        if parts.iter().any(|p| p.as_str() == "||") {
-            let ops_all_bars = parts.iter().skip(1).step_by(2).all(|p| p.as_str() == "||");
-            let operands: Vec<&str> = parts.iter().step_by(2).map(|p| p.as_str().trim()).collect();
-            return Err(if ops_all_bars {
-                refusal(
-                    input,
-                    Q012,
-                    "`||` is not an operator: concatenation is the registry call `concat`",
-                    span,
-                    vec![edit(
-                        span.0,
-                        span.1,
-                        format!("concat({})", operands.join(", ")),
-                    )],
-                    MACHINE,
-                )
-            } else {
-                refusal_note(
-                    input,
-                    Q012,
-                    "`||` is not an operator: concatenation is the registry call `concat`",
-                    span,
-                    "concat(a, b, …)",
-                )
-            });
-        }
         let mut it = parts.into_iter();
         let first = it.next().unwrap();
         let mut left = expr(first)?;
+        // The start of the `||` run the left operand ends, if it is one:
+        // `a || b || c` is one `concat` over the run (section 3).
+        let mut run: Option<usize> = None;
         while let Some(op) = it.next() {
-            let right = expr(it.next().unwrap())?;
+            let right_pair = it.next().unwrap();
+            let right_end = tend(input, &right_pair);
+            let right = expr(right_pair)?;
+            if op.as_str() == "||" {
+                let mut args = if run.is_some()
+                    && let Expr::Call(c) = &mut left
+                {
+                    std::mem::take(&mut c.args)
+                } else {
+                    vec![Arg::Expr(std::mem::replace(
+                        &mut left,
+                        Expr::Literal(Literal::Null),
+                    ))]
+                };
+                args.push(Arg::Expr(right));
+                let start = *run.get_or_insert(span.0);
+                let call = Call {
+                    name: "concat".into(),
+                    args,
+                    options: Vec::new(),
+                    at: SourceSpan::of(input, start, right_end),
+                };
+                left = Expr::Call(call);
+                // The run's latest extent replaces the earlier record.
+                RESPELLINGS.with(|r| {
+                    r.borrow_mut()
+                        .retain(|x| !(x.code == "L213" && x.start == start && x.end <= right_end))
+                });
+                respelled("L213", input, (start, right_end), print::expr(&left));
+                continue;
+            }
+            run = None;
             let op = match op.as_str() {
                 "+" => ArithOp::Add,
                 "-" => ArithOp::Sub,
@@ -4260,51 +4394,54 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
                     ),
                 })
             }
-            Rule::case_rec => {
-                let mut whens: Vec<(String, String)> = Vec::new();
+            Rule::case_expr => {
+                // `case [x] when v then a … [else e] end` is nested `if`,
+                // `if(x = v, a, …)` for the simple form, a missing `else`
+                // meaning `null` (section 3).
+                let mut subject = None;
+                let mut arms: Vec<(Expr, Expr, SourceSpan)> = Vec::new();
                 let mut otherwise = None;
                 let parts: Vec<Pair<Rule>> = inner.clone().into_inner().collect();
                 let mut i = 0;
                 while i < parts.len() {
                     match parts[i].as_rule() {
-                        Rule::fw_when => {
-                            whens.push((
-                                parts[i + 1].as_str().trim().to_string(),
-                                parts[i + 3].as_str().trim().to_string(),
-                            ));
+                        Rule::kw_when => {
+                            let (v, a) = (parts[i + 1].clone(), parts[i + 3].clone());
+                            let at = SourceSpan::of(input, span_of(&v).0, tend(input, &v));
+                            arms.push((expr(v)?, expr(a)?, at));
                             i += 4;
                         }
-                        Rule::fw_else => {
-                            otherwise = Some(parts[i + 1].as_str().trim().to_string());
+                        Rule::kw_else => {
+                            otherwise = Some(expr(parts[i + 1].clone())?);
                             i += 2;
+                        }
+                        Rule::expr => {
+                            subject = Some(expr(parts[i].clone())?);
+                            i += 1;
                         }
                         _ => i += 1,
                     }
                 }
-                let message = "`CASE` is not GQ: a conditional is the registry call `if(condition, then, else)`";
-                match otherwise {
-                    Some(e) => {
-                        let text = whens
-                            .iter()
-                            .rev()
-                            .fold(e, |acc, (c, t)| format!("if({c}, {t}, {acc})"));
-                        Err(refusal(
-                            input,
-                            Q012,
-                            message,
-                            span,
-                            vec![edit(span.0, span.1, text)],
-                            MACHINE,
-                        ))
-                    }
-                    None => Err(refusal_note(
-                        input,
-                        Q012,
-                        message,
-                        span,
-                        "if(<condition>, <then>, <else>)",
-                    )),
+                let mut out = otherwise.unwrap_or(Expr::Literal(Literal::Null));
+                for (v, a, at) in arms.into_iter().rev() {
+                    let condition = match &subject {
+                        Some(x) => Expr::Compare {
+                            op: CompOp::Eq,
+                            left: Box::new(x.clone()),
+                            right: Box::new(v),
+                            at,
+                        },
+                        None => v,
+                    };
+                    out = Expr::Call(Call {
+                        name: "if".into(),
+                        args: vec![Arg::Expr(condition), Arg::Expr(a), Arg::Expr(out)],
+                        options: Vec::new(),
+                        at: SourceSpan::of(input, span.0, span.1),
+                    });
                 }
+                respelled("L212", input, span, print::expr(&out));
+                Ok(out)
             }
             Rule::literal => Ok(Expr::Literal(literal(inner)?)),
             Rule::value_list => {

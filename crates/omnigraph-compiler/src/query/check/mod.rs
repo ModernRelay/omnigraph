@@ -1154,8 +1154,43 @@ const SCALAR_ROWS: &[&str] = &[
     "if",
     "coalesce",
     "concat",
+    "lower",
+    "upper",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "length",
+    "left",
+    "right",
+    "substring",
+    "abs",
+    "floor",
+    "ceil",
+    "round",
+    "sqrt",
+    "power",
+    "exp",
+    "ln",
+    "log10",
+    "size",
+    "cast",
 ];
-const AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max", "collect"];
+const AGGREGATES: &[&str] = &[
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "collect",
+    "stddev",
+    "percentile",
+];
+
+/// Whether `name` (in lower case) names a registry row: a relation, scalar
+/// or aggregate row, which the parser reads in any letter case.
+pub(crate) fn is_registry_name(name: &str) -> bool {
+    RELATION_ROWS.contains(&name) || SCALAR_ROWS.contains(&name) || AGGREGATES.contains(&name)
+}
 /// The default an omitted option of a registry row takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OptionDefault {
@@ -1198,10 +1233,6 @@ pub(crate) const REGISTRY_OPTIONS: &[(&str, &[(&str, OptionDefault)])] = &[
 const CLAUSE_KEYWORDS: &[&str] = &["let", "from", "optional", "exists", "not"];
 /// Annotations retained as pure metadata.
 const METADATA_ANNOTATIONS: &[&str] = &["description", "instruction", "example", "rename_from"];
-
-fn is_registry_name(name: &str) -> bool {
-    RELATION_ROWS.contains(&name) || SCALAR_ROWS.contains(&name) || AGGREGATES.contains(&name)
-}
 
 // ---------------------------------------------------------------------------
 // Context, frames and scopes.
