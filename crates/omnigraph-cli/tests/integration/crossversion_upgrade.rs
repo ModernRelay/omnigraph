@@ -3867,3 +3867,287 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
     }
     assert_eq!(head_exports(), heads, "--older-than 0s");
 }
+
+/// Resolve the published edition-2 CLI the GQ 3 break follows:
+/// `OMNIGRAPH_EDITION_2_RELEASE_BIN`, else a binary under
+/// `target/storage-upgrade-binaries/edition-2-release/`. CI installs the
+/// published `edge-20261118-fd4d61f` archive, the main build before the
+/// break, through the checksum-verifying installer.
+fn edition_2_release_bin() -> Option<PathBuf> {
+    storage_upgrade_predecessor(
+        "OMNIGRAPH_EDITION_2_RELEASE_BIN",
+        "edition-2-release",
+        "the published edge-20261118-fd4d61f omnigraph binary",
+    )
+}
+
+/// The current binary, run hermetically.
+fn run_current(args: &[&str]) -> std::process::Output {
+    run_old(&assert_cmd::cargo::cargo_bin("omnigraph"), args)
+}
+
+/// Every row of the one-way table, applied by the current binary over a
+/// graph the edition-2 binary created, is named by `schema plan` and
+/// `schema apply`, and the edition-2 binary then refuses the whole graph.
+/// A change outside the table (plain `@index` on a String, an added
+/// property, a body-level `@index` over a list) leaves a graph it still
+/// reads, and so does an explicit `l2`, which plans no step and publishes
+/// nothing.
+#[test]
+fn genuine_edition_2_storage_upgrade_names_every_one_way_schema_construct() {
+    use omnigraph_compiler::schema::one_way::{ONE_WAY_CONSTRUCTS, ONE_WAY_NOTE};
+    let Some(old) = edition_2_release_bin() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let graph_for = |name: &str, before: &str| {
+        let dir = temp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let schema = dir.join("before.pg");
+        std::fs::write(&schema, before).unwrap();
+        let graph = dir.join("g");
+        assert_ok(
+            "init",
+            &run_old(
+                &old,
+                &[
+                    "init",
+                    "--schema",
+                    schema.to_str().unwrap(),
+                    graph.to_str().unwrap(),
+                ],
+            ),
+        );
+        (dir, graph)
+    };
+    let apply = |dir: &Path, graph: &Path, after: &str| -> serde_json::Value {
+        let schema = dir.join("after.pg");
+        std::fs::write(&schema, after).unwrap();
+        let args = [
+            "--schema",
+            schema.to_str().unwrap(),
+            "--target",
+            graph.to_str().unwrap(),
+            "--json",
+        ];
+        let plan = run_current(&[&["schema", "plan"][..], &args[..]].concat());
+        output_success_ref("schema plan", &plan);
+        let applied = run_current(&[&["schema", "apply"][..], &args[..]].concat());
+        output_success_ref("schema apply", &applied);
+        let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+        let applied: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+        assert_eq!(
+            plan["one_way_constructs"], applied["one_way_constructs"],
+            "plan and apply name the same constructs"
+        );
+        applied
+    };
+    for row in ONE_WAY_CONSTRUCTS {
+        let (dir, graph) = graph_for(row.id, row.before);
+        let applied = apply(&dir, &graph, row.after);
+        assert_eq!(applied["applied"], true, "{}: {applied}", row.id);
+        let named: Vec<_> = applied["one_way_constructs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}: {applied}", row.id))
+            .iter()
+            .map(|c| c["construct"].as_str().unwrap())
+            .collect();
+        assert!(named.contains(&row.id), "{}: {applied}", row.id);
+        assert_eq!(applied["one_way_note"], ONE_WAY_NOTE);
+        let refused = run_old(
+            &old,
+            &["snapshot", "--target", graph.to_str().unwrap(), "--json"],
+        );
+        assert!(
+            !refused.status.success(),
+            "{}: the edition-2 binary still opens the graph:\n{}",
+            row.id,
+            String::from_utf8_lossy(&refused.stdout)
+        );
+    }
+
+    let (dir, graph) = graph_for(
+        "outside",
+        "node Doc { slug: String @key title: String tags: [String] }\n",
+    );
+    let applied = apply(
+        &dir,
+        &graph,
+        "node Doc { slug: String @key title: String @index tags: [String] n: I64? @index @index(tags) }\n",
+    );
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert!(applied.get("one_way_constructs").is_none(), "{applied}");
+    assert_ok(
+        "snapshot after a change outside the table",
+        &run_old(
+            &old,
+            &["snapshot", "--target", graph.to_str().unwrap(), "--json"],
+        ),
+    );
+
+    let (dir, graph) = graph_for(
+        "explicit_l2",
+        "node Doc { slug: String @key emb: Vector(2) }\n",
+    );
+    let applied = apply(
+        &dir,
+        &graph,
+        "node Doc { slug: String @key emb: Vector(2, distance = \"l2\") }\n",
+    );
+    assert_eq!(applied["applied"], false, "{applied}");
+    assert_eq!(applied["step_count"], 0, "{applied}");
+    assert_ok(
+        "snapshot after an explicit l2",
+        &run_old(
+            &old,
+            &["snapshot", "--target", graph.to_str().unwrap(), "--json"],
+        ),
+    );
+}
+
+/// The full-text rebuild is the one maintenance step the edition-2 binary
+/// cannot read back, and its own rebuild undoes it. On a graph it indexed
+/// and then wrote past, the current `index build` recommends no full-text
+/// rebuild; the current rebuild names its one-way effect; the edition-2
+/// binary then refuses full-text reads until its own `index rebuild --kind
+/// full-text` restores them with the same rows.
+#[test]
+fn genuine_edition_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predecessor() {
+    let Some(old) = edition_2_release_bin() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let schema = temp.path().join("s.pg");
+    let data = temp.path().join("d.jsonl");
+    let more = temp.path().join("more.jsonl");
+    let query = temp.path().join("q.gq");
+    let graph = temp.path().join("g");
+    let g = graph.to_str().unwrap();
+    std::fs::write(
+        &schema,
+        "node Doc { slug: String @key title: String @index }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &data,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"a\",\"title\":\"graph engines\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"b\",\"title\":\"vector search\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &more,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"c\",\"title\":\"graph search\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &query,
+        "query s($q: String) { match { $d: Doc search($d.title, $q) } return { $d.slug } order { $d.slug } }\n",
+    )
+    .unwrap();
+    assert_ok(
+        "init",
+        &run_old(&old, &["init", "--schema", schema.to_str().unwrap(), g]),
+    );
+    for (label, file) in [("load", &data), ("load more", &more)] {
+        assert_ok(
+            label,
+            &run_old(
+                &old,
+                &[
+                    "load",
+                    "--data",
+                    file.to_str().unwrap(),
+                    "--mode",
+                    "merge",
+                    "--target",
+                    g,
+                ],
+            ),
+        );
+        if label == "load" {
+            assert_ok(
+                "index build",
+                &run_old(&old, &["index", "build", "--target", g]),
+            );
+        }
+    }
+    let search = || {
+        run_old(
+            &old,
+            &[
+                "query",
+                "s",
+                "--query",
+                query.to_str().unwrap(),
+                "--params",
+                "{\"q\":\"graph\"}",
+                "--target",
+                g,
+                "--format",
+                "json",
+            ],
+        )
+    };
+    let before = search();
+    assert_ok("search before", &before);
+
+    let build = run_current(&["index", "build", "--target", g, "--json"]);
+    output_success_ref("current index build", &build);
+    let build: serde_json::Value = serde_json::from_slice(&build.stdout).unwrap();
+    assert!(
+        !build.to_string().contains("rebuild --kind full-text"),
+        "the build recommends no full-text rebuild: {build}"
+    );
+    assert_ok("search after the current index build", &search());
+
+    let rebuilt = run_current(&[
+        "index",
+        "rebuild",
+        "--kind",
+        "full-text",
+        "--target",
+        g,
+        "--json",
+    ]);
+    output_success_ref("current full-text rebuild", &rebuilt);
+    let rebuilt: serde_json::Value = serde_json::from_slice(&rebuilt.stdout).unwrap();
+    assert!(
+        rebuilt["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .starts_with("Binaries before this release refuse full-text reads")),
+        "{rebuilt}"
+    );
+    let refused = search();
+    assert!(
+        !refused.status.success(),
+        "the edition-2 binary reads the rebuilt index"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("requires rebuild")
+            || String::from_utf8_lossy(&refused.stderr).contains("requires rebuild"),
+        "{}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_ok(
+        "the edition-2 full-text rebuild",
+        &run_old(
+            &old,
+            &["index", "rebuild", "--kind", "full-text", "--target", g],
+        ),
+    );
+    let restored = search();
+    assert_ok("search after the edition-2 rebuild", &restored);
+    let rows = |out: &std::process::Output| -> serde_json::Value {
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["rows"].clone()
+    };
+    assert_eq!(rows(&restored), rows(&before));
+}
+
+fn output_success_ref(label: &str, out: &std::process::Output) {
+    assert!(
+        out.status.success(),
+        "current binary `{label}` failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
