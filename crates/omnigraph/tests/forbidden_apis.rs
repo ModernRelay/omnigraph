@@ -1701,18 +1701,20 @@ impl CallInventory {
     /// file, so this runs after the whole file is visited. The renames are
     /// per file, not per scope: another function or method with the same name
     /// as a rename target is counted too. That fails a guard loudly, where a
-    /// missed call would pass silently.
+    /// missed call would pass silently. A rename with no call in its file
+    /// counts once, because a renamed re-export is called in other files,
+    /// where this per-file map cannot see the rename. A `use … as _` makes no
+    /// name to call through, so it counts nothing.
     fn count_renamed_calls(&mut self) {
         let renames: BTreeSet<(String, String)> = self
             .use_renames
             .iter()
-            .filter(|(name, rename)| name != rename)
+            .filter(|(name, rename)| name != rename && rename != "_")
             .cloned()
             .collect();
         for (name, rename) in renames {
-            if let Some(&count) = self.counts.get(&rename) {
-                *self.counts.entry(name).or_default() += count;
-            }
+            let count = self.counts.get(&rename).copied().unwrap_or(0).max(1);
+            *self.counts.entry(name).or_default() += count;
         }
     }
 }
@@ -3161,6 +3163,8 @@ fn structural_call_scanner_records_use_renames() {
         }
 
         use crate::branch_control::retire_branch_recoverably as retire;
+        pub(crate) use crate::instrumentation::open_dataset_entry_at_recorded_manifest as open_entry;
+        use std::fmt::Write as _;
         "#,
         "scanner use-rename self-test",
     );
@@ -3177,14 +3181,30 @@ fn structural_call_scanner_records_use_renames() {
                 "retire_branch_recoverably".to_string(),
                 "retire".to_string()
             ),
+            (
+                "open_dataset_entry_at_recorded_manifest".to_string(),
+                "open_entry".to_string()
+            ),
+            ("Write".to_string(), "_".to_string()),
         ]
     );
     // A call through a rename counts under both names, including when the
     // `use` follows the call.
-    for (name, rename) in &inventory.use_renames {
+    for (name, rename) in &inventory.use_renames[..3] {
         assert_eq!(inventory.counts.get(rename), Some(&1), "{rename}");
         assert_eq!(inventory.counts.get(name), Some(&1), "{name}");
     }
+    // A rename with no call in the file, such as a re-export whose calls are
+    // in another file, counts once under the imported name.
+    assert_eq!(inventory.counts.get("open_entry"), None);
+    assert_eq!(
+        inventory
+            .counts
+            .get("open_dataset_entry_at_recorded_manifest"),
+        Some(&1)
+    );
+    // `as _` makes no name to call through, so it counts nothing.
+    assert_eq!(inventory.counts.get("Write"), None);
 }
 
 #[test]
@@ -4649,8 +4669,9 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
 /// `open_pinned_dataset_at_recorded_manifest` stays `pub` because the catalog
 /// calls it across the crate boundary, and the engine imports all of core's
 /// instrumentation, so this count, not visibility, keeps the engine off it.
-/// A call through a `use … as` rename counts under the imported name
-/// (`CallInventory::count_renamed_calls`). A function used as a value
+/// A call through a `use … as` rename counts under the imported name, and a
+/// rename with no call in its file, such as a renamed re-export, counts once
+/// there (`CallInventory::count_renamed_calls`). A function used as a value
 /// (`let open = open_pinned_dataset_at_recorded_manifest;`) is not a call, and
 /// the guard does not see it.
 #[test]
