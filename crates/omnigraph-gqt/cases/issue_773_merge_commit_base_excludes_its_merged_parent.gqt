@@ -25,14 +25,14 @@ branch create b0
 
 --- mutate branch: b0
 query insert_y() {
-    insert Person { name: "y" }
+    replace Person { name: "y" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query insert_w() {
-    insert Person { name: "w" }
+    replace Person { name: "w" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -57,21 +57,21 @@ query delete_w() {
 
 --- mutate branch: b1
 query insert_x1() {
-    insert Person { name: "x1" }
+    replace Person { name: "x1" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: b1
 query insert_x2() {
-    insert Person { name: "x2" }
+    replace Person { name: "x2" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: b0
 query insert_z() {
-    insert Person { name: "z" }
+    replace Person { name: "z" }
 }
 
 --- expect affected: nodes=1 edges=0

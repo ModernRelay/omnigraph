@@ -2449,7 +2449,7 @@ mod owned_shutdown {
 
         let insert = |name: &str| {
             serde_json::json!({
-                "query": "query insert_person($name: String) { insert Person { name: $name } }",
+                "query": "query insert_person($name: String) { replace Person { name: $name } }",
                 "name": "insert_person",
                 "params": {"name": name}
             })
@@ -2852,7 +2852,7 @@ async fn live_deployment_fixture(mode: &str) {
         omnigraph::Session::from_defaults(Arc::clone(&original_engine), Default::default())
             .mutate_as(
                 "feature",
-                "query add() { insert Person { name: \"Merged\" } }",
+                "query add() { replace Person { name: \"Merged\" } }",
                 "add",
                 &Default::default(),
                 Some("operator"),
@@ -3568,7 +3568,7 @@ async fn live_deployment_fixture(mode: &str) {
             .body(body)
             .unwrap()
     }
-    let mutation = serde_json::json!({"query":"query add() { insert Person { name: \"Granted\" } }", "name":"add"});
+    let mutation = serde_json::json!({"query":"query add() { replace Person { name: \"Granted\" } }", "name":"add"});
     let (code, body) = json_response(&app, change(Body::from(mutation.to_string()))).await;
     assert_eq!(code, StatusCode::OK, "{body}");
     assert!(
@@ -3585,7 +3585,7 @@ async fn live_deployment_fixture(mode: &str) {
         polled.send(()).unwrap();
         body_released.await.unwrap();
         Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
-            br#"{"query":"query add() { insert Person { name: \"BeforeRevocation\" } }","name":"add"}"#,
+            br#"{"query":"query add() { replace Person { name: \"BeforeRevocation\" } }","name":"add"}"#,
         ))
     })));
     let request_app = app.clone();
@@ -3632,7 +3632,7 @@ async fn live_deployment_fixture(mode: &str) {
         engine
             .mutate_as(
                 "main",
-                "query add() { insert Person { name: \"EngineBypass\" } }",
+                "query add() { replace Person { name: \"EngineBypass\" } }",
                 "add",
                 &Default::default(),
                 Some("reader")

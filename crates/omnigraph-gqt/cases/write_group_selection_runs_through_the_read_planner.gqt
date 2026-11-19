@@ -121,8 +121,8 @@ query mentor_from_a_read() {
 --- mutate
 query badge_per_row() {
   match { $p: Person, $p worksAt $c } where $c.slug = "acme"
-  insert Badge { owner: $p.name, label: concat($p.name, "@", $c.slug) }
-  insert Badge { owner: $c.slug, label: $c.city }
+  replace Badge { owner: $p.name, label: concat($p.name, "@", $c.slug) }
+  replace Badge { owner: $c.slug, label: $c.city }
 }
 
 --- expect affected: nodes=3 edges=0
@@ -155,7 +155,7 @@ p.name: String
 --- mutate
 query badge_per_company() {
   match { $p: Person, $p worksAt $c } where $c.slug = "acme"
-  insert Badge { owner: $c.slug, label: $p.name }
+  replace Badge { owner: $c.slug, label: $p.name }
 }
 
 --- expect error: E4: `badge_per_company`: the rows of statement 1 of group 1 give Badge ("acme") two values for `label`, "ada" and "bob"
@@ -209,7 +209,7 @@ c.slug: String
 k.role: String?
 
 --- mutate
-query add_eve() { insert Person { name: "eve", age: 1 } }
+query add_eve() { replace Person { name: "eve", age: 1 } }
 
 --- expect affected: nodes=1 edges=0
 
@@ -226,7 +226,7 @@ query age_then_move() {
 query age_insert_then_move() {
   match { $p: Person } where $p.city = "lima"
   update $p set { age: 3 }
-  insert Person { name: "fay", city: "lima" }
+  replace Person { name: "fay", city: "lima" }
   update $p set { city: "quito" }
 }
 

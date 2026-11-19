@@ -27,7 +27,7 @@ node Person {
 
 --- mutate
 query mark() {
-    insert Person { name: "start", age: 0 }
+    replace Person { name: "start", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -52,7 +52,7 @@ query alice_reverts() {
 
 --- mutate
 query gina_arrives() {
-    insert Person { name: "gina", age: 50 }
+    replace Person { name: "gina", age: 50 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -75,7 +75,7 @@ query hank_leaves() {
 
 --- mutate
 query hank_returns() {
-    insert Person { name: "hank", age: 40 }
+    replace Person { name: "hank", age: 40 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -90,14 +90,14 @@ query ivan_leaves() {
 
 --- mutate
 query ivan_returns_older() {
-    insert Person { name: "ivan", age: 21 }
+    replace Person { name: "ivan", age: 21 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query jill_arrives() {
-    insert Person { name: "jill", age: 18 }
+    replace Person { name: "jill", age: 18 }
 }
 
 --- expect affected: nodes=1 edges=0

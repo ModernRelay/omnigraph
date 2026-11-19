@@ -27,9 +27,9 @@ scope: next_step
 
 --- mutate branch: main
 query add_all() {
-    insert Person { name: "bob" }
-    insert Marker { name: "after" }
-    insert Knows { @src: "alice", @dst: "eve" }
+    replace Person { name: "bob" }
+    replace Marker { name: "after" }
+    replace Knows { @src: "alice", @dst: "eve" }
 }
 --- expect error: injected failpoint triggered: mutation.post_table_commit
 
@@ -83,9 +83,9 @@ q.name: String
 
 --- mutate branch: main
 query add_all() {
-    insert Person { name: "bob" }
-    insert Marker { name: "after" }
-    insert Knows { @src: "alice", @dst: "eve" }
+    replace Person { name: "bob" }
+    replace Marker { name: "after" }
+    replace Knows { @src: "alice", @dst: "eve" }
 }
 --- expect affected: nodes=2 edges=1
 

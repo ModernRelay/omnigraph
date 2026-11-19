@@ -122,7 +122,7 @@ node User {
 
 const OCC_UNIQUE_MUTATIONS: &str = r#"
 query insert_user($name: String, $email: String) {
-    insert User { name: $name, email: $email }
+    replace User { name: $name, email: $email }
 }
 "#;
 
@@ -133,7 +133,7 @@ query set_age($name: String, $age: I32) {
 }
 
 query insert_company($name: String) {
-    insert Company { name: $name }
+    replace Company { name: $name }
 }
 "#;
 
@@ -1553,7 +1553,7 @@ async fn mutation_revalidates_unique_after_pre_effect_authority_change() {
 
 const ISSUE_1331_COMPANY_INSERT: &str = r#"
 query insert_company($name: String) {
-    insert Company { name: $name }
+    replace Company { name: $name }
 }
 "#;
 
@@ -12525,13 +12525,13 @@ async fn merge_as_commit_probe_failure_retains_inputs_issue_1067() {
 
 const UNATTACHED_ROOT_QUERY: &str = r#"
 query insert_root($name: String, $age: I32) as unattached branch {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#;
 
 const UNATTACHED_CHILD_QUERY: &str = r#"
 query insert_child($name: String, $age: I32, $base: String) as unattached branch on $base {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#;
 
@@ -12540,7 +12540,7 @@ fn unattached_child_on(base: &str) -> String {
     format!(
         r#"
 query insert_child($name: String, $age: I32) as unattached branch on "{base}" {{
-    insert Person {{ name: $name, age: $age }}
+    replace Person {{ name: $name, age: $age }}
 }}
 "#
     )

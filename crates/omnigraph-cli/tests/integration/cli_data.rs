@@ -2618,7 +2618,7 @@ fn query_format_arrow_writes_a_query_s_batches_unless_stdout_is_a_terminal_issue
         cli()
             .args(["mutate", "--target"])
             .arg(graph.path())
-            .args(["-e", "query add() { insert Person { name: \"Eve\" } }"]),
+            .args(["-e", "query add() { replace Person { name: \"Eve\" } }"]),
     );
     let arrow_query = |source: &str| {
         let mut command = cli_process();
@@ -3058,7 +3058,7 @@ fn change_json_outputs_affected_counts_and_persists() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     );
@@ -4359,7 +4359,7 @@ fn change_resolves_uri_and_default_branch_from_store_scope() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     );
@@ -4458,7 +4458,7 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
     ];
     for &(verb, graph, flags, expected_format) in cases {
         let source = if verb == "mutate" {
-            r#"query q() { insert Person { name: "original-server" } }"#
+            r#"query q() { replace Person { name: "original-server" } }"#
         } else {
             "query q() { match { $p: Person } return { $p.name } }"
         };
@@ -4795,7 +4795,7 @@ fn as_on_a_served_write_asserts_the_actor() {
         &[
             "mutate",
             "-e",
-            "query add($name: String) { insert Person { name: $name } }",
+            "query add($name: String) { replace Person { name: $name } }",
             "--params",
             r#"{"name":"X"}"#,
         ],
@@ -4887,7 +4887,7 @@ fn commit_publish_and_drop_take_as_on_a_direct_graph_issue_1023() {
                 .arg(&graph)
                 .args(["--as", "act-author", "-e"])
                 .arg(format!(
-                    "query propose() as commit {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+                    "query propose() as commit {{ replace Person {{ name: \"{name}\", age: 33 }} }}"
                 ))
                 .arg("--json"),
         );
@@ -4966,7 +4966,9 @@ fn change_supports_inline_query_string() {
             .arg("--target")
             .arg(&repo)
             .arg("--query-string")
-            .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
+            .arg(
+                "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
+            )
             .arg("--params")
             .arg(r#"{"name":"Inline","age":42}"#)
             .arg("--json"),
@@ -5223,7 +5225,7 @@ fn write_echoes_resolved_target_to_stderr() {
             .args([
                 "mutate",
                 "-e",
-                "query add() { insert Person { name: \"new\" } }",
+                "query add() { replace Person { name: \"new\" } }",
                 "--json",
                 "--target",
             ])
@@ -7062,7 +7064,7 @@ fn direct_writes_to_a_cluster_graph_obey_its_applied_policy_issue_1414() {
         &mutation,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     );

@@ -26,7 +26,7 @@ scope: next_step
 
 --- mutate
 query root_bob() as unattached branch {
-    insert Person { name: "bob", age: 41 }
+    replace Person { name: "bob", age: 41 }
 }
 
 --- expect error: injected failpoint triggered: propose.post_candidate_pre_tag
@@ -45,7 +45,7 @@ p.name: String
 
 --- mutate
 query root_carol() as unattached branch {
-    insert Person { name: "carol", age: 52 }
+    replace Person { name: "carol", age: 52 }
 }
 
 --- expect affected: nodes=1 edges=0

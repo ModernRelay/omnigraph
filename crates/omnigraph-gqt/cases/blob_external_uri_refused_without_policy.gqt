@@ -23,7 +23,7 @@ node Doc {
 
 --- mutate
 query insert_external_uri($content: Blob?) {
-    insert Doc { slug: "b", content: $content, title: "beta" }
+    replace Doc { slug: "b", content: $content, title: "beta" }
 }
 
 --- params

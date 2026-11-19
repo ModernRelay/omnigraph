@@ -301,8 +301,8 @@ scan PlainNote as $n: access sequential
 
 --- mutate
 query append_notes() {
-    insert Note { slug: "n7", text: "hello world again" }
-    insert PlainNote { slug: "n7", text: "hello world again" }
+    replace Note { slug: "n7", text: "hello world again" }
+    replace PlainNote { slug: "n7", text: "hello world again" }
 }
 
 --- expect affected: nodes=2 edges=0

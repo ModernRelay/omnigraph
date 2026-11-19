@@ -172,7 +172,7 @@ branch create feature
 
 --- mutate branch: feature
 query add_doc() {
-    insert Doc { slug: "d12", rank: 12, title: "t-12", body: "body 12", embedding: [12.0, 0.0] }
+    replace Doc { slug: "d12", rank: 12, title: "t-12", body: "body 12", embedding: [12.0, 0.0] }
 }
 
 --- expect affected: nodes=1 edges=0

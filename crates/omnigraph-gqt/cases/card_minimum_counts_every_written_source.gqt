@@ -31,15 +31,15 @@ edge WorksAt: Person -> Company @card(1..)
 
 --- mutate
 query hire_without_employer() {
-    insert Person { name: "bob" }
+    replace Person { name: "bob" }
 }
 
 --- expect error: @card violation on edge WorksAt: source 'bob' has 0 edges (min 1)
 
 --- mutate
 query hire_two_with_one_employer() {
-    insert Person { name: "bob" }
-    insert Person { name: "carol" }
+    replace Person { name: "bob" }
+    replace Person { name: "carol" }
     insert WorksAt { @src: "carol", @dst: "acme" }
 }
 
@@ -47,7 +47,7 @@ query hire_two_with_one_employer() {
 
 --- mutate
 query hire_with_employer() {
-    insert Person { name: "bob" }
+    replace Person { name: "bob" }
     insert WorksAt { @src: "bob", @dst: "acme" }
 }
 

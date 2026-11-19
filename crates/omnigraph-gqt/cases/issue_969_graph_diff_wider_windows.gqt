@@ -38,7 +38,7 @@ edge Knows: Person -> Person {
 
 --- mutate
 query mark() {
-    insert Person { name: "start", age: 0 }
+    replace Person { name: "start", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -63,7 +63,7 @@ query alice_ages_again() {
 
 --- mutate
 query erin_arrives() {
-    insert Person { name: "erin", age: 25 }
+    replace Person { name: "erin", age: 25 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -86,14 +86,14 @@ query carol_leaves() {
 
 --- mutate
 query carol_returns_older() {
-    insert Person { name: "carol", age: 21 }
+    replace Person { name: "carol", age: 21 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query carol_knows_erin() {
-    insert Knows { @src: "carol", @dst: "erin", since: 2024 }
+    replace Knows { @src: "carol", @dst: "erin", since: 2024 }
 }
 
 --- expect affected: nodes=0 edges=1

@@ -54,8 +54,8 @@ query bump_alice($n: I32) {
 --- endloop
 
 --- concurrent
-w1 on b: query releasing_publish() { insert Person { name: "carol", age: 1 } }
-w2 on b: query queued_publish() { insert Person { name: "dave", age: 2 } }
+w1 on b: query releasing_publish() { replace Person { name: "carol", age: 1 } }
+w2 on b: query queued_publish() { replace Person { name: "dave", age: 2 } }
 order: w1 park put __history/blocks/, w2 start, w1 put __history/blocks/, w1, w2
 --- expect
 w1: ok

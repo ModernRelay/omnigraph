@@ -32,27 +32,27 @@ branch create b0
 --- expect ok
 
 --- mutate branch: main
-query add_loop_on_main() { insert Knows { @src: "Diana", @dst: "Diana" } }
+query add_loop_on_main() { replace Knows { @src: "Diana", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query add_loop_on_branch() { insert Knows { @src: "Diana", @dst: "Diana" } }
+query add_loop_on_branch() { replace Knows { @src: "Diana", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query upsert_branch_loop() { insert Knows { @src: "Diana", @dst: "Diana" } }
+query upsert_branch_loop() { replace Knows { @src: "Diana", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query upsert_inherited_edge() { insert Knows { @src: "Alice", @dst: "Bob" } }
+query upsert_inherited_edge() { replace Knows { @src: "Alice", @dst: "Bob" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: main
-query add_person_on_main() { insert Person { name: "Eve" } }
+query add_person_on_main() { replace Person { name: "Eve" } }
 
 --- expect affected: nodes=1 edges=0
 

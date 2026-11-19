@@ -50,9 +50,9 @@ p.score: F64?
 
 --- mutate
 query insert_then_upsert_twice() {
-    insert Person { name: "b", age: 1 }
-    insert Person { name: "b", age: 2 }
-    insert Person { name: "b", age: 3 }
+    replace Person { name: "b", age: 1 }
+    replace Person { name: "b", age: 2 }
+    replace Person { name: "b", age: 3 }
 }
 --- expect affected: nodes=3 edges=0
 

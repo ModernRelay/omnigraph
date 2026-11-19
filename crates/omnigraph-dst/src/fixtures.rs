@@ -69,7 +69,7 @@ pub fn fixture_knows() -> Vec<(String, String)> {
 
 pub const MUTATION_QUERIES: &str = r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 
 query set_age($name: String, $age: I32) {
@@ -88,7 +88,7 @@ query all_persons() {
 }
 
 query insert_person_v($name: String, $age: I32, $ver: I64) {
-    insert Person { name: $name, age: $age, ver: $ver }
+    replace Person { name: $name, age: $age, ver: $ver }
 }
 
 query set_age_v($name: String, $age: I32, $ver: I64) {

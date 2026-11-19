@@ -34,7 +34,7 @@ query link_edge() {
 
 --- mutate
 query link_node() {
-    insert Link { name: "c" }
+    replace Link { name: "c" }
 }
 --- expect affected: nodes=1 edges=0
 

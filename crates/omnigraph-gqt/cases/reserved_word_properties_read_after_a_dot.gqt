@@ -62,7 +62,7 @@ p.slug: String
 
 --- mutate
 query assign_bare() {
-    insert Person { slug: "c", and: 1, is: 1 }
+    replace Person { slug: "c", and: 1, is: 1 }
 }
 
 --- expect affected: nodes=1 edges=0

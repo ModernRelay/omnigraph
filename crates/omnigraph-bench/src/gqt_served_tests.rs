@@ -173,7 +173,7 @@ fn served_identity_axes_and_read_only_suffix_are_enforced() {
     let mut invalid = plan("tiny-read");
     invalid.definition.protocol.reset = ResetMode::None;
     assert!(replan(invalid).is_err());
-    const PROPOSE: &str = "\n--- mutate\nquery propose() as commit { insert Person { name: \"zed\" } }\n--- expect affected: nodes=1 edges=0\n--- bind commit $w\n";
+    const PROPOSE: &str = "\n--- mutate\nquery propose() as commit { replace Person { name: \"zed\" } }\n--- expect affected: nodes=1 edges=0\n--- bind commit $w\n";
     let restarted = format!("{}\n--- restart\n", p.queries.text);
     let parsed = omnigraph_gqt_core::parse_case("served_restart_suffix", &restarted).unwrap();
     assert_eq!(

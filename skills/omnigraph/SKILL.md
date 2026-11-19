@@ -103,7 +103,7 @@ There is **no `mutation` keyword** (`Q009`) — every block is a named `query`; 
 
 ```gq
 query add_signal($slug: String, $name: String, $brief: String, $createdAt: DateTime) {
-    insert Signal { slug: $slug, name: $name, brief: $brief,
+    replace Signal { slug: $slug, name: $name, brief: $brief,
                     stagingTimestamp: $createdAt, createdAt: $createdAt, updatedAt: $createdAt }
 }
 query link($from: String, $to: String) { insert FormsPattern { @src: $from, @dst: $to } }

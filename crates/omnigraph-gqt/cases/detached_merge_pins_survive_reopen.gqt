@@ -21,11 +21,11 @@ branch create source
 --- expect ok
 
 --- mutate branch: source
-query add_source() { insert Person { name: "bob" } insert Knows { @src: "bob", @dst: "alice" } }
+query add_source() { replace Person { name: "bob" } replace Knows { @src: "bob", @dst: "alice" } }
 --- expect affected: nodes=1 edges=1
 
 --- mutate branch: main
-query advance_target() { insert Person { name: "carol" } }
+query advance_target() { replace Person { name: "carol" } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate
@@ -88,7 +88,7 @@ p.name: String
 q.name: String
 
 --- mutate branch: main
-query after_merge() { insert Person { name: "diana" } insert Knows { @src: "diana", @dst: "carol" } }
+query after_merge() { replace Person { name: "diana" } replace Knows { @src: "diana", @dst: "carol" } }
 --- expect affected: nodes=1 edges=1
 
 --- restart

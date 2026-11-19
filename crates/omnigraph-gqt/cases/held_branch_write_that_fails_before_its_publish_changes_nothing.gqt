@@ -25,7 +25,7 @@ action: fail
 scope: next_step
 
 --- mutate
-query add_bob() { insert Person { name: "bob" } }
+query add_bob() { replace Person { name: "bob" } }
 --- expect error: injected failpoint triggered: mutation.post_finalize_pre_publisher
 
 --- query
@@ -43,7 +43,7 @@ query remove_nobody() {
 --- expect affected: nodes=0 edges=0
 
 --- mutate
-query add_carol() { insert Person { name: "carol" } }
+query add_carol() { replace Person { name: "carol" } }
 --- expect affected: nodes=1 edges=0
 
 --- query

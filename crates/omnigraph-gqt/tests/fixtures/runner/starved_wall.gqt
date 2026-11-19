@@ -13,8 +13,8 @@ node Person {
 --- seed
 {"type":"Person","data":{"name":"alice"}}
 --- concurrent
-w1: query add_bob() { insert Person { name: "bob" } }
-w2: query add_carol() { insert Person { name: "carol" } }
+w1: query add_bob() { replace Person { name: "bob" } }
+w2: query add_carol() { replace Person { name: "carol" } }
 order: w1 park put __manifest/_versions/, w2 start, w2, w1 put __manifest/_versions/
 --- expect
 w1: ok

@@ -51,7 +51,7 @@ query duplicate_inherited_edge() { insert Knows { @src: "Alice", @dst: "Bob" } }
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: main
-query add_person_on_main() { insert Person { name: "Eve" } }
+query add_person_on_main() { replace Person { name: "Eve" } }
 
 --- expect affected: nodes=1 edges=0
 

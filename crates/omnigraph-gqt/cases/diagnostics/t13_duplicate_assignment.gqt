@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- mutate
-query w() { insert Person { handle: "a", name: "b", name: "c" } }
+query w() { replace Person { handle: "a", name: "b", name: "c" } }
 
 --- expect error: type error: T13:

@@ -38,7 +38,7 @@ pass expand_mode
 
 --- mutate
 query add_side() {
-    insert Person { name: "side" }
+    replace Person { name: "side" }
 }
 --- expect affected: nodes=1 edges=0
 

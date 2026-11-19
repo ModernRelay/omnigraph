@@ -2602,7 +2602,7 @@ async fn insert(graph: &Arc<Omnigraph>, branch: &str, name: &str) {
     session(graph)
         .mutate(
             branch,
-            "query seed($name: String) { insert Person { name: $name } }",
+            "query seed($name: String) { replace Person { name: $name } }",
             "seed",
             &HashMap::from([(
                 "name".to_string(),

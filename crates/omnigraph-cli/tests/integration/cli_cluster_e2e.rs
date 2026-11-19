@@ -900,7 +900,7 @@ fn cluster_e2e_declared_graph_removal_deletes_owned_storage() {
                 "mutate",
                 "seed",
                 "-e",
-                "query seed() { insert Service { name: \"Deleted\" } }",
+                "query seed() { replace Service { name: \"Deleted\" } }",
                 "--target",
             ])
             .arg(&graph),
@@ -1140,7 +1140,7 @@ fn live_graph_removal_deletes_owned_storage(
         "--graph",
         "tools",
         "-e",
-        "query seed() { insert Tool { name: \"Retained\" } }",
+        "query seed() { replace Tool { name: \"Retained\" } }",
         "--json",
     ]));
     let snapshot = live_snapshot(server, "tools");
@@ -1164,7 +1164,7 @@ fn live_graph_removal_deletes_owned_storage(
         "--graph",
         "retired",
         "-e",
-        "query seed() { insert Tool { name: \"Deleted\" } }",
+        "query seed() { replace Tool { name: \"Deleted\" } }",
         "--json",
     ]));
     assert!(live_get(server, "/graphs/retired/commits")["commits"].is_array());
@@ -1569,7 +1569,7 @@ fn live_policy_mutation(server: &TestServer, name: &str) -> assert_cmd::Command 
         "--graph",
         "knowledge",
         "-e",
-        "query policy_probe($name: String) { insert Person { name: $name } }",
+        "query policy_probe($name: String) { replace Person { name: $name } }",
         "--params",
         &serde_json::json!({"name":name}).to_string(),
         "--json",

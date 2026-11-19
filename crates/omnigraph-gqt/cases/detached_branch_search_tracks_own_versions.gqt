@@ -114,7 +114,7 @@ query nearest_docs($q: Vector(4)) {
 d.slug: String
 
 --- mutate branch: work
-query replace_b($e: Vector(4)) { insert Doc { slug: "b", embedding: $e } }
+query replace_b($e: Vector(4)) { replace Doc { slug: "b", embedding: $e } }
 --- params
 {"e":[40.0,0.0,0.0,0.0]}
 --- expect affected: nodes=1 edges=0

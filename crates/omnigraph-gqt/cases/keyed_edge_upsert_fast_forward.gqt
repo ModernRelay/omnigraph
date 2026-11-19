@@ -31,7 +31,7 @@ branch create b0
 --- expect ok
 
 --- mutate branch: b0
-query upsert_inherited_edge() { insert Knows { @src: "Bob", @dst: "Diana" } }
+query upsert_inherited_edge() { replace Knows { @src: "Bob", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 

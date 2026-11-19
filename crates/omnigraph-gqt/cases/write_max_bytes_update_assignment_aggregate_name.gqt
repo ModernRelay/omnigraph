@@ -23,8 +23,8 @@ node Doc {
 
 --- mutate
 query seed_docs() {
-    insert Doc { slug: "a", note: "n" }
-    insert Doc { slug: "b", note: "n" }
+    replace Doc { slug: "a", note: "n" }
+    replace Doc { slug: "b", note: "n" }
 }
 
 --- expect affected: nodes=2 edges=0
@@ -44,7 +44,7 @@ query assign_both_rows($payload: Blob) {
 --- mutate
 set write_max_bytes = 30000;
 query two_properties($payload: Blob) {
-    insert Doc { slug: "c", content: $payload, extra: $payload, note: "m" }
+    replace Doc { slug: "c", content: $payload, extra: $payload, note: "m" }
 }
 
 --- params

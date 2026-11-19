@@ -27,7 +27,7 @@ node Doc {
 
 --- mutate
 query put($slug: String, $body: Blob) {
-    insert Doc { slug: $slug, body: $body }
+    replace Doc { slug: $slug, body: $body }
 }
 
 --- params generate: v1 seed: 0

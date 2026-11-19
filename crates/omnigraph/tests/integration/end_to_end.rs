@@ -1013,7 +1013,7 @@ query get_doc_clause($title: String) {
 
 const BLOB_MUTATIONS: &str = r#"
 query insert_doc($title: String, $content: Blob) {
-    insert Document { title: $title, content: $content }
+    replace Document { title: $title, content: $content }
 }
 
 query update_doc_content($title: String, $content: Blob) {
@@ -1027,8 +1027,8 @@ query clear_doc_content($title: String, $content: Blob?) {
 }
 
 query insert_then_clear_doc_content($title: String, $content: Blob, $cleared: Blob?) {
-    insert Document { title: $title, content: $content }
-    insert Document { title: $title, content: $cleared }
+    replace Document { title: $title, content: $content }
+    replace Document { title: $title, content: $cleared }
 }
 "#;
 
@@ -1803,7 +1803,7 @@ node Person {
 "#;
     let queries = r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -1881,7 +1881,7 @@ node Order {
 "#;
     let queries = r#"
 query insert_order($code: String) {
-    insert Order { code: $code }
+    replace Order { code: $code }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -2008,7 +2008,7 @@ node Article {
 "#;
     let mutations = r#"
 query insert_article($slug: String, $attachment: Blob, $summary: String, $rating: I32) {
-    insert Article { slug: $slug, attachment: $attachment, summary: $summary, rating: $rating }
+    replace Article { slug: $slug, attachment: $attachment, summary: $summary, rating: $rating }
 }
 query update_summary($slug: String, $summary: String) {
     match { $x: Article } where $x.slug = $slug

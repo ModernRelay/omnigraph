@@ -50,7 +50,7 @@ i.key: String
 
 --- mutate
 query insert_item_above_the_signed_range($v: U64) {
-    insert Item { key: "c", size: $v }
+    replace Item { key: "c", size: $v }
 }
 
 --- params

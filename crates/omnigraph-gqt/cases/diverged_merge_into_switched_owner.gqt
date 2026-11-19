@@ -49,7 +49,7 @@ query main_write() {
 
 --- mutate
 query main_adds_bob() {
-    insert Person { name: "bob", age: 40 }
+    replace Person { name: "bob", age: 40 }
 }
 
 --- expect affected: nodes=1 edges=0

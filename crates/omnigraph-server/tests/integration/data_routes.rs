@@ -2199,8 +2199,8 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE, SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
     };
     const ATOMIC: &str = r#"query atomic() {
-        insert Person { name: "Owned", age: 41 }
-        insert Company { name: "OwnedCo" }
+        replace Person { name: "Owned", age: 41 }
+        replace Company { name: "OwnedCo" }
         insert WorksAt { @src: "Owned", @dst: "OwnedCo" }
     }"#;
     const BATCH: &str = concat!(
@@ -3359,7 +3359,7 @@ async fn propose_person(app: &axum::Router, name: &str) -> Value {
         json_post(
             "/mutate",
             &json!({"query": format!(
-                "query propose() as commit {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+                "query propose() as commit {{ replace Person {{ name: \"{name}\", age: 33 }} }}"
             )}),
         ),
     )
@@ -3486,7 +3486,7 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
         &app,
         json_post(
             "/mutate",
-            &json!({"query": "query add() { insert Person { name: \"Sol\", age: 34 } }"}),
+            &json!({"query": "query add() { replace Person { name: \"Sol\", age: 34 } }"}),
         ),
     )
     .await;
@@ -3524,7 +3524,7 @@ async fn sprout_person(app: &axum::Router, name: &str, base: Option<&str>) -> Va
         json_post(
             "/mutate",
             &json!({"query": format!(
-                "query sprout() as unattached branch{on} {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+                "query sprout() as unattached branch{on} {{ replace Person {{ name: \"{name}\", age: 33 }} }}"
             )}),
         ),
     )
@@ -3700,7 +3700,7 @@ async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches()
             json_post(
                 "/mutate",
                 &json!({"query": format!(
-                    "query sprout() as unattached branch on \"{id}\" {{ insert Person {{ name: \"Late\", age: 33 }} }}"
+                    "query sprout() as unattached branch on \"{id}\" {{ replace Person {{ name: \"Late\", age: 33 }} }}"
                 )}),
             ),
         )
@@ -3725,12 +3725,12 @@ async fn stored_unattached_mutation_keeps_its_clause_per_invocation() {
         &[
             (
                 "sprout_root",
-                "query sprout_root($name: String) as unattached branch { insert Person { name: $name, age: 33 } }",
+                "query sprout_root($name: String) as unattached branch { replace Person { name: $name, age: 33 } }",
                 true,
             ),
             (
                 "sprout_child",
-                "query sprout_child($name: String, $base: String) as unattached branch on $base { insert Person { name: $name, age: 33 } }",
+                "query sprout_child($name: String, $base: String) as unattached branch on $base { replace Person { name: $name, age: 33 } }",
                 true,
             ),
         ],
@@ -5084,7 +5084,7 @@ async fn query_endpoint_answers_an_explain_statement_as_rows() {
     );
 }
 
-const EXPLAIN_INSERT_PERSON: &str = "explain query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}\n";
+const EXPLAIN_INSERT_PERSON: &str = "explain query insert_person($name: String, $age: I32) {\n    replace Person { name: $name, age: $age }\n}\n";
 
 const EXPLAIN_OLDER_PAIRS: &str = "explain query older_pairs() {\n    match { $a: Person, let $bs = { match { $b: Person } return { $b } }, from $bs }\n    where $a.age > $b.age\n    return { $a.name, $b.name }\n}\n";
 
@@ -6958,7 +6958,7 @@ async fn aggregate_mutation_memory_refusal_keeps_graph_and_admission_usable() {
         json_post(
             "/mutate",
             &json!({"query":
-                "query small() { insert First { name: \"ok\", payload: \"ok\" } }"
+                "query small() { replace First { name: \"ok\", payload: \"ok\" } }"
             }),
         ),
     )
@@ -7053,7 +7053,7 @@ async fn removed_id_memory_refusals_keep_graph_and_admission_usable() {
         &app,
         json_post(
             "/mutate",
-            &json!({"query": "query small() { insert First { name: \"ok\" } }"}),
+            &json!({"query": "query small() { replace First { name: \"ok\" } }"}),
         ),
     )
     .await;
@@ -7147,12 +7147,12 @@ async fn change_disjoint_table_concurrency_succeeds_under_branch_occ_gate() {
     // must reflect every insert.
     const PERSON_QUERY: &str = r#"
 query insert_p($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#;
     const COMPANY_QUERY: &str = r#"
 query insert_c($name: String) {
-    insert Company { name: $name }
+    replace Company { name: $name }
 }
 "#;
     const SEED_PERSONS: u64 = 4;
@@ -8895,7 +8895,7 @@ async fn removed_routes_and_legacy_query_fields_refuse_without_graph_effects() {
             .oneshot(json_post(
                 path,
                 &json!({
-                    "query": "mutation add() { insert Person { name: \"Unexpected\", age: 1 } }",
+                    "query": "mutation add() { replace Person { name: \"Unexpected\", age: 1 } }",
                     "data": "{\"type\":\"Person\",\"data\":{\"name\":\"Unexpected\",\"age\":1}}"
                 }),
             ))

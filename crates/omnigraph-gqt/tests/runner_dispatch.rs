@@ -979,7 +979,7 @@ fn prepared_store_under_dst_runs_a_concurrent_block_and_leaves_the_root_unchange
     let path = dir.path().join("prepared.gqt");
     std::fs::write(
         &path,
-        "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- concurrent\nw1: query add_bob() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 park put __manifest/_versions/, r1 start, w1 put __manifest/_versions/, w1, r1\n--- expect\nw1: ok\nr1: ok\n\n--- query\nquery all() { match { $p: Person } return { $p.name } }\n--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n--- expect shape\np.name: String\n",
+        "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- concurrent\nw1: query add_bob() { replace Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 park put __manifest/_versions/, r1 start, w1 put __manifest/_versions/, w1, r1\n--- expect\nw1: ok\nr1: ok\n\n--- query\nquery all() { match { $p: Person } return { $p.name } }\n--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n--- expect shape\np.name: String\n",
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
@@ -1066,10 +1066,10 @@ fn prepared_store_under_dst_runs_seams_on_the_view_ignores_foreign_files_and_ref
     });
     let header = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n";
     let retried = format!(
-        "{header}--- seam\nat: publish.load_state\noccurrence: 1\naction: contention\nscope: next_step\n\n--- mutate\nquery add_bob() {{ insert Person {{ name: \"bob\" }} }}\n--- expect affected: nodes=1 edges=0\n\n--- query\nquery all() {{ match {{ $p: Person }} return {{ $p.name }} }}\n--- expect unordered\n{{\"p.name\":\"alice\"}}\n{{\"p.name\":\"bob\"}}\n--- expect shape\np.name: String\n"
+        "{header}--- seam\nat: publish.load_state\noccurrence: 1\naction: contention\nscope: next_step\n\n--- mutate\nquery add_bob() {{ replace Person {{ name: \"bob\" }} }}\n--- expect affected: nodes=1 edges=0\n\n--- query\nquery all() {{ match {{ $p: Person }} return {{ $p.name }} }}\n--- expect unordered\n{{\"p.name\":\"alice\"}}\n{{\"p.name\":\"bob\"}}\n--- expect shape\np.name: String\n"
     );
     let windowed = format!(
-        "{header}--- seam\nat: mutation.post_table_commit\noccurrence: 1\naction: fail\nscope: next_step\n\n--- mutate\nquery add_bob() {{ insert Person {{ name: \"bob\" }} }}\n--- expect error: injected failpoint triggered: mutation.post_table_commit\n\n--- query\nquery all() {{ match {{ $p: Person }} return {{ $p.name }} }}\n--- expect unordered\n{{\"p.name\":\"alice\"}}\n--- expect shape\np.name: String\n"
+        "{header}--- seam\nat: mutation.post_table_commit\noccurrence: 1\naction: fail\nscope: next_step\n\n--- mutate\nquery add_bob() {{ replace Person {{ name: \"bob\" }} }}\n--- expect error: injected failpoint triggered: mutation.post_table_commit\n\n--- query\nquery all() {{ match {{ $p: Person }} return {{ $p.name }} }}\n--- expect unordered\n{{\"p.name\":\"alice\"}}\n--- expect shape\np.name: String\n"
     );
     let run = |name: &str, text: &str| {
         let path = dir.path().join(name);
@@ -1544,7 +1544,7 @@ fn selecting_engine_does_not_allow_blessing_a_shared_case() {
 #[cfg(tokio_unstable)]
 #[test]
 fn measure_counts_schema_contract_requests_issue_817() {
-    const CASE: &str = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person { name: String @key }\n--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n--- mutate\nquery add_bob() { insert Person { name: \"bob\" } }\n--- expect affected: nodes=1 edges=0\n--- mutate\nquery add_carol() { insert Person { name: \"carol\" } }\n--- expect affected: nodes=1 edges=0\n--- query\nquery all() { match { $p: Person } return { $p.name } }\n--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n{\"p.name\":\"carol\"}\n--- expect shape\np.name: String\n";
+    const CASE: &str = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person { name: String @key }\n--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n--- mutate\nquery add_bob() { replace Person { name: \"bob\" } }\n--- expect affected: nodes=1 edges=0\n--- mutate\nquery add_carol() { replace Person { name: \"carol\" } }\n--- expect affected: nodes=1 edges=0\n--- query\nquery all() { match { $p: Person } return { $p.name } }\n--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n{\"p.name\":\"carol\"}\n--- expect shape\np.name: String\n";
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("two_inserts_on_main.gqt");
     std::fs::write(&path, CASE).unwrap();

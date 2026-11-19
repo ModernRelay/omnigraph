@@ -213,7 +213,7 @@ id (`--snapshot <id>`), and the commit lists with `published: false`.
 
 ```gq
 query propose_bob() as commit {
-    insert Person { name: "bob", age: 41 }
+    replace Person { name: "bob", age: 41 }
 }
 ```
 
@@ -259,11 +259,11 @@ their own snapshot and see nothing of each other's.
 
 ```gq
 query add_person($name: String) as unattached branch {
-    insert Person { name: $name }
+    replace Person { name: $name }
 }
 
 query add_address($id: String, $base: String) as unattached branch on $base {
-    insert Address { owner: $id, city: "Delft" }
+    replace Address { owner: $id, city: "Delft" }
 }
 ```
 

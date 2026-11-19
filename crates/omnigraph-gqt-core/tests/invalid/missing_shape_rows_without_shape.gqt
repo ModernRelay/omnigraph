@@ -16,7 +16,7 @@ query all() { match { $p: Person } return { $p.name } }
 --- expect unordered
 {"p.name":"alice"}
 --- mutate
-query add($n: String) { insert Person { name: $n, age: 2 } }
+query add($n: String) { replace Person { name: $n, age: 2 } }
 --- params
 {"n":"bob"}
 --- expect affected: nodes=1 edges=0

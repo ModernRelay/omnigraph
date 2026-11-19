@@ -165,8 +165,8 @@ scan PlainDoc as $d: access sequential
 
 --- mutate
 query append_docs() {
-    insert Doc { slug: "d6", tags: ["rust"] }
-    insert PlainDoc { slug: "d6", tags: ["rust"] }
+    replace Doc { slug: "d6", tags: ["rust"] }
+    replace PlainDoc { slug: "d6", tags: ["rust"] }
 }
 
 --- expect affected: nodes=2 edges=0

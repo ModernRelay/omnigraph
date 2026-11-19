@@ -25,7 +25,7 @@ branch create b0
 
 --- mutate branch: b0
 query b0_n1() {
-    insert Person { name: "n1" }
+    replace Person { name: "n1" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -42,7 +42,7 @@ branch merge b0
 
 --- mutate
 query main_n0() {
-    insert Person { name: "n0" }
+    replace Person { name: "n0" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -54,7 +54,7 @@ branch merge main into b0
 
 --- mutate branch: b0
 query b0_n2() {
-    insert Person { name: "n2" }
+    replace Person { name: "n2" }
 }
 
 --- expect affected: nodes=1 edges=0

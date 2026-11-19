@@ -22,7 +22,7 @@ node Event {
 
 --- mutate
 query insert_event($name: String, $day: Date) {
-    insert Event { name: $name, day: $day }
+    replace Event { name: $name, day: $day }
 }
 
 --- params

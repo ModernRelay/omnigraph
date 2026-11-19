@@ -26,7 +26,7 @@ node Person {
 
 --- mutate
 query insert_carol() {
-    insert Person { name: "carol", age: 22 }
+    replace Person { name: "carol", age: 22 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -73,7 +73,7 @@ p.age: I32
 
 --- mutate branch: fix
 query insert_dave() {
-    insert Person { name: "dave", age: 50 }
+    replace Person { name: "dave", age: 50 }
 }
 
 --- expect affected: nodes=1 edges=0

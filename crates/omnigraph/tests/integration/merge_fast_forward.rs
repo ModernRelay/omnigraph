@@ -1571,7 +1571,7 @@ const BLOB_SCHEMA: &str =
     "node Document {\n  title: String @key\n  content: Blob?\n  note: String?\n}\n";
 const BLOB_INSERT: &str = r#"
 query insert_doc($title: String, $content: Blob, $note: String) {
-    insert Document { title: $title, content: $content, note: $note }
+    replace Document { title: $title, content: $content, note: $note }
 }
 "#;
 

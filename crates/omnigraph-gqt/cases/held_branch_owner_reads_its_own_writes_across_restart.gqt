@@ -36,7 +36,7 @@ p.name: String
 
 --- mutate
 query add_bob() {
-    insert Person { name: "bob", age: 40 }
+    replace Person { name: "bob", age: 40 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -71,7 +71,7 @@ p.name: String
 
 --- mutate
 query add_carol() {
-    insert Person { name: "carol", age: 50 }
+    replace Person { name: "carol", age: 50 }
 }
 
 --- expect affected: nodes=1 edges=0

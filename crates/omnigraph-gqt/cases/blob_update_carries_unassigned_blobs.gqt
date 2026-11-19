@@ -73,7 +73,7 @@ query assign_both($slug: String, $first: Blob?, $second: Blob?) {
 
 --- mutate
 query insert_c($first: Blob?) {
-    insert Doc { slug: "c", first: $first, title: "gamma", rank: 3 }
+    replace Doc { slug: "c", first: $first, title: "gamma", rank: 3 }
 }
 
 --- params

@@ -46,7 +46,7 @@ pub fn full_text_test_schema() -> String {
 
 pub const MUTATION_QUERIES: &str = r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 
 query add_friend($from: String, $to: String) {
@@ -69,7 +69,7 @@ query remove_friendship($from: String) {
 }
 
 query insert_person_and_friend($name: String, $age: I32, $friend: String) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
     insert Knows { @src: $name, @dst: $friend }
 }
 "#;

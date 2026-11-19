@@ -30,7 +30,7 @@ edge Cites: Doc -> Doc {
 {"edge":"Cites","from":"a","to":"b","data":{"signal":[1.0,1.0]}}
 
 --- mutate
-query add($s: String, $e: Vector(2)) { insert Doc { slug: $s, embedding: $e } }
+query add($s: String, $e: Vector(2)) { replace Doc { slug: $s, embedding: $e } }
 
 --- params
 {"s": "z", "e": [0.0, 0.0]}
@@ -38,7 +38,7 @@ query add($s: String, $e: Vector(2)) { insert Doc { slug: $s, embedding: $e } }
 --- expect error: Doc.embedding declares the cosine distance, which a zero vector leaves undefined
 
 --- mutate
-query add($s: String, $e: Vector(2)) { insert Doc { slug: $s, embedding: $e } }
+query add($s: String, $e: Vector(2)) { replace Doc { slug: $s, embedding: $e } }
 
 --- params
 {"s": "z", "e": [-0.0, 0.0]}
@@ -46,7 +46,7 @@ query add($s: String, $e: Vector(2)) { insert Doc { slug: $s, embedding: $e } }
 --- expect error: Doc.embedding declares the cosine distance, which a zero vector leaves undefined
 
 --- mutate
-query add($s: String, $e: Vector(2)) { insert Doc { slug: $s, embedding: $e } }
+query add($s: String, $e: Vector(2)) { replace Doc { slug: $s, embedding: $e } }
 
 --- params
 {"s": "z", "e": [1e-30, 0.0]}
@@ -73,7 +73,7 @@ query cite($e: Vector(2)) { insert Cites { @src: "b", @dst: "a", signal: $e } }
 --- expect error: Cites.signal declares the cosine distance, which a zero vector leaves undefined
 
 --- mutate
-query add_null($s: String, $r: Vector(2)) { insert Doc { slug: $s, raw: $r } }
+query add_null($s: String, $r: Vector(2)) { replace Doc { slug: $s, raw: $r } }
 
 --- params
 {"s": "y", "r": [0.0, 0.0]}

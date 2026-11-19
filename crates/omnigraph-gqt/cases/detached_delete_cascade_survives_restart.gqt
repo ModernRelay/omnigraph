@@ -81,12 +81,12 @@ p.name: String
 q.name: String
 
 --- mutate branch: work
-query reinsert_bob() { insert Person { name: "bob" } }
+query reinsert_bob() { replace Person { name: "bob" } }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: work
-query add_fresh_edge() { insert Knows { @src: "alice", @dst: "bob" } }
+query add_fresh_edge() { replace Knows { @src: "alice", @dst: "bob" } }
 
 --- expect affected: nodes=0 edges=1
 

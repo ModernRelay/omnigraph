@@ -29,7 +29,7 @@ use tower::ServiceExt;
 
 pub const MUTATION_QUERIES: &str = r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 
 query set_age($name: String, $age: I32) {

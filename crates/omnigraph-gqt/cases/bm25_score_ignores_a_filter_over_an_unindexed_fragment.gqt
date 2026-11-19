@@ -44,8 +44,8 @@ validation scope invariants_only
 
 --- mutate
 query tail() {
-    insert Doc { slug: "t1", text: "graph", year: 2022 }
-    insert Doc { slug: "t2", text: "graph graph graph graph graph graph graph graph", year: 1990 }
+    replace Doc { slug: "t1", text: "graph", year: 2022 }
+    replace Doc { slug: "t2", text: "graph graph graph graph graph graph graph graph", year: 1990 }
 }
 --- expect ok
 

@@ -66,7 +66,7 @@ fn insert_person_query(graph: &SystemGraph, name: &str) -> std::path::PathBuf {
         name,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     )
@@ -266,7 +266,9 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
             .arg("--target")
             .arg(graph.path())
             .arg("-e")
-            .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
+            .arg(
+                "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
+            )
             .arg("--params")
             .arg(r#"{"name":"Inline","age":42}"#)
             .arg("--json"),
@@ -936,7 +938,7 @@ query insert_task(
     $scores: [I32],
     $active_days: [Date]
 ) {
-    insert Task {
+    replace Task {
         slug: $slug,
         title: $title,
         due_at: $due_at,
@@ -1350,7 +1352,8 @@ fn local_cli_change_enforces_engine_layer_policy() {
         cluster.path(),
         &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
     );
-    let insert = "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
+    let insert =
+        "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }";
     let before = served_policy_state(&server);
 
     // Case 1: no token → the server refuses before any policy check.
@@ -2681,7 +2684,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     .unwrap();
     fs::write(
         cluster.path().join("insert-person.gq"),
-        "query insert_person($name: String) { insert Person { name: $name, age: 41 } }",
+        "query insert_person($name: String) { replace Person { name: $name, age: 41 } }",
     )
     .unwrap();
     fs::write(

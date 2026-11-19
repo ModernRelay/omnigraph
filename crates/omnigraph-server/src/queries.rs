@@ -683,7 +683,7 @@ mod tests {
     fn mutation_body_classifies_as_mutation() {
         let reg = QueryRegistry::from_specs(vec![spec(
             "add_user",
-            "query add_user($name: String) { insert User { name: $name } }",
+            "query add_user($name: String) { replace User { name: $name } }",
             false,
         )])
         .unwrap();
@@ -879,7 +879,7 @@ embedding: Vector(4)
         use crate::api;
         let reg = QueryRegistry::from_specs(vec![spec(
             "add_user",
-            "query add_user($name: String) { insert User { name: $name } }",
+            "query add_user($name: String) { replace User { name: $name } }",
             true,
         )])
         .unwrap();

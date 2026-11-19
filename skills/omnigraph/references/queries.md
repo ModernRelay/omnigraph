@@ -108,7 +108,7 @@ integer, `F64` for an integer or `F32` with a float. An integer literal,
 `U64` with a signed integer and `-` over an unsigned value are `T72`.
 An integer literal reads the whole range from `-9223372036854775808` to
 `18446744073709551615`: one above the `I64` range is a `U64`, written as a
-parameter's value is (`where $a.size = 18446744073709551615`, `insert Account
+parameter's value is (`where $a.size = 18446744073709551615`, `replace Account
 { size: 18446744073709551615, balance: -5 }`); outside it is `Q005`.
 `from { match … return { … } }` joins an inline read's rows; its own
 aggregate, `distinct`, `order` and `limit` run per outer row when it reads
@@ -501,7 +501,7 @@ refused (`E4`).
 ```gq
 query add_signal($slug: String, $name: String, $brief: String,
                  $stagingTimestamp: DateTime, $createdAt: DateTime, $updatedAt: DateTime) {
-    insert Signal {
+    replace Signal {
         slug: $slug,
         name: $name,
         brief: $brief,
@@ -566,7 +566,7 @@ query remove_signal($slug: String) {
 
 ```gq
 query add_and_link($slug: String, $pattern: String, $createdAt: DateTime, $updatedAt: DateTime) {
-    insert Signal { slug: $slug, name: $slug, brief: $slug,
+    replace Signal { slug: $slug, name: $slug, brief: $slug,
                     stagingTimestamp: $createdAt, createdAt: $createdAt, updatedAt: $updatedAt }
     insert FormsPattern { @src: $slug, @dst: $pattern }
 }

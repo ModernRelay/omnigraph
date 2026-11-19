@@ -11,7 +11,7 @@ node Person {
 --- seed
 {"type":"Person","data":{"name":"alice"}}
 --- mutate
-query add($n: String) { insert Person { name: $n } }
+query add($n: String) { replace Person { name: $n } }
 --- params
 {"n":"bob"}
 --- expect affected: nodes=1 edges=0

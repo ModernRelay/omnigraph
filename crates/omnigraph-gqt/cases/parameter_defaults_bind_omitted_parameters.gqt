@@ -75,7 +75,7 @@ query negative_default($x: I32 = -1, $y: I32? = 25) { match { $p: Person } where
 p.handle: String
 
 --- mutate
-query insert_with_default($handle: String, $age: I32 = 41) { insert Person { handle: $handle, age: $age } }
+query insert_with_default($handle: String, $age: I32 = 41) { replace Person { handle: $handle, age: $age } }
 
 --- params
 {"handle": "p4"}

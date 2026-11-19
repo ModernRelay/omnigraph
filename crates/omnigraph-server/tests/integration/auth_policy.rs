@@ -1864,7 +1864,7 @@ async fn policy_commit_publish_and_drop_denials_are_indistinguishable_from_unkno
         statement_request(
             "/mutate",
             "writer-token",
-            "query propose() as commit { insert Person { name: \"Pia\", age: 33 } }",
+            "query propose() as commit { replace Person { name: \"Pia\", age: 33 } }",
         ),
     )
     .await;
@@ -2009,7 +2009,7 @@ async fn policy_unattached_child_writes_authorize_on_the_recorded_target() {
     let sprout = |token: &str, name: &str, base: Option<&str>, branch: Option<&str>| {
         let on = base.map(|id| format!(" on \"{id}\"")).unwrap_or_default();
         let mut body = json!({"query": format!(
-            "query sprout() as unattached branch{on} {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+            "query sprout() as unattached branch{on} {{ replace Person {{ name: \"{name}\", age: 33 }} }}"
         )});
         if let Some(branch) = branch {
             body["branch"] = json!(branch);
@@ -3547,7 +3547,7 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
         .unwrap();
     db.mutate(
         "feature",
-        r#"query add() { insert Person { name: "Zoe", age: 33 } }"#,
+        r#"query add() { replace Person { name: "Zoe", age: 33 } }"#,
         "add",
         &Default::default(),
     )

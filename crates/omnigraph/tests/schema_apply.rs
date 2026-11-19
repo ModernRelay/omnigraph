@@ -247,7 +247,7 @@ async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
 
     let mutation = r#"
 query insert_with_nickname($name: String, $age: I32, $nickname: String) {
-    insert Person { name: $name, age: $age, nickname: $nickname }
+    replace Person { name: $name, age: $age, nickname: $nickname }
 }
 "#;
     let inserted = stale_handle
@@ -283,7 +283,7 @@ query insert_with_nickname($name: String, $age: I32, $nickname: String) {
     stale_handle.branch_create("target").await.unwrap();
     let project_mutation = r#"
 query insert_project($name: String) {
-    insert Project { name: $name }
+    replace Project { name: $name }
 }
 "#;
     stale_handle
@@ -3092,7 +3092,7 @@ node Pair {
 "#;
     let mutation = r#"
 query put_pair($aaaa: String, $zzzz: String, $label: String) {
-    insert Pair { aaaa: $aaaa, zzzz: $zzzz, label: $label }
+    replace Pair { aaaa: $aaaa, zzzz: $zzzz, label: $label }
 }
 "#;
 

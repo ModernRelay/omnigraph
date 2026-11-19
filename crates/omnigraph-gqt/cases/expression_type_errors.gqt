@@ -87,7 +87,7 @@ query search_in_a_mutation_where() {
 
 --- mutate
 query count_in_an_assignment() {
-    insert Person { slug: "b", name: "b", age: 1, text: "t", adult: count(1) > 3 }
+    replace Person { slug: "b", name: "b", age: 1, text: "t", adult: count(1) > 3 }
 }
 
 --- expect error: T8: `count(…)` is an aggregate; it belongs in `return`, or as a block `count($x.p) { … }`

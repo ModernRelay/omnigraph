@@ -86,7 +86,7 @@ y.name: String
 
 --- mutate branch: feature
 query add_d_on_feature() {
-    insert Person { name: "d" }
+    replace Person { name: "d" }
 }
 
 --- expect affected: nodes=1 edges=0

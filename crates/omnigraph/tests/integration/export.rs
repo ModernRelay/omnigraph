@@ -15,7 +15,7 @@ use crate::helpers::*;
 
 const EXPORT_MUTATIONS: &str = r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 
 query add_friend($from: String, $to: String) {
@@ -46,7 +46,7 @@ node Counter {
 
 const U64_KEY_MUTATION: &str = r#"
 query insert_counter($sequence: U64, $label: String) {
-    insert Counter { sequence: $sequence, label: $label }
+    replace Counter { sequence: $sequence, label: $label }
 }
 "#;
 
@@ -104,7 +104,7 @@ edge Related: Membership -> Membership
 
 const COMPOSITE_KEY_MUTATION: &str = r#"
 query put_membership($tenant: String, $slot: U32, $label: String) {
-    insert Membership { tenant: $tenant, slot: $slot, label: $label }
+    replace Membership { tenant: $tenant, slot: $slot, label: $label }
 }
 
 query move_membership($tenant: String, $next_slot: U32) {
@@ -140,15 +140,15 @@ node FloatBoundary {
 
 const NARROWING_MUTATIONS: &str = r#"
 query put_signed($value: I32) {
-    insert SignedBoundary { value: $value }
+    replace SignedBoundary { value: $value }
 }
 
 query put_unsigned($value: U32) {
-    insert UnsignedBoundary { value: $value }
+    replace UnsignedBoundary { value: $value }
 }
 
 query put_float($value: F32) {
-    insert FloatBoundary { value: $value }
+    replace FloatBoundary { value: $value }
 }
 "#;
 

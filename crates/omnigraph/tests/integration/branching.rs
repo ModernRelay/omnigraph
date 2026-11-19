@@ -48,7 +48,7 @@ const UNIQUE_DATA: &str = r#"{"type":"User","data":{"name":"Alice","email":"alic
 
 const UNIQUE_MUTATIONS: &str = r#"
 query insert_user($name: String, $email: String) {
-    insert User { name: $name, email: $email }
+    replace User { name: $name, email: $email }
 }
 "#;
 
@@ -117,7 +117,7 @@ node Asset {
 
 const BLOB_MUTATIONS: &str = r#"
 query insert_doc($title: String, $content: Blob, $note: String) {
-    insert Document { title: $title, content: $content, note: $note }
+    replace Document { title: $title, content: $content, note: $note }
 }
 
 query update_doc_note($title: String, $note: String) {
@@ -3725,7 +3725,7 @@ async fn branch_create_at_a_commit_refuses_what_is_not_branch_history() {
             "main",
             r#"
 query propose($name: String, $age: I32) as commit {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
             "propose",
@@ -3740,7 +3740,7 @@ query propose($name: String, $age: I32) as commit {
             "main",
             r#"
 query park($name: String, $age: I32) as unattached branch {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
             "park",

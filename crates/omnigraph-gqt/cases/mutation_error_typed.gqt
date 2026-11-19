@@ -21,7 +21,7 @@ node Person {
 
 --- mutate
 query insert_missing_key($age: I32) {
-    insert Person { age: $age }
+    replace Person { age: $age }
 }
 
 --- params

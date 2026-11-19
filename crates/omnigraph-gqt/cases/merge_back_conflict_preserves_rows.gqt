@@ -28,14 +28,14 @@ branch create feature;
 
 --- mutate branch: feature
 query add_carol() {
-    insert Person { name: "carol", age: 50 }
+    replace Person { name: "carol", age: 50 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query add_dave() {
-    insert Person { name: "dave", age: 60 }
+    replace Person { name: "dave", age: 60 }
 }
 
 --- expect affected: nodes=1 edges=0

@@ -91,7 +91,7 @@ query friends_of($name: String) {
     return { $f.name }
 }
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 query employ($person: String, $company: String) {
     insert WorksAt { @src: $person, @dst: $company }

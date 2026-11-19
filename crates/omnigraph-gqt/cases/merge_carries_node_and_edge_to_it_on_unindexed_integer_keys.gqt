@@ -27,7 +27,7 @@ branch create b
 --- expect ok
 
 --- mutate branch: b
-query add_node() { insert Person { id: 100 } }
+query add_node() { replace Person { id: 100 } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: b

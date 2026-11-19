@@ -155,7 +155,7 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
                 "mutate",
                 "seed",
                 "-e",
-                "query seed() { insert Person { name: \"Alice\", age: 31 } }",
+                "query seed() { replace Person { name: \"Alice\", age: 31 } }",
                 "--store",
             ])
             .arg(&graph)

@@ -64,7 +64,7 @@ p.name: String
 p.age: I64
 
 --- mutate
-query readd() { insert Person { name: "bob", age: 41 } }
+query readd() { replace Person { name: "bob", age: 41 } }
 --- expect affected: nodes=1 edges=0
 
 --- query branch: main

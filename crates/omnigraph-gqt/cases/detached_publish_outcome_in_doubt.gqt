@@ -30,7 +30,7 @@ scope: next_step
 
 --- mutate
 query ambiguous_write() {
-    insert Person { name: "bob" }
+    replace Person { name: "bob" }
     insert Knows { @src: "alice", @dst: "alice" }
 }
 --- expect error: outcome is in doubt
@@ -55,7 +55,7 @@ p.name: String
 q.name: String
 
 --- mutate
-query distinct_next_write() { insert Person { name: "carol" } }
+query distinct_next_write() { replace Person { name: "carol" } }
 --- expect affected: nodes=1 edges=0
 
 --- restart

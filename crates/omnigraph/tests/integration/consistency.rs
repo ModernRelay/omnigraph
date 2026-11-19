@@ -1386,7 +1386,7 @@ node Item {
 "#;
     let insert_item = r#"
 query insert_item($slug: String, $a: String, $b: String) {
-    insert Item { slug: $slug, a: $a, b: $b }
+    replace Item { slug: $slug, a: $a, b: $b }
 }
 "#;
     let main = Omnigraph::init(uri, schema).await.unwrap();

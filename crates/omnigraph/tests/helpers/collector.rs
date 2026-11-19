@@ -25,7 +25,7 @@ node Person {
 
 const SCORE_MUTATIONS: &str = r#"
 query insert_scored($name: String) {
-    insert Person { name: $name, score: 2 }
+    replace Person { name: $name, score: 2 }
 }
 "#;
 

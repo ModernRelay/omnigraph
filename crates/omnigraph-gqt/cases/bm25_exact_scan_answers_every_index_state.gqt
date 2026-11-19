@@ -101,11 +101,11 @@ d.slug: String
 
 --- mutate
 query twins() {
-    insert Doc { slug: "t1", title: "Graph Engines", year: 2020 }
-    insert Doc { slug: "t4", title: "a search engine runs", year: 2023 }
-    insert Memo { slug: "m1", body: "Café au lait" }
-    insert Memo { slug: "m2", body: "cafes and bars" }
-    insert Memo { slug: "m3", body: "" }
+    replace Doc { slug: "t1", title: "Graph Engines", year: 2020 }
+    replace Doc { slug: "t4", title: "a search engine runs", year: 2023 }
+    replace Memo { slug: "m1", body: "Café au lait" }
+    replace Memo { slug: "m2", body: "cafes and bars" }
+    replace Memo { slug: "m3", body: "" }
 }
 
 --- expect ok

@@ -25,7 +25,7 @@ branch create child
 
 --- mutate branch: child
 query add_gamma() {
-    insert Person { slug: "gamma", age: 33 }
+    replace Person { slug: "gamma", age: 33 }
 }
 --- expect affected: nodes=1 edges=0
 
@@ -58,7 +58,7 @@ query bump_alpha() {
 
 --- mutate
 query add_delta() {
-    insert Person { slug: "delta", age: 55 }
+    replace Person { slug: "delta", age: 55 }
 }
 --- expect affected: nodes=1 edges=0
 

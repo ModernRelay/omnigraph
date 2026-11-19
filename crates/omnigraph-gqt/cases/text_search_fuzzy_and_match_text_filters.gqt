@@ -145,7 +145,7 @@ d.title: String
 
 --- mutate
 query add_fresh() {
-    insert Fresh { slug: "fresh-1", body: "Deep Learning" }
+    replace Fresh { slug: "fresh-1", body: "Deep Learning" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -192,7 +192,7 @@ f.slug: String
 
 --- mutate
 query add_second_fresh() {
-    insert Fresh { slug: "fresh-2", body: "Deep Dive" }
+    replace Fresh { slug: "fresh-2", body: "Deep Dive" }
 }
 
 --- expect affected: nodes=1 edges=0

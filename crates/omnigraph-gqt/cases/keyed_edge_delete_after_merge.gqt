@@ -31,7 +31,7 @@ branch create b0
 --- expect ok
 
 --- mutate branch: b0
-query upsert_inherited_edge() { insert Knows { @src: "Alice", @dst: "Bob" } }
+query upsert_inherited_edge() { replace Knows { @src: "Alice", @dst: "Bob" } }
 
 --- expect affected: nodes=0 edges=1
 
@@ -41,12 +41,12 @@ branch merge b0
 --- expect ok
 
 --- mutate branch: b0
-query write_on_merged_branch() { insert Knows { @src: "Charlie", @dst: "Diana" } }
+query write_on_merged_branch() { replace Knows { @src: "Charlie", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: main
-query write_on_main() { insert Knows { @src: "Bob", @dst: "Charlie" } }
+query write_on_main() { replace Knows { @src: "Bob", @dst: "Charlie" } }
 
 --- expect affected: nodes=0 edges=1
 

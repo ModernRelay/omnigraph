@@ -269,7 +269,7 @@ query unknown_node_property() { match { $p: Person } return { $p.salary } }
 --- expect error: T6: type `Person` has no property `salary`
 
 --- mutate
-query insert_node_id_property() { insert Person { name: "x", id: "x" } }
+query insert_node_id_property() { replace Person { name: "x", id: "x" } }
 
 --- expect error: T11: type `Person` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 

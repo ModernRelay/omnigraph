@@ -36,7 +36,7 @@ edge E: T -> T {
 
 --- mutate
 query insert_empty() {
-    insert T { k: "a", n: 2, i32s: [], ints: [], u64s: [], floats: [], bools: [], dates: [], stamps: [], words: [] }
+    replace T { k: "a", n: 2, i32s: [], ints: [], u64s: [], floats: [], bools: [], dates: [], stamps: [], words: [] }
 }
 --- expect affected: nodes=1 edges=0
 

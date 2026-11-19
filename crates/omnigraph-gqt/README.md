@@ -519,7 +519,7 @@ it is one step of the case and runs under the DST runner only.
 
 ```text
 --- concurrent
-w1: query add_bob() { insert Person { name: "bob" } }
+w1: query add_bob() { replace Person { name: "bob" } }
 r1: query all() { match { $p: Person } return { $p.name } }
 order: w1 park put __manifest/_versions/, r1 start, r1, w1 put __manifest/_versions/
 --- expect

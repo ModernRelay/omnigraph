@@ -60,7 +60,7 @@ action: fail
 scope: next_step
 
 --- mutate branch: b
-query releasing_publish_with_lost_ack() { insert Person { name: "carol", age: 1 } }
+query releasing_publish_with_lost_ack() { replace Person { name: "carol", age: 1 } }
 
 --- expect affected: nodes=1 edges=0
 

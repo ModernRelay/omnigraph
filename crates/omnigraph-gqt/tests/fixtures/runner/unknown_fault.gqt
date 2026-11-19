@@ -19,7 +19,7 @@ action: fail
 scope: next_step
 
 --- mutate
-query add() { insert Person { name: "bob" } }
+query add() { replace Person { name: "bob" } }
 --- expect affected: nodes=1 edges=0
 --- restart
 --- query

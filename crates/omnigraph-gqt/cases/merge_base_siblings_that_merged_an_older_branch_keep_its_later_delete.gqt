@@ -52,7 +52,7 @@ query touch_p_twice() {
 
 --- mutate branch: b
 query insert_w() {
-    insert Person { name: "w", age: 0 }
+    replace Person { name: "w", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0

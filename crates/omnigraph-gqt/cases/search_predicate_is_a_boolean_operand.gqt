@@ -167,9 +167,9 @@ p.name: String
 
 --- mutate
 query twins() {
-    insert Doc { slug: "t1", title: "Graph Engines", year: 2020 }
-    insert Doc { slug: "t3", title: "Databases", year: 1999 }
-    insert Doc { slug: "t4", year: 2022 }
+    replace Doc { slug: "t1", title: "Graph Engines", year: 2020 }
+    replace Doc { slug: "t3", title: "Databases", year: 1999 }
+    replace Doc { slug: "t4", year: 2022 }
 }
 
 --- expect ok

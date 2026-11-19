@@ -8,7 +8,7 @@ const QUERY: &str =
 const EXPECT: &str =
     "--- expect unordered\n{\"p.name\": \"alice\"}\n--- expect shape\np.name: String\n";
 const SHAPE: &str = "--- expect shape\np.name: String\n";
-const MUTATE: &str = "--- mutate\nquery ins($n: String) {\n    insert Person { name: $n }\n}\n";
+const MUTATE: &str = "--- mutate\nquery ins($n: String) {\n    replace Person { name: $n }\n}\n";
 const PARAMS: &str = "--- params\n{\"n\": \"bob\"}\n";
 const EXPECT_OK: &str = "--- expect ok\n";
 
@@ -93,7 +93,7 @@ async fn generated_params_supply_a_step_and_are_refused_outside_their_contract()
     let blob = format!(
         "{HDR}--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n\
          --- schema\nnode Doc {{\n    slug: String @key\n    body: Blob?\n}}\n--- seed\n\
-         --- mutate\nquery put($slug: String, $body: Blob) {{\n    insert Doc {{ slug: $slug, body: $body }}\n}}\n\
+         --- mutate\nquery put($slug: String, $body: Blob) {{\n    replace Doc {{ slug: $slug, body: $body }}\n}}\n\
          --- params generate: v1 seed: 0\nparams:\n  slug: {{kind: literal, value: doc}}\n  body: {{kind: blob, byte: 1, length: 3}}\n\
          --- expect affected: nodes=1 edges=0\n"
     );
@@ -353,7 +353,7 @@ fn a_fault_section_is_refused() {
 }
 
 const DST_RUNNER: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person {\n    name: String @key\n}\n";
-const BLOCK: &str = "--- concurrent\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 put __manifest/, r1, w1\n";
+const BLOCK: &str = "--- concurrent\nw1: query add() { replace Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 put __manifest/, r1, w1\n";
 const BLOCK_EXPECT: &str = "--- expect\nw1: ok\nr1: ok\n";
 
 #[test]
@@ -389,7 +389,7 @@ fn a_concurrent_block_refuses_what_it_cannot_run() {
     );
     assert!(
         refused(
-            "--- concurrent\nw1: query add($n: String) { insert Person { name: $n } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1, r1\n",
+            "--- concurrent\nw1: query add($n: String) { replace Person { name: $n } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1, r1\n",
             BLOCK_EXPECT
         )
         .contains("declares parameters")
@@ -577,7 +577,7 @@ fn a_section_runs_its_last_declaration_after_the_reads_it_calls() {
         panic!("one query step");
     };
     assert_eq!(step.name, "b");
-    let mutation_first = "--- query\nquery ins($n: String) {\n    insert Person { name: $n }\n}\nquery b() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let mutation_first = "--- query\nquery ins($n: String) {\n    replace Person { name: $n }\n}\nquery b() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{mutation_first}{EXPECT}");
     assert!(refusal("x", &text).contains("a mutation declaration is the last or none"));
 }
@@ -585,7 +585,7 @@ fn a_section_runs_its_last_declaration_after_the_reads_it_calls() {
 #[test]
 fn refuses_mutation_declaration_under_query() {
     let text = format!(
-        "{HDR}{SCHEMA}{SEED}--- query\nquery ins($n: String) {{\n    insert Person {{ name: $n }}\n}}\n{EXPECT}"
+        "{HDR}{SCHEMA}{SEED}--- query\nquery ins($n: String) {{\n    replace Person {{ name: $n }}\n}}\n{EXPECT}"
     );
     assert!(refusal("x", &text).contains("use `--- mutate`"));
 }
@@ -596,7 +596,7 @@ fn refuses_mutation_declaration_under_query() {
 /// unbound name, or with a shape section.
 #[test]
 fn branch_read_steps_parse_and_refuse() {
-    const BIND: &str = "--- mutate\nquery ins() {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $c\n";
+    const BIND: &str = "--- mutate\nquery ins() {\n    replace Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $c\n";
     let accepted = format!(
         "{HDR}{SCHEMA}{SEED}{BIND}\
          --- query\nbranch diff \"${{c}}\" to main\n--- expect ordered\n\
@@ -855,7 +855,7 @@ fn refuses_substitution_marker_in_a_statement_body() {
     );
 }
 
-const PROPOSE: &str = "--- mutate\nquery propose() as commit {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n";
+const PROPOSE: &str = "--- mutate\nquery propose() as commit {\n    replace Person { name: \"bob\" }\n}\n--- expect ok\n";
 const BIND: &str = "--- bind commit $c\n";
 
 /// `--- bind commit $name` attaches to the write before it, a `snapshot:
@@ -910,7 +910,7 @@ fn bind_commit_names_a_write_and_its_consumers_resolve_it() {
 #[test]
 fn as_commit_and_bound_drop_are_visible_per_step() {
     let text = format!(
-        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\ncommit drop \"${{c}}\"\n{EXPECT_OK}--- mutate\nquery publish_bob() {{\n    insert Person {{ name: \"carol\" }}\n}}\n{EXPECT_OK}--- mutate\nbranch merge b0 as commit\n--- expect outcome: merged\n--- mutate\nbranch merge b0\n--- expect outcome: merged\n--- mutate\ncommit drop \"hb1-literal\"\n{EXPECT_OK}{QUERY}{EXPECT}"
+        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\ncommit drop \"${{c}}\"\n{EXPECT_OK}--- mutate\nquery publish_bob() {{\n    replace Person {{ name: \"carol\" }}\n}}\n{EXPECT_OK}--- mutate\nbranch merge b0 as commit\n--- expect outcome: merged\n--- mutate\nbranch merge b0\n--- expect outcome: merged\n--- mutate\ncommit drop \"hb1-literal\"\n{EXPECT_OK}{QUERY}{EXPECT}"
     );
     let case = parse_case("x", &text).unwrap();
     let want = [
@@ -1034,8 +1034,8 @@ fn bind_fence_admits_only_a_whole_quoted_commit_operand() {
     );
 }
 
-const ROOT: &str = "--- mutate\nquery root() as unattached branch {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $r\n";
-const CHILD: &str = "--- mutate\nquery child() as unattached branch on \"${r}\" {\n    insert Person { name: \"carol\" }\n}\n--- expect ok\n";
+const ROOT: &str = "--- mutate\nquery root() as unattached branch {\n    replace Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $r\n";
+const CHILD: &str = "--- mutate\nquery child() as unattached branch on \"${r}\" {\n    replace Person { name: \"carol\" }\n}\n--- expect ok\n";
 
 /// A whole quoted `on "${name}"` base operand needs its binding first, is the
 /// id in the compiled source, and admits no other `${` in the body; a params
@@ -1043,7 +1043,7 @@ const CHILD: &str = "--- mutate\nquery child() as unattached branch on \"${r}\" 
 #[test]
 fn unattached_base_operand_resolves_its_binding() {
     let text = format!(
-        "{HDR}{SCHEMA}{SEED}{ROOT}{CHILD}--- mutate branch: feature\nquery by_param($base: String) as unattached branch on $base {{\n    insert Person {{ name: \"dave\" }}\n}}\n--- params\n{{\"base\": \"${{r}}\"}}\n{EXPECT_OK}"
+        "{HDR}{SCHEMA}{SEED}{ROOT}{CHILD}--- mutate branch: feature\nquery by_param($base: String) as unattached branch on $base {{\n    replace Person {{ name: \"dave\" }}\n}}\n--- params\n{{\"base\": \"${{r}}\"}}\n{EXPECT_OK}"
     );
     let case = parse_case("x", &text).unwrap();
     let [
@@ -3237,7 +3237,7 @@ fn runner_is_required_and_cannot_be_repeated() {
 #[test]
 fn fault_limits_and_loop_scope_are_enforced() {
     let fault = "--- seam\nat: mutation.post_sidecar_pre_fork\noccurrence: 1\naction: fail\nscope: next_step\n";
-    let operation = "--- mutate\nquery add() { insert Person { name: \"bob\" } }\n--- expect error: injected failpoint\n";
+    let operation = "--- mutate\nquery add() { replace Person { name: \"bob\" } }\n--- expect error: injected failpoint\n";
     let prefix = format!("{HDR}{SCHEMA}{SEED}");
     assert!(
         parse_case(

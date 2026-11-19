@@ -273,8 +273,8 @@ scan PlainTask as $t: access sequential
 
 --- mutate
 query append_tasks() {
-    insert Task { slug: "t6", status: "open", done: true }
-    insert PlainTask { slug: "t6", status: "open", done: true }
+    replace Task { slug: "t6", status: "open", done: true }
+    replace PlainTask { slug: "t6", status: "open", done: true }
 }
 
 --- expect affected: nodes=2 edges=0

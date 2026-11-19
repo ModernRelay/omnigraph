@@ -34,7 +34,7 @@ scope: next_step
 
 --- mutate branch: work
 query ambiguous_write() {
-    insert Person { name: "bob" }
+    replace Person { name: "bob" }
     insert Knows { @src: "alice", @dst: "alice" }
 }
 --- expect error: outcome is in doubt
@@ -62,11 +62,11 @@ p.name: String
 q.name: String
 
 --- mutate branch: main
-query advance_main() { insert Person { name: "carol" } }
+query advance_main() { replace Person { name: "carol" } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: work
-query advance_work() { insert Person { name: "diana" } }
+query advance_work() { replace Person { name: "diana" } }
 --- expect affected: nodes=1 edges=0
 
 --- restart

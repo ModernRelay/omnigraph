@@ -33,7 +33,7 @@ tables:
 
 --- mutate
 query w() {
-    insert Person { id: 500, code: 103 }
+    replace Person { id: 500, code: 103 }
     insert Knows { @src: "0", @dst: "79" }
 }
 --- expect error: @unique violation on Person.code: value '103' held by '3' and '500'

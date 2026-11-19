@@ -39,14 +39,14 @@ query age_alice() {
 
 --- mutate branch: feature
 query insert_carol() {
-    insert Person { name: "carol", age: 22 }
+    replace Person { name: "carol", age: 22 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query insert_dave() {
-    insert Person { name: "dave", age: 50 }
+    replace Person { name: "dave", age: 50 }
 }
 
 --- expect affected: nodes=1 edges=0

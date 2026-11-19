@@ -36,9 +36,9 @@ scope: next_step
 
 --- mutate branch: main
 query w() {
-    insert Person { name: "bob" }
-    insert Company { name: "globex" }
-    insert WorksAt { @src: "bob", @dst: "globex" }
+    replace Person { name: "bob" }
+    replace Company { name: "globex" }
+    replace WorksAt { @src: "bob", @dst: "globex" }
 }
 --- expect error: injected failpoint triggered: mutation.post_table_commit
 
@@ -96,9 +96,9 @@ c.name: String
 
 --- mutate branch: main
 query w() {
-    insert Person { name: "bob" }
-    insert Company { name: "globex" }
-    insert WorksAt { @src: "bob", @dst: "globex" }
+    replace Person { name: "bob" }
+    replace Company { name: "globex" }
+    replace WorksAt { @src: "bob", @dst: "globex" }
 }
 --- expect affected: nodes=2 edges=1
 

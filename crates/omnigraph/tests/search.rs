@@ -71,7 +71,7 @@ node Doc {
 "#;
 const SEARCH_MUTATIONS: &str = r#"
 query insert_doc($slug: String, $title: String, $body: String, $embedding: Vector(4)) {
-    insert Doc {
+    replace Doc {
         slug: $slug,
         title: $title,
         body: $body,

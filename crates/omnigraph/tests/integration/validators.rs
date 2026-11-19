@@ -21,7 +21,7 @@ const ENUM_VALID_SEED: &str = r#"{"type":"Person","data":{"name":"Alice","role":
 
 const ENUM_MUTATIONS: &str = r#"
 query insert_person($name: String, $role: String) {
-    insert Person { name: $name, role: $role }
+    replace Person { name: $name, role: $role }
 }
 
 query set_role($name: String, $role: String) {
@@ -40,7 +40,7 @@ node Person {
 
 const RANGE_MUTATIONS: &str = r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 
 query set_age($name: String, $age: I32) {
@@ -59,7 +59,7 @@ node User {
 
 const UNIQUE_MUTATIONS: &str = r#"
 query insert_user($name: String, $email: String) {
-    insert User { name: $name, email: $email }
+    replace User { name: $name, email: $email }
 }
 "#;
 
@@ -862,7 +862,7 @@ query reassign() {
     match { $x: User } where $x.name = "Alice"
     update $x set { email: "temp" }
     update $x set { email: "final" }
-    insert User { name: "Carol", email: "temp" }
+    replace User { name: "Carol", email: "temp" }
 }
 "#;
     mutate_main(&db, Q, "reassign", &params(&[])).await.expect(
@@ -987,11 +987,11 @@ const EDGE_KEY_SEED: &str = r#"{"type":"Person","data":{"name":"Alice"}}
 
 const EDGE_KEY_MUTATIONS: &str = r#"
 query add_knows($from: String, $to: String) {
-    insert Knows { @src: $from, @dst: $to }
+    replace Knows { @src: $from, @dst: $to }
 }
 
 query add_knows_since($from: String, $to: String, $since: String) {
-    insert Knows { @src: $from, @dst: $to, since: $since }
+    replace Knows { @src: $from, @dst: $to, since: $since }
 }
 "#;
 

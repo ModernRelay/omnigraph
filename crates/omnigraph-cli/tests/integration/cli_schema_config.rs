@@ -119,7 +119,7 @@ fn an_undelivered_failure_keeps_its_exit() {
                 "--target",
                 graph,
                 "-e",
-                "query add() { insert Person { name: \"Undelivered\", age: 1 } }",
+                "query add() { replace Person { name: \"Undelivered\", age: 1 } }",
                 "--json",
             ],
             2,

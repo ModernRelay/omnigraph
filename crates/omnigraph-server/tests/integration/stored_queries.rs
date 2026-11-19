@@ -68,7 +68,7 @@ async fn signed_stored_invocation_requires_both_outer_and_inner_policy_permissio
         ),
         (
             "signed_insert",
-            "query signed_insert($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+            "query signed_insert($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
             true,
         ),
     ]);
@@ -792,7 +792,7 @@ async fn invoke_stored_mutation_double_gates_on_change() {
 
     let specs: &[(&str, &str, bool)] = &[(
         "add_person",
-        "query add_person($name: String) { insert Person { name: $name } }",
+        "query add_person($name: String) { replace Person { name: $name } }",
         false,
     )];
     let (_temp, app) = app_with_stored_queries(
@@ -955,7 +955,7 @@ async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
             ("find_person", FIND_PERSON_GQ, false),
             (
                 "add_person",
-                "query add_person($name: String) { insert Person { name: $name } }",
+                "query add_person($name: String) { replace Person { name: $name } }",
                 false,
             ),
         ],
@@ -1053,7 +1053,7 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
             ("find_person", FIND_PERSON_GQ, true),
             (
                 "add_person",
-                "query add_person($name: String) { insert Person { name: $name } }",
+                "query add_person($name: String) { replace Person { name: $name } }",
                 true,
             ),
             (
@@ -1228,7 +1228,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
 
     let specs: &[(&str, &str, bool)] = &[(
         "add_person",
-        "query add_person($name: String) { insert Person { name: $name } }",
+        "query add_person($name: String) { replace Person { name: $name } }",
         false,
     )];
     let (_temp, app) =
@@ -1429,7 +1429,7 @@ graphs:
     std::fs::write(
         reserved.path().join("mutations.gq"),
         format!(
-            "query add_person($slug: String, $n: I64) {{ insert Person {{ slug: $slug, and: $n }} }}\n{reserved_where}\n"
+            "query add_person($slug: String, $n: I64) {{ replace Person {{ slug: $slug, and: $n }} }}\n{reserved_where}\n"
         ),
     )
     .unwrap();
@@ -1466,7 +1466,7 @@ graphs:
     .unwrap();
     std::fs::write(
         rewritten.path().join("mutations.gq"),
-        "query add_person($slug: String, $n: I64) { insert Person { slug: $slug, conj: $n } }\nquery clear_flag() { match { $x: Person } where $x.conj = 1  update $x set { conj: 0 } }\n",
+        "query add_person($slug: String, $n: I64) { replace Person { slug: $slug, conj: $n } }\nquery clear_flag() { match { $x: Person } where $x.conj = 1  update $x set { conj: 0 } }\n",
     )
     .unwrap();
     std::fs::write(

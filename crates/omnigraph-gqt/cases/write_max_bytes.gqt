@@ -30,7 +30,7 @@ node Image {
 --- mutate
 set write_max_bytes = 4093;
 query exact($payload: Blob) {
-    insert Doc { slug: "accepted", content: $payload, note: "scalar" }
+    replace Doc { slug: "accepted", content: $payload, note: "scalar" }
 }
 
 --- params
@@ -41,7 +41,7 @@ query exact($payload: Blob) {
 --- mutate
 set write_max_bytes = 4093;
 query too_large($payload: Blob) {
-    insert Doc { slug: "refused", content: $payload, note: "scalar" }
+    replace Doc { slug: "refused", content: $payload, note: "scalar" }
 }
 
 --- params
@@ -52,8 +52,8 @@ query too_large($payload: Blob) {
 --- mutate
 set write_max_bytes = 4093;
 query aggregate($payload: Blob) {
-    insert Doc { slug: "a", content: $payload, note: "scalar" }
-    insert Doc { slug: "b", content: $payload, note: "scalar" }
+    replace Doc { slug: "a", content: $payload, note: "scalar" }
+    replace Doc { slug: "b", content: $payload, note: "scalar" }
 }
 
 --- params
@@ -64,8 +64,8 @@ query aggregate($payload: Blob) {
 --- mutate
 set write_max_bytes = 4093;
 query cross_table($payload: Blob) {
-    insert Doc { slug: "cross-doc", content: $payload, note: "scalar" }
-    insert Image { slug: "cross-image", content: $payload }
+    replace Doc { slug: "cross-doc", content: $payload, note: "scalar" }
+    replace Image { slug: "cross-image", content: $payload }
 }
 
 --- params
@@ -87,7 +87,7 @@ i.slug: String
 --- mutate
 set write_max_bytes = 4093;
 query wide_scalar($note: String) {
-    insert Doc { slug: "wide", note: $note }
+    replace Doc { slug: "wide", note: $note }
 }
 
 --- params
@@ -129,9 +129,9 @@ d.note: String
 --- mutate
 set write_max_bytes = 8190;
 query three_payloads($payload: Blob) {
-    insert Doc { slug: "capacity-a", content: $payload, note: "first" }
-    insert Doc { slug: "capacity-b", content: $payload, note: "second" }
-    insert Doc { slug: "capacity-c", content: $payload, note: "third" }
+    replace Doc { slug: "capacity-a", content: $payload, note: "first" }
+    replace Doc { slug: "capacity-b", content: $payload, note: "second" }
+    replace Doc { slug: "capacity-c", content: $payload, note: "third" }
 }
 
 --- params

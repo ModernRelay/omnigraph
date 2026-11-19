@@ -72,7 +72,7 @@ branch create b
 
 --- mutate branch: a
 query ins($n: String, $v: I64, $e: Vector(4)) {
-    insert Person { name: $n, value: $v, text: "needle", embedding: $e }
+    replace Person { name: $n, value: $v, text: "needle", embedding: $e }
 }
 
 --- params
@@ -87,7 +87,7 @@ branch merge a into tgt
 
 --- mutate branch: b
 query ins($n: String, $v: I64, $e: Vector(4)) {
-    insert Person { name: $n, value: $v, text: "needle", embedding: $e }
+    replace Person { name: $n, value: $v, text: "needle", embedding: $e }
 }
 
 --- params

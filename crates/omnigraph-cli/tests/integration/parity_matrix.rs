@@ -458,7 +458,7 @@ fn parity_mutate() {
     let (l, r) = p.run(&[
         "mutate",
         "-e",
-        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+        "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
         "--params",
         r#"{"name":"Parity","age":7}"#,
         "--json",
@@ -489,7 +489,7 @@ fn parity_mutate() {
         "--branch",
         "feature",
         "-e",
-        "query root() as unattached branch { insert Person { name: \"Root\", age: 8 } }",
+        "query root() as unattached branch { replace Person { name: \"Root\", age: 8 } }",
         "--json",
     ]);
     for (arm, root) in [("local", local_root), ("remote", remote_root)] {
@@ -498,7 +498,7 @@ fn parity_mutate() {
         let base = root["commit"]["graph_commit_id"].as_str().unwrap();
         let source = format!(
             "query child() as unattached branch on \"{base}\" {{ \
-             insert Person {{ name: \"Child\", age: 9 }} }}"
+             replace Person {{ name: \"Child\", age: 9 }} }}"
         );
         let run = |args: &[&str]| {
             let mut command = cli();
@@ -570,7 +570,7 @@ fn parity_branch_merge() {
         "--branch",
         "feature",
         "-e",
-        "query add() { insert Person { name: \"Receipt\", age: 31 } }",
+        "query add() { replace Person { name: \"Receipt\", age: 31 } }",
         "--json",
     ]);
     assert_write_parity("merge source write", &l, &r);
@@ -584,7 +584,7 @@ fn parity_branch_merge() {
             "--branch",
             " main",
             "-e",
-            "query add() { insert Person { name: \"Padded\", age: 32 } }",
+            "query add() { replace Person { name: \"Padded\", age: 32 } }",
             "--json",
         ][..],
     ] {
@@ -652,7 +652,7 @@ fn parity_branch_merge() {
     let (l, r) = p.run(&[
         "mutate",
         "-e",
-        "query add() { insert Person { name: \"Retained\", age: 32 } }",
+        "query add() { replace Person { name: \"Retained\", age: 32 } }",
         "--json",
     ]);
     assert_write_parity("refused deletion source write", &l, &r);
@@ -734,7 +734,7 @@ fn parity_branch_statements() {
         "--branch",
         "stmt",
         "-e",
-        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+        "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
         "--params",
         r#"{"name":"Stmt","age":1}"#,
         "--json",
@@ -1701,7 +1701,7 @@ fn parity_branch_review() {
         "--branch",
         "feature",
         "-e",
-        "query add() { insert Person { name: \"Reviewed\", age: 31 } }",
+        "query add() { replace Person { name: \"Reviewed\", age: 31 } }",
         "--json",
     ]);
     assert_write_parity("review source write", &l, &r);

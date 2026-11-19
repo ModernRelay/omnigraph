@@ -232,7 +232,7 @@ query retitle_apart_doc_in_two_statements() {
     match { $x: ApartDocTwice } where $x.slug = "row000"
     update $x set { title: "twice" }
     match { $n: Shared } where $n.slug = "nobody"
-    insert ApartDocTwice { slug: "never", title: "never" }
+    replace ApartDocTwice { slug: "never", title: "never" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -243,7 +243,7 @@ query retitle_shared_doc_in_two_statements() {
     match { $x: SharedDocTwice } where $x.slug = "row000"
     update $x set { title: "twice" }
     match { $n: Shared } where $n.slug = "nobody"
-    insert SharedDocTwice { slug: "never", title: "never" }
+    replace SharedDocTwice { slug: "never", title: "never" }
 }
 
 --- expect affected: nodes=1 edges=0

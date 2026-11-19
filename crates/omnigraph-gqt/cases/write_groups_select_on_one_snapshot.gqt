@@ -93,7 +93,7 @@ c.name: String
 
 --- mutate
 query hire_by_key() {
-    insert Person { name: "cy", city: "lima" }
+    replace Person { name: "cy", city: "lima" }
     match { $c: Company } where $c.slug = "acme"
     insert WorksAt { @src: "cy", @dst: $c }
 }

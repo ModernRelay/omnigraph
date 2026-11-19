@@ -27,7 +27,7 @@ node Account {
 
 --- mutate
 query insert_max() {
-    insert Account { slug: "b", size: 18446744073709551615, balance: -9223372036854775808, sizes: [1, 18446744073709551615] }
+    replace Account { slug: "b", size: 18446744073709551615, balance: -9223372036854775808, sizes: [1, 18446744073709551615] }
 }
 --- expect affected: nodes=1 edges=0
 

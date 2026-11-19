@@ -4752,7 +4752,7 @@ async fn graph_diff_resolves_every_read_target_kind() {
             "main",
             r#"
 query insert_root($name: String, $age: I32) as unattached branch {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
             "insert_root",

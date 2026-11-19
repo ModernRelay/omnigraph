@@ -27,8 +27,8 @@ branch create source
 
 --- mutate branch: source
 query source_changes() {
-    insert Person { name: "carol", age: 50 }
-    insert Person { name: "alice", age: 31 }
+    replace Person { name: "carol", age: 50 }
+    replace Person { name: "alice", age: 31 }
 }
 --- expect affected: nodes=2 edges=0
 
@@ -73,7 +73,7 @@ p.name: String
 p.age: I64
 
 --- mutate
-query add_dave() { insert Person { name: "dave", age: 60 } }
+query add_dave() { replace Person { name: "dave", age: 60 } }
 --- expect affected: nodes=1 edges=0
 
 --- query branch: main

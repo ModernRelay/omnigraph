@@ -21,7 +21,7 @@ branch create b0
 --- expect ok
 
 --- mutate branch: b0
-query insert_a_same_size() { insert Person { name: "a" } match { $x: Company } where $x.name = "c0"  update $x set { size: 5 } }
+query insert_a_same_size() { replace Person { name: "a" } match { $x: Company } where $x.name = "c0"  update $x set { size: 5 } }
 --- expect affected: nodes=2 edges=0
 
 --- mutate
@@ -29,7 +29,7 @@ branch merge b0
 --- expect outcome: fast_forward
 
 --- mutate branch: b0
-query insert_b() { insert Person { name: "b" } }
+query insert_b() { replace Person { name: "b" } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate

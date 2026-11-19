@@ -175,7 +175,7 @@ x.slug: String
 distance: F32
 
 --- mutate
-query add($s: String, $e: Vector(4)) { insert Doc { slug: $s, embedding: $e } }
+query add($s: String, $e: Vector(4)) { replace Doc { slug: $s, embedding: $e } }
 
 --- params
 {"s": "g", "e": [1.0, 1.0, 1.0, 2.0]}
@@ -183,7 +183,7 @@ query add($s: String, $e: Vector(4)) { insert Doc { slug: $s, embedding: $e } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query add($s: String, $e: Vector(4)) { insert Doc { slug: $s, embedding: $e } }
+query add($s: String, $e: Vector(4)) { replace Doc { slug: $s, embedding: $e } }
 
 --- params
 {"s": "h", "e": [1.0, 1.0, 1.0, -1.0]}

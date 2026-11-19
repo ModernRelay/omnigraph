@@ -985,7 +985,7 @@ edge Mentors: Person -> Person
 const SELECTION_MUTATIONS: &str = r#"
 query badge_and_mentor_staff($slug: String, $hub: String) {
   match { $c: Company, $p worksAt $c, $h: Person } where $c.slug = $slug and $h.name = $hub
-  insert Badge { owner: $p.name }
+  replace Badge { owner: $p.name }
   insert Mentors { @src: $h, @dst: $p }
 }
 query tag_staff($slug: String) {

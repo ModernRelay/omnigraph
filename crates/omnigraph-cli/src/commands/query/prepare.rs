@@ -376,7 +376,7 @@ mod tests {
         );
         // A child snapshot's recorded branch is not the request's main default.
         let child =
-            "query q() as unattached branch on \"base-id\" { insert Person { name: \"new\" } }";
+            "query q() as unattached branch on \"base-id\" { replace Person { name: \"new\" } }";
         assert_eq!(
             prepare_mutation(QueryInput::Supplied(child), envelope(), true)
                 .unwrap()

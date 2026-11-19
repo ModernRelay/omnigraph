@@ -199,8 +199,8 @@ n: I64
 
 --- mutate
 query twins() {
-    insert Doc { slug: "t1", title: "Graph Engines", year: 2020 }
-    insert Doc { slug: "t5", title: "search engines", year: 2023 }
+    replace Doc { slug: "t1", title: "Graph Engines", year: 2020 }
+    replace Doc { slug: "t5", title: "search engines", year: 2023 }
 }
 
 --- expect ok

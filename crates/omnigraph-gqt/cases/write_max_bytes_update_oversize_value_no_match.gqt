@@ -22,7 +22,7 @@ node Doc {
 
 --- mutate
 query seed_doc() {
-    insert Doc { slug: "present", note: "n" }
+    replace Doc { slug: "present", note: "n" }
 }
 
 --- expect affected: nodes=1 edges=0

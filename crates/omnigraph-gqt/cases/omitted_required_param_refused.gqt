@@ -89,7 +89,7 @@ query rename_thing_by_id_with_empty_params($id: String, $name: String) {
 
 --- mutate
 query insert_thing_without_params($id: String) {
-    insert Thing { id: $id }
+    replace Thing { id: $id }
 }
 
 --- expect error: parameter 'id' not provided

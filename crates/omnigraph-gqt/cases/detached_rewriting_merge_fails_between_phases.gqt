@@ -27,8 +27,8 @@ branch create source
 
 --- mutate branch: source
 query source_changes() {
-    insert Person { name: "carol", age: 50 }
-    insert Person { name: "alice", age: 31 }
+    replace Person { name: "carol", age: 50 }
+    replace Person { name: "alice", age: 31 }
 }
 --- expect affected: nodes=2 edges=0
 
@@ -37,7 +37,7 @@ query delete_bob() { match { $x: Person } where $x.name = "bob"  delete $x }
 --- expect affected: nodes=1 edges=2
 
 --- mutate
-query advance() { insert Person { name: "erin", age: 70 } }
+query advance() { replace Person { name: "erin", age: 70 } }
 --- expect affected: nodes=1 edges=0
 
 --- seam

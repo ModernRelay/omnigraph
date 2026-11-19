@@ -56,7 +56,7 @@ branch merge main into feature
 
 --- mutate branch: child
 query child_writes() {
-    insert Person { name: "carol", age: 1 }
+    replace Person { name: "carol", age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -100,7 +100,7 @@ p.age: I32
 
 --- mutate branch: child
 query child_writes_again() {
-    insert Person { name: "dave", age: 2 }
+    replace Person { name: "dave", age: 2 }
 }
 
 --- expect affected: nodes=1 edges=0

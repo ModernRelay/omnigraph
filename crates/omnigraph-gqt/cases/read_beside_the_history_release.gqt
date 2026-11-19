@@ -41,7 +41,7 @@ query bump_alice($n: I32) {
 --- endloop
 
 --- concurrent
-w1 on b: query add_carol() { insert Person { name: "carol", age: 1 } }
+w1 on b: query add_carol() { replace Person { name: "carol", age: 1 } }
 r1 on b: query all() { match { $p: Person } return { $p.name } }
 order: w1 park put __history/blocks/, r1 start, r1, w1 put __history/blocks/, w1
 --- expect

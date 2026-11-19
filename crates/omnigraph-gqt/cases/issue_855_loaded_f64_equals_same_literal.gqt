@@ -23,7 +23,7 @@ node Person {
 
 --- mutate
 query insert_literal() {
-    insert Person { name: "b", x: 123456789.12345679 }
+    replace Person { name: "b", x: 123456789.12345679 }
 }
 
 --- expect affected: nodes=1 edges=0

@@ -34,7 +34,7 @@ not pass key_to_id
 
 --- mutate
 query append_person() {
-    insert Person { slug: "gamma", age: 11 }
+    replace Person { slug: "gamma", age: 11 }
 }
 --- expect affected: nodes=1 edges=0
 

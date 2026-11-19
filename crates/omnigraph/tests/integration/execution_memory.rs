@@ -1504,7 +1504,7 @@ async fn hydration_on_a_graph_branch_reads_in_coalesced_requests() {
     mutate_branch(
         &v2,
         "feature",
-        r#"query add() { insert Person { name: "zz", payload: "new" } }"#,
+        r#"query add() { replace Person { name: "zz", payload: "new" } }"#,
         "add",
         &params(&[]),
     )
@@ -2398,7 +2398,7 @@ async fn write_selection_maps_are_charged_to_the_read_pool_and_work() {
     }"#;
     let writes = r#"query badge($note: String) {
         match { $a: Person, $a knows $b } where $a.name = "hub"
-        insert Badge { owner: $b.name, note: $note }
+        replace Badge { owner: $b.name, note: $note }
     }
     query stamp() {
         match { $a: Person, $a knows $b } where $a.name = "hub"

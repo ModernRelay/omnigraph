@@ -69,7 +69,7 @@ fn remote_server_and_cli_end_to_end_flow() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     )
@@ -222,7 +222,9 @@ query insert_person($name: String, $age: I32) {
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query-string")
-            .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
+            .arg(
+                "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
+            )
             .arg("--params")
             .arg(r#"{"name":"Inline","age":42}"#)
             .arg("--json"),
@@ -251,7 +253,7 @@ query insert_person($name: String, $age: I32) {
         .post(format!("{}/graphs/{GRAPH_ID}/query", server.base_url))
         .json(&json!({
             "branch": "main",
-            "query": "query bad($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+            "query": "query bad($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
             "params": { "name": "Nope", "age": 1 }
         }))
         .send()
@@ -507,7 +509,7 @@ fn remote_branch_create_list_merge_flow() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     )
@@ -660,7 +662,7 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
             .post(format!("{graph_url}/mutate"))
             .json(&json!({
                 "branch": source,
-                "query": "query add($name: String) { insert Person { name: $name, age: 33 } }",
+                "query": "query add($name: String) { replace Person { name: $name, age: 33 } }",
                 "params": {"name": marker}
             }))
             .send()
@@ -865,7 +867,7 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
             let proposal = client
                 .post(format!("{graph_url}/mutate"))
                 .json(&json!({
-                    "query": "query propose($name: String) as commit { insert Person { name: $name, age: 33 } }",
+                    "query": "query propose($name: String) as commit { replace Person { name: $name, age: 33 } }",
                     "params": {"name": marker}
                 }))
                 .send()
@@ -1535,7 +1537,7 @@ fn remote_export_round_trips_full_branch_graph() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 
 query add_friend($from: String, $to: String) {
@@ -1926,7 +1928,7 @@ fn remote_policy_enforces_branch_first_cli_workflow() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     )
@@ -2277,7 +2279,7 @@ fn graphs_list_against_multi_graph_server() {
 fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     const FIND_ALICE: &str = "query find($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }";
     const ADD_PERSON: &str =
-        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
+        "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }";
     fn mutate_cmd(base_url: &str, name: &str, if_commit: Option<&str>) -> std::process::Output {
         let mut cmd = cli();
         cmd.arg("mutate")
@@ -2440,7 +2442,7 @@ fn remote_unix_socket_serves_query_mutate_load_export_and_blob_get_issue_979() {
     let mutation = parse_stdout_json(&over_socket(&[
         "mutate",
         "-e",
-        r#"query add($title: String) { insert Document { title: $title, note: "over a socket" } }"#,
+        r#"query add($title: String) { replace Document { title: $title, note: "over a socket" } }"#,
         "--params",
         r#"{"title":"socket-mutate"}"#,
         "--json",

@@ -21,7 +21,7 @@ node Person {
 
 --- mutate
 query root_bob() as unattached branch {
-    insert Person { name: "bob", age: 41 }
+    replace Person { name: "bob", age: 41 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -38,7 +38,7 @@ query noop_child() as unattached branch on "${r}" {
 
 --- mutate
 query child_carol() as unattached branch on "${r}" {
-    insert Person { name: "carol", age: 52 }
+    replace Person { name: "carol", age: 52 }
 }
 
 --- expect affected: nodes=1 edges=0

@@ -4,7 +4,7 @@ Mutation statements live inside a named `.gq` query; run it with `omnigraph muta
 
 ```gq
 query hire($person_id: String, $company_id: String, $role: String) {
-  insert WorksAt {
+  replace WorksAt {
     @src: $person_id,
     @dst: $company_id,
     role: $role
@@ -17,7 +17,7 @@ An edge insert assigns its endpoints as `from` and `to`, the logical ids of exis
 ## Statements
 
 ```gq fragment
-insert Person { email: $email, display_name: $name }
+replace Person { email: $email, display_name: $name }
 
 match { $x: Person } where $x.email = $email
 update $x set { display_name: $name }

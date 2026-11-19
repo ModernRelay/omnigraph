@@ -47,7 +47,7 @@ action: fail
 scope: next_step
 
 --- mutate branch: b
-query rejected_releasing_publish() { insert Person { name: "carol", age: 1 } }
+query rejected_releasing_publish() { replace Person { name: "carol", age: 1 } }
 
 --- expect error: injected failpoint triggered: publish.pre_merge
 
@@ -63,7 +63,7 @@ p.name: String
 p.age: I32
 
 --- mutate branch: b
-query retried_releasing_publish() { insert Person { name: "carol", age: 1 } }
+query retried_releasing_publish() { replace Person { name: "carol", age: 1 } }
 
 --- expect affected: nodes=1 edges=0
 
