@@ -1,3 +1,5 @@
-- A graph that 0.16 creates (`init`, a new cluster graph, a rebuild) is storage format 17, which 0.15.x and older refuse to open. Existing graphs stay at 16 until `omnigraph upgrade`, which has no way back. Upgrade every server and CLI that opens a graph before creating one with 0.16. See [storage upgrade][format-17-upgrade].
+- 0.16 reads and writes existing format-16 graphs without a rebuild. New graphs use format 17,
+  which 0.15 cannot open. Upgrade all readers and writers before creating a graph or
+  [upgrading a standalone graph][format-17-upgrade] to 17.
 
 [format-17-upgrade]: ../docs/user/operations/upgrade.md#storage-upgrade
