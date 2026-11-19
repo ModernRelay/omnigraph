@@ -559,7 +559,7 @@ cargo test -p omnigraph-gqt --locked                            # complete corpu
 cargo test -p omnigraph-gqt --test gq_logic_tests issue_563      # matching case names
 cargo test -p omnigraph-gqt --test gq_logic_tests -- --list      # one line per case
 cargo run -p omnigraph-gqt --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure   # store requests per step under DST
-cargo run -p omnigraph-gqt --bin omnigraph-gqt -- cases/concurrent_read_beside_publish.gqt --measure   # a `--- concurrent` block: sessions overlap under an `order:` line, one cost row per session
+cargo run -p omnigraph-gqt --bin omnigraph-gqt -- cases/concurrent_read_beside_publish.gqt --measure   # a `--- concurrent scripted` block: sessions overlap under its `order:` line, one cost row per session
 cargo run -p omnigraph-gqt --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure --baseline /tmp/gqt-cost.tsv --write-baseline   # record a cost baseline anywhere on disk; --baseline alone prints the delta
 cargo run -p omnigraph-gqt --bin omnigraph-gqt -- --store file:///path/to/graph /path/to/queries.gqt
 cargo run -p omnigraph-gqt --bin omnigraph-gqt -- --check cases/   # every format error of every case, each with its code and fix; runs nothing
