@@ -408,6 +408,108 @@ fn brace_frame(prev: Option<Word>, prev2: Option<Word>) -> Frame {
     Frame::Body
 }
 
+/// One top-level declaration or statement of a source, found by the same
+/// lexical scan that needs no parse tree, so a source whose other
+/// declarations the parser refuses still yields each one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationUnit {
+    /// Its byte range in the source.
+    pub start: usize,
+    pub end: usize,
+    /// The name its `query` header declares, when it has one.
+    pub name: Option<String>,
+    /// Every word written directly before a `(` in it, outside strings and
+    /// comments, after its own header: the names it may call.
+    pub called: std::collections::BTreeSet<String>,
+}
+
+/// The declarations and statements of `text`, in source order.
+pub fn declaration_units(text: &str) -> Vec<DeclarationUnit> {
+    let scan = Scan::of(text);
+    scan.units
+        .iter()
+        .filter(|u| u.kind == UnitKind::Declaration && !u.blank)
+        .map(|u| {
+            let words = words_of(&text[u.start..u.end]);
+            let header = words
+                .iter()
+                .position(|(w, _)| keyword(w, &["query", "mutation", "view"]))
+                .and_then(|at| {
+                    words
+                        .get(at + 1)
+                        .filter(|(w, _)| {
+                            w.as_bytes()[0].is_ascii_alphabetic() || w.starts_with('_')
+                        })
+                        .map(|(w, _)| (at + 1, (*w).to_string()))
+                });
+            let after = header.as_ref().map_or(0, |(at, _)| at + 1);
+            DeclarationUnit {
+                start: u.start,
+                end: u.end,
+                name: header.map(|(_, name)| name),
+                called: words[after..]
+                    .iter()
+                    .filter(|(w, call)| *call && !w.starts_with('$') && !w.starts_with('@'))
+                    .map(|(w, _)| (*w).to_string())
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// The words of `text` outside strings and comments, each with whether the
+/// next token is `(`.
+fn words_of(text: &str) -> Vec<(&str, bool)> {
+    let b = text.as_bytes();
+    let mut words: Vec<(&str, bool)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+        } else if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < b.len() && b[i] != c {
+                if b[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(b.len());
+        } else if is_word_byte(c) || c == b'$' || c == b'@' {
+            let start = i;
+            i += 1;
+            while i < b.len() && is_word_byte(b[i]) {
+                i += 1;
+            }
+            words.push((&text[start..i], false));
+        } else {
+            if c == b'(' {
+                if let Some(last) = words.last_mut() {
+                    // Only when the word is the token right before `(`.
+                    let gap =
+                        &text[last.0.as_ptr() as usize - text.as_ptr() as usize + last.0.len()..i];
+                    if gap.trim().is_empty() {
+                        last.1 = true;
+                    }
+                }
+            }
+            i += utf8_len(c);
+        }
+    }
+    words
+}
+
 /// What [`neutralize`] did: the region it replaced.
 pub(crate) struct Neutralized {
     pub text: String,
@@ -516,6 +618,32 @@ fn finish(bytes: Vec<u8>, region: (usize, usize)) -> Option<Neutralized> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declaration_units_name_each_declaration_and_what_it_calls() {
+        let text = "query helper($of: String) {\n  match { $p: Person } where $p.name = $of\n  return { $p.name }\n}\n\n// a comment naming helper(x)\nquery broken() {\n  match { $d: Doc { slug: \"helper(\" } }\n  return { count($d) }\n}\nquery caller() { from helper (\"a\") return { name } }\n";
+        let units = declaration_units(text);
+        let named: Vec<_> = units
+            .iter()
+            .map(|u| {
+                (
+                    u.name.as_deref(),
+                    u.called.iter().map(String::as_str).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (Some("helper"), vec![]),
+                (Some("broken"), vec!["count"]),
+                (Some("caller"), vec!["helper"]),
+            ]
+        );
+        for unit in &units {
+            assert!(text[unit.start..unit.end].trim_start().starts_with("query"));
+        }
+    }
 
     fn units(text: &str) -> Vec<(UnitKind, &str)> {
         let scan = Scan::of(text);

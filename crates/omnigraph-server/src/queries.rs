@@ -30,10 +30,14 @@ use omnigraph_compiler::types::{PropType, ScalarType};
 pub struct StoredQuery {
     /// Identity: manifest key == `query <name>` symbol.
     pub name: String,
-    /// Full `.gq` source text the query was selected from.
+    /// The `.gq` file the query was selected from, every declaration the
+    /// compiler refuses blanked (byte offsets kept): what an invocation runs.
     pub source: Arc<str>,
     /// Parsed declaration (params, mutations, description, …).
     pub decl: QueryDecl,
+    /// The declarations of its file it calls: when one fails to type-check,
+    /// this query is unavailable naming it.
+    pub callees: Vec<QueryDecl>,
     /// Whether this query is listed in the MCP tool catalog (`GET /queries`).
     /// Default `true` (the manifest entry is the opt-in); `expose: false`
     /// keeps it HTTP/service-callable but hidden from the agent tool list.
@@ -180,7 +184,24 @@ impl QueryRegistry {
     /// they agree. Collects every failure. No schema type-checking here
     /// — that is [`check`]. The registry is strict: one failure refuses it.
     pub fn from_specs(specs: Vec<RegistrySpec>) -> Result<Self, Vec<LoadError>> {
-        let (mut registry, errors) = Self::load(specs);
+        let registered: std::collections::BTreeSet<String> =
+            specs.iter().map(|spec| spec.name.clone()).collect();
+        let sources: std::collections::BTreeSet<String> =
+            specs.iter().map(|spec| spec.source.clone()).collect();
+        let (mut registry, mut errors) = Self::load(specs);
+        // Strict refuses for any declaration of a stored file, registered
+        // or only called.
+        for source in &sources {
+            for (name, refusal) in FileUnits::compile(source).refused() {
+                if !registered.contains(name) {
+                    errors.push(LoadError {
+                        query: Some(name.to_string()),
+                        message: refusal.0.clone(),
+                        diagnostic: refusal.1.clone().map(Box::new),
+                    });
+                }
+            }
+        }
         if errors.is_empty() {
             registry.strict = true;
             Ok(registry)
@@ -257,55 +278,38 @@ impl QueryRegistry {
     }
 
     /// Every entry loaded, and every failure an entry or the registry
-    /// owns.
+    /// owns. Each declaration of a file compiles on its own ([`FileUnits`]):
+    /// one the compiler refuses is unavailable with its own diagnostic, one
+    /// that calls an unavailable declaration of its file is unavailable
+    /// naming it, and the others load.
     fn load(specs: Vec<RegistrySpec>) -> (Self, Vec<LoadError>) {
         let mut by_name = BTreeMap::new();
         let mut errors = Vec::new();
+        let mut files: BTreeMap<String, FileUnits> = BTreeMap::new();
 
         for spec in specs {
-            let declarations = parse_query(&spec.source)
-                .map_err(|err| LoadError {
+            let file = files
+                .entry(spec.source.clone())
+                .or_insert_with(|| FileUnits::compile(&spec.source));
+            match file.select(&spec.name) {
+                Ok((decl, callees)) => {
+                    by_name.insert(
+                        spec.name.clone(),
+                        StoredQuery {
+                            name: spec.name,
+                            source: Arc::clone(&file.served),
+                            decl,
+                            callees,
+                            expose: spec.expose,
+                            tool_name: spec.tool_name,
+                        },
+                    );
+                }
+                Err((message, diagnostic)) => errors.push(LoadError {
                     query: Some(spec.name.clone()),
-                    message: err.to_string(),
-                    diagnostic: err.diagnostic().cloned().map(Box::new),
-                })
-                .and_then(|file| {
-                    if file.settings.is_empty() {
-                        file.into_declarations()
-                    } else {
-                        Err(STORED_QUERY_CARRIES_NO_SETTINGS.to_string())
-                    }
-                    .map_err(|message| LoadError {
-                        query: Some(spec.name.clone()),
-                        message,
-                        diagnostic: None,
-                    })
-                });
-            match declarations {
-                Ok(queries) => match queries.into_iter().find(|q| q.name == spec.name) {
-                    Some(decl) => {
-                        by_name.insert(
-                            spec.name.clone(),
-                            StoredQuery {
-                                name: spec.name,
-                                source: Arc::from(spec.source),
-                                decl,
-                                expose: spec.expose,
-                                tool_name: spec.tool_name,
-                            },
-                        );
-                    }
-                    None => errors.push(LoadError {
-                        query: Some(spec.name.clone()),
-                        message: format!(
-                            "no `query {}` declaration found in its `.gq` file \
-                                 (the registry key must match the query symbol)",
-                            spec.name
-                        ),
-                        diagnostic: None,
-                    }),
-                },
-                Err(error) => errors.push(error),
+                    message,
+                    diagnostic: diagnostic.map(Box::new),
+                }),
             }
         }
 
@@ -358,6 +362,171 @@ impl QueryRegistry {
     pub fn len(&self) -> usize {
         self.by_name.len()
     }
+}
+
+/// A refusal: its message and, when it carries one, the compiler's
+/// diagnostic.
+type Refusal = (String, Option<omnigraph_compiler::QueryDiagnostic>);
+
+/// One stored-query file, each declaration compiled on its own.
+///
+/// The file is split into its declarations by the compiler's lexical scan
+/// (`declaration_units`), which needs no parse tree. Each declaration
+/// compiles with every other declaration blanked (bytes kept, so positions
+/// stay those of the file); a statement or settings line with no declaration
+/// name stays in every compile, so its refusal holds for every declaration.
+/// A declaration that calls a refused one of its file is refused naming it.
+/// What is served is the file with every refused declaration blanked.
+struct FileUnits {
+    /// Each named declaration's own outcome.
+    outcomes: BTreeMap<String, Result<(), Refusal>>,
+    /// The declarations each named declaration calls, within the file.
+    calls: BTreeMap<String, Vec<String>>,
+    /// The file with every refused declaration blanked.
+    served: Arc<str>,
+    /// The served file's declarations, or its refusal.
+    declarations: Result<Vec<QueryDecl>, Refusal>,
+}
+
+impl FileUnits {
+    fn compile(source: &str) -> Self {
+        use omnigraph_compiler::query::syntax::recover::declaration_units;
+        let units = declaration_units(source);
+        let names: std::collections::BTreeSet<&str> =
+            units.iter().filter_map(|u| u.name.as_deref()).collect();
+        let only = |keep: &[usize]| {
+            let mut bytes = source.as_bytes().to_vec();
+            for (index, unit) in units.iter().enumerate() {
+                if unit.name.is_some() && !keep.contains(&index) {
+                    for byte in &mut bytes[unit.start..unit.end] {
+                        if *byte != b'\n' {
+                            *byte = b' ';
+                        }
+                    }
+                }
+            }
+            // Whole units of ASCII spaces over token boundaries.
+            String::from_utf8(bytes).expect("blanking whole units keeps UTF-8")
+        };
+        let mut outcomes = BTreeMap::new();
+        let mut calls = BTreeMap::new();
+        for (index, unit) in units.iter().enumerate() {
+            let Some(name) = &unit.name else { continue };
+            let alone = declarations_of(&only(&[index])).map(|_| ());
+            // A name declared twice keeps its first outcome; the served
+            // file refuses the repetition for both.
+            outcomes.entry(name.clone()).or_insert(alone);
+            calls.entry(name.clone()).or_insert_with(|| {
+                unit.called
+                    .iter()
+                    .filter(|called| *called != name && names.contains(called.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+        }
+        // A caller of a refused declaration is refused naming it, to the
+        // fixed point.
+        loop {
+            let refused: Vec<(String, String)> = calls
+                .iter()
+                .filter(|(name, _)| outcomes.get(*name).is_some_and(Result::is_ok))
+                .filter_map(|(name, called)| {
+                    called
+                        .iter()
+                        .find(|c| outcomes.get(*c).is_some_and(Result::is_err))
+                        .map(|c| (name.clone(), c.clone()))
+                })
+                .collect();
+            if refused.is_empty() {
+                break;
+            }
+            for (name, called) in refused {
+                outcomes.insert(
+                    name,
+                    Err((
+                        format!("calls `{called}`, a declaration of its file that is unavailable"),
+                        None,
+                    )),
+                );
+            }
+        }
+        let keep: Vec<usize> = units
+            .iter()
+            .enumerate()
+            .filter(|(_, unit)| {
+                unit.name
+                    .as_ref()
+                    .is_some_and(|name| outcomes.get(name).is_some_and(Result::is_ok))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let served = only(&keep);
+        let declarations = declarations_of(&served);
+        Self {
+            outcomes,
+            calls,
+            served: Arc::from(served),
+            declarations,
+        }
+    }
+
+    /// Every refused declaration of the file, by name.
+    fn refused(&self) -> impl Iterator<Item = (&str, &Refusal)> {
+        self.outcomes
+            .iter()
+            .filter_map(|(name, outcome)| outcome.as_ref().err().map(|r| (name.as_str(), r)))
+    }
+
+    /// The declaration named `name` and the declarations it calls, or its
+    /// refusal.
+    fn select(&self, name: &str) -> Result<(QueryDecl, Vec<QueryDecl>), Refusal> {
+        match self.outcomes.get(name) {
+            Some(Err(refusal)) => return Err(refusal.clone()),
+            Some(Ok(())) => {}
+            // No declaration carries the name: a refusal of the file as a
+            // whole (a statement, a settings line) is the reason.
+            None if self.declarations.is_err() => {
+                return Err(self.declarations.clone().unwrap_err());
+            }
+            None => {
+                return Err((
+                    format!(
+                        "no `query {name}` declaration found in its `.gq` file \
+                         (the registry key must match the query symbol)"
+                    ),
+                    None,
+                ));
+            }
+        }
+        let declarations = self.declarations.as_ref().map_err(Clone::clone)?;
+        let find = |wanted: &str| declarations.iter().find(|q| q.name == wanted).cloned();
+        let decl = find(name).ok_or_else(|| {
+            (
+                format!(
+                    "no `query {name}` declaration found in its `.gq` file \
+                     (the registry key must match the query symbol)"
+                ),
+                None,
+            )
+        })?;
+        let callees = self
+            .calls
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|called| find(called))
+            .collect();
+        Ok((decl, callees))
+    }
+}
+
+/// The declarations of `source`, or its refusal.
+fn declarations_of(source: &str) -> Result<Vec<QueryDecl>, Refusal> {
+    let file = parse_query(source).map_err(|err| (err.to_string(), err.diagnostic().cloned()))?;
+    if !file.settings.is_empty() {
+        return Err((STORED_QUERY_CARRIES_NO_SETTINGS.to_string(), None));
+    }
+    file.into_declarations().map_err(|message| (message, None))
 }
 
 /// A stored query that fails to type-check against the live schema —
@@ -424,10 +593,26 @@ pub fn check(registry: &QueryRegistry, catalog: &Catalog) -> CheckReport {
     let mut report = CheckReport::default();
     for query in registry.iter() {
         if let Err(err) = typecheck_query_decl(catalog, &query.decl) {
-            report.breakages.push(Breakage {
-                query: query.name.clone(),
-                message: err.to_string(),
-                diagnostic: err.diagnostic().cloned(),
+            // A query whose own refusal comes from a declaration it calls is
+            // unavailable naming that declaration.
+            let refused_callee = query
+                .callees
+                .iter()
+                .find(|callee| typecheck_query_decl(catalog, callee).is_err());
+            report.breakages.push(match refused_callee {
+                Some(callee) => Breakage {
+                    query: query.name.clone(),
+                    message: format!(
+                        "calls `{}`, a declaration of its file that is unavailable",
+                        callee.name
+                    ),
+                    diagnostic: None,
+                },
+                None => Breakage {
+                    query: query.name.clone(),
+                    message: err.to_string(),
+                    diagnostic: err.diagnostic().cloned(),
+                },
             });
         }
         if query.expose {
@@ -677,6 +862,80 @@ mod tests {
         // `good` loads cleanly; only the mismatch and the parse error are
         // reported, and both surface in one pass (not fail-fast).
         assert_eq!(errors.len(), 2);
+    }
+
+    /// A file of four declarations: `fine` compiles, `old_form` is refused
+    /// by the parser, `caller` calls it, and `helper_user` calls `fine`.
+    const MIXED_FILE: &str = "query fine() {\n  match { $u: User }\n  return { $u }\n}\n\nquery old_form() {\n  match { $u: User { name: \"a\" } }\n  return { $u.name }\n}\n\nquery caller() {\n  match { from old_form() }\n  return { $u.name }\n}\n\nquery helper_user() {\n  match { from fine() }\n  return { $u.name }\n}\n";
+
+    #[test]
+    fn each_declaration_of_a_file_is_available_on_its_own() {
+        let specs = ["fine", "old_form", "caller", "helper_user"]
+            .map(|name| spec(name, MIXED_FILE, true))
+            .to_vec();
+        let registry = QueryRegistry::from_specs_per_query(specs.clone()).unwrap();
+        let served: Vec<_> = registry.iter().map(|q| q.name.as_str()).collect();
+        assert_eq!(served, ["fine", "helper_user"]);
+
+        // The refused declaration carries its own diagnostic, at its own
+        // line of the file.
+        let old_form = registry.lookup_unavailable("old_form").unwrap();
+        let diagnostic = old_form.diagnostic.as_ref().unwrap();
+        assert_eq!(diagnostic.code.as_str(), "Q010");
+        assert_eq!(diagnostic.position.as_ref().unwrap().line, 7);
+        assert_eq!(&*old_form.source, MIXED_FILE);
+        // Its caller is unavailable naming it, with no diagnostic of its own.
+        let caller = registry.lookup_unavailable("caller").unwrap();
+        assert!(caller.diagnostic.is_none());
+        assert!(caller.message.contains("`old_form`"), "{}", caller.message);
+        assert_eq!(registry.unavailable().count(), 2);
+
+        // What is served is the file with the refused declarations blanked,
+        // byte for byte where they were.
+        let fine = registry.lookup("fine").unwrap();
+        assert_eq!(fine.source.len(), MIXED_FILE.len());
+        assert!(!fine.source.contains("old_form"));
+        assert!(fine.source.contains("query helper_user()"));
+        assert_eq!(registry.lookup("helper_user").unwrap().callees.len(), 1);
+
+        // The strict registry refuses on any refused declaration.
+        let strict = QueryRegistry::from_specs(specs).unwrap_err();
+        let refused: Vec<_> = strict.iter().map(|e| e.query.as_deref().unwrap()).collect();
+        assert_eq!(refused, ["old_form", "caller"]);
+        // Also for one only called, never registered.
+        let strict = QueryRegistry::from_specs(vec![spec("fine", MIXED_FILE, true)]).unwrap_err();
+        let refused: Vec<_> = strict.iter().map(|e| e.query.as_deref().unwrap()).collect();
+        assert_eq!(refused, ["caller", "old_form"]);
+    }
+
+    #[test]
+    fn a_caller_of_a_declaration_that_fails_its_type_check_is_unavailable_naming_it() {
+        let source = "query helper() { match { $g: Ghost } return { $g } }\n\
+                      query uses_helper() { match { from helper() } return { $g.name } }\n\
+                      query plain() { match { $u: User } return { $u.name } }\n";
+        let mut registry = QueryRegistry::from_specs_per_query(
+            ["helper", "uses_helper", "plain"]
+                .map(|name| spec(name, source, false))
+                .to_vec(),
+        )
+        .unwrap();
+        let report = check(&registry, &test_catalog());
+        let mut broken: Vec<_> = report
+            .breakages
+            .iter()
+            .map(|b| (b.query.as_str(), b.diagnostic.is_some()))
+            .collect();
+        broken.sort();
+        assert_eq!(broken, [("helper", true), ("uses_helper", false)]);
+        let uses = report
+            .breakages
+            .iter()
+            .find(|b| b.query == "uses_helper")
+            .unwrap();
+        assert!(uses.message.contains("`helper`"), "{}", uses.message);
+        registry.withdraw_breakages(&report);
+        let served: Vec<_> = registry.iter().map(|q| q.name.as_str()).collect();
+        assert_eq!(served, ["plain"]);
     }
 
     #[test]

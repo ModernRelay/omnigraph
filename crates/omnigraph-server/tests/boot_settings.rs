@@ -3919,6 +3919,10 @@ async fn live_deployment_fixture(mode: &str) {
     );
 }
 
+/// A stored-query file an older binary applied: one declaration this
+/// release refuses beside one it compiles.
+const LEGACY_FILE: &str = "query legacy() { match { $p: Person } where $p.name == \"!\" return { $p.name } }\nquery legacy_mate() { match { $p: Person } return { $p.name } }\n";
+
 /// A served graph whose stored query fails to compile under this release
 /// (the GQ 3 upgrade) stays served with that query alone unavailable: the
 /// health routes report it, `GET /readyz` its count and `GET /graphs` its
@@ -3966,14 +3970,32 @@ async fn a_served_graph_reports_its_unavailable_stored_queries_on_the_health_rou
         },
         omnigraph_server::queries::RegistrySpec {
             name: "legacy".into(),
-            source:
-                "query legacy() { match { $p: Person } where $p.name == \"!\" return { $p.name } }"
-                    .into(),
+            source: LEGACY_FILE.into(),
+            expose: true,
+            tool_name: None,
+        },
+        // The refused declaration's file mate serves.
+        omnigraph_server::queries::RegistrySpec {
+            name: "legacy_mate".into(),
+            source: LEGACY_FILE.into(),
             expose: true,
             tool_name: None,
         },
     ])
     .unwrap();
+    // The strict setting refuses the registry, and with it the graph, for
+    // the one refused declaration.
+    let strict = omnigraph_server::queries::QueryRegistry::from_specs(vec![
+        omnigraph_server::queries::RegistrySpec {
+            name: "legacy_mate".into(),
+            source: LEGACY_FILE.into(),
+            expose: true,
+            tool_name: None,
+        },
+    ])
+    .unwrap_err();
+    assert_eq!(strict.len(), 1);
+    assert_eq!(strict[0].query.as_deref(), Some("legacy"));
     let state = omnigraph_server::open_multi_graph_state(
         graphs,
         vec![("operator".into(), "operator-token".into())],
@@ -4009,6 +4031,8 @@ async fn a_served_graph_reports_its_unavailable_stored_queries_on_the_health_rou
     .await;
     assert_eq!(status, StatusCode::OK, "{catalog}");
     assert_eq!(catalog["queries"][0]["name"], "find_person", "{catalog}");
+    assert_eq!(catalog["queries"][1]["name"], "legacy_mate", "{catalog}");
+    assert_eq!(catalog["unavailable"].as_array().unwrap().len(), 1);
     assert_eq!(
         catalog["unavailable"][0]["diagnostic"], *diagnostic,
         "{catalog}"

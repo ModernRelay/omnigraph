@@ -433,6 +433,12 @@ async fn a_stored_query_that_fails_to_compile_is_unavailable_and_the_graph_serve
             "query shout() { match { $p: Person } where $p.name == \"Alice\" return { $p.name } }",
             true,
         ),
+        // One file of three declarations, each available on its own: the
+        // one that compiles serves, the refused one carries its own
+        // diagnostic, and its caller is unavailable naming it.
+        ("fine_mate", MIXED_GQ, true),
+        ("old_mate", MIXED_GQ, true),
+        ("calls_old", MIXED_GQ, true),
     ]);
     let state = AppState::open_single_with_queries(
         graph.to_string_lossy().to_string(),
@@ -452,9 +458,27 @@ async fn a_stored_query_that_fails_to_compile_is_unavailable_and_the_graph_serve
         .iter()
         .map(|q| q["name"].as_str().unwrap())
         .collect();
-    assert_eq!(served, ["find_person"], "{body}");
+    assert_eq!(served, ["find_person", "fine_mate"], "{body}");
     let unavailable = body["unavailable"].as_array().expect("unavailable listed");
-    assert_eq!(unavailable.len(), 2, "{body}");
+    assert_eq!(unavailable.len(), 4, "{body}");
+    let old_mate = unavailable
+        .iter()
+        .find(|q| q["name"] == "old_mate")
+        .unwrap();
+    assert_eq!(old_mate["diagnostic"]["code"], "Q010", "{old_mate}");
+    assert_eq!(
+        old_mate["diagnostic"]["position"]["line"], 7,
+        "the refusal is placed in the file: {old_mate}"
+    );
+    let calls_old = unavailable
+        .iter()
+        .find(|q| q["name"] == "calls_old")
+        .unwrap();
+    assert!(calls_old["diagnostic"].is_null(), "{calls_old}");
+    assert!(
+        calls_old["error"].as_str().unwrap().contains("`old_mate`"),
+        "{calls_old}"
+    );
     let ghost = unavailable.iter().find(|q| q["name"] == "ghost").unwrap();
     assert!(
         ghost["diagnostic"]["code"]
@@ -498,7 +522,20 @@ async fn a_stored_query_that_fails_to_compile_is_unavailable_and_the_graph_serve
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["row_count"], 1, "{body}");
+    // So does the declaration whose file mate is refused.
+    let (status, body) =
+        json_response(&app, invoke_request("fine_mate", "t-invoke", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["row_count"].as_u64().unwrap() > 0, "{body}");
+    let (status, body) =
+        json_response(&app, invoke_request("calls_old", "t-invoke", json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stored_query_unavailable", "{body}");
 }
+
+/// A stored-query file whose declarations compile one by one: a refused
+/// declaration (line 7) and its caller sit beside one that serves.
+const MIXED_GQ: &str = "query fine_mate() {\n  match { $p: Person }\n  return { $p.name }\n}\n\nquery old_mate() {\n  match { $p: Person { name: \"Alice\" } }\n  return { $p }\n}\n\nquery calls_old() {\n  match { from old_mate() }\n  return { $p.name }\n}\n";
 
 /// The strict registry keeps today's behavior: one stored query that fails
 /// to compile refuses the graph.
