@@ -72,7 +72,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `schema apply` | Apply a schema to a standalone graph | direct |
 | `schema plan` | Preview a schema migration | direct |
 | `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
-| `lint` | Validate `.gq` source | local schema or direct graph |
+| `lint` | Validate `.gq` source; `--fix` applies the compiler's printed fixes to a file, a directory or a configuration's stored-query files ([Lint](../queries/lint.md#fix)) | local schema, direct graph or configuration directory |
 | `upgrade` | Convert a v8, v9 or v13 graph's storage to the format this binary serves, offline; `--check` writes nothing | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes on `main`; a server target runs it as a [recorded operation](../operations/recorded-operations.md), waiting for its record unless `--no-wait` | direct or served |
 | `index build` | Build a branch's missing declared indexes and refresh lagging scalar and vector coverage ([Maintenance](../operations/maintenance.md#build-indexes)) | direct |
