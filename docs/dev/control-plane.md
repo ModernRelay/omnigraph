@@ -249,12 +249,16 @@ Read-only CLI consumers instead validate canonical membership, captured ledger
 CAS and accepted schema through `graph_read.rs`, without taking writer admission.
 This is an observation, not a reclamation lease or a fence against later changes.
 Dropping a guard or returning from writable work, including success, retains its
-persisted lock. Completed read-only preflight refusals during new deployment,
+persisted lock unless the owner releases it explicitly as described here. Completed read-only preflight refusals during new deployment,
 conversion, admission construction or read-only server settings validation
 explicitly release the exact lock. Recovery
 of an accepted invocation retains admission even when its current preparation
 refuses. Other explicit release requires qualified terminal graph and control
-I/O; generic server drain does not establish that proof. Clean serving release
+I/O; generic server drain does not establish that proof. A direct deployment
+(`apply_direct_bundle`) runs its control and graph writes in one explicit
+storage scope and, when the deployment completes converged, releases through
+the same scope settlement as clean serving release; Azure, a non-converged or
+outstanding result, and an uncertain scope retain admission. Clean serving release
 adds an explicit storage scope covering native and Lance writes, described below.
 Other operator transfer requires stopped prior processes and accepted-I/O quiescence,
 then exact-ID unlock with all admissions and other unlocks excluded until it
