@@ -5,8 +5,8 @@
 # notes: endpoint columns, Lance answers each `key IN (...)` probe with one batch per
 # notes: contiguous row range; uniform random endpoints scatter the matches, so a probe
 # notes: held whole kept many decode buffers alive and the pool charged each by capacity.
-# notes: Main needs about 1.5 times this pool. With the same 1 MiB scan batches, main is
-# notes: refused at every pool from 32 to 48 MiB and answers from 52 MiB up. A refusal
+# notes: Main needs about 1.6 times this pool. With the same 1 MiB scan batches, main is
+# notes: refused at every pool from 32 to 51 MiB and answers from 52 MiB up. A refusal
 # notes: names only the first reservation over the limit, so `actual` is under 1% over at
 # notes: each of those pools and changes between runs. It does not show the margin. At
 # notes: 16 MiB the scan batches are smaller and main answers, so the 32 MiB setting is
