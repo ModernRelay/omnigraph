@@ -17,7 +17,7 @@ node Person {
 --- seed
 {"type":"Person","data":{"name":"alice","age":30}}
 
---- concurrent
+--- concurrent scripted
 w1: query add_bob() { replace Person { name: "bob", age: 31 } }
 r1: query all() { match { $p: Person } return { $p.name } }
 r2: query all() { match { $p: Person } return { $p.name } }

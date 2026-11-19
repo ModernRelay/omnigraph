@@ -475,6 +475,70 @@ impl Generated {
         self.tables.iter().map(|table| table.commits).sum()
     }
 
+    /// The shape a dealt recipe (a `load generate:` session statement) has:
+    /// one node table with a `kind: key` column and no `blob` column, since
+    /// the readback after the block matches the row as a node by that key
+    /// and projects every column through GQ; its row count and that column.
+    pub(crate) fn dealt_shape(&self) -> Result<(u64, String), String> {
+        let [table] = self.tables.as_slice() else {
+            return Err(format!(
+                "a dealt recipe has one table, got {}",
+                self.tables.len()
+            ));
+        };
+        if !matches!(table.kind, RowKind::Node) {
+            return Err(format!(
+                "a dealt recipe's table is a node table; `{}` is an edge table, which the readback after the block cannot match by key",
+                table.name
+            ));
+        }
+        if let Some((name, _)) = table
+            .columns
+            .iter()
+            .find(|(_, column)| matches!(column, Column::Blob { .. }))
+        {
+            return Err(format!(
+                "a dealt recipe's column `{name}` is a blob, which the readback after the block cannot project through GQ"
+            ));
+        }
+        let key = table
+            .columns
+            .iter()
+            .find(|(_, column)| matches!(column, Column::Key { .. }))
+            .map(|(name, _)| name.clone())
+            .ok_or("a dealt recipe's table needs a `kind: key` column, which the readback after the block reads")?;
+        Ok((table.rows, key))
+    }
+
+    /// Row `index` of a dealt recipe's table as one JSONL line.
+    pub(crate) fn dealt_row(&self, index: u64) -> Result<String, String> {
+        let (rows, _) = self.dealt_shape()?;
+        if index >= rows {
+            return Err(format!(
+                "the dealt stream has {rows} rows and row {index} was asked for"
+            ));
+        }
+        let table = &self.tables[0];
+        self.batch(table, &table.distributions()?, index, index + 1)
+    }
+
+    /// Row `index`'s table, key column and key value, for the readback after
+    /// the block.
+    pub(crate) fn dealt_key(&self, index: u64) -> Result<(String, String, Value), String> {
+        let (_, key) = self.dealt_shape()?;
+        let table = &self.tables[0];
+        let column = &table.columns[&key];
+        let ordinal = table.ordinal(index)?;
+        let value = column.value(
+            self.seed,
+            &table.name,
+            &format!("data.{key}"),
+            ordinal,
+            None,
+        )?;
+        Ok((table.name.clone(), key, value))
+    }
+
     pub(crate) fn single_batch(&self) -> Result<Option<String>, String> {
         if self.call_count() != 1 {
             return Ok(None);

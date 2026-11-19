@@ -1,0 +1,69 @@
+# issue: none
+# red_on: fd4d61f6; the parser reads the session line `writer x4 on w<worker marker>` as no session line and refuses the block for lacking an `order:` line, so no step runs on either host.
+# notes: A session line with a worker count `x<n>` is n sessions `<label>.0` to `<label>.<n-1>` sharing one statement, and the worker marker in `on <branch>` is the worker's index. Four writers insert one row each on their own declared branch; `main` keeps its two rows, every branch holds the seed, its fixture row and the one its writer added, and the `--- expect` names the label once for all four.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Chunk { slug: String @key n: I64 }
+
+--- seed generate: v1 seed: 0
+tables:
+  - kind: node
+    name: Chunk
+    rows: 2
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: base-, width: 3}
+      n: {kind: ordinal, start: 0, step: 1}
+
+--- branches generate: v1 seed: 0 count: 4 prefix: w from: main
+tables:
+  - kind: node
+    name: Chunk
+    rows: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: ${branch}-, width: 3}
+      n: {kind: ordinal, start: 10, step: 1}
+
+--- concurrent
+writer x4 on w${worker}: query put() { replace Chunk { slug: "cw", n: 100 } }
+--- expect
+writer: ok
+
+--- query
+query on_main() { match { $c: Chunk } return { count($c) as n } }
+--- expect unordered
+{"n": 2}
+--- expect shape
+n: I64
+
+--- query branch: w0
+query on_w0() { match { $c: Chunk } return { $c.slug, $c.n } }
+--- expect unordered
+{"c.slug": "base-000", "c.n": 0}
+{"c.slug": "base-001", "c.n": 1}
+{"c.slug": "w0-000", "c.n": 10}
+{"c.slug": "cw", "c.n": 100}
+--- expect shape
+c.slug: String
+c.n: I64
+
+--- query branch: w3
+query on_w3() { match { $c: Chunk } return { $c.slug, $c.n } }
+--- expect unordered
+{"c.slug": "base-000", "c.n": 0}
+{"c.slug": "base-001", "c.n": 1}
+{"c.slug": "w3-000", "c.n": 10}
+{"c.slug": "cw", "c.n": 100}
+--- expect shape
+c.slug: String
+c.n: I64

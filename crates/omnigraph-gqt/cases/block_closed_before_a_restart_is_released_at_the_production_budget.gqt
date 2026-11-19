@@ -60,7 +60,7 @@ reset history_release_bytes;
 
 --- expect ok
 
---- concurrent
+--- concurrent scripted
 w1 on b: query releasing_publish_at_production_budget() { replace Person { name: "carol", age: 1 } }
 r1 on b: query all() { match { $p: Person } return { $p.name } }
 order: w1 park put __history/blocks/, r1 start, r1, w1 put __history/blocks/, w1

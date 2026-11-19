@@ -1,0 +1,34 @@
+# issue: none
+# red_on: fd4d61f6; the parser refuses the block ("a concurrent block needs an `order:` line; sessions with no named interleaving belong to the DST fleet"), so no step runs on either host.
+# notes: A `--- concurrent` block is a free-running block (a block with an `order:` script is `--- concurrent scripted`): the plain host runs the case once per session order, the sessions one after another in that order, and the DST runner runs each session once with the seed's interleaving. Two disjoint inserts on `main` land whoever goes first and the read after the block sees both.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Chunk { slug: String @key }
+
+--- seed
+{"type":"Chunk","data":{"slug":"seed"}}
+
+--- concurrent
+w1: query add_a() { replace Chunk { slug: "a" } }
+w2: query add_b() { replace Chunk { slug: "b" } }
+--- expect
+w1: ok
+w2: ok
+
+--- query
+query all_chunks() { match { $c: Chunk } return { $c.slug } }
+--- expect unordered
+{"c.slug":"seed"}
+{"c.slug":"a"}
+{"c.slug":"b"}
+--- expect shape
+c.slug: String

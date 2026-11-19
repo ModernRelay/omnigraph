@@ -23,7 +23,7 @@ node Person {
 branch create feature
 --- expect ok
 
---- concurrent
+--- concurrent scripted
 w1: query add_dave() { replace Person { name: "dave", age: 4 } }
 w2 on feature: query add_carol() { replace Person { name: "carol", age: 3 } }
 order: w1 head __manifest/_versions/, w1 head __manifest/_versions/, w1 park head __manifest/_versions/, w2 start, w2, w1 head __manifest/_versions/, w1
@@ -51,7 +51,7 @@ query feature_has_its_own_row() { match { $p: Person } return { $p.name, $p.age 
 p.name: String
 p.age: I32?
 
---- concurrent
+--- concurrent scripted
 w1: query age_alice() { match { $x: Person } where $x.name = "alice"  update $x set { age: 9 } }
 w2 on feature: query add_erin() { replace Person { name: "erin", age: 5 } }
 order: w1 head __manifest/_versions/, w1 head __manifest/_versions/, w1 park head __manifest/_versions/, w2 start, w2, w1 head __manifest/_versions/, w1

@@ -1,0 +1,66 @@
+# issue: none
+# red_on: fd4d61f6; the parser refuses the blocks for lacking an `order:` line, so no step runs on either host.
+# notes: A case may hold several free-running blocks, and the plain host runs it once per session order of the largest one, six seeded orders for a block above three sessions; a smaller block cycles its own orders through those passes instead of being asked for an order it does not have. The first block has two sessions and two orders; the second has three labels of eight workers, twenty-four sessions, the most a block admits, so its pass count is the cap and never a factorial of its size. Every pass lands the same rows: the seed, the first block's one insert and the twenty-four worker inserts.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Chunk { slug: String @key n: I64 }
+
+--- seed
+{"type":"Chunk","data":{"slug":"seed","n":0}}
+
+--- concurrent
+w1: query add_first() { replace Chunk { slug: "first", n: 1 } }
+r1: query seed_row() { match { $c: Chunk } where $c.slug = "seed" return { $c.n } }
+--- expect
+w1: ok
+r1: ok
+
+--- concurrent
+a x8: query add_a() { replace Chunk { slug: "a-${worker}", n: 10 } }
+b x8: query add_b() { replace Chunk { slug: "b-${worker}", n: 20 } }
+c x8: query add_c() { replace Chunk { slug: "c-${worker}", n: 30 } }
+--- expect
+a: ok
+b: ok
+c: ok
+
+--- query
+query rows_by_group() { match { $c: Chunk } return { $c.n } }
+--- expect unordered
+{"c.n":0}
+{"c.n":1}
+{"c.n":10}
+{"c.n":10}
+{"c.n":10}
+{"c.n":10}
+{"c.n":10}
+{"c.n":10}
+{"c.n":10}
+{"c.n":10}
+{"c.n":20}
+{"c.n":20}
+{"c.n":20}
+{"c.n":20}
+{"c.n":20}
+{"c.n":20}
+{"c.n":20}
+{"c.n":20}
+{"c.n":30}
+{"c.n":30}
+{"c.n":30}
+{"c.n":30}
+{"c.n":30}
+{"c.n":30}
+{"c.n":30}
+{"c.n":30}
+--- expect shape
+c.n: I64

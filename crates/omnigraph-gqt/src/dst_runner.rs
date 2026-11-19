@@ -651,6 +651,13 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// The wall-time budget of one run of `case`: its `timeout_ms` is the budget
+/// of one pass, and the plain host runs a free-running block once per
+/// session order, so dispatch and replay both grant the pass count's worth.
+fn case_budget(case: &omnigraph_gqt_core::Case) -> Duration {
+    Duration::from_millis(case.runner.timeout_ms) * case.plain_passes() as u32
+}
+
 fn executable_digest(path: &Path) -> Result<String, String> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| format!("environment_changed: open executable: {e}"))?;
@@ -1743,7 +1750,7 @@ fn run_invocation(
     }
     let build = executable_digest(executable)?;
     summary.executable_digest = Some(build.clone());
-    let budget = Duration::from_millis(case.runner.timeout_ms);
+    let budget = case_budget(&case);
     let remaining = || {
         budget
             .checked_sub(started.elapsed())
@@ -2490,8 +2497,8 @@ fn replay_attempts(
             return Err("environment_changed: prior input digest differs".into());
         }
 
-        budget = Some(Duration::from_millis(case.runner.timeout_ms));
-        let remaining = Duration::from_millis(case.runner.timeout_ms)
+        budget = Some(case_budget(&case));
+        let remaining = case_budget(&case)
             .checked_sub(started.elapsed())
             .filter(|left| !left.is_zero())
             .ok_or("timeout: replay exceeded wall-time budget")?;
@@ -2783,6 +2790,7 @@ mod action_tests {
                         ordinal as usize,
                         &[serde_json::json!({"label": "w2", "outcome": "ok"}),
                           serde_json::json!({"label": "r1", "outcome": "ok"})],
+                        &[Some(0), Some(0)],
                         &crate::concurrent::Outcome {
                             stuck_at: None,
                             failure: None,
@@ -2825,7 +2833,7 @@ mod action_tests {
             block: &crate::concurrent::Outcome,
         ) -> super::WorkerReport {
             super::capture("same-input".into(), async {
-                crate::record_concurrent_outcome(3, sessions, block);
+                crate::record_concurrent_outcome(3, sessions, &[Some(0), Some(0)], block);
                 Ok(())
             })
             .await

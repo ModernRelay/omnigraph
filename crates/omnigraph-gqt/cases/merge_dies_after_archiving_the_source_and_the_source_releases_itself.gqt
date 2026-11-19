@@ -77,7 +77,7 @@ branch merge src into main
 
 --- expect outcome: merged
 
---- concurrent
+--- concurrent scripted
 w1 on src: query source_releases_its_block() { replace Person { name: "carol", age: 1 } }
 r1 on src: query all() { match { $p: Person } return { $p.name } }
 order: w1 park put __history/blocks/, r1 start, r1, w1 put __history/blocks/, w1

@@ -1,0 +1,43 @@
+# issue: none
+# red_on: fd4d61f6; the parser refuses the block for lacking an `order:` line, so no step runs on either host.
+# notes: The `--- expect` after a free-running block names a session's failure the way a scripted block's does: `<label>: error: <needle>` holds when the session's statement fails with a message containing the needle, whichever order the sessions ran in. A writer on a branch that does not exist fails with the branch's name in every order, and so does a dealt load on one, whose row is then not read back after the block; the writer on main lands, and the rows after the block are the seed plus its one insert.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Chunk { slug: String @key n: I64 }
+
+--- seed
+{"type":"Chunk","data":{"slug":"seed","n":0}}
+
+--- concurrent
+w1: query add_a() { replace Chunk { slug: "a", n: 1 } }
+w2 on nosuch: query add_b() { replace Chunk { slug: "b", n: 2 } }
+w3 on nosuch: load generate: v1 seed: 42 mode: insert
+  tables:
+    - kind: node
+      name: Chunk
+      rows: 1
+      commits: 1
+      columns:
+        slug: {kind: key, prefix: cw-, width: 3}
+        n: {kind: ordinal, start: 100, step: 1}
+--- expect
+w1: ok
+w2: error: nosuch
+w3: error: nosuch
+
+--- query
+query all_chunks() { match { $c: Chunk } return { $c.slug } }
+--- expect unordered
+{"c.slug":"a"}
+{"c.slug":"seed"}
+--- expect shape
+c.slug: String

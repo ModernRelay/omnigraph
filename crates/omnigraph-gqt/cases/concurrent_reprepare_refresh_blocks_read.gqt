@@ -15,7 +15,7 @@ node Person {
 --- mutate
 branch create feature
 --- expect ok
---- concurrent
+--- concurrent scripted
 w1: query add_bob() { replace Person { name: "bob" } }
 w2: query add_carol() { replace Person { name: "carol" } }
 w3 on feature: query add_dave() { replace Person { name: "dave" } }

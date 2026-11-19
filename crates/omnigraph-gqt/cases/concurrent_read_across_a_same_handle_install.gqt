@@ -16,7 +16,7 @@ node Person {
 --- seed
 {"type":"Person","data":{"name":"alice"}}
 
---- concurrent
+--- concurrent scripted
 w1: query add_bob() { replace Person { name: "bob" } }
 r1: query all() { match { $p: Person } return { $p.name } }
 order: w1 park put __manifest/_versions/, r1 start, r1 park head __manifest/, w1 put __manifest/_versions/, w1, r1 head __manifest/, r1

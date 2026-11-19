@@ -1,0 +1,27 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Chunk { slug: String @key n: I64 }
+
+--- seed
+{"type":"Chunk","data":{"slug":"seed","n":0}}
+
+--- concurrent
+writer x1: load generate: v1 seed: 42 mode: insert
+  tables:
+    - kind: node
+      name: Chunk
+      rows: 1
+      commits: 1
+      columns:
+        slug: {kind: key, prefix: cw-, width: 3}
+        n: {kind: ordinal, start: 100, step: 1}
+tamper: query drop_dealt() { match { $x: Chunk } where $x.slug = "cw-000" delete $x }
+--- expect
+writer: ok
+tamper: ok

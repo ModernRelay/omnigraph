@@ -1182,13 +1182,18 @@ multi-session interleaving is the `--- concurrent` block below.
 
 ### Concurrent block
 
-A `--- concurrent` section runs two to four labeled GQ statements at the
-same time on the case's one handle, under the DST runner only, in an order
-the block names. It is one step of the case, with one ordinal, and the
-steps before and after it stay sequential.
+A concurrent section runs two to four labeled GQ statements at the same
+time on the case's one handle, and its header says which block it is:
+`--- concurrent scripted` is a scripted block, its last line the `order:`
+script, under the DST runner only, in the order the script names;
+`--- concurrent` is a free-running block (below), which takes no `order:`
+line and every host runs. A scripted block without its script and a
+free-running block with one are refused, never read as the other block. It
+is one step of the case, with one ordinal, and the steps before and after
+it stay sequential.
 
 ```text
---- concurrent
+--- concurrent scripted
 w1: query add_bob() { insert Person { name: "bob" } }
 r1: query all() { match { $p: Person } return { $p.name } }
 order: w1 park put __manifest/_versions/, r1 start, r1, w1 put __manifest/_versions/
@@ -1197,18 +1202,54 @@ w1: ok
 r1: ok
 ```
 
-A session line is `<label>[ on <branch>]: <statement>` at column 0, its
-statement continuing on the lines that follow up to the next session line
-or `order:` (a column-0 line shaped `word: …` opens a session); the label
-is `[a-z][a-z0-9]*`, unique in the block and not one of the reserved
+A session line is `<label>[ x<n>][ on <branch>]: <statement>` at column 0,
+its statement continuing on the lines that follow up to the next session
+line or `order:` (a column-0 line shaped `word: …` opens a session); the
+label is `[a-z][a-z0-9]*`, unique in the block and not one of the reserved
 `setup`, `runner`, `step`, `order`; the branch is `main` when unspelled,
-and the statement is one query or mutation declaration with no parameters
-(`show`, branch, settings and `explain` statements are refused). Every
-session is a `Session` over the case handle, so the sessions share the
-handle's in-process locks the way a server's requests do, and a `#
+and the statement is one query or mutation declaration with no parameters,
+a `branch merge <source> into <target>`, or a `load generate:` recipe
+(`show`, settings, `explain` and the other branch statements are refused).
+Every session is a `Session` over the case handle, so the sessions share
+the handle's in-process locks the way a server's requests do, and a `#
 traversal:` pin applies to every session.
 
-`order:` is the block's last line: comma-separated entries, each one of
+A worker count `x<n>` declares `n` sessions under one label, `<label>.0`
+to `<label>.<n-1>`, each with the same statement; on the session line,
+`${worker}` is the worker's index, in the `on <branch>` operand or in the
+statement, and nothing else is bound there; inside a dealt recipe (below)
+it is refused, since the recipe is one text shared by the label's workers.
+The parser takes any count; a host with a scripted clock (the plain host,
+the DST runner) admits at most 8 workers under one label, a measuring host
+sets its own bound. A block declares at most four labels and at least two
+sessions in all (two labels, or one label with `x2` or more). A counted
+label belongs to a free-running block: a script names sessions one by one.
+
+A `load generate: v1 seed: <u64> mode: <append|merge>` statement, its
+recipe on the indented lines that follow (one node table with a `kind: key`
+column and no `blob` column, `rows:` at least the worker count), is a dealt
+stream: the host hands worker `w` on its run `s` the row at index `w + n·s`,
+so keys are disjoint by construction and no key scheme is written. After
+the block every dealt row is read back by its key on the case session, as a
+node match through GQ (the reason for the table and column bounds), and
+compared column by column with the row the recipe generated; a missing or
+changed row fails the block. The check needs no line in the file. A dealt
+session whose expect is an `error:` is not read back: it loaded nothing the
+file claims.
+
+A session's authority conflicts are the times its write was prepared again
+after `ReadSetChanged`: inside the engine (the pre-effect reprepares behind
+an acknowledged write, read off the engine's probe) and by the host, which
+runs a statement the engine still answers with `ReadSetChanged` again, up
+to 32 times. `<label>: ok` means every worker of the label ended ok after
+its retries. The count has one meaning on every host and is a measurement,
+never an oracle: under DST it differs between two replays of one seed (the
+hop through Lance's CPU pool is the one-tick window below), so it sits with
+the grants and wall times in the block's measurement detail, not in the
+replay-compared evidence row, and no expect line names it; a measuring host
+reports it beside its throughput.
+
+`order:` is a scripted block's last line: comma-separated entries, each one of
 
 - `<label> start`: the session's statement begins; the runner holds the
   session before it, so a session can be made to begin inside another's
@@ -1240,9 +1281,29 @@ manifest `put` is safe to park at; a read's `__manifest` listing is under
 the coordinator read lock and is not). The `--- expect` after the block is
 bare and its body names each session once, `<label>: ok` or
 `<label>: error: <needle>`, compared as a mutate or query step's `ok` and
-`error:` are; rows are not compared inside a block.
+`error:` are, and names a counted label once for all its workers; rows are
+not compared inside a block.
 
-The paused clock is the block's one subtlety: the runtime advances it to
+**Free-running block.** A `--- concurrent` block names no interleaving,
+and each host gives it the meaning it can: the plain host
+runs the case once per session order of the block, every order when the
+block has at most three sessions and six seeded orders above that, the
+declaration order first, each pass on a fresh store, the sessions one after
+another in that order, so the block's expects and every step after it must
+hold whoever goes first and the block is a logic test of order-invariance
+(the case's `timeout_ms` is the budget of one pass, so the corpus run and
+the DST replay multiply it by the pass count; a case with several
+free-running blocks runs the largest block's pass count, a smaller block
+cycling its own orders through the passes); the DST runner runs every session once at
+the same time, the seed deciding
+the interleaving, so the block is the interleaving search a scripted block
+never is, recorded in the same `concurrent_block` evidence row; a measuring
+host (`omnigraph-bench`, a later amendment) runs every session's statement
+repeatedly for its protocol's duration on a real clock. The file says who
+does what; the host says how many times and on which clock. A scripted
+block runs under the DST runner only, as before.
+
+The paused clock is a scripted block's one subtlety: the runtime advances it to
 the earliest pending timer whenever it is idle, and never while a task of
 its blocking pool runs, so while a session waits on the script the other
 sessions' modeled request costs elapse, a commit backoff fires at its
@@ -1275,11 +1336,17 @@ beside a write is a number a case can state. Once a block is starved its
 sessions drain, and the requests they make from then on are in phase
 `after_abort`, never in the session's own phases.
 
-The block names interleavings only. It does not choose them: a case whose
-sessions run by seed alone, with no `order:` line, is refused, because that
-is the DST fleet's job. Store requests are the only points a v1 entry can
-name; engine seams and in-process gates as entries, control statements as
-sessions, and sessions on separate handles are later amendments.
+A scripted block names interleavings; a free-running block searches them
+by seed, the DST fleet's job, which the first form of this section refused
+(2026-11-19 amendment: `--- concurrent` is the free-running block and the
+scripted block is spelled `--- concurrent scripted`, `x<n>`, `${worker}`,
+the dealt stream and its readback, `branch merge` as a session, the
+authority conflict count as a measurement, the plain host's pass per
+session order).
+Store requests
+are the only points a v1 entry can name; engine seams and in-process gates
+as entries, the other control statements as sessions, a measured block and
+its run settings, and sessions on separate handles are later amendments.
 
 ### Sequential server lifecycle steps
 

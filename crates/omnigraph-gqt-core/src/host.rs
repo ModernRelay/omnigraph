@@ -11,9 +11,30 @@ use omnigraph_compiler::ir::core::CoreRead;
 use omnigraph_compiler::{ParamMap, QueryResult};
 use serde_json::Value;
 
-use crate::concurrent::ConcurrentStep;
+use crate::concurrent::{ConcurrentStep, Pass, permutation};
 use crate::runner_config::SeamDirective;
-use crate::{Case, ReferenceRefusal, Step, StepFail};
+use crate::{Case, Item, ReferenceRefusal, Step, StepFail};
+
+/// The most workers one label of a block declares on a host with a scripted
+/// clock (the plain host, the DST runner); a measuring host sets its own.
+pub const SCRIPTED_HOST_WORKERS: usize = 8;
+
+/// Refuses a case whose block declares more workers under one label than a
+/// scripted host runs.
+pub fn admit_workers(case: &Case) -> Result<(), String> {
+    for item in &case.items {
+        if let Item::Step(Step::Concurrent(block)) = item
+            && block.max_workers() > SCRIPTED_HOST_WORKERS
+        {
+            return Err(format!(
+                "unsupported_environment: a scripted host runs at most {SCRIPTED_HOST_WORKERS} workers under one label; step {} declares {}",
+                block.ordinal,
+                block.max_workers()
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Runner-owned observation and execution facilities around ordinary GQT steps.
 pub trait ExecutionHost: Sync {
@@ -22,10 +43,11 @@ pub trait ExecutionHost: Sync {
     fn admit_case(&self, case: &Case) -> Result<(), String> {
         if case.needs_dst() {
             return Err(
-                "unsupported_environment: this executor cannot run seams or concurrent blocks"
+                "unsupported_environment: this executor cannot run seams or scripted concurrent blocks"
                     .into(),
             );
         }
+        admit_workers(case)?;
         Ok(())
     }
 
@@ -102,15 +124,26 @@ pub trait ExecutionHost: Sync {
         .boxed()
     }
 
+    /// A free-running block runs its sessions once each, one after another in
+    /// declaration order, on the case session; a block with an `order:` line
+    /// needs the DST runner's gate and is refused here.
     fn concurrent_step<'a>(
         &'a self,
-        _session: &'a Session,
+        session: &'a Session,
         _case: &'a Case,
         step: &'a ConcurrentStep,
-    ) -> BoxFuture<'a, Result<(), StepFail>> {
+    ) -> BoxFuture<'a, Result<(), StepFail>>
+    where
+        Self: Sized,
+    {
+        if step.is_free_running() {
+            let order = permutation(step.sessions.len(), Pass(0));
+            return async move { crate::run_free_running_block(self, session, step, &order).await }
+                .boxed();
+        }
         futures::future::ready(Err(StepFail::new(
             format!("step {} (concurrent)", step.ordinal),
-            "unsupported_environment: concurrent blocks require the DST runner".into(),
+            "unsupported_environment: a concurrent block with an `order:` line requires the DST runner".into(),
         )))
         .boxed()
     }

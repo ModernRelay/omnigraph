@@ -1,0 +1,30 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+node Tag {
+    name: String @key
+}
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+--- concurrent
+w1 x2: load generate: v1 seed: 42 mode: insert
+  tables:
+    - kind: edge
+      name: Knows
+      rows: 2
+      commits: 1
+      id: {kind: key, prefix: e, width: 2}
+      from: {kind: endpoint, prefix: n, width: 2, population: 2, distribution: {kind: ordinal}}
+      to: {kind: endpoint, prefix: n, width: 2, population: 2, distribution: {kind: ordinal}}
+      columns:
+        weight: {kind: ordinal, start: 0, step: 1}
+--- expect
+w1: ok

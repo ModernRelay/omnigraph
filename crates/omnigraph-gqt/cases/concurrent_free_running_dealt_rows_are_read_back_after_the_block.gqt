@@ -1,0 +1,45 @@
+# issue: none
+# red_on: fd4d61f6; the parser refuses the block for lacking an `order:` line, and a `load generate:` statement is no session statement there, so no step runs on either host.
+# notes: A session statement may be a `load generate:` recipe: the host deals its rows, worker w on its run s loading row w + workers * s, so keys are disjoint by construction and no key scheme is written. After the block every dealt row is read back by its key and compared column by column with the row the recipe generated, with no line in the file. Four writers deal four rows beside a reader; the count after the block is the seed plus four.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Chunk { slug: String @key n: I64 }
+
+--- seed
+{"type":"Chunk","data":{"slug":"seed","n":0}}
+
+--- concurrent
+writer x4: load generate: v1 seed: 42 mode: insert
+  tables:
+    - kind: node
+      name: Chunk
+      rows: 4
+      commits: 1
+      columns:
+        slug: {kind: key, prefix: cw-, width: 3}
+        n: {kind: ordinal, start: 100, step: 1}
+reader: query seed_row() { match { $c: Chunk } where $c.slug = "seed" return { $c.n } }
+--- expect
+writer: ok
+reader: ok
+
+--- query
+query all_chunks() { match { $c: Chunk } return { $c.slug, $c.n } }
+--- expect unordered
+{"c.slug":"seed","c.n":0}
+{"c.slug":"cw-000","c.n":100}
+{"c.slug":"cw-001","c.n":101}
+{"c.slug":"cw-002","c.n":102}
+{"c.slug":"cw-003","c.n":103}
+--- expect shape
+c.slug: String
+c.n: I64

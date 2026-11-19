@@ -53,7 +53,7 @@ query bump_alice($n: I32) {
 --- expect affected: nodes=1 edges=0
 --- endloop
 
---- concurrent
+--- concurrent scripted
 w1 on b: query releasing_publish() { replace Person { name: "carol", age: 1 } }
 w2 on b: query queued_publish() { replace Person { name: "dave", age: 2 } }
 order: w1 park put __history/blocks/, w2 start, w1 put __history/blocks/, w1, w2

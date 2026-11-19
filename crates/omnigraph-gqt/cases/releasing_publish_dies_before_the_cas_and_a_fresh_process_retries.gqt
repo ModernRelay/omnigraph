@@ -77,7 +77,7 @@ query rows_from_the_buffer_before_the_retry() { match { $p: Person } return { $p
 p.name: String
 p.age: I32
 
---- concurrent
+--- concurrent scripted
 w1 on b: query retried_releasing_publish() { replace Person { name: "carol", age: 1 } }
 r1 on b: query all() { match { $p: Person } return { $p.name } }
 order: w1 park put __history/blocks/, r1 start, r1, w1 put __history/blocks/, w1
