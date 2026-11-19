@@ -145,11 +145,13 @@ whatever has been built to speed it up. *Kept by:* invariants 7 and 12.
 | **merge** | two heads and their ancestor | one commit on the target, or none | sides disagree on an entity `D5`; constraint broken | what both sides changed |
 | **schema** | head of `main` at publish | one commit, or none | stored data breaks a new rule; another branch is live `D6` | types changed |
 | **branch** | a commit to start from | a name, never data `D1` | name taken | not the graph's size |
-| **maintain** | all heads | physical state, never an answer `G3` | graph is held | what is out of shape |
+| **maintain** | all heads | physical state, never an answer `G3` | graph is held; the branch moved since it began | what is out of shape |
 | **forget** | all branches | removes commits | consent missing; graph is held | history removed |
 
-- **Head at start:** the branch head when the operation begins. A commit
-  published during the operation is not seen.
+- **Head at start:** the branch head when the read captures its snapshot,
+  after it is authorized and after any wait for a schema change (`D7`). A
+  commit published before that moment is seen; one published after it is
+  not.
 - **Head at publish:** the branch head when the change lands. If the head
   moved, the write is prepared again on the new head, or refused.
 - **Named head:** the caller says "only if the head is still commit X".
@@ -169,12 +171,19 @@ write on its target and reads its source at the start.
 
 | | read | write | schema | branch | maintain | forget |
 |---|---|---|---|---|---|---|
-| **read** | free | free | read may wait in one process `D7` | read may wait in one process `D7` | free | free `G5` |
-| **write** | | same branch: queue; other branch: free `G2` | write waits `D8` | `?` | write waits `D8` | write waits `D8` |
-| **schema** | | | queue | one: apply is refused while another branch is live `D6` | `?` | queue |
-| **branch** | | | | same name: one; other names: free `G2` | `?` | `?` |
-| **maintain** | | | | | `?` | `?` |
-| **forget** | | | | | | `?` |
+| **read** | free | free | read waits for the apply `D7` | read waits for a create, not a delete `D7` | free; waits for `schema upgrade-system-columns` `D7` | free `G5` |
+| **write** | | same branch: queue; other branch: free `G2` | queue; a write that selects rows prepared on the old schema is refused `D8` | create: queue; delete of the same branch: queue, and a write landing after it is refused; delete of another branch: free | `optimize`: a write on `main` waits for the run, then lands unchanged; other branches free. `index build`: free, and the build is refused if a write lands first `D8` | write waits; `cleanup` is refused if `main` moved before it began `D8` |
+| **schema** | | | queue | one: apply is refused while another branch is live `D6`; create: queue | queue; the maintenance may be refused | queue |
+| **branch** | | | | same name: one; creates queue with each other and with deletes; deletes of different names: free | create: queue; delete: free with `optimize`, queue with `cleanup` and with `index build` on that branch | queue |
+| **maintain** | | | | | queue; a second `optimize` or `index build` started without the server is then refused | queue; `cleanup` is refused if `optimize` published first |
+| **forget** | | | | | | `cleanup`: queue; graph removal: one |
+
+The table describes one process. Across two processes, a `write`, `merge`,
+`schema` or `maintain` that loses the race for a head is prepared again or
+refused, and every pair involving `branch` or `forget` is unsupported `G2`.
+An export or a `changes baseline` is the exception among reads: it and a
+`schema`, `branch` create or delete, `optimize` or `cleanup` refuse each
+other without waiting `D7`.
 
 ## Details
 
@@ -218,7 +227,8 @@ Full rules: [search](../user/search/index.md),
    one entity and inserts another.
 3. `write:3` A write with a named head applies only if that commit is still
    the head. Without one, a write lands on whatever the head is when it
-   publishes. A proposal publishes only while the head is the commit it was
+   publishes. `blob put` and `blob clear` can require the cell's ETag
+   instead, and `commit publish` always requires the commit it was built on. A proposal publishes only while the head is the commit it was
    built on.
 
 Full rules: [writes](writes.md).
@@ -235,7 +245,8 @@ Full rules: [writes](writes.md).
    `orphan_edge`, `unique_violation`, `cardinality_violation`,
    `value_constraint_violation`.
 4. `merge:4` Conflicts, orphan edges and uniqueness violations name the
-   entity. Cardinality and value violations name the kind only.
+   entity. Cardinality and value violations name the type; a cardinality
+   message names the source node in its text, with no entity field.
 5. `merge:5` Nothing is resolved automatically, and there is no "ours" or
    "theirs" rule. A conflict is resolved by writing to a branch and merging
    again.
@@ -258,13 +269,17 @@ Full rules: [merge](../user/branching/merge.md).
 1. `branch:1` A branch starts at a head or at a published commit of a live
    branch. Creating it copies no data.
 2. `branch:2` A proposal becomes unreadable when it is dropped or when it
-   expires. It expires when another commit lands on its target.
+   expires. It expires when its target's head moves past the commit it was
+   built on, or when its target branch is deleted or created again.
 
 ### maintain
 
 1. `maintain:1` Maintenance runs only when asked. Nothing runs it in the
    background.
-2. `maintain:2` On a served cluster, only `optimize` runs beside the server.
+2. `maintain:2` On a served cluster, `optimize` runs only through the
+   server, as a recorded operation the operator enables. `index build`,
+   `index rebuild` and `cleanup` are refused while the server holds the
+   cluster, and `upgrade` refuses any graph inside a cluster.
 
 ### forget
 
@@ -288,7 +303,7 @@ RFC that set it.
 | `G2` | `write+write`, `branch+branch` | One writer process per cluster is supported. Branch create and delete, schema apply, dropping a proposal and `cleanup` are safe from one process only | [Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md), accepted, in progress |
 | `G3` | `E7`, `maintain.changes` | Building a full-text index can change `bm25` scores, their order and a limited result | Invariant 7 |
 | `G4` | Scope | Azure writes are a preview that needs an external admission lease | [RFC 0029](../rfcs/0029-azure-blob-storage.md), accepted, in progress |
-| `G5` | `read+forget` | Reported, not traced end to end: `cleanup` can remove a commit that a running read is using | Invariant 3 |
+| `G5` | `read+forget` | Nothing coordinates `cleanup` with a running read, in one process or across two. A read pinned to a commit the keep rule drops is refused as reclaimed when it opens a table after the removal, and fails with an untyped storage error when a file under an open table is removed. No test covers it | Invariant 3 |
 
 ## Decisions
 
@@ -297,21 +312,21 @@ Until it is decided, the statement is today's behavior.
 
 | Decision | Where | Today | Open question |
 |---|---|---|---|
-| `D1` | `E7`, `branch.changes` | Deleting a branch makes the commits only it held unreadable at once | Keep them readable by id until `cleanup`, or make delete a `forget`? |
+| `D1` | `E7`, `branch.changes` | Deleting a branch makes its commits that no live branch reaches through parents or merged parents unreadable by id at once. `commit show` can still return such a commit's record | Keep them readable by id until `cleanup`, or make delete a `forget`? |
 | `D2` | `write.changes` | A write that changes no value still publishes a commit, and so does a load with no rows | Publish nothing? |
 | `D3` | `write.sees` | Only a `.gq` mutation can require a named head | Every write? |
 | `D4` | `write.sees` | A named head is refused by any commit in between, related or not | A condition as narrow as what the caller read? |
 | `D5` | `merge.refuses` | Two agents that changed different properties of one entity conflict | Merge by property? |
 | `D6` | `schema.refuses`, `schema+branch` | Schema apply runs on `main` only, with no other branch live | A schema change made on a branch and merged? |
-| `D7` | `read+schema`, `read+branch` | Inside one process a read can wait behind schema apply or branch create. While an export runs, branch create and delete, schema apply, `optimize` and `cleanup` are refused, and an export is refused while one of them runs | Reads never wait or refuse? |
-| `D8` | `write+schema`, `write+maintain`, `write+forget` | Writers wait while schema apply, `optimize` or `cleanup` runs | Writes continue? |
+| `D7` | `read+schema`, `read+branch` | Inside one process a read can wait behind schema apply or branch create. In one process an export or `changes baseline` and a branch create or delete, schema apply, `schema upgrade-system-columns`, `optimize` or `cleanup` refuse each other without waiting, and two exports refuse each other; nothing excludes them across processes | Reads never wait or refuse? |
+| `D8` | `write+schema`, `write+maintain`, `write+forget` | Writers wait while schema apply or `cleanup` runs, and writers on `main` wait while `optimize` runs, for a time a run started without the server does not bound | Writes continue? |
 | `D9` | `E6` | Reads are checked at the server only. Policy scope stops at the branch class | Check reads at every door? Scope by type and property? |
 | `D10` | `read:1` | Groups that tie on the sort keys come back in no stated order | One total order for every sorted read? |
 | `D11` | `forget:4` | `optimize` does not rewrite every file that holds a deleted value | An erasure path? |
 | `D12` | `E4`, Kinds | A stream that fails after its headers ends in a cut-off body. A merge that deletes its source can report success when the delete failed | Every failure typed? |
 | `D13` | Scope | One server serves a cluster. There is no read-only serving mode | Read-only servers? |
 | `D14` | Kinds | A load onto a new branch is two steps | One commit? |
-| `D15` | `E4` | `schema apply` reports a manifest version on success, not a commit id | Name the commit? |
+| `D15` | `E4` | The CLI's direct `schema apply` reports a manifest version and no commit id; the engine and a served deployment name the commit | Name the commit at every door? |
 | `D16` | `E5` | A served request can raise four resource settings up to the larger of the server's value and the built-in default, so a budget an operator set below the default can be raised back to it | The server's value as the ceiling? |
 
 ## Direction
