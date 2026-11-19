@@ -7,9 +7,9 @@
 # notes: `café` one. `matches(0) ⊆ matches(1) ⊆ matches(2)`. Repeated or reordered query terms
 # notes: change nothing; a null, empty or punctuation-only title never matches. `search`,
 # notes: `match_text` and `fuzzy` stay registry rows and mean `match_terms(f, terms(q, mode: any))`
-# notes: there, `fuzzy` with two edits when its budget is unwritten. A budget outside 0..=2, or a
-# notes: text with no searchable term, is a type error, from a literal at check and from a
-# notes: parameter when it is bound.
+# notes: there, `fuzzy` with two edits when its budget is unwritten. A budget outside 0..=2 is a type
+# notes: error, from a literal at check and from a parameter when it is bound. A literal text with no
+# notes: searchable character is a type error too; a bound text with no searchable term matches nothing.
 
 --- runner
 timeout_ms: 10000
@@ -280,4 +280,7 @@ query bound_text_with_no_searchable_term($q: String) {
 --- params
 {"q": "... ?"}
 
---- expect error: T20: the lexical query `... ?` has no searchable terms
+--- expect unordered
+
+--- expect shape
+d.slug: String

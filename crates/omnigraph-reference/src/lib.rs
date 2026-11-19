@@ -1346,7 +1346,8 @@ impl<'a> Interpreter<'a> {
 
     /// `match_terms(field, terms(q, mode, max_edits))`: every (`all`) or some
     /// (`any`) analyzed query term has a document term within the budget. A
-    /// null or token-empty document does not match: the predicate is false.
+    /// null or token-empty document does not match: the predicate is false,
+    /// and so it is for a query that analyzes to no term, under either mode.
     /// `q` is a non-null String (section 4, The lexical query): a parameter
     /// bound to null is refused.
     #[allow(clippy::too_many_arguments)]
@@ -1368,7 +1369,7 @@ impl<'a> Interpreter<'a> {
             Value::Str(f) => analysis.tokens(&f)?,
             _ => return Ok(Value::Bool(false)),
         };
-        if doc.is_empty() {
+        if doc.is_empty() || q.is_empty() {
             return Ok(Value::Bool(false));
         }
         let hit = |t: &String| doc.iter().any(|w| levenshtein(w, t) <= max_edits);
@@ -2260,11 +2261,14 @@ impl Bm25 {
                 total += idf * best;
             }
         }
-        let member = if self.mode_all {
-            matched == self.query.len()
-        } else {
-            matched > 0
-        };
+        // A query that analyzes to no term, one of only stop words, matches
+        // no document under either mode.
+        let member = !self.query.is_empty()
+            && if self.mode_all {
+                matched == self.query.len()
+            } else {
+                matched > 0
+            };
         Ok(member.then_some(total))
     }
 }
