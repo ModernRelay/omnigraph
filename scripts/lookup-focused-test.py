@@ -93,7 +93,7 @@ def resolve_mapping(path_str: str, repo_root: Path | None = None) -> TestMapping
             package="omnigraph-gqt",
             crate_dir="crates/omnigraph-gqt",
             category="gqt-logic-test",
-            recommended_command=f"cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch -- {case_name}",
+            recommended_command=f"cargo test -p omnigraph-gqt --locked --test gq_logic_tests -- {case_name}",
             notes=f"Single GQT test case execution for {case_name}",
         )
 
@@ -115,8 +115,8 @@ def resolve_mapping(path_str: str, repo_root: Path | None = None) -> TestMapping
             package="omnigraph-dst",
             crate_dir="crates/omnigraph-dst",
             category="dst-simulation",
-            recommended_command="cargo test -p omnigraph-dst --locked",
-            notes="Requires --cfg tokio_unstable (set by workspace .cargo/config.toml)",
+            recommended_command="(cd crates/omnigraph-dst && cargo test --locked)",
+            notes="Crate-local Cargo configuration supplies the pool environment; workspace configuration enables tokio_unstable",
         )
 
     # Find matching crate by longest directory prefix match
@@ -192,8 +192,8 @@ def resolve_mapping(path_str: str, repo_root: Path | None = None) -> TestMapping
                 package=package,
                 crate_dir=matching_prefix,
                 category="unit-and-write-integration",
-                recommended_command=f"cargo test -p {package} --test integration writes::",
-                notes="Write-path source file: fastest coverage via writes:: integration module",
+                recommended_command=f"cargo test -p {package} --test writes",
+                notes="Write-path source file: fastest coverage via the writes integration binary",
             )
         # Special case: engine traversal / planner
         if package == "omnigraph-engine" and ("traversal" in sub_path or "engine" in sub_path):
@@ -243,10 +243,10 @@ def self_test() -> None:
         ("crates/omnigraph/tests/integration/traversal_indexed.rs", "omnigraph-engine", "--test integration traversal_indexed::"),
         ("crates/omnigraph/tests/writes.rs", "omnigraph-engine", "--test writes"),
         ("crates/omnigraph/tests/failpoints.rs", "omnigraph-engine", "--features failpoints --test failpoints"),
-        ("crates/omnigraph/src/exec/staging.rs", "omnigraph-engine", "--test integration writes::"),
+        ("crates/omnigraph/src/exec/staging.rs", "omnigraph-engine", "--test writes"),
         ("crates/omnigraph-compiler/src/lexer.rs", "omnigraph-compiler", "--lib lexer::"),
-        ("crates/omnigraph-gqt/cases/match_simple.gqt", "omnigraph-gqt", "runner_dispatch -- match_simple"),
-        ("crates/omnigraph-dst/src/harness.rs", "omnigraph-dst", "cargo test -p omnigraph-dst --locked"),
+        ("crates/omnigraph-gqt/cases/match_simple.gqt", "omnigraph-gqt", "gq_logic_tests -- match_simple"),
+        ("crates/omnigraph-dst/src/harness.rs", "omnigraph-dst", "(cd crates/omnigraph-dst && cargo test --locked)"),
         ("docs/dev/invariants.md", "docs", "scripts/check-docs.py"),
         ("skills/omnigraph/SKILL.md", "omnigraph-skill", "cli_schema_config::"),
     ]
