@@ -1248,7 +1248,7 @@ mod endpoint_probe_tests {
             db.load(
                 "main",
                 r#"{"edge":"Link","from":"keep","to":"keep"}"#,
-                LoadMode::Append,
+                LoadMode::Insert,
             )
             .await
             .unwrap();

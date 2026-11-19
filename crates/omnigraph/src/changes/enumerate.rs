@@ -777,7 +777,7 @@ mod tests {
         db.load(
             "feature",
             r#"{"type":"Person","data":{"name":"b"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();

@@ -168,8 +168,8 @@ fn mapped_columns(catalog: &Catalog, stmt: &LoadStmt) -> usize {
 fn checks(catalog: &Catalog, target: &LoadTarget, mode: LoadStmtMode) -> Vec<LoadCheck> {
     let delta = match mode {
         LoadStmtMode::Overwrite => DeltaClass::Replace,
-        LoadStmtMode::Append => DeltaClass::Insert,
-        LoadStmtMode::Merge => DeltaClass::Upsert,
+        LoadStmtMode::Insert => DeltaClass::Insert,
+        LoadStmtMode::Upsert | LoadStmtMode::Replace => DeltaClass::Upsert,
     };
     checks_for(catalog, target, delta, false)
 }

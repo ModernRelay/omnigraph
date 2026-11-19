@@ -2597,7 +2597,7 @@ async fn run_json_load(
 ) -> std::result::Result<IngestOutput, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let from = request.from;
-    let mode = request.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
+    let mode = request.mode.unwrap_or(omnigraph::loader::LoadMode::Replace);
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
@@ -2754,7 +2754,7 @@ pub(crate) async fn server_load_ndjson(
     let actor = actor.as_ref().map(|Extension(actor)| actor);
     let branch = query.branch.unwrap_or_else(|| "main".to_string());
     let from = query.from;
-    let mode = query.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
+    let mode = query.mode.unwrap_or(omnigraph::loader::LoadMode::Replace);
 
     authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
 

@@ -76,21 +76,23 @@ impl LoadTarget {
     }
 }
 
-/// `mode overwrite | append | merge`, the load modes `omnigraph load` takes.
+/// `mode insert | upsert | replace | overwrite`, the load modes `omnigraph load` takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadStmtMode {
     Overwrite,
-    Append,
-    Merge,
+    Insert,
+    Upsert,
+    Replace,
 }
 
 impl LoadStmtMode {
     pub fn as_str(self) -> &'static str {
         match self {
             LoadStmtMode::Overwrite => "overwrite",
-            LoadStmtMode::Append => "append",
-            LoadStmtMode::Merge => "merge",
+            LoadStmtMode::Insert => "insert",
+            LoadStmtMode::Upsert => "upsert",
+            LoadStmtMode::Replace => "replace",
         }
     }
 }

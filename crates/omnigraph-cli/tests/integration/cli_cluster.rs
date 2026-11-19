@@ -1793,7 +1793,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                 } else {
                     serde_json::json!({
                         "branch":"main", "base_branch":null, "branch_created":false,
-                        "mode":"append", "nodes":[{"name":"Person", "entities_loaded":1}],
+                        "mode":"insert", "nodes":[{"name":"Person", "entities_loaded":1}],
                         "edges":[], "total_entities":1, "actor_id":"legacy-actor", "commit":null,
                         "embedding_generation":null
                     })
@@ -1822,7 +1822,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                     .timeout(std::time::Duration::from_secs(15));
                 if verb == "load" {
                     fs::write(temp.path().join("batch.jsonl"), "{}\n").unwrap();
-                    command.args(["--data", "batch.jsonl", "--mode", "append"]);
+                    command.args(["--data", "batch.jsonl", "--mode", "insert"]);
                 } else {
                     command.arg("q");
                 }
@@ -1843,7 +1843,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                 assert_eq!(
                     requests[0].path,
                     if verb == "load" {
-                        "/graphs/knowledge/load/ndjson?branch=main&mode=append"
+                        "/graphs/knowledge/load/ndjson?branch=main&mode=insert"
                     } else {
                         "/graphs/knowledge/queries/q"
                     }
@@ -3317,7 +3317,7 @@ async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
         vec!["cleanup", "--keep", "1", "--confirm", "--json"],
         vec!["branch", "create", "must-not-exist"],
         vec![
-            "load", "--data", data, "--mode", "append", "--base", base_graph,
+            "load", "--data", data, "--mode", "insert", "--base", base_graph,
         ],
     ] {
         let output = output_failure(cli().args(&args).arg("--target").arg(&graph).arg("--yes"));

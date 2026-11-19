@@ -691,7 +691,7 @@ pub async fn execute_with_layout(case: &Case, path: &Path, layout: Layout) -> Re
         .map(|_| ())
 }
 
-/// Writes again, by key (`LoadMode::Merge`), the seed lines of keyed node
+/// Writes again, by key (`LoadMode::Replace`), the seed lines of keyed node
 /// types that `pick(position, count)` selects: the same logical rows, moved
 /// to a new fragment with their old copies deleted. A generated seed is
 /// left as it is.
@@ -726,7 +726,7 @@ async fn rewrite_keyed_nodes(
         return Ok(());
     }
     session
-        .load_jsonl(&picked.join("\n"), omnigraph::loader::LoadMode::Merge)
+        .load_jsonl(&picked.join("\n"), omnigraph::loader::LoadMode::Replace)
         .await
         .map(|_| ())
         .map_err(|e| format!("layout rewrite failed: {e}"))

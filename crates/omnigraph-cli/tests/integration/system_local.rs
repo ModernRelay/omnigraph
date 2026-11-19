@@ -396,7 +396,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&ingest_data)
             .arg("--branch")
@@ -413,7 +413,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     assert_eq!(ingest_payload["branch_created"], true);
     assert!(ingest_payload["commit"]["graph_commit_id"].is_string());
     assert!(ingest_payload["commit"]["graph_manifest_version"].is_number());
-    assert_eq!(ingest_payload["mode"], "merge");
+    assert_eq!(ingest_payload["mode"], "replace");
     assert_eq!(ingest_payload["nodes"][0]["name"], "Person");
     assert_eq!(ingest_payload["nodes"][0]["entities_loaded"], 2);
     assert_eq!(ingest_payload["total_entities"], 2);
@@ -423,7 +423,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&ingest_data)
             .arg("--branch")
@@ -499,7 +499,7 @@ fn local_cli_load_from_forks_branch_and_missing_branch_errors_without_from() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&extra)
             .arg("--branch")
@@ -517,7 +517,7 @@ fn local_cli_load_from_forks_branch_and_missing_branch_errors_without_from() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&extra)
             .arg("--branch")
@@ -531,7 +531,7 @@ fn local_cli_load_from_forks_branch_and_missing_branch_errors_without_from() {
     assert_eq!(payload["branch"], "feature-load");
     assert_eq!(payload["base_branch"], "main");
     assert_eq!(payload["branch_created"], true);
-    assert_eq!(payload["mode"], "merge");
+    assert_eq!(payload["mode"], "replace");
     assert_eq!(payload["nodes"][0]["name"], "Person");
     assert_eq!(payload["nodes"][0]["entities_loaded"], 1);
     assert_eq!(payload["total_entities"], 1);
@@ -602,7 +602,7 @@ fn local_cli_export_round_trips_full_branch_graph() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(graph.path()),
     );
@@ -779,7 +779,7 @@ fn local_cli_failed_load_keeps_target_state_unchanged() {
             .arg("--data")
             .arg(&bad_data)
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(graph.path()),
     );
@@ -1585,7 +1585,7 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
         .envs(server.credential("bruno-tok"))
         .arg("load")
         .arg("--mode")
-        .arg("merge")
+        .arg("replace")
         .arg("--target")
         .fixture_target(&server.base_url)
         .arg("--graph")
@@ -1613,7 +1613,7 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
             .envs(server.credential("ragnor-tok"))
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .fixture_target(&server.base_url)
             .arg("--graph")

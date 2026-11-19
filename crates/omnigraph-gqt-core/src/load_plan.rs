@@ -34,17 +34,18 @@ use omnigraph::loader::LoadExecuted;
 use serde::Serialize;
 use serde_json::Value;
 
-const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: probe <swept|judged>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load validate source_cardinality <node> <edge>: access <delta|probe|scan>`, `load validate removal <table>: <scan|none>`, `load write: <overwrite fragments|append strict_insert|merge upsert>`, `load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]`, `load executed: partitions <n> rows <m>`, `load executed <Node>: rows <m>`";
+const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: probe <swept|judged>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load validate source_cardinality <node> <edge>: access <delta|probe|scan>`, `load validate removal <table>: <scan|none>`, `load write: <overwrite fragments|insert strict_insert|upsert upsert|replace upsert>`, `load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]`, `load executed: partitions <n> rows <m>`, `load executed <Node>: rows <m>`";
 
 const ACCESS: [&str; 3] = ["delta", "probe", "scan"];
 const REMOVALS: [&str; 2] = ["scan", "none"];
 const PROBES: [&str; 2] = ["swept", "judged"];
 const ENDPOINTS: [&str; 2] = ["from", "to"];
 const ROUTES: [&str; 2] = ["plan", "pipeline"];
-const WRITES: [&str; 3] = [
+const WRITES: [&str; 4] = [
     "overwrite fragments",
-    "append strict_insert",
-    "merge upsert",
+    "insert strict_insert",
+    "upsert upsert",
+    "replace upsert",
 ];
 
 /// One fact of a load plan, in the spelling the section uses; the receipt's
@@ -701,7 +702,7 @@ mod tests {
             "load validate removal node:Person: scan",
             "load validate removal edge:Knows: none",
             "load write: overwrite fragments",
-            "load write: append strict_insert",
+            "load write: insert strict_insert",
             "load pipeline 0: CsvSource => Validate",
             "load pipeline 1: Validate -> FragmentWrite => consumer after 0",
             "load pipeline 2: Scan -> HashJoin(probe) -> Projection => consumer after 0, 1",

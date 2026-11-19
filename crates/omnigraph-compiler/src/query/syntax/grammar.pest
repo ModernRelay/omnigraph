@@ -23,7 +23,7 @@ setting_value = { digits | ident | string_lit }
 branch_stmt   = { kw_branch ~ (branch_create | branch_delete | branch_merge_base | branch_merge | branch_list | branch_diff) }
 // The two control writes on an unpublished commit, named by its full id.
 commit_stmt   = { kw_commit ~ (commit_publish | commit_drop) }
-// `load csv "<uri>" into node:Person mode overwrite [delimiter "|"] [header]
+// `load csv "<uri>" into node:Person mode insert|upsert|replace|overwrite [delimiter "|"] [header]
 // [columns (a, b)]`: one CSV object, named by URI, into one declared type.
 // Every option is a keyword so a `.pg` property may carry any of these names.
 load_stmt      = { kw_load ~ kw_csv ~ string_lit ~ kw_into ~ load_target ~ load_option* }
@@ -31,7 +31,8 @@ load_target    = { load_kind ~ ":" ~ type_name }
 load_kind      = @{ ("node" | "edge") ~ !(ASCII_ALPHANUMERIC | "_") }
 load_option    = { load_mode | load_delimiter | load_header | load_columns }
 load_mode      = { kw_mode ~ load_mode_name }
-load_mode_name = @{ ("overwrite" | "append" | "merge") ~ !(ASCII_ALPHANUMERIC | "_") }
+// `append` and `merge` are edition 2's names, recognised to print their fix.
+load_mode_name = @{ ("overwrite" | "insert" | "upsert" | "replace" | "append" | "merge") ~ !(ASCII_ALPHANUMERIC | "_") }
 load_delimiter = { kw_delimiter ~ string_lit }
 load_header    = { kw_header }
 load_columns   = { kw_columns ~ "(" ~ ident ~ ("," ~ ident)* ~ ")" }

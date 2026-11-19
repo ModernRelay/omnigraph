@@ -9275,7 +9275,7 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
             .await
             .unwrap(),
     );
-    let merge = omnigraph::loader::LoadMode::Merge;
+    let merge = omnigraph::loader::LoadMode::Replace;
     db.load_with_receipt("main", &row_identity_rows(0..32, 0), merge)
         .await
         .unwrap();

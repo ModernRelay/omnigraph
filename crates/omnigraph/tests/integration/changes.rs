@@ -124,7 +124,7 @@ async fn write_receipts_identify_exact_commits_and_mutation_noops() {
         .load_with_receipt(
             "main",
             r#"{"type":"Person","data":{"name":"LoadReceipt","age":40}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -144,7 +144,7 @@ async fn write_receipts_identify_exact_commits_and_mutation_noops() {
     // receipt rather than reconstructing it from a later branch-head read.
     let head_before_empty_load = snapshot_id(&db, "main").await.unwrap();
     let empty_load_receipt = db
-        .load_with_receipt("main", "", LoadMode::Merge)
+        .load_with_receipt("main", "", LoadMode::Replace)
         .await
         .unwrap();
     assert!(empty_load_receipt.result.nodes_loaded.is_empty());
@@ -188,7 +188,7 @@ async fn graph_diff_takes_the_exact_merge_below_a_missing_history_block() {
     for load in 0..256 {
         let line = format!(r#"{{"type":"Person","data":{{"name":"p{load:03}"}}}}"#);
         let receipt = db
-            .load_with_receipt("main", &line, LoadMode::Append)
+            .load_with_receipt("main", &line, LoadMode::Insert)
             .await
             .unwrap();
         published.push(receipt.commit.graph_commit_id);
@@ -290,7 +290,7 @@ node Anchor { name: String @key }
     db.load(
         "main",
         r#"{"type":"Person","data":{"name":"Alice"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -336,7 +336,7 @@ node Anchor { name: String @key }
     db.load(
         "main",
         r#"{"type":"Human","data":{"name":"Bob"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1173,7 +1173,7 @@ node Document {
     db.load_with_receipt(
         "main",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1185,7 +1185,7 @@ node Document {
         .load_with_receipt(
             "main",
             r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qg=="}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -1240,7 +1240,7 @@ async fn change_feed_detects_same_length_blob_only_update() {
     db.load_with_receipt(
         "main",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1258,7 +1258,7 @@ async fn change_feed_detects_same_length_blob_only_update() {
     db.load_with_receipt(
         "main",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qg=="}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1370,7 +1370,7 @@ async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
     db.load(
         "main",
         r#"{"type":"Document","data":{"title":"later","content":"base64:QQ=="}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -1478,7 +1478,7 @@ async fn cross_branch_diff_detects_same_length_blob_only_update() {
     db.load_with_receipt(
         "main",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1490,7 +1490,7 @@ async fn cross_branch_diff_detects_same_length_blob_only_update() {
         .load_with_receipt(
             "feature",
             r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qg=="}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -1532,7 +1532,7 @@ async fn cross_branch_diff_detects_same_length_blob_update_between_sibling_branc
     db.load_with_receipt(
         "main",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1546,7 +1546,7 @@ async fn cross_branch_diff_detects_same_length_blob_update_between_sibling_branc
     a.load_with_receipt(
         "branch-a",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qg=="}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1556,7 +1556,7 @@ async fn cross_branch_diff_detects_same_length_blob_update_between_sibling_branc
     b.load_with_receipt(
         "branch-b",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qw=="}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1760,7 +1760,7 @@ async fn commit_changes_are_exact_ordered_and_bounded() {
         .load_with_receipt(
             "main",
             "{\"type\":\"Person\",\"data\":{\"name\":\"feed-C\",\"age\":3}}\n{\"type\":\"Person\",\"data\":{\"name\":\"feed-A\",\"age\":1}}\n{\"type\":\"Person\",\"data\":{\"name\":\"feed-B\",\"age\":2}}",
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -1967,7 +1967,7 @@ async fn commit_changes_are_exact_ordered_and_bounded() {
 
     // An empty load still publishes a lineage commit; its block is empty.
     let empty = db
-        .load_with_receipt("main", "", LoadMode::Merge)
+        .load_with_receipt("main", "", LoadMode::Replace)
         .await
         .unwrap();
     let empty_page = db
@@ -2021,7 +2021,7 @@ node Document {
         .load_with_receipt(
             "main",
             r#"{"type":"Document","data":{"title":"old","payload":"keep"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2049,7 +2049,7 @@ node Article @rename_from("Document") {
         .load_with_receipt(
             "main",
             r#"{"type":"Article","data":{"title":"new","payload":"x"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2106,7 +2106,7 @@ node Document {
             "\n",
             r#"{"type":"Document","data":{"title":"b","note":"two","payload":"base64:Qg=="}}"#,
         ),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2118,7 +2118,7 @@ node Document {
         .load_with_receipt(
             "main",
             r#"{"type":"Document","data":{"title":"a","note":"revised","payload":"base64:QQ=="}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2254,7 +2254,7 @@ async fn physical_only_commit_over_a_large_fragment_reads_as_empty_issue_705() {
     main.load(
         "main",
         r#"{"type":"Doc","data":{"key":"row-tail","payload":"tail"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2324,7 +2324,7 @@ edge Refs: Note -> Note {
             "\n",
             r#"{"edge":"Refs","id":"ref-1","from":"note-a","to":"note-b","data":{"label":"old"}}"#,
         ),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2341,7 +2341,7 @@ edge Refs: Note -> Note {
                 "\n",
                 r#"{"edge":"Refs","id":"ref-1","from":"note-a","to":"note-b","data":{"label":"new"}}"#,
             ),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2470,7 +2470,7 @@ async fn commit_changes_page_token_rejections_are_typed() {
         .load_with_receipt(
             "main",
             "{\"type\":\"Person\",\"data\":{\"name\":\"t-A\",\"age\":1}}\n{\"type\":\"Person\",\"data\":{\"name\":\"t-B\",\"age\":2}}",
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2503,7 +2503,7 @@ async fn commit_changes_page_token_rejections_are_typed() {
         .load_with_receipt(
             "main",
             r#"{"type":"Person","data":{"name":"t-C","age":3}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2539,7 +2539,7 @@ async fn commit_changes_page_token_rejections_are_typed() {
         .load_with_receipt(
             "main",
             r#"{"type":"Person","data":{"name":"t-A","age":1}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2605,7 +2605,7 @@ node Ghost {
         "main",
         "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n\
          {\"type\":\"Person\",\"data\":{\"name\":\"Carol\",\"age\":50}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2674,7 +2674,7 @@ node Ghost {
     db.load_with_receipt(
         "main",
         r#"{"type":"Person","data":{"name":"Bob","age":40,"attachment":"base64:Ym9i"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2886,7 +2886,7 @@ async fn change_feed_poll_follows_commits_from_another_handle() {
     db_b.load(
         "main",
         r#"{"type":"Person","data":{"name":"from-b"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2937,7 +2937,7 @@ async fn change_feed_byte_budget_admits_one_solo_oversized_change_per_page() {
         db.load(
             "main",
             &format!(r#"{{"type":"Person","data":{{"name":"solo-{row}"}}}}"#),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2988,7 +2988,7 @@ async fn change_feed_byte_budget_does_not_reset_solo_exception_per_commit() {
         .load_with_receipt(
             "main",
             r#"{"type":"Person","data":{"name":"budget-first"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2999,7 +2999,7 @@ async fn change_feed_byte_budget_does_not_reset_solo_exception_per_commit() {
                 r#"{{"type":"Person","data":{{"name":"budget-second-{}"}}}}"#,
                 "x".repeat(512)
             ),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3067,7 +3067,7 @@ async fn change_feed_advances_only_at_block_boundaries_and_pins_the_cut() {
         .load_with_receipt(
             "main",
             "{\"type\":\"Person\",\"data\":{\"name\":\"fa-1\",\"age\":1}}\n{\"type\":\"Person\",\"data\":{\"name\":\"fa-2\",\"age\":2}}\n{\"type\":\"Person\",\"data\":{\"name\":\"fa-3\",\"age\":3}}",
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3075,7 +3075,7 @@ async fn change_feed_advances_only_at_block_boundaries_and_pins_the_cut() {
         .load_with_receipt(
             "main",
             "{\"type\":\"Person\",\"data\":{\"name\":\"fb-1\",\"age\":4}}\n{\"type\":\"Person\",\"data\":{\"name\":\"fb-2\",\"age\":5}}",
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3109,7 +3109,7 @@ async fn change_feed_advances_only_at_block_boundaries_and_pins_the_cut() {
         .load_with_receipt(
             "main",
             r#"{"type":"Person","data":{"name":"fc-1","age":6}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3173,7 +3173,7 @@ async fn change_feed_start_modes_now_aftercommit_beginning() {
         .load_with_receipt(
             "main",
             r#"{"type":"Person","data":{"name":"Late","age":9}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3637,7 +3637,7 @@ async fn change_feed_cursor_scope_mismatches_are_typed() {
         .load_with_receipt(
             "main",
             "{\"type\":\"Person\",\"data\":{\"name\":\"x-1\",\"age\":1}}\n{\"type\":\"Person\",\"data\":{\"name\":\"x-2\",\"age\":2}}",
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3742,7 +3742,7 @@ async fn change_feed_commits_examined_ceiling_bounds_sparse_polls() {
         db.load_with_receipt(
             "main",
             &format!(r#"{{"type":"Person","data":{{"name":"s-{row}","age":{row}}}}}"#),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3812,7 +3812,7 @@ async fn change_feed_resume_is_stateless_across_handles() {
         .load_with_receipt(
             "main",
             r#"{"type":"Person","data":{"name":"Stateless","age":1}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3851,14 +3851,14 @@ async fn change_feed_gap_then_baseline_reset() {
         .load_with_receipt(
             "main",
             r#"{"type":"Person","data":{"name":"gap-a","age":1}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
     db.load_with_receipt(
         "main",
         r#"{"type":"Person","data":{"name":"gap-b","age":2}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3906,7 +3906,7 @@ async fn change_feed_gap_then_baseline_reset() {
         .load_with_receipt(
             "main",
             r#"{"type":"Person","data":{"name":"post-baseline","age":3}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3989,7 +3989,7 @@ node Foxtrot { name: String @key }
                 "\n",
                 r#"{"type":"Foxtrot","data":{"name":"f"}}"#,
             ),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -4079,7 +4079,7 @@ async fn long_ids_resume_exactly_with_bounded_commit_and_feed_tokens() {
                 serde_json::json!({"type": "Person", "data": {"name": &first_id}}),
                 serde_json::json!({"type": "Person", "data": {"name": &second_id}}),
             ),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -4159,7 +4159,7 @@ async fn change_feed_resumed_oversized_change_is_delivered_solo() {
             r#"{"type":"Person","data":{"name":"a-small","age":1}}"#,
             format_args!(r#"{{"type":"Person","data":{{"name":"{large_name}","age":2}}}}"#),
         ),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();

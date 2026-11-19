@@ -104,7 +104,7 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Company","data":{"name":"acme"}}
 "#;
-    db.load_jsonl(test_data, LoadMode::Append).await.unwrap();
+    db.load_jsonl(test_data, LoadMode::Insert).await.unwrap();
     db.ensure_indices_as(None).await.unwrap();
     drop(db);
 

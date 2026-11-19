@@ -237,6 +237,14 @@ const INTENDED: &[(&str, &str)] = &[
         "query q() { match { $p: Person } return { $p.name } }",
     ),
     (
+        "diagnostics/q004_load_mode_append_and_merge.gqt step 4",
+        r#"load csv "people.csv" into node:Person mode insert header"#,
+    ),
+    (
+        "diagnostics/q004_load_mode_append_and_merge.gqt step 6",
+        r#"load csv "people.csv" into node:Person mode replace header"#,
+    ),
+    (
         "diagnostics/q007_arrow_traversal.gqt step 3",
         r#"query q() { match { $a: Person, $a knows $b } return { $b.name } }"#,
     ),

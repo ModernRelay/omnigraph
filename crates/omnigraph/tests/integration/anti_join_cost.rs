@@ -211,7 +211,7 @@ async fn correlated_block_strategy_rows_and_time() {
             let uri = dir.path().to_str().unwrap().to_string();
             let db = session(Omnigraph::init(&uri, SCHEMA).await.unwrap());
             for batch in synthetic_batches(48) {
-                db.load_jsonl(&batch, LoadMode::Append).await.unwrap();
+                db.load_jsonl(&batch, LoadMode::Insert).await.unwrap();
             }
             uri
         }

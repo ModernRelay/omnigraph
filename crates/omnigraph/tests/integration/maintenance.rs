@@ -837,7 +837,7 @@ async fn optimize_rewrite_keeps_index_coverage_so_index_rows_count_only_a_laggin
                 "data": {"slug": slug, "n": n, "embedding": [n as f32, 0.0, 0.0, 0.0]},
             })
             .to_string(),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -896,7 +896,7 @@ async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
     for name in ["Acme", "Beta", "Cygnus", "Delta"] {
         db.load_jsonl(
             &serde_json::json!({"type": "Company", "data": {"name": name}}).to_string(),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -1458,7 +1458,7 @@ node Doc {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1469,7 +1469,7 @@ node Doc {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"rank\":3}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"rank\":4}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1634,14 +1634,14 @@ node Tag {\n    slug: String @key\n}\n";
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"content\":\"base64:\"}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"content\":\"base64:cm93LXRocmVl\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"content\":\"base64:cm93LWZvdXI=\"}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d5\",\"content\":\"base64:cm93LWZpdmU=\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1663,12 +1663,12 @@ node Tag {\n    slug: String @key\n}\n";
         "test precondition: valid empty must lead the second of three fragments"
     );
     // Plain table, also multi-fragment so it has something to compact.
-    db.load_jsonl("{\"type\":\"Tag\",\"data\":{\"slug\":\"t1\"}}\n{\"type\":\"Tag\",\"data\":{\"slug\":\"t2\"}}", LoadMode::Merge, )
+    db.load_jsonl("{\"type\":\"Tag\",\"data\":{\"slug\":\"t1\"}}\n{\"type\":\"Tag\",\"data\":{\"slug\":\"t2\"}}", LoadMode::Replace, )
     .await
     .unwrap();
     db.load_jsonl(
         "{\"type\":\"Tag\",\"data\":{\"slug\":\"t3\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1793,7 +1793,7 @@ async fn optimize_compacts_large_blob_rows_in_bounded_batches() {
         let mode = if load == 0 {
             LoadMode::Overwrite
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         db.load_jsonl(&lines.join("\n"), mode).await.unwrap();
     }
@@ -1973,7 +1973,7 @@ async fn optimize_sizes_a_blob_batch_by_the_sum_of_a_rows_blob_columns() {
         let mode = if load == 0 {
             LoadMode::Overwrite
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         db.load_jsonl(&line, mode).await.unwrap();
     }
@@ -2050,7 +2050,7 @@ async fn optimize_compacts_blob_fragments_with_deleted_rows() {
         let mode = if load == 0 {
             LoadMode::Overwrite
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         db.load_jsonl(&lines.join("\n"), mode).await.unwrap();
     }
@@ -2132,7 +2132,7 @@ async fn optimize_sizes_each_compaction_task_from_its_own_fragments() {
         let mode = if load == 0 {
             LoadMode::Overwrite
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         db.load_jsonl(&line, mode).await.unwrap();
         if load == 1 {
@@ -2210,7 +2210,7 @@ async fn optimize_does_not_size_a_blob_batch_by_external_references() {
     db.load_jsonl(&lines[0].to_string(), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.load_jsonl(&lines[1].to_string(), LoadMode::Merge)
+    db.load_jsonl(&lines[1].to_string(), LoadMode::Replace)
         .await
         .unwrap();
     let external = db
@@ -2513,7 +2513,7 @@ async fn optimize_then_cleanup_erases_dropped_property_values() {
     db.load(
         "retained",
         r#"{"type":"Tag","data":{"slug":"u","icon":"base64:dQ=="}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2772,7 +2772,7 @@ async fn write_on_a_never_written_table_succeeds_over_foreign_drift_and_the_coll
     );
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -2793,7 +2793,7 @@ async fn write_on_a_never_written_table_succeeds_over_foreign_drift_and_the_coll
 
     db.load_jsonl(
         r#"{"type":"Company","data":{"name":"Acme"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect("the write stages on the pin, not the foreign HEAD");
@@ -2852,7 +2852,7 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
     )
     .await
     .unwrap();
-    db.load_jsonl(r#"{"type":"Person","data":{"name":"Alice","age":30,"biography":"organism university running"}}"#, LoadMode::Merge, )
+    db.load_jsonl(r#"{"type":"Person","data":{"name":"Alice","age":30,"biography":"organism university running"}}"#, LoadMode::Replace, )
     .await
     .unwrap();
     db.ensure_indices_as(None).await.unwrap();
@@ -3041,7 +3041,7 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
             "\n",
             r#"{"type":"Person","data":{"name":"Eve","age":41}}"#,
         ),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3277,7 +3277,7 @@ query patch($v: Vector(4)?) {
             "\n",
             r#"{"type":"D","data":{"slug":"k5","v":[1.0,-2.0,-2.0,-1.0]}}"#,
         ),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3725,7 +3725,7 @@ async fn cleanup_older_than_zero_preserves_head() {
 
     // Smoke test: after aggressive cleanup, we can still read and write the
     // graph — head wasn't pruned.
-    db.load_jsonl(TEST_DATA, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(TEST_DATA, LoadMode::Replace).await.unwrap();
 }
 
 #[tokio::test]
@@ -4037,7 +4037,7 @@ async fn cleanup_then_optimize_preserves_rows_and_table_remains_writable() {
     assert_eq!(count_rows(&db, "node:Company").await, companies_before);
 
     // Table is still writable after the cleanup+optimize sequence.
-    db.load_jsonl(TEST_DATA, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(TEST_DATA, LoadMode::Replace).await.unwrap();
     assert_eq!(count_rows(&db, "node:Person").await, people_before);
 }
 
@@ -4202,7 +4202,7 @@ async fn cleanup_reconciles_live_branch_orphan_fork_and_keeps_the_branch_write()
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"Acme"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -4303,7 +4303,7 @@ async fn cleanup_age_window_preserves_a_recent_snapshot_across_a_pointer_switch(
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"RecentCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -4324,7 +4324,7 @@ async fn cleanup_age_window_preserves_a_recent_snapshot_across_a_pointer_switch(
         "main",
         None,
         r#"{"type":"Company","data":{"name":"LaterCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -4725,7 +4725,7 @@ async fn cleanup_preserves_the_pin_a_lazy_child_reads_after_its_parent_retires()
             "feature",
             None,
             r#"{"type":"Company","data":{"name":"BorrowedCo"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
             None,
         )
         .await
@@ -4743,7 +4743,7 @@ async fn cleanup_preserves_the_pin_a_lazy_child_reads_after_its_parent_retires()
             "main",
             None,
             r#"{"type":"Company","data":{"name":"MainCo"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
             None,
         )
         .await
@@ -4780,7 +4780,7 @@ async fn cleanup_preserves_the_pin_a_lazy_child_reads_after_its_parent_retires()
                 "child",
                 None,
                 r#"{"type":"Company","data":{"name":"ChildCo"}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
                 None,
             )
             .await
@@ -4842,7 +4842,7 @@ async fn cleanup_reclaims_dead_incarnation_fork_of_live_branch() {
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"Acme"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -4982,7 +4982,7 @@ async fn index_build_tolerates_null_vector_rows() {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"n\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"n\":2}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("load rows with null embeddings");
@@ -5043,7 +5043,7 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -5100,7 +5100,7 @@ async fn optimize_materializes_index_after_type_rename() {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();

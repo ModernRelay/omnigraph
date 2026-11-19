@@ -1686,7 +1686,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .fixture_target(&server.base_url)
             .arg("--graph")
@@ -1704,7 +1704,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
     assert_eq!(ingest_payload["branch_created"], true);
     assert!(ingest_payload["commit"]["graph_commit_id"].is_string());
     assert!(ingest_payload["commit"]["graph_manifest_version"].is_number());
-    assert_eq!(ingest_payload["mode"], "merge");
+    assert_eq!(ingest_payload["mode"], "replace");
     assert_eq!(ingest_payload["nodes"][0]["name"], "Person");
     assert_eq!(ingest_payload["nodes"][0]["entities_loaded"], 2);
     assert_eq!(ingest_payload["total_entities"], 2);
@@ -1766,7 +1766,7 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&extra)
             .arg("--branch")
@@ -1786,7 +1786,7 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&extra)
             .arg("--branch")
@@ -1849,7 +1849,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .fixture_target(&server.base_url)
             .arg("--graph")
@@ -1865,7 +1865,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
     assert_eq!(ingest_payload["branch"], "feature-ingest");
     assert_eq!(ingest_payload["base_branch"], "missing-base");
     assert_eq!(ingest_payload["branch_created"], false);
-    assert_eq!(ingest_payload["mode"], "merge");
+    assert_eq!(ingest_payload["mode"], "replace");
     assert_eq!(ingest_payload["nodes"][0]["name"], "Person");
     assert_eq!(ingest_payload["nodes"][0]["entities_loaded"], 2);
     assert_eq!(ingest_payload["total_entities"], 2);
@@ -2009,7 +2009,7 @@ query insert_person($name: String, $age: I32) {
             .arg("--data")
             .arg(&batch)
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--json"),
     );
     assert_eq!(
@@ -2458,7 +2458,7 @@ fn remote_unix_socket_serves_query_mutate_load_export_and_blob_get_issue_979() {
     let load = parse_stdout_json(&over_socket(&[
         "load",
         "--mode",
-        "merge",
+        "replace",
         "--data",
         rows.to_str().unwrap(),
         "--json",

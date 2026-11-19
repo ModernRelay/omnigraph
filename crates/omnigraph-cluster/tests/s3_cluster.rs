@@ -208,7 +208,7 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         .load(
             "main",
             r#"{"type":"Person","data":{"name":"Ada"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -241,7 +241,7 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         .load(
             "feature",
             r#"{"type":"Person","data":{"name":"OldFeature"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -252,7 +252,7 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         .load(
             "feature",
             r#"{"type":"Person","data":{"name":"NewFeature"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -338,7 +338,7 @@ async fn object_storage_offline_deployment(root: &str) {
     db.load(
         "main",
         r#"{"type":"Person","data":{"name":"Ada"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();

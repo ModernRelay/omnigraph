@@ -2592,7 +2592,7 @@ mod tests {
             branch: "work".to_string(),
             base_branch: Some("main".to_string()),
             branch_created: true,
-            mode: omnigraph::loader::LoadMode::Append,
+            mode: omnigraph::loader::LoadMode::Insert,
             nodes: vec![omnigraph_api_types::GraphBatchDeclarationOutput {
                 name: "Doc".to_string(),
                 entities_loaded: 2,
@@ -2604,7 +2604,7 @@ mod tests {
             commit: None,
         };
         assert_human_format(
-            "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n\
+            "loaded graph on branch work with insert: 2 entities across 1 node types and 0 edge types\n\
              branch work created from main\n\
              Loads do not generate embeddings. Supplied vectors are preserved; omitted vectors follow schema nullability. Supply vectors in the input or prepare them with omnigraph embed.\n",
             |writer| super::write_load_human("graph", &output, writer),
@@ -2612,7 +2612,7 @@ mod tests {
         output.branch_created = false;
         output.embedding_generation = None;
         assert_human_format(
-            "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n",
+            "loaded graph on branch work with insert: 2 entities across 1 node types and 0 edge types\n",
             |writer| super::write_load_human("graph", &output, writer),
         );
     }

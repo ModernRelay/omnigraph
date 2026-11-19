@@ -851,7 +851,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
             for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
                 let receipt = if command == "load" {
                     json!({"branch":"main", "base_branch":null, "branch_created":false,
-                        "mode":"append", "nodes":[{"name":"Document", "entities_loaded":1}],
+                        "mode":"insert", "nodes":[{"name":"Document", "entities_loaded":1}],
                         "edges":[], "total_entities":1, "embedding_generation":null,
                         "actor_id":null, "commit":commit})
                 } else {
@@ -883,7 +883,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                                         branch: "main".into(),
                                         from: None,
                                         data: data.clone(),
-                                        mode: CliLoadMode::Append,
+                                        mode: CliLoadMode::Insert,
                                         settings: Vec::new(),
                                         json,
                                     },
@@ -1016,7 +1016,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                         branch: "main".into(),
                         from: None,
                         data,
-                        mode: CliLoadMode::Append,
+                        mode: CliLoadMode::Insert,
                         settings: Vec::new(),
                         json: true,
                     },

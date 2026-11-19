@@ -1348,7 +1348,7 @@ pub fn merge_managed_blob(graph: &Path, title: &str, bytes: &[u8]) {
             .await
             .unwrap();
         session_over(db)
-            .load_jsonl(&data, omnigraph::loader::LoadMode::Merge)
+            .load_jsonl(&data, omnigraph::loader::LoadMode::Replace)
             .await
             .unwrap();
     });

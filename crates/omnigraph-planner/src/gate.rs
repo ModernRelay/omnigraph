@@ -735,14 +735,16 @@ fn route_decision(
                         logical: plan,
                         explain: explain.engine(),
                     },
-                    LoadStmtMode::Append | LoadStmtMode::Merge => executor_planned(
-                        Unrouted::ModeOnExecutor {
-                            mode: ir.mode.as_str(),
-                        },
-                        explain,
-                        plan,
-                        optimized.physical,
-                    ),
+                    LoadStmtMode::Insert | LoadStmtMode::Upsert | LoadStmtMode::Replace => {
+                        executor_planned(
+                            Unrouted::ModeOnExecutor {
+                                mode: ir.mode.as_str(),
+                            },
+                            explain,
+                            plan,
+                            optimized.physical,
+                        )
+                    }
                 }
             }
             Err(error) => executor(

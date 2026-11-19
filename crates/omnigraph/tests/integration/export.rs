@@ -351,7 +351,7 @@ node Document {
         "data": { "key": "wide", "body": "λ".repeat(40_000) }
     })
     .to_string();
-    db.load_jsonl(&wide, LoadMode::Append).await.unwrap();
+    db.load_jsonl(&wide, LoadMode::Insert).await.unwrap();
     let small = (0..200)
         .map(|row| {
             serde_json::json!({
@@ -361,7 +361,7 @@ node Document {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    db.load_jsonl(&small, LoadMode::Append).await.unwrap();
+    db.load_jsonl(&small, LoadMode::Insert).await.unwrap();
     let expected = db.export_jsonl("main", &[]).await.unwrap();
     let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
     let mut chunks = Vec::new();
@@ -418,7 +418,7 @@ async fn export_jsonl_round_trips_typed_u64_key_and_rejects_id_mismatch() {
                 "{{\"type\":\"Counter\",\"data\":{{\"sequence\":{},\"label\":\"loader\"}}}}",
                 u64::MAX
             ),
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -526,7 +526,7 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
         ),
     ] {
         let duplicate = source
-            .load_jsonl(duplicate_row, LoadMode::Append)
+            .load_jsonl(duplicate_row, LoadMode::Insert)
             .await
             .unwrap_err();
         assert!(
@@ -648,7 +648,7 @@ async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed()
     let duplicate = db
         .load_jsonl(
             r#"{"type":"Rounded","data":{"value":16777217}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap_err();
@@ -679,7 +679,7 @@ async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed()
 {"type":"Padded","id":"00042","data":{"value":42}}
 {"type":"Padded","id":"42","data":{"value":42}}
 "#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap_err();
@@ -720,7 +720,7 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
     let duplicate = db
         .load_jsonl(
             r#"{"type":"Membership","data":{"tenant":"acme","slot":7,"label":"append"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap_err();
@@ -844,7 +844,7 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
     .collect::<Vec<_>>()
     .join("\n");
     loader
-        .load_jsonl(&boundaries, LoadMode::Append)
+        .load_jsonl(&boundaries, LoadMode::Insert)
         .await
         .unwrap();
 
@@ -855,7 +855,7 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
         ("FloatBoundary", serde_json::json!(f64::MAX)),
     ] {
         let row = serde_json::json!({"type":table,"data":{"value":bad_value}}).to_string();
-        let error = loader.load_jsonl(&row, LoadMode::Append).await.unwrap_err();
+        let error = loader.load_jsonl(&row, LoadMode::Insert).await.unwrap_err();
         assert!(
             error.to_string().contains("range"),
             "{table} out-of-range load must fail clearly: {error}"
@@ -1117,7 +1117,7 @@ node Document {
     db.load_jsonl(concat!(
             "{\"type\":\"Document\",\"data\":{\"title\":\"valid-empty\",\"content\":\"base64:\"}}\n",
             "{\"type\":\"Document\",\"data\":{\"title\":\"neighbor\",\"content\":\"base64:TmVpZ2hib3I=\"}}",
-        ), LoadMode::Append, )
+        ), LoadMode::Insert, )
     .await
     .unwrap();
     // Export is descriptor-first for external references: reproducing the
@@ -1241,7 +1241,7 @@ node Document {
     imported
         .load_jsonl(
             r#"{"type":"Document","data":{"title":"later","content":"base64:AAECA/8="}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();

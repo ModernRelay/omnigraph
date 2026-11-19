@@ -15,9 +15,11 @@ pub(crate) struct LoadArgs {
     /// Without this flag a missing branch is an error, never a fork.
     #[arg(long)]
     pub(crate) from: Option<String>,
-    /// How existing entities are handled: overwrite | append | merge.
-    /// Required — overwrite is destructive, so there is no default.
-    #[arg(long)]
+    /// How records meet existing entities: insert (an existing key fails the
+    /// load) | upsert (sets the named properties) | replace (writes the whole
+    /// entity) | overwrite (each type becomes the batch's entities). Required:
+    /// overwrite is destructive, so there is no default.
+    #[arg(long, value_parser = parse_cli_load_mode)]
     pub(crate) mode: CliLoadMode,
     /// Session setting for this invocation (repeatable): `name=value` in
     /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
@@ -164,20 +166,33 @@ pub(crate) enum BlobCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CliLoadMode {
     Overwrite,
-    Append,
-    Merge,
+    Insert,
+    Upsert,
+    Replace,
+}
+
+/// `--mode`'s value, by the engine's names; edition 2's `append` and `merge`
+/// are refused with the mode that now means what they meant.
+fn parse_cli_load_mode(value: &str) -> Result<CliLoadMode, String> {
+    Ok(match LoadMode::parse(value)? {
+        LoadMode::Overwrite => CliLoadMode::Overwrite,
+        LoadMode::Insert => CliLoadMode::Insert,
+        LoadMode::Upsert => CliLoadMode::Upsert,
+        LoadMode::Replace => CliLoadMode::Replace,
+    })
 }
 
 impl From<CliLoadMode> for LoadMode {
     fn from(value: CliLoadMode) -> Self {
         match value {
             CliLoadMode::Overwrite => LoadMode::Overwrite,
-            CliLoadMode::Append => LoadMode::Append,
-            CliLoadMode::Merge => LoadMode::Merge,
+            CliLoadMode::Insert => LoadMode::Insert,
+            CliLoadMode::Upsert => LoadMode::Upsert,
+            CliLoadMode::Replace => LoadMode::Replace,
         }
     }
 }
@@ -185,8 +200,9 @@ impl CliLoadMode {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             CliLoadMode::Overwrite => "overwrite",
-            CliLoadMode::Append => "append",
-            CliLoadMode::Merge => "merge",
+            CliLoadMode::Insert => "insert",
+            CliLoadMode::Upsert => "upsert",
+            CliLoadMode::Replace => "replace",
         }
     }
 }

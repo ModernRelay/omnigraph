@@ -177,7 +177,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "load",
         title: "Load NDJSON",
-        description: "Load NDJSON records (`{\"type\": \"<Type>\", \"data\": {...}}` per line) into `branch` (default `main`) as one commit. `mode`: `merge` upserts by key, `append` refuses an existing key, `overwrite` replaces the supplied types. Without `from` the branch must exist; with `from` a missing branch is created from it. The whole call must fit in 64 KiB; split larger loads into separate commits.",
+        description: "Load NDJSON records (`{\"type\": \"<Type>\", \"data\": {...}}` per line) into `branch` (default `main`) as one commit. `mode`: `insert` refuses an existing key, `upsert` sets the properties a record names and keeps the others, `replace` writes the whole row, `overwrite` replaces the supplied types; a retried load uses `upsert` or `replace`. Without `from` the branch must exist; with `from` a missing branch is created from it. The whole call must fit in 64 KiB; split larger loads into separate commits.",
         input: load_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
@@ -502,7 +502,7 @@ pub(super) fn load_schema() -> Value {
         json!({
             "branch": text_schema("Branch to load into. Defaults to `main`."),
             "from": text_schema("Create `branch` from this branch when it does not exist."),
-            "mode": {"type": "string", "enum": ["merge", "append", "overwrite"], "description": "How existing keys are handled."},
+            "mode": {"type": "string", "enum": ["insert", "upsert", "replace", "overwrite"], "description": "What a record does to an existing key: `insert` fails on one, `upsert` sets the properties the record names, `replace` writes the whole row, `overwrite` makes each type exactly the batch's rows."},
             "data": text_schema("NDJSON: one `{\"type\": \"<Type>\", \"data\": {...}}` record per line."),
         }),
         &["mode", "data"],

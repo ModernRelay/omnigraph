@@ -117,7 +117,7 @@ query whole_docs() {
     let pinned = db.resolve_snapshot("main").await.unwrap();
     db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"d2","title":"c"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -582,7 +582,7 @@ async fn a_streamed_scan_gathers_small_fragments_into_one_batch() {
                 r#"{{"edge":"Knows","from":"p{n:02}","to":"p00","data":{{}}}}"#
             ));
         }
-        db.load_jsonl(&rows.join("\n"), LoadMode::Append)
+        db.load_jsonl(&rows.join("\n"), LoadMode::Insert)
             .await
             .unwrap();
     }

@@ -36,7 +36,7 @@ async fn append_new_persons(db: &Session, branch: &str, n: usize) {
         db.load(
             branch,
             &format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"ff_new_{i}\",\"age\":30}}}}"),
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -225,7 +225,7 @@ async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
     main.load(
         "main",
         r#"{"type":"Person","data":{"name":"main-after-fork","age":40}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -244,7 +244,7 @@ async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
         .load(
             "source",
             r#"{"type":"Person","data":{"name":"source-only","age":41}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -301,7 +301,7 @@ async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
         .load(
             "target",
             r#"{"type":"Person","data":{"name":"target-only","age":42}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -369,7 +369,7 @@ node Person {
         .load(
             "feature",
             r#"{"type":"Person","data":{"name":"new","age":31}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -418,7 +418,7 @@ node Person {
         .load(
             "source",
             r#"{"type":"Person","data":{"name":"generation-one","age":31}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -430,7 +430,7 @@ node Person {
         .load(
             "leaf",
             r#"{"type":"Person","data":{"name":"generation-two","age":32}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -514,7 +514,7 @@ async fn append_only_fast_forward_merge_of_a_commit_chain_is_a_pointer_switch() 
     }
     let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
-        .load("feature", &first_commit, LoadMode::Merge)
+        .load("feature", &first_commit, LoadMode::Replace)
         .await
         .unwrap();
     feature
@@ -523,7 +523,7 @@ async fn append_only_fast_forward_merge_of_a_commit_chain_is_a_pointer_switch() 
             &format!(
                 "{{\"type\":\"Person\",\"data\":{{\"name\":\"ff_chunk_{CHUNK_ROWS}\",\"age\":30}}}}\n"
             ),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -575,7 +575,7 @@ async fn fast_forward_merge_proof_crosses_an_index_build_on_the_source_issue_840
         .load(
             "feature",
             "{\"type\":\"Person\",\"data\":{\"name\":\"ff_indexed\",\"age\":30}}\n",
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -629,7 +629,7 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
         .load(
             "feature",
             r#"{"type":"Person","data":{"name":"nested-feature","age":31}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -641,7 +641,7 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
         .load(
             "experiment",
             r#"{"type":"Person","data":{"name":"nested-experiment","age":32}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -716,7 +716,7 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
                 .load(
                     "leaf",
                     r#"{"type":"Person","data":{"name":"leaf-new","age":31}}"#,
-                    LoadMode::Append,
+                    LoadMode::Insert,
                 )
                 .await
                 .unwrap();
@@ -1025,7 +1025,7 @@ async fn load_wide_payload_rows(db: &Session, branch: &str) {
             "data": { "key": key, "payload": payload, "size": 1 },
         })
         .to_string();
-        db.load(branch, &row, LoadMode::Append).await.unwrap();
+        db.load(branch, &row, LoadMode::Insert).await.unwrap();
     }
 }
 
@@ -1157,7 +1157,7 @@ async fn branch_merge_validation_streams_wide_non_key_columns_issue_1427() {
                     "data": { "key": "on_main", "payload": "short", "size": 2 },
                 })
                 .to_string();
-                main.load("main", &row, LoadMode::Append).await.unwrap();
+                main.load("main", &row, LoadMode::Insert).await.unwrap();
             }
         }
         let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
@@ -1495,7 +1495,7 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
     }
     let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
-        .load("feature", &rows, LoadMode::Merge)
+        .load("feature", &rows, LoadMode::Replace)
         .await
         .unwrap();
 
@@ -1537,13 +1537,13 @@ async fn merged_outcome_defers_vector_index_to_reconciler() {
     }
     let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
-        .load("feature", &source_rows, LoadMode::Merge)
+        .load("feature", &source_rows, LoadMode::Replace)
         .await
         .unwrap();
     main.load(
         "main",
         r#"{"type":"Chunk","data":{"slug":"target-only","embedding":[0,1,2,3,4,5,6,7]}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1604,13 +1604,13 @@ async fn write_max_bytes_merge_keeps_independent_payload_and_chunk_allowances() 
                 .to_string(),
             );
         }
-        main.load("feature", &source_rows.join("\n"), LoadMode::Append)
+        main.load("feature", &source_rows.join("\n"), LoadMode::Insert)
             .await
             .unwrap();
         main.load(
             "main",
             r#"{"type":"Document","data":{"title":"target","note":"target"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();

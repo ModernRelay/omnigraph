@@ -39,7 +39,7 @@ pub(super) const BEST_PRACTICES: &[BestPractice] = &[
     BestPractice {
         key: "data",
         title: "Data load patterns",
-        description: "Read before calling `load`. Covers choosing `merge`, `append` or `overwrite`, the branch, load, verify, merge loop for large or risky writes, embeddings that `merge` does not recompute, and when to use `mutate` instead.",
+        description: "Read before calling `load`. Covers choosing `insert`, `upsert`, `replace` or `overwrite`, the branch, load, verify, merge loop for large or risky writes, embeddings that `upsert` and `replace` do not recompute, and when to use `mutate` instead.",
     },
     BestPractice {
         key: "schema",

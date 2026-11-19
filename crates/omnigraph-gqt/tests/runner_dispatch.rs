@@ -776,7 +776,7 @@ fn server_target_admission_refuses_before_workers() {
         std::fs::write(
             &csv_case,
             format!(
-                "{served_text}\n{fixture}\n--- mutate\nload csv \"people.csv\" into node:Person mode append header\n--- expect ok\n"
+                "{served_text}\n{fixture}\n--- mutate\nload csv \"people.csv\" into node:Person mode insert header\n--- expect ok\n"
             ),
         )
         .unwrap();

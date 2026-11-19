@@ -625,7 +625,7 @@ async fn explicit_target_load_writes_to_named_branch() {
     db.load(
         "feature",
         r#"{"type":"Person","data":{"name":"Eve","age":22}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -877,7 +877,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     main.load(
         "main",
         r#"{"type":"Document","data":{"title":"readme","content":"base64:V29ybGQ=","note":"head advance"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1157,7 +1157,7 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
     aba.load(
         "feature",
         r#"{"type":"Document","data":{"title":"aba","content":"base64:T2xk","note":"old"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1212,7 +1212,7 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
     aba.load(
         "feature",
         r#"{"type":"Document","data":{"title":"aba","content":"base64:TmV3","note":"new"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1316,7 +1316,7 @@ node Marker {
     db.load(
         "feature",
         r#"{"type":"Marker","data":{"name":"feature-commit"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1352,7 +1352,7 @@ node Marker {
     db.load(
         "feature",
         r#"{"type":"Marker","data":{"name":"ordinary-advance"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1371,7 +1371,7 @@ node Marker {
     db.load(
         "main",
         r#"{"type":"Document","data":{"title":"doc","content":"base64:TmV3"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2084,7 +2084,7 @@ async fn branch_merge_onto_main_switches_managed_blob_pointers_body() {
             }
         })
         .to_string();
-        db.load("feature", &row, LoadMode::Append).await.unwrap();
+        db.load("feature", &row, LoadMode::Insert).await.unwrap();
     }
 
     let before_tables = pointer_switch_tables(&db).await;
@@ -2588,7 +2588,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"BorrowedCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -2613,7 +2613,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
         "main",
         None,
         r#"{"type":"Company","data":{"name":"MainCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -2634,7 +2634,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"NewCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -2668,7 +2668,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
         "replacement",
         None,
         r#"{"type":"Company","data":{"name":"ReplacementCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -2711,7 +2711,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"AfterAdoptCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -3233,7 +3233,7 @@ async fn branch_merge_detects_nested_list_value_change() {
         .load_with_receipt(
             "feature",
             r#"{"type":"Doc","data":{"slug":"x","tags":["a","b"]}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3243,7 +3243,7 @@ async fn branch_merge_detects_nested_list_value_change() {
     main.load_with_receipt(
         "main",
         r#"{"type":"Doc","data":{"slug":"y","tags":["z"]}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();

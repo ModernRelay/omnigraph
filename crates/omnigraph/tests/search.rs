@@ -1965,7 +1965,7 @@ query ranked($q: Vector(4)) {{
     let uri = dir.path().to_str().unwrap();
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(&rows(0), LoadMode::Overwrite).await.unwrap();
-    db.load_jsonl(&rows(ROWS_PER_FRAGMENT), LoadMode::Append)
+    db.load_jsonl(&rows(ROWS_PER_FRAGMENT), LoadMode::Insert)
         .await
         .unwrap();
 
@@ -2383,7 +2383,7 @@ query uncapped_all($q: String) {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    db.load_jsonl(&appended, LoadMode::Append).await.unwrap();
+    db.load_jsonl(&appended, LoadMode::Insert).await.unwrap();
     let db = db;
 
     let capped = query_main(&db, PREFIX_QUERIES, "capped", &params(&[("$q", "needle")]))
@@ -2888,7 +2888,7 @@ async fn full_text_analyzer_holds_after_first_rows_and_overwrites_issue_904() {
         }
     };
 
-    db.load("main", &rows("Doc", "d"), LoadMode::Merge)
+    db.load("main", &rows("Doc", "d"), LoadMode::Replace)
         .await
         .unwrap();
     assert_eq!(hits("main", "docs").await, ["d1", "d2"], "first rows");
@@ -2900,7 +2900,7 @@ async fn full_text_analyzer_holds_after_first_rows_and_overwrites_issue_904() {
     assert_eq!(hits("main", "docs").await, ["d1", "d2"], "overwrite");
 
     db.branch_create("feature").await.unwrap();
-    db.load("feature", &rows("Note", "n"), LoadMode::Merge)
+    db.load("feature", &rows("Note", "n"), LoadMode::Replace)
         .await
         .unwrap();
     assert_eq!(
@@ -3163,7 +3163,7 @@ async fn the_exact_lexical_scan_charges_the_read_work_budget() {
         r#"{"type":"Doc","data":{"slug":"d1","body":"Deep Learning"}}
 {"type":"Doc","data":{"slug":"d2","body":"deep dive into deep water"}}
 {"type":"Doc","data":{"slug":"d3","body":"Café"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();

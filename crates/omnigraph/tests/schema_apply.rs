@@ -268,7 +268,7 @@ query insert_with_nickname($name: String, $age: I32, $nickname: String) {
         .load(
             "main",
             r#"{"type":"Person","data":{"name":"loaded-after-schema","age":32,"nickname":"fresh"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect("load parsing and validation must use the same token-bound catalog");
@@ -360,7 +360,7 @@ async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
         .load(
             "target",
             r#"{"type":"Project","data":{"name":"pending-index"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -948,7 +948,7 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
     );
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"After publication"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1255,7 +1255,7 @@ async fn prepared_schema_rejects_a_different_root_and_stale_predecessor_without_
 
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Intervening writer"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1282,7 +1282,7 @@ async fn prepared_schema_rejects_a_different_root_and_stale_predecessor_without_
     replacement
         .load_jsonl(
             r#"{"type":"Person","data":{"name":"Replacement graph"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -1369,7 +1369,7 @@ async fn prepared_schema_noop_is_bound_to_exact_source_and_live_authority() {
     // does not. Reconciliation must not invent a fresh no-op certificate.
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Later head"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2036,7 +2036,7 @@ node Tag {
             "data": {"title": "new", "score": 6, "summary": "fresh", "thumb": "base64:VGh1bWI="},
         })
         .to_string(),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2484,7 +2484,7 @@ async fn apply_schema_rejects_a_card_minimum_edge_from_an_existing_node_type() {
     let err = db
         .load_jsonl(
             r#"{"type":"Team","data":{"name":"core"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .expect_err("a Team written without its LedBy edge is below @card(1..1)");
@@ -2535,14 +2535,14 @@ async fn relaxing_edge_cardinality_applies_as_metadata_issue_1403() {
          {\"edge\":\"ChunkFromTranscript\",\"from\":\"c-all\",\"to\":\"t1\",\"data\":{}}\n\
          {\"edge\":\"ChunkFromWebPage\",\"from\":\"c-all\",\"to\":\"w1\",\"data\":{}}\n\
          {\"edge\":\"ChunkFromLinkedInPost\",\"from\":\"c-all\",\"to\":\"l1\",\"data\":{}}",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect("a chunk with one edge of every source kind meets @card(1..1)");
 
     // The reported refusal: a web-page chunk lacks the other two sources.
     let err = db
-        .load_jsonl(&web_page_chunk("c-web", "w2"), LoadMode::Append)
+        .load_jsonl(&web_page_chunk("c-web", "w2"), LoadMode::Insert)
         .await
         .expect_err("@card(1..1) on every source edge needs all three");
     assert!(
@@ -2601,7 +2601,7 @@ async fn relaxing_edge_cardinality_applies_as_metadata_issue_1403() {
     );
     assert!(after.graph_manifest_version() > before.graph_manifest_version());
 
-    db.load_jsonl(&web_page_chunk("c-web", "w2"), LoadMode::Append)
+    db.load_jsonl(&web_page_chunk("c-web", "w2"), LoadMode::Insert)
         .await
         .expect("a chunk with only its real source loads under @card(0..1)");
     let qr = query_main(
@@ -2625,7 +2625,7 @@ async fn relaxing_edge_cardinality_applies_as_metadata_issue_1403() {
                 web_page_chunk("c-ok", "w3"),
                 web_page_chunk("c-two", "w4")
             ),
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .expect_err("two web-page sources exceed @card(0..1)");
@@ -3104,7 +3104,7 @@ query put_pair($aaaa: String, $zzzz: String, $label: String) {
     );
     db.load_jsonl(
         r#"{"type":"Pair","data":{"alpha":"A","zeta":"Z","label":"before"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -3336,7 +3336,7 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
 
     // The deferred declarations are not dropped: after data arrives, the
     // explicit reconciler materializes every buildable index without error.
-    db.load_jsonl(r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#, LoadMode::Merge, )
+    db.load_jsonl(r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#, LoadMode::Replace, )
     .await
     .expect("loading a Doc with an embedding must succeed");
     db.ensure_indices_as(None)
@@ -3359,7 +3359,7 @@ async fn index_only_constraint_apply_touches_no_table_data() {
     let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
     db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"d1","n":1}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("load a Doc");
@@ -3417,7 +3417,7 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
     db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"d1","body":"Deep Learning"}}
 {"type":"Doc","data":{"slug":"d2","body":"deep dive"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3484,7 +3484,7 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
     assert_eq!(search("text").await, ["d1", "d2"]);
     db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"d3","text":"Shallow","summary":"Deep Learning"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3522,7 +3522,7 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
     db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"d1","body":"Runners were RUNNING"}}
 {"type":"Doc","data":{"slug":"d2","body":"Café crème"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3762,7 +3762,7 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
     assert_eq!(left(segments("text").await.1), [changed_segments[0].uuid]);
     db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"d3","text":"runs"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3785,7 +3785,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
     db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t1","status":"todo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("load a Ticket with an original variant");
@@ -3826,14 +3826,14 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     // The NEW variant is accepted on the write path...
     db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t2","status":"blocked"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("new variant must be accepted after widening");
     // ...an original variant still is...
     db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t3","status":"done"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("original variant must remain accepted");
@@ -3842,7 +3842,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     let err = db
         .load_jsonl(
             r#"{"type":"Ticket","data":{"slug":"t4","status":"bogus"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await;
     assert!(err.is_err(), "out-of-set enum value must still be rejected");
@@ -3868,7 +3868,7 @@ async fn enum_narrowing_apply_is_refused() {
     // The graph stays healthy and writable on the original schema.
     db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t1","status":"doing"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("graph must remain writable after a refused narrowing");
@@ -3985,7 +3985,7 @@ async fn schema_settlement_fences_only_the_original_candidate_and_repeats_its_ow
         );
         db.load_jsonl(
             r#"{"type":"Person","data":{"name":"Later write"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -4061,7 +4061,7 @@ async fn schema_settlement_proves_foreign_occupancy_but_missing_evidence_stays_u
         assert!(db.apply_prepared_schema_as(&original, None).await.is_err());
         db.load_jsonl(
             r#"{"type":"Person","data":{"name":"Later write"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -4126,7 +4126,7 @@ async fn schema_settlement_noop_refuses_stale_authority_without_a_fence() {
     db.branch_delete("other").await.unwrap();
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Later"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -4228,7 +4228,7 @@ async fn issue_721_backfilled_nullable_property_promotes_to_required_unique() {
     db.load_jsonl(
         "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
          {\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-2\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("backfilled rows load");
@@ -4241,19 +4241,19 @@ async fn issue_721_backfilled_nullable_property_promotes_to_required_unique() {
 
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"c"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect_err("a missing required value must be rejected after promotion");
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"d","ref":"D-1"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect_err("a duplicate unique value must be rejected after promotion");
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"e","ref":"D-3"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("a distinct value is accepted");
@@ -4268,7 +4268,7 @@ async fn issue_721_promotion_refuses_while_a_null_or_duplicate_remains() {
     db.load_jsonl(
         "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
          {\"type\":\"Decision\",\"data\":{\"slug\":\"b\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -4285,7 +4285,7 @@ async fn issue_721_promotion_refuses_while_a_null_or_duplicate_remains() {
 
     db.load_jsonl(
         "{\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-1\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -4301,7 +4301,7 @@ async fn issue_721_promotion_refuses_while_a_null_or_duplicate_remains() {
     // The previous schema stays usable: a null is still accepted.
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"z"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("failed validation leaves the accepted schema in force");
@@ -4315,7 +4315,7 @@ async fn issue_721_promoted_table_still_evolves_and_reopens() {
     let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"a","ref":"D-1"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -4335,14 +4335,14 @@ async fn issue_721_promoted_table_still_evolves_and_reopens() {
     reopened
         .load_jsonl(
             r#"{"type":"Decision","data":{"slug":"c","note":"n"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect_err("a reopened graph still requires ref");
     reopened
         .load_jsonl(
             r#"{"type":"Decision","data":{"slug":"d","ref":"D-9","note":"n"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect("a complete row loads");
@@ -4356,7 +4356,7 @@ async fn issue_721_promotion_tightens_the_lance_column() {
     let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"a","ref":"D-1"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -4453,7 +4453,7 @@ async fn issue_721_deleted_null_row_is_purged_by_promotion() {
             .map(|i| format!(r#"{{"type":"Decision","data":{{"slug":"s{i}","ref":"D-{i}"}}}}"#))
             .collect::<Vec<_>>();
         rows.push(r#"{"type":"Decision","data":{"slug":"gone"}}"#.to_string());
-        db.load_jsonl(&rows.join("\n"), LoadMode::Merge)
+        db.load_jsonl(&rows.join("\n"), LoadMode::Replace)
             .await
             .unwrap();
         mutate_main(
@@ -4515,7 +4515,7 @@ async fn issue_721_deleted_null_row_is_purged_by_promotion() {
             .expect("optimize succeeds");
         db.load_jsonl(
             r#"{"type":"Decision","data":{"slug":"d","ref":"D-new","note":"n"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect("a write after the later change succeeds");
@@ -4550,7 +4550,7 @@ async fn issue_721_promotion_with_a_rename_in_the_same_apply() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
-        db.load_jsonl(rows, LoadMode::Merge).await.unwrap();
+        db.load_jsonl(rows, LoadMode::Replace).await.unwrap();
         let plan = db.plan_schema(renamed).await.unwrap();
         assert!(plan.supported, "{plan:?}");
         match refusal {
@@ -4568,19 +4568,19 @@ async fn issue_721_promotion_with_a_rename_in_the_same_apply() {
                     .expect("the renamed promotion applies");
                 db.load_jsonl(
                     r#"{"type":"Decision","data":{"slug":"c"}}"#,
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .expect_err("code is required");
                 db.load_jsonl(
                     r#"{"type":"Decision","data":{"slug":"c","code":"D-2"}}"#,
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .expect_err("code is unique");
                 db.load_jsonl(
                     r#"{"type":"Decision","data":{"slug":"c","code":"D-3"}}"#,
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .expect("a distinct code loads");
@@ -4611,7 +4611,7 @@ async fn issue_721_unique_on_a_property_added_in_the_same_apply() {
         let uri = dir.path().to_str().unwrap();
         let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
         if let Some(rows) = rows {
-            db.load_jsonl(rows, LoadMode::Merge).await.unwrap();
+            db.load_jsonl(rows, LoadMode::Replace).await.unwrap();
         }
         let plan = db.plan_schema(desired).await.unwrap();
         assert!(plan.supported, "{plan:?}");
@@ -4623,13 +4623,13 @@ async fn issue_721_unique_on_a_property_added_in_the_same_apply() {
 
         db.load_jsonl(
             r#"{"type":"Decision","data":{"slug":"c","ref":"D-1","code":"X"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect("a first code loads");
         db.load_jsonl(
             r#"{"type":"Decision","data":{"slug":"d","ref":"D-1","code":"X"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect_err("the new @unique rejects a duplicate key");
@@ -4650,7 +4650,7 @@ async fn issue_721_edge_property_promotes_to_required() {
         "{\"type\":\"P\",\"data\":{\"slug\":\"a\"}}\n\
          {\"type\":\"P\",\"data\":{\"slug\":\"b\"}}\n\
          {\"edge\":\"Cites\",\"from\":\"a\",\"to\":\"b\",\"data\":{}}",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -4664,7 +4664,7 @@ async fn issue_721_edge_property_promotes_to_required() {
         "{\"type\":\"P\",\"data\":{\"slug\":\"a\"}}\n\
          {\"type\":\"P\",\"data\":{\"slug\":\"b\"}}\n\
          {\"edge\":\"Cites\",\"from\":\"a\",\"to\":\"b\",\"data\":{\"why\":\"x\"}}",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -4673,7 +4673,7 @@ async fn issue_721_edge_property_promotes_to_required() {
         .expect("a backfilled edge property promotes");
     db.load_jsonl(
         "{\"edge\":\"Cites\",\"from\":\"b\",\"to\":\"a\",\"data\":{}}",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect_err("an edge without why is refused");
@@ -4730,7 +4730,7 @@ query ranked_all($q: Vector(4)) {
 {"type":"Doc","data":{"slug":"c","embedding":[0.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d","embedding":[-2.0,-2.0,-2.0,-2.0]}}
 {"type":"Doc","data":{"slug":"e","embedding":[0.0,0.0,0.0,-4.0]}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -4859,7 +4859,7 @@ query ranked_all($q: Vector(4)) {
     let refused = db
         .load_jsonl(
             r#"{"type":"Doc","data":{"slug":"z","embedding":[0.0,-0.0,0.0,0.0]}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap_err()

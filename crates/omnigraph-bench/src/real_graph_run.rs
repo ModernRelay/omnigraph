@@ -674,12 +674,12 @@ async fn prepare_finbench_delta(root: &Path) -> Result<(), RealGraphRunError> {
         .await
         .map_err(engine_prepare_error)?;
     let source = db
-        .load_graph_batch_as_with_receipt(SOURCE_BRANCH, None, SOURCE_BATCH, LoadMode::Append, None)
+        .load_graph_batch_as_with_receipt(SOURCE_BRANCH, None, SOURCE_BATCH, LoadMode::Insert, None)
         .await
         .map_err(engine_prepare_error)?;
     require_load_receipt(&source.result, SOURCE_BRANCH)?;
     let target = db
-        .load_graph_batch_as_with_receipt(TARGET_BRANCH, None, TARGET_BATCH, LoadMode::Append, None)
+        .load_graph_batch_as_with_receipt(TARGET_BRANCH, None, TARGET_BATCH, LoadMode::Insert, None)
         .await
         .map_err(engine_prepare_error)?;
     require_load_receipt(&target.result, TARGET_BRANCH)?;

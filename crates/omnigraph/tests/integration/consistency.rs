@@ -73,7 +73,7 @@ async fn snapshot_returns_stale_data_after_write() {
     assert!(ids_after.contains(&"Eve".to_string()));
 }
 
-// ─── LoadMode::Merge ────────────────────────────────────────────────────────
+// ─── LoadMode::Replace ────────────────────────────────────────────────────────
 
 /// Append is strict insert, not an unchecked physical append. Reusing an
 /// existing logical id must return the typed RFC-023 conflict and leave both
@@ -101,7 +101,7 @@ async fn load_append_rejects_existing_id_without_update() {
     let err = db
         .load_jsonl(
             r#"{"type":"Person","data":{"name":"Alice","age":99}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap_err();
@@ -179,7 +179,7 @@ async fn load_keyed_write_row_cap_excludes_strict_overwrite() {
             .unwrap(),
     );
     exact
-        .load_jsonl(&jsonl(LIMIT), LoadMode::Append)
+        .load_jsonl(&jsonl(LIMIT), LoadMode::Insert)
         .await
         .expect("the exact keyed row limit is inclusive");
     assert_eq!(count_rows(&exact, "node:Thing").await, LIMIT);
@@ -201,7 +201,7 @@ async fn load_keyed_write_row_cap_excludes_strict_overwrite() {
     );
     let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
     let error = over
-        .load_jsonl(&jsonl(LIMIT + 1), LoadMode::Append)
+        .load_jsonl(&jsonl(LIMIT + 1), LoadMode::Insert)
         .await
         .unwrap_err();
     assert!(
@@ -247,7 +247,7 @@ async fn write_max_bytes_load_boundaries_are_independent_and_atomic() {
     use base64::Engine as _;
     use omnigraph::settings::{SettingId, SettingValue, Source};
     for strict in [false, true] {
-        for mode in [LoadMode::Append, LoadMode::Merge] {
+        for mode in [LoadMode::Insert, LoadMode::Replace] {
             let dir = tempfile::tempdir().unwrap();
             let mut db = helpers::session(
                 Omnigraph::init(
@@ -339,7 +339,7 @@ async fn wide_vector_loads_fit_write_max_bytes_by_their_arrow_size_issue_484() {
     };
     for present in [true, false] {
         for strict in [false, true] {
-            for mode in [LoadMode::Append, LoadMode::Merge] {
+            for mode in [LoadMode::Insert, LoadMode::Replace] {
                 let dir = tempfile::tempdir().unwrap();
                 let mut db = helpers::session(
                     Omnigraph::init(
@@ -424,7 +424,7 @@ node Thing {
     let wide = "x".repeat(LIMIT as usize + 1024);
     let input =
         format!("{{\"type\":\"Thing\",\"data\":{{\"key\":\"wide\",\"payload\":\"{wide}\"}}}}");
-    let error = db.load_jsonl(&input, LoadMode::Append).await.unwrap_err();
+    let error = db.load_jsonl(&input, LoadMode::Insert).await.unwrap_err();
     assert!(
         matches!(
             error,
@@ -608,7 +608,7 @@ node Attachment {
     .to_string();
 
     let error = db
-        .load("feature", &input, LoadMode::Append)
+        .load("feature", &input, LoadMode::Insert)
         .await
         .unwrap_err();
     assert!(
@@ -658,7 +658,7 @@ node Attachment {
     })
     .to_string();
     let error = db
-        .load("feature", &missing_input, LoadMode::Append)
+        .load("feature", &missing_input, LoadMode::Insert)
         .await
         .unwrap_err();
     assert!(
@@ -683,7 +683,7 @@ node Attachment {
     let oversized_probes = omnigraph::instrumentation::MergeWriteProbes::default();
     let result = omnigraph::instrumentation::with_merge_write_probes(
         oversized_probes.clone(),
-        db.load("feature", &input, LoadMode::Append),
+        db.load("feature", &input, LoadMode::Insert),
     )
     .await;
     let error = result.unwrap_err();
@@ -780,7 +780,7 @@ node Attachment {
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
     let error = omnigraph::instrumentation::with_merge_write_probes(
         probes.clone(),
-        db.load("feature", &cumulative_input, LoadMode::Append),
+        db.load("feature", &cumulative_input, LoadMode::Insert),
     )
     .await
     .unwrap_err();
@@ -1006,7 +1006,7 @@ node Thing {
             start.wait().await;
             let row =
                 format!(r#"{{"type":"Thing","data":{{"key":"SAME","value":"writer-{writer}"}}}}"#);
-            (writer, db.load_jsonl(&row, LoadMode::Append).await)
+            (writer, db.load_jsonl(&row, LoadMode::Insert).await)
         }
     }))
     .await;
@@ -1059,11 +1059,11 @@ node Thing {
     let (left, right) = tokio::join!(
         left.load_jsonl(
             r#"{"type":"Thing","data":{"key":"LEFT","value":"l"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         ),
         right.load_jsonl(
             r#"{"type":"Thing","data":{"key":"RIGHT","value":"r"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         ),
     );
     left.expect("disjoint strict insert LEFT must succeed");
@@ -1094,7 +1094,7 @@ async fn load_merge_upserts_existing_and_inserts_new() {
     // Merge: Alice updated to age=31, Charlie is new
     let merge_data = r#"{"type": "Person", "data": {"name": "Alice", "age": 31}}
 {"type": "Person", "data": {"name": "Charlie", "age": 35}}"#;
-    db.load_jsonl(merge_data, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(merge_data, LoadMode::Replace).await.unwrap();
 
     // Should have 3 persons total (not 4)
     assert_eq!(count_rows(&db, "node:Person").await, 3);
@@ -1125,7 +1125,7 @@ async fn load_merge_upserts_existing_and_inserts_new() {
     }
 }
 
-/// Regression: two sequential `LoadMode::Merge` invocations against the
+/// Regression: two sequential `LoadMode::Replace` invocations against the
 /// same set of keys must both succeed. Pre-fix, the second one failed
 /// with `Ambiguous merge inserts are prohibited: multiple source rows
 /// match the same target row on (id = "TEST-1")` even though every
@@ -1167,12 +1167,12 @@ node Thing {
         ));
     }
 
-    db.load_jsonl(&delta, LoadMode::Merge)
+    db.load_jsonl(&delta, LoadMode::Replace)
         .await
         .expect("first merge must succeed");
     assert_eq!(count_rows(&db, "node:Thing").await, 55);
 
-    db.load_jsonl(&delta, LoadMode::Merge)
+    db.load_jsonl(&delta, LoadMode::Replace)
         .await
         .expect("second merge against same keys must succeed");
     assert_eq!(count_rows(&db, "node:Thing").await, 55);
@@ -1197,7 +1197,7 @@ node Thing {
 {"type":"Thing","data":{"key":"DUP","value":"second"}}
 "#;
 
-    for mode in [LoadMode::Overwrite, LoadMode::Append, LoadMode::Merge] {
+    for mode in [LoadMode::Overwrite, LoadMode::Insert, LoadMode::Replace] {
         let err = db.load_jsonl(dupes, mode).await.unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1228,7 +1228,7 @@ node Thing {
 {"type":"Thing","id":"DUP","data":{"value":"second"}}
 "#;
 
-    for mode in [LoadMode::Append, LoadMode::Overwrite] {
+    for mode in [LoadMode::Insert, LoadMode::Overwrite] {
         let dir = tempfile::tempdir().unwrap();
         let db = helpers::session(
             Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
@@ -1466,11 +1466,11 @@ node Thing {
         ));
     }
 
-    db.load_jsonl(&delta, LoadMode::Merge)
+    db.load_jsonl(&delta, LoadMode::Replace)
         .await
         .expect("first merge after ensure_indices must succeed");
     db.ensure_indices_as(None).await.unwrap();
-    db.load_jsonl(&delta, LoadMode::Merge)
+    db.load_jsonl(&delta, LoadMode::Replace)
         .await
         .expect("second merge after ensure_indices must succeed");
     assert_eq!(count_rows(&db, "node:Thing").await, 55);

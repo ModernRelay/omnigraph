@@ -77,7 +77,7 @@ pub async fn fixture(dir: &tempfile::TempDir, scale: usize, divisor: usize) -> S
                     .to_string(),
                 );
             }
-            db.load_jsonl(&lines.join("\n"), LoadMode::Append)
+            db.load_jsonl(&lines.join("\n"), LoadMode::Insert)
                 .await
                 .unwrap();
         }

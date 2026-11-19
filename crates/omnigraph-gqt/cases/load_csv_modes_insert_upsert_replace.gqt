@@ -1,0 +1,94 @@
+# issue: none
+# notes: A load applies the keyed write statements to a batch: `insert` creates and refuses an existing key with nothing published, `upsert` sets the properties a record names and keeps the others (a property with no column is omitted; an empty field clears it), and `replace` writes the whole row, a property with no column becoming null. Creating without a required property is refused in every mode.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    id: I64 @key
+    name: String
+    age: I32?
+    nick: String?
+}
+
+--- seed
+{"type":"Person","data":{"id":1,"name":"alice","age":30,"nick":"al"}}
+{"type":"Person","data":{"id":2,"name":"bob","age":41,"nick":"bo"}}
+
+--- csv existing.csv
+id,name
+1,alice
+
+--- mutate
+load csv "existing.csv" into node:Person mode insert header
+
+--- expect error: already has this id; `upsert` sets the named properties
+
+--- csv ages.csv
+id,age
+1,31
+2,
+
+--- mutate
+load csv "ages.csv" into node:Person mode upsert header
+
+--- expect ok
+
+--- query
+query after_upsert() {
+    match { $p: Person }
+    return { $p.id, $p.name, $p.age, $p.nick }
+}
+
+--- expect unordered
+{"p.id": 1, "p.name": "alice", "p.age": 31, "p.nick": "al"}
+{"p.id": 2, "p.name": "bob", "p.nick": "bo"}
+
+--- expect shape
+p.id: I64
+p.name: String
+p.age: I32?
+p.nick: String?
+
+--- csv new_without_name.csv
+id,age
+3,7
+
+--- mutate
+load csv "new_without_name.csv" into node:Person mode upsert header
+
+--- expect error: name
+
+--- csv names.csv
+id,name
+1,alicia
+4,dan
+
+--- mutate
+load csv "names.csv" into node:Person mode replace header
+
+--- expect ok
+
+--- query
+query after_replace() {
+    match { $p: Person }
+    return { $p.id, $p.name, $p.age, $p.nick }
+}
+
+--- expect unordered
+{"p.id": 1, "p.name": "alicia"}
+{"p.id": 2, "p.name": "bob", "p.nick": "bo"}
+{"p.id": 4, "p.name": "dan"}
+
+--- expect shape
+p.id: I64
+p.name: String
+p.age: I32?
+p.nick: String?

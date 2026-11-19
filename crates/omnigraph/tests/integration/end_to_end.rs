@@ -306,7 +306,7 @@ async fn append_adds_rows() {
     let batch2 = r#"{"type": "Person", "data": {"name": "Bob", "age": 25}}"#;
 
     db.load_jsonl(batch1, LoadMode::Overwrite).await.unwrap();
-    db.load_jsonl(batch2, LoadMode::Append).await.unwrap();
+    db.load_jsonl(batch2, LoadMode::Insert).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open_dataset("node:Person").await.unwrap();
@@ -1246,7 +1246,7 @@ async fn blob_read_returns_bytes() {
         }
     })
     .to_string();
-    db.load_jsonl(&metacharacter_row, LoadMode::Append)
+    db.load_jsonl(&metacharacter_row, LoadMode::Insert)
         .await
         .unwrap();
 
@@ -1265,7 +1265,7 @@ async fn blob_read_returns_bytes() {
         }
     })
     .to_string();
-    db.load_jsonl(&large_row, LoadMode::Append).await.unwrap();
+    db.load_jsonl(&large_row, LoadMode::Insert).await.unwrap();
 
     let readme_cell = node_blob_cell("Document", "readme", "content");
     let readme = db
@@ -1504,7 +1504,7 @@ async fn blob_read_returns_bytes() {
 
     db.load_jsonl(
         r#"{"type":"Document","data":{"title":"etag-bump"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -2473,7 +2473,7 @@ async fn assert_graph_root_refuses_overlapping_bases(
             "data": {"title": "seed", "content": "base64:AQID"},
         })
         .to_string(),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2560,7 +2560,7 @@ async fn assert_graph_root_refuses_overlapping_bases(
                 },
             })
             .to_string(),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap_err();
@@ -2581,13 +2581,16 @@ async fn assert_graph_root_refuses_overlapping_bases(
     );
     assert!(db.shares_runtime_owner(&denied));
     assert!(matches!(
-        denied.load_jsonl(&row, LoadMode::Merge).await.unwrap_err(),
+        denied
+            .load_jsonl(&row, LoadMode::Replace)
+            .await
+            .unwrap_err(),
         OmniError::ExternalBlobPolicy { .. }
     ));
     assert_eq!(graph_state(graph_uri).await, before);
     // The old admitted view keeps its allow-list; the replacement denies new
     // external ingestion without changing the old policy or graph ownership.
-    db.load_jsonl(&row, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(&row, LoadMode::Replace).await.unwrap();
 }
 
 // ─── Regression: blob load with external file URI ────────────────────────────
@@ -2750,7 +2753,7 @@ async fn blob_load_external_file_uri() {
     let probes = MergeWriteProbes::default();
     with_merge_write_probes(
         probes.clone(),
-        db.load_jsonl(&duplicate_source_rows, LoadMode::Append),
+        db.load_jsonl(&duplicate_source_rows, LoadMode::Insert),
     )
     .await
     .unwrap();
@@ -2895,7 +2898,7 @@ async fn append_mode_manifest_row_count_is_total() {
     let db = init_and_load(&dir).await; // Overwrite: 4 persons
 
     let extra = r#"{"type": "Person", "data": {"name": "Eve", "age": 22}}"#;
-    db.load_jsonl(extra, LoadMode::Append).await.unwrap();
+    db.load_jsonl(extra, LoadMode::Insert).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let entry = snap.dataset("node:Person").unwrap();

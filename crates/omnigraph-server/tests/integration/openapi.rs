@@ -1774,15 +1774,16 @@ fn entity_kind_output_schema_has_node_and_edge_variants() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn load_mode_schema_has_three_variants() {
+fn load_mode_schema_has_the_four_write_intents() {
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["LoadMode"];
     let variants = schema["enum"].as_array().unwrap();
-    assert_eq!(variants.len(), 3);
     let values: HashSet<&str> = variants.iter().map(|v| v.as_str().unwrap()).collect();
-    assert!(values.contains("overwrite"));
-    assert!(values.contains("append"));
-    assert!(values.contains("merge"));
+    assert_eq!(
+        values,
+        HashSet::from(["insert", "upsert", "replace", "overwrite"]),
+        "edition 2's `append` and `merge` are refused, not documented"
+    );
 }
 
 #[test]

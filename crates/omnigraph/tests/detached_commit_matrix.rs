@@ -445,7 +445,7 @@ async fn load_two(db: &Session, name: &str) -> omnigraph::error::Result<()> {
         "{{\"type\": \"Person\", \"data\": {{\"name\": \"{name}_a\", \"age\": 30}}}}\n\
          {{\"type\": \"Person\", \"data\": {{\"name\": \"{name}_b\", \"age\": 31}}}}"
     );
-    db.load_jsonl(&payload, LoadMode::Append).await.map(|_| ())
+    db.load_jsonl(&payload, LoadMode::Insert).await.map(|_| ())
 }
 
 fn upgrade_execute() -> SystemColumnUpgradeOptions {
@@ -649,7 +649,7 @@ async fn cleanup_retains_live_branch_staging_until_owner_recreation() {
             "feature",
             None,
             r#"{"type":"Person","data":{"name":"Grace","age":37}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
             None,
         )
         .await;
@@ -798,7 +798,7 @@ async fn run_cell(
             &format!(
                 "{{\"type\": \"Person\", \"data\": {{\"name\": \"m{index}_fts\", \"city\": \"machine learning\"}}}}"
             ),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();

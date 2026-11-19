@@ -449,11 +449,7 @@ impl<'a> ProcessClient<'a> {
 }
 
 fn load_mode_word(mode: LoadMode) -> &'static str {
-    match mode {
-        LoadMode::Overwrite => "overwrite",
-        LoadMode::Append => "append",
-        LoadMode::Merge => "merge",
-    }
+    mode.as_str()
 }
 
 /// Undecodable output as diagnostic text, cut to its bound.

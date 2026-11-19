@@ -843,7 +843,7 @@ fn parity_load() {
     let (l, r) = p.run(&[
         "load",
         "--mode",
-        "merge",
+        "replace",
         "--data",
         data.to_str().unwrap(),
         "--json",
@@ -904,7 +904,7 @@ fn parity_load() {
     let (l, r) = p.run(&[
         "load",
         "--mode",
-        "append",
+        "insert",
         "--data",
         data.to_str().unwrap(),
         "--branch",
@@ -976,7 +976,7 @@ fn parity_load_embedding_diagnostics() {
                 "--branch",
                 "main",
                 "--mode",
-                "merge",
+                "replace",
                 "--data",
                 data.to_str().unwrap(),
             ];
@@ -1037,7 +1037,7 @@ fn parity_load_embedding_diagnostics() {
             "--branch",
             "main",
             "--mode",
-            "merge",
+            "replace",
             "--data",
             data.to_str().unwrap(),
             "--json",
@@ -1113,7 +1113,7 @@ fn assert_slow_export_and_baseline_complete(p: &Parity) {
     let (local, remote) = p.run(&[
         "load",
         "--mode",
-        "merge",
+        "replace",
         "--data",
         data.to_str().unwrap(),
         "--json",

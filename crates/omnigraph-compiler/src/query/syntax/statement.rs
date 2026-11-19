@@ -80,6 +80,29 @@ fn delete_removed_setting(
         })
 }
 
+/// Edition 2's load mode `append` or `merge`, refused with the mode that now
+/// means what it meant, as a machine-applicable rename of the word.
+fn removed_load_mode(old: &str, word: &pest::iterators::Pair<Rule>) -> QueryDiagnostic {
+    let new = if old == "append" { "insert" } else { "replace" };
+    let span = word.as_span();
+    diagnostic_at(
+        Q004,
+        format!("the load mode `{old}` was removed; `{new}` means what `{old}` meant"),
+        word,
+    )
+    .with_fix(format!(
+        "write `mode {new}`; `upsert` sets only the properties a record names"
+    ))
+    .with_suggestion(Suggestion {
+        applicability: Applicability::MachineApplicable,
+        edits: vec![TextEdit {
+            start: span.start(),
+            end: span.end(),
+            replacement: new.to_string(),
+        }],
+    })
+}
+
 fn parse_setting_form(
     pair: pest::iterators::Pair<Rule>,
 ) -> std::result::Result<SettingStmt, QueryDiagnostic> {
@@ -361,8 +384,12 @@ pub(crate) fn parse_load_stmt(
                             .expect("grammar: load_mode names its mode");
                         mode = Some(match name.as_str() {
                             "overwrite" => LoadStmtMode::Overwrite,
-                            "append" => LoadStmtMode::Append,
-                            "merge" => LoadStmtMode::Merge,
+                            "insert" => LoadStmtMode::Insert,
+                            "upsert" => LoadStmtMode::Upsert,
+                            "replace" => LoadStmtMode::Replace,
+                            old @ ("append" | "merge") => {
+                                return Err(removed_load_mode(old, &name));
+                            }
                             other => unreachable!("grammar: load_mode_name admits no {other}"),
                         });
                     }
@@ -417,7 +444,7 @@ pub(crate) fn parse_load_stmt(
     let Some(mode) = mode else {
         return Err(diagnostic_at(
             Q004,
-            "a load statement names its mode: `mode overwrite`, `mode append` or `mode merge`",
+            "a load statement names its mode: `mode insert`, `mode upsert`, `mode replace` or `mode overwrite`",
             &at,
         ));
     };

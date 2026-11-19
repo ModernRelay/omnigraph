@@ -1903,8 +1903,8 @@ mod tests {
                 removal,
                 delta: match mode {
                     LoadStmtMode::Overwrite => DeltaClass::Replace,
-                    LoadStmtMode::Append => DeltaClass::Insert,
-                    LoadStmtMode::Merge => DeltaClass::Upsert,
+                    LoadStmtMode::Insert => DeltaClass::Insert,
+                    LoadStmtMode::Upsert | LoadStmtMode::Replace => DeltaClass::Upsert,
                 },
                 deleted_ids: Vec::new(),
             }],
@@ -2010,7 +2010,7 @@ mod tests {
             let refused = judge(
                 &db,
                 LoadTarget::Edge("Knows".into()),
-                LoadStmtMode::Append,
+                LoadStmtMode::Insert,
                 access,
                 &orphan_first,
             )
@@ -2029,7 +2029,7 @@ mod tests {
             let refused = judge(
                 &db,
                 LoadTarget::Edge("Knows".into()),
-                LoadStmtMode::Append,
+                LoadStmtMode::Insert,
                 access,
                 &over_card,
             )
@@ -2047,7 +2047,7 @@ mod tests {
             judge(
                 &db,
                 LoadTarget::Edge("Knows".into()),
-                LoadStmtMode::Append,
+                LoadStmtMode::Insert,
                 access,
                 &admitted,
             )
@@ -2070,7 +2070,7 @@ mod tests {
         let refused = judge(
             &db,
             LoadTarget::Node("Person".into()),
-            LoadStmtMode::Append,
+            LoadStmtMode::Insert,
             ValidateAccess::Probe,
             &batches,
         )
@@ -2084,7 +2084,7 @@ mod tests {
         let refused = judge(
             &db,
             LoadTarget::Node("Person".into()),
-            LoadStmtMode::Append,
+            LoadStmtMode::Insert,
             ValidateAccess::Scan,
             &only_committed,
         )

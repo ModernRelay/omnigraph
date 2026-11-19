@@ -2762,7 +2762,11 @@ fn instrument_filtered_update_cost_over_per_commit_fragments() {
 /// the 1 MiB Blob's bytes included, and rewrites them; one that names the
 /// Blob (`UpsertKeepScalars`) reads only the omitted scalar and vector
 /// columns; and `replace` of an existing key (`ReplaceBlob1M`) reads no
-/// stored row.
+/// stored row. The load door's modes beside them: an `insert` load of a new
+/// key (`LoadInsertNewKey`), an `upsert` load of an existing key whose record
+/// omits the Blob and the vector (`LoadUpsertKeepBlob1M`), which reads them
+/// from the committed row and rewrites them, and a `replace` load of it
+/// (`LoadReplaceBlob1M`), which reads no stored row.
 fn update_patch_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    score: I32?\n    content: Blob?\n    emb: Vector(8)?\n}\n";
     const WIDE_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    title: String?\n    content: Blob?\n    emb: Vector(2048)?\n}\n";
@@ -2884,6 +2888,27 @@ query replace_existing() {
                 omnigraph_compiler::ir::ParamMap::new()
             };
             omnigraph_dst::cost::set_label(self.label);
+            let load = match self.query {
+                "load_insert_new" => Some((
+                    LoadMode::Insert,
+                    r#"{"type":"Doc","data":{"slug":"d9","age":9}}"#,
+                )),
+                "load_upsert_keep_blob" => Some((
+                    LoadMode::Upsert,
+                    r#"{"type":"Doc","data":{"slug":"d1","age":7}}"#,
+                )),
+                "load_replace_existing" => Some((
+                    LoadMode::Replace,
+                    r#"{"type":"Doc","data":{"slug":"d1","age":7}}"#,
+                )),
+                _ => None,
+            };
+            if let Some((mode, record)) = load {
+                let result = db.load_jsonl(record, mode).await;
+                omnigraph_dst::cost::set_label("_update_verify");
+                result.unwrap();
+                return;
+            }
             let result = db.mutate("main", UPDATES, self.query, &params).await;
             omnigraph_dst::cost::set_label("_update_verify");
             assert_eq!(result.unwrap().affected_nodes, 1);
@@ -2937,6 +2962,30 @@ query replace_existing() {
             None,
             "ReplaceBlob1M",
         ),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "load_insert_new",
+            None,
+            "LoadInsertNewKey",
+        ),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "load_upsert_keep_blob",
+            None,
+            "LoadUpsertKeepBlob1M",
+        ),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "load_replace_existing",
+            None,
+            "LoadReplaceBlob1M",
+        ),
     ] {
         rows.push_str(&labeled_cost_rows(
             format!("shared-memory://dst-update-cost-{replay}-{label}"),
@@ -2958,7 +3007,7 @@ query replace_existing() {
 /// two table sizes: 2 and 16 fragments of 8 people, the id BTREE covering
 /// all of them (one index page at both sizes, so a lookup reads the same
 /// index bytes). A keyed `insert` (`KeyedInsert`), a whole-row `update`
-/// (`KeyedUpdate`) and a `load --mode merge` of one present and one new row
+/// (`KeyedUpdate`) and a `load --mode replace` of one present and one new row
 /// (`MergeLoadPresent`, `MergeLoadNew`) reach their rows through the index:
 /// the update's `<key> = v` match adds the derived id conjunct, and an upsert
 /// whose rows are all new or all present skips Lance's full-table merge
@@ -3036,7 +3085,7 @@ query update_one() {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                db.load_jsonl(&rows, LoadMode::Append).await.unwrap();
+                db.load_jsonl(&rows, LoadMode::Insert).await.unwrap();
             }
             db.ensure_indices_as(None).await.unwrap();
             drop(db);
@@ -3057,14 +3106,14 @@ query update_one() {
             omnigraph_dst::cost::set_label(self.labels[2]);
             db.load_jsonl(
                 r#"{"type":"Person","data":{"slug":"p0005","age":50}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
             omnigraph_dst::cost::set_label(self.labels[3]);
             db.load_jsonl(
                 r#"{"type":"Person","data":{"slug":"new-1","age":51}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
@@ -3151,7 +3200,7 @@ query by_substring() {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            db.load_jsonl(&rows, LoadMode::Append).await.unwrap();
+            db.load_jsonl(&rows, LoadMode::Insert).await.unwrap();
             omnigraph_dst::cost::set_label(LABELS[0]);
             db.ensure_indices_as(None).await.unwrap();
             drop(db);
@@ -3752,7 +3801,7 @@ query patch($v: Vector(4)) {
                     "\n",
                     r#"{"type":"D","data":{"slug":"k5","v":[1.0,-2.0,-2.0,-1.0]}}"#,
                 ),
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
@@ -3776,7 +3825,7 @@ query patch($v: Vector(4)) {
             } else {
                 db.load_jsonl(
                     r#"{"type":"D","data":{"slug":"k7","v":[0.0,1.0,2.0,3.0]}}"#,
-                    LoadMode::Append,
+                    LoadMode::Insert,
                 )
                 .await
                 .unwrap();
@@ -4750,7 +4799,7 @@ fn removal_edge_read_cost_rows(replay: &str) -> String {
             for to in ["keep", "d00000"] {
                 db.load_jsonl(
                     &format!(r#"{{"edge":"Link","from":"keep","to":"{to}"}}"#),
-                    LoadMode::Append,
+                    LoadMode::Insert,
                 )
                 .await
                 .unwrap();

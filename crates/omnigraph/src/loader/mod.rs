@@ -34,6 +34,7 @@ use crate::db::manifest::HistoryReleaseBytes;
 use crate::db::{Omnigraph, Snapshot, WriteTxn};
 use crate::engine::{EngineContext, GraphIndexHandle, LoadFacts, LoadWrite};
 use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
+use crate::exec::keep_omitted::{OmittedCells, relaxed_schema};
 use crate::exec::staging::{MutationStaging, PendingMode, StagedMutation};
 use crate::seams::{catalog, decide_seam, fail};
 use crate::session::Session;
@@ -164,16 +165,60 @@ pub struct IngestResult {
     pub declarations: Vec<IngestDeclarationResult>,
 }
 
-/// Load mode for data ingestion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Load mode for data ingestion: the keyed write statements' names, applied
+/// to every record of a batch, plus `overwrite`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadMode {
-    /// Overwrite existing data.
+    /// Each type the batch holds becomes exactly the batch's rows of it.
     Overwrite,
-    /// Append to existing data.
-    Append,
-    /// Merge by `id` key (upsert).
-    Merge,
+    /// Creates every record; a record whose key exists fails the load with
+    /// `key_conflict` and nothing publishes.
+    Insert,
+    /// Creates a record whose key is absent, and on an existing key sets the
+    /// properties the record names, keeping the others.
+    Upsert,
+    /// Creates a record whose key is absent, and on an existing key writes
+    /// the whole row: a property the record omits becomes null.
+    Replace,
+}
+
+impl LoadMode {
+    /// Every mode's name, in the order a refusal lists them.
+    pub const NAMES: [&'static str; 4] = ["insert", "upsert", "replace", "overwrite"];
+
+    /// The mode a name spells. Edition 2's `append` and `merge` are refused
+    /// with the name that now means what they meant.
+    pub fn parse(name: &str) -> std::result::Result<Self, String> {
+        match name {
+            "insert" => Ok(Self::Insert),
+            "upsert" => Ok(Self::Upsert),
+            "replace" => Ok(Self::Replace),
+            "overwrite" => Ok(Self::Overwrite),
+            "append" => Err(removed_mode_message("append", "insert")),
+            "merge" => Err(removed_mode_message("merge", "replace")),
+            other => Err(format!(
+                "unknown load mode `{other}`; the modes are `insert`, `upsert`, `replace` and `overwrite`"
+            )),
+        }
+    }
+}
+
+/// The refusal of an edition-2 load mode name, naming its replacement.
+pub fn removed_mode_message(old: &str, new: &str) -> String {
+    format!(
+        "the load mode `{old}` was removed; write `{new}`, which means what `{old}` meant \
+         (`upsert` sets only the properties a record names)"
+    )
+}
+
+impl<'de> Deserialize<'de> for LoadMode {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::parse(&name).map_err(serde::de::Error::custom)
+    }
 }
 
 pub mod csv;
@@ -683,8 +728,9 @@ impl LoadMode {
     pub fn as_str(self) -> &'static str {
         match self {
             LoadMode::Overwrite => "overwrite",
-            LoadMode::Append => "append",
-            LoadMode::Merge => "merge",
+            LoadMode::Insert => "insert",
+            LoadMode::Upsert => "upsert",
+            LoadMode::Replace => "replace",
         }
     }
 }
@@ -843,7 +889,10 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // Append/Merge route through the bounded keyed adapter; Overwrite stages a
     // Lance replacement transaction and must retain the bulk-replacement
     // contract. Strict normalization still preflights its Arrow allocation.
-    let bounded_keyed_input = matches!(mode, LoadMode::Append | LoadMode::Merge);
+    let bounded_keyed_input = matches!(
+        mode,
+        LoadMode::Insert | LoadMode::Upsert | LoadMode::Replace
+    );
 
     let csv_buffers = memory.charge("load CSV input")?;
     let mut csv_batch = None;
@@ -885,7 +934,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let (judged, explain) = crate::validate::plan::judged_table(
             decision,
             request.target.table_key(),
-            if mode == LoadMode::Merge {
+            if matches!(mode, LoadMode::Upsert | LoadMode::Replace) {
                 DeltaClass::Upsert
             } else {
                 DeltaClass::Insert
@@ -1039,12 +1088,14 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // identity form one immutable authority unit.
     let mut staging = MutationStaging::new(write_budget);
     let pending_mode = match mode {
-        LoadMode::Merge => PendingMode::Upsert,
+        // An `upsert` load's omitted cells are filled from the stored rows
+        // before staging, so it stages through the same whole-row upsert.
+        LoadMode::Upsert | LoadMode::Replace => PendingMode::Upsert,
         // Append mode is a strict exact-id insert. Every physical graph table
         // has `id` as its Lance PK in format v6, including edges and node types
         // without a user-declared @key; no keyed table has an Append side door.
         // Merge mode applies last-write-wins source dedupe before fenced upsert.
-        LoadMode::Append => PendingMode::StrictInsert,
+        LoadMode::Insert => PendingMode::StrictInsert,
         LoadMode::Overwrite => PendingMode::Overwrite,
     };
     // Map LoadMode to the early table-version policy. Append/Merge may stage
@@ -1053,8 +1104,8 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // Overwrite keeps the strict early check because it replaces the image; its
     // later branch-wide mismatch surfaces `ReadSetChanged` without replay.
     let load_op_kind = match mode {
-        LoadMode::Append => crate::db::MutationOpKind::Insert,
-        LoadMode::Merge => crate::db::MutationOpKind::Merge,
+        LoadMode::Insert => crate::db::MutationOpKind::Insert,
+        LoadMode::Upsert | LoadMode::Replace => crate::db::MutationOpKind::Merge,
         LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
     };
     let StrictGraphRows {
@@ -1066,14 +1117,23 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // synchronous — surfaces validation errors before any S3 traffic.
     let mut node_id_remap = TypedNodeIdRemap::default();
     let mut prepared_keyed_bytes = 0;
-    let mut prepared_nodes: Vec<(String, String, Vec<RecordBatch>, usize)> =
+    // An `upsert` load keeps the properties a record omits on an existing key:
+    // each batch is built on its type's relaxed schema beside the cells its
+    // records leave out, which Phase 2b fills from the stored rows.
+    let keep_omitted = mode == LoadMode::Upsert;
+    let mut prepared_nodes: Vec<PreparedTypeBatches> =
         Vec::with_capacity(node_rows.len().saturating_add(strict_nodes.len()));
     let mut __dst_nr: Vec<_> = node_rows.into_iter().collect();
     __dst_nr.sort_by(|a, b| a.0.cmp(&b.0));
     for (type_name, rows) in __dst_nr {
-        let node_type = &catalog.node_types[&type_name];
+        let (node_type, omitted) = relaxed_node_type(
+            &catalog.node_types[&type_name],
+            rows.iter(),
+            catalog.system_columns,
+            keep_omitted,
+        );
         let batch = build_node_batch(
-            node_type,
+            &node_type,
             &rows,
             &mut node_id_remap,
             catalog.system_columns,
@@ -1088,7 +1148,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let _entry = snapshot
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-        prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
+        prepared_nodes.push((type_name, table_key, vec![(batch, omitted)], loaded_count));
     }
     let mut __dst_sn: Vec<_> = strict_nodes.into_iter().collect();
     __dst_sn.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1097,22 +1157,24 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let _entry = snapshot
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-        let batch = normalize_strict_json_rows(&catalog, &table_key, &rows, write_budget)?;
+        let (batch, omitted) =
+            normalize_strict_json_rows(&catalog, &table_key, &rows, write_budget, keep_omitted)?;
         if bounded_keyed_input {
             prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch, write_budget)?;
         }
         let loaded_count = batch.num_rows();
-        prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
+        prepared_nodes.push((type_name, table_key, vec![(batch, omitted)], loaded_count));
     }
     if let Some(prepared) = csv_batch.take_if(|prepared| !prepared.is_edge) {
         let _entry = snapshot.dataset(&prepared.table_key).ok_or_else(|| {
             OmniError::manifest(missing_graph_type_at_snapshot(&prepared.table_key))
         })?;
         prepared_keyed_bytes = admit_csv_batches(&prepared, prepared_keyed_bytes, write_budget)?;
+        let batches = prepared.batches_with_omitted_cells();
         prepared_nodes.push((
             prepared.type_name,
             prepared.table_key,
-            prepared.batches,
+            batches,
             prepared.rows,
         ));
     }
@@ -1142,7 +1204,13 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.expected_version,
             load_op_kind,
         )?;
-        for batch in batches {
+        for (batch, omitted) in batches {
+            let batch = if omitted.is_empty() {
+                batch
+            } else {
+                keep_omitted_load_properties(db, &staging, &catalog, &table_key, batch, &omitted)
+                    .await?
+            };
             if let Some(retained) = &retained {
                 retained.hold(&batch)?;
                 staged_bytes = staged_bytes
@@ -1156,14 +1224,19 @@ async fn load_jsonl_reader_once<R: BufRead>(
 
     // Phase 2d: build edge batches. Edge referential integrity (and the rest)
     // runs end-of-load via the unified evaluator, below.
-    let mut prepared_edges: Vec<(String, String, Vec<RecordBatch>, usize)> =
+    let mut prepared_edges: Vec<PreparedTypeBatches> =
         Vec::with_capacity(edge_rows.len().saturating_add(strict_edges.len()));
     let mut __dst_er: Vec<_> = edge_rows.into_iter().collect();
     __dst_er.sort_by(|a, b| a.0.cmp(&b.0));
     for (edge_name, rows) in __dst_er {
-        let edge_type = &catalog.edge_types[&edge_name];
+        let (edge_type, omitted) = relaxed_edge_type(
+            &catalog.edge_types[&edge_name],
+            rows.iter().map(|(_, _, data)| data),
+            catalog.system_columns,
+            keep_omitted,
+        );
         let batch = build_edge_batch(
-            edge_type,
+            &edge_type,
             &rows,
             &node_id_remap,
             catalog.system_columns,
@@ -1178,7 +1251,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let _entry = snapshot
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-        prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
+        prepared_edges.push((edge_name, table_key, vec![(batch, omitted)], loaded_count));
     }
     let mut __dst_se: Vec<_> = strict_edges.into_iter().collect();
     __dst_se.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1187,22 +1260,24 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let _entry = snapshot
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-        let batch = normalize_strict_json_rows(&catalog, &table_key, &rows, write_budget)?;
+        let (batch, omitted) =
+            normalize_strict_json_rows(&catalog, &table_key, &rows, write_budget, keep_omitted)?;
         if bounded_keyed_input {
             prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch, write_budget)?;
         }
         let loaded_count = batch.num_rows();
-        prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
+        prepared_edges.push((edge_name, table_key, vec![(batch, omitted)], loaded_count));
     }
     if let Some(prepared) = csv_batch.take_if(|prepared| prepared.is_edge) {
         let _entry = snapshot.dataset(&prepared.table_key).ok_or_else(|| {
             OmniError::manifest(missing_graph_type_at_snapshot(&prepared.table_key))
         })?;
         admit_csv_batches(&prepared, prepared_keyed_bytes, write_budget)?;
+        let batches = prepared.batches_with_omitted_cells();
         prepared_edges.push((
             prepared.type_name,
             prepared.table_key,
-            prepared.batches,
+            batches,
             prepared.rows,
         ));
     }
@@ -1224,7 +1299,13 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.expected_version,
             load_op_kind,
         )?;
-        for batch in batches {
+        for (batch, omitted) in batches {
+            let batch = if omitted.is_empty() {
+                batch
+            } else {
+                keep_omitted_load_properties(db, &staging, &catalog, &table_key, batch, &omitted)
+                    .await?
+            };
             if let Some(retained) = &retained {
                 retained.hold(&batch)?;
                 staged_bytes = staged_bytes
@@ -1558,8 +1639,9 @@ pub(crate) async fn plan_load(
         target: request.target.clone(),
         mode: match request.mode {
             LoadMode::Overwrite => LoadStmtMode::Overwrite,
-            LoadMode::Append => LoadStmtMode::Append,
-            LoadMode::Merge => LoadStmtMode::Merge,
+            LoadMode::Insert => LoadStmtMode::Insert,
+            LoadMode::Upsert => LoadStmtMode::Upsert,
+            LoadMode::Replace => LoadStmtMode::Replace,
         },
         delimiter: request.delimiter,
         header: request.header,
@@ -2282,6 +2364,148 @@ impl TypedNodeIdRemap {
     }
 }
 
+/// One type's prepared load input: its name, table key, batches beside the
+/// cells their records omit, and its record count.
+type PreparedTypeBatches = (String, String, Vec<(RecordBatch, OmittedCells)>, usize);
+
+/// Fill the cells an `upsert` load's records omit from the committed rows of
+/// their keys (a load's records never replace one another), then refuse a
+/// required property a new key leaves out; see `exec::keep_omitted`.
+async fn keep_omitted_load_properties(
+    db: &Omnigraph,
+    staging: &MutationStaging,
+    catalog: &Catalog,
+    table_key: &str,
+    batch: RecordBatch,
+    omitted: &OmittedCells,
+) -> Result<RecordBatch> {
+    let schema = if let Some(name) = table_key.strip_prefix("node:") {
+        catalog.node_types.get(name).map(|t| t.arrow_schema.clone())
+    } else {
+        table_key
+            .strip_prefix("edge:")
+            .and_then(|name| catalog.edge_types.get(name))
+            .map(|t| t.arrow_schema.clone())
+    }
+    .ok_or_else(|| {
+        OmniError::manifest_internal(format!("load fills omitted cells of unknown '{table_key}'"))
+    })?;
+    crate::exec::keep_omitted::keep_omitted_properties(
+        db,
+        staging,
+        table_key,
+        &schema,
+        batch,
+        omitted,
+        catalog.system_columns.id,
+        crate::exec::keep_omitted::EarlierEffects::Unseen,
+        &|property, id, omitted| {
+            if omitted {
+                OmniError::manifest(format!(
+                    "{table_key}: record '{id}' omits required property '{property}' and no \
+                     stored row has its key to keep it from"
+                ))
+            } else {
+                OmniError::manifest(format!(
+                    "non-nullable property '{property}' has null or invalid values"
+                ))
+            }
+        },
+    )
+    .await
+}
+
+/// The properties each of `rows` (JSON objects keyed by property name)
+/// leaves out, over `schema`'s property columns: identity and endpoint
+/// columns and the key's members, which every record names, are skipped.
+fn json_omitted_cells<'a>(
+    schema: &SchemaRef,
+    key: Option<&Vec<String>>,
+    rows: impl Iterator<Item = &'a JsonValue> + Clone,
+    system_columns: SystemColumns,
+) -> OmittedCells {
+    let mut omitted = OmittedCells::default();
+    for field in schema.fields() {
+        let name = field.name().as_str();
+        if name == system_columns.id
+            || name == system_columns.src
+            || name == system_columns.dst
+            || key.is_some_and(|key| key.iter().any(|k| k == name))
+        {
+            continue;
+        }
+        omitted.push(
+            name,
+            rows.clone()
+                .map(|row| {
+                    row.as_object()
+                        .is_none_or(|object| !object.contains_key(name))
+                })
+                .collect(),
+        );
+    }
+    omitted
+}
+
+/// `node_type` with the columns `rows` omit made nullable, so a `merge`
+/// load builds its batch before filling them, and the omitted cells; the
+/// type itself and no cells when `keep_omitted` is off.
+fn relaxed_node_type<'a>(
+    node_type: &NodeType,
+    rows: impl Iterator<Item = &'a JsonValue> + Clone,
+    system_columns: SystemColumns,
+    keep_omitted: bool,
+) -> (std::borrow::Cow<'_, NodeType>, OmittedCells) {
+    if !keep_omitted {
+        return (
+            std::borrow::Cow::Borrowed(node_type),
+            OmittedCells::default(),
+        );
+    }
+    let omitted = json_omitted_cells(
+        &node_type.arrow_schema,
+        node_type.key.as_ref(),
+        rows,
+        system_columns,
+    );
+    if omitted.is_empty() {
+        return (std::borrow::Cow::Borrowed(node_type), omitted);
+    }
+    let mut relaxed = node_type.clone();
+    relaxed.arrow_schema = relaxed_schema(&node_type.arrow_schema, &omitted);
+    (std::borrow::Cow::Owned(relaxed), omitted)
+}
+
+/// [`relaxed_node_type`] for an edge type.
+fn relaxed_edge_type<'a>(
+    edge_type: &omnigraph_compiler::catalog::EdgeType,
+    rows: impl Iterator<Item = &'a JsonValue> + Clone,
+    system_columns: SystemColumns,
+    keep_omitted: bool,
+) -> (
+    std::borrow::Cow<'_, omnigraph_compiler::catalog::EdgeType>,
+    OmittedCells,
+) {
+    if !keep_omitted {
+        return (
+            std::borrow::Cow::Borrowed(edge_type),
+            OmittedCells::default(),
+        );
+    }
+    let omitted = json_omitted_cells(
+        &edge_type.arrow_schema,
+        edge_type.key.as_ref(),
+        rows,
+        system_columns,
+    );
+    if omitted.is_empty() {
+        return (std::borrow::Cow::Borrowed(edge_type), omitted);
+    }
+    let mut relaxed = edge_type.clone();
+    relaxed.arrow_schema = relaxed_schema(&edge_type.arrow_schema, &omitted);
+    (std::borrow::Cow::Owned(relaxed), omitted)
+}
+
 fn build_node_batch(
     node_type: &NodeType,
     rows: &[JsonValue],
@@ -2582,12 +2806,17 @@ fn edge_key_columns(
 /// Normalize a bounded group of caller-shaped rows into one dense logical
 /// Arrow batch. This keeps strict validation at the graph facade without
 /// paying one RecordBatch allocation per NDJSON line.
+/// Normalize strict rows into one batch. With `keep_omitted` (an `upsert`
+/// load), the batch is on the type's relaxed schema and the returned cells
+/// name the properties each row leaves out, which the load fills from the
+/// stored row before staging.
 pub(crate) fn normalize_strict_json_rows(
     catalog: &Catalog,
     table_key: &str,
     rows: &[JsonValue],
     write_budget: WriteBudget,
-) -> Result<RecordBatch> {
+    keep_omitted: bool,
+) -> Result<(RecordBatch, OmittedCells)> {
     if rows.is_empty() {
         return Err(OmniError::manifest_internal(
             "strict entity normalization requires at least one entity",
@@ -2598,13 +2827,21 @@ pub(crate) fn normalize_strict_json_rows(
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{type_name}'")))?;
-        normalize_strict_node_rows(node_type, rows, catalog.system_columns, write_budget)
+        let (node_type, omitted) =
+            relaxed_node_type(node_type, rows.iter(), catalog.system_columns, keep_omitted);
+        let batch =
+            normalize_strict_node_rows(&node_type, rows, catalog.system_columns, write_budget)?;
+        Ok((batch, omitted))
     } else if let Some(type_name) = table_key.strip_prefix("edge:") {
         let edge_type = catalog
             .edge_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{type_name}'")))?;
-        normalize_strict_edge_rows(edge_type, rows, catalog.system_columns, write_budget)
+        let (edge_type, omitted) =
+            relaxed_edge_type(edge_type, rows.iter(), catalog.system_columns, keep_omitted);
+        let batch =
+            normalize_strict_edge_rows(&edge_type, rows, catalog.system_columns, write_budget)?;
+        Ok((batch, omitted))
     } else {
         Err(OmniError::manifest(format!(
             "invalid table key '{table_key}'"
@@ -4924,7 +5161,7 @@ edge WorksAt: Person -> Company
         );
 
         let result = db
-            .load_graph_batch("main", input, LoadMode::Append)
+            .load_graph_batch("main", input, LoadMode::Insert)
             .await
             .unwrap();
         assert_eq!(result.nodes_loaded["Person"], 2);
@@ -4973,7 +5210,7 @@ node Doc {
             .load_graph_batch(
                 "main",
                 r#"{"type":"Doc","data":{"slug":"doc-1","body":"hello"}}"#,
-                LoadMode::Append,
+                LoadMode::Insert,
             )
             .await
             .expect("a nullable @embed target may remain null");
@@ -5078,7 +5315,7 @@ node Doc {
         let before = db.snapshot().await;
         for (case, input, expected) in cases {
             let error = db
-                .load_graph_batch("main", input, LoadMode::Append)
+                .load_graph_batch("main", input, LoadMode::Insert)
                 .await
                 .expect_err(case);
             assert!(error.to_string().contains(expected), "{case}: {error}");
@@ -5298,7 +5535,7 @@ node Doc {
         let batch2 = r#"{"type": "Person", "data": {"name": "Bob", "age": 25}}"#;
 
         db.load_jsonl(batch1, LoadMode::Overwrite).await.unwrap();
-        db.load_jsonl(batch2, LoadMode::Append).await.unwrap();
+        db.load_jsonl(batch2, LoadMode::Insert).await.unwrap();
 
         let snap = db.snapshot().await;
         let person_ds = snap.open_dataset("node:Person").await.unwrap();
@@ -5423,7 +5660,7 @@ node Doc {
                 Some("missing-base"),
                 r#"{"type":"Person","data":{"name":"Bob","age":26}}
 {"type":"Person","data":{"name":"Eve","age":31}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
@@ -5431,7 +5668,7 @@ node Doc {
         assert_eq!(result.branch, "feature");
         assert_eq!(result.base_branch, "missing-base");
         assert!(!result.branch_created);
-        assert_eq!(result.mode, LoadMode::Merge);
+        assert_eq!(result.mode, LoadMode::Replace);
         assert_eq!(
             result.declarations,
             vec![IngestDeclarationResult {
@@ -5519,7 +5756,7 @@ node Doc {
         );
 
         let result = db
-            .load_as("feature", Some("main"), TEST_DATA, LoadMode::Merge, None)
+            .load_as("feature", Some("main"), TEST_DATA, LoadMode::Replace, None)
             .await
             .unwrap();
 
@@ -5540,7 +5777,7 @@ node Doc {
                 "feature",
                 Some("main"),
                 r#"{"type":"Person","data":{"name":"Bob","age":26}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
                 None,
             )
             .await
@@ -5559,7 +5796,7 @@ node Doc {
         );
 
         let result = db
-            .load_as("nonexistent", None, TEST_DATA, LoadMode::Merge, None)
+            .load_as("nonexistent", None, TEST_DATA, LoadMode::Replace, None)
             .await;
         assert!(
             result.is_err(),

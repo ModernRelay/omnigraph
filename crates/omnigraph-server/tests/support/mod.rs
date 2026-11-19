@@ -1074,7 +1074,7 @@ pub async fn build_parity_graph() -> (tempfile::TempDir, PathBuf, PathBuf) {
             "feature",
             None,
             r#"{"type":"Person","data":{"name":"ParityEve","age":29}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
             None,
         )
         .await

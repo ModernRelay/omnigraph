@@ -1557,7 +1557,7 @@ async fn mcp_write_tools_are_conditional_and_policy_gated() {
         &app,
         "secret",
         "load",
-        json!({"graph":"default","mode":"merge","data":"{\"type\":\"Person\",\"data\":{\"name\":\"Gina\",\"age\":50}}"}),
+        json!({"graph":"default","mode":"replace","data":"{\"type\":\"Person\",\"data\":{\"name\":\"Gina\",\"age\":50}}"}),
     )
     .await;
     assert_eq!(loaded["result"]["isError"], false, "{loaded}");
@@ -1615,7 +1615,7 @@ async fn mcp_write_tools_are_conditional_and_policy_gated() {
         &app,
         "secret",
         "load",
-        json!({"graph":"default","branch":"forked","from":"main","mode":"append","data":"{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":31}}"}),
+        json!({"graph":"default","branch":"forked","from":"main","mode":"insert","data":"{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":31}}"}),
     )
     .await;
     assert_eq!(refused["result"]["isError"], true, "{refused}");

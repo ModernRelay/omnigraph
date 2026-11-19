@@ -82,7 +82,7 @@ async fn historical_explicit_unions_pin_all_members_and_refuse_a_member_absent_a
         .unwrap();
     db.load_jsonl(
         r#"{"edge":"Likes","from":"Alice","to":"Charlie"}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -100,7 +100,7 @@ async fn historical_explicit_unions_pin_all_members_and_refuse_a_member_absent_a
     );
     db.load_jsonl(
         r#"{"edge":"Likes","from":"Alice","to":"Bob"}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -296,7 +296,7 @@ async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation(
     db.load(
         "main",
         r#"{"type":"Person","data":{"name":"Alice"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -416,7 +416,7 @@ async fn historical_query_binds_properties_by_identity_not_name() {
             "\n",
             r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"since":2020}}"#,
         ),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();

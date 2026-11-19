@@ -641,7 +641,7 @@ async fn repeated_loads_do_not_accumulate_branches() {
             r#"{{"type":"Person","data":{{"name":"p{}","age":{}}}}}"#,
             i, i
         );
-        db.load_jsonl(&payload, LoadMode::Append).await.unwrap();
+        db.load_jsonl(&payload, LoadMode::Insert).await.unwrap();
     }
 
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
@@ -927,7 +927,7 @@ async fn keyed_bytes_summed_across_tables_refuse_mutation_and_every_load_door_be
         serde_json::json!({"type":"Other","data":{"key":"two","payload":payload}}),
     );
     drop(payload);
-    for mode in [LoadMode::Append, LoadMode::Merge] {
+    for mode in [LoadMode::Insert, LoadMode::Replace] {
         for strict in [false, true] {
             let outcome = if strict {
                 with_stage_write_probes(probes.clone(), db.load_graph_batch("main", &input, mode))
@@ -1028,12 +1028,12 @@ edge LinkZ: Zed -> Zed { n: I32? }
             let error = if strict {
                 with_stage_write_probes(
                     probes.clone(),
-                    db.load_graph_batch("main", input, LoadMode::Append),
+                    db.load_graph_batch("main", input, LoadMode::Insert),
                 )
                 .await
                 .err()
             } else {
-                with_stage_write_probes(probes.clone(), db.load_jsonl(input, LoadMode::Append))
+                with_stage_write_probes(probes.clone(), db.load_jsonl(input, LoadMode::Insert))
                     .await
                     .err()
             };
@@ -1192,7 +1192,7 @@ async fn load_csv_source_read_is_bounded_by_the_deadline() {
     let request = CsvLoadRequest {
         source: source.clone(),
         target: LoadTarget::Node("Person".to_string()),
-        mode: LoadMode::Append,
+        mode: LoadMode::Insert,
         delimiter: b',',
         header: true,
         columns: None,
@@ -1412,7 +1412,7 @@ async fn explain_load_answers_the_plan_without_reading_the_source() {
     );
 
     let (result, _) = db
-        .explain_load("main", &parse_explain("append"))
+        .explain_load("main", &parse_explain("insert"))
         .await
         .unwrap();
     assert_eq!(route(&result.to_rust_json().unwrap()), "executor");
@@ -1478,8 +1478,8 @@ async fn load_csv_statement_probes_and_reads_its_source_once() {
     );
 
     for (mode, expected_rows, payload_reads) in [
-        (LoadMode::Append, 2, 1),
-        (LoadMode::Merge, 2, 1),
+        (LoadMode::Insert, 2, 1),
+        (LoadMode::Replace, 2, 1),
         (LoadMode::Overwrite, 2, 2),
     ] {
         let request = CsvLoadRequest {
@@ -2545,7 +2545,7 @@ query clear_both($content: Blob?, $preview: Blob?) {
             "from": "by-load", "to": "by-update",
             "data": {"payload": "base64:bmV3", "thumb": null}}),
     );
-    db.load_jsonl(&whole_rows, LoadMode::Merge)
+    db.load_jsonl(&whole_rows, LoadMode::Replace)
         .await
         .expect("a merge load of the whole row never reads the stored cells");
     for cell in [node("content"), edge("payload")] {
@@ -2952,7 +2952,7 @@ async fn removed_ids_summed_across_types_refuse_delete_and_overwrite_before_stag
         probes.clone(),
         db.load_jsonl(
             "{\"type\":\"Person\",\"data\":{\"name\":\"small\"}}",
-            LoadMode::Append,
+            LoadMode::Insert,
         ),
     )
     .await
@@ -3308,7 +3308,7 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
 {"edge": "Knows", "from": "Mallory", "to": "Ghost"}
 "#;
     let err = db
-        .load_jsonl(bad, LoadMode::Append)
+        .load_jsonl(bad, LoadMode::Insert)
         .await
         .expect_err("RI violation must fail the load");
     let OmniError::Manifest(manifest_err) = err else {
@@ -3334,7 +3334,7 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
 
     // Second load against the same tables — succeeds (no HEAD drift).
     let good = r#"{"type": "Person", "data": {"name": "Pat", "age": 55}}"#;
-    db.load_jsonl(good, LoadMode::Append).await.unwrap();
+    db.load_jsonl(good, LoadMode::Insert).await.unwrap();
     assert_eq!(
         count_rows(&db, "node:Person").await,
         pre_persons + 1,
@@ -3423,7 +3423,7 @@ edge WorksAt: Person -> Company @card(0..1)
 {"edge": "WorksAt", "from": "Alice", "to": "Bigco"}
 "#;
     let err = db
-        .load_jsonl(bad, LoadMode::Append)
+        .load_jsonl(bad, LoadMode::Insert)
         .await
         .expect_err("cardinality violation must fail the load");
     let OmniError::Manifest(manifest_err) = err else {
@@ -3440,7 +3440,7 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(mid_works, pre_works);
 
     let good = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}"#;
-    db.load_jsonl(good, LoadMode::Append).await.unwrap();
+    db.load_jsonl(good, LoadMode::Insert).await.unwrap();
     assert_eq!(
         count_rows(&db, "edge:WorksAt").await,
         pre_works + 1,
@@ -3726,7 +3726,7 @@ query drop_docs() {
             serde_json::json!({"edge":"Link","from":from,"to":to}).to_string()
         };
         for (from, to) in [("keep", last.as_str()), (first.as_str(), last.as_str())] {
-            db.load_jsonl(&append(from, to), LoadMode::Append)
+            db.load_jsonl(&append(from, to), LoadMode::Insert)
                 .await
                 .unwrap();
         }
@@ -3734,7 +3734,7 @@ query drop_docs() {
             db.ensure_indices_as(None).await.unwrap();
         }
         for (from, to) in [("keep", middle.as_str()), ("keep", "keep")] {
-            db.load_jsonl(&append(from, to), LoadMode::Append)
+            db.load_jsonl(&append(from, to), LoadMode::Insert)
                 .await
                 .unwrap();
         }
@@ -3819,7 +3819,7 @@ query add_person($name: String, $friend: String) {
     );
 }
 
-/// `LoadMode::Merge` on edges must NOT double-count the committed
+/// `LoadMode::Replace` on edges must NOT double-count the committed
 /// edge AND its updated pending replacement. Build a custom
 /// schema where WorksAt has @card(0..1). Seed Alice with one WorksAt to
 /// Acme. Then Merge-load the SAME edge id (so it's an update, not an
@@ -3855,7 +3855,7 @@ edge WorksAt: Person -> Company @card(0..1)
     // would trip @card(0..1). With merge dedupe, Alice has 1 WorksAt.
     let merge_data = r#"{"edge": "WorksAt", "id": "w1", "from": "Alice", "to": "Bigco", "data": {}}
 "#;
-    db.load_jsonl(merge_data, LoadMode::Merge)
+    db.load_jsonl(merge_data, LoadMode::Replace)
         .await
         .expect("Merge update must dedupe the committed edge by id");
 
@@ -3903,7 +3903,7 @@ edge WorksAt: Person -> Company @card(0..1)
     let dup_data = r#"{"edge": "WorksAt", "id": "w1", "from": "Alice", "to": "Acme", "data": {}}
 {"edge": "WorksAt", "id": "w1", "from": "Alice", "to": "Bigco", "data": {}}
 "#;
-    db.load_jsonl(dup_data, LoadMode::Merge)
+    db.load_jsonl(dup_data, LoadMode::Replace)
         .await
         .expect("Merge load with within-input dup ids must dedupe pending count");
 
@@ -4291,7 +4291,7 @@ async fn first_write_self_heals_manifest_unreferenced_fork_on_live_branch() {
 
     // load → must self-heal, not wedge with "incomplete prior delete".
     let row = r#"{"type":"Person","data":{"name":"Zoe","age":30}}"#;
-    db.load_as("feature", None, row, LoadMode::Merge, None)
+    db.load_as("feature", None, row, LoadMode::Replace, None)
         .await
         .expect("load onto a manifest-unreferenced fork must self-heal, not wedge");
 
@@ -4595,7 +4595,7 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
     let seed: String = (1..=40)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    db.load_jsonl(&seed, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(&seed, LoadMode::Replace).await.unwrap();
 
     // Same-key updates: Lance Operation::Update rewrites these 15 rows into
     // new fragments that keep their original stable row ids (the overlap).
@@ -4607,7 +4607,7 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
             )
         })
         .collect();
-    db.load_jsonl(&updates, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(&updates, LoadMode::Replace).await.unwrap();
 
     // The delete adds a deletion vector, so the overlapping region no longer
     // densely tiles its id range — the shape lance#7444 choked on.
@@ -4651,13 +4651,13 @@ async fn filtered_read_after_append_and_delete_is_consistent() {
     let seed: String = (1..=40)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    db.load_jsonl(&seed, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(&seed, LoadMode::Replace).await.unwrap();
 
     // Disjoint keys: plain inserts, no fragment rewrite, no id reuse.
     let more: String = (41..=55)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    db.load_jsonl(&more, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(&more, LoadMode::Replace).await.unwrap();
 
     mutate_main(
         &db,
@@ -5386,7 +5386,7 @@ query bump_all() {
     );
 }
 
-/// `replace` and a `merge` load replace the whole row on an existing key:
+/// `replace` and a `replace` load write the whole row on an existing key:
 /// every nullable property the statement or record omits becomes null, a
 /// managed Blob and a vector included, and an explicit `null` clears too. A
 /// missing required property is refused on an existing key as on a new one.
@@ -5396,7 +5396,7 @@ query bump_all() {
 /// `issue_1278_replace_writes_the_whole_row.gqt` pins the scalar, list and
 /// vector rows of the mutation door.
 #[tokio::test]
-async fn replace_and_merge_load_replace_the_whole_row_issue_1278() {
+async fn replace_statement_and_load_write_the_whole_row_issue_1278() {
     use arrow_array::cast::AsArray;
     use base64::Engine as _;
 
@@ -5479,7 +5479,7 @@ query retitle($slug: String) {
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     db.branch_create("feature").await.unwrap();
 
-    // The mutation door on main, the merge load on the branch.
+    // The mutation door on main, the `replace` load on the branch.
     let result = db
         .mutate("main", WRITES, "retitle", &params(&[("$slug", "d1")]))
         .await
@@ -5489,19 +5489,19 @@ query retitle($slug: String) {
         "feature",
         None,
         r#"{"type":"Doc","data":{"slug":"d2","title":"merged"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
     .unwrap();
-    // An explicit null clears through the merge load too.
+    // An explicit null clears through the `replace` load too.
     db.load_jsonl(
         &serde_json::json!({"type": "Doc", "data": {
             "slug": "d3", "title": "full", "n": 7, "tags": ["a", "b"],
             "emb": null, "file": null,
         }})
         .to_string(),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -5521,7 +5521,7 @@ query retitle($slug: String) {
     let error = db
         .load_jsonl(
             r#"{"type":"Doc","data":{"slug":"d2","n":1}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap_err();
@@ -5547,7 +5547,7 @@ query retitle($slug: String) {
         assert_eq!(
             row_state(&db, "feature", "d2").await,
             ("merged".to_string(), false, false, false),
-            "{when}: the merge load nulls every omitted property on the branch"
+            "{when}: the `replace` load nulls every omitted property on the branch"
         );
         assert!(blob_is_null(&db, "feature", "d2").await, "{when}");
         assert_eq!(
@@ -5694,6 +5694,51 @@ query twice() {
         .unwrap();
     assert_eq!(result.affected_nodes, 2);
 
+    // The load door: an `upsert` load keeps what a record omits, on main and
+    // on a branch; an explicit null clears; a new key without the required
+    // `title` is refused and publishes nothing, while an existing key needs
+    // no `title`.
+    db.load_jsonl(
+        &[full_row("d5", 5), full_row("d6", 6)].join("\n"),
+        LoadMode::Insert,
+    )
+    .await
+    .unwrap();
+    db.branch_create("loads").await.unwrap();
+    db.load_jsonl(
+        &[
+            r#"{"type":"Doc","data":{"slug":"d5","title":"loaded"}}"#,
+            r#"{"type":"Doc","data":{"slug":"d6","emb":[4.0,5.0,6.0],"file":null}}"#,
+        ]
+        .join("\n"),
+        LoadMode::Upsert,
+    )
+    .await
+    .unwrap();
+    db.load_as(
+        "loads",
+        None,
+        r#"{"type":"Doc","data":{"slug":"d6","title":"branch"}}"#,
+        LoadMode::Upsert,
+        None,
+    )
+    .await
+    .unwrap();
+    let head = head_commit_id(&uri).await;
+    let error = db
+        .load_jsonl(
+            r#"{"type":"Doc","data":{"slug":"d7","emb":[1.0,1.0,1.0]}}"#,
+            LoadMode::Upsert,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("title"), "{error}");
+    assert_eq!(
+        head_commit_id(&uri).await,
+        head,
+        "a refused upsert load publishes nothing"
+    );
+
     for reopened in [false, true] {
         let db = if reopened {
             helpers::session(Omnigraph::open(&uri).await.unwrap())
@@ -5746,6 +5791,32 @@ query twice() {
             None,
             "{when}: created without a Blob"
         );
+        assert_eq!(
+            row_state(&db, "main", "d5").await,
+            ("loaded".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: an upsert load keeps the vector its record omits"
+        );
+        assert_eq!(
+            blob(&db, "main", "d5").await,
+            Some(vec![5_u8; 300]),
+            "{when}: and the Blob"
+        );
+        assert_eq!(
+            row_state(&db, "main", "d6").await,
+            ("full".to_string(), Some(vec![4.0, 5.0, 6.0])),
+            "{when}: an upsert load without `title` on an existing key keeps it"
+        );
+        assert_eq!(blob(&db, "main", "d6").await, None, "{when}: null clears");
+        assert_eq!(
+            row_state(&db, "loads", "d6").await,
+            ("branch".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: an upsert load on a branch keeps the branch's row"
+        );
+        assert_eq!(
+            blob(&db, "loads", "d6").await,
+            Some(vec![6_u8; 300]),
+            "{when}"
+        );
     }
 }
 
@@ -5789,4 +5860,21 @@ query beside_a_replace() {
         );
         assert_eq!(head_commit_id(uri).await, head, "{name} published nothing");
     }
+    // The load door: an `insert` load of an existing key fails the same way.
+    let error = db
+        .load_jsonl(
+            r#"{"type":"Person","data":{"name":"Alice","age":1}}"#,
+            LoadMode::Insert,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OmniError::KeyConflict { .. }),
+        "insert load: {error:?}"
+    );
+    assert_eq!(
+        head_commit_id(uri).await,
+        head,
+        "the insert load published nothing"
+    );
 }

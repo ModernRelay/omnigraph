@@ -2627,7 +2627,7 @@ query title_contains_case() {
         &[
             "load",
             "--mode",
-            "append",
+            "insert",
             "--data",
             additions.to_str().unwrap(),
             "--target",

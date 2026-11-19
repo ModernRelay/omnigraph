@@ -361,7 +361,7 @@ async fn cross_version_unique_rejected_on_append_load() {
     let (_dir, db) = init_with(UNIQUE_SCHEMA, "").await;
     db.load_jsonl(
         r#"{"type":"User","data":{"name":"Bob","email":"dup@example.com"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -369,7 +369,7 @@ async fn cross_version_unique_rejected_on_append_load() {
         .load_jsonl(
             r#"{"type":"User","data":{"name":"Carol","email":"dup@example.com"}}
 {"type":"User","data":{"name":"Dave","email":"dave@example.com"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap_err();
@@ -395,14 +395,14 @@ async fn cross_version_unique_rejected_on_date_column() {
     let (_dir, db) = init_with(DATE_UNIQUE_SCHEMA, "").await;
     db.load_jsonl(
         r#"{"type":"Task","data":{"name":"T1","due":"2026-06-29"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
     let err = db
         .load_jsonl(
             r#"{"type":"Task","data":{"name":"T2","due":"2026-06-29"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap_err();
@@ -422,13 +422,13 @@ async fn noncolliding_write_to_date_unique_column_succeeds() {
     let (_dir, db) = init_with(DATE_UNIQUE_SCHEMA, "").await;
     db.load_jsonl(
         r#"{"type":"Task","data":{"name":"T1","due":"2026-06-29"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
     db.load_jsonl(
         r#"{"type":"Task","data":{"name":"T2","due":"2026-07-01"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect("a distinct Date value must not collide and must not raise a coercion error");
@@ -451,7 +451,7 @@ async fn merge_load_edge_src_move_rechecks_vacated_src_cardinality() {
     let err = db
         .load_jsonl(
             r#"{"edge":"WorksAt","id":"E1","from":"Bob","to":"Acme","data":{}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect_err("moving Alice's only edge to Bob drops Alice below @card(1..)");
@@ -480,7 +480,7 @@ async fn merge_load_duplicate_edge_id_counts_once_per_card() {
     // (Bob->Beta). Alice stays at her one committed edge (E0).
     let batch = r#"{"edge":"WorksAt","id":"E1","from":"Alice","to":"Beta","data":{}}
 {"edge":"WorksAt","id":"E1","from":"Bob","to":"Beta","data":{}}"#;
-    db.load_jsonl(batch, LoadMode::Merge)
+    db.load_jsonl(batch, LoadMode::Replace)
         .await
         .expect("a deduped edge id must not double-count Alice into a @card(0..1) violation");
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 2);
@@ -530,7 +530,7 @@ async fn jsonl_load_refuses_a_source_node_without_its_required_edge() {
 {"edge":"WorksAt","id":"E1","from":"Alice","to":"Acme","data":{}}"#;
     let (_dir, db) = init_with(CARD_MIN_SCHEMA, seed).await;
 
-    for mode in [LoadMode::Append, LoadMode::Merge] {
+    for mode in [LoadMode::Insert, LoadMode::Replace] {
         let err = db
             .load_jsonl(
                 r#"{"type":"Person","data":{"name":"Bob"}}
@@ -550,7 +550,7 @@ async fn jsonl_load_refuses_a_source_node_without_its_required_edge() {
     let err = db
         .load_jsonl(
             r#"{"type":"Person","data":{"name":"Bob"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .expect_err("a source node loaded without its edges is below @card(1..)");
@@ -570,13 +570,13 @@ async fn jsonl_load_refuses_a_source_node_without_its_required_edge() {
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Bob"}}
 {"edge":"WorksAt","id":"E2","from":"Bob","to":"Acme","data":{}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect("a source node and its required edge in one load meet @card(1..)");
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Alice"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("Alice keeps her committed WorksAt");
@@ -683,8 +683,8 @@ async fn jsonl_edge_overwrite_recounts_the_sources_it_empties() {
 async fn merge_load_reupsert_existing_key_is_not_unique_violation() {
     let (_dir, db) = init_with(UNIQUE_SCHEMA, "").await;
     let row = r#"{"type":"User","data":{"name":"Alice","email":"alice@example.com"}}"#;
-    db.load_jsonl(row, LoadMode::Merge).await.unwrap();
-    db.load_jsonl(row, LoadMode::Merge)
+    db.load_jsonl(row, LoadMode::Replace).await.unwrap();
+    db.load_jsonl(row, LoadMode::Replace)
         .await
         .expect("merge-load re-upserting an existing @key is not a unique violation");
 }
@@ -704,7 +704,7 @@ node Message {
 
 #[tokio::test]
 async fn load_issue_765_camelcase_unique_column_loads_and_rejects_duplicates() {
-    for mode in [LoadMode::Append, LoadMode::Merge] {
+    for mode in [LoadMode::Insert, LoadMode::Replace] {
         let (_dir, db) = init_with(CAMEL_UNIQUE_SCHEMA, "").await;
         db.load_jsonl(
             r#"{"type":"Message","data":{"slug":"msg-1","messageId":"<a@b>"}}"#,
@@ -752,7 +752,7 @@ async fn append_load_rejects_orphan_edge() {
     let err = db
         .load_jsonl(
             r#"{"edge":"Knows","from":"Alice","to":"Ghost"}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap_err();
@@ -816,7 +816,7 @@ async fn overwrite_finds_a_retained_orphan_past_the_first_removed_id_chunk_issue
     for _ in 0..2 {
         db.load_jsonl(
             r#"{"edge":"Knows","from":"keep","to":"keep"}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -833,7 +833,7 @@ async fn overwrite_finds_a_retained_orphan_past_the_first_removed_id_chunk_issue
         r#"{"edge":"Knows","from":"keep","to":"keep"}"#.to_string(),
         format!(r#"{{"edge":"Knows","from":"keep","to":"{last}"}}"#),
     ] {
-        db.load_jsonl(&edge, LoadMode::Append).await.unwrap();
+        db.load_jsonl(&edge, LoadMode::Insert).await.unwrap();
     }
     let err = db
         .load_jsonl(keep_only, LoadMode::Overwrite)
@@ -963,7 +963,7 @@ async fn cardinality_rejected_on_jsonl_load() {
     let (_dir, db) = init_with(CARDINALITY_SCHEMA, CARDINALITY_SEED).await;
     let bad = r#"{"edge":"WorksAt","from":"Alice","to":"Acme"}
 {"edge":"WorksAt","from":"Alice","to":"Beta"}"#;
-    let err = db.load_jsonl(bad, LoadMode::Append).await.unwrap_err();
+    let err = db.load_jsonl(bad, LoadMode::Insert).await.unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("cardinality")
             || err.to_string().to_lowercase().contains("@card"),
@@ -1084,7 +1084,7 @@ async fn keyed_edge_load_refuses_mismatched_explicit_id() {
     let err = db
         .load_jsonl(
             r#"{"edge":"Knows","id":"wrong","from":"Alice","to":"Bob","data":{}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap_err();
@@ -1102,15 +1102,15 @@ async fn keyed_edge_load_refuses_mismatched_explicit_id() {
 async fn keyed_edge_load_derives_and_converges_on_merge() {
     let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
     let row = r#"{"edge":"Knows","from":"Alice","to":"Bob"}"#;
-    db.load_jsonl(row, LoadMode::Merge).await.unwrap();
-    db.load_jsonl(row, LoadMode::Merge)
+    db.load_jsonl(row, LoadMode::Replace).await.unwrap();
+    db.load_jsonl(row, LoadMode::Replace)
         .await
         .expect("merge-load re-upserting an existing keyed edge converges");
     assert_eq!(count_rows(&db, "edge:Knows").await, 1);
 
     let explicit =
         r#"{"edge":"Knows","id":"[\"Alice\",\"Bob\"]","from":"Alice","to":"Bob","data":{}}"#;
-    db.load_jsonl(explicit, LoadMode::Merge)
+    db.load_jsonl(explicit, LoadMode::Replace)
         .await
         .expect("an explicit id equal to the derivation is accepted");
     assert_eq!(count_rows(&db, "edge:Knows").await, 1);
@@ -1123,7 +1123,7 @@ async fn keyed_edge_append_load_refuses_mismatched_explicit_id() {
     let err = db
         .load_jsonl(
             r#"{"edge":"Knows","id":"wrong","from":"Alice","to":"Bob","data":{}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap_err();
@@ -1141,8 +1141,8 @@ async fn keyed_edge_append_load_refuses_mismatched_explicit_id() {
 async fn keyed_edge_append_load_conflicts_on_committed_key() {
     let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
     let row = r#"{"edge":"Knows","from":"Alice","to":"Bob"}"#;
-    db.load_jsonl(row, LoadMode::Append).await.unwrap();
-    let err = db.load_jsonl(row, LoadMode::Append).await.unwrap_err();
+    db.load_jsonl(row, LoadMode::Insert).await.unwrap();
+    let err = db.load_jsonl(row, LoadMode::Insert).await.unwrap_err();
     assert!(
         err.to_string().contains("already has this id"),
         "got: {}",
@@ -1186,7 +1186,7 @@ async fn keyed_edge_null_key_member_rejected_on_load() {
     let err = db
         .load_jsonl(
             r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"since":null}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap_err();

@@ -3050,7 +3050,7 @@ mod tests {
         db.load_jsonl(
             r#"{"type":"Person","data":{"name":"seed"}}
 {"type":"Company","data":{"name":"seed"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3060,7 +3060,7 @@ mod tests {
             for type_name in ["Person", "Company"] {
                 db.load_jsonl(
                     &format!("{{\"type\":\"{type_name}\",\"data\":{{\"name\":\"{name}\",\"embedding\":[1.0,2.0]}}}}"),
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .unwrap();
@@ -3123,7 +3123,7 @@ mod tests {
         db.load_jsonl(
             "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\"}}\n\
              {\"type\":\"Company\",\"data\":{\"name\":\"Acme\"}}",
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();

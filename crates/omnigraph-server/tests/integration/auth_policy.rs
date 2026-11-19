@@ -333,9 +333,9 @@ async fn signed_identities_obey_current_policy_and_attribute_writes() {
 
 fn signed_load_request(token: &str, fork: bool) -> Request<Body> {
     let path = if fork {
-        "/load/ndjson?branch=load_review&from=main&mode=merge"
+        "/load/ndjson?branch=load_review&from=main&mode=replace"
     } else {
-        "/load/ndjson?branch=load_review&mode=merge"
+        "/load/ndjson?branch=load_review&mode=replace"
     };
     Request::builder()
         .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
@@ -2172,7 +2172,7 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         .load_with_receipt(
             "feature",
             r#"{"type":"Person","data":{"name":"feature-only","age":40}}"#,
-            omnigraph::loader::LoadMode::Merge,
+            omnigraph::loader::LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2185,7 +2185,7 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         .load_with_receipt(
             "gone",
             r#"{"type":"Person","data":{"name":"gone-only","age":41}}"#,
-            omnigraph::loader::LoadMode::Merge,
+            omnigraph::loader::LoadMode::Replace,
         )
         .await
         .unwrap()
@@ -2364,7 +2364,7 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         .load_with_receipt(
             "main",
             r#"{"type":"Person","data":{"name":"later","age":42}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2413,7 +2413,7 @@ async fn policy_merge_dry_run_needs_read_and_not_branch_merge() {
     db.load_with_receipt(
         "feature",
         r#"{"type":"Person","data":{"name":"feature-only","age":40}}"#,
-        omnigraph::loader::LoadMode::Merge,
+        omnigraph::loader::LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2489,7 +2489,7 @@ async fn policy_branch_review_needs_read_on_the_target() {
             "\n",
             r#"{"type":"Person","data":{"name":"feature-two","age":41}}"#,
         ),
-        omnigraph::loader::LoadMode::Merge,
+        omnigraph::loader::LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2497,7 +2497,7 @@ async fn policy_branch_review_needs_read_on_the_target() {
         .load_with_receipt(
             "private",
             r#"{"type":"Person","data":{"name":"private-only","age":42}}"#,
-            omnigraph::loader::LoadMode::Merge,
+            omnigraph::loader::LoadMode::Replace,
         )
         .await
         .unwrap()
@@ -2658,7 +2658,7 @@ async fn policy_diff_continuation_follows_a_moved_inherited_head() {
             "\n",
             r#"{"type":"Person","data":{"name":"other-two","age":41}}"#,
         ),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2708,7 +2708,7 @@ async fn policy_diff_continuation_follows_a_moved_inherited_head() {
         .load_with_receipt(
             "fresh",
             r#"{"type":"Person","data":{"name":"fresh-one","age":42}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2974,7 +2974,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     db.load(
         "feature",
         r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -4157,12 +4157,16 @@ async fn policy_commit_list_continuation_stays_on_a_readable_branch() {
         format!(r#"{{"type":"Person","data":{{"name":"{name}","age":{age}}}}}"#)
     };
     for i in 0..24 {
-        db.load_with_receipt("secret", &person(format!("secret-{i}"), i), LoadMode::Merge)
-            .await
-            .unwrap();
+        db.load_with_receipt(
+            "secret",
+            &person(format!("secret-{i}"), i),
+            LoadMode::Replace,
+        )
+        .await
+        .unwrap();
     }
     for i in 0..4 {
-        db.load_with_receipt("main", &person(format!("main-{i}"), i), LoadMode::Merge)
+        db.load_with_receipt("main", &person(format!("main-{i}"), i), LoadMode::Replace)
             .await
             .unwrap();
     }

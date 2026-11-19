@@ -2089,7 +2089,7 @@ async fn offline_deployment_upgrade_preserves_data_history_and_applied_facts() {
     );
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Ada","age":37}}"#,
-        omnigraph::loader::LoadMode::Merge,
+        omnigraph::loader::LoadMode::Replace,
     )
     .await
     .unwrap();

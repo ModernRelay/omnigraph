@@ -252,7 +252,7 @@ query set_note($title: String, $note: String) {
     .unwrap();
     main.load_jsonl(
         r#"{"type":"Document","data":{"title":"scalar","note":"before"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();

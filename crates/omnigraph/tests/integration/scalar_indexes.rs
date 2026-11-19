@@ -149,7 +149,7 @@ async fn a_lagging_bitmap_label_list_or_ngram_is_rebuilt_in_its_own_family() {
                 &format!(
                     r#"{{"type":"Item","data":{{"slug":"{slug}","status":"archived","published":"2025-03-03T00:00:00Z","rank":9,"title":"zeta","active":false,"tags":["z"],"note":"n"}}}}"#
                 ),
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();

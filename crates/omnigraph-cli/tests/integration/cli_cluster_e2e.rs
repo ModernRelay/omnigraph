@@ -236,7 +236,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
             .arg(temp.path().join("seed.jsonl"))
             .args([
                 "--mode",
-                "merge",
+                "replace",
                 "--target",
                 KEYED_SERVER_NAME,
                 "--graph",

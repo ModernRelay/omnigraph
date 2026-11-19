@@ -60,13 +60,13 @@ async fn fixture(dir: &tempfile::TempDir, removed: usize, fragments: usize) -> S
         .map(|slug| serde_json::json!({"type": "Doc", "data": {"slug": slug}}).to_string())
         .collect();
     for chunk in docs.chunks(8_000) {
-        db.load_jsonl(&chunk.join("\n"), LoadMode::Merge)
+        db.load_jsonl(&chunk.join("\n"), LoadMode::Replace)
             .await
             .unwrap();
     }
     let edge = serde_json::json!({"edge": "Link", "from": "keep", "to": "keep"}).to_string();
     for _ in 0..fragments {
-        db.load_jsonl(&edge, LoadMode::Append).await.unwrap();
+        db.load_jsonl(&edge, LoadMode::Insert).await.unwrap();
     }
     db
 }
@@ -159,7 +159,7 @@ async fn delete_of_many_ids_over_indexed_and_unindexed_edge_fragments_stays_boun
     db.ensure_indices_as(None).await.unwrap();
     let edge = serde_json::json!({"edge": "Link", "from": "keep", "to": "keep"}).to_string();
     for _ in 0..appended {
-        db.load_jsonl(&edge, LoadMode::Append).await.unwrap();
+        db.load_jsonl(&edge, LoadMode::Insert).await.unwrap();
     }
     delete_and_measure(&db, removed, indexed + appended).await;
 }

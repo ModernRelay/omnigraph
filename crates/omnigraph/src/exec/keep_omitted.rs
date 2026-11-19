@@ -115,7 +115,6 @@ pub(crate) enum EarlierEffects {
     Seen,
     /// A load's input is one set: no record replaces another of the same
     /// input, so only committed rows are read.
-    #[allow(dead_code)] // the load door's `upsert` mode takes it
     Unseen,
 }
 

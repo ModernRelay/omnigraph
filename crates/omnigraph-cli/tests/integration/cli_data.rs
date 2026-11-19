@@ -356,7 +356,7 @@ fn blob_get_honors_branch_and_immutable_snapshot_targets() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--branch")
             .arg("feature")
             .arg("--data")
@@ -374,7 +374,7 @@ fn blob_get_honors_branch_and_immutable_snapshot_targets() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&main_data)
             .arg("--target")
@@ -1246,7 +1246,7 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
     .unwrap();
     output_success(
         cli()
-            .args(["load", "--mode", "merge", "--branch", "feature", "--data"])
+            .args(["load", "--mode", "replace", "--branch", "feature", "--data"])
             .arg(&rows)
             .arg("--target")
             .arg(&graph),
@@ -2113,7 +2113,7 @@ fn load_json_outputs_summary_for_main_branch() {
 }
 
 #[test]
-fn load_into_feature_branch_with_merge_mode_succeeds() {
+fn load_into_feature_branch_with_replace_mode_succeeds() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
@@ -2144,15 +2144,87 @@ fn load_into_feature_branch_with_merge_mode_succeeds() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .arg(&graph),
     );
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("branch feature"));
-    assert!(stdout.contains("with merge"));
+    assert!(stdout.contains("with replace"));
     assert!(stdout.contains("1 entities across 1 node types and 0 edge types"));
+}
+
+/// `--mode upsert` keeps the properties a record omits, `--mode replace`
+/// writes the whole entity and `--mode insert` fails on an existing key with
+/// nothing published; edition 2's `append` and `merge` are refused at
+/// argument parsing with the mode that now means what they meant.
+#[test]
+fn load_modes_are_the_write_statements_issue_1278() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let age_of = |name: &str| -> Value {
+        let payload = parse_stdout_json(&output_success(
+            cli()
+                .arg("query")
+                .arg("--target")
+                .arg(&graph)
+                .arg("-e")
+                .arg(format!(
+                    "query q() {{ match {{ $p: Person }} where $p.name = \"{name}\" return {{ $p.age }} }}"
+                ))
+                .arg("--json"),
+        ));
+        payload["rows"][0]["p.age"].clone()
+    };
+    let rows = temp.path().join("partial.jsonl");
+    write_jsonl(&rows, r#"{"type":"Person","data":{"name":"Alice"}}"#);
+    let load = |mode: &str| {
+        let mut command = cli();
+        command
+            .arg("load")
+            .arg("--data")
+            .arg(&rows)
+            .arg("--mode")
+            .arg(mode)
+            .arg("--target")
+            .arg(&graph);
+        command
+    };
+
+    let upserted = output_success(&mut load("upsert"));
+    assert!(stdout_string(&upserted).contains("with upsert"));
+    assert_eq!(age_of("Alice"), 30, "upsert keeps the age the record omits");
+
+    let refused = output_failure(&mut load("insert"));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("upsert"),
+        "an insert load of an existing key names `upsert`: {refused:?}"
+    );
+    assert_eq!(
+        age_of("Alice"),
+        30,
+        "the refused insert load changed nothing"
+    );
+
+    output_success(&mut load("replace"));
+    assert_eq!(
+        age_of("Alice"),
+        Value::Null,
+        "replace writes the whole entity, the omitted age null"
+    );
+
+    for (old, new) in [("append", "insert"), ("merge", "replace")] {
+        let refused = output_failure(&mut load(old));
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&format!("the load mode `{old}` was removed"))
+                && stderr.contains(&format!("write `{new}`")),
+            "{old}: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -2295,7 +2367,7 @@ fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(&graph),
     );
@@ -2855,7 +2927,7 @@ fn csv_query_output_round_trips_through_load_csv() {
             .arg("--data")
             .arg(&rows)
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .arg(&source),
     );
@@ -3761,7 +3833,7 @@ fn a_policy_refused_served_load_reports_not_started() {
         vec![
             "load".to_string(),
             "--mode".into(),
-            "append".into(),
+            "insert".into(),
             "--data".into(),
             rows.to_string_lossy().into_owned(),
             "--branch".into(),
@@ -3834,7 +3906,7 @@ fn an_embedded_load_reports_its_fork_from_the_engine() {
     fs::write(&rows, "not valid graph NDJSON\n").unwrap();
     let load = |branch: &str| {
         cli()
-            .args(["load", "--mode", "append", "--data"])
+            .args(["load", "--mode", "insert", "--data"])
             .arg(&rows)
             .args(["--branch", branch, "--from", "main", "--json", "--target"])
             .arg(&graph)
@@ -3899,9 +3971,9 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         vec!["mutate", "-e", "commit drop \"proposal\"", "--yes"],
         vec!["commit", "publish", "proposal"],
         vec!["commit", "drop", "proposal", "--yes"],
-        vec!["load", "--data", data, "--mode", "append"],
+        vec!["load", "--data", data, "--mode", "insert"],
         vec![
-            "load", "--data", data, "--mode", "merge", "--branch", "review", "--from", "main",
+            "load", "--data", data, "--mode", "replace", "--branch", "review", "--from", "main",
         ],
         vec![
             "blob", "put", "node", "Document", "readme", "content", "--file", data,
@@ -5205,7 +5277,7 @@ fn write_echoes_resolved_target_to_stderr() {
         init_graph(&graph);
         let data = fixture("test.jsonl");
         let mut load = cli();
-        load.args(["load", "--mode", "append", "--data"])
+        load.args(["load", "--mode", "insert", "--data"])
             .arg(&data)
             .arg("--target")
             .arg(&graph)
@@ -5624,7 +5696,7 @@ fn branch_merge_defaults_target_to_main() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(&graph),
     );
@@ -5927,7 +5999,7 @@ fn branch_merge_supports_explicit_target() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(&graph),
     );
@@ -5978,7 +6050,7 @@ fn branch_merge_delete_branch_retires_parent_with_live_child() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(&graph),
     );
@@ -6311,7 +6383,7 @@ fn cli_fails_for_missing_schema_or_data_file() {
         let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
         let mut command = cli();
         command
-            .args(["load", "--mode", "append", "--data"])
+            .args(["load", "--mode", "insert", "--data"])
             .arg(&missing_data)
             .args(["--target"])
             .fixture_target(&server.origin)
@@ -7115,7 +7187,7 @@ query insert_person($name: String, $age: I32) {
         addressed(&mut load, by_store);
         load.arg("--data")
             .arg(&data)
-            .args(["--mode", "append", "--json"]);
+            .args(["--mode", "insert", "--json"]);
         with_actor(&mut load, actor);
         let mut mutate = cli();
         mutate.arg("mutate");
@@ -7173,7 +7245,7 @@ query insert_person($name: String, $age: I32) {
         .arg(&base)
         .arg("--data")
         .arg(temp.path().join("row-1.jsonl"))
-        .args(["--mode", "append", "--as", "act-outsider", "--json"]);
+        .args(["--mode", "insert", "--as", "act-outsider", "--json"]);
     let refused = load.output().unwrap();
     unlock_cluster_fixture(&root);
     assert!(!refused.status.success(), "{refused:?}");
@@ -7337,7 +7409,7 @@ fn changes_baseline_succeeds_and_prints_the_paired_cursor() {
             .arg("--data")
             .arg(&data)
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .arg(&graph),
     );

@@ -2261,7 +2261,7 @@ async fn load_runs(db: &Session, records: ArchiveRecordIter) -> Result<(), Proje
 }
 
 async fn load_batch(db: &Session, body: &str) -> Result<(), ProjectionError> {
-    db.load_graph_batch("main", body, LoadMode::Append)
+    db.load_graph_batch("main", body, LoadMode::Insert)
         .await
         .map_err(|error| {
             ProjectionError::new("projection_graph_load_failed", None, error.to_string())

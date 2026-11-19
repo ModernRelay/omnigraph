@@ -506,8 +506,10 @@ impl FragmentWriteSpec {
     pub fn adapter(&self) -> &'static str {
         match self.mode {
             LoadStmtMode::Overwrite => "fragments",
-            LoadStmtMode::Append => "strict_insert",
-            LoadStmtMode::Merge => "upsert",
+            LoadStmtMode::Insert => "strict_insert",
+            // An `upsert` load fills the cells its records omit before it
+            // stages, so both keyed modes run the whole-row upsert adapter.
+            LoadStmtMode::Upsert | LoadStmtMode::Replace => "upsert",
         }
     }
 }

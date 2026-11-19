@@ -31,7 +31,7 @@ async fn selected_fanout_obeys_work_and_memory_limits_issue_659() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    db.load_jsonl(&extra, LoadMode::Append).await.unwrap();
+    db.load_jsonl(&extra, LoadMode::Insert).await.unwrap();
     let selected = EXPAND.replace("knows", "(knows | likes)");
     let probes = QueryMemoryProbes::default();
     let result = with_query_memory_probes(
@@ -1033,7 +1033,7 @@ async fn wide_source_fanout_stays_within_the_query_pool() {
     v2.load_jsonl(
         &serde_json::json!({"type":"Person","data":{"name":"hub","payload":"x".repeat(16 * 1024)}})
             .to_string(),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1445,7 +1445,7 @@ async fn a_hydrated_fetch_stops_at_the_chunk_bound_when_rows_widen() {
     let wide_rows: Vec<String> = (0..96)
         .map(|row| person(format!("b{row:03}"), "w".repeat(wide)))
         .collect();
-    db.load_jsonl(&wide_rows.join("\n"), LoadMode::Append)
+    db.load_jsonl(&wide_rows.join("\n"), LoadMode::Insert)
         .await
         .unwrap();
     let v2 = db.clone();

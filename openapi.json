@@ -9635,7 +9635,7 @@
           {
             "name": "mode",
             "in": "query",
-            "description": "How existing entities are handled. Defaults to `merge`.",
+            "description": "What a record does to an existing key: `insert`, `upsert`, `replace`\nor `overwrite`. Defaults to `replace`; `append` and `merge` are\nrefused with `insert` and `replace` as their fixes.",
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/LoadMode"
@@ -16071,7 +16071,7 @@
               },
               {
                 "$ref": "#/components/schemas/LoadMode",
-                "description": "How existing entities are handled. Defaults to `merge`."
+                "description": "What a record does to an existing key: `insert`, `upsert`, `replace`\nor `overwrite`. Defaults to `replace`; `append` and `merge` are\nrefused with `insert` and `replace` as their fixes."
               }
             ]
           }
@@ -16190,9 +16190,10 @@
         "type": "string",
         "description": "Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.",
         "enum": [
-          "overwrite",
-          "append",
-          "merge"
+          "insert",
+          "upsert",
+          "replace",
+          "overwrite"
         ]
       },
       "LoadOperatorExecutedOutput": {

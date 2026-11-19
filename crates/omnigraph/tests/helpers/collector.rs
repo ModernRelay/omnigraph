@@ -165,7 +165,7 @@ pub async fn merge_three_chunk_chain(dir: &tempfile::TempDir) -> (Session, Strin
     let db = session(Omnigraph::init(&uri, KEY_SCORE_SCHEMA).await.unwrap());
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"base","score":0}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -183,7 +183,7 @@ pub async fn merge_three_chunk_chain(dir: &tempfile::TempDir) -> (Session, Strin
                 "{{\"type\":\"Person\",\"data\":{{\"name\":\"merge-row-{row}\",\"score\":1}}}}\n"
             ));
         }
-        db.load("feature", &rows, LoadMode::Append).await.unwrap();
+        db.load("feature", &rows, LoadMode::Insert).await.unwrap();
     }
     assert_eq!(
         count_rows_branch(&db, "feature", "node:Person").await,

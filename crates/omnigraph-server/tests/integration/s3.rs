@@ -231,7 +231,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     let load = IngestRequest {
         branch: None,
         from: None,
-        mode: Some(LoadMode::Append),
+        mode: Some(LoadMode::Insert),
         data: json!({
             "type": "Person",
             "data": {
@@ -268,7 +268,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     let missing = IngestRequest {
         branch: None,
         from: None,
-        mode: Some(LoadMode::Append),
+        mode: Some(LoadMode::Insert),
         data: json!({
             "type": "Person",
             "data": {

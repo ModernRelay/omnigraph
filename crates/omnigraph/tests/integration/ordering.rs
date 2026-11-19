@@ -123,7 +123,7 @@ async fn ordering_parallel_edge_tie_breaks_by_physical_edge_id() {
     .unwrap();
     db.load_jsonl(
         r#"{"edge":"Knows","id":"edge-a","from":"Alice","to":"Bob","data":{"label":"id-first"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();

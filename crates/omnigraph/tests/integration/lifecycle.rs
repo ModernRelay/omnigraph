@@ -655,7 +655,7 @@ node Document {
     let dir = tempfile::tempdir().unwrap();
     let db = historical_graph(&dir, UNIQUE_TAGS).await;
     let error = db
-        .load("main", TAGS_ROW, omnigraph::loader::LoadMode::Merge)
+        .load("main", TAGS_ROW, omnigraph::loader::LoadMode::Replace)
         .await
         .expect_err("the historical @unique(tags) refuses a write that sets tags");
     assert!(
@@ -672,7 +672,7 @@ node Document {
         .apply_schema(BASE_SCHEMA)
         .await
         .expect("the property comes back without the constraint");
-    db.load("main", TAGS_ROW, omnigraph::loader::LoadMode::Merge)
+    db.load("main", TAGS_ROW, omnigraph::loader::LoadMode::Replace)
         .await
         .expect("a write that sets tags succeeds once the constraint is gone");
     assert_eq!(db.db().schema_source().as_str(), BASE_SCHEMA);
@@ -927,11 +927,11 @@ async fn write_preparation_manifest_read_failures_carry_before_effect_evidence()
     let merge_error = db.branch_merge("refusal-probe", "main").await.unwrap_err();
     let data = r#"{"type":"Person","data":{"name":"blocked","age":12}}"#;
     let load_error = db
-        .load("main", data, omnigraph::loader::LoadMode::Append)
+        .load("main", data, omnigraph::loader::LoadMode::Insert)
         .await
         .unwrap_err();
     let graph_batch_error = db
-        .load_graph_batch("main", data, omnigraph::loader::LoadMode::Append)
+        .load_graph_batch("main", data, omnigraph::loader::LoadMode::Insert)
         .await
         .unwrap_err();
     let fork_load_error = db
@@ -939,7 +939,7 @@ async fn write_preparation_manifest_read_failures_carry_before_effect_evidence()
             "load-probe",
             Some("main"),
             data,
-            omnigraph::loader::LoadMode::Append,
+            omnigraph::loader::LoadMode::Insert,
             None,
         )
         .await
@@ -988,7 +988,7 @@ async fn write_capture_rejects_schema_ir_tables_missing_from_manifest() {
     let err = db
         .load_jsonl(
             r#"{"type":"Person","data":{"name":"blocked"}}"#,
-            omnigraph::loader::LoadMode::Merge,
+            omnigraph::loader::LoadMode::Replace,
         )
         .await
         .expect_err("write preparation must reject schema/manifest identity drift");

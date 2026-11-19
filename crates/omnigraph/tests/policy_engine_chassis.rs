@@ -553,7 +553,7 @@ async fn load_as_denies_when_policy_rejects_actor() {
             "main",
             None,
             ONE_PERSON_JSONL,
-            LoadMode::Merge,
+            LoadMode::Replace,
             Some("act-denied"),
         )
         .await;
@@ -569,7 +569,7 @@ async fn load_as_allows_when_policy_permits_actor() {
         "main",
         None,
         ONE_PERSON_JSONL,
-        LoadMode::Merge,
+        LoadMode::Replace,
         Some("act-allowed"),
     )
     .await
@@ -593,7 +593,7 @@ async fn load_file_as_denies_when_policy_rejects_actor() {
             "main",
             None,
             data_path.to_str().unwrap(),
-            LoadMode::Merge,
+            LoadMode::Replace,
             Some("act-denied"),
         )
         .await;
@@ -611,7 +611,7 @@ async fn load_file_as_allows_when_policy_permits_actor() {
         "main",
         None,
         data_path.to_str().unwrap(),
-        LoadMode::Merge,
+        LoadMode::Replace,
         Some("act-allowed"),
     )
     .await
@@ -629,7 +629,7 @@ async fn ingest_as_denies_when_policy_rejects_actor() {
             "main",
             Some("main"),
             ONE_PERSON_JSONL,
-            LoadMode::Merge,
+            LoadMode::Replace,
             Some("act-denied"),
         )
         .await;
@@ -646,7 +646,7 @@ async fn ingest_as_allows_when_policy_permits_actor() {
         "main",
         Some("main"),
         ONE_PERSON_JSONL,
-        LoadMode::Merge,
+        LoadMode::Replace,
         Some("act-allowed"),
     )
     .await
@@ -908,7 +908,7 @@ async fn non_canonical_branch_names_cannot_reach_a_protected_branch() {
             protected_state(&db).await,
         );
         let result = db
-            .load_as(main, None, ONE_PERSON_JSONL, LoadMode::Merge, actor)
+            .load_as(main, None, ONE_PERSON_JSONL, LoadMode::Replace, actor)
             .await
             .map(drop);
         check(
@@ -936,7 +936,7 @@ async fn non_canonical_branch_names_cannot_reach_a_protected_branch() {
                 "fresh",
                 Some(main),
                 ONE_PERSON_JSONL,
-                LoadMode::Merge,
+                LoadMode::Replace,
                 actor,
             )
             .await
@@ -1101,7 +1101,7 @@ rules:
 async fn init_with_maintenance_policy(dir: &tempfile::TempDir) -> Session {
     let db = init_and_load(dir).await;
     db.branch_create("feature").await.unwrap();
-    db.load("feature", ONE_PERSON_JSONL, LoadMode::Merge)
+    db.load("feature", ONE_PERSON_JSONL, LoadMode::Replace)
         .await
         .unwrap();
     for (name, age) in [("Eve", 40), ("Frank", 41)] {

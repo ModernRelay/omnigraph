@@ -17,7 +17,7 @@ const GENERATED_PERSON: &str = "tables:\n  - kind: node\n    name: Person\n    r
 #[test]
 fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
     let text = format!(
-        "{HDR}{SCHEMA}--- seed generate: v1 seed: 7\n{GENERATED_PERSON}--- load generate: v1 seed: 7 mode: merge branch: main\n{GENERATED_PERSON}{EXPECT_OK}"
+        "{HDR}{SCHEMA}--- seed generate: v1 seed: 7\n{GENERATED_PERSON}--- load generate: v1 seed: 7 mode: replace branch: main\n{GENERATED_PERSON}{EXPECT_OK}"
     );
     let case = parse_case("generated", &text).unwrap();
     assert!(matches!(
@@ -28,7 +28,7 @@ fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
     assert!(
         case.steps()[0]
             .source
-            .starts_with("--- load generate: v1 seed: 7 mode: merge branch: main")
+            .starts_with("--- load generate: v1 seed: 7 mode: replace branch: main")
     );
     let [Item::Step(Step::Load(load))] = case.items.as_slice() else {
         panic!("expected generated load");
@@ -38,9 +38,11 @@ fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
         ("generate: v1", "generate: v2"),
         ("seed: 7", "seed: -1"),
         ("seed: 7", "seed: 7 seed: 8"),
-        ("mode: merge", "mode: overwrite"),
-        ("mode: merge", "mode: unknown"),
-        ("mode: merge", ""),
+        ("mode: replace", "mode: overwrite"),
+        ("mode: replace", "mode: unknown"),
+        ("mode: replace", "mode: merge"),
+        ("mode: replace", "mode: append"),
+        ("mode: replace", ""),
         ("--- expect ok", "--- expect affected: nodes=1 edges=0"),
         ("--- expect ok", "--- params\n{}\n--- expect ok"),
     ] {
@@ -61,7 +63,7 @@ fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
         for source in [
             format!("{HDR}{SCHEMA}--- seed generate: v1 seed: 7\n{recipe}"),
             format!(
-                "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append\n{recipe}{EXPECT_OK}"
+                "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: insert\n{recipe}{EXPECT_OK}"
             ),
         ] {
             assert!(
@@ -138,7 +140,7 @@ async fn generated_params_supply_a_step_and_are_refused_outside_their_contract()
     for (from, to) in [
         ("generate: v1", "generate: v2"),
         (" seed: 7", ""),
-        ("seed: 7", "seed: 7 mode: merge"),
+        ("seed: 7", "seed: 7 mode: replace"),
         ("seed: 7", "seed: 7 branch: main"),
         (
             "{kind: key, prefix: gen-, width: 3}",
@@ -166,7 +168,7 @@ async fn generated_params_supply_a_step_and_are_refused_outside_their_contract()
         parse_case(
             "generated_params",
             &format!(
-                "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append\n{GENERATED_PERSON}{GENERATED}{EXPECT_OK}"
+                "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: insert\n{GENERATED_PERSON}{GENERATED}{EXPECT_OK}"
             )
         )
         .is_err(),
@@ -185,7 +187,7 @@ fn empty_generated_seeds_are_admitted_but_empty_loads_are_refused() {
         let seed = format!("{HDR}{SCHEMA}--- seed generate: v1 seed: 7\n{recipe}");
         assert!(parse_case("empty_seed", &seed).is_ok());
         let load = format!(
-            "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append branch: absent\n{recipe}{EXPECT_OK}"
+            "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: insert branch: absent\n{recipe}{EXPECT_OK}"
         );
         assert!(refusal("empty_load", &load).contains("at least one nonempty batch"));
     }
@@ -194,7 +196,7 @@ fn empty_generated_seeds_are_admitted_but_empty_loads_are_refused() {
 #[tokio::test]
 async fn generated_load_calls_the_host_once_before_checking_its_expectation() {
     let text = format!(
-        "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append\n{GENERATED_PERSON}--- expect error: deliberately false\n"
+        "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: insert\n{GENERATED_PERSON}--- expect error: deliberately false\n"
     );
     let case = parse_case("generated", &text).unwrap();
     let (session, uri, _dir) = open_case_store(&case).await.unwrap();
@@ -245,7 +247,7 @@ async fn generated_append_partitions_publish_the_declared_number_of_commits() {
 #[tokio::test]
 async fn generated_load_repeats_the_same_recipe_in_a_loop() {
     let text = format!(
-        "{HDR}{SCHEMA}--- seed\n--- loop $i 0 3\n--- load generate: v1 seed: 7 mode: merge\n{GENERATED_PERSON}{EXPECT_OK}--- endloop\n"
+        "{HDR}{SCHEMA}--- seed\n--- loop $i 0 3\n--- load generate: v1 seed: 7 mode: replace\n{GENERATED_PERSON}{EXPECT_OK}--- endloop\n"
     );
     let case = parse_case("generated", &text).unwrap();
     let (session, uri, _dir) = open_case_store(&case).await.unwrap();
@@ -296,7 +298,7 @@ async fn generated_load_observes_typed_errors_for_single_and_multiple_calls() {
             .replace("rows: 1", &format!("rows: {count}"))
             .replace("commits: 1", &format!("commits: {count}"));
         let text = format!(
-            "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append branch: absent\n{recipe}--- expect error: absent\n"
+            "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: insert branch: absent\n{recipe}--- expect error: absent\n"
         );
         let case = parse_case("generated", &text).unwrap();
         let (session, uri, _dir) = open_case_store(&case).await.unwrap();

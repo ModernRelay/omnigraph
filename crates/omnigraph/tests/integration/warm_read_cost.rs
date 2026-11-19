@@ -3091,7 +3091,7 @@ async fn merge_and_load_close_a_block_under_the_session_budget() {
                 async move {
                     history.requests();
                     let receipt = lowered
-                        .load_as_with_receipt("loaded", None, &line, LoadMode::Append, None)
+                        .load_as_with_receipt("loaded", None, &line, LoadMode::Insert, None)
                         .await
                         .unwrap();
                     receipt.commit.graph_commit_id

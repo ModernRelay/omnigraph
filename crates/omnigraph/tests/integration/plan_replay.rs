@@ -68,7 +68,7 @@ async fn a_fusion_ranks_targets_and_the_selected_edges_after_it_replay_issue_659
     .map(Value::to_string)
     .collect::<Vec<_>>()
     .join("\n");
-    db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
+    db.load_jsonl(&edges, LoadMode::Insert).await.unwrap();
     db.ensure_indices_as(None).await.unwrap();
     let query = r#"query selected_page() {
         match { let $pop = { match { $p: Person, $q: Person, $p $e:(knows | likes) $q } return { $p } }, from rrf(bm25($pop, $p.text, "needle"), bm25($pop, $p.text, "needle needle"), k: 60) as $score, $p $e:(knows | likes) $q }
@@ -99,7 +99,7 @@ async fn wildcard_replay_keeps_captured_members_and_pins_every_member_issue_659(
         .unwrap();
     db.load_jsonl(
         r#"{"edge":"Bookmarks","from":"cyd","to":"d1"}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -151,7 +151,7 @@ async fn wildcard_replay_keeps_captured_members_and_pins_every_member_issue_659(
     }
     db.load_jsonl(
         r#"{"edge":"Bookmarks","from":"bob","to":"d1"}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -206,7 +206,7 @@ async fn in_flight_wildcard_keeps_its_captured_schema_while_an_owner_adds_an_edg
     owner
         .load_jsonl(
             r#"{"edge":"Bookmarks","from":"cyd","to":"d1"}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -256,7 +256,7 @@ async fn selected_cold_indexed_route_uses_persisted_members_without_building_csr
         .unwrap();
     db.load_jsonl(
         r#"{"edge":"Bookmarks","from":"cyd","to":"d1"}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -2187,7 +2187,7 @@ async fn an_edge_write_after_planning_refuses_the_replay() {
     );
     db.load_jsonl(
         r#"{"edge":"Likes","from":"cyd","to":"d1"}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -2224,7 +2224,7 @@ async fn a_write_to_an_unread_table_leaves_the_replay_accepted() {
         .unwrap();
     db.load_jsonl(
         r#"{"edge":"Likes","from":"cyd","to":"d1"}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -2489,7 +2489,7 @@ async fn an_insert_after_planning_refuses_the_replay_of_a_count() {
     );
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"dee","age":60}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -2519,7 +2519,7 @@ async fn sibling_plan_replay_is_refused(
     let db = people(&dir).await;
     for (branch, batch) in [("left", left_write), ("right", right_write)] {
         db.branch_create(branch).await.unwrap();
-        db.load_with_receipt(branch, batch, LoadMode::Append)
+        db.load_with_receipt(branch, batch, LoadMode::Insert)
             .await
             .unwrap();
     }
@@ -2734,7 +2734,7 @@ async fn an_exact_bm25_replays_over_a_partially_indexed_property() {
     db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"t1","text":"graph","year":2022}}
 {"type":"Doc","data":{"slug":"t2","text":"graph graph graph graph","year":1990}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();

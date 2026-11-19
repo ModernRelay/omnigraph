@@ -3727,7 +3727,7 @@ mod tests {
                                 "main",
                                 None,
                                 file.path().to_str().unwrap(),
-                                CliLoadMode::Append,
+                                CliLoadMode::Insert,
                                 &[],
                                 &mut std::io::sink(),
                             )

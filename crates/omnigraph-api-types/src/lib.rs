@@ -336,15 +336,23 @@ fn history_release_bytes_schema() -> utoipa::openapi::schema::Object {
 #[schema(as = LoadMode)]
 #[allow(dead_code)]
 enum LoadModeSchema {
-    /// Overwrite existing data.
+    /// Creates every record; a record whose key exists fails the load with
+    /// `key_conflict` and nothing publishes. `append` is refused with this
+    /// mode as its fix.
+    #[schema(rename = "insert")]
+    Insert,
+    /// Creates a record whose key is absent; on an existing key sets the
+    /// properties the record names and keeps the others.
+    #[schema(rename = "upsert")]
+    Upsert,
+    /// Creates a record whose key is absent; on an existing key writes the
+    /// whole row, a property the record omits becoming null. `merge` is
+    /// refused with this mode as its fix.
+    #[schema(rename = "replace")]
+    Replace,
+    /// Each type the batch holds becomes exactly the batch's rows of it.
     #[schema(rename = "overwrite")]
     Overwrite,
-    /// Append to existing data.
-    #[schema(rename = "append")]
-    Append,
-    /// Merge by id key (upsert).
-    #[schema(rename = "merge")]
-    Merge,
 }
 
 /// Logical graph entity namespace.
@@ -2091,7 +2099,9 @@ pub struct IngestRequest {
     /// creation is opt-in by presence of this field; omit it to require an
     /// existing branch.
     pub from: Option<String>,
-    /// How existing entities are handled. Defaults to `merge`.
+    /// What a record does to an existing key: `insert`, `upsert`, `replace`
+    /// or `overwrite`. Defaults to `replace`; `append` and `merge` are
+    /// refused with `insert` and `replace` as their fixes.
     #[schema(value_type = Option<LoadModeSchema>)]
     pub mode: Option<LoadMode>,
     /// NDJSON payload: one record per line, each shaped
@@ -2110,7 +2120,9 @@ pub struct GraphBatchLoadQuery {
     pub branch: Option<String>,
     /// Parent branch used to create a missing target branch.
     pub from: Option<String>,
-    /// How existing entities are handled. Defaults to `merge`.
+    /// What a record does to an existing key: `insert`, `upsert`, `replace`
+    /// or `overwrite`. Defaults to `replace`; `append` and `merge` are
+    /// refused with `insert` and `replace` as their fixes.
     #[param(value_type = Option<LoadModeSchema>)]
     pub mode: Option<LoadMode>,
 }

@@ -497,8 +497,8 @@ fn endpoint_checks_without_consulted_statistics_probe_only_for_an_overwrite() {
     for (mode, source_bytes, expected) in [
         (LoadStmtMode::Overwrite, within, ValidateAccess::Probe),
         (LoadStmtMode::Overwrite, past, ValidateAccess::Probe),
-        (LoadStmtMode::Append, past, ValidateAccess::Scan),
-        (LoadStmtMode::Merge, past, ValidateAccess::Scan),
+        (LoadStmtMode::Insert, past, ValidateAccess::Scan),
+        (LoadStmtMode::Replace, past, ValidateAccess::Scan),
     ] {
         let op = operation(LoadTarget::Edge("Knows".into()), mode, source_bytes);
         let decision = route(&op, &source(), RouteOverride::Registry, &BOUNDS);
@@ -507,7 +507,7 @@ fn endpoint_checks_without_consulted_statistics_probe_only_for_an_overwrite() {
                 (Some(plan), explain)
             }
             (
-                LoadStmtMode::Append | LoadStmtMode::Merge,
+                LoadStmtMode::Insert | LoadStmtMode::Replace,
                 Decision::Executor {
                     reason,
                     explain,

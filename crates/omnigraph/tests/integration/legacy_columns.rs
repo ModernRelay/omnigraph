@@ -141,7 +141,7 @@ async fn legacy_vintage_graph_keeps_its_identity_and_change_images() {
         r#"{"edge":"WorksAt","id":"other","from":"Alice","to":"company-1","data":{"id":"duplicate"}}"#,
         r#"{"edge":"WorksAt","id":17,"from":"Alice","to":"company-1","data":{}}"#,
     ] {
-        assert!(db.load_jsonl(invalid, LoadMode::Append).await.is_err());
+        assert!(db.load_jsonl(invalid, LoadMode::Insert).await.is_err());
         assert_eq!(version_main(&db).await.unwrap(), loaded_version);
         assert_eq!(snapshot_id(&db, "main").await.unwrap(), loaded_commit);
         assert_eq!(count_rows(&db, "node:Company").await, 1);
@@ -632,7 +632,7 @@ async fn legacy_endpoint_constraint_keeps_the_accepted_shape_hash(constraint: &s
     if constraint.starts_with("@unique") {
         let before = version_main(&db).await.unwrap();
         let head = snapshot_id(&db, "main").await.unwrap();
-        let error = db.load_jsonl(r#"{"edge":"Knows","id":"duplicate","from":"alice","to":"bob","data":{"since":2021}}"#, LoadMode::Append).await.unwrap_err();
+        let error = db.load_jsonl(r#"{"edge":"Knows","id":"duplicate","from":"alice","to":"bob","data":{"since":2021}}"#, LoadMode::Insert).await.unwrap_err();
         assert!(
             error.to_string().to_lowercase().contains("unique"),
             "{error}"

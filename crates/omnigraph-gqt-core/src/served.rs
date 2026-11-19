@@ -487,7 +487,7 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
             .map_err(|error| format!("seed load failed: {error}")),
         Seed::Generated(generated) => {
             client
-                .load_generated(generated, MAIN_BRANCH, LoadMode::Append)
+                .load_generated(generated, MAIN_BRANCH, LoadMode::Insert)
                 .await
         }
     }?;
@@ -517,7 +517,7 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
             })?;
         if let Some(generated) = branches.recipe(&name)? {
             client
-                .load_generated(&generated, &name, LoadMode::Append)
+                .load_generated(&generated, &name, LoadMode::Insert)
                 .await
                 .map_err(|error| format!("branches fixture: load {name}: {error}"))?;
         }

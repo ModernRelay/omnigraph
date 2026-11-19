@@ -797,12 +797,12 @@ node User {
         );
         // Committed baseline so the cross-version `@unique` probe has a
         // non-empty committed view (an empty view skips the probe entirely).
-        db.load_jsonl(&users_jsonl("seed", 4), omnigraph::loader::LoadMode::Append)
+        db.load_jsonl(&users_jsonl("seed", 4), omnigraph::loader::LoadMode::Insert)
             .await
             .unwrap();
         let (res, io) = measure(db.load_jsonl(
             &users_jsonl(&format!("delta{rows}"), rows),
-            omnigraph::loader::LoadMode::Append,
+            omnigraph::loader::LoadMode::Insert,
         ))
         .await;
         res.unwrap();
@@ -920,7 +920,7 @@ async fn load_csv_reuses_endpoint_reads_and_falls_back_under_a_small_pool() {
         let source_dir = tempfile::tempdir().unwrap();
         let csv_path = source_dir.path().join("knows.csv");
         std::fs::write(&csv_path, "from,to\nAlice,Bob\nBob,Alice\n").unwrap();
-        for mode in [LoadMode::Overwrite, LoadMode::Append, LoadMode::Merge] {
+        for mode in [LoadMode::Overwrite, LoadMode::Insert, LoadMode::Replace] {
             let mut counts = Vec::new();
             for budget in [3 * 1024 * 1024, 150 * 1024 * 1024] {
                 let policy = ExternalBlobPolicy::allow(vec![

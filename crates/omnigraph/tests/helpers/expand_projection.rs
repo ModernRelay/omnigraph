@@ -59,7 +59,7 @@ pub async fn fixture(dir: &tempfile::TempDir, sources: usize, payload_bytes: usi
                     .to_string(),
             );
         }
-        db.load_jsonl(&lines.join("\n"), LoadMode::Append)
+        db.load_jsonl(&lines.join("\n"), LoadMode::Insert)
             .await
             .unwrap();
     }

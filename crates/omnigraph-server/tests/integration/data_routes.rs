@@ -1209,7 +1209,7 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
     db.load(
         "feature",
         r#"{"type":"Person","data":{"name":"Eve","age":29}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -1667,7 +1667,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     let ingest = IngestRequest {
         branch: Some("feature-ingest".to_string()),
         from: Some("main".to_string()),
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}
 {"type":"Person","data":{"name":"Bob","age":26}}"#
             .to_string(),
@@ -1689,7 +1689,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     assert_eq!(body["branch"], "feature-ingest");
     assert_eq!(body["base_branch"], "main");
     assert_eq!(body["branch_created"], true);
-    assert_eq!(body["mode"], "merge");
+    assert_eq!(body["mode"], "replace");
     assert_eq!(body["actor_id"], "act-andrew");
     assert_eq!(body["nodes"][0]["name"], "Person");
     assert_eq!(body["nodes"][0]["entities_loaded"], 2);
@@ -1722,7 +1722,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     let refused = IngestRequest {
         branch: Some("feature-refused".to_string()),
         from: Some("main".to_string()),
-        mode: Some(LoadMode::Append),
+        mode: Some(LoadMode::Insert),
         data: r#"{"type":"Person","data":{"name":"Bob","age":26}}"#.to_string(),
     };
     let (status, body) = json_response(
@@ -1829,7 +1829,7 @@ async fn a_load_that_forks_a_branch_deleted_during_its_body_reports_the_fork() {
     let request = Request::builder()
         .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
-        .uri(g("/load/ndjson?branch=feature&from=main&mode=append"))
+        .uri(g("/load/ndjson?branch=feature&from=main&mode=insert"))
         .header("content-type", "application/x-ndjson")
         .body(body)
         .unwrap();
@@ -1886,7 +1886,7 @@ async fn ingest_existing_branch_skips_branch_create_policy_check() {
     let ingest = IngestRequest {
         branch: Some("feature".to_string()),
         from: Some("other-base".to_string()),
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
     };
 
@@ -1915,7 +1915,7 @@ async fn ingest_without_from_returns_404_for_missing_branch_and_creates_nothing(
     let ingest = IngestRequest {
         branch: Some("feature-typo".to_string()),
         from: None,
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
     };
 
@@ -1957,7 +1957,7 @@ async fn ingest_without_from_loads_into_existing_branch() {
     let ingest = IngestRequest {
         branch: Some("feature".to_string()),
         from: None,
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
     };
 
@@ -1988,7 +1988,7 @@ async fn ingest_denies_missing_branch_without_branch_create_permission() {
     let ingest = IngestRequest {
         branch: Some("feature".to_string()),
         from: Some("main".to_string()),
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
     };
 
@@ -2022,7 +2022,7 @@ async fn ingest_denies_when_actor_lacks_change_permission() {
     let ingest = IngestRequest {
         branch: Some("feature".to_string()),
         from: Some("main".to_string()),
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
     };
 
@@ -2052,7 +2052,7 @@ async fn ingest_rejects_payloads_over_32_mib() {
     let oversize = IngestRequest {
         branch: Some("feature".to_string()),
         from: Some("main".to_string()),
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: "x".repeat(33 * 1024 * 1024),
     };
 
@@ -2279,7 +2279,7 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         let before = db.list_commits(None).await.unwrap();
         let request = match door {
             "/mutate" => json_post(door, &json!({"query": ATOMIC})),
-            "/load" => json_post(door, &json!({"data": BATCH, "mode": "append"})),
+            "/load" => json_post(door, &json!({"data": BATCH, "mode": "insert"})),
             "/load/ndjson" => Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .method(Method::POST)
@@ -2918,7 +2918,7 @@ async fn branch_statements_dispatch_to_their_route_bodies() {
 /// A `load csv` statement naming a source no base admits; the loaded test
 /// graph has no external Blob policy, so the served default, deny, applies.
 const LOAD_CSV_PEOPLE: &str =
-    "load csv \"s3://imports/people.csv\" into node:Person mode append header";
+    "load csv \"s3://imports/people.csv\" into node:Person mode insert header";
 
 /// Served `load csv` on `/mutate`, with and without the request `branch`:
 /// a graph without a policy denies the source before any byte is read, so
@@ -2930,7 +2930,7 @@ async fn load_csv_statement_is_denied_served_without_a_policy_and_moves_no_head(
     for request in [
         json!({"query": LOAD_CSV_PEOPLE}),
         json!({"query": LOAD_CSV_PEOPLE, "branch": "main"}),
-        json!({"query": "load csv \"file:///tmp/people.csv\" into node:Person mode append header"}),
+        json!({"query": "load csv \"file:///tmp/people.csv\" into node:Person mode insert header"}),
     ] {
         let (status, body) = json_response(&app, json_post("/mutate", &request)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {body}");
@@ -4701,13 +4701,13 @@ async fn write_max_bytes_request_override_reset_and_load_process_default() {
         let request = if path == "/load/ndjson" {
             Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/load/ndjson?branch=main&mode=append"))
+                .uri(g("/load/ndjson?branch=main&mode=insert"))
                 .method(Method::POST)
                 .header("content-type", "application/x-ndjson")
                 .body(Body::from(data.clone()))
                 .unwrap()
         } else {
-            json_post(path, &json!({"branch":"main","mode":"append","data":data}))
+            json_post(path, &json!({"branch":"main","mode":"insert","data":data}))
         };
         let (status, body) = json_response(&app, request).await;
         assert!(!status.is_success(), "{path}: {body}");
@@ -4722,6 +4722,92 @@ async fn write_max_bytes_request_override_reset_and_load_process_default() {
         status,
         StatusCode::OK,
         "a request may raise an environment default: {body}"
+    );
+}
+
+/// The HTTP load routes take the keyed write statements' names: `upsert`
+/// keeps what a record omits, `replace` writes the whole entity and `insert`
+/// refuses an existing key with nothing published; edition 2's `append` and
+/// `merge` are a 400 naming the mode that now means what they meant, before
+/// anything is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn load_routes_take_the_write_statement_modes_issue_1278() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let alice_age = |app: axum::Router| async move {
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/query",
+                &json!({"query": "query q() { match { $p: Person } where $p.name = \"Alice\" return { $p.age } }"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["rows"][0]["p.age"].clone()
+    };
+    let data = json!({"type": "Person", "data": {"name": "Alice"}}).to_string();
+    let ndjson = |mode: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(&format!("/load/ndjson?branch=main&mode={mode}")))
+            .method(Method::POST)
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from(data.clone()))
+            .unwrap()
+    };
+
+    let (status, body) = json_response(
+        &app,
+        json_post("/load", &json!({"mode": "upsert", "data": data})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mode"], "upsert");
+    assert_eq!(
+        alice_age(app.clone()).await,
+        30,
+        "upsert keeps the omitted age"
+    );
+
+    let head = main_head_commit_id(&app).await;
+    let (status, body) = json_response(&app, ndjson("insert")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("`upsert`"), "{body}");
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "the refused insert published nothing"
+    );
+
+    let (status, body) = json_response(&app, ndjson("replace")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        alice_age(app.clone()).await,
+        Value::Null,
+        "replace nulls the omitted age"
+    );
+
+    let head = main_head_commit_id(&app).await;
+    for (old, new) in [("append", "insert"), ("merge", "replace")] {
+        for request in [
+            json_post("/load", &json!({"mode": old, "data": data})),
+            ndjson(old),
+        ] {
+            let (status, body) = json_response(&app, request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{old}: {body}");
+            assert_eq!(body["code"], "bad_request", "{old}: {body}");
+            let message = body["error"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(&format!("the load mode `{old}` was removed"))
+                    && message.contains(&format!("write `{new}`")),
+                "{old}: {body}"
+            );
+        }
+    }
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "a refused mode published nothing"
     );
 }
 
@@ -5284,7 +5370,7 @@ async fn load_endpoint_loads_into_existing_branch() {
     let request = IngestRequest {
         branch: Some("main".to_string()),
         from: None,
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Loaded","age":7}}"#.to_string(),
     };
     let response = app
@@ -5401,7 +5487,7 @@ node Plain { slug: String @key }
                 if path == "/load/ndjson" {
                     Request::builder()
                         .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                        .uri(g("/load/ndjson?branch=main&mode=merge"))
+                        .uri(g("/load/ndjson?branch=main&mode=replace"))
                         .method(Method::POST)
                         .header("content-type", "application/x-ndjson")
                         .body(Body::from(data.to_owned()))
@@ -5409,7 +5495,7 @@ node Plain { slug: String @key }
                 } else {
                     json_post(
                         path,
-                        &json!({"branch": "main", "mode": "merge", "data": data}),
+                        &json!({"branch": "main", "mode": "replace", "data": data}),
                     )
                 }
             };
@@ -5548,7 +5634,7 @@ async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
         .oneshot(
             Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/load/ndjson?branch=main&mode=append"))
+                .uri(g("/load/ndjson?branch=main&mode=insert"))
                 .method(Method::POST)
                 .header("content-type", "application/x-ndjson")
                 .body(Body::from(batch))
@@ -5654,7 +5740,7 @@ async fn invalid_raw_graph_batch_has_no_effect() {
         .oneshot(
             Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/load/ndjson?branch=main&mode=append"))
+                .uri(g("/load/ndjson?branch=main&mode=insert"))
                 .method(Method::POST)
                 .header("content-type", "application/x-ndjson")
                 .body(Body::from(concat!(
@@ -7334,7 +7420,7 @@ async fn ingest_per_actor_admission_cap_returns_429() {
                 ),
                 branch: Some("main".to_string()),
                 from: Some("main".to_string()),
-                mode: Some(omnigraph::loader::LoadMode::Merge),
+                mode: Some(omnigraph::loader::LoadMode::Replace),
             })
             .unwrap();
             let req = Request::builder()
@@ -8155,7 +8241,7 @@ async fn load_commit(app: &axum::Router, ndjson: &str) -> String {
     let request = IngestRequest {
         branch: Some("main".to_string()),
         from: None,
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: ndjson.to_string(),
     };
     let (status, body) = json_response(
