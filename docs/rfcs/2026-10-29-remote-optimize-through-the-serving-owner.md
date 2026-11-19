@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-29
-updated: 2026-11-11
+updated: 2026-11-18
 discussion: https://github.com/ModernRelay/omnigraph/pull/1214
 supersedes: []
 superseded_by: []
@@ -31,8 +31,9 @@ commit adds fragments, and nothing removes them.
 
 This RFC adds one operation: a **manually requested, bounded `optimize` of a
 served graph's main branch, executed by the process that already serves and
-publishes that graph**. Direct optimize stays as it is for a stopped server,
-on local and object storage.
+publishes that graph**. Direct optimize stays for a stopped server, on local
+and object storage, and takes the engine changes below with it
+(§[Compatibility](#compatibility)).
 
 - **Engine.** The run keeps today's writer gates and its one graph
   publication. It works table by table from a resumable position, stops
@@ -111,8 +112,12 @@ durable before any effect and before the response. From then on:
 
 - **Identity.** One operation id names one request: graph, branch (main),
   kind (`optimize`), exact options and principal. The same id with the same
-  request returns the existing operation. The same id with a different request
-  is refused. A new id is a new operation and can repeat work.
+  request returns the existing operation, including its original dataset
+  outcomes once terminal. Repeating the request starts no new run and publishes
+  no additional graph commit. The server refuses a different request under
+  the same id and refuses to execute an evicted id (§2.5). A caller that
+  wants another attempt submits a new id. The engine then plans against the
+  current published graph (§1.5).
 - **Progress.** Status moves through `accepted`, `running` and `publishing`
   to one terminal state: `succeeded`, `failed`, `cancelled` or `interrupted`.
   A terminal record is never rewritten. A run whose publication is in doubt
@@ -194,12 +199,17 @@ covers a large catalog.
 installed (invariant 10). `maintain` is branch-scoped, and `admin` does not
 grant it. The request carries:
 
-- `tables`: optional. When present, only these node and edge tables are
-  considered, in the given order. A name that does not exist is refused
-  before any effect.
+- `datasets`: optional. When present, only these node and edge tables are
+  considered, in the given order, each named by its type key (`node:<Type>`,
+  `edge:<Type>`). A key that names no table is refused before any effect.
+  The field, the record's keys and the CLI flag say `datasets`, the
+  graph-facing name the snapshot contract and the direct report already use
+  for a table's entry. This text keeps "table" for the physical unit.
 - `start_at`: optional, for a full-catalog request. The run starts at this
   type key, or at the first key after it when no table has it (§1.3). The
-  server supplies the graph's resume position. Direct callers usually omit it.
+  server supplies the graph's resume position. A direct run stores none, so
+  its caller passes the `resume_at` the previous bounded run reported
+  (`--start-at`, §4).
 - `limits`: `max_gate_hold` and the resource ceilings of §1.4. Every limit
   is optional, and an absent limit does not bound the run.
 - `concurrency`: how many tables are planned at once, and how many are
@@ -213,15 +223,16 @@ grant it. The request carries:
 The served path sets every limit from serve settings, plans
 `maintenance_planning_concurrency` tables ahead (a serve setting; planning only
 reads) and rewrites one table at a time. Of these, an HTTP request can name
-only `tables` and `max_gate_hold`, and `max_gate_hold` only at or below the
+only `datasets` and `max_gate_hold`, and `max_gate_hold` only at or below the
 server's ceiling (§3.1). The resource ceilings and the run byte budget are
 serve settings alone, as #1186 has it: a caller tunes what the run covers and
 how long writers wait, never how much memory or storage traffic the server
 spends. Every request field is API surface for good, so the request starts
-with the two a scheduler and an operator need. The direct path keeps today's behavior: no time bound, no
-ceilings, and both concurrencies from `OMNIGRAPH_MAINTENANCE_CONCURRENCY`
-(default 8). `--max-gate-hold` and `--tables` let a direct caller bound a run.
-The served path does not read that variable.
+with the two a scheduler and an operator need. The direct path keeps its
+defaults: no time bound, no ceilings, and both concurrencies from
+`OMNIGRAPH_MAINTENANCE_CONCURRENCY` (default 8). `--max-gate-hold` and
+`--datasets` let a direct caller bound a run, and `--start-at` continues one
+(§4). The served path does not read that variable.
 
 #### 1.2 What a run holds
 
@@ -283,7 +294,7 @@ process.
 
 #### 1.3 Order, stopping and the resume position
 
-- **Order.** A request with `tables` works in that order. A full-catalog
+- **Order.** A request with `datasets` works in that order. A full-catalog
   request works in type-key order, starting at `start_at`. It wraps to the
   beginning and stops before the starting table, so a run never visits a
   table twice.
@@ -307,10 +318,13 @@ process.
   next run starts at C and wraps through A and B. The writer gates are
   released between the two runs. A `resource_limit` deferral does not set the
   position: that table stays deferred until its ceiling or its size changes.
-  A run that stops on neither bound clears the position. A request with `tables` neither reads nor moves it. A run that
-  ends without a terminal report keeps the previous position. Over a sequence
-  of runs, every table is planned, including the tail of a catalog whose no-op
-  prefix alone takes longer than one bound.
+  A run that stops on neither bound clears the position. A request with
+  `datasets` neither reads nor moves it. A run that ends without a terminal
+  report keeps the previous position. A direct run has no stored position:
+  its report prints the key as `resume_at`, and the caller passes it to the
+  next run (`--start-at`, §4). Over a sequence of runs, every table is
+  planned, including the tail of a catalog whose no-op prefix alone takes
+  longer than one bound.
 
 The position is a hint. A missing or stale one changes where a run starts,
 never what it does to a table.
@@ -326,15 +340,21 @@ table's first write:
 |---|---|
 | Source fragments | the compaction plan's tasks, counted until the ceiling is passed |
 | Source rows | the plan's fragment row counts |
-| Source bytes | each data file's recorded size (`DataFile::file_size_bytes`, a `CachedFileSize`), with a HEAD request when `get()` is empty; and a HEAD request for each deletion file, since Lance 13's `DeletionFile` records no size. A HEAD goes to the file itself, in the store `Dataset::object_store(base_id)` returns. A data file is `DataFile.path` under its directory: the dataset root joined with `data` when `base_id` is absent, the base's path (`BasePath::extract_path`) joined with `data` when that base `is_dataset_root`, and the base's path alone when the base holds data only. A deletion file is `lance_table::io::deletion::relative_deletion_file_path` (`_deletions/{fragment}-{read_version}-{id}.{suffix}`) under the dataset root, or under its base, which must be a dataset root. This is the rule of Lance's crate-private `data_file_dir_for_base` and `dataset_dir_for_deletion`. The collector already resolves files by it: `probe_directory` returns the directory and `capture_dataset_paths` joins each file to it. The ceiling calls that resolution, not a second copy of Lance's rule. A base's root alone, which the collector's borrowed-origin walk returns, is not the file. A HEAD that misses an inherited file would defer the table on every run. The source-fragment ceiling is checked first, so it bounds those requests. |
+| Source bytes | each data file's recorded size (`DataFile::file_size_bytes`, a `CachedFileSize`), with a HEAD request when `get()` is empty; and a HEAD request for each deletion file, since Lance 13's `DeletionFile` records no size. A HEAD goes to the file itself, in the store `Dataset::object_store(base_id)` returns. A data file is `DataFile.path` under its directory: the dataset root joined with `data` when `base_id` is absent, the base's path (`BasePath::extract_path`) joined with `data` when that base `is_dataset_root`, and the base's path alone when the base holds data only. A deletion file is `lance_table::io::deletion::relative_deletion_file_path` (`_deletions/{fragment}-{read_version}-{id}.{suffix}`) under the dataset root, or under its base, which must be a dataset root. This is the rule of Lance's crate-private `data_file_dir_for_base` and `dataset_dir_for_deletion`. The collector already resolves files by it: `probe_directory` returns the directory and `capture_dataset_paths` joins each file to it. The ceiling calls that resolution, not a second copy of Lance's rule. A base's root alone, which the collector's borrowed-origin walk returns, is not the file. A HEAD that misses an inherited file would fail the table on every run (below). The source-fragment ceiling is checked first, so it bounds those requests. |
 | Managed Blob payload bytes | the descriptor-only scan that compaction sizing already performs (`compaction_blob_batch_rows`). External references count nothing and are never fetched. |
 | Index rebuild rows | the table's row count, when a lagging index would be rebuilt whole |
 
 A table over a per-table ceiling is reported `deferred(resource_limit)` with
 the measure, the measured value and the ceiling, and nothing is written for
 it. Counting stops once a value passes its ceiling, so an oversized table does
-not cost a full inventory. A size that cannot be measured defers the table
-too. The run never falls back to an unbounded rewrite.
+not cost a full inventory. A size the plan does not record (a fragment with
+no row count, a Blob field its descriptors cannot size) defers the table too,
+with no measured value. A size the run could not read from storage (a HEAD or
+a row count that failed) is different: it is that table's failure, with the
+storage error as its cause, as any other planning read is (§1.5). Reporting
+it as a resource limit would point the operator at a ceiling that is not the
+cause, drop the error, and defer the table on every run. Either way the run
+never falls back to an unbounded rewrite.
 
 The run budget is a ceiling on total source bytes across the tables the run
 starts. A table that would exceed the remaining budget is deferred with
@@ -366,7 +386,13 @@ index not yet built. Index work follows the current rules:
   `append_deferred_full_text_indexes` records the gap with the
   `rebuild-full-text-indexes` remedy. Full-text rebuild stays its own
   operation.
-- A vector column that cannot train stays pending.
+- A vector column that cannot train stays pending. A column cannot train
+  when it holds too few vectors for the builder to train on. A first build
+  asks before it builds, by counting the column's non-null vectors
+  (`vector_column_trainable`). A rebuild learns it from the one typed answer
+  Lance gives for it, `Error::Unprocessable`. Any other failure of a build is
+  that link's failure (below), never pending work: a storage fault during a
+  rebuild must not read as a column with nothing to train on.
 - #1156 owns any incremental fold.
 
 Compaction goes through `TableStore::stage_compaction`, which refuses an
@@ -378,26 +404,45 @@ Each table the run considers gets exactly one outcome:
 
 | Outcome | Meaning |
 |---|---|
-| `optimized` | A rewrite or index link was staged and is in the publication. Carries fragments removed and added, indexes rebuilt and built, and the table's duration. |
+| `optimized` | A rewrite or index link was staged and is in the publication. Carries fragments removed and added and the table's duration. When an index link failed after an earlier link committed, it also carries that failure as the reason `index_failed` (below). |
 | `unchanged` | Planning found nothing to do. |
 | `deferred(reason)` | Not started: `gate_hold_limit`, `byte_budget`, `resource_limit` or `cancelled`. |
-| `skipped(reason)` | Deliberately left alone. There is no producer today, see below. |
-| `failed(code)` | A table-local failure with definite evidence (`BeforeEffect` or `Unpublished`). The table's staging is unreachable, and the other tables still publish. |
+| `failed(code)` | A table-local failure with definite evidence (`BeforeEffect` or `Unpublished`) before any link of the table committed. Nothing of the table is published, its staging is unreachable, and the other tables still publish. |
 
 Pending index work (partial full-text coverage, a vector column that cannot
-train) is listed on the outcome as a result, not as a failure.
+train) is listed with the table's outcome as a result, not as a failure. The
+engine's report and the direct CLI carry it. The record does not carry it
+yet, and nothing reports which indexes a run rebuilt or built
+(§[Unresolved questions](#unresolved-questions)).
 
 A table-local failure is one raised while planning, staging or committing that
 table's detached links. A failure outside one table fails the run unpublished:
 authority, catalog, gates or the publisher. So do the containment classes of
 §1.7.
 
+**An index link's failure keeps the links before it.** A table's links are
+independent derived state (invariant 7). A stable-row-id rewrite carries the
+coverage of every index the engine builds to the new fragments
+([Lance alignment](../dev/lance.md#current-compatibility-fences), "Index
+coverage"), so it is complete without the index work that follows it, and an
+index link that committed is complete without the next. When an index link
+fails with definite evidence after an earlier link of the same table
+committed, the committed links publish: the table is `optimized`, and its
+outcome carries the failure as the reason `index_failed`, with the error as
+its detail. If the dataset has not changed, a new run sees the published
+rewrite and retries only the outstanding index work. Queries still return
+every matching row while that index work is outstanding. Discarding the
+committed links would repeat the rewrite, the expensive step, on every run
+for as long as the index failure lasts, and each discarded rewrite leaves
+files only `cleanup` reclaims, which cannot run while a server holds the
+cluster lock (§3.6). A failure before any link committed is the table's
+`failed` outcome. A failure without definite evidence fails the run, as any
+staging failure does.
+
 **Drift.** Each table opens at its pin (`open_pinned_for_write`), never at
-linear HEAD. Since #776, `SkipReason::DriftNeedsRepair` has had no producer.
-The enum and the CLI's formatting of it remain. Foreign linear movement is
-`repair`'s finding (invariant 5). The `skipped` outcome keeps a later skip
-reason per table, so it never becomes a run-level failure that discards
-finished tables.
+linear HEAD, so optimize neither reads nor reports foreign linear movement:
+that is the collector's finding (`cleanup`'s `foreign_versions`, invariant 5).
+No outcome is `skipped`.
 
 #### 1.6 Publication and the before-publish callback
 
@@ -628,9 +673,13 @@ that adds scopes bounds their count in its §2.6 row) and the unresolved ones
 record per scope plus four at the per-record bound, so a full unresolved
 list cannot make the record unwritable. A per-table outcome's `detail` is
 capped at 512 bytes, keeping its code and measure. A record lists per-table
-outcomes for at most 1,024 tables and summarizes the rest as counts per
-outcome code, so a catalog larger than one record can describe never makes
-the before-publish write, and with it every run, fail validation.
+outcomes for at most 1,024 tables, under `datasets`, and summarizes the rest
+under `more_datasets` as counts per outcome code and reason: the key is the
+outcome code, followed by a colon and the reason when the outcome has one
+(`deferred:gate_hold_limit`, `optimized:index_failed`). A catalog larger than
+one record can describe therefore never makes the before-publish write, and
+with it every run, fail validation, and a table whose index work failed
+(§1.5) is never counted among the clean ones.
 
 A record describes the graph that held the graph id at acceptance, and stores
 that graph's `schema_identity_domain` beside the id: a field of the contract
@@ -835,9 +884,9 @@ each scope has one in-process admission gate (§3.3).
 
 | A kind supplies | `optimize` (this RFC) | `merge` (next; not in this RFC) |
 |---|---|---|
-| Start route and typed request | `POST …/operations/optimize`, `OptimizeRequest` (§3.1) | its own start route and request; the synchronous merge route is unchanged |
+| Start route and typed request | `POST …/operations/optimize`, `StartOptimizeRequest` (§3.1) | its own start route and request; the synchronous merge route is unchanged |
 | Grant, on its start route and on lookup and cancel of its records | `maintain` on main (§1.1) | the grant the synchronous merge requires |
-| Admission scope, each with one in-process gate (§3.3) | the maintenance scope: one active per cluster, shared by `optimize`, cleanup, repair and full-text rebuild (§3.2); one gate | per target branch, independent of the maintenance scope; one gate per target branch, the count of scopes bounded by the kind |
+| Admission scope, each with one in-process gate (§3.3) | the maintenance scope: one active per cluster, shared by `optimize`, cleanup and full-text rebuild (§3.2); one gate | per target branch, independent of the maintenance scope; one gate per target branch, the count of scopes bounded by the kind |
 | Settlement branch, stored in the record and walked by §2.4 | main of the graph | the target branch |
 | Typed outcomes | per-table outcomes and the tail (§1.5, §1.8) | the merge result |
 | Kind-local state, in the header per graph and kind | the resume position (§1.3) | none |
@@ -863,7 +912,7 @@ run.
 
 | Route | Purpose | Answers |
 |---|---|---|
-| `POST /graphs/{graph_id}/operations/optimize` (`startOptimize`) | Submit. The body (`OptimizeRequest`) carries `operation_id` (a canonical ULID the caller chose), optional `tables` and an optional `max_gate_hold`; nothing else (§1.1). | 202 with the record (`OperationOutput`) while it is non-terminal, including for a repeated POST of the same id and request; 200 once it is terminal |
+| `POST /graphs/{graph_id}/operations/optimize` (`startOptimize`) | Submit. The body (`StartOptimizeRequest`) carries `operation_id` (a canonical ULID the caller chose), optional `datasets` and an optional `max_gate_hold_ms`; nothing else (§1.1). | 202 with the record (`OperationOutput`) while it is non-terminal, including for a repeated POST of the same id and request; 200 once it is terminal |
 | `GET /graphs/{graph_id}/operations/{operation_id}` (`getOperation`) | Look up by original id, whatever the kind. | 200 with the record, or 200 with `lookup: unknown` |
 | `POST /graphs/{graph_id}/operations/{operation_id}/cancel` (`cancelOperation`) | Ask the run to stop at its next safe boundary. | 202 with the record while it is non-terminal, and a `publishing` record unchanged (§1.9); 200 with a terminal record, unchanged |
 
@@ -914,9 +963,9 @@ ceiling or the run budget, is an operator decision on the server, never a
 request option.
 
 One active operation in the maintenance scope per cluster means that other
-graphs in that cluster wait. That is a sound first slice: cleanup, repair
-and full-text rebuild extend the record by `kind` and a start route and
-share this scope.
+graphs in that cluster wait. That is a sound first slice: cleanup and
+full-text rebuild extend the record by `kind` and a start route and share
+this scope.
 A kind that is a user write, a merge, declares its own scope in §2.6. None of
 them adds a file, a callback or a restart rule of its own.
 
@@ -1038,8 +1087,11 @@ deployment gate and the cluster lock then agree on one unit.
   then submits and waits for a terminal record. After a lost response, it
   looks the operation up by that id. It never resubmits.
 - **Flags.** `--no-wait` returns after acceptance. `--operation <id>`
-  observes an existing operation. `--tables` and `--max-gate-hold` map to the
-  request. `--timeout` bounds the local wait, not the operation.
+  observes an existing operation. `--datasets` and `--max-gate-hold` map to
+  the request of a new operation, so they are refused beside `--operation`,
+  which submits none. `--start-at` is refused for a server target: the server
+  keeps the resume position. `--timeout` bounds the local wait, not the
+  operation.
 - **Exits.** The served path uses the exits of the classified data commands:
 
   | Outcome | Exit |
@@ -1053,8 +1105,14 @@ deployment gate and the cluster lock then agree on one unit.
   For `unknown` the CLI prints the operation id and says that the server
   holds no record of it. That proves neither that it ran nor that it did not.
   It does not resubmit, and a new id would be a new operation.
-- **Direct and standalone targets** run in process as today. `--max-gate-hold`
-  and `--tables` bound a direct run.
+- **Direct and standalone targets** run in process and return the report
+  synchronously, with the same per-table outcomes (`datasets` in `--json`).
+  `--max-gate-hold` and `--datasets` bound a direct run. `--start-at <key>`
+  starts a full-catalog run at the `resume_at` the previous one reported,
+  since a direct run stores no position; it is refused beside `--datasets`,
+  whose order is the caller's. A direct run that published, or found nothing
+  to publish, exits 0 whatever its tables' outcomes, as a `succeeded` served
+  run does.
 - **Inventory.** `optimize` moves from `CLI_ONLY_OPERATIONS` to the HTTP
   inventory for a server target, and `openapi.json` is regenerated.
 - **MCP.** No tool in this slice. A long-running write with durable lookup
@@ -1066,8 +1124,7 @@ Each of these needs its own requirements and evidence:
 
 - `cleanup` and any reclamation, which carries the reader, retained-history
   and staging safety rules;
-- `repair`'s served form, and the full-text rebuild and `index build`
-  routes;
+- the full-text rebuild and `index build` routes;
 - automatic triggering, reconcilers and schedules;
 - external workers, serialized plans and input retention for them;
 - a new way to share the gates with writers: staging outside the gates,
@@ -1081,9 +1138,10 @@ Each of these needs its own requirements and evidence:
 
 - **PR #1186** (served optimization, a synchronous call): the same operation
   with a different result contract. This RFC adapts four of its rules:
-  ceilings before a rewrite (§1.4), the deferred full-text and drift outcomes
-  as their own results (§1.5), full-text rebuild as its own operation, and the
-  input commit captured while the gates hold it (§1.6). The ceilings are
+  ceilings before a rewrite (§1.4), the deferred full-text outcome as its own
+  result (§1.5; the drift outcome adapted with it left with the `repair`
+  command, #1372), full-text rebuild as its own operation, and the input
+  commit captured while the gates hold it (§1.6). The ceilings are
   adapted, not copied: #1186 refuses the whole request before any effect when
   a ceiling is exceeded and rejects "silently optimizing only a prefix";
   here a per-table ceiling defers that table with its measure, the other
@@ -1091,7 +1149,7 @@ Each of these needs its own requirements and evidence:
   next run, so the prefix is reported, never silent. The two drafts also
   differ on: the durable record and lookup (§2); cancellation (§1.9, §3.1); the
   gate-hold bound, the run byte budget and the resume position (§1.2, §1.3);
-  the two request options, `tables` and a `max_gate_hold` within the
+  the two request options, `datasets` and a `max_gate_hold` within the
   server's ceiling (§1.1, §3.1), where #1186 accepts none; the resource
   ceilings are serve settings alone in both; the policy action; the three-route shape with a
   caller-chosen id (§3.1), where #1186 has one route and a correlation id
@@ -1100,15 +1158,16 @@ Each of these needs its own requirements and evidence:
   narrow `optimize` action so that the right to manage configuration or
   membership never implies the right to run expensive maintenance. `maintain`
   keeps that property, since `admin` does not grant it either, and is broader
-  only over content-preserving maintenance (index build, full-text rebuild,
-  the repair report); the destructive grant, `reclaim`, stays separate. A
+  only over content-preserving maintenance (index build, full-text rebuild);
+  the destructive grant, `reclaim`, stays separate. A
   per-verb action would add a name for every later kind. Two accepted
   optimize RFCs would leave two contracts.
 - **PR #1175** (the `maintain` and `reclaim` actions, `_as` entry points,
   report-only repair): this RFC needs `maintain` and `optimize_as`, and
   `ensure_indices{,_on}_as` where they share optimize's index writer.
-  `maintain` does not include `reclaim`. `reclaim`, `cleanup_as` and the
-  repair report belong with cleanup and repair.
+  `maintain` does not include `reclaim`. `reclaim` and `cleanup_as` belong
+  with cleanup. The repair report #1175 carried left with the `repair`
+  command (#1372).
 - **PR #1176** (control-object re-issue and read-back): the record's four puts
   depend on it (§2.3).
 - **PR #1189** (an inline `s3://` cluster root for deployment, recovery and
@@ -1151,13 +1210,21 @@ Each of these needs its own requirements and evidence:
   ignore it, and `state.json` is unchanged.
 - **API.** The routes and schemas are additive. Moving `optimize` into the
   HTTP inventory changes no existing route.
-- **CLI.** `omnigraph optimize` against a direct target behaves as before.
-  Against a server target it now works instead of refusing.
+- **CLI.** `omnigraph optimize` against a direct target changes in one
+  behavior. In 0.15.0 a table's failure failed the command and nothing was
+  published. Now the table is reported `failed`, the other tables publish,
+  and the command exits 0 (§4). Its `--json` report gains each table's
+  `outcome`, `reason`, `duration_ms` and `error`, and `--datasets`,
+  `--max-gate-hold` and `--start-at` are new flags. Against a server target
+  it now works instead of refusing.
 - **Engine.** `optimize_as` replaces the actor-less `optimize`, a Rust API
   change for embedders, as #1175 already proposes. The report gains per-table
   outcomes, the input commit, the published commit and the tail outcomes. The
-  direct path's default behavior is unchanged. The served path rewrites one
-  table at a time and ignores `OMNIGRAPH_MAINTENANCE_CONCURRENCY`.
+  direct path keeps its defaults (no time bound, no ceilings, concurrency
+  from `OMNIGRAPH_MAINTENANCE_CONCURRENCY`). Its failure handling changes as
+  the CLI's does: one table's failure is that table's outcome, not the call's
+  error. The served path rewrites one table at a time and ignores
+  `OMNIGRAPH_MAINTENANCE_CONCURRENCY`.
 - **Reversibility.** Removing the routes leaves graphs unchanged. A leftover
   record is ignored.
 
@@ -1231,9 +1298,13 @@ Every row extends an existing owner in [testing](../dev/testing.md).
 | `optimize_as` enforces `maintain`; `admin` does not grant it | allow and deny cases | `policy_engine_chassis.rs` |
 | The run stops starting tables at `max_gate_hold`, publishes once and reports every table | integration test with a fake clock | `integration/maintenance.rs` |
 | A full-catalog run resumes at the first table the time bound or the run budget deferred, visiting it first; a `resource_limit` deferral neither sets the position nor stops later tables; a run whose no-op prefix exceeds the bound still reaches the tail over successive runs | many-table fixture with a fake clock | `integration/maintenance.rs`, server `operation_routes` |
+| A bounded direct run continues at `--start-at`; a server target refuses the flag, `--datasets` refuses it, and `--operation` refuses `--datasets` and `--max-gate-hold` | a bounded run, then one from its `resume_at`; each refused combination, the server ones against a served cluster | CLI `cli_data`, `system_local` |
 | A table over a ceiling, the first table included, is deferred with its measure and nothing is written for it; counting stops at the ceiling; deletion files are counted; an inherited data or deletion file is sized at its `base_id` location | fixtures over each ceiling, including a large managed Blob, an external reference, a fragment with a deletion file and a table whose files sit under another base | `integration/maintenance.rs` |
+| A size the run cannot read from storage fails the table with the storage error instead of deferring it; nothing is written for it, and the other tables still run | a table whose deletion file is removed before a run that sets a byte ceiling | `integration/maintenance.rs` |
 | A table-local failure fails only that table, and the other tables publish | failpoint in one table's rewrite | `failpoints.rs`, `detached_commit_matrix.rs` |
+| An index link that fails after an earlier link of its table committed leaves the table `optimized` with `index_failed` and the error; the committed links are in the publication, the next run stages only the remaining index work, and the record carries the reason | failpoint before an index link, with a rewrite before it and without one | `failpoints.rs`, server `recorded_operations` tests |
 | Partial full-text coverage and an untrainable vector stay pending with their remedy | existing pending-index fixtures | `integration/maintenance.rs` |
+| A vector rebuild is skipped as untrainable only on Lance's `Unprocessable`; a rebuild that fails for another reason is its link's failure | a lagging vector index over a column with too few vectors to train on, then one whose data file is gone | in-source `table_store` tests, `lance_surface_guards.rs` |
 | A failure before the publication is labelled, and the server keeps serving | failpoints in the per-table loop and in `before_publish` | `failpoints.rs`, server `boot_settings` |
 | A failed `before_publish` publishes nothing | failpoint | `failpoints.rs` |
 | Writers that pass no callback make no control-object request | unchanged rows for mutate, load and merge | DST storage-cost golden |
@@ -1250,7 +1321,7 @@ Every row extends an existing owner in [testing](../dev/testing.md).
 | Lookup after a lost response, after restart and for an evicted id answers `unknown` without replay, with the stated CLI exits | lost-delivery matrix and restart journey | CLI `system_remote`, `cli_cluster_e2e` |
 | Restart resolves `publishing` by history, and `accepted` or `running` to `interrupted` | failpoints before and after publication, with a killed process | cluster `failpoints.rs`, server `boot_settings` |
 | A record from another ledger is refused, never overwritten | route test | `operation_routes` |
-| Four unresolved records plus one active per scope at the per-record bound still write; 1,024 per-table outcomes with 512-byte details fit one record, and a larger catalog summarizes the rest | record validation at the bounds | cluster `maintenance` tests |
+| Four unresolved records plus one active per scope at the per-record bound still write; 1,024 per-table outcomes with 512-byte details fit one record, and a larger catalog summarizes the rest per outcome code and reason | record validation at the bounds | cluster `maintenance` tests |
 | On the served path, a write that lands between the request and the gates does not refuse the run; a direct or embedded caller keeps today's refusal; either refusal carries `BeforeEffect` | writers racing optimize, served and direct | `integration/maintenance.rs`, `failpoints.rs` |
 | One active operation per cluster; deployment, drain and unresolved-cap refusals | route tests | `operation_routes`, `boot_settings` |
 | Logical data, row ids, schema, indexes, retained history, live branches and Blob values are unchanged | before/after comparison on a representative fixture | `integration/maintenance.rs` |
@@ -1297,6 +1368,18 @@ dated pending entry in its decision log:
 1. Whether a later slice should split one table's work. A table whose single
    rewrite exceeds the bound is today visible only by its duration, unless a
    ceiling defers it first.
+2. Whether a run with failed tables should exit with a status of its own. A
+   run that published, or found nothing to publish, exits 0 whatever its
+   tables' outcomes (§4), and `cleanup` has the same contract for a table
+   whose trace did not finish, so a script must read the result rows, not the
+   status. Deferred tables are normal in a bounded run; failed ones are not.
+   One decision should cover both commands.
+3. Whether the outcome should carry index results. Nothing reports which
+   indexes a run rebuilt or built, and the record carries no pending index
+   work, so a served caller cannot see what the direct report shows (§1.5).
+   The record refuses unknown fields, so once a release writes records, a
+   field added later makes that release's binary refuse the newer record. The
+   cheap moment to add one is before then.
 
 ## Decision log
 
@@ -1452,3 +1535,98 @@ dated pending entry in its decision log:
   its typed shape instead of `BeforeEffect` (§1.7); and a record a graph
   deletion ends is terminal in the state `unsettled` (§3.4, §4). #1175's
   commits ride in #1275, and #1176 is merged, so neither blocks the RFC.
+- 2026-11-15: Recorded after the fact. Two implementation pull requests
+  rewrote the rule for a write that overlaps a run, and neither added an
+  entry here:
+  - **#1282 (2026-11-11).** The Observable contract's "The request bounds
+    that wait (§1.2). This slice does not promise low write latency during a
+    run." gained a writer yield: before it took the gates, a run waited, up
+    to `max_writer_yield`, for the writes its last publication had sent back.
+    §1.2 gained the paragraph that described it.
+  - **#1349 (2026-11-13).** The yield gave way to the current sentences: the
+    contract's "a write that overlaps a run prepares again at most once" and
+    §1.2's paragraph of that name. The mechanism belongs to the
+    [carried-writes RFC](2026-11-10-writes-carried-over-row-preserving-publications.md),
+    which is still a draft. This RFC states the observable rule; if that
+    draft changes it, this sentence is amended with it.
+- 2026-11-15: Amended after a review of the merged slices (PRs #1275 and
+  #1282) against 0.15.0 and the graph-facing vocabulary of 0.10.0. The
+  terminal states, the exit table and the record's bounds are unchanged.
+  Each item names the sentences it supersedes:
+  - **Unreadable sizes (§1.4).** "A size that cannot be measured defers the
+    table too" now holds only for a size the plan does not record. A size
+    the run could not read from storage fails the table with its cause, and
+    the Source bytes row's "would defer the table on every run" became
+    "would fail". The deferral reported a storage fault as a resource limit
+    and dropped its cause, against §1.5's own rule that a failure while
+    planning is the table's. #1186 refused before effects on an unknown size
+    and said "index, statistics and storage errors must remain errors"; the
+    per-table adaptation had lost the second half.
+  - **Index link after a committed link (§1.5).** New paragraph. The
+    `failed(code)` row's "The table's staging is unreachable, and the other
+    tables still publish" now covers only a failure before any link of the
+    table committed, and the `optimized` row carries the failure of an index
+    link that failed after one did, as the reason `index_failed`. The old
+    rule came with "today's chain" and was never argued. A rewrite carries
+    index coverage to the new fragments, so discarding it protected nothing
+    and cost a full rewrite per run, with files only `cleanup` reclaims.
+  - **Untrainable vectors (§1.5).** "A vector column that cannot train stays
+    pending" gained its definition. The code read every failure of a vector
+    rebuild as a column that cannot train, so a storage fault was listed as
+    pending work, while a first build already kept build errors fatal
+    (`vector_column_trainable`). Lance 13.0.0 constructs
+    `Error::Unprocessable` only in vector training (`train_kmeans` in
+    `lance-index`'s `vector/kmeans.rs`, and the PQ trainers in
+    `vector/pq/builder.rs` and `lance`'s `index/vector/pq.rs`), when the
+    vectors to train on are fewer than the centroids. This item and the one
+    above stand together: alone, it would turn such a rebuild failure into a
+    failed table that never compacts.
+  - **Record summary (§2.2).** "summarizes the rest as counts per outcome
+    code" became counts per outcome code and reason, so a table past the
+    1,024th whose index work failed is not counted as a clean `optimized`.
+  - **Names (§1.1, §1.3, §2.2, §3.1, §4).** `tables` became `datasets` in the
+    request ("`tables`: optional", "A request with `tables`", "optional
+    `tables`"), in the record's keys and in the CLI ("`--tables` and
+    `--max-gate-hold`"). 0.10.0 removed `tables` and `export --table` from
+    the graph-facing contract, and this command's direct report already
+    printed `datasets`; the new names had followed the engine's internal
+    word. No release has shipped them. The prose keeps "table".
+  - **Direct resume (§1.1, §1.3, §4).** "Direct callers usually omit it" and
+    "`--max-gate-hold` and `--tables` bound a direct run" gained
+    `--start-at`. The direct report printed `resume_at` with no way to pass
+    it back, so §1.3's coverage over a sequence of runs held only where a
+    position is stored.
+  - **Observation flags (§4).** "`--tables` and `--max-gate-hold` map to the
+    request" now says they belong to a new operation: beside `--operation`
+    they were accepted and ignored.
+  - **Compatibility.** "`omnigraph optimize` against a direct target behaves
+    as before" and "The direct path's default behavior is unchanged" were
+    false from the engine slice on: in 0.15.0 one table's failure failed the
+    command with nothing published. The Summary's "Direct optimize stays as
+    it is", §1.1's "keeps today's behavior" and §4's "run in process as
+    today" changed with them.
+  - **Removed surfaces (§1.5, §2.6, §3.2, Not in this RFC, Relationship).**
+    #1372 removed the `repair` command and `SkipReason::DriftNeedsRepair`.
+    The `skipped(reason)` row, the Drift paragraph's "Foreign linear movement
+    is `repair`'s finding" and its sentences on the skip reason, and the
+    mentions of `repair` as a kind, a route and a report are gone. Foreign
+    movement is the collector's finding.
+  - **Index results (§1.5).** "Carries fragments removed and added, indexes
+    rebuilt and built, and the table's duration" lost the indexes, and
+    "listed on the outcome" now says where: neither the engine's report nor
+    the record carries the indexes a run rebuilt or built, and the record
+    carries no pending index work. Unresolved question 3 owns the decision.
+  - **Body names (§2.6, §3.1).** "The body (`OptimizeRequest`) carries ...
+    an optional `max_gate_hold`" names `StartOptimizeRequest` and
+    `max_gate_hold_ms`, as implemented.
+  - **Unresolved questions.** 2 (exit status with failed tables, decided
+    with `cleanup`) and 3 (index results in the outcome) are new.
+- 2026-11-18 — Maintainer decision on idempotent `optimize` in
+  [#1415](https://github.com/ModernRelay/omnigraph/pull/1415). The Identity
+  rule replaces “a new id is a new operation and can repeat work” with the
+  two cases above. Replaying an accepted request returns its recorded
+  operation. A deliberate new run plans from the published graph. In §1.5,
+  the sentence about the next run now specifies that a completed rewrite
+  survives a definite later index failure. With unchanged input, only the
+  outstanding index work needs another attempt. The replay and partial
+  failure regressions are in [#1418](https://github.com/ModernRelay/omnigraph/pull/1418).

@@ -1,6 +1,42 @@
 use super::*;
 use crate::operator::{InvocationConfig, parse_operator_config};
 
+#[tokio::test]
+async fn replaced_file_remains_visible_when_directory_sync_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    std::fs::write(&path, "old").unwrap();
+    let error = replace_file_with_dir_sync(&path, "new", |parent| {
+        assert_eq!(parent, directory.path());
+        Err(std::io::Error::other("injected directory sync failure"))
+    })
+    .unwrap_err();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    assert!(error.to_string().contains("file was replaced"), "{error}");
+    let mut session_present = true;
+    let failure = crate::commands::targets::registration_save_error(error, true, async {
+        session_present = false;
+        Ok(())
+    })
+    .await;
+    assert!(failure.to_string().contains("sign-in preserved"));
+    assert!(session_present);
+
+    // Renaming a file over this directory fails before replacement.
+    let error = replace_file(directory.path(), "new").unwrap_err();
+    let failure = crate::commands::targets::registration_save_error(error, true, async {
+        session_present = false;
+        Ok(())
+    })
+    .await;
+    assert!(
+        failure
+            .to_string()
+            .contains("session cleanup completed: true")
+    );
+    assert!(!session_present);
+}
+
 #[test]
 fn explicit_rename_and_principal_replacement_commands_parse_without_legacy_selectors() {
     for args in [
