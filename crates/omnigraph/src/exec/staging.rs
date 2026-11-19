@@ -482,13 +482,6 @@ impl MutationStaging {
         self.pending.is_empty() && self.delete_predicates.is_empty()
     }
 
-    /// Total count of pending rows across all tables. Used by tests and
-    /// (eventually) memory-budget enforcement.
-    #[allow(dead_code)]
-    pub(crate) fn pending_row_count(&self) -> usize {
-        self.pending.values().map(|p| p.total_rows()).sum()
-    }
-
     /// End-of-query: for each pending table, concat batches and stage
     /// uncommitted fragments for every table in `pending`. No Lance commit,
     /// no manifest publish. Returns a [`StagedMutation`] carrying the

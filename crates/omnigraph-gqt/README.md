@@ -491,12 +491,19 @@ does not support process crashes, server/CLI sessions or network simulation.
 
 ## Concurrent block
 
-A `--- concurrent` section runs two to four labeled GQ statements at the
-same time on the case's one handle, in the order its `order:` line names;
-it is one step of the case and runs under the DST runner only.
+A concurrent section runs two to four labeled GQ statements at the same
+time on the case's one handle; it is one step of the case, and its header
+says which block it is. `--- concurrent scripted` is a scripted block, its
+last line the `order:` script, run in the order the script names under the
+DST runner only. `--- concurrent` is a free-running block, which takes no
+`order:` line; the plain host runs it once per session order (every order
+up to three sessions, six seeded orders above, each pass on a fresh store,
+`timeout_ms` budgeting one pass) and the DST runner once per session with
+the seed's interleaving. A scripted block without its script and a
+free-running block with one are refused.
 
 ```text
---- concurrent
+--- concurrent scripted
 w1: query add_bob() { insert Person { name: "bob" } }
 r1: query all() { match { $p: Person } return { $p.name } }
 order: w1 park put __manifest/_versions/, r1 start, r1, w1 put __manifest/_versions/
@@ -505,11 +512,30 @@ w1: ok
 r1: ok
 ```
 
-A session is `<label>[ on <branch>]: <statement>` at column 0, continued on
-the lines that follow: one query or mutation declaration with no parameters,
-on `main` unless `on <branch>` says otherwise. Every session is a `Session`
-over the case handle, so the sessions share its in-process locks the way a
-server's requests do. `order:` closes the block: comma-separated entries,
+A session is `<label>[ x<n>][ on <branch>]: <statement>` at column 0,
+continued on the lines that follow: one query or mutation declaration with
+no parameters, a `branch merge <source> into <target>`, or a `load
+generate: v1 seed: <u64> mode: <append|merge>` recipe on the indented lines
+after it, on `main` unless `on <branch>` says otherwise. A block declares
+at most four labels. `x<n>` declares `n` workers `<label>.0` to
+`<label>.<n-1>` with the same statement (a scripted host admits at most 8
+under one label; the `--- expect` names the label once for all of them),
+and `${worker}` on the session line is the worker's index, refused inside
+a recipe; a counted label belongs to a free-running block. A recipe is a
+dealt stream over one node table with a `kind: key` column and no `blob`
+column: worker `w` on its run `s` loads row `w + n·s`, keys disjoint by
+construction, and after the block every dealt row is read back by its key
+as a node match and compared column by column with the generated row, a
+missing or changed row failing the block; a dealt session expected to fail
+is not read back. A case with several free-running blocks runs the largest
+block's pass count, a smaller block cycling its own orders. A session's authority conflicts are the
+times its write prepared again after `ReadSetChanged`, the engine's
+pre-effect reprepares plus the host's own retries (up to 32): a measurement
+in the block's detail beside the grants and wall times, not replay-compared
+(two replays of one DST seed can differ) and named by no expect line.
+Every session is a `Session` over the case handle, so the
+sessions share its in-process locks the way a server's requests do.
+`order:` closes a scripted block: comma-separated entries,
 each `<label> start` (the session's statement begins; the runner holds it
 before that), `<label>` (the session's completion, reported as `done`),
 `<label> <verb> <key-suffix>` (the session's next store request of that

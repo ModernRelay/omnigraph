@@ -1051,7 +1051,7 @@ pub(crate) async fn plan_collection(
     branches: &[Option<String>],
 ) -> Result<CollectorReport> {
     let now = crate::dst_clock::now_utc();
-    let cutoff = options.older_than.map(|older_than| now - older_than);
+    let cutoff = options.cutoff(|| now)?;
     let mut report = CollectorReport::default();
     let mut views = Vec::new();
     let mut captured_lineages = Vec::new();
