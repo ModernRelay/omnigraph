@@ -1226,13 +1226,16 @@ sessions in all (two labels, or one label with `x2` or more). A counted
 label belongs to a free-running block: a script names sessions one by one.
 
 A `load generate: v1 seed: <u64> mode: <append|merge>` statement, its
-recipe on the indented lines that follow (one table with a `kind: key`
-column, `rows:` at least the worker count), is a dealt stream: the host
-hands worker `w` on its run `s` the row at index `w + n·s`, so keys are
-disjoint by construction and no key scheme is written. After the block
-every dealt row is read back by its key on the case session and compared
-column by column with the row the recipe generated; a missing or changed
-row fails the block. The check needs no line in the file.
+recipe on the indented lines that follow (one node table with a `kind: key`
+column and no `blob` column, `rows:` at least the worker count), is a dealt
+stream: the host hands worker `w` on its run `s` the row at index `w + n·s`,
+so keys are disjoint by construction and no key scheme is written. After
+the block every dealt row is read back by its key on the case session, as a
+node match through GQ (the reason for the table and column bounds), and
+compared column by column with the row the recipe generated; a missing or
+changed row fails the block. The check needs no line in the file. A dealt
+session whose expect is an `error:` is not read back: it loaded nothing the
+file claims.
 
 A session's authority conflicts are the times its write was prepared again
 after `ReadSetChanged`: inside the engine (the pre-effect reprepares behind
@@ -1288,8 +1291,10 @@ block has at most three sessions and six seeded orders above that, the
 declaration order first, each pass on a fresh store, the sessions one after
 another in that order, so the block's expects and every step after it must
 hold whoever goes first and the block is a logic test of order-invariance
-(the case's `timeout_ms` is the budget of one pass, so the corpus run
-multiplies it by the pass count); the DST runner runs every session once at
+(the case's `timeout_ms` is the budget of one pass, so the corpus run and
+the DST replay multiply it by the pass count; a case with several
+free-running blocks runs the largest block's pass count, a smaller block
+cycling its own orders through the passes); the DST runner runs every session once at
 the same time, the seed deciding
 the interleaving, so the block is the interleaving search a scripted block
 never is, recorded in the same `concurrent_block` evidence row; a measuring

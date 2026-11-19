@@ -654,6 +654,13 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// The wall-time budget of one run of `case`: its `timeout_ms` is the budget
+/// of one pass, and the plain host runs a free-running block once per
+/// session order, so dispatch and replay both grant the pass count's worth.
+fn case_budget(case: &omnigraph_gqt_core::Case) -> Duration {
+    Duration::from_millis(case.runner.timeout_ms) * case.plain_passes() as u32
+}
+
 fn executable_digest(path: &Path) -> Result<String, String> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| format!("environment_changed: open executable: {e}"))?;
@@ -1728,7 +1735,7 @@ fn run_invocation(
     }
     let build = executable_digest(executable)?;
     summary.executable_digest = Some(build.clone());
-    let budget = Duration::from_millis(case.runner.timeout_ms) * case.plain_passes() as u32;
+    let budget = case_budget(&case);
     let remaining = || {
         budget
             .checked_sub(started.elapsed())
@@ -2479,8 +2486,8 @@ fn replay_attempts(
             return Err("environment_changed: prior input digest differs".into());
         }
 
-        budget = Some(Duration::from_millis(case.runner.timeout_ms));
-        let remaining = Duration::from_millis(case.runner.timeout_ms)
+        budget = Some(case_budget(&case));
+        let remaining = case_budget(&case)
             .checked_sub(started.elapsed())
             .filter(|left| !left.is_zero())
             .ok_or("timeout: replay exceeded wall-time budget")?;

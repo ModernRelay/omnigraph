@@ -2001,6 +2001,14 @@ fn check_refuses_every_concurrent_block_shape() {
             "recipe_with_marker",
             "bound on the session line and nowhere in the recipe",
         ),
+        (
+            "recipe_edge_table",
+            "`Knows` is an edge table, which the readback after the block cannot match by key",
+        ),
+        (
+            "recipe_blob_column",
+            "column `doc` is a blob, which the readback after the block cannot project through GQ",
+        ),
         ("block_in_loop", "inside a loop"),
         ("reserved_label", "`setup` is reserved"),
         ("duplicate_label", "session `w1` is declared twice"),

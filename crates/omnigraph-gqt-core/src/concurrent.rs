@@ -21,13 +21,32 @@ pub const MAX_HOST_RETRIES: u32 = 32;
 pub const PLAIN_PASSES: usize = 6;
 const RESERVED_LABELS: [&str; 4] = ["setup", "runner", "step", "order"];
 
-fn factorial(n: usize) -> usize {
-    (1..=n).product()
+/// The most sessions whose every order the plain host runs; above it the
+/// passes are [`PLAIN_PASSES`] seeded shuffles and no factorial is computed
+/// (an admitted block of 24 sessions has a 24! that overflows `usize`).
+const EXACT_SESSIONS: usize = 3;
+const _: () = assert!(
+    factorial(EXACT_SESSIONS) == PLAIN_PASSES,
+    "the exact bound is the session count whose factorial is PLAIN_PASSES"
+);
+
+const fn factorial(n: usize) -> usize {
+    let mut product = 1;
+    let mut factor = 2;
+    while factor <= n {
+        product *= factor;
+        factor += 1;
+    }
+    product
 }
 
 /// How many passes the plain host runs a block of `sessions` sessions in.
 pub fn passes(sessions: usize) -> usize {
-    factorial(sessions).min(PLAIN_PASSES)
+    if sessions <= EXACT_SESSIONS {
+        factorial(sessions)
+    } else {
+        PLAIN_PASSES
+    }
 }
 
 /// Which run of the case the plain host is on, `Pass(0)` the first; the
@@ -38,14 +57,15 @@ pub struct Pass(pub usize);
 /// The session order of pass `pass` over `sessions` sessions: pass 0 is the
 /// declaration order; while the orders fit in [`PLAIN_PASSES`] every order
 /// appears once, in lexicographic rank; above that each later pass is a
-/// seeded shuffle.
+/// seeded shuffle. The case's pass count is its largest block's
+/// ([`crate::Case::plain_passes`]), so a smaller block cycles its own orders.
 pub fn permutation(sessions: usize, pass: Pass) -> Vec<usize> {
-    let Pass(index) = pass;
+    let index = pass.0 % passes(sessions);
     let mut order: Vec<usize> = (0..sessions).collect();
     if index == 0 {
         return order;
     }
-    if factorial(sessions) <= PLAIN_PASSES {
+    if sessions <= EXACT_SESSIONS {
         let mut rank = index;
         let mut rest = order;
         order = Vec::with_capacity(sessions);

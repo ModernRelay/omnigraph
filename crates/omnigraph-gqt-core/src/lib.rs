@@ -5269,7 +5269,8 @@ async fn attempt_session(
 /// its key on the case session, `runs` runs per worker, and compared column
 /// by column with the row the recipe generated; a missing row or a changed
 /// column fails the block. The check needs no line in the file: a dealt row
-/// is a row the host knows, so the host asks for it.
+/// is a row the host knows, so the host asks for it. A session whose expect
+/// is an `error:` loaded nothing the file claims, so it is not read back.
 pub async fn readback_dealt_rows(
     host: &impl ExecutionHost,
     session: &Session,
@@ -5281,6 +5282,9 @@ pub async fn readback_dealt_rows(
         let SessionKind::Load(recipe) = &op.kind else {
             continue;
         };
+        if matches!(op.expect, SessionExpect::Error { .. }) {
+            continue;
+        }
         for seq in 0..runs {
             let index = op.dealt_index(seq);
             let (table, column, value) = recipe.generated.dealt_key(index)?;

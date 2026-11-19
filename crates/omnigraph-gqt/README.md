@@ -522,10 +522,13 @@ at most four labels. `x<n>` declares `n` workers `<label>.0` to
 under one label; the `--- expect` names the label once for all of them),
 and `${worker}` on the session line is the worker's index, refused inside
 a recipe; a counted label belongs to a free-running block. A recipe is a
-dealt stream: worker `w` on its run `s` loads row `w + n·s`, keys disjoint
-by construction, and after the block every dealt row is read back by its
-key and compared column by column with the generated row, a missing or
-changed row failing the block. A session's authority conflicts are the
+dealt stream over one node table with a `kind: key` column and no `blob`
+column: worker `w` on its run `s` loads row `w + n·s`, keys disjoint by
+construction, and after the block every dealt row is read back by its key
+as a node match and compared column by column with the generated row, a
+missing or changed row failing the block; a dealt session expected to fail
+is not read back. A case with several free-running blocks runs the largest
+block's pass count, a smaller block cycling its own orders. A session's authority conflicts are the
 times its write prepared again after `ReadSetChanged`, the engine's
 pre-effect reprepares plus the host's own retries (up to 32): a measurement
 in the block's detail beside the grants and wall times, not replay-compared
