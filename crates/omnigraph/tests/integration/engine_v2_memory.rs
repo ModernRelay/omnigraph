@@ -2330,7 +2330,11 @@ query pairs() {
 /// that capacity once per batch: on this graph, the issue's synthetic code
 /// graph at 20,000 nodes, the hub read needed 512 MiB once the edge table was
 /// indexed and 64 MiB before. Held one batch at a time, the read fits the same
-/// pool on both sides of `ensure_indices`, with the same rows.
+/// 32 MiB pool on both sides of `ensure_indices`, with the same rows. Main
+/// is refused the indexed read even at 128 MiB, so a small charge change
+/// cannot make this pass on the defect; 16 MiB refuses the unindexed read
+/// here, so 32 MiB is the floor. Scale twin:
+/// `crates/omnigraph-gqt/cases_slow/v2/issue_1459_indexed_hop_streams_its_edge_probe.gqt`.
 #[tokio::test]
 #[serial]
 async fn hub_traversal_fits_one_pool_before_and_after_indexing_issue_1459() {
@@ -2351,7 +2355,7 @@ query impact() {
     order { $c.name asc }
     limit 5000
 }"#;
-    let limit = 128 * MIB;
+    let limit = 32 * MIB;
     let mut answers = Vec::new();
     for indexed in [false, true] {
         if indexed {

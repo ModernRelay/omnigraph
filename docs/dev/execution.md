@@ -106,14 +106,11 @@ an unindexed column is not pushed, because Lance 13 clones the pushed list
 for every fragment it reads (it builds the physical expression once per
 distinct expression), so that scan reads unfiltered and the engine keeps the
 rows whose key is in one set of the keys (one more column read per fragment
-no key is in, which only a long list pays for). An indexed hop
-(`graph.rs::scan_neighbor_map`) consumes its probe as it streams: each batch is
-held under its own `expand probe batch` charge only while its endpoints are
-interned into the hop's neighbour map, then released. Lance answers a
-BTREE-covered list with one batch per contiguous row range, each a slice of a
-decode buffer whose capacity the pool charges, so a probe held whole cost its
-batch count times that capacity, not its rows. It preserves incoming row/rank order and carries a
-deterministic edge tie-break. A correlated block (`not { ... }`,
+no key is in, which only a long list pays for). It preserves incoming row/rank order and carries a
+deterministic edge tie-break. An indexed hop (`graph.rs::scan_neighbor_map`)
+holds each probe batch under its own `expand probe batch` charge only while it
+interns that batch's endpoints. A probe batch can be a slice of a larger decode
+buffer, and the pool charges the buffer by capacity. A correlated block (`not { ... }`,
 `exists { ... }`, `count { ... } > 2`, `sum($d.size) { ... } > 100`) is one
 anti-join over its typed inner pipeline, keeping each outer row by a
 `SubqueryPredicate` on the aggregate of its matches.
