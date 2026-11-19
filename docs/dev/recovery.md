@@ -9,8 +9,9 @@ normal open never installs a contract from root files. No writer arms a
 recovery sidecar, classifier, roll-forward, rollback, `Restore` compensation or
 recovery audit ([RFC 0067](../rfcs/0067-detached-table-commits.md)). Table pins
 are not promoted onto linear history
-([Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md)). This
-build has no storage conversion and refuses a graph that carries a pending one.
+([Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md)). Ordinary open neither starts nor resumes a storage
+conversion and refuses a graph that carries a pending one; the offline
+`omnigraph upgrade` owns it ([Pending storage conversion](#pending-storage-conversion)).
 
 ## What a crash can leave
 
@@ -18,7 +19,7 @@ build has no storage conversion and refuses a graph that carries a pending one.
 |---|---|---|
 | Before the manifest commit | Unreferenced detached Lance versions and possibly an unregistered original empty added-type dataset | A replay-safe caller retries from a fresh capture. A durably accepted prepared schema invocation instead retains its original identity and uses settlement below. The collector reclaims detached versions only when their recorded publication authority is gone. Added-type retry preserves the existing path and qualifies its original Create as described in [writes.md](writes.md) |
 | After the manifest commit | Complete table pins and the accepted contract row in the branch's `__manifest` | No durable installation remains. Reads open the published pins and contract; refresh rebuilds disposable memory |
-| During a storage conversion run by another executable | `UPGRADE_PENDING_KEY` on main's `__manifest` | The executable that started the conversion, while the root remains offline; this build refuses the graph |
+| During an `omnigraph upgrade` conversion | `UPGRADE_PENDING_KEY` on main's `__manifest` and the state the step table below lists | `omnigraph upgrade` rerun offline: this executable resumes an intent it owns, and an intent it cannot read is finished by the executable that started it. Ordinary open refuses the graph |
 
 ## Pins
 
@@ -91,8 +92,8 @@ instead of adopting it. Never remove the key by hand.
 A stamp-8 or stamp-9 source has one stop of its own before the fence,
 `source_recovery_required` and writing nothing: a `.staging` copy of
 `_schema.pg`, `_schema.ir.json` or `__schema_state.json` at the graph root,
-the unfinished schema apply of release 0.11.x, or a recovery sidecar, each
-with or without a live `__schema_apply_lock__` ref beside it. A read-write
+the unfinished schema apply of release 0.11.x, with
+or without a live `__schema_apply_lock__` ref beside it. A read-write
 open by 0.11.x (`omnigraph snapshot` is one) removes the sidecar and finishes
 or rolls back an apply whose live and staging schemas imply different table
 sets; when both imply the same table set (a property-only apply) 0.11.x
@@ -117,9 +118,10 @@ the contract's columns with each registered table's Lance columns before any
 write, so root objects restored from a backup older than a property-only
 apply are `unsupported_source`, not a contract of every commit.
 
-The upgrade owns its own recovery; no other writer resumes it. Every durable
-effect is either create-only under `__history/` (`put_if_absent`, equal bytes
-accepted again) or one zero-retry Lance commit on one ref, and the intent
+The upgrade owns its own recovery; no other writer resumes it. Every durable effect is either create-only under
+`__history/` (`put_if_absent`, equal bytes accepted again), one zero-retry
+Lance commit on one ref, or, on a stamp-8 or stamp-9 source, the idempotent
+retirement of a leftover `__schema_apply_lock__` ref, and the intent
 binds the whole plan before the first of them, so a rerun reads where the
 attempt stopped:
 
@@ -152,17 +154,22 @@ file under `__recovery/` can only come from an earlier build that stopped
 mid-write. This build cannot interpret it, so a read-write open
 refuses the graph, naming the operation ids, until the build
 that wrote the sidecar has opened the graph read-write and finished its own
-recovery. A read-only open never looks at `__recovery/`: reads are pinned to
-published manifest versions, which a sidecar-era writer never moved before
-its own publication.
+recovery. A read-only open never looks at
+`__recovery/`: reads are pinned to published manifest versions, which a
+sidecar-era writer never moved before its own publication. Cluster deployment
+asks without opening the graph: `Omnigraph::ensure_no_pending_recovery`
+refuses on any `.json` under `__recovery/`, malformed ones included, under a
+bounded listing.
 
 ## Ordering and visibility
 
 Accepted-view captures never treat a warm coordinator or cache as current
 authority. Writers retain the gate order of schema, branch, then sorted
 tables, and revalidate the complete captured authority before publication.
-Adopting a changed contract invalidates derived handles. A retried write is a
-new attempt with a new lineage commit; nothing replays on the caller's behalf.
+Adopting a changed contract invalidates derived handles. A write sent back before any effect is prepared again from
+its request by the engine, boundedly ([writes](writes.md#mutation-and-load)).
+After a detached effect nothing replays on the caller's behalf: a caller's
+retry is a new attempt with a new lineage commit.
 
 ## Liveness
 
@@ -261,6 +268,9 @@ The v8 storage fence keeps older binaries from exposing retired branches.
   visibility, a partial legacy write completed on retry, a resume after the
   directory running no census, and the `recovery_required` reports for a
   foreign intent, a changed source and a modified legacy object.
+- `crates/omnigraph/tests/integration/recovery_probe.rs` owns the no-open
+  sidecar probe: unknown sidecars and an inventory at its listing bound both
+  refuse without a write.
 - `crates/omnigraph/tests/integration/recovery.rs` owns manifest-only contract admission,
   ignored orphan schema artifacts, read-only opens without writes, and legacy
   sidecars refusing read-write but not read-only open.
