@@ -13,14 +13,23 @@
 //! and `F64`, comparisons over every scalar, `in` over list literals,
 //! list and enum properties, parameters (nullable, omitted), `return`,
 //! `return distinct`, groups with every aggregate and `count(distinct …)`,
-//! `order`, `limit` (a literal or a parameter), and the rankings
-//! `nearest`, `distance`, `bm25`, `rrf` (with `weights`).
+//! the registry's scalar rows (`lower`, `upper`, `trim`, `ltrim`, `rtrim`,
+//! `length`, `left`, `right`, `substring`, `abs`, `floor`, `ceil`, `round`
+//! with and without `digits:`, `sqrt`, `power`, `exp`, `ln`, `log10`,
+//! `size`, `cast` between the pairs it converts) over values with Unicode
+//! whitespace, case mappings, negative zero and the texts `cast` reads or
+//! refuses, `order` with `nulls first` and `nulls last`, `limit` (a literal
+//! or a parameter), and the rankings `nearest`, `distance`, `bm25`, `rrf`
+//! (with `weights`).
 //!
 //! The law: the engine's answer equals the reference's, as rows under the
 //! result's order rule (ordered when the read has an `order`, as bags
 //! otherwise) or as the same refusal, under every traversal mode (`csr`,
 //! `indexed` and the planner's choice) and again after every declared index
 //! is built. Writes are not generated: the reference evaluates reads only.
+//! Two run-time refusals with different codes agree when the read can raise
+//! each: the RFC fixes each row's refusal, not which one a read reports when
+//! its rows fail in different ways ([`refused_in_two_ways`]).
 //!
 //! The metamorphic layer reruns each read rewritten to an equal one: a
 //! tautology conjoined to its `where`, its top-level conjuncts reversed
@@ -156,6 +165,10 @@ async fn judge(
     .await
     .map_err(|e| format!("{label}: {e}\n{}", sample.describe()))?;
     let rows = judgment.engine.starts_with("[{");
+    if judgment.verdict.is_err() && refused_in_two_ways(source, &judgment) {
+        MIXED_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(false);
+    }
     judgment.verdict.map(|()| rows).map_err(|e| {
         format!(
             "{label}: {e}\n{}\n--- rewritten query\n{source}\n--- engine\n{}\n--- reference\n{}",
@@ -164,6 +177,69 @@ async fn judge(
             judgment.reference
         )
     })
+}
+
+/// Reads both sides refused at run time with different codes, each one the
+/// read's text can raise.
+static MIXED_REFUSALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the engine and the reference refused at run time with two
+/// different codes the read can each raise. The RFC fixes each row's
+/// refusal but not which one a read reports when its rows fail in
+/// different ways: the reference evaluates a row at a time and reports the
+/// first row's, the engine an operator at a time over a batch and reports
+/// the first operator's (`log10(abs(round($x.p, digits: (-1))))` refuses
+/// with `E5` on a row holding `0` and with `E1` on a row whose rounding
+/// leaves `I32`). A code the read cannot raise still disagrees, and so
+/// does a refusal against rows.
+fn refused_in_two_ways(source: &str, judgment: &omnigraph_gqt::ReferenceJudgment) -> bool {
+    let engine = judgment
+        .engine
+        .strip_prefix("refused: Coded(\"")
+        .and_then(|rest| rest.get(..2));
+    let reference = judgment
+        .reference
+        .strip_prefix("refused: ")
+        .and_then(|rest| rest.get(..2));
+    let (Some(engine), Some(reference)) = (engine, reference) else {
+        return false;
+    };
+    let markers: &[(&str, &[&str])] = &[
+        (
+            "E1",
+            &[" + ", " - ", " * ", "(-", "abs(", "round(", "sum(", "avg("],
+        ),
+        ("E2", &[" / ", " % "]),
+        (
+            "E3",
+            &[
+                " / ", " + ", " - ", " * ", "(-", "exp(", "power(", "round(", "sqrt(", "ln(",
+                "log10(", "sum(", "avg(",
+            ],
+        ),
+        (
+            "E5",
+            &[
+                "sqrt(",
+                "ln(",
+                "log10(",
+                "left(",
+                "right(",
+                "substring(",
+                "round(",
+                "power(",
+                "percentile(",
+            ],
+        ),
+        ("E6", &["cast("]),
+    ];
+    let raises = |code: &str| {
+        markers
+            .iter()
+            .find(|(c, _)| *c == code)
+            .is_some_and(|(_, m)| m.iter().any(|m| source.contains(m)))
+    };
+    engine != reference && raises(engine) && raises(reference)
 }
 
 /// The read with `extra` conjoined to its `where` (one is added when it
@@ -227,12 +303,33 @@ fn rrf_arms_swapped(source: &str) -> Option<String> {
     ))
 }
 
-/// Whether a conjunct may hold a term that can fail: arithmetic or an
-/// aggregate that can overflow.
+/// Whether a conjunct may hold a term that can fail: arithmetic, an
+/// aggregate that can overflow, or a registry row that can fail
+/// (`ScalarFunc::row_can_fail`).
 fn can_fail(conjunct: &str) -> bool {
-    [" / ", " % ", " * ", " + ", " - ", "(-", "sum(", "avg("]
-        .iter()
-        .any(|op| conjunct.contains(op))
+    [
+        " / ",
+        " % ",
+        " * ",
+        " + ",
+        " - ",
+        "(-",
+        "sum(",
+        "avg(",
+        "left(",
+        "right(",
+        "substring(",
+        "abs(",
+        "round(",
+        "sqrt(",
+        "exp(",
+        "ln(",
+        "log10(",
+        "power(",
+        "cast(",
+    ]
+    .iter()
+    .any(|op| conjunct.contains(op))
 }
 
 /// The top-level `and` conjuncts of a fully parenthesized predicate.
@@ -347,7 +444,10 @@ fn run_law(cases: u32) {
     }
     let nonempty = NONEMPTY.load(std::sync::atomic::Ordering::Relaxed);
     let total = TOTAL.load(std::sync::atomic::Ordering::Relaxed);
-    eprintln!("{nonempty} of {total} generated reads returned a row");
+    eprintln!(
+        "{nonempty} of {total} generated reads returned a row; {} judgments refused in two ways",
+        MIXED_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+    );
     assert!(
         nonempty * 5 >= total,
         "only {nonempty} of {total} generated reads returned a row"
@@ -620,6 +720,182 @@ edge Rel0: A -> A
   match { $n1: A, from { match { $m: A, $n1 rel0 $m } return { $m } order { $m.k } limit 5 }, $m rel0 $x, from { match { $y: A, $n1 rel0{1,2} $y } return { sum((10 / $y.p0)) as s } } }
   where $n1.k = "a"
   return { $n1.k as c0 }
+}"#;
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap();
+        let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+        session.load_jsonl(seed, LoadMode::Overwrite).await.unwrap();
+        let judgment = omnigraph_gqt::judge_read_against_reference(
+            &session,
+            source,
+            "q",
+            &ParamMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        judgment.verdict.unwrap_or_else(|e| {
+            panic!(
+                "{e}\nengine: {}\nreference: {}",
+                judgment.engine, judgment.reference
+            )
+        });
+    });
+}
+
+/// The shrunk case of a defect law 1 found, which predates the registry
+/// rows it was hunting: a zero query vector on a `cosine` field is refused
+/// before the read runs (`vector_distance_cosine_refuses_zero_vectors.gqt`),
+/// but the reference interpreter refuses it only where it scores a row, so
+/// over a population with no row it returns no row where the engine
+/// refuses.
+#[test]
+#[ignore = "hunt: the reference does not refuse a zero cosine query vector over an empty population"]
+fn a_zero_cosine_query_vector_is_refused_over_an_empty_population() {
+    let schema = r#"node A {
+    k: String @key
+    v: Vector(3, distance = "cosine")?
+    t: String? @index(fulltext, analyzer = "english_v1")
+}
+"#;
+    let source = r#"query q($qv: Vector(3)) {
+  match { let $pop = { match { $d: A } where false return { $d } }, from rrf(nearest($pop, $d.v, $qv, k: 1), bm25($pop, $d.t, "graph"), k: 1) as $s }
+  return { 0 as c0 }
+}"#;
+    let params: ParamMap = [(
+        "qv".to_string(),
+        omnigraph_compiler::query::value::Literal::List(vec![
+            omnigraph_compiler::query::value::Literal::Float(0.0);
+            3
+        ]),
+    )]
+    .into_iter()
+    .collect();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap();
+        let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+        let judgment =
+            omnigraph_gqt::judge_read_against_reference(&session, source, "q", &params, false)
+                .await
+                .unwrap();
+        judgment.verdict.unwrap_or_else(|e| {
+            panic!(
+                "{e}\nengine: {}\nreference: {}",
+                judgment.engine, judgment.reference
+            )
+        });
+    });
+}
+
+/// The shrunk case of a defect law 1 found once the registry rows let an
+/// uncorrelated grouped `from`'s `where` fail; it predates them, as a
+/// division shows: the elements evaluate in written order, so a `from`
+/// whose `where` refuses (`E2`) refuses the read even where a triple
+/// written after it matches no edge, but the engine joins the `from` with
+/// that empty triple and never runs it. The generator's grouped `from`
+/// draws no `where` that can fail until the element order is the written
+/// one.
+#[test]
+#[ignore = "hunt: an uncorrelated from that can fail is not run beside a later triple that matches nothing"]
+fn an_uncorrelated_from_that_can_fail_runs_beside_an_empty_triple() {
+    let schema = "node A {\n    k: String @key\n    t: String?\n}\nedge Rel0: A -> A\n";
+    let seed = r#"{"type":"A","data":{"k":"a"}}"#;
+    let source = r#"query q($z: I64) {
+  match { from { match { $g: A } where ((1 / $z) > 0) return { $g.t as t, count($g) as n } }, $a: A, $a rel0 $b }
+  return { $a.k as c0 }
+}"#;
+    let params: ParamMap = [(
+        "z".to_string(),
+        omnigraph_compiler::query::value::Literal::Integer(0),
+    )]
+    .into_iter()
+    .collect();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap();
+        let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+        session.load_jsonl(seed, LoadMode::Overwrite).await.unwrap();
+        let judgment =
+            omnigraph_gqt::judge_read_against_reference(&session, source, "q", &params, false)
+                .await
+                .unwrap();
+        judgment.verdict.unwrap_or_else(|e| {
+            panic!(
+                "{e}\nengine: {}\nreference: {}",
+                judgment.engine, judgment.reference
+            )
+        });
+    });
+}
+
+/// The shrunk case of a defect law 1 found once `cast` let a block's
+/// aggregate fail; it predates the registry rows, as a division shows: a
+/// `let` bound to a block whose aggregate refuses (`E2`) refuses the read
+/// even where a triple written after the `let` matches no edge, but the
+/// engine runs the triple first and never evaluates the block. A scalar
+/// `let` keeps its place. The generator draws no term that can fail in a
+/// block a `let` binds until the element order is the written one.
+#[test]
+#[ignore = "hunt: a block a let binds that can fail does not run before a later triple that matches nothing"]
+fn a_let_block_that_can_fail_runs_before_a_later_empty_triple() {
+    let schema =
+        "node A {\n    k: String @key\n    z: I64?\n}\nedge Rel0: A -> A\nedge Rel1: A -> A\n";
+    let seed = r#"{"type":"A","data":{"k":"a","z":0}}
+{"edge":"Rel1","from":"a","to":"a","data":{}}"#;
+    let source = r#"query q() {
+  match { $a: A, let $s = (sum((1 / $b.z)) { $b: A, $a rel1 $b }), $a rel0 $c }
+  return { $s as c0 }
+}"#;
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap();
+        let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+        session.load_jsonl(seed, LoadMode::Overwrite).await.unwrap();
+        let judgment = omnigraph_gqt::judge_read_against_reference(
+            &session,
+            source,
+            "q",
+            &ParamMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        judgment.verdict.unwrap_or_else(|e| {
+            panic!(
+                "{e}\nengine: {}\nreference: {}",
+                judgment.engine, judgment.reference
+            )
+        });
+    });
+}
+
+/// The shrunk case of a defect the placement law found once `cast` let a
+/// block in `return` fail; it predates the registry rows, as a division
+/// shows: the `return` items are computed on the rows the `where` keeps,
+/// so a block there that refuses (`E2`) on a row the `where` removes
+/// leaves no row to refuse, but the engine computes the block first. The
+/// generator draws no term that can fail in a block in `return` until the
+/// block runs above the `where`.
+#[test]
+#[ignore = "hunt: a block in return that can fail runs on rows the where removes"]
+fn a_return_block_that_can_fail_runs_on_the_rows_the_where_keeps() {
+    let schema = "node A {\n    k: String @key\n    z: I64?\n}\nedge Rel0: A -> A\n";
+    let seed = r#"{"type":"A","data":{"k":"a","z":0}}
+{"edge":"Rel0","from":"a","to":"a","data":{}}"#;
+    let source = r#"query q() {
+  match { $a: A }
+  where ($a.k = "b")
+  return { (count { $b: A, $a rel0 $b where ((1 / $a.z) > 0) }) as c0 }
 }"#;
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let dir = tempfile::tempdir().unwrap();

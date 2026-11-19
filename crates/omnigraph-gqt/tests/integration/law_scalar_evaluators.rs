@@ -6,8 +6,14 @@
 //! one input of each of `I32`, `I64`, `U32`, `F32`, `F64`, `Bool` and
 //! `String` and over literals: `+ - * / %`, unary minus, `if`, `coalesce`,
 //! comparisons across the numeric types, `and`, `or`, `not`, `is [not]
-//! null`. The inputs are one generated row (nulls, zeros, `-0.0`, the
-//! integer extremes, `1e30` in an `F32`).
+//! null`, and the registry's scalar rows: `lower`, `upper`, `trim`,
+//! `ltrim`, `rtrim`, `length`, `left`, `right`, `substring`, `abs`,
+//! `floor`, `ceil`, `round` with and without `digits:`, `sqrt`, `exp`,
+//! `ln`, `log10`, `power` and `cast` between every pair of the inputs'
+//! types it converts. The inputs are one generated row (nulls, zeros,
+//! `-0.0`, the integer extremes, `1e30` in an `F32`, Strings with Unicode
+//! whitespace and case mappings, and texts `cast` reads or refuses as a
+//! number or a Boolean).
 //!
 //! One expression is evaluated:
 //!

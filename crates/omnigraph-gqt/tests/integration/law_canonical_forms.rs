@@ -7,23 +7,28 @@
 //! have the same typed IR, the same logical and physical explain plans, the
 //! same `logical_hash`, and the same rows.
 //!
-//! Three parts:
+//! Four parts:
 //!
 //! - every listed pair, once, over a fixed schema and graph. The pairs are
-//!   lint's codes `L203` and `L206` to `L211` (the RFC's list), which are
-//!   also the eight kinds of collision the type checker spike pinned and the
-//!   compiler's desugaring test re-pins with the parser (the RFC names the
-//!   five that the surface removed but not the eight that remain; this law
-//!   takes them to be those eight kinds). The five spellings the RFC's list
-//!   also names (`case`, `||`, `<>`, a single-quoted string, a keyword in
-//!   another letter case) do not compile: the grammar refuses them, so they
-//!   have no typed IR, and this part requires instead that the refusal's
-//!   printed suggestion, applied, has the canonical spelling's typed IR;
+//!   lint's codes `L203` and `L206` to `L216` (the RFC's list): the eight
+//!   kinds of collision the type checker spike pinned and the compiler's
+//!   desugaring test re-pins with the parser (the RFC names the five that
+//!   the surface removed but not the eight that remain; this law takes them
+//!   to be those eight kinds), and the five spellings section 3 admits:
+//!   `case` (searched, simple, without `else`, nested in a `where`), `||`,
+//!   `<>`, a single-quoted string and a keyword or registry name in another
+//!   letter case;
+//! - the spellings the grammar refuses with a printed fix (section 5's
+//!   habits and the SQL and Cypher forms it does not admit): the fix,
+//!   applied, has the canonical spelling's typed IR;
 //! - generated reads (p21's generator) with the listed rewrites applied at
-//!   random positions, each rewritten read held to its original;
+//!   random positions, each rewritten read held to its original: the five
+//!   admitted spellings are written by `arbitrary::respell_spellings`, which
+//!   chooses the keywords and registry names from the parse tree, so
+//!   property, edge and alias names keep their spelling;
 //! - every read of the GQT corpus that lint flags with a canonical form,
-//!   with lint's printed fix applied, held to the same typed IR and
-//!   `logical_hash`.
+//!   with lint's printed byte-range fix applied, held to the same typed IR
+//!   and `logical_hash`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,6 +42,7 @@ use omnigraph_compiler::ParamMap;
 use omnigraph_compiler::catalog::{Catalog, build_catalog};
 use omnigraph_compiler::ir::core::CoreDecl;
 use omnigraph_compiler::query::check::check_source;
+use omnigraph_compiler::query::diagnostic::TextEdit;
 use omnigraph_compiler::query::lint::{QueryLintSchemaSource, lint_query_file};
 use omnigraph_compiler::query::syntax::parse::apply_edits;
 use omnigraph_compiler::query_input::{JsonParamMode, find_named_query, json_params_to_param_map};
@@ -45,7 +51,7 @@ use proptest::test_runner::TestCaseError;
 use serde_json::Value;
 
 use crate::law_engine_reference::{law_runner, load, sample};
-use omnigraph_compiler::arbitrary::{ReadOptions, choices};
+use omnigraph_compiler::arbitrary::{ReadOptions, Spelling, choices, respell_spellings};
 
 /// The per-pull-request case count; the nightly test runs `NIGHTLY`.
 const CASES: u32 = 200;
@@ -144,35 +150,102 @@ const LISTED: &[(&str, &str, &str)] = &[
         "query q($t: String) { match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.text, terms($t, mode: any)) as $s } return { $d.slug, $s } order { $s desc, $d.slug } }",
         "query q($t: String) { match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.text, $t) as $s } return { $d.slug, $s } order { $s desc, $d.slug } }",
     ),
-];
-
-/// The five spellings the RFC's list names that the grammar refuses, each
-/// with the canonical spelling its refusal's suggestion must reach.
-const REFUSED: &[(&str, &str, &str)] = &[
     (
-        "<>",
-        "query q() { match { $p: Person } where $p.name <> \"ada\" return { $p.name } }",
-        "query q() { match { $p: Person } where $p.name != \"ada\" return { $p.name } }",
+        "L212",
+        "query q() { match { $p: Person } return { $p.name, case when $p.age > 30 then \"older\" else \"younger\" end as band } }",
+        "query q() { match { $p: Person } return { $p.name, if($p.age > 30, \"older\", \"younger\") as band } }",
     ),
     (
-        "single-quoted string",
-        "query q() { match { $p: Person } where $p.name = 'ada' return { $p.name } }",
-        "query q() { match { $p: Person } where $p.name = \"ada\" return { $p.name } }",
+        "L212",
+        "query q() { match { $p: Person } return { $p.name, case when $p.age > 30 then \"older\" end as band } }",
+        "query q() { match { $p: Person } return { $p.name, if($p.age > 30, \"older\", null) as band } }",
     ),
     (
-        "keyword in another letter case",
-        "query q() { MATCH { $p: Person } RETURN { $p.name } }",
-        "query q() { match { $p: Person } return { $p.name } }",
+        "L212",
+        "query q() { match { $p: Person } return { $p.name, case when $p.age > 30 then 2 when $p.age > 18 then 1 else 0 end as band } }",
+        "query q() { match { $p: Person } return { $p.name, if($p.age > 30, 2, if($p.age > 18, 1, 0)) as band } }",
     ),
     (
-        "||",
+        "L212",
+        "query q() { match { $p: Person } return { $p.name, case $p.name when \"ada\" then 1 when \"bob\" then 2 else 0 end as n } }",
+        "query q() { match { $p: Person } return { $p.name, if($p.name = \"ada\", 1, if($p.name = \"bob\", 2, 0)) as n } }",
+    ),
+    (
+        "L212",
+        "query q() { match { $p: Person } where case when $p.age is null then false else $p.age > 20 end return { $p.name } }",
+        "query q() { match { $p: Person } where if($p.age is null, false, $p.age > 20) return { $p.name } }",
+    ),
+    (
+        "L213",
         "query q() { match { $p: Person } return { $p.name || \"!\" as n } }",
         "query q() { match { $p: Person } return { concat($p.name, \"!\") as n } }",
     ),
     (
-        "case",
-        "query q() { match { $p: Person } return { case when $p.age > 30 then 1 else 0 end as n } }",
-        "query q() { match { $p: Person } return { if($p.age > 30, 1, 0) as n } }",
+        "L213",
+        "query q() { match { $p: Person, $p worksAt $c } return { $p.name || \"@\" || $c.name as n } }",
+        "query q() { match { $p: Person, $p worksAt $c } return { concat($p.name, \"@\", $c.name) as n } }",
+    ),
+    (
+        "L214",
+        "query q() { match { $p: Person } where $p.name <> \"ada\" return { $p.name } }",
+        "query q() { match { $p: Person } where $p.name != \"ada\" return { $p.name } }",
+    ),
+    (
+        "L215",
+        "query q() { match { $p: Person } where $p.name = 'ada' return { $p.name } }",
+        "query q() { match { $p: Person } where $p.name = \"ada\" return { $p.name } }",
+    ),
+    (
+        "L215",
+        "query q() { match { $p: Person } where $p.name != 'it\\'s \"x\"' return { $p.name } }",
+        "query q() { match { $p: Person } where $p.name != \"it's \\\"x\\\"\" return { $p.name } }",
+    ),
+    (
+        "L216",
+        "QUERY q() { MATCH { $p: Person } WHERE $p.age IS NOT NULL AND NOT ($p.name = \"bob\") RETURN { $p.name, $p.age } ORDER { $p.age DESC NULLS LAST } LIMIT 2 }",
+        "query q() { match { $p: Person } where $p.age is not null and not ($p.name = \"bob\") return { $p.name, $p.age } order { $p.age desc nulls last } limit 2 }",
+    ),
+    (
+        "L216",
+        "query q() { match { $p: Person, Optional { $f: Person, $p knows $f } } where Exists { $c: Company, $p worksAt $c } or $p.age Is Null return Distinct { Upper($p.name) as n, Coalesce($f.name, \"-\") as f } }",
+        "query q() { match { $p: Person, optional { $f: Person, $p knows $f } } where exists { $c: Company, $p worksAt $c } or $p.age is null return distinct { upper($p.name) as n, coalesce($f.name, \"-\") as f } }",
+    ),
+    (
+        "L216",
+        "query q() { match { $p: Person } return { COUNT($p) as n, Max($p.age) as oldest, CAST(SUM($p.age), String) as total, IF(TRUE, 1, 0) as one } }",
+        "query q() { match { $p: Person } return { count($p) as n, max($p.age) as oldest, cast(sum($p.age), String) as total, if(true, 1, 0) as one } }",
+    ),
+];
+
+/// Spellings the grammar refuses whose refusal prints a fix (section 5),
+/// each with the canonical spelling its suggestion must reach. The five
+/// spellings of section 6's list it once refused are admitted now and are
+/// pairs of [`LISTED`].
+const REFUSED: &[(&str, &str, &str)] = &[
+    (
+        "==",
+        "query q() { match { $p: Person } where $p.name == \"ada\" return { $p.name } }",
+        "query q() { match { $p: Person } where $p.name = \"ada\" return { $p.name } }",
+    ),
+    (
+        "x not in list",
+        "query q() { match { $p: Person } where $p.name not in [\"ada\"] return { $p.name } }",
+        "query q() { match { $p: Person } where not $p.name in [\"ada\"] return { $p.name } }",
+    ),
+    (
+        "starts with",
+        "query q() { match { $p: Person } where $p.name starts with \"a\" return { $p.name } }",
+        "query q() { match { $p: Person } where starts_with($p.name, \"a\") return { $p.name } }",
+    ),
+    (
+        "between",
+        "query q() { match { $p: Person } where $p.age between 18 and 40 return { $p.name } }",
+        "query q() { match { $p: Person } where $p.age >= 18 and $p.age <= 40 return { $p.name } }",
+    ),
+    (
+        "&&",
+        "query q() { match { $p: Person } where $p.age > 18 && $p.age < 40 return { $p.name } }",
+        "query q() { match { $p: Person } where $p.age > 18 and $p.age < 40 return { $p.name } }",
     ),
 ];
 
@@ -300,7 +373,7 @@ fn every_listed_canonical_form_keeps_the_ir_the_plan_the_hash_and_the_rows() {
             }
             // Lint names the written form with its code and no other.
             let findings = canonical_findings(&session.catalog(), written);
-            if !findings.iter().any(|(c, _, _)| c == code) && written != canonical {
+            if !findings.iter().any(|(c, _)| c == code) && written != canonical {
                 failures.push(format!("{code}: lint does not name\n  {written}"));
             }
             if !canonical_findings(&session.catalog(), canonical).is_empty() {
@@ -313,11 +386,11 @@ fn every_listed_canonical_form_keeps_the_ir_the_plan_the_hash_and_the_rows() {
     });
 }
 
-/// The five spellings of the RFC's list that the grammar refuses: their
-/// refusal's suggestion, applied, must have the canonical spelling's typed
-/// IR. A refusal without a suggestion is reported with the others.
+/// The spellings the grammar refuses with a printed fix: their refusal's
+/// suggestion, applied, must have the canonical spelling's typed IR. A
+/// refusal without a suggestion is reported with the others.
 #[test]
-fn refused_spellings_of_the_list_suggest_their_canonical_form() {
+fn refused_spellings_suggest_their_canonical_form() {
     let catalog = build_catalog(&parse_schema(SCHEMA).unwrap()).unwrap();
     let mut failures = Vec::new();
     for (label, written, canonical) in REFUSED {
@@ -351,9 +424,14 @@ fn refused_spellings_of_the_list_suggest_their_canonical_form() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Every canonical-form finding lint prints for `source`: (code, the form
-/// as written, the fix).
-fn canonical_findings(catalog: &Catalog, source: &str) -> Vec<(String, String, String)> {
+/// lint's codes of section 6's canonical forms.
+const CANONICAL_CODES: [&str; 12] = [
+    "L203", "L206", "L207", "L208", "L209", "L210", "L211", "L212", "L213", "L214", "L215", "L216",
+];
+
+/// Every canonical-form finding lint prints for `source`: its code and its
+/// printed byte-range fix, `None` where it prints none.
+fn canonical_findings(catalog: &Catalog, source: &str) -> Vec<(String, Option<Vec<TextEdit>>)> {
     lint_query_file(
         catalog,
         source,
@@ -362,57 +440,9 @@ fn canonical_findings(catalog: &Catalog, source: &str) -> Vec<(String, String, S
     )
     .findings
     .into_iter()
-    .filter(|f| {
-        matches!(
-            f.code.as_str(),
-            "L203" | "L206" | "L207" | "L208" | "L209" | "L210" | "L211"
-        )
-    })
-    .filter_map(|f| {
-        let fix = f.fix?;
-        let start = f.message.find('`')? + 1;
-        let end = start + f.message[start..].find("` is `")?;
-        Some((f.code, f.message[start..end].to_string(), fix))
-    })
+    .filter(|f| CANONICAL_CODES.contains(&f.code.as_str()))
+    .map(|f| (f.code, f.suggestion.map(|s| s.edits)))
     .collect()
-}
-
-/// `written` replaced by `fix` in `source`, where `written` occurs once up
-/// to whitespace (lint prints the construct, which the source may lay out
-/// with other spacing).
-fn apply_fix(source: &str, written: &str, fix: &str) -> Option<String> {
-    // Whitespace between two word characters must be there; elsewhere it
-    // may be absent. The match must not run into a neighboring word.
-    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
-    let chars: Vec<char> = written.chars().collect();
-    let mut pattern = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i].is_whitespace() {
-            let before = pattern.is_empty() || chars[..i].last().is_some_and(|c| word(*c));
-            let next = chars[i..].iter().find(|c| !c.is_whitespace());
-            let after = next.is_some_and(|c| word(*c));
-            pattern.push_str(if before && after { r"\s+" } else { r"\s*" });
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            continue;
-        }
-        if i > 0 && !chars[i - 1].is_whitespace() {
-            pattern.push_str(r"\s*");
-        }
-        pattern.push_str(&regex::escape(&chars[i].to_string()));
-        i += 1;
-    }
-    let pattern = format!(r"(?:^|[^\w$])(?P<m>{pattern})(?:$|[^\w])");
-    let re = regex::Regex::new(&pattern).ok()?;
-    let mut found = re.captures_iter(source);
-    let m = found.next()?.name("m")?;
-    if found.next().is_some() {
-        return None;
-    }
-    let (start, end) = (m.start(), m.end());
-    Some(format!("{}{fix}{}", &source[..start], &source[end..]))
 }
 
 // ---------------------------------------------------------------------------
@@ -474,19 +504,27 @@ fn exists_count(s: &str, pick: usize) -> Option<String> {
     Some(format!("{}{with}{}", &s[..start], &s[end..]))
 }
 
-/// `L208`: an order key with and without `asc`.
+/// `L208`: an order key with and without `asc`, before its `nulls first`
+/// or `nulls last`.
 fn order_asc(s: &str, pick: usize) -> Option<String> {
     let at = s.find("\n  order { ")? + "\n  order { ".len();
     let end = at + s[at..].find(" }")?;
     let keys: Vec<String> = s[at..end].split(", ").map(str::to_string).collect();
+    let split = |key: &str| -> (String, String) {
+        match key.find(" nulls ") {
+            Some(n) => (key[..n].to_string(), key[n..].to_string()),
+            None => (key.to_string(), String::new()),
+        }
+    };
     let candidates: Vec<usize> = (0..keys.len())
-        .filter(|&i| !keys[i].ends_with(" desc"))
+        .filter(|&i| !split(&keys[i]).0.ends_with(" desc"))
         .collect();
     let i = nth(candidates, pick)?;
     let mut keys = keys;
-    keys[i] = match keys[i].strip_suffix(" asc") {
-        Some(bare) => bare.to_string(),
-        None => format!("{} asc", keys[i]),
+    let (key, nulls) = split(&keys[i]);
+    keys[i] = match key.strip_suffix(" asc") {
+        Some(bare) => format!("{bare}{nulls}"),
+        None => format!("{key} asc{nulls}"),
     };
     Some(format!("{}{}{}", &s[..at], keys.join(", "), &s[end..]))
 }
@@ -552,6 +590,38 @@ fn bm25_terms(s: &str, pick: usize) -> Option<String> {
     ))
 }
 
+/// One admitted spelling (`L212` to `L216`) written at places `pick`
+/// seeds, the next seeds tried where one writes none at a place the read
+/// has; `None` where none of four does.
+fn spelled(s: &str, pick: usize, form: Spelling) -> Option<String> {
+    (0..4).find_map(|i| {
+        let (out, written) = respell_spellings(s, pick as u64 + i, &[form]);
+        (!written.is_empty()).then_some(out)
+    })
+}
+
+fn case_spelling(s: &str, pick: usize) -> Option<String> {
+    spelled(s, pick, Spelling::Case)
+}
+
+fn bars_spelling(s: &str, pick: usize) -> Option<String> {
+    spelled(s, pick, Spelling::Bars)
+}
+
+fn not_equal_spelling(s: &str, pick: usize) -> Option<String> {
+    spelled(s, pick, Spelling::NotEqual)
+}
+
+fn single_quote_spelling(s: &str, pick: usize) -> Option<String> {
+    spelled(s, pick, Spelling::SingleQuote)
+}
+
+fn letter_case_spelling(s: &str, pick: usize) -> Option<String> {
+    spelled(s, pick, Spelling::LetterCase)
+}
+
+/// The textual rewrites first: the admitted spellings, written from the
+/// parse tree, change the text they match.
 const REWRITES: &[(&str, Rewrite)] = &[
     ("L203", exists_count),
     ("L208", order_asc),
@@ -559,6 +629,11 @@ const REWRITES: &[(&str, Rewrite)] = &[
     ("L207 undirected", undirected_ends),
     ("L210", rrf_options),
     ("L211", bm25_terms),
+    ("L212 case", case_spelling),
+    ("L213 ||", bars_spelling),
+    ("L214 <>", not_equal_spelling),
+    ("L215 single quote", single_quote_spelling),
+    ("L216 letter case", letter_case_spelling),
 ];
 
 static APPLIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -629,6 +704,19 @@ fn run_rewrite_law(cases: u32) {
     assert!(
         applied * 4 >= total,
         "only {applied} of {total} reads took a rewrite"
+    );
+    let by_rewrite = BY_REWRITE.lock().unwrap();
+    let untaken: Vec<&str> = REWRITES
+        .iter()
+        .map(|(label, _)| *label)
+        .filter(|label| {
+            Spelling::ALL.iter().any(|f| label.starts_with(f.code()))
+                && !by_rewrite.contains_key(label)
+        })
+        .collect();
+    assert!(
+        untaken.is_empty(),
+        "no generated read took the admitted spellings {untaken:?}"
     );
 }
 
@@ -712,7 +800,6 @@ fn lint_fixes_over_the_corpus_keep_the_typed_ir_and_the_logical_hash() {
     paths.sort();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut checked = BTreeMap::<String, usize>::new();
-    let mut not_applied = Vec::new();
     let mut failures = Vec::new();
     for path in paths {
         let text = std::fs::read_to_string(&path).unwrap();
@@ -747,11 +834,14 @@ fn lint_fixes_over_the_corpus_keep_the_typed_ir_and_the_logical_hash() {
                 }
             };
             let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
-            for (source, params, (code, written, fix)) in flagged {
-                let Some(fixed) = apply_fix(&source, &written, &fix) else {
-                    not_applied.push(format!("{name}: {code} `{written}`"));
+            for (source, params, (code, edits)) in flagged {
+                // Every canonical-form finding prints its fix as byte-range
+                // edits of the source, which `lint --fix` applies.
+                let Some(edits) = edits else {
+                    failures.push(format!("{name}: {code} prints no byte-range fix\n{source}"));
                     continue;
                 };
+                let fixed = apply_edits(&source, &edits);
                 let query = last_declaration_name(&source);
                 let json = params
                     .as_deref()
@@ -806,10 +896,6 @@ fn lint_fixes_over_the_corpus_keep_the_typed_ir_and_the_logical_hash() {
         });
     }
     eprintln!("lint fixes checked: {checked:?}");
-    eprintln!(
-        "not applied textually ({}): {not_applied:?}",
-        not_applied.len()
-    );
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     assert!(
         checked.values().sum::<usize>() >= 50,
