@@ -1178,7 +1178,7 @@ jobs:
       # The edition-2 side: the GQT runner of the merge base with main that
       # the GQ 3 break was measured against. Keep it immutable: the edition-2
       # engine is what every case is compared with, and a moving reference
-      # would compare edition 3 with itself (docs/dev/testing.md, Cross-edition
+      # would compare edition 3 with itself (docs/dev/test-ownership.md, Cross-edition
       # comparison).
       - name: Build the edition-2 GQT runner and CLI
         env:
@@ -1244,7 +1244,7 @@ jobs:
             --measure
 
       # The generated reads both editions express, run through the edition-2
-      # CLI and this tree's engine (docs/dev/testing.md, Generated laws).
+      # CLI and this tree's engine (docs/dev/test-ownership.md, Generated laws).
       - name: Run the two-edition law
         env:
           OMNIGRAPH_REQUIRE_EDITION_2: '1'
@@ -1257,7 +1257,7 @@ jobs:
       # `omnigraph lint --fix`'s loop over every edition-2 text of the pinned
       # tree: the printed fixes converge, and what they write has the typed
       # IR of the hand rewrite in this tree or a row of
-      # crates/omnigraph-gqt/lint-fix-edition-2.tsv (docs/dev/testing.md,
+      # crates/omnigraph-gqt/lint-fix-edition-2.tsv (docs/dev/test-ownership.md,
       # Cross-edition comparison).
       - name: Respell the edition-2 corpus with the printed fixes
         env:

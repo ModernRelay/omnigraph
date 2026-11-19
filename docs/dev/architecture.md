@@ -4,9 +4,9 @@
 **Authority:** current system boundaries and ownership; detailed protocols live
 in the linked area guides
 
-OmniGraph is a typed property-graph engine that coordinates many Lance
+Omnigraph is a typed property-graph engine that coordinates many Lance
 datasets. Lance supplies columnar storage, per-dataset versions, branches,
-transactions, and indexes. OmniGraph adds one accepted graph schema, one
+transactions, and indexes. Omnigraph adds one accepted graph schema, one
 graph-wide visibility boundary, graph query and mutation semantics, policy,
 cluster deployment state, and public CLI/HTTP surfaces.
 
@@ -28,13 +28,19 @@ flowchart TB
     LANCE[Lance datasets]
     OBJECTS[local FS / S3 / Azure Blob]
 
-    CLI --> CLUSTER
+        CLI --> CLUSTER
     CLI --> ENGINE
+    CLI --> HTTP
+    CLI --> POLICY
+
     HTTP --> ENGINE
     HTTP --> CLUSTER
     HTTP --> POLICY
     HTTP --> MCP
-    CLUSTER --> ENGINE
+        CLUSTER --> ENGINE
+    CLUSTER --> POLICY
+    CLUSTER --> COMPILER
+
     ENGINE --> COMPILER
     ENGINE --> PLANNER
     PLANNER --> COMPILER
@@ -42,10 +48,15 @@ flowchart TB
     ENGINE --> STORAGE
     ENGINE --> CATALOG
     ENGINE --> CORE
-    CATALOG --> CORE
+        CATALOG --> CORE
     CATALOG --> STORAGE
+    CATALOG --> COMPILER
     CORE --> STORAGE
+    CORE --> COMPILER
     ENGINE --> LANCE
+    CATALOG --> LANCE
+    CORE --> LANCE
+
     CLUSTER --> STORAGE
     LANCE --> OBJECTS
     STORAGE --> OBJECTS
@@ -100,9 +111,14 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph-skill` | The `skills/omnigraph` agent skill, embedded byte for byte by its build script; the package root is `skills/`, so the skill tree stays its one copy. `omnigraph skill export` writes it. |
 | `omnigraph-mcp` | MCP SDK integration, boot settings, tool and resource catalog, argument decoding, result formatting and response deadlines. The server supplies execution through its adapter. |
 | `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, multi-graph serving and live deployment activation. |
-| `omnigraph-azure-admission` | Azure deployment wrapper that admits one mutation-capable server process through the root-derived Blob lease. It is not a storage backend. |
+| `omnigraph-azure-admission` | Azure deployment wrapper that admits one mutation-capable process (a server or a job) through the root-derived Blob lease. It is not a storage backend. |
 | `omnigraph-gqt-core` | GQT format, embedded and served execution, and expectation checks shared by the GQT runner and benchmark harness. It has no build script or test-only engine dependency. |
 | `omnigraph-reference` | The typed core IR's reference interpreter: it evaluates a checked read directly from the operator table (whole-table reads, nested loops; no index, planner or cost model) over a branch's JSONL export, depending on the compiler alone. GQT compares every read step on the direct engine with it, the GQT runner is its one dependent, and a change to core semantics updates it in the same change ([testing](testing.md)). |
+| `omnigraph-seams` | The one seam type for test-time behavior substitution: a named slot a test fills and the engine, core, catalog and cluster consult. |
+| `omnigraph-gqt`, `omnigraph-gqt-served` | The `.gqt` logic-test corpus and its runner, one named test per case, and the same corpus run against an in-process `omnigraph-server`. |
+| `omnigraph-dst` | Deterministic simulation testing. |
+| `omnigraph-bench` | Declarative benchmark planning and execution. |
+| `tools/omnigraph-vocabulary-guard` | The audit tool CI's `Graph Vocabulary Guard` job runs. |
 
 The server mounts `omnigraph-mcp` at `/mcp` on its existing listener. Its adapter
 dispatches to the same handlers as HTTP and retains authentication, OAuth
@@ -162,7 +178,9 @@ for frozen destinations; they cannot return routing authority. Managed acquisiti
 exchanges control access for a verified cluster-bound data credential before
 constructing the common served `GraphClient`. There is no per-command managed
 allowlist or control credential at a graph endpoint. Real direct-only capability
-boundaries remain in dispatch. Operator direct targets support local files only;
+boundaries remain in dispatch. Registered direct targets accept `file://` only; an inline `s3://` root reaches
+stopped-writer deployment commands, direct maintenance, and clone roots under
+an `s3://` base;
 engine/server cloud-storage constructors retain their independent contracts.
 Acquired credentials retain their typed binding and expiry through client
 construction. HTTP dispatch checks expiry after public discovery and before
@@ -214,8 +232,9 @@ client's write evidence; initialization and system-column upgrade retain their
 own execution paths and do not claim the data-write outcome envelope. The upgrade
 adapter keeps its separate read-only check and execution modes.
 
-`commands/maintenance` owns optimize, cleanup, full-text index rebuilding
-and storage upgrade arguments and dispatch. Supplied output writers keep delivery
+`commands/maintenance` owns optimize (direct, and served as a recorded
+operation), index build and rebuild (full-text included), cleanup and storage upgrade
+arguments and dispatch. Supplied output writers keep delivery
 failures in application completion. Cleanup retains preview and consent before
 write admission; rebuild retains its actor and branch. The storage-upgrade adapter retains its existing
 conversion and recovery owner. These commands do not use the data-write outcome
@@ -234,6 +253,8 @@ Neither path replays work to recover output. Deployment and recovery authority
 remain in the cluster crate.
 
 `commands/local` owns version and bundled skill/embedding dispatch.
+`commands/mcp` owns the stdio MCP bridge, and `commands/studio` the `studio`
+link.
 `commands/targets` owns offline configuration validation, target editing and
 credential commands, including journaled owner/profile renames that preserve
 binding IDs and explicit rename recovery. `managed` owns platform onboarding,
@@ -258,9 +279,9 @@ including identity diagnostics before dispatch.
   pin, accepted schema and lineage change in one manifest CAS. See [writes.md](writes.md) and
   [recovery.md](recovery.md).
 - A merge performs a graph-level three-way comparison, validates the selected
-  result, stages its table effects, and uses the same publication boundary. A
-  fast forward that only inserts nodes of types with no `@unique`, `@range`,
-  `@check` or enum property skips the validation. See [merge.md](merge.md).
+  result, stages its table effects, and uses the same publication boundary. A fast forward whose candidates are all proven pure inserts into node
+  types with no `@unique`, `@range`, `@check` or enum property, and no edge type
+  with a non-zero `@card` minimum from them, skips the validation. See [merge.md](merge.md).
 - Blob cells use an engine-owned, snapshot-bound facade; callers never receive
   a raw Lance `BlobFile` or physical placement. See [blob.md](blob.md).
 - Cluster apply converges definitions and graph topology into a CAS-protected
@@ -295,8 +316,7 @@ gates for single-writer ownership.
   its storage round trips on a clone and installs the result with one
   pointer swap, refused when the installed state already supersedes it
   (`Omnigraph::install_coordinator`). A read and a write sharing one handle
-  and branch (for example, the server's requests on `main`) no longer wait
-  for each other; a read that starts while a publish is in flight binds the
+  and branch (for example, the server's requests on `main`) do not wait for each other; a read that starts while a publish is in flight binds the
   installed state and sees the publish once it is installed. While the
   process holds the branch's [writer epoch](writes.md#writer-epoch) with its
   last publication there on record, a read of the handle's bound branch takes

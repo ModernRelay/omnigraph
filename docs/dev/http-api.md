@@ -50,16 +50,15 @@ commit-page default remains with the separate pagination design.
 
 `omnigraph-api-types::operations` names each HTTP operation once, with its
 method, path, write capability and existing MCP and CLI bindings. An absent
-or restricted binding has a reason. CLI commands whose owners are local
-storage, the operator configuration or the managed control plane have exact
-named entries with those reasons. The inventory adds no commands or tools.
+or restricted binding has a reason. Every CLI command with no HTTP operation has an exact named entry with
+its reason.
 
 The server registers native routes through this inventory. Its route owner
 also records branch actions from the actual `BranchAction` dispatch and OAuth
 metadata from the production constructor. Tests compare those registrations
 with the inventory and the generated specification. The CLI compares its
-Clap command leaves; the MCP integration owner compares real `tools/list`
-responses across its boot gates. The MCP crate remains engine-free.
+Clap command leaves; the MCP integration owner compares the real `tools/list` response
+with the inventory. The MCP crate remains engine-free.
 
 When adding an operation, update its inventory row, handler registration,
 OpenAPI annotation and existing test owner together. The convention test uses
@@ -85,10 +84,7 @@ facts; the OpenAPI owner tests their published description.
 
 Changing an operationId or schema name changes generated SDK source even when
 the wire is unchanged. The released 0.14 contract uses `actor_id` in access
-results and the `listing` enum for commit lists. When upgrading from a
-prerelease build, update clients and servers together and regenerate SDKs:
-earlier 0.14 builds share the header, so admission cannot distinguish their
-older shapes. Retired `unpublished` and `unattached` query keys are refused
+results and the `listing` enum for commit lists.  Retired `unpublished` and `unattached` query keys are refused
 even when false; they
 cannot silently select history. MCP has its own tool-schema migration and
 does not require the HTTP contract header. See the

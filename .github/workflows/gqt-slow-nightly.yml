@@ -66,7 +66,7 @@ jobs:
           rm -rf "$RUNNER_TEMP/edition-2-target"
           echo "OMNIGRAPH_EDITION_2_BIN=$e2_cli" >> "$GITHUB_ENV"
 
-      # The generated laws at nightly breadth (docs/dev/testing.md, Generated
+      # The generated laws at nightly breadth (docs/dev/test-ownership.md, Generated
       # laws), enrolled by exact name; a name that did not run and pass fails.
       - name: Run the generated laws at nightly breadth
         env:

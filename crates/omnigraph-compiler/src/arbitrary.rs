@@ -1,5 +1,5 @@
 //! Generators of schemas, graphs and well-typed GQ 3 reads, shared by every
-//! generated law (`docs/dev/testing.md`, "Generated laws").
+//! generated law (`docs/dev/test-ownership.md`, "Generated laws").
 //!
 //! Every generator reads one [`Choices`] stream: a list of numbers that
 //! proptest draws and shrinks. A choice past the end of the list is `0`, and

@@ -73,8 +73,10 @@ pull request is what review is for: `.github/CODEOWNERS` does not cover
 history but no mechanical stop.
 
 Among the blocking jobs: `Graph Vocabulary Guard` reports a successful skip on
-pull requests and queue entries; the full OpenAPI, Rust presentation-string,
-and public-Rust audit runs after merge, on tags, and by manual dispatch. User
+pull requests and queue entries. After merge, on tags, and by manual dispatch
+it runs only its unit tests: the OpenAPI, Rust presentation-string, and
+public-Rust audit steps are disabled by the `VOCABULARY_AUDIT_ENABLED` switch
+([ci.md](ci.md)). User
 documentation is intentionally outside this exact-occurrence audit and is
 validated by the documentation structure check. PRs outside the engine-input
 class (documentation, `.gqt` cases, deployment files; see the classes in
@@ -92,12 +94,11 @@ the rest. `dependency-guard-nightly.yml` runs the same check on `main` daily,
 so the red shows there first.
 
 `Test Workspace` blocks on pull requests and on the merge queue's branch.
-Before the queue it was reporting-only because of strict checks: every merge
-invalidated every other open pull request's required contexts, so a required
-60-minute context would have spaced merges an hour apart. Under the queue the
+Under the queue the
 entry waits for its slowest blocking job anyway (`Test omnigraph-server
---features aws` and `Storage Upgrade Compatibility` share the suite's
-60-minute ceiling; ceilings bound the wait, they are not durations), so
+--features aws` shares the suite's 60-minute ceiling and `Storage Upgrade
+Compatibility` has a 120-minute one; ceilings bound the wait, they are not
+durations), so
 requiring the suite adds runner minutes and, per entry, only the time by
 which it outruns the other blocking jobs; in return a red suite can no
 longer land. `V5 ↔ V10
@@ -134,10 +135,12 @@ status-check timeout removes it, so `ci.yml`, `gq-logic-tests.yml`,
 (rustfmt)` and `Lint (clippy)` job conditions accept the event beside
 `pull_request`, and `scripts/check-merge-group-triggers.py`, a step of `Check
 Workflow Action Pins`, fails the build when a workflow owning a required
-context loses the trigger, a job condition admits `pull_request` without
-`merge_group`, or the gate's wiring drifts from the shape above. A job the
-gate needs that skipped on the queue where its `if:` says it runs makes the
-gate red there, so the queue shows the gap instead of waiting it out. The
+context loses the trigger, the job that owns a required context reads the
+event without deciding on `merge_group`, or the gate's wiring drifts from the
+shape above. The `if:` of a job inside the gate is not validated statically:
+the table of `scripts/ci_gate.py` restates it, and a job the gate needs that
+skipped on the queue where its `if:` says it runs makes the gate red there,
+so the queue shows the gap instead of waiting it out. The
 classifier diffs the merge group's own `base_sha` and
 `head_sha` from the event payload; GitHub does not document whether that base
 is `main`'s tip or the entry ahead, so an entry may run the work of the
@@ -146,10 +149,10 @@ context required only on the rule page and absent from the JSON is invisible
 to the validator; if its workflow lacks the trigger, every entry stalls until
 the timeout.
 
-The reporting contexts that are not required (`V5 ↔ V9 Format Fence`, the
+The reporting contexts that are not required (`V5 ↔ V10 Format Fence`, the
 `RustFS S3 Integration` shards, `Azurite Azure Integration`, `Container
 Entrypoint`, `Azure Deployment Validation`, `Azure Contract Guards`) and the
-vocabulary audit are gated off the merge-group branch: the queue merges on
+vocabulary guard are gated off the merge-group branch: the queue merges on
 the required contexts alone, so a run there would finish after the merge and
 only repeat the post-merge run. `DST pinned suite` (`dst.yml`) runs on queue
 entries as a reporting context; it does not hold the queue.
@@ -179,7 +182,7 @@ A title edited after queueing does not change that captured subject: the
 edit re-runs only the pull-request check, and whether a red result there
 removes the entry is undocumented, as for the regression gate above. That
 the landed commit's subject is the captured one is inferred from the
-payload, not documented; one observed queue run after rollout confirms it.
+payload, not documented; one observed queue run confirms it.
 This merge-group run executes the queued commit's copy of the checker, like
 every merge-group run; the policy copy ran on the pull request.
 
@@ -197,13 +200,14 @@ match this list: merge method Squash and merge; build concurrency 5; minimum
 entries to merge 1, or after 5 minutes; maximum entries to merge 5; **Only
 merge non-failing pull requests** on (the removal rule above holds only with
 it on; off, a red entry lands behind a green one); status-check timeout 90
-minutes, above the 60-minute ceilings of the slowest blocking jobs on a
-cold cache (`Test Workspace`, `Test omnigraph-server --features aws`,
-`Storage Upgrade Compatibility`).
+minutes, above the 60-minute ceilings of `Test Workspace` and `Test
+omnigraph-server --features aws` on a cold cache. `Storage Upgrade
+Compatibility` has a 120-minute ceiling, so a run of it that outlasts the
+queue timeout removes its entry.
 
 A group merges as one push of `main` carrying one squash commit per entry, so
 the post-merge runs (`Test Workspace`, the fence, the shards, Azurite, the
-vocabulary audit) cover the whole group at once, and a
+vocabulary guard) cover the whole group at once, and a
 revert picks the entry's own squash commit out of that push.
 
 Changing one of the five required context names still needs the rule page:
@@ -251,9 +255,10 @@ after every apply.
 
 ## Code owners
 
-`.github/CODEOWNERS` names the reviewers GitHub requests for each workspace
-member: one anchored line per crate under `crates/` and under `tools/`, plus
-one for `/deny.toml`, the dependency allowlist. Other paths request nobody. GitHub reads the copy on `main`,
+`.github/CODEOWNERS` names the reviewers GitHub requests for workspace
+members: one anchored line per member directory (under `crates/`, `tools/`
+and `skills/`), plus one for `/deny.toml`, the dependency allowlist. A member
+without a line, like every other path, requests nobody. GitHub reads the copy on `main`,
 requests the listed people when a pull request is opened ready for review,
 marked ready, or gains a matching path in a later push, and never requests the
 pull request's own author. Two handles on
