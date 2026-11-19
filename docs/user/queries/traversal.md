@@ -164,10 +164,10 @@ query staff_beside($slug: String) {
 ```
 
 The fix joins the components through a triple; when exactly one edge type
-connects a variable of one with a variable of the other, the diagnostic's
-suggestion inserts it, source first (`$p worksAt $c`). An intended product is
-written as a named relation drawn with `from`, which reads nothing of the
-scope; that is the form the suggestion writes otherwise:
+connects a variable of one with a variable of the other, the printed fix names
+it, source first (`$p worksAt $c`). An intended product is written as a named
+relation drawn with `from`, which reads nothing of the scope. That is the form
+the suggestion writes, for review, since it keeps the product's rows:
 
 ```gq
 query every_pair() {

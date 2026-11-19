@@ -13,7 +13,7 @@ CLI configuration, HTTP/MCP, and client compatibility changes.
 
 This release parses GQ 3 only: a stored query or `.gq` file written for an
 earlier release fails to compile, and [Upgrading queries to GQ
-3](../queries/upgrading-to-gq3.md) maps each older form to its GQ 3 form. Validate stored queries with the new binary first (`omnigraph queries validate`), rewrite the failing ones from their printed fixes, and apply the rewritten registry in the same step as the binary switch, since an older server cannot load the new syntax ([procedure](../queries/upgrading-to-gq3.md#stored-queries-at-upgrade)).
+3](../queries/upgrading-to-gq3.md) maps each older form to its GQ 3 form. Validate stored queries with the new binary first (`omnigraph queries validate`), rewrite the failing ones from their printed fixes (`omnigraph lint --fix` applies them), and apply the rewritten registry in the same step as the binary switch, since an older server cannot load the new syntax ([procedure](../queries/upgrading-to-gq3.md#stored-queries-at-upgrade)).
 
 ## Storage upgrade
 

@@ -1,1 +1,1 @@
-- `collect(x)` gathers a group's non-null values into a list in value order (`collect(distinct x)` drops repeats), in `return` and as a block value; saved plans use `bound_plan_version` 17.
+- `collect(x)` gathers a group's non-null values into a list in value order (`collect(distinct x)` drops repeats) in `return` and as a block value.

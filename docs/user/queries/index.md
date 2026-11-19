@@ -92,7 +92,7 @@ to `null` makes every comparison on it null, and `is null` refuses a `Blob`.
 `not ($p.age > 30) or $p.age is null` selects every row the comparison did not.
 
 `and`, `or`, `not`, `is`, `null` and `in` are reserved words: none is a bare operand, a return alias or a call name. A keyword is never a call name either: `where(…)`, `match(…)` and `and(a, b)` are `Q019`, whose fix prints the form the word is used in (`a and b`).
-`$p.and` after a dot and `and: 1` in an assignment stay legal; `nothing` and `android` are ordinary identifiers. Whitespace may follow a minus sign: `- $p.age`, `[- 1, 2]` and a default `= - 3` read as `-$p.age`, `[-1, 2]` and `= -3`.
+Keywords and function names are read in any letter case, and `case`, `||`, `<>` and single-quoted strings are accepted as [other spellings](functions.md#other-accepted-spellings) of `if`, `concat`, `!=` and double-quoted strings; lint names each. `$p.and` after a dot and `and: 1` in an assignment stay legal; `nothing` and `android` are ordinary identifiers. Whitespace may follow a minus sign: `- $p.age`, `[- 1, 2]` and a default `= - 3` read as `-$p.age`, `[-1, 2]` and `= -3`.
 A bare name is never a value in a read (`Q018`): a property is `$x.name`, a
 parameter `$name` and a string `"name"`; the one bare name is an `order` alias.
 Inside `match` any word is an edge name, reserved words included: `$i in $b`
@@ -102,7 +102,7 @@ wrong side); a [write](../mutations/index.md) selects the same way.
 ### Correlated blocks
 
 `exists { ... }`, `not exists { ... }`, `count { ... } op value` and
-`sum(expr) { ... } op value` (also `min`, `max`, `avg`) match a pattern once
+`sum(expr) { ... } op value` (also `min`, `max`, `avg`, `stddev` and `percentile(expr, p)`) match a pattern once
 per outer row; a block holds elements and its own `where`, `count { $q:
 Person, $p knows $q where $q.age > 30 }`, reads an outer variable (`T39`, `T9`
 under `not`) and binds every name new to it (`T84`, [inner
@@ -113,7 +113,7 @@ $p.quota`), by the [comparison rules](#boolean-expressions-and-nulls), and
 under `or` or `not` a block is a Boolean operand like any other. A block is
 also a value, `let $n = count { … }` or `count { … } as n` in `return`, one
 per outer row; `collect($q.name) { … }` is the list of its values, `[]` with none. Its argument is a scalar expression in the block's scope: numeric for
-`sum` and `avg`; numeric, `String`, `Bool`, `Date` or `DateTime` for `min` and
+`sum`, `avg`, `stddev` and `percentile`; numeric, `String`, `Bool`, `Date` or `DateTime` for `min` and
 `max`, as in `return`. With no matches `count` is `0` and the others are null.
 
 Integer block `sum` accumulates exactly in 128 bits, refuses overflow of that
@@ -166,7 +166,7 @@ query prolific($least: I64) {
 
 `NULL` never matches these predicates, and `%` and `_` are not wildcards. An
 index never changes their rows; `@index` speeds `in` over a list and `contains`
-([what `@index` builds](../schema/index.md#what-index-builds)). Use [full-text
+([what `@index` builds](../schema/index.md#what-index-builds)) over the bare property, never over a function of it such as `contains(lower($x.title), $q)` ([indexes](functions.md#indexes)). Use [full-text
 search](../search/index.md) for tokens, fuzzy matching, relevance.
 
 ### System fields
@@ -195,8 +195,8 @@ order { companies desc, $person.name asc }
 limit 20
 ```
 
-Return expressions include variables, properties, literals, [arithmetic](traversal.md#values-and-inline-reads), `if`, `coalesce`, `concat`, `now()`, `count`,
-`sum`, `avg`, `min`, `max`, `collect`, and a [ranking](../search/index.md)'s score, named
+Return expressions include variables, properties, literals, [arithmetic](traversal.md#values-and-inline-reads), [functions](functions.md) (`if`, `coalesce`, `concat`, `lower`, `round`, `cast`, …), `now()`, `count`,
+`sum`, `avg`, `min`, `max`, `collect`, [`stddev` and `percentile`](functions.md#aggregates), and a [ranking](../search/index.md)'s score, named
 by its `from`'s `as` (`T85`). Each gives one column named by its alias or
 expression (`$p.name` gives `p.name`; a score drawn `as $s` gives `s`); duplicates are
 refused (`T25`).
@@ -231,7 +231,7 @@ limiting, so the limit counts distinct rows. Aggregates with `distinct` are refu
 DISTINCT order keys must be projected values or aliases, including property keys (`T42`).
 
 Order is total under the tie rule: after the written keys (ascending puts nulls
-first, descending last), each entity id in the order the pattern writes it (a
+first, descending last; `nulls first` or `nulls last` after a key, as in `order { $p.age desc nulls first }`, places that key's nulls, and rows whose key is null fall to the later keys), each entity id in the order the pattern writes it (a
 traversal's destination before its edge), then a `from`'s value columns, all
 ascending; group rows use their keys, bare nodes (by id) first. Ids are read
 only when they can change the order. A `limit` with no `order` cuts this order
@@ -327,7 +327,7 @@ A refused file reports its refusal's code at `line <n>, column <c>`: a
 [branch statement](../branching/index.md) where declarations were expected is
 `Q004`, a refused [settings line](#session-settings) `Q003`, and `T83` too. A
 refused query reports every refusal with its code and line, and exits nonzero
-on an error; [Lint](lint.md) lists the findings, canonical forms included.
+on an error; [Lint](lint.md) lists the findings, canonical forms included, and `omnigraph lint --fix` applies the printed fixes.
 
 For every query that compiles successfully, JSON output includes an
 `operation` descriptor:

@@ -171,7 +171,8 @@ Traversal costing uses these facts; absent, unusable or incomplete endpoint
 indexes receive scan cost. Saved plans retain this coverage. Older accepted
 plans without coverage provenance continue to check coverage during execution.
 
-Sort keys and ordering use GQ text such as `$p.name desc`; a ranked scan's
+Sort keys and ordering use GQ text such as `$p.name desc`, with a written
+null placement after the direction (`$p.rank desc nulls first`); a ranked scan's
 ordering names `$p._distance asc` or `$p._score desc`, and the physical
 `Sort` above a search order leads its `keys` with that score key, followed by
 the query's plain keys; a fusion's rows leave unordered, and the read's own

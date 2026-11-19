@@ -1,1 +1,1 @@
-- Explain shows a `bm25` as a `Score` node; the `TextSearch` kind, a ranked scan's `eligibility` and `assumptions.full_text` are gone. Saved plans use `bound_plan_version` 15.
+- Explain shows a `bm25` as a `Score` node; the `TextSearch` kind, a ranked scan's `eligibility` and `assumptions.full_text` are gone.

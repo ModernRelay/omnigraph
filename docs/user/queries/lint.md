@@ -10,7 +10,8 @@ omnigraph lint --query queries.gq --schema schema.pg --json
 
 Each finding has a `severity` (`error`, `warning` or `info`), a `code`, a
 `message` and, for a finding about a query, `query_names`. A finding that
-names a non-canonical form also has `fix`, the text that replaces the form.
+names a non-canonical form also has `fix`, the text that replaces the form,
+and `suggestion`, the same fix as byte-range edits of the source.
 `errors`, `warnings` and `infos` count them; lint exits nonzero when
 `errors` is not zero.
 
@@ -37,6 +38,11 @@ them.
 | `L209` | `return { $p as p }` | `return { $p }`: no alias equal to its column's name |
 | `L210` | `rrf(…, k: 60)`, `terms($q, max_edits: 0, mode: any)` | a call's options in the registry's order, those equal to their default dropped: `rrf(…)`, `terms($q, mode: any)` |
 | `L211` | `bm25($pop, $d.body, terms($q, mode: any))` | `bm25($pop, $d.body, $q)` |
+| `L212` | `case when c then a else b end`, `case x when v then a end` | `if(c, a, b)`, `if(x = v, a, null)`: nested `if`, a missing `else` meaning `null` |
+| `L213` | `a \|\| b \|\| c` | `concat(a, b, c)` |
+| `L214` | `$p.age <> 3` | `$p.age != 3` |
+| `L215` | `'Ada'` | `"Ada"` |
+| `L216` | `WHERE`, `IS NULL`, `LOWER($p.name)` | `where`, `is null`, `lower($p.name)`: keywords and function names in lower case |
 
 Two findings have the rows of a canonical form but not its meaning, since a
 count compared with a number is not a test of existence; replacing them is
@@ -73,6 +79,9 @@ stops, unchanged, at a refusal with no fix, and lint lists that refusal; its
 position counts into the text the earlier passes wrote (`stopped_at_pass`). A
 fix printed for review (`needs_review`) can change what a query means, such as
 dropping an `offset`, so it stops a file too unless `--review-fixes` is given.
+`T81`'s suggestion is for review too: it writes a product of two patterns as
+a named relation, which keeps the product's rows, where the intended query
+usually joins them through an edge.
 A file whose fixes write a text seen before, or still change after 16 passes,
 does not converge and is left as it was.
 

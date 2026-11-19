@@ -186,9 +186,9 @@ expected format instead, without an edit.
 | `Q009` | `mutation` is not a declaration keyword; the fix is `query`. |
 | `Q010` | A binding carries a property map or braces; the fix is the binding and the conjunct in `where`, `match { $p: Person } where $p.handle = $h`. |
 | `Q011` | A read body carries `as commit` or `as unattached branch`. |
-| `Q012` | A respelling the language refuses (`not { … }`, `\|\|`, `CASE`, a chained comparison, a one-name edge group `(knows)`, an annotation's empty parentheses `@name()`); the fix prints the legal form. |
+| `Q012` | A respelling the language refuses (`not { … }`, a chained comparison, a one-name edge group `(knows)`, an annotation's empty parentheses `@name()`); the fix prints the legal form. |
 | `Q013` | A write's elements are written without `match { }`, or after a statement; the fix is the group's `match`. |
-| `Q014` | A spelling from another language (`==`, `&&`, `WHERE`, `count(*)`, …); the fix prints the GQ form. |
+| `Q014` | A spelling from another language (`==`, `&&`, `!`, `count(*)`, `like`, …); the fix prints the GQ form. `case`, `\|\|`, `<>`, single quotes and another letter case are accepted ([other spellings](functions.md#other-accepted-spellings)). |
 | `Q015` | A form the language does not have yet; the message names it. |
 | `Q016` | Two elements, return items, order keys, call arguments or assignments are separated by whitespace alone; the fix is the comma. |
 | `Q017` | A filter, a `where` or a comparison inside the `match` braces; the fix moves it to the `where` after them, joined with `and`. |
@@ -216,9 +216,8 @@ error[T81]: type error: T81: `$p: Person` shares no variable with `$c: Company`,
   fix: join them through the edge, `$p worksAt $c`, or write the intended product as a named relation, `let $ps = { match { $p: Person } return { $p } }, from $ps`
 ```
 
-The suggestion appends the triple, machine-applicable, when exactly one edge
-type joins the components; otherwise it writes the named relation and needs
-review.
+The suggestion writes the named relation, which keeps the product's rows, and
+needs review: joining through the edge the `fix` names changes the rows.
 
 ## Triples against their edge's direction
 
@@ -339,8 +338,7 @@ whatever its population declares first
 ## Execution codes
 
 An execution code refuses a row while the query or write runs
-(`execution error: E2: …`). A refused write publishes nothing. A `limit`, `limit 0` included, hides
-no refusal: the return items and order keys are computed on every row before the cut.
+(`execution error: E2: …`). A refused write publishes nothing. A `limit`, `limit 0` included, hides no refusal: the return items and order keys are computed on every row before the cut.
 
 | Code | Meaning |
 |---|---|
@@ -348,3 +346,5 @@ no refusal: the return items and order keys are computed on every row before the
 | `E2` | A divisor is zero. |
 | `E3` | A float result is not finite. |
 | `E4` | The rows of one write statement give one entity's property two values, which row order would otherwise decide; make the selection reach each entity once, or agree on the value. |
+| `E5` | A [function](functions.md)'s argument is outside its domain (the root of a negative number, a negative count), or `percentile`'s bound fraction is null or outside 0 to 1. |
+| `E6` | A value does not convert to `cast`'s type: text that is not a literal of the type, or a number out of its range. |

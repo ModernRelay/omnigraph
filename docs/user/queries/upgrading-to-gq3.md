@@ -1,11 +1,21 @@
 # Upgrading queries to GQ 3
 
 GQ 3 replaces the query language. This release parses GQ 3 only: there is no
-edition line, no older parser and no conversion command. A source written for
-an earlier release fails to compile like any other invalid source, and every
-older form that GQ 3 refuses prints its fix, as text and as byte-range edits
-([Diagnostics](diagnostics.md)). Rewrite each source from the map below and
-the fixes the compiler prints.
+edition line and no older parser. A source written for an earlier release
+fails to compile like any other invalid source, and every older form that GQ 3
+refuses prints its fix, as text and as byte-range edits
+([Diagnostics](diagnostics.md)). `omnigraph lint --fix` applies those fixes
+to a file, a directory or a cluster configuration's stored queries
+([Lint](lint.md#fix)):
+
+```bash
+omnigraph lint --fix --query queries/ --schema schema.pg --dry-run --json
+```
+
+It leaves a file unchanged at a refusal with no fix, and at a fix printed for
+review unless `--review-fixes` is given; finish those from the map below. It
+also leaves a keyed `insert` that the older release meant as `replace`, since
+that text still compiles (the map's `insert` row).
 
 ## Stored queries at upgrade
 
@@ -19,9 +29,11 @@ binary:
    applied registry and schemas and reports every stored query that fails,
    parse and type refusals together, each with its code, position, fix and
    byte-range edits; byte offsets count into the stored query's own source.
-2. **Rewrite the failing queries from their printed fixes.** Edit the `.gq`
-   files your `cluster.yaml` names, applying each fix, and check the bundle
-   with the new binary (`omnigraph cluster validate --config <bundle>`).
+2. **Rewrite the failing queries from their printed fixes.** Run
+   `omnigraph lint --fix --config <bundle>` on the configuration directory
+   your `cluster.yaml` is in, finish what it leaves by hand, and check the
+   bundle with the new binary (`omnigraph cluster validate --config
+   <bundle>`).
 3. **Apply the rewritten registry with the binary switch.** Stop the old
    server, apply the bundle directly with the new CLI (`omnigraph cluster
    apply --target <cluster-root> --config <bundle>`; direct apply requires
@@ -158,10 +170,16 @@ refuses a `sum`, `avg`, `min`, `max` or `collect` block without its argument.
 ## Other changes a reader sees
 
 - A read may not be named after a registry function or an element keyword
-  (`T74`): `distance`, `nearest`, `bm25`, `rrf`, `union`, `contains`,
-  `starts_with`, `match_terms`, `terms`, `now`, `if`, `coalesce`, `concat`,
-  `count`, `sum`, `avg`, `min`, `max`, `collect`, `let`, `from`, `optional`, `exists`
-  and `not`. A write's name is not checked.
+  (`T74`): `distance`, `nearest`, `bm25`, `rrf`, `union`, every scalar
+  function and aggregate on [Functions and operators](functions.md)
+  (`contains`, `starts_with`, `match_terms`, `terms`, `now`, `lower`,
+  `length`, `left`, `round`, `size`, `cast`, …), `let`, `from`, `optional`,
+  `exists` and `not`. A write's name is not checked.
+- Keywords and function names are read in any letter case, and `case … end`,
+  `||`, `<>` and single-quoted strings are accepted as other spellings of
+  `if`, `concat`, `!=` and double-quoted strings
+  ([Functions and operators](functions.md#other-accepted-spellings)). Lint
+  names each with its canonical form, and `lint --fix` writes that form.
 - Over grouped rows (an aggregate or `return distinct`), every order key must
   be a `return` item or its alias (`T42`); before, a key such as `$p.@id` or
   `$e.@type` was accepted there.
