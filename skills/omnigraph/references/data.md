@@ -148,7 +148,8 @@ in the file are preserved:
   property the record omits becomes null, Blob and vector included.
 
 A job that retries a load uses `upsert` or `replace`. `append` and `merge`,
-edition 2's names, are refused with `insert` and `replace` as the fixes. An
+edition 2's names, are refused with `insert` and `replace` as the fixes (under
+`--json`, a `bad_request` error whose `diagnostic` is `Q004` with the fix). An
 unkeyed edge without a supplied `id` never matches an existing row, so re-running
 a file duplicates it; declare `@key(@src, @dst)` when creating the edge type if
 repeated loads must converge.

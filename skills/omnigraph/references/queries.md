@@ -42,6 +42,10 @@ Lint returns:
 - `"warnings": N` — count of `L201` warnings (a nullable property that no update query sets)
 - `"infos": N` — the canonical forms, each finding with its `fix`: `L203` (`count { } > 0` → `exists`), `L206` (nested `union` → flat), `L207` (`<e>` ends and alternation members in name order), `L208` (drop `asc`), `L209` (drop an alias equal to its column), `L210` (options in registry order, defaults dropped), `L211` (`bm25` over `terms(q, mode: any)` → the String), `L212` (`case … end` → nested `if`), `L213` (`a || b` → `concat(a, b)`), `L214` (`<>` → `!=`), `L215` (`'x'` → `"x"`), `L216` (`WHERE`, `LOWER(…)` → lower case); `L204`/`L205` (`count { } >= 1` / `= 0`: same rows as `exists` / `not exists`, your choice). Write the canonical form
 
+Every refusal and canonical form in `--json` carries its `fix` and, when it
+is machine-applicable, `suggestion.edits`: the byte-range edits `--fix`
+writes.
+
 Run lint after every `.gq` or `.pg` edit. Wire into precommit.
 `omnigraph lint --fix --query queries/ --schema schema.pg` writes the printed
 fixes and canonical forms into the files (`--dry-run` to preview, `--config
@@ -289,6 +293,28 @@ query busy_signals($least: I64) {
     return { $s.slug }
 }
 ```
+
+### The engine catalogue (`@` types)
+
+Five built-in node types describe the running binary, read like any type and
+never written: `@Operator` (`name`, `inputs`: the physical operators),
+`@Pass` (`name`, `position`: the planner passes in order), `@Setting`
+(`name`, `kind`, `default`, `scope`), `@Engine` (`version`,
+`current_internal_schema_version`, `min_supported_internal_schema_version`)
+and `@LogicalKind` (`name`, `coverage`). No `@` type can be declared, written
+or searched.
+
+```gq
+query operators() {
+  match { $o: @Operator }
+  return { $o.name, $o.inputs }
+  order { $o.name }
+}
+```
+
+Run it on any graph (`omnigraph query --target <uri> -e '…'`), on the local
+binary with no store (`omnigraph catalogue -e '…' --json`), or served under the
+reserved graph `og_catalog`.
 
 ## System Fields and Result Values
 
@@ -637,6 +663,31 @@ another, in two writes.
 > **Constructive-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts, upserts, replaces and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`upsert`/`replace`/`update` in the same query is a type error (`T76`) that `lint` reports. The split is deliberate: one mutation query is constructive XOR destructive. Split a delete-then-insert into two separate mutations.
 
 A write's filter may compare at most four properties more than once each with `=`, `!=` or `in` (for example `$x.s in ["a"] or $x.s in ["b"]` compares `s` twice). One that compares more is refused before any effect; split the condition across groups or simplify it.
+
+### Proposals and snapshots: `as commit`, `as unattached branch`
+
+The clause after a write's parameters decides where its result lands; the
+branch head stays where it was in both cases.
+
+```gq
+query propose_bob() as commit {
+    replace Person { name: "bob", age: 41 }
+}
+
+query draft_person($name: String) as unattached branch {
+    replace Person { name: $name }
+}
+
+query draft_more($base: String) as unattached branch on $base {
+    replace Person { name: "carol" }
+}
+```
+
+`as commit` records an unpublished commit: read it with `--snapshot <id>`,
+then `commit publish "<id>"` installs it on its branch or `commit drop "<id>"`
+discards it; a merge takes `branch merge feature into main as commit`.
+`as unattached branch` records a snapshot that never publishes: its id is the
+caller's tip, and the next write `on "<id>"` (or `on $base`) builds on it.
 
 ### Date and DateTime values
 

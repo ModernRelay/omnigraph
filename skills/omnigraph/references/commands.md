@@ -204,7 +204,9 @@ omnigraph schema plan --schema next.pg --target $REPO --json
 omnigraph schema apply --schema next.pg --target $REPO
 ```
 
-Both commands require a direct target; server and managed targets refuse. Cluster-managed
+Both commands require a direct target; server and managed targets refuse. A
+plan with no step publishes nothing; `one_way_constructs` names what a binary
+before GQ 3 cannot read back. Cluster-managed
 graphs evolve through `cluster apply`. See `references/schema.md` for the full
 workflow.
 
@@ -356,9 +358,10 @@ Builds every declared index a table on the branch lacks (a type whose first rows
 landed there) and rebuilds each BTREE or vector index that leaves the branch's
 rows uncovered, in one graph commit on that branch; a second run is a no-op with
 a null `graph_commit_id`. Read `indexes` (`kind`, `action`: `built` or
-`refreshed`) and `pending_indexes`: full-text coverage stays pending with the
-`index rebuild --kind full-text` remedy, as do vector properties with no vectors.
-Only those are pending: a rebuild that fails for another reason, a storage
+`refreshed`) and `pending_indexes`: vector properties with no vectors. No
+query reads a full-text index, so its coverage is never pending and the build
+never recommends `index rebuild --kind full-text`, after which a binary before
+GQ 3 refuses full-text reads until its own rebuild. Only those are pending: a rebuild that fails for another reason, a storage
 failure for one, fails the command.
 No query waits on it: matching and `bm25` read the rows, not the index.
 

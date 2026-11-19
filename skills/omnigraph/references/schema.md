@@ -112,6 +112,21 @@ omnigraph schema apply --schema next.pg --target ./graph.omni
 
 If `supported: false`, fix the source before applying. Plan is free; run it as often as needed.
 
+A plan with no step is a no-op: its apply publishes nothing and the stored
+schema text stays as it was, even when the new text differs (a comment, an
+explicit `distance = "l2"`). A cluster refuses such a text-only change of a
+graph's schema file (`schema_preflight_failed`): keep the file equal to
+`omnigraph schema show`.
+
+**One-way constructs.** A binary before GQ 3 re-parses the stored schema on
+every open, so once an apply stores one of these it refuses the whole graph,
+and only a backup taken before the upgrade restores it: an explicit
+`distance` on a Vector (`l2` included), `@index` on a List property,
+`@index(fulltext)` with or without options, an `analyzer` or a `scorer` in it.
+`schema plan`, `schema apply` and `cluster plan` name each one under
+`one_way_constructs` (`construct`, `type_name`, `property`, `line`, `column`)
+with a `one_way_note`; nothing gates the apply.
+
 Plan/apply diagnostics may carry stable codes of the form **`OG-XXX-NNN`**. When
 a code is present, match it rather than the free-form message text.
 

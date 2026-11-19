@@ -43,9 +43,11 @@ omnigraph queries list --target prod --graph dev --json # a server's GET /graphs
   `queries validate` instead audits the **applied** registry against each
   applied schema without restarting the server; it cannot see unapplied source
   edits; it reports every failing query, parse and type refusals together,
-  each with its code, position, fix and byte edits. A stored query that fails
-  to compile under the server's release (after a binary upgrade, say) makes
-  only itself unavailable while its graph serves: `queries list`, the MCP
+  each with its code, position, fix and byte edits. Each declaration of a
+  stored file compiles on its own: one that fails under the server's release
+  (after a binary upgrade, say) is unavailable with its own diagnostic, one
+  that calls it is unavailable naming it, and the others in the file serve,
+  while the graph serves: `queries list`, the MCP
   `queries` tool and `GET /graphs/{graph_id}/queries` list it under
   `unavailable` with its diagnostic, `GET /graphs` reports it per graph, and
   invoking it answers 409 `stored_query_unavailable` with the same diagnostic.

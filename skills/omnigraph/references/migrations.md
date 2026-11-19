@@ -12,6 +12,10 @@ dispatch or graph access. Earlier prerelease 0.14 builds share the header and
 header admission cannot distinguish their older shapes; refresh clients,
 server and integrations together. See [server policy](server-policy.md).
 
+`omnigraph version` prints `query-language gq3` (`query_language` in `--json`
+and in `/healthz`); a binary that speaks the older query syntax prints none,
+under the same version and contract numbers.
+
 ## Upgrade to the 0.14 HTTP API
 
 Regenerate SDKs from the current OpenAPI document: graph operation IDs lose
@@ -137,5 +141,11 @@ certificate records the field's analyzer profile (`english_v1` where none is
 declared), and returns no rows. It reads the BITMAP, LABEL_LIST and NGRAM
 indexes `@index` now builds, but rebuilds a lagging one as a BTREE or fails.
 To roll back, restore the whole-root backup taken before the upgrade, or
-rebuild the indexes with the earlier binary on each live branch. Do not edit
-certificates or index metadata to make the earlier binary accept them.
+rebuild the indexes with the earlier binary on each live branch: after the
+current `index rebuild --kind full-text`, the earlier binary's own
+`index rebuild --kind full-text` restores its full-text reads. `index build`
+and `optimize` never recommend that rebuild, since no query reads a full-text
+index. A schema apply that stored a one-way construct
+([schema.md](schema.md#evolution-schema-planapply)) has no in-place rollback:
+the earlier binary refuses the whole graph until the backup is restored. Do
+not edit certificates or index metadata to make the earlier binary accept them.
