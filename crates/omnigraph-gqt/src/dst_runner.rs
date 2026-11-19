@@ -1728,7 +1728,7 @@ fn run_invocation(
     }
     let build = executable_digest(executable)?;
     summary.executable_digest = Some(build.clone());
-    let budget = Duration::from_millis(case.runner.timeout_ms);
+    let budget = Duration::from_millis(case.runner.timeout_ms) * case.plain_passes() as u32;
     let remaining = || {
         budget
             .checked_sub(started.elapsed())
@@ -2773,6 +2773,7 @@ mod action_tests {
                         ordinal as usize,
                         &[serde_json::json!({"label": "w2", "outcome": "ok"}),
                           serde_json::json!({"label": "r1", "outcome": "ok"})],
+                        &[Some(0), Some(0)],
                         &crate::concurrent::Outcome {
                             stuck_at: None,
                             failure: None,
@@ -2815,7 +2816,7 @@ mod action_tests {
             block: &crate::concurrent::Outcome,
         ) -> super::WorkerReport {
             super::capture("same-input".into(), async {
-                crate::record_concurrent_outcome(3, sessions, block);
+                crate::record_concurrent_outcome(3, sessions, &[Some(0), Some(0)], block);
                 Ok(())
             })
             .await

@@ -70,7 +70,7 @@ impl Environment {
         };
         if needs_dst {
             return Err(
-                "unsupported_environment: --store cannot execute seams or concurrent blocks on the direct engine; select or declare omnigraph-engine-dst (--target omnigraph-engine-dst)".into(),
+                "unsupported_environment: --store cannot execute seams or scripted concurrent blocks on the direct engine; select or declare omnigraph-engine-dst (--target omnigraph-engine-dst)".into(),
             );
         }
         if !["file://", "s3://", "az://"]
@@ -164,7 +164,7 @@ impl Environment {
                 }
             }
             _ => Err(format!(
-                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams or concurrent blocks and omnigraph-engine-dst/in-memory-object-store",
+                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams or scripted concurrent blocks and omnigraph-engine-dst/in-memory-object-store",
                 self
             )),
         }
