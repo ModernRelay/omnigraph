@@ -2911,17 +2911,6 @@ fn validate_required_row_string<'a>(
     }
 }
 
-// Single-row test shim over `preflight_strict_row_arrow_bytes_with_limit`,
-// kept next to the strict-row staged-write preflight helpers.
-#[cfg(test)]
-#[allow(dead_code)]
-fn preflight_strict_row_arrow_bytes(
-    schema: &arrow_schema::Schema,
-    object: &serde_json::Map<String, JsonValue>,
-) -> Result<()> {
-    preflight_strict_row_arrow_bytes_with_limit(schema, object, KEYED_WRITE_MAX_BYTES)
-}
-
 #[cfg(test)]
 fn preflight_strict_row_arrow_bytes_with_limit(
     schema: &arrow_schema::Schema,

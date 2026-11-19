@@ -131,8 +131,9 @@ five more changes like this one?**
 13. **Evidence matches the boundary.** Test the layer whose contract changed.
     Irreversible storage, protocol, or substrate decisions require an RFC plus
     compatibility, refusal, crash, and rebuild evidence. Cost claims require a
-    checked-in instrument. Extend the existing owner in
-    [testing.md](testing.md) before adding a parallel fixture.
+    checked-in instrument. Extend the existing owner
+    ([testing.md](testing.md), [test ownership](test-ownership.md)) before
+    adding a parallel fixture.
 
 ## Deny-list
 
@@ -194,8 +195,9 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
 - The writer epoch fences publications that move a branch's head, on a branch
   some process claimed ([writes](writes.md#writer-epoch)). Only the embedded
   engine claims: no command or route does, so a claimed branch refuses the
-  server and the CLI. Ref metadata and ref deletes, the collector's deletes
-  and `optimize`'s configuration commit are not fenced. The process that holds
+  server and the CLI. Ref metadata and ref deletes, the collector's
+  deletes, `optimize`'s configuration commit and the stamp-only route of
+  `omnigraph upgrade` are not fenced. The process that holds
   its handle's bound branch reads it, and opens and revalidates its writes on
   it, with no head probe ([writes](writes.md#writer-epoch) lists the sites and
   the captures that still probe), so the reads of an owner another process

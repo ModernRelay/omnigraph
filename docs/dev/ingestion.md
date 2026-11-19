@@ -1,6 +1,6 @@
 # Ingestion
 
-OmniGraph has one durable ingestion model: a bounded batch becomes visible through the ordinary `Load` writer and one graph commit. There is no separate streaming database, WAL, token ledger, lane lifecycle, or acknowledgement tier.
+Omnigraph has one durable ingestion model: a bounded batch becomes visible through the ordinary `Load` writer and one graph commit. There is no separate streaming database, WAL, token ledger, lane lifecycle, or acknowledgement tier.
 
 The rejected designs are retained in [RFC 0018](../rfcs/0018-ingest-wal.md) and [RFC 0026](../rfcs/0026-memwal-streaming-ingest.md). They are history, not implementation guidance.
 
@@ -29,13 +29,13 @@ The HTTP handler authorizes both change and any requested branch creation before
 
 ### Compatibility loader
 
-`POST /graphs/{graph_id}/load` and the engine `load_as` accept a JSON envelope whose `data` field contains loader-compatible NDJSON. This preserves historical coercions and shapes that the strict graph-batch boundary intentionally refuses: a nullable scalar or list item of the wrong JSON type becomes NULL (a non-nullable property then refuses the load), and a list that is not a JSON array is refused. `Date` and `DateTime` are the exception on both paths: their string form already goes through a fallible parser, so a NULL for a wrong-typed value would be a lost error rather than a coercion, and such a value is refused with the property named.
+`POST /graphs/{graph_id}/load` accepts a JSON envelope whose `data` field is loader-compatible NDJSON; the engine `load_as` takes that NDJSON directly. This preserves historical coercions and shapes that the strict graph-batch boundary intentionally refuses: a nullable scalar or list item of the wrong JSON type becomes NULL (a non-nullable property then refuses the load), and a list that is not a JSON array is refused. `Date` and `DateTime` are the exception on both paths: their string form already goes through a fallible parser, so a NULL for a wrong-typed value would be a lost error rather than a coercion, and such a value is refused with the property named.
 
 The engine `ingest*` methods are deprecated parser/default shims over the same loader, with no separate fast path or durability contract. They retain the old default of forking a missing branch from `main` when no base is supplied. CLI and HTTP integrations use `load` or `/load/ndjson`, which require an explicit base to create a missing branch.
 
 ## Transaction contract
 
-All surfaces converge on the same writer:
+A third input, the `load csv` statement, reads an external object under the Blob policy ([blob.md](blob.md)), bounded by `load_source_max_bytes`, and never forks a branch. All surfaces converge on the same writer:
 
 1. Resolve the target branch and optionally fork it from an explicit base.
 2. Capture one accepted catalog and branch snapshot.
@@ -65,11 +65,11 @@ Load publishes logical data only. Declared physical indexes are derived and reco
 
 ## Why there is no MemWAL path
 
-The removed experiment could durably admit rows into per-dataset Lance MemWALs, but OmniGraph still needed graph-level validation, cross-table ordering, recovery, fold, and one manifest publication. That extra coordinator duplicated authority and paid the graph commit cost later rather than removing it.
+The removed experiment could durably admit rows into per-dataset Lance MemWALs, but Omnigraph still needed graph-level validation, cross-table ordering, recovery, fold, and one manifest publication. That extra coordinator duplicated authority and paid the graph commit cost later rather than removing it.
 
-Current cluster configuration therefore rejects removed `streaming` declarations. Current manifests contain no stream profile, `_mem_wal`, `_stream_tokens`, lifecycle revision, receipt, or durable-but-not-visible acknowledgement state. A graph written by an unreleased experimental format must be exported with its matching binary and rebuilt.
+Current cluster configuration therefore rejects removed `streaming` declarations. A load leaves no stream profile, `_mem_wal`, `_stream_tokens`, lifecycle revision, receipt, or durable-but-not-visible acknowledgement state. A graph written by an unreleased experimental format must be exported with its matching binary and rebuilt.
 
-If an application needs durable acceptance before graph visibility, put an external log or queue in front of OmniGraph. Its consumer submits bounded idempotent batches and checkpoints the external offset only after OmniGraph acknowledges the graph commit. That keeps each system's durability promise explicit.
+If an application needs durable acceptance before graph visibility, put an external log or queue in front of Omnigraph. Its consumer submits bounded idempotent batches and checkpoints the external offset only after Omnigraph acknowledges the graph commit. That keeps each system's durability promise explicit.
 
 ## Test owners
 
@@ -77,4 +77,4 @@ If an application needs durable acceptance before graph visibility, put an exter
 - Atomic table staging and recovery: `crates/omnigraph/tests/writes.rs`, `integration/recovery.rs`, and `failpoints.rs`.
 - Strict and compatibility HTTP routes: `crates/omnigraph-server/tests/integration/data_routes.rs`, auth coverage, and `integration/openapi.rs`.
 - CLI local/remote load behavior: `crates/omnigraph-cli/tests/integration/system_local.rs`, `system_remote.rs`, and `parity_matrix.rs`.
-- Absence of retired durable surfaces: `crates/omnigraph/tests/forbidden_apis.rs` and configuration rejection tests.
+- Absence of retired durable surfaces: `crates/omnigraph/tests/integration/lifecycle.rs` (`init_creates_graph`). The `removed_streaming_declaration` diagnostic has no test.
