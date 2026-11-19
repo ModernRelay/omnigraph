@@ -90,13 +90,6 @@ pub(crate) fn remote_url(base: &str, segments: &[&str], query: &[(&str, &str)]) 
     Ok(url.to_string())
 }
 
-#[cfg(test)]
-pub(crate) fn normalize_bearer_token(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 /// The Cedar resource id for a graph selection: the explicit graph name when one
 /// is given, else the normalized URI (the anonymous fallback). Used by the
 /// `policy` tooling to address a graph's bundle.
