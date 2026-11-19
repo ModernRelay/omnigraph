@@ -451,7 +451,8 @@ mod tests {
             ],
             unavailable: vec![omnigraph_api_types::UnavailableQueryOutput {
                 name: "legacy".into(),
-                error: "error[Q012] at line 1, column 50: `||` is not GQ; fix: concat(a, b)".into(),
+                error: "error[Q014] at line 1, column 46: `==` is not GQ; equality is `=`; fix: ="
+                    .into(),
                 diagnostic: None,
             }],
         };
@@ -466,7 +467,7 @@ mod tests {
                 "                 by name\n",
                 "mutation  retag($count: bigint, $batch: int = 3) [mcp: retag_people]\n",
                 "    instruction: Use for bulk changes\n",
-                "unavailable legacy: error[Q012] at line 1, column 50: `||` is not GQ; fix: concat(a, b)\n",
+                "unavailable legacy: error[Q014] at line 1, column 46: `==` is not GQ; equality is `=`; fix: =\n",
             )
         );
         let mut encoded = Vec::new();

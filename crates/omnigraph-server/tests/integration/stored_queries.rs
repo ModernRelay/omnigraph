@@ -426,10 +426,11 @@ async fn a_stored_query_that_fails_to_compile_is_unavailable_and_the_graph_serve
             "query ghost() { match { $w: Widget } return { $w.name } }",
             true,
         ),
-        // A parse refusal whose fix is machine-applicable.
+        // A parse refusal whose fix is machine-applicable: `==`, a habit
+        // the grammar refuses (`||` is an admitted spelling of `concat`).
         (
             "shout",
-            "query shout() { match { $p: Person } return { $p.name || \"!\" as s } }",
+            "query shout() { match { $p: Person } where $p.name == \"Alice\" return { $p.name } }",
             true,
         ),
     ]);
@@ -464,7 +465,7 @@ async fn a_stored_query_that_fails_to_compile_is_unavailable_and_the_graph_serve
     );
     assert!(ghost["diagnostic"]["position"]["line"].is_u64(), "{ghost}");
     let shout = unavailable.iter().find(|q| q["name"] == "shout").unwrap();
-    assert_eq!(shout["diagnostic"]["code"], "Q012", "{shout}");
+    assert_eq!(shout["diagnostic"]["code"], "Q014", "{shout}");
     assert!(shout["diagnostic"]["fix"].is_string(), "{shout}");
     assert!(
         !shout["diagnostic"]["suggestion"]["edits"]
@@ -474,7 +475,7 @@ async fn a_stored_query_that_fails_to_compile_is_unavailable_and_the_graph_serve
         "the byte edits ride the listing: {shout}"
     );
     assert!(
-        shout["error"].as_str().unwrap().contains("error[Q012]"),
+        shout["error"].as_str().unwrap().contains("error[Q014]"),
         "{shout}"
     );
 

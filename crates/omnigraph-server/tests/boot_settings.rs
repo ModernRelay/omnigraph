@@ -3966,8 +3966,9 @@ async fn a_served_graph_reports_its_unavailable_stored_queries_on_the_health_rou
         },
         omnigraph_server::queries::RegistrySpec {
             name: "legacy".into(),
-            source: "query legacy() { match { $p: Person } return { $p.name || \"!\" as s } }"
-                .into(),
+            source:
+                "query legacy() { match { $p: Person } where $p.name == \"!\" return { $p.name } }"
+                    .into(),
             expose: true,
             tool_name: None,
         },
@@ -3998,7 +3999,7 @@ async fn a_served_graph_reports_its_unavailable_stored_queries_on_the_health_rou
         "{listed}"
     );
     let diagnostic = &graph["unavailable_queries"][0]["diagnostic"];
-    assert_eq!(diagnostic["code"], "Q012", "{listed}");
+    assert_eq!(diagnostic["code"], "Q014", "{listed}");
     assert!(diagnostic["fix"].is_string(), "{listed}");
 
     let (status, catalog) = json_response(
