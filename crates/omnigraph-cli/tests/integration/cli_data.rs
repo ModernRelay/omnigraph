@@ -2491,6 +2491,23 @@ fn load_modes_are_the_write_statements_issue_1278() {
                 && stderr.contains(&format!("write `{new}`")),
             "{old}: {stderr}"
         );
+        // Under `--json` the refusal is the coded error `load csv` and the
+        // HTTP route give, naming the mode, never a usage text.
+        let refused = output_failure(load(old).arg("--json"));
+        assert_eq!(refused.status.code(), Some(1), "{old}: {refused:?}");
+        let body: Value = serde_json::from_slice(&refused.stdout)
+            .unwrap_or_else(|e| panic!("{old}: {e}: {refused:?}"));
+        assert_eq!(body["code"], "bad_request", "{body}");
+        assert_eq!(body["disposition"]["effects"], "none", "{body}");
+        assert_eq!(body["diagnostic"]["code"], "Q004", "{body}");
+        assert_eq!(body["diagnostic"]["fix"], format!("--mode {new}"), "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("write `{new}`")),
+            "{body}"
+        );
     }
 }
 

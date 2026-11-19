@@ -19,8 +19,8 @@ pub(crate) struct LoadArgs {
     /// load) | upsert (sets the named properties) | replace (writes the whole
     /// entity) | overwrite (each type becomes the batch's entities). Required:
     /// overwrite is destructive, so there is no default.
-    #[arg(long, value_parser = parse_cli_load_mode)]
-    pub(crate) mode: CliLoadMode,
+    #[arg(long, value_parser = parse_load_mode_arg)]
+    pub(crate) mode: LoadModeArg,
     /// Session setting for this invocation (repeatable): `name=value` in
     /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
     /// stores only: no served load route carries a `settings` field.
@@ -173,6 +173,54 @@ pub(crate) enum CliLoadMode {
     Insert,
     Upsert,
     Replace,
+}
+
+/// `--mode` as written: a mode, or edition 2's `append` or `merge`, which the
+/// load refuses as a command failure (a coded error, JSON under `--json`)
+/// rather than as a usage error.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LoadModeArg {
+    Mode(CliLoadMode),
+    Removed {
+        old: &'static str,
+        new: &'static str,
+    },
+}
+
+impl LoadModeArg {
+    /// The mode, or the refusal of a removed one: `Q004` naming the mode
+    /// that now means what it meant, before anything is read.
+    pub(crate) fn resolve(self) -> Result<CliLoadMode, omnigraph::error::OmniError> {
+        match self {
+            Self::Mode(mode) => Ok(mode),
+            Self::Removed { old, new } => {
+                use omnigraph_compiler::query::codes::Q004;
+                use omnigraph_compiler::{QueryDiagnostic, error::CompilerError};
+                Err(omnigraph::error::OmniError::Compiler(CompilerError::query(
+                    QueryDiagnostic::parse(
+                        Q004,
+                        omnigraph::loader::removed_mode_message(old, new),
+                        None,
+                    )
+                    .with_fix(format!("--mode {new}")),
+                )))
+            }
+        }
+    }
+}
+
+fn parse_load_mode_arg(value: &str) -> Result<LoadModeArg, String> {
+    Ok(match value {
+        "append" => LoadModeArg::Removed {
+            old: "append",
+            new: "insert",
+        },
+        "merge" => LoadModeArg::Removed {
+            old: "merge",
+            new: "replace",
+        },
+        value => LoadModeArg::Mode(parse_cli_load_mode(value)?),
+    })
 }
 
 /// `--mode`'s value, by the engine's names; edition 2's `append` and `merge`

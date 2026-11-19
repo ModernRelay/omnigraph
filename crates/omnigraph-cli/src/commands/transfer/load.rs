@@ -34,6 +34,7 @@ pub(crate) async fn run_load(
         settings,
         json,
     } = args;
+    let mode = mode.resolve()?;
     let settings = client::parse_set_flags(&settings)?;
     let client = GraphClient::from_target(
         scope.operator,
