@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use color_eyre::eyre::{Result, bail};
-use omnigraph::db::{CleanupPolicyOptions, Omnigraph};
+use omnigraph::db::CleanupPolicyOptions;
 
 use crate::app::Completion;
 use crate::helpers::{confirm_destructive, parse_duration_arg, resolve_actor};
@@ -42,7 +42,8 @@ pub(crate) async fn run_optimize(
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     let OptimizeArgs {
-        tables,
+        datasets,
+        start_at,
         max_gate_hold,
         no_wait,
         operation,
@@ -53,15 +54,30 @@ pub(crate) async fn run_optimize(
         .as_deref()
         .map(parse_duration_arg)
         .transpose()?;
+    // Flag combinations are refused here, before any request or open: a
+    // refusal exits 1, the exit of a run with no graph effects.
+    if start_at.is_some() && !datasets.is_empty() {
+        bail!("--start-at applies to a full-catalog run, not with --datasets");
+    }
     if matches!(
         scope.target.binding,
         crate::targets::TargetBinding::Server { .. } | crate::targets::TargetBinding::Managed(_)
     ) {
+        if start_at.is_some() {
+            bail!(
+                "--start-at applies to a direct target only: a server keeps the graph's resume position"
+            );
+        }
+        if operation.is_some() && (!datasets.is_empty() || max_gate_hold.is_some()) {
+            bail!(
+                "--operation observes an existing operation; --datasets and --max-gate-hold apply only to a new one"
+            );
+        }
         let client = crate::client::GraphClient::from_target(
             scope.operator,
             scope.target,
             scope.graph,
-            None,
+            scope.actor,
             stderr,
         )
         .await?;
@@ -69,7 +85,7 @@ pub(crate) async fn run_optimize(
         return served::run(
             &client,
             served::ServedOptimize {
-                tables,
+                datasets,
                 max_gate_hold,
                 no_wait,
                 operation,
@@ -85,8 +101,11 @@ pub(crate) async fn run_optimize(
         bail!("--no-wait, --operation and --timeout apply to a server target only");
     }
     let mut request = omnigraph::db::OptimizeRequest::default();
-    if !tables.is_empty() {
-        request = request.with_tables(tables);
+    if !datasets.is_empty() {
+        request = request.with_datasets(datasets);
+    }
+    if let Some(table_key) = start_at {
+        request = request.with_start_at(table_key);
     }
     if let Some(hold) = max_gate_hold {
         request =
@@ -95,10 +114,10 @@ pub(crate) async fn run_optimize(
     let uri = crate::scope::direct_graph_uri(scope.target, scope.graph).await?;
     let binding = crate::scope::capture_storage_binding(scope.target)?.for_uri(&uri)?;
     let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
-    crate::admission::ensure_graph_with_binding(&binding, stderr).await?;
-    let db = Omnigraph::open_with_storage(
-        binding.uri(),
-        omnigraph::storage::storage_for_binding(&binding)?,
+    let db = crate::admission::open_writable(
+        &binding,
+        async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
+        stderr,
     )
     .await?;
     let report = db.optimize_as(actor.as_deref(), request).await?;
@@ -117,10 +136,10 @@ pub(crate) async fn run_index(
             let uri = crate::scope::direct_graph_uri(scope.target, scope.graph).await?;
             let binding = crate::scope::capture_storage_binding(scope.target)?.for_uri(&uri)?;
             let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
-            crate::admission::ensure_graph_with_binding(&binding, stderr).await?;
-            let db = Omnigraph::open_with_storage(
-                binding.uri(),
-                omnigraph::storage::storage_for_binding(&binding)?,
+            let db = crate::admission::open_writable(
+                &binding,
+                async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
+                stderr,
             )
             .await?;
             let result = db.ensure_indices_on_as(&branch, actor.as_deref()).await?;
@@ -175,9 +194,12 @@ pub(crate) async fn rebuild_full_text_indexes(
     stderr: &mut dyn Write,
 ) -> Result<()> {
     let uri = binding.uri();
-    crate::admission::ensure_graph_with_binding(binding, stderr).await?;
-    let db = Omnigraph::open_with_storage(uri, omnigraph::storage::storage_for_binding(binding)?)
-        .await?;
+    let db = crate::admission::open_writable(
+        binding,
+        async { Ok(omnigraph::storage::storage_for_binding(binding)?) },
+        stderr,
+    )
+    .await?;
     let result = db.rebuild_full_text_indices_on_as(branch, actor).await?;
     write_full_text_rebuild(uri, &result, json, stdout, stderr)
 }
@@ -226,10 +248,10 @@ pub(crate) async fn run_cleanup(
         older_than: older_than_dur,
     };
     let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
-    crate::admission::ensure_graph_with_binding(&binding, stderr).await?;
-    let db = Omnigraph::open_with_storage(
-        binding.uri(),
-        omnigraph::storage::storage_for_binding(&binding)?,
+    let db = crate::admission::open_writable(
+        &binding,
+        async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
+        stderr,
     )
     .await?;
     let stats = db.cleanup_as(options.clone(), actor.as_deref()).await?;

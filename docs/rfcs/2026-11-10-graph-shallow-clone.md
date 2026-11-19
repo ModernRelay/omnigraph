@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-11-10
-updated: 2026-11-12
+updated: 2026-11-14
 discussion: null
 supersedes: []
 superseded_by: []
@@ -337,7 +337,7 @@ Lance 13.0.0, the pinned crates.io release. In source: `Dataset::shallow_clone` 
 
 1. **Read-through storage on the local instance and the route comparison in the harness.** Ships the engine API, the storage and route tests, and `--local-route`. No product surface, no record on a clone route, no change to the default repetition. Phase 1 lands while this RFC is a draft, since the first gate in `blocked_on` needs its route tests and `--local-route`; the API it adds claims no authority until acceptance. `implementation` moves to `in-progress` when phase 1 starts and to `complete` with acceptance, once phase 2 has landed with the evidence above (the registry refuses `complete` on a draft). Phases 3 to 5 advance the `implementation` fields of their own RFCs.
 2. **The S3 instance.** The same contract over an `s3://` base and clone root, through the same function, which for an `s3://` pair reads the standard `AWS_*` environment as the engine's S3 storage does and carries no captured binding; the `s3` provider wrapped in the per-handle registry; and the evidence in the RustFS S3 integration job named under Required evidence. That job reports on pull requests and does not gate `main`; a configured test that skips is a failure there, and a test needs `OMNIGRAPH_S3_TEST_BUCKET` and skips without it, as the engine's `s3_storage` module does. It lands before phase 3, because RFC 0039 names MinIO as the end-to-end benchmark's repeatable rig and real S3 as its truth, so the one mechanism that benchmark adopts must hold on S3.
-3. **The harness's engine target adopts a clone per repetition.** Not decided here. Repetition reset is a Protocol factor in RFC 0039 and enters the run spec, so a clone is a new level with new point ids. It needs an amendment to RFC 0039 and the XFS comparison.
+3. **The harness's engine target adopts a clone per repetition.** Decided by RFC 0039's amendment of 2026-11-14 (its Decision log): `clone` is a level of the repetition-reset factor with point ids of its own, the frozen fixture lives in a store on a local directory or an object-store prefix and is built there, each repetition opens an empty clone root over it, and the harness drives the commit's product binary. The XFS comparison stays a gate of this RFC's acceptance (`blocked_on`).
 4. **A product operation that creates and drops clones.** Its own RFC. Its gates are the gaps this RFC names: a clone root that records its base's identity and an open that refuses a mismatch, an enforced rule that keeps a base unchanged and its files alive while a clone exists, more than one process on a clone root, `cleanup`, `optimize` and storage upgrades on a clone, a bound on the cost of building the storage, a clone of a clone, a served clone, a base opened at a path other than the one its absolute references name, and `repair`.
 5. **The native form over `Dataset::shallow_clone`.** Its own RFC. It is tested against read-through storage: the same scenarios, the same verification.
 
@@ -348,4 +348,5 @@ Lance 13.0.0, the pinned crates.io release. In source: `Dataset::shallow_clone` 
 ## Decision log
 
 - 2026-11-10: Created. The decisions, each with what it rejects: **The name.** Graph shallow clone, the term Lance and Delta use, here carrying a whole graph where Lance's carries one version of one dataset. Rejected: fork, a repository's word for a copy with its own history; overlay, a filesystem's name for a mechanism and not a name for the feature. **Where a clone is handed to the engine.** The handle's storage (Alternatives: a URI scheme, a process-wide table). **The whiteout object.** Durable before the delete (Alternatives: the design without it).
+- 2026-11-14: **Rollout 3 decided.** The sentence "Not decided here. Repetition reset is a Protocol factor in RFC 0039 and enters the run spec, so a clone is a new level with new point ids. It needs an amendment to RFC 0039 and the XFS comparison." is replaced by the decision RFC 0039's amendment of the same day records; the XFS comparison stays in `blocked_on`.
 - 2026-11-11: **The contract on the object-store API.** The contract names no backend; the local filesystem and S3 are instances, local in phase 1 and S3 in phase 2 over an S3-compatible service, RustFS in CI and MinIO where the end-to-end benchmark runs, before the harness adopts clones. Rejected: a contract stated for the local instance alone, with object storage deferred to the product operation, since RFC 0039 runs the end-to-end benchmark on MinIO and real S3 and one mechanism must hold on every backend that benchmark runs on.

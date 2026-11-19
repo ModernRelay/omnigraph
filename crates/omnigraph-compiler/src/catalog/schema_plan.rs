@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::schema::ast::{Annotation, Constraint};
+use crate::schema::ast::{Annotation, Cardinality, Constraint};
 use crate::types::PropType;
 
 use super::schema_ir::{
@@ -85,6 +85,18 @@ pub enum SchemaMigrationStep {
         type_kind: SchemaTypeKind,
         type_name: String,
         property_name: String,
+    },
+    /// Widen an edge type's `@card` range (#1403): the desired minimum is no
+    /// higher and the desired maximum no lower (or absent). `type_name` is the
+    /// DESIRED (post-rename) edge name. Metadata-only at apply time: every
+    /// stored edge count that met the accepted range meets the wider one, so
+    /// no table data is touched and every write validates against the new
+    /// range once the accepted catalog updates. A change that raises the
+    /// minimum or lowers the maximum still plans as `UnsupportedChange`.
+    RelaxCardinality {
+        type_name: String,
+        from: Cardinality,
+        to: Cardinality,
     },
     UpdateTypeMetadata {
         type_kind: SchemaTypeKind,
@@ -567,14 +579,23 @@ fn plan_edges(
             });
         }
         if existing.cardinality != edge.cardinality {
-            steps.push(SchemaMigrationStep::UnsupportedChange {
-                entity: format!("edge:{}", edge.name),
-                reason: format!(
-                    "changing cardinality on edge '{}' is not supported in schema migration v1",
-                    edge.name
-                ),
-                code: None,
-            });
+            if existing.cardinality.is_within(&edge.cardinality) {
+                steps.push(SchemaMigrationStep::RelaxCardinality {
+                    type_name: edge.name.clone(),
+                    from: existing.cardinality.clone(),
+                    to: edge.cardinality.clone(),
+                });
+            } else {
+                steps.push(SchemaMigrationStep::UnsupportedChange {
+                    entity: format!("edge:{}", edge.name),
+                    reason: format!(
+                        "tightening cardinality on edge '{}' from {} to {} needs a check of the \
+                         stored edge counts and is not supported in schema migration v1",
+                        edge.name, existing.cardinality, edge.cardinality
+                    ),
+                    code: None,
+                });
+            }
         }
 
         plan_type_metadata(
@@ -1242,6 +1263,58 @@ node Ticket {
             property_name: "status".to_string(),
             added_values: vec!["blocked".to_string(), "canceled".to_string()],
         }));
+    }
+
+    #[test]
+    fn plan_relaxes_edge_cardinality_in_place_and_refuses_tightening_issue_1403() {
+        let schema = |card: &str| {
+            format!(
+                "node Chunk {{\n    slug: String @key\n}}\n\
+                 node WebPage {{\n    slug: String @key\n}}\n\
+                 edge ChunkFromWebPage: Chunk -> WebPage @card({card})\n"
+            )
+        };
+        let card = |min: u32, max: Option<u32>| Cardinality { min, max };
+        for (from, to, relaxed) in [
+            ("1..1", "0..1", Some((card(1, Some(1)), card(0, Some(1))))),
+            ("0..1", "0..", Some((card(0, Some(1)), card(0, None)))),
+            ("1..2", "0..5", Some((card(1, Some(2)), card(0, Some(5))))),
+            ("0..1", "1..1", None),
+            ("0..", "0..1", None),
+            ("1..5", "0..3", None),
+        ] {
+            let accepted = ir(&schema(from));
+            let desired = evolve(&accepted, &schema(to));
+            let plan = plan_schema_migration(&accepted, &desired).unwrap();
+            match relaxed {
+                Some((from_card, to_card)) => {
+                    assert!(plan.supported, "{from} -> {to} must plan: {plan:?}");
+                    assert_eq!(
+                        plan.steps,
+                        vec![SchemaMigrationStep::RelaxCardinality {
+                            type_name: "ChunkFromWebPage".to_string(),
+                            from: from_card,
+                            to: to_card,
+                        }],
+                        "{from} -> {to}"
+                    );
+                }
+                None => {
+                    assert!(!plan.supported, "{from} -> {to} must not plan: {plan:?}");
+                    let expected = format!(
+                        "tightening cardinality on edge 'ChunkFromWebPage' from @card({from}) to @card({to})"
+                    );
+                    assert!(
+                        plan.steps.iter().any(|step| matches!(
+                            step,
+                            SchemaMigrationStep::UnsupportedChange { reason, .. }
+                                if reason.contains(&expected)
+                        )),
+                        "{from} -> {to}: {plan:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

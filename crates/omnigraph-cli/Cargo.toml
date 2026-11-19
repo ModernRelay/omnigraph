@@ -54,6 +54,9 @@ keyring = { version = "3.6.3", features = ["windows-native"] }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
 
 [dev-dependencies]
+arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
 rcgen = "0.13.2"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 assert_cmd = "2"

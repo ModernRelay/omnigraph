@@ -65,8 +65,8 @@ Binaries are installed in `%USERPROFILE%\.local\bin`.
 
 ## Release channels
 
-The default is the latest stable release, and the installer prints its tag
-before downloading. Only when no stable release publishes the platform's archive
+The default is the latest stable release; `install.sh` prints its tag before
+downloading, and `install.ps1` names the channel. Only when no stable release publishes the platform's archive
 (HTTP 404) does it fall back to `edge`, and it says so; a network or server
 failure stops the install instead of switching channels.
 
@@ -210,6 +210,11 @@ or `edge` for a GitHub release archive and null for any other build. `commit`
 is the commit a packaged build was compiled from; a plain source build reports
 it as null and prints no `commit` line. The server reports the same commit as
 `source_version` on `GET /healthz`.
+
+`internal_schema.writes` is the storage format of a graph this binary
+creates, and the one `omnigraph upgrade` converts a graph to; `serves` is the
+range of formats it opens. A graph it opens keeps its own format, apart from
+the v14 and v15 stamps described in [upgrading](operations/upgrade.md).
 
 `http_contract` is the `Omnigraph-Http-Api` value the CLI sends. A server
 accepts only an exact match and returns its own value on every response,

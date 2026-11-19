@@ -16,7 +16,7 @@
 - Open Studio (studio)
 - Addressing a graph
 - Output formats and positions · health check
-- Organization administration (members and invitations)
+- Organization administration (your organizations, members and invitations)
 - Cluster control plane (direct and managed)
 
 Commands you'll reach for but don't need best-practice rules around. Quick syntax reference.
@@ -50,10 +50,10 @@ prints the exact flags of the installed binary.
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
-| `organization` | `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
+| `organization` | `list` `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | List the organizations you belong to; manage the selected organization's members and invitations; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
-| `login` | — | Create a profile with `--create-profile`, or sign in to its `omnigraph` auth provider |
+| `login` | — | Create a profile with `--create-profile` (pass `--organization ID` when you belong to several), or sign in to its `omnigraph` auth provider |
 | `logout` | — | Clear the selected platform session and report revocation |
 | `target` | `list` `inspect` `add` `refresh` `remove` | Manage resource bindings |
 | `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
@@ -322,10 +322,25 @@ traversal startup; it does not collect unused forks (that is `cleanup`). It
 works on `main`; use `index build` for another branch. Writes running beside
 it are not refused by its publication: a write it overtook commits over the
 compaction, or prepares again once, holding writes off, when it changes a row
-the run moved. None returns `read_set_conflict` for it. Against a server
+the run moved. None returns `read_set_conflict` for it. Writes to `main` wait
+while it holds main's writer gates: `--max-gate-hold 30s` starts no table after
+that long except the first, so a write waits about the bound plus one table,
+and `--datasets node:Person,edge:Knows` runs only those tables, in that order.
+Each table reports `optimized`, `unchanged`, `deferred` or `failed`; one
+table's failure does not stop the others, so read the report. Against a server
 target it runs as a recorded operation: it prints an operation id, waits for
 the operation's record (`--no-wait`, `--timeout`), and `--operation <id>`
 observes one; after a lost response it looks the id up and never resubmits.
+`--datasets` runs only the listed tables and `--max-gate-hold 30s` bounds how
+long writers wait: the tables it did not reach are `deferred` and `resume_at`
+names the first. On a direct target copy the printed `--start-at <key>`
+argument into the next run (a server keeps the position and refuses the flag;
+`--datasets` and `--max-gate-hold` are refused beside `--operation`). Exit 0
+means the run finished, not that every table was optimized: read each
+dataset's `outcome` (`optimized`, `unchanged`, `deferred`, `failed` with
+`error`) and `reason`. With `index_failed`, the run published completed
+table work and the error identifies the index maintenance step that failed.
+On a direct target, `pending_indexes` also lists indexes already known to need work.
 
 ### `index build` — a branch's missing and lagging indexes
 
@@ -339,6 +354,8 @@ rows uncovered, in one graph commit on that branch; a second run is a no-op with
 a null `graph_commit_id`. Read `indexes` (`kind`, `action`: `built` or
 `refreshed`) and `pending_indexes`: full-text coverage stays pending with the
 `index rebuild --kind full-text` remedy, as do vector properties with no vectors.
+Only those are pending: a rebuild that fails for another reason, a storage
+failure for one, fails the command.
 The remedy for `FullTextIndexRequired` on any branch.
 
 ### `index rebuild` — explicit analyzer upgrade
@@ -357,8 +374,9 @@ for that dependency change. Do not mix fleets across an incompatible analyzer
 transition. Rebuilds use default English analysis, replacing custom tokenizer
 settings; JSON `warnings` reports this for actual work. Check the selected
 `branch`, `graph_commit_id`, and `rebuilt_indexes`; an empty list/null commit is
-a no-op, not a migration of other branches or historical snapshots. `--as` is
-actor attribution and does not install server policy on direct access.
+a no-op, not a migration of other branches or historical snapshots. On a
+cluster graph the cluster's applied graph policy judges `--as` (`maintain` on
+the branch); a standalone graph has no policy.
 
 ### `cleanup` — destructive version GC
 
@@ -381,7 +399,9 @@ drops does not stop it; `--older-than` reads every other commit's time and
 stops on one it cannot read. Without `--confirm`, cleanup only echoes the
 policy and exits 0; it lists no candidates. Cleanup also reclaims table forks
 and deleted branches' refs once nothing needs them. Branch
-deletion and `optimize` leave this reclamation to `cleanup`.
+deletion and `optimize` leave this reclamation to `cleanup`. On a cluster
+graph the applied policy judges the `--as` actor: `reclaim` for `cleanup`,
+`maintain` for `optimize` and `index`.
 
 ## Stored Queries
 
@@ -433,9 +453,19 @@ pipe, not terminal/file output, and never exports refresh credentials.
 refreshes a managed endpoint without changing its incarnation. `target remove
 NAME` keeps credentials/journals and requires remaining references to be valid.
 Onboarding requires `login --create-profile NAME`, with optional `--organization ID`
-and `--api URL` (default `https://platform.omnigraph.dev`). Bare login uses
+and `--api URL` (default `https://platform.omnigraph.dev`). A profile belongs to
+one organization. Without `--organization`, a person in one organization gets
+it. With several, interactive login asks which one to use. Pass
+`--organization ID` in automation. With `--json`, a required choice returns
+`organization_required` and an `organizations` array on stdout.
+Bare login uses
 `defaults.profile`; `login --profile NAME` selects an existing profile. Missing
 profiles never cause implicit creation, and creation refuses existing names.
+A refused sign-in names its check: `provider_response_invalid` means the
+identity provider's tokens do not fit the API's published sign-in
+configuration, which signing in again does not fix; `credential_invalid` means
+a session saved on this machine fails a check, which `logout` then `login`
+replaces.
 Managed target add uses `--profile NAME` or `defaults.profile`.
 `config recover-operations --source DIR --profile NAME [--json]`
 preserves matching legacy folder evidence; it neither converts config nor submits
@@ -503,9 +533,17 @@ Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
 `optimize`/`index build`/`index rebuild`/`cleanup --graph`, with region
 and endpoint captured from the environment
-([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
-Each direct writer keeps its admission lock; `cluster force-unlock` it before
-starting the server. Inline local paths and `file://`
+([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)),
+and a graph shallow clone: `--base URI` opens a direct graph target over the
+graph at `URI` (reads fall through to the base, writes land in the target, the
+base is never written) for `query`, `mutate`, `load`, `branch`, `commit`,
+`changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`; an inline
+`s3://` clone root with an `s3://` base is admitted there. Nothing in the target
+records its base, so every reopen passes the same `--base`; a clone root opened
+without it is refused. `--stats PATH` writes one JSON document per invocation
+with the logical object-store calls, the exit code and the peak resident set.
+For direct writer admission, including release after a converged local or S3
+apply and exact-ID lock recovery, see [direct bootstrap](cluster.md#direct-bootstrap). Inline local paths and `file://`
 URIs are accepted; remote endpoints must be registered. Server targets own auth;
 managed targets reference a profile and pin cluster identity/incarnation.
 Graph operations need `--graph` or target `default_graph`; direct graphs reject
@@ -531,13 +569,19 @@ For params:
 - `table` (default) — human-readable
 - `toon` — the same document as `json`, in TOON (specification 4.4). Uniform rows declare their fields once. Numbers are canonical (`1`, not `1.0`). A refusal is that document on stdout. The HTTP API still returns JSON
 - `kv` — `key: value` per line; good for single rows
-- `csv` — comma-separated
+- `csv` — comma-separated; a null is an empty field and an empty string is `""`. `load csv` reads both back as null and skips an empty line, so a one-column result loses its null rows
 - `jsonl` — NDJSON, one per line, with metadata line first
 - `json` — pretty `ReadOutput` envelope (metadata, columns, and rows); the `rows` array is printed compact and verbatim
 
-`--format arrow` appears in `--help` but the CLI has no Arrow output: it always
-fails with "has no text rendering". Do not use it, or set it as
-`defaults.output`.
+`query --format arrow` writes the result's columns and rows to stdout as one
+Arrow IPC stream (pyarrow `ipc.open_stream`, Polars `read_ipc_stream`), with
+each column's declared type and real nulls. The stream carries no
+`graph_commit_id`, target or `ranking`; take those from `--json`. Only a query
+run on a direct target (an `explain` statement included) has batches to write.
+It refuses before the read runs, exit 1: on a served or managed target (its server
+answers JSON), for a control statement (`branch list`, `show`), and when stdout
+is a terminal, so redirect it (`> result.arrow`). `alias` and `defaults.output`
+do not offer `arrow`; for a whole branch use `export` (JSONL).
 
 Mutations do not take `--format`; use `--json`. Successful `mutate --json` and
 `load --json` include the exact published `commit` (`null` for a no-op
@@ -569,13 +613,19 @@ is healthy; authorized `graphs list --target NAME --json` on a registered target
 Use a profile for `organization` (`org`):
 
 ```bash
+omnigraph organization list --profile work
 omnigraph organization members list --profile work --json
 omnigraph organization invitations send person@example.com --role member --profile work --idempotency-key invite-person
 omnigraph organization members set person@example.com --profile work --role member --idempotency-key role-person
 omnigraph organization members offboard person@example.com --profile work --idempotency-key offboard-person --json
 ```
 
-The caller needs current provider `members_manage` permission. WorkOS owns
+`organization list` shows the organizations the signed-in person is an active
+member of, with names and IDs, and marks the profile's; it needs no service
+permission, and its `--json` is the API envelope (`data.organizations`).
+Use an ID from it with `login --create-profile NAME --organization ID` to work
+in another organization. The member and invitation commands need current
+provider `members_manage` permission. WorkOS owns
 organization membership and service roles; applied cluster configuration owns
 graph and deployment permissions. No local enrollment or member-patch command
 is required. Member operations accept an email or exact user ID. `members set`

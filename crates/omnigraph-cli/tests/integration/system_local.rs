@@ -1283,6 +1283,33 @@ fn local_cli_optimize_runs_a_recorded_operation() {
     assert_eq!(accepted.status.code(), Some(0), "{accepted:?}");
     assert_eq!(parse_stdout_json(&accepted)["lookup"], "found");
 
+    // An observation takes no request field: the operation ran with what it
+    // was submitted with, so a table list or a gate hold beside `--operation`
+    // is refused instead of ignored. The server keeps the resume position,
+    // so a start position is refused too. Each exits 1: nothing ran.
+    for (extra, message) in [
+        (
+            vec!["--operation", id.as_str(), "--datasets", "node:Person"],
+            "observes an existing operation",
+        ),
+        (
+            vec!["--operation", id.as_str(), "--max-gate-hold", "30s"],
+            "observes an existing operation",
+        ),
+        (
+            vec!["--start-at", "node:Person"],
+            "applies to a direct target only",
+        ),
+    ] {
+        let refused = optimize(&extra);
+        assert_eq!(refused.status.code(), Some(1), "{extra:?}: {refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains(message),
+            "{extra:?}: {refused:?}"
+        );
+        assert!(refused.stdout.is_empty(), "{extra:?}: {refused:?}");
+    }
+
     let direct = cli()
         .arg("optimize")
         .arg("--target")
@@ -2110,23 +2137,7 @@ graphs:
 }
 
 fn seed_graph(dir: &std::path::Path, graph: &str, row: &str) {
-    let data = dir.join(format!("{graph}-seed.jsonl"));
-    std::fs::write(&data, row).unwrap();
-    let output = cli()
-        .arg("load")
-        .arg("--mode")
-        .arg("overwrite")
-        .arg("--data")
-        .arg(&data)
-        .arg("--target")
-        .arg(dir.join(format!("graphs/{graph}.omni")))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "seed {graph} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    seed_as_storage_owner(&dir.join(format!("graphs/{graph}.omni")), row);
     unlock_cluster_fixture(dir);
 }
 
@@ -2691,6 +2702,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     output_success(
         cli()
             .arg("load")
+            .args(["--as", "act-op"])
             .arg("--data")
             .arg(fixture("test.jsonl"))
             .arg("--mode")

@@ -25,7 +25,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 yaml_serde = { workspace = true }
 sha2 = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

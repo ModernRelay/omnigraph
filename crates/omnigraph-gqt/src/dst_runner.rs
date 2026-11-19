@@ -654,6 +654,13 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// The wall-time budget of one run of `case`: its `timeout_ms` is the budget
+/// of one pass, and the plain host runs a free-running block once per
+/// session order, so dispatch and replay both grant the pass count's worth.
+fn case_budget(case: &omnigraph_gqt_core::Case) -> Duration {
+    Duration::from_millis(case.runner.timeout_ms) * case.plain_passes() as u32
+}
+
 fn executable_digest(path: &Path) -> Result<String, String> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| format!("environment_changed: open executable: {e}"))?;
@@ -690,6 +697,11 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(bytes)
+}
+
+/// A case's text as a run reads it: a regular file within `LIMIT`, UTF-8.
+pub(crate) fn read_case_text(path: &Path) -> Result<String, String> {
+    String::from_utf8(read_bounded(path)?).map_err(|e| format!("invalid_case: UTF-8: {e}"))
 }
 
 mod shared_text {
@@ -1568,17 +1580,9 @@ fn run_invocation(
     let selected = selection.target;
     let selected_storage = selection.storage;
     let selected_seed = selection.seed;
-    let text =
-        String::from_utf8(read_bounded(path)?).map_err(|e| format!("invalid_case: UTF-8: {e}"))?;
-    let text: std::sync::Arc<str> = text.into();
+    let text: std::sync::Arc<str> = read_case_text(path)?.into();
     summary.case_digest = Some(digest(text.as_bytes()));
-    let case = parse_case(&stem_of(path), &text).map_err(|error| {
-        if error.starts_with("invalid_case:") {
-            error
-        } else {
-            format!("invalid_case: {error}")
-        }
-    })?;
+    let case = parse_case(&stem_of(path), &text).map_err(|errors| errors.to_string())?;
     summary.declared = Some(case.runner.environments.clone());
     for env in &case.runner.environments {
         if matches!(env.execution, Execution::ServerDst { .. }) {
@@ -1622,8 +1626,10 @@ fn run_invocation(
     }
     .into();
     let plan_digest = digest(&json(&summary.planned)?);
-    if selection.fast_tier && case.runner.timeout_ms > 10_000 {
-        return Err("invalid_case: the required corpus admits timeout_ms at most 10000; use a standalone heavy reproduction".into());
+    if selection.fast_tier
+        && let Err(error) = omnigraph_gqt_core::corpus_admission(&case.runner)
+    {
+        return Err(error.to_string());
     }
     if selected_seed.is_some() && selected.is_none() && selected_storage.is_none() {
         return Err("invalid_case: --seed requires --target or --storage".into());
@@ -1729,7 +1735,7 @@ fn run_invocation(
     }
     let build = executable_digest(executable)?;
     summary.executable_digest = Some(build.clone());
-    let budget = Duration::from_millis(case.runner.timeout_ms);
+    let budget = case_budget(&case);
     let remaining = || {
         budget
             .checked_sub(started.elapsed())
@@ -2480,8 +2486,8 @@ fn replay_attempts(
             return Err("environment_changed: prior input digest differs".into());
         }
 
-        budget = Some(Duration::from_millis(case.runner.timeout_ms));
-        let remaining = Duration::from_millis(case.runner.timeout_ms)
+        budget = Some(case_budget(&case));
+        let remaining = case_budget(&case)
             .checked_sub(started.elapsed())
             .filter(|left| !left.is_zero())
             .ok_or("timeout: replay exceeded wall-time budget")?;
@@ -2774,6 +2780,7 @@ mod action_tests {
                         ordinal as usize,
                         &[serde_json::json!({"label": "w2", "outcome": "ok"}),
                           serde_json::json!({"label": "r1", "outcome": "ok"})],
+                        &[Some(0), Some(0)],
                         &crate::concurrent::Outcome {
                             stuck_at: None,
                             failure: None,
@@ -2816,7 +2823,7 @@ mod action_tests {
             block: &crate::concurrent::Outcome,
         ) -> super::WorkerReport {
             super::capture("same-input".into(), async {
-                crate::record_concurrent_outcome(3, sessions, block);
+                crate::record_concurrent_outcome(3, sessions, &[Some(0), Some(0)], block);
                 Ok(())
             })
             .await

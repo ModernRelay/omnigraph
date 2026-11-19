@@ -22,11 +22,7 @@ pub(crate) fn write_optimize(
     stdout: &mut dyn Write,
 ) -> Result<()> {
     use omnigraph::db::{ArtifactRefresh, ConfigurationClear, TableOptimizeOutcome};
-    let stats = &report.tables;
-    let reason = |outcome: &TableOptimizeOutcome| match outcome {
-        TableOptimizeOutcome::Deferred(reason) => Some(reason.as_str()),
-        _ => None,
-    };
+    let stats = &report.datasets;
     let clear_error = match &report.configuration_clear {
         ConfigurationClear::Failed(error) | ConfigurationClear::Unknown(error) => Some(error),
         _ => None,
@@ -55,12 +51,18 @@ pub(crate) fn write_optimize(
             "datasets": stats.iter().map(|s| serde_json::json!({
                 "type_key": s.type_key,
                 "outcome": s.outcome.as_str(),
-                "reason": reason(&s.outcome),
+                "reason": s.reason(),
                 "fragments_removed": s.fragments_removed,
                 "fragments_added": s.fragments_added,
                 "committed": s.committed(),
                 "duration_ms": s.duration.as_millis() as u64,
-                "error": s.failure.as_ref().map(|error| error.to_string()),
+                // A failed table's error, or, under the reason
+                // `index_failed`, the index failure of an optimized one.
+                "error": s
+                    .failure
+                    .as_ref()
+                    .or(s.index_failure.as_ref())
+                    .map(|error| error.to_string()),
                 "pending_indexes": s.pending_indexes.iter().map(|p| serde_json::json!({
                     "property": p.property,
                     "reason": p.reason,
@@ -82,6 +84,11 @@ pub(crate) fn write_optimize(
                         "  {:<40} frags {} → {} ✓",
                         subject, s.fragments_removed, s.fragments_added
                     )?;
+                    if let Some(error) = &s.index_failure {
+                        let error = error.to_string();
+                        let first = error.lines().next().unwrap_or("unknown error");
+                        writeln!(stdout, "    ↳ index maintenance incomplete: {first}")?;
+                    }
                 }
                 TableOptimizeOutcome::Failed => {
                     let error = s.failure.as_ref().map(|error| error.to_string());
@@ -105,7 +112,7 @@ pub(crate) fn write_optimize(
             writeln!(stdout, "graph commit: {commit}")?;
         }
         if let Some(key) = &report.resume_at {
-            writeln!(stdout, "resume at: {}", graph_type_subject(key))?;
+            writeln!(stdout, "resume with: --start-at {key}")?;
         }
         match clear_error {
             Some(error) => writeln!(
@@ -787,6 +794,11 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             schema_type_kind_label(*type_kind),
             type_name
         ),
+        SchemaMigrationStep::RelaxCardinality {
+            type_name,
+            from,
+            to,
+        } => format!("relax cardinality on edge '{type_name}' from {from} to {to}"),
         SchemaMigrationStep::UpdateTypeMetadata {
             type_kind,
             name,
@@ -2009,7 +2021,7 @@ mod tests {
             .optimize_as(None, omnigraph::db::OptimizeRequest::default())
             .await
             .unwrap();
-        let mut compacted = report.tables.pop().unwrap();
+        let mut compacted = report.datasets.pop().unwrap();
         compacted.type_key = "node:Person".into();
         compacted.fragments_removed = 3;
         compacted.fragments_added = 1;
@@ -2039,7 +2051,15 @@ mod tests {
             "rewrite lost",
         )));
         let failure = failed.failure.as_ref().unwrap().to_string();
-        report.tables = vec![compacted, noop, failed, deferred];
+        // A table whose rewrite published and whose index link then failed.
+        let mut unindexed = compacted.clone();
+        unindexed.type_key = "node:Wombat".into();
+        unindexed.pending_indexes.clear();
+        unindexed.index_failure = Some(std::sync::Arc::new(omnigraph::error::OmniError::manifest(
+            "index build lost",
+        )));
+        let index_failure = unindexed.index_failure.as_ref().unwrap().to_string();
+        report.datasets = vec![compacted, unindexed, noop, failed, deferred];
         report.input_commit = Some("hb1.parent".into());
         report.graph_commit_id = Some("hb1.child".into());
         report.resume_at = Some("node:Zebra".into());
@@ -2049,17 +2069,20 @@ mod tests {
         assert_maintenance_report(
             &format!(
                 concat!(
-                    "optimize graph — 4 datasets\n",
+                    "optimize graph — 5 datasets\n",
                     "  node type 'Person'                       frags 3 → 1 ✓\n",
                     "    ↳ index pending on property 'embedding': no trainable vectors\n",
+                    "  node type 'Wombat'                       frags 3 → 1 ✓\n",
+                    "    ↳ index maintenance incomplete: {index_failure}\n",
                     "  node type 'Yak'                          no-op\n",
                     "  node type 'Xerus'                        failed ({failure})\n",
                     "  node type 'Zebra'                        deferred (the run reached its writer-gate hold limit)\n",
                     "graph commit: hb1.child\n",
-                    "resume at: node type 'Zebra'\n",
+                    "resume with: --start-at node:Zebra\n",
                     "configuration clear: unknown (timed out)\n",
                 ),
-                failure = failure
+                failure = failure,
+                index_failure = index_failure
             ),
             serde_json::json!({
                 "uri":"graph",
@@ -2071,6 +2094,7 @@ mod tests {
                 "artifact":{"outcome":"skipped","reason":"no_edge_types","error":null},
                 "datasets":[
                     {"type_key":"node:Person","outcome":"optimized","reason":null,"fragments_removed":3,"fragments_added":1,"committed":true,"duration_ms":12,"error":null,"pending_indexes":[{"property":"embedding","reason":"no trainable vectors"}]},
+                    {"type_key":"node:Wombat","outcome":"optimized","reason":"index_failed","fragments_removed":3,"fragments_added":1,"committed":true,"duration_ms":12,"error":index_failure,"pending_indexes":[]},
                     {"type_key":"node:Yak","outcome":"unchanged","reason":null,"fragments_removed":0,"fragments_added":0,"committed":false,"duration_ms":3,"error":null,"pending_indexes":[]},
                     {"type_key":"node:Xerus","outcome":"failed","reason":null,"fragments_removed":0,"fragments_added":0,"committed":false,"duration_ms":5,"error":failure,"pending_indexes":[]},
                     {"type_key":"node:Zebra","outcome":"deferred","reason":"gate_hold_limit","fragments_removed":0,"fragments_added":0,"committed":false,"duration_ms":0,"error":null,"pending_indexes":[]},
@@ -2079,7 +2103,7 @@ mod tests {
             |json, writer| super::write_optimize("graph", &report, json, writer),
         );
         let mut empty = report.clone();
-        empty.tables.clear();
+        empty.datasets.clear();
         empty.input_commit = None;
         empty.graph_commit_id = None;
         empty.resume_at = None;

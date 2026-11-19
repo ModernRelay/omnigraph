@@ -152,9 +152,8 @@ unsupported. Pattern:
 1. Add as optional: `new_prop: String?`
 2. Apply
 3. Backfill via a `mutate` or `load --mode merge`
-4. Keep it optional: tightening `T?` -> `T` is currently refused by the planner
-   (a property-type change, OG-MF-106). Enforce presence at write time by
-   convention until required-tightening ships as a migration step.
+4. Promote it: change `new_prop: String?` to `new_prop: String` and apply. The
+   constraints section below says when that apply is refused.
 
 ### Enum widening is a supported apply
 
@@ -181,15 +180,17 @@ check: every stored row holds a null there, and a key with a null part is exempt
 
 Adding another constraint (`@key`, `@range`, `@check`, an edge `@unique`)
 to an existing type, removing a constraint from a property that stays,
-changing edge cardinality or endpoints, and adding an edge type with a non-zero
-`@card` minimum from an existing node type (OG-MF-107) are refused as
-unsupported. Dropping a
+changing edge endpoints, raising an edge's `@card` minimum or lowering its
+maximum, and adding an edge type with a non-zero `@card` minimum from an
+existing node type (OG-MF-107) are refused as unsupported. Widening a `@card`
+range (`@card(1..1)` to `@card(0..1)`, or lifting the maximum) is metadata
+only: a count that met the old range also meets the new one. Dropping a
 property drops every constraint that names only dropped properties (its own
 `@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
 or a constraint that also names a field that stays, is refused. In-place
 migrations are additions of nullable properties and types, `@index` and node
-`@unique` additions, nullable-to-required promotion, enum widening, renames,
-and drops; any other tightening means a rebuild.
+`@unique` additions, nullable-to-required promotion, enum widening, `@card`
+widening, renames, and drops; any other tightening means a rebuild.
 
 ### `schema apply` blocks writes while running
 

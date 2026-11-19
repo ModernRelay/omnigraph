@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-09-04
-updated: 2026-10-05
+updated: 2026-11-17
 discussion: null
 supersedes: []
 superseded_by: []
@@ -173,6 +173,14 @@ None that block acceptance.
 
 ## Decision log
 
+- 2026-11-17: The CLI's `--format arrow` (issue #1428) writes the result
+  batches of a query its own engine runs on a direct target, through
+  `QueryResult::write_arrow_ipc`, which streams each batch in slices of about
+  8 MiB; the variant had shipped refusing every invocation. The query routes
+  still answer JSON alone, so a served or managed target refuses
+  `--format arrow` before its credential is read, a terminal stdout refuses
+  it, and `alias` does not offer it. The `Accept` negotiation, its OpenAPI
+  entry and the 406 remain unimplemented; the proposal remains draft.
 - 2026-10-05: Aligned this proposal with the maintainer-authorized removal of
   `/read` and `LegacyReadOutput`. Removed the query-envelope and Arrow
   negotiation exceptions for that route, and the retired DTO from the raw-row

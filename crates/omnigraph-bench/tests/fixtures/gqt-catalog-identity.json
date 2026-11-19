@@ -1,6 +1,6 @@
 {
-  "branch-merge-d50-process-cold-xfs": {
-    "planned_sha256": "ccdd6fe31f024747a44d0911bc915e5c8285d9590d870bf4fe7eedff3c3652b4",
+  "branch-merge-d50-process-cold": {
+    "planned_sha256": "447af131d11ea7a0f50249d5c6453766fba2df06f38105a1a43b32dc7d765d60",
     "recipe_sha256": "15da6902a942b5e48e9549b9a5c73d6eea42f4a49f146ff478b364a75b7c8fb9",
     "needs_indices": false,
     "cache_condition": {
@@ -18,7 +18,7 @@
     "environment": {
       "backend": {
         "kind": "local-fs",
-        "filesystem": "xfs",
+        "filesystem": "apfs",
         "storage_class": "nvme-ssd"
       }
     },
@@ -26,11 +26,11 @@
       "deadline_seconds": 60,
       "attribution": "per-phase",
       "schedule": "manual",
-      "reset": "plain-copy",
+      "reset": "local-clonefile",
       "timer": "monotonic"
     },
     "repetitions": 5,
-    "bound_point_id": "58f5ae4950087b6f9578398df9ec741c0426ae4c7a938c93f0ed85b6e95b922c"
+    "bound_point_id": "d049504cc0bcfc577e3fa6c382fcb305d995115d249696880b9254d46e71c73e"
   },
   "branch-merge-d50-warm": {
     "planned_sha256": "e8a4f0e4761ff264ee41e72613d3d431f8d65b02bc68c957096098fac752077e",

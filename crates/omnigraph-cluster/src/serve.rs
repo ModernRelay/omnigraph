@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::config::storage_root_conflict_code;
+use crate::policy_binding::{PolicyBindings, Scope};
 
 /// One graph in a serving snapshot: its id and on-disk root.
 #[derive(Debug, Clone)]
@@ -62,6 +63,29 @@ pub struct ServingSnapshot {
     /// safety checks, sorted. Evidence for an unregistered graph never adds
     /// that graph to the applied inventory.
     pub quarantined_graphs: Vec<ServingBlockedGraph>,
+}
+
+impl ServingSnapshot {
+    /// The bundle bound to `graph`. A snapshot read from a ledger carries at
+    /// most one, since the binding rule refused any other ledger
+    /// (`PolicyBindings`); every consumer selects a graph's bundle here.
+    pub fn graph_policy(&self, graph: &str) -> Option<&ServingPolicy> {
+        self.bound(Scope::Graph(graph))
+    }
+
+    /// The bundle bound to the cluster scope, under the same rule.
+    pub fn cluster_policy(&self) -> Option<&ServingPolicy> {
+        self.bound(Scope::Cluster)
+    }
+
+    fn bound(&self, scope: Scope<'_>) -> Option<&ServingPolicy> {
+        self.policies.iter().find(|policy| {
+            policy
+                .applies_to
+                .iter()
+                .any(|binding| Scope::parse(binding) == Some(scope))
+        })
+    }
 }
 
 /// A serving snapshot paired with the canonical root of the same opened store.
@@ -750,6 +774,12 @@ async fn read_snapshot_impl(
         embedding_profiles.insert(address.to_owned(), profile);
     }
 
+    // The one binding rule (`PolicyBindings`): a ledger that breaks it is
+    // refused whole, so the snapshot carries at most one bundle per scope and
+    // every binding it carries names a scope.
+    if let Err(diagnostic) = PolicyBindings::of(&state.applied_revision.resources) {
+        diagnostics.push(diagnostic);
+    }
     let mut graphs = Vec::new();
     let mut queries = Vec::new();
     let mut policies = Vec::new();
@@ -834,21 +864,18 @@ async fn read_snapshot_impl(
                 let ResourceKind::Policy(name) = &kind else {
                     unreachable!()
                 };
+                // Refused above when absent: the snapshot then fails.
                 let Some(applies_to) = entry.applies_to.clone() else {
-                    diagnostics.push(Diagnostic::error(
-                        "policy_bindings_missing",
-                        address.clone(),
-                        "no applied applies_to bindings recorded (ledger predates binding metadata); re-run `cluster apply` to backfill",
-                    ));
                     continue;
                 };
                 let applies_to: Vec<String> = applies_to
                     .into_iter()
-                    .filter(|binding| {
-                        binding.strip_prefix("graph.").is_none_or(|graph| {
+                    .filter(|binding| match Scope::parse(binding) {
+                        Some(Scope::Graph(graph)) => {
                             graph == omnigraph_compiler::CATALOGUE_SCOPE
                                 || (selected(graph) && !quarantined_graphs.contains(graph))
-                        })
+                        }
+                        _ => true,
                     })
                     .collect();
                 if applies_to.is_empty() {

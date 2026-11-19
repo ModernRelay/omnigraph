@@ -2154,7 +2154,7 @@ node Document {
         .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap()
-        .tables;
+        .datasets;
     assert!(
         stats
             .iter()
@@ -2260,7 +2260,7 @@ async fn physical_only_commit_over_a_large_fragment_reads_as_empty_issue_705() {
         .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap()
-        .tables;
+        .datasets;
     assert!(
         stats
             .iter()

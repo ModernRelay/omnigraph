@@ -1,3 +1,4 @@
-- `optimize --max-gate-hold` stops starting tables once the limit passes, so writes to main wait about that long plus one table, not the whole run; `--tables` runs just those tables. See [bounding a run][optimize-bounded-runs].
+- After the first dataset, `--max-gate-hold` stops new work at the deadline.
+  Use `--datasets` to select datasets or the printed `--start-at` to [resume a direct run][optimize-bounded-runs].
 
 [optimize-bounded-runs]: ../docs/user/operations/maintenance.md#bounding-a-run

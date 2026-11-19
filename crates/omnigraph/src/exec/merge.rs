@@ -22,12 +22,13 @@ const MERGE_STAGE_DIR_ENV: &str = "OMNIGRAPH_MERGE_STAGING_DIR";
 const DELETE_FILTER_IN: &str = " IN (";
 const DELETE_FILTER_SEPARATOR: &str = ", ";
 const DELETE_FILTER_SUFFIX: &str = ")";
-/// The unified validator currently consumes one cross-table `ChangeSet`, so
-/// projected scalar deltas must remain resident until evaluation completes.
-/// Keep that operation-wide retained input bounded independently of the
-/// per-transaction keyed-write chunks.
+/// The merge validator streams the delta and keeps only what its cross-row
+/// checks judge across the whole delta at once, derived from the key columns
+/// of the rows and the removed ids ([`MergeValidationBudget`]). Those stay
+/// resident until judgment ends, so the keys' operation-wide total is limited
+/// independently of the per-transaction keyed-write chunks.
 const MERGE_VALIDATION_MAX_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
-const MERGE_VALIDATION_RESOURCE: &str = "branch-merge retained validation delta bytes";
+const MERGE_VALIDATION_RESOURCE: &str = "branch-merge retained validation key bytes";
 /// Maximum detached chunk commits one table may chain in a single merge. The
 /// writer rejects a larger plan before its first effect, which bounds the
 /// chain `walk_chain` follows.
@@ -3376,12 +3377,29 @@ fn classify_merge_conflict(
     }
 }
 
-/// Operation-wide budget for the scalar delta retained by merge validation.
+/// Operation-wide budget for what merge validation keeps of the delta.
 ///
-/// Physical merge staging is chunked, but the unified validator evaluates one
-/// cross-table `ChangeSet`. Without a second aggregate ceiling, many valid
-/// chunks (or many candidate tables) could be collected back into an unbounded
-/// resident delta before the first effect.
+/// The validator sweeps each candidate's delta from storage once, a batch at
+/// a time ([`crate::validate::load::Sweep`]), and lets every batch go: a value
+/// only a row-local check reads (a wide description, an enum or `@range`
+/// column) is judged in its batch and never retained, and vectors and Blobs
+/// are never read. What stays until judgment ends is what the cross-row
+/// checks judge across the whole delta at once: the key columns a fact is
+/// extracted from (the ids, each uniqueness group's values, an edge's source
+/// and endpoints) and the removed ids. This budget charges those columns'
+/// value bytes as each batch is swept
+/// ([`crate::validate::load::Sweep::fact_bytes`]), and each removed id as it
+/// is copied, so a delta whose keys exceed it is refused before the first
+/// effect. It limits the keys validation takes in, not the memory it uses:
+/// the facts built from the keys (owned strings, hash entries, a copy per
+/// check that reads them) take a multiple of the keys' bytes, proportional to
+/// them but not bounded by this count.
+///
+/// The ceiling is fixed: it limits what validation keeps, not a write, so
+/// `write_max_bytes` (which a pointer adoption that writes no row does not
+/// meet) does not move it. It applies to the whole delta since the merge
+/// base, however the source's commits were chunked; a larger delta merges in
+/// stages, through a branch at an intermediate source commit merged first.
 #[derive(Debug)]
 struct MergeValidationBudget {
     retained_bytes: u64,
@@ -3413,16 +3431,6 @@ impl MergeValidationBudget {
         Ok(())
     }
 
-    /// Charge the exact projected Arrow allocation before the batch is pushed
-    /// into the retained `ChangeSet`.
-    fn reserve_projected_batch(&mut self, batch: &RecordBatch) -> Result<u64> {
-        let bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("branch merge validation batch bytes exceed u64")
-        })?;
-        self.reserve(bytes)?;
-        Ok(bytes)
-    }
-
     /// Deleted IDs are cloned from the already-bounded physical delete plan
     /// into the validator's logical delta. Charge their owned UTF-8 payload and
     /// `String` slot so delete-only candidates cannot bypass the aggregate cap.
@@ -3451,133 +3459,126 @@ fn retain_deleted_ids_for_validation(
     Ok(())
 }
 
-async fn scan_adopt_delta_for_validation(
-    db: &Omnigraph,
-    delta: &AdoptDelta,
-    projection: &[&str],
-    budget: &mut MergeValidationBudget,
-    change: &mut crate::validate::TableChange,
-) -> Result<()> {
-    if let Some(table) = &delta.inserts {
-        scan_staged_for_validation(db, table, projection, budget, &mut change.added).await?;
-    }
-    if let Some(table) = &delta.upserts {
-        scan_staged_for_validation(db, table, projection, budget, &mut change.changed).await?;
-    }
-    retain_deleted_ids_for_validation(&delta.deleted_ids, budget, &mut change.deleted_ids)?;
-    Ok(())
+/// Where merge validation reads rows of one table's delta: a staged delta
+/// dataset, or the source interval proven to hold only fenced inserts. The
+/// rows stay in storage until the sweep reads them.
+#[derive(Clone, Copy)]
+enum ValidationRows<'c> {
+    Staged(&'c StagedTable),
+    ProvenInserts(&'c ProvenPureInsertAdopt),
 }
 
-/// Build the validator's per-table changes from candidate deltas and proven inserts.
-async fn build_merge_changeset(
-    db: &Omnigraph,
-    catalog: &Catalog,
-    candidates: &HashMap<String, CandidateTableState>,
-) -> Result<crate::validate::ChangeSet> {
-    let mut changeset = crate::validate::ChangeSet::new();
-    let mut validation_budget = MergeValidationBudget::default();
+impl ValidationRows<'_> {
+    /// The exact rows the source holds, known before it is read.
+    fn rows(self) -> u64 {
+        match self {
+            Self::Staged(table) => table.row_count,
+            Self::ProvenInserts(proven) => proven.inserted_rows,
+        }
+    }
+}
+
+/// One table's delta as merge validation judges it: the rows the result adds
+/// and the rows it changes, both read from storage when the sweep reaches
+/// them, and the ids it removes.
+struct ValidationDelta<'c> {
+    table_key: String,
+    added: Vec<ValidationRows<'c>>,
+    changed: Vec<ValidationRows<'c>>,
+    deleted_ids: Vec<String>,
+}
+
+impl ValidationDelta<'_> {
+    fn added_rows(&self) -> u64 {
+        self.added.iter().map(|rows| rows.rows()).sum()
+    }
+
+    fn changed_rows(&self) -> u64 {
+        self.changed.iter().map(|rows| rows.rows()).sum()
+    }
+}
+
+/// Every candidate's delta in the judge's order ([`crate::validate::plan::judgment_rank`]), with
+/// its removed ids copied out of the physical delete plan and charged; a
+/// table that adds, changes and removes nothing is left out.
+fn merge_validation_deltas<'c>(
+    candidates: &'c HashMap<String, CandidateTableState>,
+    budget: &mut MergeValidationBudget,
+) -> Result<Vec<ValidationDelta<'c>>> {
+    use crate::validate::plan::judgment_rank;
     // The shared-budget failure and the validator's observable traversal must
     // not depend on HashMap iteration order.
     let mut ordered_table_keys = candidates.keys().collect::<Vec<_>>();
-    ordered_table_keys.sort();
+    ordered_table_keys.sort_by(|a, b| judgment_rank(a).cmp(&judgment_rank(b)));
+    let mut deltas = Vec::new();
     for table_key in ordered_table_keys {
         let candidate = candidates.get(table_key).ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "branch merge validation candidate '{table_key}' disappeared"
             ))
         })?;
-        // Validation reads only id/src/dst + scalar constraint columns; project
-        // out Vector/Blob so the change-set never holds embeddings (holding the
-        // delta with embeddings would re-introduce the memory pressure the
-        // streaming append exists to avoid).
-        let projection = validation_projection(catalog, table_key);
-        let projection: Vec<&str> = projection.iter().map(String::as_str).collect();
-        let mut change = crate::validate::TableChange::default();
+        let mut delta = ValidationDelta {
+            table_key: table_key.clone(),
+            added: Vec::new(),
+            changed: Vec::new(),
+            deleted_ids: Vec::new(),
+        };
+        let mut row_delta = |inserts: &'c Option<StagedTable>,
+                             changed: &'c Option<StagedTable>,
+                             deleted: &'c DeleteIdChunks,
+                             delta: &mut ValidationDelta<'c>|
+         -> Result<()> {
+            delta
+                .added
+                .extend(inserts.as_ref().map(ValidationRows::Staged));
+            delta
+                .changed
+                .extend(changed.as_ref().map(ValidationRows::Staged));
+            retain_deleted_ids_for_validation(deleted, budget, &mut delta.deleted_ids)
+        };
         match candidate {
             CandidateTableState::AdoptSourceState {
                 validation_delta: None,
             } => continue,
             CandidateTableState::AdoptSourceState {
-                validation_delta: Some(AdoptValidation::RowDelta(delta)),
-            } => {
-                scan_adopt_delta_for_validation(
-                    db,
-                    delta,
-                    &projection,
-                    &mut validation_budget,
-                    &mut change,
-                )
-                .await?;
-            }
-            CandidateTableState::AdoptWithDelta(delta) => {
-                scan_adopt_delta_for_validation(
-                    db,
-                    delta,
-                    &projection,
-                    &mut validation_budget,
-                    &mut change,
-                )
-                .await?;
-            }
+                validation_delta: Some(AdoptValidation::RowDelta(adopt)),
+            } => row_delta(
+                &adopt.inserts,
+                &adopt.upserts,
+                &adopt.deleted_ids,
+                &mut delta,
+            )?,
+            CandidateTableState::AdoptWithDelta(adopt) => row_delta(
+                &adopt.inserts,
+                &adopt.upserts,
+                &adopt.deleted_ids,
+                &mut delta,
+            )?,
             CandidateTableState::AdoptSourceState {
                 validation_delta: Some(AdoptValidation::PureInserts(proven)),
-            } => {
-                scan_proven_pure_inserts_for_validation(
-                    table_key,
-                    proven,
-                    &projection,
-                    &mut validation_budget,
-                    &mut change.added,
-                )
-                .await?;
-            }
+            } => delta.added.push(ValidationRows::ProvenInserts(proven)),
             CandidateTableState::AdoptPureInserts(proven) => {
-                scan_proven_pure_inserts_for_validation(
-                    table_key,
-                    proven,
-                    &projection,
-                    &mut validation_budget,
-                    &mut change.added,
-                )
-                .await?;
+                delta.added.push(ValidationRows::ProvenInserts(proven))
             }
-            CandidateTableState::RewriteMerged(staged) => {
-                if let Some(table) = &staged.inserts {
-                    scan_staged_for_validation(
-                        db,
-                        table,
-                        &projection,
-                        &mut validation_budget,
-                        &mut change.added,
-                    )
-                    .await?;
-                }
-                if let Some(table) = &staged.updates {
-                    scan_staged_for_validation(
-                        db,
-                        table,
-                        &projection,
-                        &mut validation_budget,
-                        &mut change.changed,
-                    )
-                    .await?;
-                }
-                retain_deleted_ids_for_validation(
-                    &staged.deleted_ids,
-                    &mut validation_budget,
-                    &mut change.deleted_ids,
-                )?;
-            }
+            CandidateTableState::RewriteMerged(staged) => row_delta(
+                &staged.inserts,
+                &staged.updates,
+                &staged.deleted_ids,
+                &mut delta,
+            )?,
         }
-        changeset.insert(table_key.as_str().to_string(), change);
+        if delta.added_rows() == 0 && delta.changed_rows() == 0 && delta.deleted_ids.is_empty() {
+            continue;
+        }
+        deltas.push(delta);
     }
-    Ok(changeset)
+    Ok(deltas)
 }
 
 /// Columns validation needs from a staged delta: `id` (+ `src`/`dst` for edges)
 /// plus scalar/enum property columns. Vector and Blob columns are excluded — no
-/// constraint reads them, and keeping them out of the change-set keeps validation
-/// memory bounded regardless of embedding width.
+/// constraint reads them, and leaving them out of every validation read keeps
+/// a swept batch's size independent of embedding width and Blob payloads.
 fn validation_projection(catalog: &Catalog, table_key: &str) -> Vec<String> {
     use omnigraph_compiler::types::{PropType, ScalarType};
     let is_heavy = |ty: &PropType| matches!(ty.scalar, ScalarType::Vector(_) | ScalarType::Blob);
@@ -3608,76 +3609,52 @@ fn validation_projection(catalog: &Catalog, table_key: &str) -> Vec<String> {
     cols
 }
 
-/// Scan a staged delta table for validation, projected to the constraint columns
-/// (no embeddings) and kept batch-shaped — never concatenated into one batch, so
-/// it does not reintroduce the whole-delta materialization the streaming append
-/// avoids. Empty batches are dropped.
-async fn scan_staged_for_validation(
-    db: &Omnigraph,
-    table: &StagedTable,
-    projection: &[&str],
-    budget: &mut MergeValidationBudget,
-    output: &mut Vec<RecordBatch>,
-) -> Result<()> {
-    let snapshot = SnapshotHandle::new(table.dataset.clone());
-    let mut stream = db
-        .storage()
-        .scan_stream_bounded(
-            &snapshot,
-            Some(projection),
-            None,
-            None,
-            false,
-            KEYED_WRITE_MAX_ROWS,
-            KEYED_WRITE_MAX_BYTES,
-        )
-        .await?;
-    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let projected_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("branch merge validation batch bytes exceed u64")
-        })?;
-        crate::instrumentation::record_merge_validation_batch(projected_bytes);
-        // Charge before `output.push`: rejection never retains the batch that
-        // crosses the shared operation-wide ceiling.
-        budget.reserve_projected_batch(&batch)?;
-        output.push(batch);
-    }
-    Ok(())
-}
-
-/// Project the source rows proven to have been created in `(base, source]`
-/// directly into the merge validator.  This is a narrow scalar scan (vectors
-/// and blobs are projected out), while the later physical publish performs one
-/// independent wide stream into Lance's native filtered merge transaction.
-async fn scan_proven_pure_inserts_for_validation(
+/// Stream one source of a table's delta rows for validation, projected to the
+/// constraint columns (no embeddings or Blobs) in row- and byte-bounded
+/// batches, and hand each non-empty batch to `sweep` in the source's order.
+/// No batch is kept here: `sweep` extracts what it needs and the batch is
+/// dropped before the next one is read. The rows read must be exactly the
+/// rows the source declared, which validation was planned with.
+///
+/// A proven-insert source is a narrow scalar scan of the certified source
+/// interval; the later physical publish performs one independent wide stream
+/// into Lance's native filtered merge transaction.
+async fn sweep_validation_rows(
     table_key: &str,
-    proven: &ProvenPureInsertAdopt,
+    rows: ValidationRows<'_>,
     projection: &[&str],
-    budget: &mut MergeValidationBudget,
-    output: &mut Vec<RecordBatch>,
+    mut sweep: impl FnMut(&RecordBatch) -> Result<()>,
 ) -> Result<()> {
-    let mut stream = match &proven.interval {
-        crate::table_store::ProvenInsertInterval::Fragments { fragments, .. } => {
-            let fragments = fragments.clone();
-            crate::table_store::TableStore::scan_stream_with(
-                &proven.source,
-                Some(projection),
-                None,
-                None,
-                false,
-                move |scanner| {
-                    scanner.with_fragments(fragments);
-                    scanner.batch_size(KEYED_WRITE_MAX_ROWS);
-                    scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
-                    Ok(())
-                },
-            )
-            .await?
-        }
+    // Lance decodes and fetches ahead of the consumer outside any budget,
+    // by default up to 32 MiB per I/O thread; cap both as an engine read
+    // does (`ScanTuning::pipelined`), so the sweep holds about one batch in
+    // flight, not the delta.
+    let (dataset, fragments) = match rows {
+        ValidationRows::Staged(table) => (&table.dataset, None),
+        ValidationRows::ProvenInserts(proven) => match &proven.interval {
+            crate::table_store::ProvenInsertInterval::Fragments { fragments, .. } => {
+                (&proven.source, Some(fragments.clone()))
+            }
+        },
     };
+    let mut stream = crate::table_store::TableStore::scan_stream_with(
+        dataset,
+        Some(projection),
+        None,
+        None,
+        false,
+        move |scanner| {
+            if let Some(fragments) = fragments {
+                scanner.with_fragments(fragments);
+            }
+            scanner.batch_size(KEYED_WRITE_MAX_ROWS);
+            scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
+            scanner.pipelined();
+            Ok(())
+        },
+    )
+    .await?;
+    let proven = matches!(rows, ValidationRows::ProvenInserts(_));
     let mut observed_rows = 0_u64;
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
         if batch.num_rows() == 0 {
@@ -3686,42 +3663,45 @@ async fn scan_proven_pure_inserts_for_validation(
         let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
             OmniError::manifest_internal("branch merge validation batch bytes exceed u64")
         })?;
-        if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
+        if proven && batch.num_rows() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::resource_limit(
                 format!("branch-merge pure-insert validation batch entities for {table_key}"),
                 KEYED_WRITE_MAX_ROWS as u64,
                 batch.num_rows() as u64,
             ));
         }
-        if batch_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                format!("branch-merge pure-insert validation batch bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                batch_bytes,
-            ));
-        }
+        // No byte bound per batch, on either route: the sweep frees the batch
+        // once its facts are extracted, `MergeValidationBudget` limits the
+        // keys it keeps, and the scanner's byte size is a target that cannot
+        // split a row. A row wider than 32 MiB was written under a raised
+        // `write_max_bytes`; a merge that writes it again bounds it by its own
+        // captured allowance, and one that adopts the table by pointer writes
+        // no row.
         observed_rows = observed_rows
             .checked_add(batch.num_rows() as u64)
             .ok_or_else(|| {
-                OmniError::manifest_internal(
-                    "branch merge pure-insert validation row count overflow",
-                )
+                OmniError::manifest_internal("branch merge validation row count overflow")
             })?;
         crate::instrumentation::record_merge_validation_batch(batch_bytes);
-        budget.reserve_projected_batch(&batch)?;
-        output.push(batch);
+        sweep(&batch)?;
     }
-    if observed_rows != proven.inserted_rows {
-        return Err(OmniError::manifest_internal(format!(
-            "branch merge pure-insert validation for '{table_key}' observed {observed_rows} rows against a provenance proof for {}",
-            proven.inserted_rows
-        )));
+    if observed_rows != rows.rows() {
+        return Err(OmniError::manifest_internal(match rows {
+            ValidationRows::Staged(_) => format!(
+                "branch merge validation for '{table_key}' read {observed_rows} rows of a staged delta of {}",
+                rows.rows()
+            ),
+            ValidationRows::ProvenInserts(_) => format!(
+                "branch merge pure-insert validation for '{table_key}' observed {observed_rows} rows against a provenance proof for {}",
+                rows.rows()
+            ),
+        }));
     }
     Ok(())
 }
 
 /// Whether certified pure inserts into node types constrained only by `@key` discharge
-/// every check a fast forward's `ChangeSet` would run: the target holds the base's rows,
+/// every check a fast forward's validation sweep would run: the target holds the base's rows,
 /// and edges keep validation for their cross-table checks.
 fn proven_fast_forward_needs_no_validation(
     catalog: &Catalog,
@@ -4359,6 +4339,65 @@ mod chain_limit_tests {
         );
     }
 
+    /// A planned chunk the scan returns as two batches over one decode
+    /// buffer, the second a null whose offsets span the first row's bytes,
+    /// is rebuilt with the first row's bytes alone: `concat` would copy the
+    /// null's span too and double the chunk (#1427).
+    #[tokio::test]
+    async fn staged_publication_copies_no_bytes_a_null_spans_issue_1427() {
+        use datafusion::arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
+
+        const VALUE: usize = 1024 * 1024;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("wide", arrow_schema::DataType::Utf8, true),
+        ]));
+        let shared = Buffer::from(vec![b'w'; 2 * VALUE]);
+        let wide = |offsets: Vec<i32>, valid: bool| {
+            Arc::new(arrow_array::StringArray::new(
+                OffsetBuffer::new(offsets.into()),
+                shared.clone(),
+                Some(NullBuffer::from(vec![valid])),
+            )) as arrow_array::ArrayRef
+        };
+        let span = i32::try_from(VALUE).unwrap();
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["big"])),
+                wide(vec![0, span], true),
+            ],
+        )
+        .unwrap();
+        let second = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["small"])),
+                wide(vec![span, 2 * span], false),
+            ],
+        )
+        .unwrap();
+        let reader = arrow_array::RecordBatchIterator::new([Ok(first), Ok(second)], schema.clone());
+        let mut stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+        let chunk =
+            next_exact_staged_chunk(&mut stream, &mut None, &schema, 2, WriteBudget::default())
+                .await
+                .unwrap();
+        let wide = chunk
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(chunk.num_rows(), 2);
+        assert_eq!(wide.value(0).len(), VALUE);
+        assert!(wide.is_null(1));
+        assert_eq!(
+            wide.value_offsets()[2] as usize,
+            VALUE,
+            "the null's span was copied into the chunk"
+        );
+    }
+
     #[test]
     fn branch_merge_delete_ids_split_on_row_and_escaped_byte_bounds() {
         let mut row_bounded = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
@@ -4773,11 +4812,15 @@ async fn next_exact_staged_chunk(
             *carry = Some(batch.slice(take, batch.num_rows() - take));
         }
     }
+    // A scan can return a null whose offsets span a neighbour's bytes in a
+    // shared decode buffer. `concat` copies every slot's offset range and
+    // would carry those bytes into the chunk, past the bound its rows were
+    // planned under; a copy (`copy_batch_range`) holds valid values alone.
     let chunk = if slices.len() == 1 {
         let slice = slices.pop().expect("one slice");
         let usage = crate::table_store::write_batch_bytes(&slice)?;
         let retained = slice.get_array_memory_size() as u64;
-        let logical = crate::table_store::batch_slice_memory_size(&slice, 0, slice.num_rows())?;
+        let logical = crate::table_store::batch_logical_bytes(&slice);
         if !partial_batch
             && usage.rows <= write_budget.bytes()
             && usage.payload <= write_budget.bytes()
@@ -4786,12 +4829,15 @@ async fn next_exact_staged_chunk(
         {
             slice
         } else {
-            let indices = UInt64Array::from_iter_values(0..slice.num_rows() as u64);
-            arrow_select::take::take_record_batch(&slice, &indices)
-                .map_err(OmniError::arrow_internal)?
+            crate::table_store::copy_batch_range(&slice, 0, slice.num_rows())?
         }
     } else {
-        arrow_select::concat::concat_batches(schema, &slices).map_err(OmniError::arrow_internal)?
+        let compact = slices
+            .iter()
+            .map(|slice| crate::table_store::copy_batch_range(slice, 0, slice.num_rows()))
+            .collect::<Result<Vec<_>>>()?;
+        drop(slices);
+        arrow_select::concat::concat_batches(schema, &compact).map_err(OmniError::arrow_internal)?
     };
     let usage = crate::table_store::write_batch_bytes(&chunk)?;
     let chunk_bytes = usage.rows;
@@ -5964,10 +6010,16 @@ impl Omnigraph {
             let validation_timing = crate::instrumentation::start_merge_timing(
                 crate::instrumentation::MergeTimingPhase::CandidateValidation,
             );
-            let changeset = build_merge_changeset(self, catalog, &candidates).await?;
-            plans = self
-                .validate_merge_candidates(target_txn, &changeset, write_budget)
-                .await?;
+            // Boxed, as the per-table stage futures are: the sweep's stream
+            // and the judge are deep futures, kept off the merge future's
+            // frame.
+            plans = Box::pin(self.validate_merge_candidates(
+                target_txn,
+                catalog,
+                &candidates,
+                write_budget,
+            ))
+            .await?;
             validation_timing.finish();
         }
         fail(&BRANCH_MERGE_POST_CANDIDATE_VALIDATION)?;
@@ -6334,44 +6386,49 @@ impl Omnigraph {
     /// The merge delta judged against the target through every candidate
     /// table's `Validate` node, planned at the target's pinned version; every
     /// violation is a [`MergeConflict`], the documents go to the receipt.
+    ///
+    /// Each table's delta rows are streamed from storage through one sweep,
+    /// added rows before changed ones, in the judge's table order, and each
+    /// batch is let go once its facts are extracted; what the sweep keeps is
+    /// charged to the [`MergeValidationBudget`] as it is taken.
     async fn validate_merge_candidates(
         &self,
         target_txn: &WriteTxn,
-        changeset: &crate::validate::ChangeSet,
+        catalog: &Catalog,
+        candidates: &HashMap<String, CandidateTableState>,
         write_budget: WriteBudget,
     ) -> Result<Vec<omnigraph_planner::Explain>> {
-        use crate::validate::load::{JudgedSide, LoadAdmission, RepeatRule, Report, WriteJudge};
-        use crate::validate::plan::{WriteTable, judgment_rank, plan_write};
+        use crate::validate::load::{
+            JudgedSide, LoadAdmission, RepeatRule, Report, Sweep, WriteJudge,
+        };
+        use crate::validate::plan::{WriteTable, plan_write};
         use omnigraph_compiler::ir::{DeltaClass, WriteKind};
         use omnigraph_planner::CommittedSide;
 
-        let mut table_keys: Vec<&String> = changeset.keys().collect();
-        table_keys.sort_by(|a, b| judgment_rank(a).cmp(&judgment_rank(b)));
-        let mut tables = Vec::new();
-        let mut batches = Vec::new();
-        for table_key in table_keys {
-            let change = &changeset[table_key];
-            let rows: usize = change.value_batches().map(RecordBatch::num_rows).sum();
-            if rows == 0 && change.deleted_ids.is_empty() {
-                continue;
-            }
-            tables.push(WriteTable {
-                table: table_key.clone(),
-                delta: if rows == 0 {
-                    DeltaClass::Removal
-                } else if change.changed.is_empty() {
-                    DeltaClass::Insert
-                } else {
-                    DeltaClass::Upsert
-                },
-                rows: rows as u64,
-                deleted_ids: change.deleted_ids.clone(),
-            });
-            batches.push(change.value_batches().cloned().collect::<Vec<_>>());
-        }
-        if tables.is_empty() {
+        let mut budget = MergeValidationBudget::default();
+        let mut deltas = merge_validation_deltas(candidates, &mut budget)?;
+        if deltas.is_empty() {
             return Ok(Vec::new());
         }
+        let tables = deltas
+            .iter_mut()
+            .map(|delta| {
+                let added = delta.added_rows();
+                let changed = delta.changed_rows();
+                WriteTable {
+                    table: delta.table_key.clone(),
+                    delta: if added == 0 && changed == 0 {
+                        DeltaClass::Removal
+                    } else if changed == 0 {
+                        DeltaClass::Insert
+                    } else {
+                        DeltaClass::Upsert
+                    },
+                    rows: added + changed,
+                    deleted_ids: std::mem::take(&mut delta.deleted_ids),
+                }
+            })
+            .collect();
         let mut base = target_txn.base.clone();
         base.set_read_caches(crate::db::manifest::SnapshotReadCaches {
             session: self.read_caches().session.clone(),
@@ -6397,22 +6454,47 @@ impl Omnigraph {
             report: Report::Every,
             repeat: RepeatRule::for_write(WriteKind::BranchMerge),
         };
+        let mut sweep = Sweep::streamed(&judge);
+        for (index, delta) in deltas.iter().enumerate() {
+            if judge.tables[index].table != delta.table_key {
+                return Err(OmniError::manifest_internal(format!(
+                    "branch merge validation planned {} where it sweeps {}",
+                    judge.tables[index].table, delta.table_key
+                )));
+            }
+            // Validation reads only id/src/dst + scalar constraint columns:
+            // vectors and Blobs are projected out of every read.
+            let projection = validation_projection(catalog, &delta.table_key);
+            let projection: Vec<&str> = projection.iter().map(String::as_str).collect();
+            for rows in delta.added.iter().chain(&delta.changed) {
+                Box::pin(sweep_validation_rows(
+                    &delta.table_key,
+                    *rows,
+                    &projection,
+                    |batch| {
+                        // Charge before the sweep: a refusal never extracts
+                        // the facts of the batch that crosses the ceiling.
+                        budget.reserve(sweep.fact_bytes(index, batch)?)?;
+                        sweep.observe(index, batch)
+                    },
+                ))
+                .await?;
+            }
+        }
         let mut deleted = DeletedIdBudget::new(write_budget);
         let mut admit_removed = |id: &str| deleted.retain(id);
         let mut admit_retained = |_: &RecordBatch| Ok(());
-        let violations = judge
-            .judge_batches(
-                self,
-                batches,
-                &mut LoadAdmission {
-                    phase: None,
-                    bytes: None,
-                    reuse: None,
-                    removed: &mut admit_removed,
-                    retained: &mut admit_retained,
-                },
-            )
-            .await?;
+        let violations = Box::pin(sweep.judge(
+            self,
+            &mut LoadAdmission {
+                phase: None,
+                bytes: None,
+                reuse: None,
+                removed: &mut admit_removed,
+                retained: &mut admit_retained,
+            },
+        ))
+        .await?;
         if violations.is_empty() {
             Ok(plans)
         } else {
