@@ -438,7 +438,10 @@ for every fragment it reads (it builds the physical expression once per
 distinct expression), so that scan reads unfiltered and the engine keeps the
 rows whose key is in one set of the keys (one more column read per fragment
 no key is in, which only a long list pays for). It preserves incoming row/rank order and carries a
-deterministic edge tie-break. A correlated block (`not exists { ... }`,
+deterministic edge tie-break. An indexed hop (`graph.rs::scan_neighbor_map`)
+holds each probe batch under its own `expand probe batch` charge only while it
+interns that batch's endpoints. A probe batch can be a slice of a larger decode
+buffer, and the pool charges the buffer by capacity. A correlated block (`not exists { ... }`,
 `exists { ... }`, `count { ... } > 2`, `sum($d.size) { ... } > 100`) is one
 anti-join over its typed inner pipeline, keeping each outer row by a
 `SubqueryPredicate` on the aggregate of its matches.

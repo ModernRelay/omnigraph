@@ -1538,6 +1538,12 @@ pub(super) enum HopPolicy {
 /// One `key IN (keys)` scan per probe, every row's endpoints interned into
 /// `interner` and the opposite appended to `neighbor_map[key]` in scan order
 /// (probe 0's rows, then probe 1's; parallel edges kept, like the CSR).
+///
+/// Each batch is consumed as it streams and held, under its own charge, only
+/// while its rows are interned (issue #1459). A BTREE-answered probe yields
+/// one batch per contiguous row range, each slicing a Lance decode buffer the
+/// pool charges by capacity, so holding the probe whole cost its batch count
+/// times that capacity rather than its rows.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn scan_neighbor_map(
     edge_ds: &Dataset,
@@ -1549,15 +1555,26 @@ pub(super) async fn scan_neighbor_map(
     hop_memory: &WorkMemory,
     memory: &WorkMemory,
 ) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
     for &orientation in probes {
         let EndpointColumns {
             key: key_col,
             opposite: opp_col,
         } = orientation;
-        let batches = scan_edges(edge_ds, orientation, &[], keys, pushdown, hop_memory).await?;
-        for batch in &batches {
-            let keys = utf8_column(batch, key_col)?;
-            let opposites = utf8_column(batch, opp_col)?;
+        let mut stream =
+            scan_edges_stream(edge_ds, orientation, &[], keys, pushdown, hop_memory).await?;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|error| memory.error(error))?;
+            let batch_memory = hop_memory
+                .child("expand probe batch")
+                .map_err(|error| memory.error(error))?;
+            batch_memory
+                .hold(&batch)
+                .map_err(|error| memory.error(error))?;
+            let keys = utf8_column(&batch, key_col)?;
+            let opposites = utf8_column(&batch, opp_col)?;
             for r in 0..batch.num_rows() {
                 let k = intern(interner, keys.value(r), memory)?;
                 let o = intern(interner, opposites.value(r), memory)?;
@@ -1595,24 +1612,6 @@ pub(super) fn intern(
         .string(value.len().saturating_mul(2))
         .map_err(|error| memory.error(error))?;
     Ok(index.get_or_insert(value))
-}
-
-async fn scan_edges(
-    ds: &Dataset,
-    orientation: EndpointColumns,
-    extras: &[&str],
-    keys: &[String],
-    pushdown: Option<bool>,
-    memory: &WorkMemory,
-) -> Result<Vec<RecordBatch>> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let stream = scan_edges_stream(ds, orientation, extras, keys, pushdown, memory).await?;
-    memory
-        .collect(stream)
-        .await
-        .map_err(|error| memory.error(error))
 }
 
 /// The backend has no selective pre-page admission hook. Reserve the
