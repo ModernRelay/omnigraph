@@ -1228,22 +1228,18 @@ pub fn capture_deployment_for_server(
 fn remote_root_identity(root: &str) -> Result<String, Diagnostic> {
     let normalized = omnigraph_storage::normalize_root_uri(root)
         .map_err(|error| refusal("storage_root_invalid", error.to_string()))?;
-    match omnigraph_storage::storage_kind_for_uri(&normalized)
-        .map_err(|error| refusal("storage_root_invalid", error.to_string()))?
-    {
-        omnigraph_storage::StorageKind::Local => {
-            if !Path::new(&normalized).is_absolute() {
-                return Err(refusal(
-                    "storage_root_invalid",
-                    "remote deployment requires an absolute storage root; omit storage to select the server's root",
-                ));
-            }
-            Ok(format!("file://{normalized}"))
-        }
-        omnigraph_storage::StorageKind::S3
-        | omnigraph_storage::StorageKind::Azure
-        | omnigraph_storage::StorageKind::Gcs => Ok(normalized),
+    let kind = omnigraph_storage::storage_kind_for_uri(&normalized)
+        .map_err(|error| refusal("storage_root_invalid", error.to_string()))?;
+    if kind.is_object_store() {
+        return Ok(normalized);
     }
+    if !Path::new(&normalized).is_absolute() {
+        return Err(refusal(
+            "storage_root_invalid",
+            "remote deployment requires an absolute storage root; omit storage to select the server's root",
+        ));
+    }
+    Ok(format!("file://{normalized}"))
 }
 
 fn capture_deployment_input(

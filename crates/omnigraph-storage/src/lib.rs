@@ -1251,6 +1251,18 @@ pub enum StorageKind {
     Gcs,
 }
 
+impl StorageKind {
+    /// Whether roots of this kind are object-store keys (`s3://`, `az://`,
+    /// `gs://`) rather than local paths. The one exhaustive answer, so a new
+    /// kind decides it here and every local-versus-remote branch follows.
+    pub fn is_object_store(self) -> bool {
+        match self {
+            Self::Local => false,
+            Self::S3 | Self::Azure | Self::Gcs => true,
+        }
+    }
+}
+
 /// Concrete storage selection for control-plane authority checks.
 ///
 /// Unlike [`StorageAdapter`], this handle cannot be implemented by a caller:
@@ -1380,6 +1392,34 @@ impl ObjectStorageAdapter {
         self
     }
 
+    /// A conditional-update object-store backend over `store`. With a scope,
+    /// its mutations are accounted to it and its reads go through
+    /// `retrying` ([`Self::with_scope_and_retrying`]).
+    fn remote<S: ObjectStore>(
+        store: S,
+        retrying: Option<S>,
+        codec: UriCodec,
+        scope: Option<StorageIoScope>,
+    ) -> Self {
+        let adapter = Self {
+            store: Arc::new(store),
+            scope: None,
+            codec,
+            supports_conditional_update: true,
+            #[cfg(test)]
+            omit_read_etag: false,
+            #[cfg(test)]
+            omit_write_etag: false,
+            read_through: None,
+        };
+        match (scope, retrying) {
+            (Some(scope), Some(retrying)) => {
+                adapter.with_scope_and_retrying(scope, Arc::new(retrying))
+            }
+            _ => adapter,
+        }
+    }
+
     /// S3 backend scoped to the bucket named in `root_uri`. Credentials and
     /// endpoint come from the standard `AWS_*` environment variables (the
     /// same ones Lance reads for its dataset stores).
@@ -1395,26 +1435,14 @@ impl ObjectStorageAdapter {
     fn s3_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
         let location = parse_s3_uri(root_uri)?;
         let (store, retrying) = s3_clients(&location.bucket, root_uri, scope.is_some())?;
-
-        let adapter = Self {
-            store: Arc::new(store),
-            scope: None,
-            codec: UriCodec::S3 {
+        Ok(Self::remote(
+            store,
+            retrying,
+            UriCodec::S3 {
                 bucket: location.bucket,
             },
-            supports_conditional_update: true,
-            #[cfg(test)]
-            omit_read_etag: false,
-            #[cfg(test)]
-            omit_write_etag: false,
-            read_through: None,
-        };
-        Ok(match (scope, retrying) {
-            (Some(scope), Some(retrying)) => {
-                adapter.with_scope_and_retrying(scope, Arc::new(retrying))
-            }
-            _ => adapter,
-        })
+            scope,
+        ))
     }
 
     /// Azure backend selected from the process-wide canonical root snapshot.
@@ -1507,25 +1535,14 @@ impl ObjectStorageAdapter {
                 ),
             )
         })?;
-        let adapter = Self {
-            store: Arc::new(store),
-            scope: None,
-            codec: UriCodec::Azure {
+        Ok(Self::remote(
+            store,
+            retrying,
+            UriCodec::Azure {
                 container: root.container().to_string(),
             },
-            supports_conditional_update: true,
-            #[cfg(test)]
-            omit_read_etag: false,
-            #[cfg(test)]
-            omit_write_etag: false,
-            read_through: None,
-        };
-        Ok(match (scope, retrying) {
-            (Some(scope), Some(retrying)) => {
-                adapter.with_scope_and_retrying(scope, Arc::new(retrying))
-            }
-            _ => adapter,
-        })
+            scope,
+        ))
     }
 
     /// Google Cloud Storage backend scoped to the bucket named in `root_uri`.
@@ -1544,26 +1561,20 @@ impl ObjectStorageAdapter {
 
     fn gcs_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
         let location = parse_gcs_uri(root_uri)?;
-        let (store, retrying) = gcs_clients(&location.bucket, root_uri, scope.is_some())?;
-        let adapter = Self {
-            store: Arc::new(store),
-            scope: None,
-            codec: UriCodec::Gcs {
+        let (store, retrying) = remote_clients(
+            gcs_bucket_builder(&location.bucket),
+            scope.is_some(),
+            GoogleCloudStorageBuilder::with_retry,
+            |builder| build_gcs_store(builder, root_uri),
+        )?;
+        Ok(Self::remote(
+            store,
+            retrying,
+            UriCodec::Gcs {
                 bucket: location.bucket,
             },
-            supports_conditional_update: true,
-            #[cfg(test)]
-            omit_read_etag: false,
-            #[cfg(test)]
-            omit_write_etag: false,
-            read_through: None,
-        };
-        Ok(match (scope, retrying) {
-            (Some(scope), Some(retrying)) => {
-                adapter.with_scope_and_retrying(scope, Arc::new(retrying))
-            }
-            _ => adapter,
-        })
+            scope,
+        ))
     }
 
     /// In-memory backend for tests and embedded experiments. Implements the
@@ -3075,7 +3086,7 @@ pub fn write_queue_root_identity(normalized_root: &str) -> Result<String> {
 pub fn join_uri(root_uri: &str, relative_path: &str) -> String {
     let relative_path = relative_path.trim_start_matches('/');
     match storage_kind_for_uri(root_uri) {
-        Ok(StorageKind::S3 | StorageKind::Azure | StorageKind::Gcs) => {
+        Ok(kind) if kind.is_object_store() => {
             let root = trim_trailing_slashes(root_uri);
             if root.is_empty() {
                 relative_path.to_string()
@@ -3083,7 +3094,7 @@ pub fn join_uri(root_uri: &str, relative_path: &str) -> String {
                 format!("{}/{}", root, relative_path)
             }
         }
-        Ok(StorageKind::Local) => {
+        Ok(_) => {
             let root = if root_uri.starts_with(FILE_SCHEME_PREFIX) {
                 local_path_from_file_uri(root_uri)
                     .map(|path| normalize_local_path(&path))
@@ -3241,18 +3252,30 @@ fn s3_clients(
     object_store::aws::AmazonS3,
     Option<object_store::aws::AmazonS3>,
 )> {
-    let mut builder = s3_bucket_builder(bucket);
-    let retrying = match scoped {
-        true => Some(build_s3_store(
-            builder.clone().with_retry(scoped_read_retry_config()),
-            root_uri,
-        )?),
-        false => None,
-    };
-    if scoped {
-        builder = builder.with_retry(single_attempt_retry_config());
+    remote_clients(
+        s3_bucket_builder(bucket),
+        scoped,
+        AmazonS3Builder::with_retry,
+        |builder| build_s3_store(builder, root_uri),
+    )
+}
+
+/// The clients of one remote root built from `builder`: the store its reads
+/// and writes go to and, when `scoped`, a second client with bounded retries
+/// for its reads, the first then single-attempt
+/// (`ObjectStorageAdapter::with_scope_and_retrying`).
+fn remote_clients<B: Clone, S>(
+    builder: B,
+    scoped: bool,
+    with_retry: impl Fn(B, object_store::RetryConfig) -> B,
+    build: impl Fn(B) -> Result<S>,
+) -> Result<(S, Option<S>)> {
+    if !scoped {
+        return Ok((build(builder)?, None));
     }
-    Ok((build_s3_store(builder, root_uri)?, retrying))
+    let retrying = build(with_retry(builder.clone(), scoped_read_retry_config()))?;
+    let single = build(with_retry(builder, single_attempt_retry_config()))?;
+    Ok((single, Some(retrying)))
 }
 
 /// Whether two canonical key prefixes of one bucket (object-store paths: no
@@ -3315,30 +3338,6 @@ fn build_gcs_store(
             ),
         )
     })
-}
-
-/// The clients of one `gs://` root, shaped as [`s3_clients`]: when `scoped`,
-/// a retrying client for reads beside the single-attempt client for writes.
-fn gcs_clients(
-    bucket: &str,
-    root_uri: &str,
-    scoped: bool,
-) -> Result<(
-    object_store::gcp::GoogleCloudStorage,
-    Option<object_store::gcp::GoogleCloudStorage>,
-)> {
-    let mut builder = gcs_bucket_builder(bucket);
-    let retrying = match scoped {
-        true => Some(build_gcs_store(
-            builder.clone().with_retry(scoped_read_retry_config()),
-            root_uri,
-        )?),
-        false => None,
-    };
-    if scoped {
-        builder = builder.with_retry(single_attempt_retry_config());
-    }
-    Ok((build_gcs_store(builder, root_uri)?, retrying))
 }
 
 fn gcs_configuration_error(message: impl Into<String>) -> StorageError {

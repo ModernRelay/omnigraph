@@ -7,7 +7,7 @@ use lance_namespace::Error as LanceNamespaceError;
 
 use crate::error::{OmniError, Result};
 use crate::instrumentation::VersionResolution;
-use crate::storage::{StorageKind, join_uri, storage_kind_for_uri};
+use crate::storage::{join_uri, storage_kind_for_uri};
 
 use super::TableIdentity;
 
@@ -278,12 +278,12 @@ pub(crate) fn table_uri_for_path(
             dataset_location = join_uri(&dataset_location, segment);
         }
     }
-    match storage_kind_for_uri(root_uri)? {
-        StorageKind::Local => Ok(url::Url::from_file_path(&dataset_location)
-            .map(|uri| uri.to_string())
-            .unwrap_or(dataset_location)),
-        StorageKind::S3 | StorageKind::Azure | StorageKind::Gcs => Ok(dataset_location),
+    if storage_kind_for_uri(root_uri)?.is_object_store() {
+        return Ok(dataset_location);
     }
+    Ok(url::Url::from_file_path(&dataset_location)
+        .map(|uri| uri.to_string())
+        .unwrap_or(dataset_location))
 }
 
 #[cfg(any(test, feature = "test-util"))]

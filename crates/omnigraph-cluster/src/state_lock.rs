@@ -241,7 +241,7 @@ impl Drop for StateLockGuard {
             return;
         }
         match self.kind {
-            StorageKind::Local => {
+            kind if !kind.is_object_store() => {
                 let path = self.uri.trim_start_matches("file://");
                 let still_owned = std::fs::read_to_string(path)
                     .ok()
@@ -251,7 +251,7 @@ impl Drop for StateLockGuard {
                     let _ = std::fs::remove_file(path);
                 }
             }
-            StorageKind::S3 | StorageKind::Azure | StorageKind::Gcs => {
+            _ => {
                 let adapter = Arc::clone(&self.adapter);
                 let uri = self.uri.clone();
                 let lock_id = self.lock_id().to_string();
