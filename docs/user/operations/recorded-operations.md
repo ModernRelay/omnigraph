@@ -91,7 +91,13 @@ reason to resubmit the same work under the same id.
 
 Earlier edge builds wrote `tables` and `more_tables`. If the cluster's
 operation record contains either field, submit, lookup and cancel return
-HTTP 409 with `operation_record_invalid` after upgrading.
+HTTP 409 with `operation_record_invalid` after upgrading. No copy of that
+record is valid for this build, so restoring one does not help. To recover,
+stop the server, move `__cluster/operations.json` out of the cluster root and
+start the server again. The next submission creates a new record. The old
+record's results, resume position and eviction mark are lost: an earlier
+operation id answers `unknown` and is accepted as a new operation if it is
+submitted again, and the next full-catalog run starts at the first table.
 
 | Refusal | Status |
 |---|---|
