@@ -516,7 +516,7 @@ pub(super) fn empty_ledger() -> ClusterState {
 
 /// Initialize only an empty root; all graph effects then use the same v2
 /// deployment protocol as updates. Existing v1 state is never executed.
-async fn bootstrap_ledger(
+pub(super) async fn bootstrap_ledger(
     store: &ClusterStore,
     bundle: &DeploymentBundle,
     caller: &DeploymentCaller,
@@ -570,10 +570,8 @@ async fn bootstrap_ledger(
         .await
         .map_err(|error| retained_error(error, guard.lock_id()))?;
     // Only awaited control writes happened. No graph/native operation started.
-    store
-        .release_settled(guard.lock_id())
-        .await
-        .map_err(|error| retained_error(error, guard.lock_id()))
+    // A failed release states its own outcome; the lock may already be free.
+    store.release_settled(guard.lock_id()).await
 }
 
 async fn replace(
@@ -1677,6 +1675,9 @@ async fn apply_direct_bundle(
             return Ok(found);
         }
     }
+    // Every control and graph write of this deployment runs in one storage
+    // scope, so a converged result can prove them settled before release.
+    let store = store.with_io_scope(omnigraph_storage::StorageIoScope::new())?;
     let admission = admission::acquire_with_store(&store, ClusterAdmissionPurpose::Deployment)
         .await?
         .ok_or_else(|| refusal("state_missing", "cluster ledger is missing"))?;
@@ -1701,7 +1702,33 @@ async fn apply_direct_bundle(
             }
         };
     }
-    result
+    // A writable deployment can hand the root to a successor only after
+    // convergence on a backend with tracked I/O. Azure retains admission.
+    match result {
+        Ok(DeploymentLookup::Complete { result })
+            if result.converged && admission.io_scope().is_some() =>
+        {
+            release_converged_deployment(admission, &result.id).await?;
+            Ok(DeploymentLookup::Complete { result })
+        }
+        other => other,
+    }
+}
+
+pub(super) async fn release_converged_deployment(
+    admission: ClusterAdmission,
+    deployment_id: &str,
+) -> Result<(), Diagnostic> {
+    admission
+        .release_after_settlement()
+        .await
+        .map_err(|mut error| {
+            error.message = bounded_message(format!(
+                "deployment {deployment_id} converged; {}",
+                error.message
+            ));
+            error
+        })
 }
 
 /// Execute under the existing sole writer. The server supplies its paused live
@@ -1959,8 +1986,7 @@ pub(super) async fn execute_captured_deployment_in_store(
         cas = replace(store, &mut state, &cas).await?;
     }
     let result = finish(store, &mut state, &cas, bundle).await?;
-    // Exact publication is not a proof that all accepted native/control I/O
-    // has stopped. Retain admission until explicit operator quiescence/unlock.
+    // Admission still belongs to the caller, who owns storage settlement.
     Ok(DeploymentLookup::Complete { result })
 }
 

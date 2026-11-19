@@ -135,10 +135,21 @@ pub(super) async fn lock_at(directory: &Path, origin: &str, wait: Duration) -> R
     }
 }
 
+#[cfg(test)]
+tokio::task_local! { pub(super) static TEST_LOCK_DIRECTORY: PathBuf; }
+
+fn session_directory() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Ok(directory) = TEST_LOCK_DIRECTORY.try_with(Clone::clone) {
+        return Ok(directory);
+    }
+    Ok(home()?.join(".omnigraph-session-locks"))
+}
+
 pub(super) async fn lock(origin: &str) -> Result<LockGuard> {
     // Stable per-account location, independent of working folder and OMNIGRAPH_HOME.
     lock_at(
-        &home()?.join(".omnigraph-session-locks"),
+        &session_directory()?,
         &crate::operator_routing::namespace(origin),
         Duration::from_secs(40),
     )
@@ -146,7 +157,7 @@ pub(super) async fn lock(origin: &str) -> Result<LockGuard> {
 }
 
 pub(super) fn cache_index_lock() -> Result<LockGuard> {
-    cache_index_lock_at(&home()?.join(".omnigraph-session-locks"))
+    cache_index_lock_at(&session_directory()?)
 }
 
 fn cache_index_lock_at(directory: &Path) -> Result<LockGuard> {
@@ -163,7 +174,7 @@ fn cache_index_lock_at(directory: &Path) -> Result<LockGuard> {
 
 pub(super) async fn global_session_lock() -> Result<LockGuard> {
     lock_at(
-        &home()?.join(".omnigraph-session-locks"),
+        &session_directory()?,
         "provider-session-claims",
         Duration::from_secs(40),
     )

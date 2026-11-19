@@ -213,7 +213,8 @@ actor retention, and target-output failure before writable admission. Extend
 
 Cluster delivery tests extend the application and output owners. Direct apply
 tests fail supplied stdout/stderr writes and flushes, then inspect the original
-receipt, retained lock, single deployment result and stable graph history. The
+receipt, the released lock of the converged apply, single deployment result and
+stable graph history. The
 served adapter's tests verify identity delivery before POST and receipt/timeout output failures without
 resubmission. `cli_cluster` and `cli_queries` own exact unlock refusals, graph
 filtering and wrong-plane refusal before configuration or HTTP access. The existing
@@ -229,6 +230,14 @@ static set/remove, no-network/no-helper/noninteractive status and pipe-only expo
 before secret acquisition. Managed authentication tests own independent profile
 sessions, principal/session collision refusal, refresh coordination and logout
 cache clearing; lifecycle fixtures retain original-identity recovery checks.
+They also own zero, one and multiple active organizations at login, refresh
+when the access token expires during selection, and revocation after an
+abandoned choice. Application tests own interactive and machine-mode dispatch
+and the JSON refusal on stdout. Authentication tests cover each credential
+check: a provider response that
+does not fit the published sign-in configuration is never reported as a saved
+credential's fault. `cli_cluster` owns `organization list` beside the member
+and invitation lists, including the 1,000-membership bound.
 Transport owners cover prefix boundaries, no redirects, explicit proxy selection,
 CA capture and unsupported trust combinations. Extend the shared served-client
 fixtures across managed and standalone graph commands instead of adding an
