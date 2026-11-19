@@ -98,6 +98,7 @@ mod fts_compat_tests {
                         column: "body".into(),
                         analysis: build.clone(),
                     }],
+                    &crate::table_store::MaintenanceBudget::default(),
                 )
                 .await
                 .unwrap();
@@ -270,6 +271,7 @@ mod fts_compat_tests {
                     column: "body".into(),
                     analysis: build.clone(),
                 }],
+                &crate::table_store::MaintenanceBudget::default(),
             )
             .await
             .unwrap();

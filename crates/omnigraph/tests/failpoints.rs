@@ -6188,7 +6188,24 @@ async fn optimize_keeps_a_tables_fold_when_its_index_build_fails() {
         // The table crosses the seam once per index link: its fold first,
         // then its index build.
         let _failpoint = catalog::OPTIMIZE_BEFORE_INDEX_LINK.fire_once_at(2);
-        db.optimize_as(None, request()).await.unwrap()
+        let probes = omnigraph::instrumentation::IndexBuildProbes::rendezvous(2);
+        let request = request().with_concurrency(omnigraph::db::OptimizeConcurrency::new(1, 2));
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            omnigraph::instrumentation::with_index_build_probes(
+                probes.clone(),
+                Box::pin(db.optimize_as(None, request)),
+            ),
+        )
+        .await
+        .expect("the identity, key and n BTREE folds must overlap")
+        .unwrap();
+        assert_eq!(
+            probes.entered(),
+            3,
+            "the three lagging BTREEs (identity, key and n) were rebuilt"
+        );
+        report
     };
     assert!(report.graph_commit_id.is_some(), "{report:?}");
     let stat = &report.datasets[0];

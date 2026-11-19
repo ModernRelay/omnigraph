@@ -491,11 +491,12 @@ impl OptimizeCancellation {
 }
 
 /// How many tables a run plans ahead of the ones it rewrites, and how many it
-/// rewrites at once. Planning only reads. `rewrite` also bounds the heavy
-/// steps in flight across those tables (compaction tasks, index folds and
-/// index builds, one permit each), so a lone table may run that many of its
-/// compaction tasks at once and the run never runs more steps at once than
-/// `rewrite` (#1384).
+/// rewrites at once. Planning only reads. `rewrite` is also the width of the
+/// run's one budget of heavy steps across those tables (compaction tasks and
+/// index builds; `MaintenanceBudget`), so a lone table may run that many of
+/// its compaction tasks at once and the run never runs more steps at once
+/// than `rewrite` (#1384); a full-text or vector build takes the whole
+/// budget, and at most `INDEX_BUILD_CONCURRENCY` BTREEs build at once (#1385).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OptimizeConcurrency {
     pub planning: usize,
@@ -521,8 +522,10 @@ impl OptimizeConcurrency {
 pub struct OptimizeLimits {
     /// Stop starting tables once the run has held main's writer gates this
     /// long. The first table always starts, so every run makes progress; the
-    /// wait of a writer that queued for the gates is at most this, plus that
-    /// table, the publication and the configuration clear.
+    /// wait of a writer that queued for the gates is at most this, plus the
+    /// tables already started, the publication and the configuration clear.
+    /// Those tables share the run's budget, so their full-text and vector
+    /// builds run one at a time.
     pub max_gate_hold: Option<Duration>,
     /// Ceilings on one table's plan, checked before its first write.
     pub table: TableCeilings,
@@ -1212,17 +1215,17 @@ async fn run_table_pipeline(
             (index, started, result)
         }
     };
-    // #1384: the tables being rewritten share one budget of the rewrite
-    // concurrency for their heavy steps (compaction tasks, index folds, index
+    // #1384, #1385: the tables being rewritten share one budget of the
+    // rewrite concurrency for their heavy steps (compaction tasks and index
     // builds), so a run never has more steps in flight than tables it may
-    // rewrite, and a lone large table uses the idle slots.
-    let step_limit = crate::table_store::OptimizeStepLimit::new(concurrency.rewrite);
+    // rewrite, a lone large table uses the idle slots, and at most
+    // `INDEX_BUILD_CONCURRENCY` BTREEs build together.
+    let budget = crate::table_store::MaintenanceBudget::new(concurrency.rewrite);
+    let budget = &budget;
     let stage = |index: usize, started: Instant, work: PreparedOptimizeTable| {
         let catalog = std::sync::Arc::clone(catalog);
-        let step_limit = step_limit.clone();
         async move {
-            let result =
-                apply_optimize_table_effects(db, catalog.as_ref(), work, &step_limit).await;
+            let result = apply_optimize_table_effects(db, catalog.as_ref(), work, budget).await;
             (index, started, result)
         }
     };
@@ -1829,9 +1832,8 @@ type CommittedLink = (
 /// whose coverage lags the rewritten layout (Lance 13 folds only through a
 /// linear commit, so `stage_index_fold` rebuilds instead of merging), then
 /// any declared-but-unbuilt index. The rewrite comes first so an index is
-/// rebuilt once, over the settled layout. Each compaction task, the fold and
-/// the index build hold one permit of `step_limit`, the run's budget, while
-/// they run.
+/// rebuilt once, over the settled layout. Compaction tasks and index builders
+/// take their permits from the same run budget.
 ///
 /// The links are independent derived state, so an index link does not decide
 /// the fate of the links before it: when the fold or the index build fails
@@ -1845,7 +1847,7 @@ async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
-    step_limit: &crate::table_store::OptimizeStepLimit,
+    budget: &crate::table_store::MaintenanceBudget,
 ) -> Result<OptimizeEffectOutcome> {
     let table_key = work.table_key;
     let full_path = work.full_path;
@@ -1861,7 +1863,7 @@ async fn apply_optimize_table_effects(
     let mut metrics = CompactionMetrics::default();
     if let Some((staged, compaction_metrics)) = db
         .storage()
-        .stage_compaction(&base, work.plan, step_limit)
+        .stage_compaction(&base, work.plan, budget)
         .await?
     {
         let (rewrite, identity) = db
@@ -1887,7 +1889,7 @@ async fn apply_optimize_table_effects(
         &tip,
         &witness,
         &declared_full_text,
-        step_limit,
+        budget,
         &mut skipped_folds,
     )
     .await;
@@ -1907,7 +1909,7 @@ async fn apply_optimize_table_effects(
                 &mut pending_indexes,
                 &witness,
                 &declared_full_text,
-                step_limit,
+                budget,
             )
             .await
         }
@@ -2014,7 +2016,7 @@ fn index_maintenance_failure(
 }
 
 /// One table's fold link at `tip`: stage a whole rebuild of every foldable
-/// index whose coverage lags, holding one permit of `step_limit`, and commit
+/// index whose coverage lags under the shared run budget, and commit
 /// it detached. Record the vector columns that could not train before the
 /// commit, so its failure keeps those reasons. Returns `None` when no index
 /// lagged or none could be rebuilt.
@@ -2023,11 +2025,11 @@ async fn stage_fold_link(
     tip: &crate::storage_layer::SnapshotHandle,
     witness: &crate::table_store::StagingWitness,
     declared_full_text: &[crate::storage_layer::FullTextColumn],
-    step_limit: &crate::table_store::OptimizeStepLimit,
+    budget: &crate::table_store::MaintenanceBudget,
     skipped_folds: &mut Vec<(String, String)>,
 ) -> Result<Option<CommittedLink>> {
     fail(&OPTIMIZE_BEFORE_INDEX_LINK)?;
-    let (fold, skipped) = step_limit.run(db.storage().stage_index_fold(tip)).await?;
+    let (fold, skipped) = db.storage().stage_index_fold(tip, budget).await?;
     *skipped_folds = skipped;
     let Some(staged) = fold else {
         return Ok(None);
@@ -2039,8 +2041,8 @@ async fn stage_fold_link(
 }
 
 /// One table's index-build link at `tip`: plan the declared indexes the
-/// table lacks, stage them as one `CreateIndex`, holding one permit of
-/// `step_limit`, and commit it detached. Refresh the declared pending indexes
+/// table lacks, build them under the shared run budget, stage them as one
+/// `CreateIndex`, and commit it detached. Refresh the declared pending indexes
 /// as soon as the plan is known, so a build failure keeps them. Returns
 /// `None` when no declared index was missing.
 #[allow(clippy::too_many_arguments)]
@@ -2052,7 +2054,7 @@ async fn stage_build_link(
     pending_indexes: &mut Vec<super::PendingIndex>,
     witness: &crate::table_store::StagingWitness,
     declared_full_text: &[crate::storage_layer::FullTextColumn],
-    step_limit: &crate::table_store::OptimizeStepLimit,
+    budget: &crate::table_store::MaintenanceBudget,
 ) -> Result<Option<CommittedLink>> {
     fail(&OPTIMIZE_BEFORE_INDEX_LINK)?;
     let index_work =
@@ -2062,8 +2064,9 @@ async fn stage_build_link(
     if index_work.specs.is_empty() {
         return Ok(None);
     }
-    let staged = step_limit
-        .run(db.storage().stage_create_indices(tip, &index_work.specs))
+    let staged = db
+        .storage()
+        .stage_create_indices(tip, &index_work.specs, budget)
         .await
         .map_err(|error| {
             error.with_context(format!(
@@ -3026,27 +3029,37 @@ mod tests {
     /// #1384: optimize takes every heavy step of the tables it stages, each
     /// compaction task, index fold and index build, through its run's one
     /// budget of `concurrency.rewrite` steps. Two tables each have one
-    /// compaction task, a fold to look for and a key index to build. Every
-    /// step waits at a
-    /// two-party rendezvous, so steps that never ran side by side time out,
-    /// a step taken outside the budget is not counted, and a budget per
-    /// table would not hold the peak at two.
+    /// compaction task, an identity and a key BTREE to fold and a vector index
+    /// to build.
+    /// The first two steps rendezvous so serialized work times out. A build
+    /// outside the shared budget is missing from the step count.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn optimize_takes_every_tables_heavy_steps_through_one_budget_issue_1384() {
         use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
 
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let schema = "node Person { name: String @key }\nnode Company { name: String @key }\n";
+        let schema = "node Person {\n name: String @key\n embedding: Vector(2)? @index\n}\n\
+                      node Company {\n name: String @key\n embedding: Vector(2)? @index\n}";
         let db = crate::Session::from_defaults(
             std::sync::Arc::new(Omnigraph::init(uri, schema).await.unwrap()),
             omnigraph_compiler::settings::SessionSettings::default(),
         );
-        // Three one-row fragments per table: one compaction task each.
-        for name in ["a", "b", "c"] {
+        // Index the first fragment. The next two have the same uncovered
+        // layout, so they compact together. Their vectors can then be indexed.
+        db.load_jsonl(
+            r#"{"type":"Person","data":{"name":"seed"}}
+{"type":"Company","data":{"name":"seed"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+        let pending = db.ensure_indices_as(None).await.unwrap();
+        assert_eq!(pending.len(), 2, "both vector indexes await data");
+        for name in ["a", "b"] {
             for type_name in ["Person", "Company"] {
                 db.load_jsonl(
-                    &format!("{{\"type\":\"{type_name}\",\"data\":{{\"name\":\"{name}\"}}}}"),
+                    &format!("{{\"type\":\"{type_name}\",\"data\":{{\"name\":\"{name}\",\"embedding\":[1.0,2.0]}}}}"),
                     LoadMode::Merge,
                 )
                 .await
@@ -3070,15 +3083,25 @@ mod tests {
         .expect("the two tables' steps never ran side by side")
         .unwrap();
         assert_eq!(report.datasets.len(), 2, "{report:?}");
+        let snapshot = db
+            .snapshot_of(crate::db::ReadTarget::branch("main"))
+            .await
+            .unwrap();
         for stat in &report.datasets {
             assert!(stat.committed(), "{stat:?}");
             assert!(stat.fragments_removed > 1, "one compaction task: {stat:?}");
             assert!(stat.index_failure.is_none(), "{stat:?}");
+            let table = snapshot.open_dataset(&stat.type_key).await.unwrap();
+            assert_eq!(
+                table.index_coverage("__id").await.unwrap(),
+                crate::IndexCoverage::Indexed
+            );
+            assert!(table.has_vector_index("embedding").await.unwrap());
         }
         assert_eq!(
             probes.entered(),
-            6,
-            "one compaction task, one fold and one index build per table, each within the budget"
+            8,
+            "one compaction task, two folds (the identity and key BTREEs) and one index build per table, each within the budget"
         );
         assert_eq!(
             probes.peak_in_flight(),
