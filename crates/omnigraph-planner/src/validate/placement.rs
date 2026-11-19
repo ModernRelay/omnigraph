@@ -18,7 +18,10 @@
 //! subterms the engine folded) erased. A conjunct whose skeleton another
 //! conjunct of its scope shares, one that reads no column, or one the shaper
 //! rewrote (a `let` read in place, an inline read's names renamed apart), is
-//! not found and not checked.
+//! not found and not checked. A conjunct reading a `let` counts under its
+//! skeleton with the `let` read in place too, since that is how the plan may
+//! test it: a conjunct of another scope whose skeleton that rewrite reaches
+//! is then not unique, and the rewritten one is not taken for it.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -59,6 +62,7 @@ pub(super) fn check(
         &mut BTreeSet::new(),
         &mut scopes,
     );
+    let lets = let_skeletons(&core.term);
     let tested = tested(plan);
     budget.visit(u64::try_from(tested.len() * scopes.len().max(1)).unwrap_or(u64::MAX))?;
     let parents = parents(plan);
@@ -93,10 +97,17 @@ pub(super) fn check(
                 .collect()
         })
         .collect();
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    // Each part counts under its skeleton, and under its skeleton with the
+    // `let`s it reads in place where that differs.
+    let mut counts: HashMap<String, usize> = HashMap::new();
     for (scope, parts) in scopes.iter().zip(&parts) {
-        for (_, _, _, shape) in parts {
-            *counts.entry(shape.as_str()).or_default() += if scope.shared { 2 } else { 1 };
+        for (_, part, _, shape) in parts {
+            let n = if scope.shared { 2 } else { 1 };
+            *counts.entry(shape.clone()).or_default() += n;
+            let inlined = skeleton_with(part, Some(&lets));
+            if inlined != *shape {
+                *counts.entry(inlined).or_default() += n;
+            }
         }
     }
     let unique = |shape: &str| shape != "_" && counts.get(shape) == Some(&1);
@@ -318,9 +329,41 @@ fn parents(plan: &PhysicalPlan) -> HashMap<NodeId, NodeId> {
     out
 }
 
+/// The skeleton of every value a `Project` of `t` computes, by its column:
+/// how a conjunct reading that column reads once the shaper puts the value
+/// in place. A value reading an earlier one is written with it in place.
+fn let_skeletons(t: &Term) -> HashMap<String, String> {
+    let mut order = Vec::new();
+    let mut seen: BTreeSet<*const Term> = BTreeSet::new();
+    let mut pending = vec![(t, false)];
+    while let Some((node, children_done)) = pending.pop() {
+        if children_done {
+            order.push(node);
+        } else if seen.insert(node as *const Term) {
+            pending.push((node, true));
+            pending.extend(node.children().into_iter().map(|c| (c, false)));
+        }
+    }
+    let mut out = HashMap::new();
+    for node in order {
+        if let Term::Project { items, .. } = node {
+            for (name, value) in items {
+                let shape = skeleton_with(value, Some(&out));
+                out.insert(name.clone(), shape);
+            }
+        }
+    }
+    out
+}
+
 /// `e` with its constant parts erased: what stays of a conjunct whatever
 /// value its parameters bind and whatever the engine folded.
 fn skeleton(e: &IRExpr) -> String {
+    skeleton_with(e, None)
+}
+
+/// [`skeleton`], with each column of `lets` written as the value it holds.
+fn skeleton_with(e: &IRExpr, lets: Option<&HashMap<String, String>>) -> String {
     // Which subtrees read a column, bottom up: one that reads none is a
     // constant, written `_`.
     let mut reads: HashMap<*const IRExpr, bool> = HashMap::new();
@@ -346,13 +389,18 @@ fn skeleton(e: &IRExpr) -> String {
         }
     }
     let mut out = String::new();
-    write_skeleton(e, &reads, &mut out);
+    write_skeleton(e, &reads, lets, &mut out);
     out
 }
 
 /// `e`'s skeleton appended to `out`, each level entered through the stack
 /// guard.
-fn write_skeleton(e: &IRExpr, reads: &HashMap<*const IRExpr, bool>, out: &mut String) {
+fn write_skeleton(
+    e: &IRExpr,
+    reads: &HashMap<*const IRExpr, bool>,
+    lets: Option<&HashMap<String, String>>,
+    out: &mut String,
+) {
     use std::fmt::Write;
     omnigraph_compiler::stack::deep(|| {
         if !reads[&(e as *const IRExpr)] {
@@ -365,7 +413,12 @@ fn write_skeleton(e: &IRExpr, reads: &HashMap<*const IRExpr, bool>, out: &mut St
             } => {
                 let _ = write!(out, "{variable}.{property}");
             }
-            IRExpr::Variable(name, _) | IRExpr::AliasRef(name, _) => out.push_str(name),
+            IRExpr::Variable(name, _) | IRExpr::AliasRef(name, _) => {
+                match lets.and_then(|lets| lets.get(name)) {
+                    Some(value) => out.push_str(value),
+                    None => out.push_str(name),
+                }
+            }
             IRExpr::Param(..) | IRExpr::Literal(..) => out.push('_'),
             IRExpr::Nearest {
                 variable,
@@ -374,7 +427,7 @@ fn write_skeleton(e: &IRExpr, reads: &HashMap<*const IRExpr, bool>, out: &mut St
                 ..
             } => {
                 let _ = write!(out, "nearest({variable}.{property},");
-                write_skeleton(query, reads, out);
+                write_skeleton(query, reads, lets, out);
                 out.push(')');
             }
             IRExpr::Aggregate {
@@ -385,10 +438,10 @@ fn write_skeleton(e: &IRExpr, reads: &HashMap<*const IRExpr, bool>, out: &mut St
                 ..
             } => {
                 let _ = write!(out, "{func:?}({distinct},");
-                write_skeleton(arg, reads, out);
+                write_skeleton(arg, reads, lets, out);
                 if let Some(p) = fraction {
                     out.push(',');
-                    write_skeleton(p, reads, out);
+                    write_skeleton(p, reads, lets, out);
                 }
                 out.push(')');
             }
@@ -396,25 +449,25 @@ fn write_skeleton(e: &IRExpr, reads: &HashMap<*const IRExpr, bool>, out: &mut St
                 left, op, right, ..
             } => {
                 out.push('(');
-                write_skeleton(left, reads, out);
+                write_skeleton(left, reads, lets, out);
                 let _ = write!(out, " {op:?} ");
-                write_skeleton(right, reads, out);
+                write_skeleton(right, reads, lets, out);
                 out.push(')');
             }
             IRExpr::Not(inner, _) => {
                 out.push_str("not(");
-                write_skeleton(inner, reads, out);
+                write_skeleton(inner, reads, lets, out);
                 out.push(')');
             }
-            IRExpr::Cast { expr, .. } => write_skeleton(expr, reads, out),
+            IRExpr::Cast { expr, .. } => write_skeleton(expr, reads, lets, out),
             IRExpr::IsNull { expr, negated, .. } => {
                 let _ = write!(out, "isnull({negated},");
-                write_skeleton(expr, reads, out);
+                write_skeleton(expr, reads, lets, out);
                 out.push(')');
             }
             IRExpr::Neg { expr, .. } => {
                 out.push_str("neg(");
-                write_skeleton(expr, reads, out);
+                write_skeleton(expr, reads, lets, out);
                 out.push(')');
             }
             IRExpr::Call { func, args, .. } => {
@@ -423,7 +476,7 @@ fn write_skeleton(e: &IRExpr, reads: &HashMap<*const IRExpr, bool>, out: &mut St
                     if i > 0 {
                         out.push(',');
                     }
-                    write_skeleton(arg, reads, out);
+                    write_skeleton(arg, reads, lets, out);
                 }
                 out.push(')');
             }
