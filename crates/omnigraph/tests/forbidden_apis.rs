@@ -1683,15 +1683,37 @@ fn collect_use_renames(tree: &syn::UseTree, renames: &mut Vec<(String, String)>)
 struct CallInventory {
     counts: BTreeMap<String, usize>,
     macro_hits: Vec<String>,
-    /// `use … as` renames as (imported name, new name). `counts` keys a call
-    /// by the last identifier of its path, so a renamed import's calls are
-    /// counted under the new name.
+    /// `use … as` renames as (imported name, new name), outside test-only
+    /// items. `counts` keys a call by the last identifier of its path, so
+    /// `call_inventory` also counts a renamed import's calls under the
+    /// imported name.
     use_renames: Vec<(String, String)>,
 }
 
 impl CallInventory {
     fn record(&mut self, key: impl Into<String>) {
         *self.counts.entry(key.into()).or_default() += 1;
+    }
+
+    /// Adds the count of each rename target to its imported name, once per
+    /// distinct rename, so a guard that pins a function's calls also sees the
+    /// calls made through a renamed import. A `use` may follow the call in the
+    /// file, so this runs after the whole file is visited. The renames are
+    /// per file, not per scope: another function or method with the same name
+    /// as a rename target is counted too. That fails a guard loudly, where a
+    /// missed call would pass silently.
+    fn count_renamed_calls(&mut self) {
+        let renames: BTreeSet<(String, String)> = self
+            .use_renames
+            .iter()
+            .filter(|(name, rename)| name != rename)
+            .cloned()
+            .collect();
+        for (name, rename) in renames {
+            if let Some(&count) = self.counts.get(&rename) {
+                *self.counts.entry(name).or_default() += count;
+            }
+        }
     }
 }
 
@@ -1740,7 +1762,11 @@ impl<'ast> Visit<'ast> for CallInventory {
                     .push(format!("durable identifier `{name}` renamed to `{rename}`"));
             }
         }
-        self.use_renames.extend(renames);
+        // Calls in test-only items are not counted, so neither are the
+        // renames a test-only `use` makes.
+        if !cfg_requires_test(&node.attrs) {
+            self.use_renames.extend(renames);
+        }
         visit::visit_item_use(self, node);
     }
 
@@ -1911,6 +1937,7 @@ fn primitive_inventory_key(primitive: &str) -> String {
 fn call_inventory(ast: &syn::File) -> CallInventory {
     let mut inventory = CallInventory::default();
     inventory.visit_file(ast);
+    inventory.count_renamed_calls();
     inventory
 }
 
@@ -3124,11 +3151,16 @@ fn structural_call_scanner_records_use_renames() {
         r#"
         use crate::instrumentation::open_pinned_dataset_at_recorded_manifest as open_fast;
         use omnigraph_core::{instrumentation::{pinned_commit_handler as handler}, other};
+        #[cfg(test)]
+        use crate::branch_control::retire_branch_recoverably as retire_in_test;
 
         async fn read(uri: &str) {
             let _ = open_fast(uri).await;
             let _ = handler();
+            retire(uri).await;
         }
+
+        use crate::branch_control::retire_branch_recoverably as retire;
         "#,
         "scanner use-rename self-test",
     );
@@ -3141,15 +3173,18 @@ fn structural_call_scanner_records_use_renames() {
                 "open_fast".to_string()
             ),
             ("pinned_commit_handler".to_string(), "handler".to_string()),
+            (
+                "retire_branch_recoverably".to_string(),
+                "retire".to_string()
+            ),
         ]
     );
-    assert_eq!(inventory.counts.get("open_fast"), Some(&1));
-    assert_eq!(
-        inventory
-            .counts
-            .get("open_pinned_dataset_at_recorded_manifest"),
-        None
-    );
+    // A call through a rename counts under both names, including when the
+    // `use` follows the call.
+    for (name, rename) in &inventory.use_renames {
+        assert_eq!(inventory.counts.get(rename), Some(&1), "{rename}");
+        assert_eq!(inventory.counts.get(name), Some(&1), "{name}");
+    }
 }
 
 #[test]
@@ -4614,8 +4649,8 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
 /// `open_pinned_dataset_at_recorded_manifest` stays `pub` because the catalog
 /// calls it across the crate boundary, and the engine imports all of core's
 /// instrumentation, so this count, not visibility, keeps the engine off it.
-/// A call is counted by the last name of its path, so the guard also refuses
-/// a `use … as` that renames one of the three. A function used as a value
+/// A call through a `use … as` rename counts under the imported name
+/// (`CallInventory::count_renamed_calls`). A function used as a value
 /// (`let open = open_pinned_dataset_at_recorded_manifest;`) is not a call, and
 /// the guard does not see it.
 #[test]
@@ -4627,7 +4662,6 @@ fn recorded_manifest_open_call_counts_are_pinned() {
     ];
     let src = engine_src_root();
     let mut sites = Vec::new();
-    let mut renamed = Vec::new();
     for (relative, file) in labeled_scan_files(&src, true) {
         let contents = std::fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
@@ -4639,17 +4673,7 @@ fn recorded_manifest_open_call_counts_are_pinned() {
                 sites.push((function, relative.clone(), count));
             }
         }
-        for (name, rename) in &inventory.use_renames {
-            if PINNED.contains(&name.as_str()) {
-                renamed.push(format!("{relative}: `{name}` renamed to `{rename}`"));
-            }
-        }
     }
-    assert!(
-        renamed.is_empty(),
-        "a renamed import hides recorded-manifest opener calls from the count \
-         below: {renamed:?}"
-    );
     sites.sort();
     assert_eq!(
         sites,
