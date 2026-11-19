@@ -174,6 +174,13 @@ impl CapturedStorageBinding {
                 root.azure_options.extend(options.clone());
                 azure = Some(root);
             }
+            (StorageKind::Gcs, _) => {
+                // No captured GCS destination exists yet: `gs://` roots open
+                // unbound, with the native environment chain.
+                return Err(binding_error(
+                    "a captured storage destination does not support gs:// roots; open the graph by its gs:// URI",
+                ));
+            }
             _ => {
                 return Err(binding_error(
                     "storage destination kind does not match its URI",
@@ -472,7 +479,8 @@ fn provider_option(kind: StorageKind, key: &str) -> Option<(String, bool)> {
             );
             Some((key.as_ref().into(), auth))
         }
-        StorageKind::Local => None,
+        // Neither has a captured destination (`CapturedStorageBinding::capture`).
+        StorageKind::Local | StorageKind::Gcs => None,
     }
 }
 

@@ -247,6 +247,17 @@ impl ClusterStore {
         if kind == StorageKind::Local {
             return Ok(Self::for_config_dir(Path::new(&normalized)));
         }
+        if kind == StorageKind::Gcs {
+            // Graphs may live at gs:// roots; the cluster ledger's serving
+            // lease and bootstrap handoff are not yet qualified there.
+            return Err(Diagnostic::error(
+                "storage_root_invalid",
+                "storage",
+                format!(
+                    "cluster storage does not support gs:// roots ('{diagnostic_root}'); use a local, s3:// or az:// cluster root"
+                ),
+            ));
+        }
         let storage = storage_handle_for_uri(&normalized).map_err(|err| {
             Diagnostic::error(
                 "storage_root_invalid",
@@ -441,7 +452,7 @@ impl ClusterStore {
     pub(crate) fn graph_root(&self, graph_id: &str) -> String {
         match self.kind() {
             StorageKind::Local => format!("{}/graphs/{graph_id}.omni", self.display_root),
-            StorageKind::S3 | StorageKind::Azure => {
+            StorageKind::S3 | StorageKind::Azure | StorageKind::Gcs => {
                 format!("{}/graphs/{graph_id}.omni", self.root)
             }
         }
@@ -536,7 +547,7 @@ impl ClusterStore {
                 .join(CLUSTER_STATE_FILE)
                 .try_exists()
                 .map_err(StorageError::from),
-            StorageKind::S3 | StorageKind::Azure => {
+            StorageKind::S3 | StorageKind::Azure | StorageKind::Gcs => {
                 self.adapter.exists(&self.uri(CLUSTER_STATE_FILE)).await
             }
         }
@@ -666,7 +677,9 @@ impl ClusterStore {
             // bounded-to-the-first-result prefix listing. A partially deleted
             // graph whose root contains only nested Lance objects therefore
             // remains present, while list/authorization failures stay loud.
-            StorageKind::S3 | StorageKind::Azure => self.adapter.exists(graph_uri).await,
+            StorageKind::S3 | StorageKind::Azure | StorageKind::Gcs => {
+                self.adapter.exists(graph_uri).await
+            }
         }
     }
 

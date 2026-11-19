@@ -282,7 +282,7 @@ pub(crate) fn table_uri_for_path(
         StorageKind::Local => Ok(url::Url::from_file_path(&dataset_location)
             .map(|uri| uri.to_string())
             .unwrap_or(dataset_location)),
-        StorageKind::S3 | StorageKind::Azure => Ok(dataset_location),
+        StorageKind::S3 | StorageKind::Azure | StorageKind::Gcs => Ok(dataset_location),
     }
 }
 

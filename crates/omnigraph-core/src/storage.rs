@@ -173,6 +173,17 @@ impl ObjectStorageAdapter {
         })
     }
 
+    /// Google Cloud Storage backend scoped to the bucket named in `root_uri`.
+    /// Credentials come from the `GOOGLE_*` environment and Google's
+    /// application-default chain, the same configuration Lance reads for its
+    /// `gs://` datasets.
+    pub fn gcs_from_root_uri(root_uri: &str) -> Result<Self> {
+        Ok(Self {
+            inner: omnigraph_storage::ObjectStorageAdapter::gcs_from_root_uri(root_uri)?,
+            binding: None,
+        })
+    }
+
     /// In-memory backend for tests and embedded experiments. Implements the
     /// full contract including true conditional updates.
     pub fn in_memory() -> Self {
@@ -324,6 +335,7 @@ pub fn storage_for_uri(uri: &str) -> Result<Arc<dyn StorageAdapter>> {
         StorageKind::Local => Ok(Arc::new(ObjectStorageAdapter::local())),
         StorageKind::S3 => Ok(Arc::new(ObjectStorageAdapter::s3_from_root_uri(uri)?)),
         StorageKind::Azure => Ok(Arc::new(ObjectStorageAdapter::azure_from_root_uri(uri)?)),
+        StorageKind::Gcs => Ok(Arc::new(ObjectStorageAdapter::gcs_from_root_uri(uri)?)),
     }
 }
 
@@ -336,6 +348,9 @@ pub fn storage_for_uri_scoped(uri: &str, scope: StorageIoScope) -> Result<Arc<dy
         }
         StorageKind::Azure => {
             omnigraph_storage::ObjectStorageAdapter::azure_from_root_uri_scoped(uri, scope)?
+        }
+        StorageKind::Gcs => {
+            omnigraph_storage::ObjectStorageAdapter::gcs_from_root_uri_scoped(uri, scope)?
         }
     };
     Ok(Arc::new(ObjectStorageAdapter {
@@ -422,7 +437,8 @@ pub fn lance_store_params_for_session(
 /// Azure's public URI deliberately omits the storage account. Passing the
 /// canonical, process-captured selection explicitly keeps Lance's dataset
 /// client on the same account and endpoint as the control-object adapter.
-/// Local and S3 retain Lance's existing provider defaults.
+/// Local, S3 and Google Cloud Storage retain Lance's existing provider
+/// defaults, which read the same environment as their control-object adapters.
 pub fn lance_store_params_for_uri(uri: &str) -> Result<lance::io::ObjectStoreParams> {
     let mut params = lance::io::ObjectStoreParams::default();
     if storage_kind_for_uri(uri)? == StorageKind::Azure {

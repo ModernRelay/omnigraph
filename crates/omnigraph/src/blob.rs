@@ -715,7 +715,9 @@ impl NormalizedExternalUri {
         let root_scheme = match kind {
             omnigraph_storage::StorageKind::S3 => "s3",
             omnigraph_storage::StorageKind::Local => "file",
-            omnigraph_storage::StorageKind::Azure => return Ok(Vec::new()),
+            omnigraph_storage::StorageKind::Azure | omnigraph_storage::StorageKind::Gcs => {
+                return Ok(Vec::new());
+            }
         };
         if base_scheme != root_scheme {
             return Ok(Vec::new());

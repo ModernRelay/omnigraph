@@ -1240,9 +1240,9 @@ fn remote_root_identity(root: &str) -> Result<String, Diagnostic> {
             }
             Ok(format!("file://{normalized}"))
         }
-        omnigraph_storage::StorageKind::S3 | omnigraph_storage::StorageKind::Azure => {
-            Ok(normalized)
-        }
+        omnigraph_storage::StorageKind::S3
+        | omnigraph_storage::StorageKind::Azure
+        | omnigraph_storage::StorageKind::Gcs => Ok(normalized),
     }
 }
 

@@ -12,6 +12,7 @@ datasets directly.
 | `/absolute/path/graph.omni` or `file:///absolute/path/graph.omni` | Local filesystem |
 | `s3://bucket/prefix/graph.omni` | Amazon S3 or an S3-compatible service |
 | `az://container/prefix/graph.omni` | Azure Blob Storage qualification preview |
+| `gs://bucket/prefix/graph.omni` | Google Cloud Storage |
 
 An `http://` or `https://` URL addresses an OmniGraph server; it is not a graph
 storage URI. These are engine/server storage capabilities, not CLI target variants.
@@ -70,8 +71,8 @@ A graph's commit protocol relies on the store honouring conditional writes
 S3 binding. The project's S3 test suites run against RustFS; qualify any other
 S3-compatible service before production. Google Cloud Storage's S3
 interoperability endpoint is untested, and a store that ignores the conditions
-can let two writers publish the same graph version. Native `gs://` URIs are not
-supported.
+can let two writers publish the same graph version; use a native `gs://` root
+for Google Cloud Storage instead.
 
 ## Azure configuration
 
@@ -87,6 +88,23 @@ belong in the URI.
 Azure Container Apps supplies its managed-identity endpoint variables at
 runtime. Restart the process after changing storage-account, endpoint, or
 identity selection.
+
+## Google Cloud Storage configuration
+
+Google Cloud Storage roots use the strict form `gs://<bucket>/<prefix>`.
+Credentials never belong in the URI. OmniGraph uses Google's
+application-default credentials: `GOOGLE_APPLICATION_CREDENTIALS` or the
+`gcloud auth application-default login` file, then the metadata server of the
+Compute Engine, GKE or Cloud Run instance. `GOOGLE_SERVICE_ACCOUNT_KEY` or
+`GOOGLE_SERVICE_ACCOUNT` select a service-account key explicitly. The identity
+needs read, create, overwrite, delete and list on objects in the bucket, for
+example `roles/storage.objectUser`.
+
+Every conditional write is checked against the object generation
+(`x-goog-if-generation-match`), so graph publication keeps the same
+single-winner guarantee as on S3. A `gs://` root works for graphs opened by
+URI; cluster storage roots and operator direct targets do not accept `gs://`
+yet.
 
 For deployment, server boot, and cloud-specific safety requirements, see
 [Deployment](../deployment.md).
