@@ -270,7 +270,7 @@ where
         prepared.validate_capture(db, actor, &captured)?;
         prepared
     } else {
-        issued = captured.issue(db, desired_schema_source, actor)?;
+        issued = captured.issue(db, actor)?;
         &issued
     };
     if let Some(commit_id) = prepared.graph_commit_id()
@@ -303,16 +303,18 @@ where
         desired_catalog,
     } = planned;
     if prepared.is_noop() {
+        // The accepted schema stays: its catalog, IR and stored source.
         db.store_schema_view(
-            desired_catalog,
-            desired_schema_source.to_string(),
-            &desired_ir,
+            (*accepted_catalog).clone(),
+            prepared.desired_source.clone(),
+            &accepted_ir,
         )?;
         return Ok(SchemaApplyResult {
             supported: true,
             applied: false,
             graph_manifest_version: snapshot.graph_manifest_version(),
             steps: plan.steps,
+            one_way_constructs: Vec::new(),
             commit: None,
             contract: prepared.desired_contract().clone(),
         });

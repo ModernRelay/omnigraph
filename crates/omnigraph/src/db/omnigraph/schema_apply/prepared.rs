@@ -174,15 +174,13 @@ pub(super) struct CapturedSchemaApply {
     pub(super) graph_head: Option<String>,
     base_contract: SchemaContractDigest,
     desired_contract: SchemaContractDigest,
+    /// The source the attempt publishes: the caller's, or the accepted one
+    /// when the desired schema keeps the accepted identity (a no-op).
+    desired_source: String,
 }
 
 impl CapturedSchemaApply {
-    pub(super) fn issue(
-        &self,
-        db: &Omnigraph,
-        source: &str,
-        actor: Option<&str>,
-    ) -> Result<PreparedSchemaApply> {
+    pub(super) fn issue(&self, db: &Omnigraph, actor: Option<&str>) -> Result<PreparedSchemaApply> {
         let lineage = if self.base_contract == self.desired_contract {
             None
         } else {
@@ -203,7 +201,7 @@ impl CapturedSchemaApply {
             ),
             base_manifest_version: self.snapshot.graph_manifest_version(),
             base_contract: self.base_contract.clone(),
-            desired_source: source.to_string(),
+            desired_source: self.desired_source.clone(),
             desired_contract: self.desired_contract.clone(),
             actor: actor.map(str::to_string),
             lineage,
@@ -242,8 +240,8 @@ pub(super) async fn capture(
     let accepted_ir = accepted_catalog.bound_schema_ir().ok_or_else(|| {
         OmniError::manifest_internal("accepted catalog carries no bound SchemaIR")
     })?;
-    let base_contract =
-        SchemaContractDigest::from_row(&snapshot.read_schema_contract(&db.root_uri).await?);
+    let base_row = snapshot.read_schema_contract(&db.root_uri).await?;
+    let base_contract = SchemaContractDigest::from_row(&base_row);
     // Refuse stale input before resolving desired identities against a newer
     // schema. Even a now-unsupported migration is a stale prepared attempt.
     if let Some(prepared) = prepared
@@ -261,6 +259,20 @@ pub(super) async fn capture(
     let planned = plan_schema_for_apply_from_accepted(db, source, accepted_ir).await?;
     let desired_contract =
         SchemaContractDigest::from_row(&render_schema_contract(&planned.desired_ir, source)?);
+    // A desired schema whose accepted identity equals the base one is a
+    // no-op, however its text differs (an explicit `l2`, a comment, layout):
+    // its plan has no step, so the apply publishes nothing and the stored
+    // source stays the accepted one, which every older binary re-parses on
+    // open.
+    let (desired_contract, desired_source) = if desired_contract.schema_ir_hash
+        == base_contract.schema_ir_hash
+        && desired_contract.schema_identity_domain == base_contract.schema_identity_domain
+        && desired_contract.schema_identity_version == base_contract.schema_identity_version
+    {
+        (base_contract.clone(), base_row.source)
+    } else {
+        (desired_contract, source.to_string())
+    };
     Ok(CapturedSchemaApply {
         planned,
         accepted_catalog,
@@ -270,6 +282,7 @@ pub(super) async fn capture(
         graph_head,
         base_contract,
         desired_contract,
+        desired_source,
     })
 }
 
@@ -283,7 +296,7 @@ pub(in crate::db::omnigraph) async fn prepare_schema_apply(
     let captured = capture(db, source, None)
         .await
         .map_err(OmniError::before_effect)?;
-    let intent = captured.issue(db, source, actor)?;
+    let intent = captured.issue(db, actor)?;
     Ok((intent, captured.planned.plan))
 }
 

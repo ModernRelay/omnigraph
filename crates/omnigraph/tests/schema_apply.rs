@@ -765,14 +765,52 @@ async fn apply_schema_noop_returns_not_applied() {
     assert_eq!(db.list_commits(None).await.unwrap(), before_commits);
     assert_eq!(db.schema_contract_digest(), result.contract);
 
-    // Source bytes are part of the accepted contract even when the typed schema
-    // has no migration steps. This Rust owner checks publication and table pins,
-    // which the query-level logic-test format does not expose.
-    let desired = format!("// Deployment source revision\n{TEST_SCHEMA}\n");
-    assert!(db.plan_schema(&desired).await.unwrap().steps.is_empty());
-    let changed = db.apply_schema(&desired).await.unwrap();
+    // A desired source whose accepted identity is unchanged (a comment, an
+    // explicit `l2`, layout) plans no step and publishes nothing: the stored
+    // source stays the accepted one, which an older binary re-parses on open.
+    // This Rust owner checks publication and table pins, which the
+    // query-level logic-test format does not expose.
+    for desired in [
+        format!("// Deployment source revision\n{TEST_SCHEMA}\n"),
+        format!("\n{TEST_SCHEMA}\n\n"),
+    ] {
+        assert!(db.plan_schema(&desired).await.unwrap().steps.is_empty());
+        let unchanged = db.apply_schema(&desired).await.unwrap();
+        assert!(unchanged.supported && !unchanged.applied);
+        assert!(unchanged.steps.is_empty());
+        assert!(unchanged.commit.is_none());
+        assert_eq!(unchanged.contract, result.contract);
+        assert_eq!(
+            unchanged.graph_manifest_version,
+            before.graph_manifest_version()
+        );
+        let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        assert_eq!(
+            after.graph_manifest_version(),
+            before.graph_manifest_version()
+        );
+        assert_eq!(db.list_commits(None).await.unwrap(), before_commits);
+        let after_contract = omnigraph_catalog::ManifestCoordinator::read_schema_contract_at(
+            uri,
+            None,
+            after.graph_manifest_version(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_contract.source, before_contract.source);
+        assert_eq!(after_contract.head, before_contract.head);
+        assert_eq!(db.schema_source().as_str(), TEST_SCHEMA);
+        assert_eq!(db.schema_contract_digest(), result.contract);
+    }
+
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(reopened.schema_source().as_str(), TEST_SCHEMA);
+    assert_eq!(reopened.schema_contract_digest(), result.contract);
+
+    // A source change that does change the accepted identity publishes it.
+    let desired = format!("{TEST_SCHEMA}\nnode Spare {{ name: String @key }}\n");
+    let changed = reopened.apply_schema(&desired).await.unwrap();
     assert!(changed.supported && changed.applied);
-    assert!(changed.steps.is_empty());
     assert_eq!(
         changed.commit.as_ref().unwrap().parent_commit_id.as_deref(),
         Some(before_commits[0].graph_commit_id.as_str())
@@ -781,63 +819,11 @@ async fn apply_schema_noop_returns_not_applied() {
         changed.contract.source_hash,
         format!("{:x}", Sha256::digest(desired.as_bytes()))
     );
-    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert_eq!(
-        after.graph_manifest_version(),
-        before.graph_manifest_version() + 1
-    );
-    assert_eq!(
-        changed.graph_manifest_version,
-        after.graph_manifest_version()
-    );
-    assert_eq!(
-        db.list_commits(None).await.unwrap().len(),
-        before_commits.len() + 1
-    );
-    assert_eq!(after.datasets().count(), before.datasets().count());
-    for entry in before.datasets() {
-        assert!(entry.same_registration(after.dataset(&entry.type_key).unwrap()));
-    }
-    let after_contract = omnigraph_catalog::ManifestCoordinator::read_schema_contract_at(
-        uri,
-        None,
-        after.graph_manifest_version(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(after_contract.source, desired);
-    assert_eq!(after_contract.ir, before_contract.ir);
-    assert_eq!(after_contract.head, before_contract.head);
-    assert_eq!(
-        changed.contract.schema_ir_hash,
-        after_contract.head.schema_ir_hash
-    );
-    assert_eq!(
-        changed.contract.schema_identity_domain,
-        after_contract.head.schema_identity_domain
-    );
-    assert_eq!(
-        changed.contract.schema_identity_version,
-        after_contract.head.schema_identity_version
-    );
-    assert_eq!(db.schema_source().as_str(), desired);
-    assert_eq!(db.schema_contract_digest(), changed.contract);
-
-    let reopened = Omnigraph::open(uri).await.unwrap();
     assert_eq!(reopened.schema_source().as_str(), desired);
     let repeated = reopened.apply_schema(&desired).await.unwrap();
     assert!(!repeated.applied);
     assert!(repeated.commit.is_none());
     assert_eq!(repeated.contract, changed.contract);
-    assert_eq!(reopened.schema_contract_digest(), changed.contract);
-    assert_eq!(
-        repeated.graph_manifest_version,
-        after.graph_manifest_version()
-    );
-    assert_eq!(
-        reopened.list_commits(None).await.unwrap(),
-        db.list_commits(None).await.unwrap()
-    );
     reopened.branch_create("feature").await.unwrap();
     assert_eq!(
         Omnigraph::open_read_only(uri)
@@ -846,6 +832,27 @@ async fn apply_schema_noop_returns_not_applied() {
             .schema_contract_digest(),
         changed.contract,
         "reading accepted contract identity does not require a single branch"
+    );
+
+    // An explicit `l2` is the omitted distance: the same accepted identity,
+    // so the apply publishes nothing and the stored source keeps no
+    // `distance` an older binary cannot parse.
+    let vectors = tempfile::tempdir().unwrap();
+    let vectors_uri = vectors.path().to_str().unwrap();
+    let omitted = "node Doc { slug: String @key emb: Vector(2) }\n";
+    let db = Omnigraph::init(vectors_uri, omitted).await.unwrap();
+    let head = db.list_commits(None).await.unwrap();
+    let explicit = omitted.replace("Vector(2)", "Vector(2, distance = \"l2\")");
+    let result = db.apply_schema(&explicit).await.unwrap();
+    assert!(!result.applied && result.commit.is_none());
+    assert_eq!(db.list_commits(None).await.unwrap(), head);
+    assert_eq!(
+        Omnigraph::open(vectors_uri)
+            .await
+            .unwrap()
+            .schema_source()
+            .as_str(),
+        omitted
     );
 }
 
@@ -4014,7 +4021,10 @@ async fn schema_settlement_proves_foreign_occupancy_but_missing_evidence_stays_u
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let db = init_and_load(&dir).await;
-        let desired = format!("{TEST_SCHEMA}\n// original deployment\n");
+        let desired = TEST_SCHEMA.replace(
+            "node Company {",
+            "node Company @description(\"original deployment\") {",
+        );
         let original = db.prepare_schema_apply_as(&desired, None).await.unwrap();
         let fence = db
             .prepare_schema_settlement_as(&original, None)
@@ -4030,7 +4040,10 @@ async fn schema_settlement_proves_foreign_occupancy_but_missing_evidence_stays_u
                 .await
                 .unwrap();
         } else {
-            let foreign = format!("{TEST_SCHEMA}\n// unrelated schema\n");
+            let foreign = TEST_SCHEMA.replace(
+                "node Company {",
+                "node Company @description(\"unrelated schema\") {",
+            );
             db.apply_schema(&foreign).await.unwrap();
         }
         let candidate_version = original.base_manifest_version() + 1;

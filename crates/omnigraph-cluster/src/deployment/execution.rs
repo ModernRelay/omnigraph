@@ -1456,6 +1456,9 @@ pub async fn plan_captured_deployment(
                     "observed schema migration is unsupported",
                 ));
             }
+            if migration.steps.is_empty() {
+                diagnostics.push(schema_text_without_step(graph));
+            }
             if db
                 .branch_list()
                 .await
@@ -2323,6 +2326,9 @@ async fn prepare_graphs(
                 )
                 .await
                 .map_err(|error| refusal("schema_preflight_failed", error.to_string()))?;
+            if intent.is_noop() {
+                return Err(schema_text_without_step(&graph));
+            }
             if intent.base_contract() != achieved {
                 return Err(refusal(
                     "applied_schema_drift",
@@ -2338,6 +2344,18 @@ async fn prepare_graphs(
         graphs.insert(graph, entry);
     }
     Ok((graphs, migrations))
+}
+
+/// A configured schema whose text differs from the stored one while its plan
+/// has no step: the engine's apply publishes nothing for it, so the stored
+/// source would never match the configuration the ledger records.
+fn schema_text_without_step(graph: &str) -> Diagnostic {
+    refusal(
+        "schema_preflight_failed",
+        format!(
+            "graph {graph}: the configured schema text differs from the stored schema but plans no step, so a schema apply publishes nothing for it; keep the configured text equal to the stored schema (`omnigraph schema show`) or make a change the plan reports"
+        ),
+    )
 }
 
 fn authorize_graph_deletion(

@@ -1645,7 +1645,7 @@ mod tests {
             drop(retained);
             waiting.await.unwrap();
         }
-        beta.engine.apply_schema("// accepted during deployment\nnode Person { name: String @key nickname: String? }\n").await.unwrap();
+        beta.engine.apply_schema("node Person @description(\"accepted during deployment\") { name: String @key nickname: String? }\n").await.unwrap();
         let rebound = Arc::new(GraphHandle {
             key: beta.key.clone(),
             uri: beta.uri.clone(),
@@ -1749,7 +1749,9 @@ mod tests {
                 }
                 "contract" => {
                     beta.engine
-                        .apply_schema(&format!("// changed\n{TEST_SCHEMA}"))
+                        .apply_schema(
+                            "node Person @description(\"changed\") { name: String @key }\n",
+                        )
                         .await
                         .unwrap();
                 }
@@ -1933,7 +1935,7 @@ mod tests {
                 alpha
                     .engine
                     .apply_schema(&format!(
-                        "// {outcome}\nnode Person {{ name: String @key nickname: String? }}\n"
+                        "node Person @description(\"{outcome}\") {{ name: String @key nickname: String? }}\n"
                     ))
                     .await
                     .unwrap();
@@ -2021,7 +2023,9 @@ mod tests {
             let expected = if refusal == "contract" {
                 alpha
                     .engine
-                    .apply_schema(&format!("// final-boundary\n{TEST_SCHEMA}"))
+                    .apply_schema(
+                        "node Person @description(\"final-boundary\") { name: String @key }\n",
+                    )
                     .await
                     .unwrap();
                 ServingTransitionError::SchemaChanged
@@ -2321,7 +2325,9 @@ mod tests {
             // drift. Even a source-only change invalidates the exact binding.
             alpha
                 .engine
-                .apply_schema(&format!("// foreign {stage} revision\n{TEST_SCHEMA}"))
+                .apply_schema(&format!(
+                    "node Person @description(\"foreign {stage} revision\") {{ name: String @key }}\n"
+                ))
                 .await
                 .unwrap();
             match stage {
