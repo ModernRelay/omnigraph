@@ -1,0 +1,1 @@
+- Delete staging buffers participant table deletions concurrently up to write concurrency, eliminating sequential round-trips. Staged transactions and results are unchanged.

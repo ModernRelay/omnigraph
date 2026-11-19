@@ -689,6 +689,7 @@ impl MutationStaging {
         // no inline HEAD advance, closing the zero-row drift class).
         let mut __dst_dp: Vec<_> = delete_predicates.into_iter().collect();
         __dst_dp.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut delete_inputs = Vec::with_capacity(__dst_dp.len());
         for (table_key, predicates) in __dst_dp {
             let path = paths.get(&table_key).cloned().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
@@ -707,19 +708,36 @@ impl MutationStaging {
             };
             let removed_ids = deleted_ids.get(&table_key).cloned().unwrap_or_default();
             let row_addrs = deleted_row_addrs.remove(&table_key);
-            if let Some(entry) = stage_delete_table(
-                db,
-                table_key,
-                combined,
-                path,
-                expected,
-                removed_ids,
-                row_addrs,
-            )
-            .await?
-            {
-                staged_entries.push(entry);
-            }
+            delete_inputs.push((table_key, combined, path, expected, removed_ids, row_addrs));
+        }
+
+        if !delete_inputs.is_empty() {
+            let delete_concurrency = concurrency.min(delete_inputs.len()).max(1);
+            let staged_deletes: Vec<StagedTableEntry> =
+                futures::stream::iter(delete_inputs.into_iter().map(
+                    |(table_key, combined, path, expected, removed_ids, row_addrs)| async move {
+                        stage_delete_table(
+                            db,
+                            table_key,
+                            combined,
+                            path,
+                            expected,
+                            removed_ids,
+                            row_addrs,
+                        )
+                        .await
+                    },
+                ))
+                .buffered(delete_concurrency)
+                .collect::<Vec<Result<Option<StagedTableEntry>>>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+
+            staged_entries.extend(staged_deletes);
         }
 
         let expected_versions = expected_table_versions(&expected_versions, &paths)?;
