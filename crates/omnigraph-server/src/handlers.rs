@@ -2656,8 +2656,10 @@ async fn run_json_load(
 /// Compatibility-load NDJSON data through a JSON envelope.
 ///
 /// `data` is NDJSON with one record per line. `mode` controls behavior on
-/// existing entities: `merge` upserts by id (default), `append` strictly inserts
-/// absent ids, and `overwrite` replaces type data. Branch creation is opt-in by
+/// existing entities: `replace` writes each record's whole row (default),
+/// `upsert` sets the properties a record names, `insert` creates and refuses
+/// an existing id with `key_conflict`, and `overwrite` replaces type data;
+/// `append` and `merge` are refused with their fix. Branch creation is opt-in by
 /// presence of `from`: with `from` set, a missing `branch` is created from
 /// it; without `from`, `branch` must already exist — a missing branch is a
 /// 404, never an implicit fork. **Destructive** when `mode` is `overwrite`
