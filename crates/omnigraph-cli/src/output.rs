@@ -134,6 +134,14 @@ pub(crate) fn write_optimize(
     Ok(())
 }
 
+/// The warnings an `index rebuild --kind full-text` that rebuilt an index
+/// prints: what replaced the old analysis, and the one-way step it is for a
+/// binary before this release.
+pub(crate) const FULL_TEXT_REBUILD_WARNINGS: [&str; 2] = [
+    "Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced.",
+    "Binaries before this release refuse full-text reads on this graph from now on; that binary's own `omnigraph index rebuild --kind full-text` restores them.",
+];
+
 pub(crate) fn write_full_text_rebuild(
     uri: &str,
     result: &omnigraph::db::FullTextIndexRebuildResult,
@@ -333,6 +341,34 @@ pub(crate) struct SchemaPlanOutput<'a> {
     pub(crate) supported: bool,
     pub(crate) step_count: usize,
     pub(crate) steps: &'a [SchemaMigrationStep],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub(crate) one_way_constructs: &'a [omnigraph_compiler::schema::one_way::OneWayConstruct],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) one_way_note: Option<&'static str>,
+}
+
+/// The one-way constructs of a schema plan or apply, one line each, then the
+/// line naming what they cost.
+pub(crate) fn write_one_way_human(
+    constructs: impl IntoIterator<Item = (String, String, usize, usize, String)>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let mut any = false;
+    for (type_name, property, line, column, description) in constructs {
+        any = true;
+        writeln!(
+            writer,
+            "one-way: {type_name}.{property} (line {line}, column {column}): {description}"
+        )?;
+    }
+    if any {
+        writeln!(
+            writer,
+            "{}",
+            omnigraph_compiler::schema::one_way::ONE_WAY_NOTE
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn write_schema_apply_human(
@@ -366,7 +402,18 @@ pub(crate) fn write_schema_apply_human(
     for step in &output.steps {
         writeln!(writer, "- {}", render_schema_plan_step(step))?;
     }
-    Ok(())
+    write_one_way_human(
+        output.one_way_constructs.iter().map(|c| {
+            (
+                c.type_name.clone(),
+                c.property.clone(),
+                c.line,
+                c.column,
+                c.description.clone(),
+            )
+        }),
+        writer,
+    )
 }
 
 pub(crate) fn query_kind_label(kind: QueryLintQueryKind) -> &'static str {
@@ -524,6 +571,22 @@ pub(crate) fn write_cluster_plan_human(output: &PlanOutput, stdout: &mut dyn Wri
                         "      {}",
                         serde_json::to_string(step).unwrap_or_else(|_| format!("{step:?}"))
                     )?;
+                }
+                let mut one_way = Vec::new();
+                write_one_way_human(
+                    migration.one_way_constructs.iter().map(|c| {
+                        (
+                            c.type_name.clone(),
+                            c.property.clone(),
+                            c.line,
+                            c.column,
+                            c.description.clone(),
+                        )
+                    }),
+                    &mut one_way,
+                )?;
+                for line in String::from_utf8_lossy(&one_way).lines() {
+                    writeln!(stdout, "      {line}")?;
                 }
             }
         }
@@ -753,13 +816,24 @@ pub(crate) fn write_schema_plan_human(
         if plan.supported { "yes" } else { "no" }
     )?;
     if plan.steps.is_empty() {
-        writeln!(writer, "no table migration steps")?;
+        writeln!(writer, "no schema changes; an apply publishes nothing")?;
         return Ok(());
     }
     for step in &plan.steps {
         writeln!(writer, "- {}", render_schema_plan_step(step))?;
     }
-    Ok(())
+    write_one_way_human(
+        plan.one_way_constructs.iter().map(|c| {
+            (
+                c.type_name.clone(),
+                c.property.clone(),
+                c.line,
+                c.column,
+                c.description.clone(),
+            )
+        }),
+        writer,
+    )
 }
 
 pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
@@ -2301,7 +2375,8 @@ mod tests {
     #[test]
     fn maintenance_full_text_reports_keep_warning_stream_and_noop_distinct() {
         use omnigraph::db::{FullTextIndexRebuildResult, RebuiltFullTextIndex};
-        let warning = "Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced.";
+        let [warning, one_way] = super::FULL_TEXT_REBUILD_WARNINGS;
+        assert!(one_way.contains("Binaries before this release refuse full-text reads"));
         let result = FullTextIndexRebuildResult {
             branch: "dev".into(),
             graph_commit_id: Some("commit-1".into()),
@@ -2312,7 +2387,7 @@ mod tests {
         };
         assert_maintenance_report(
             "index rebuild graph — branch dev, 1 indexes rebuilt\n  node type 'Doc', property 'body'\ngraph commit: commit-1\n",
-            serde_json::json!({"uri":"graph","branch":"dev","graph_commit_id":"commit-1","warnings":[warning],"rebuilt_indexes":[{"type_key":"node:Doc","property":"body"}]}),
+            serde_json::json!({"uri":"graph","branch":"dev","graph_commit_id":"commit-1","warnings":[warning, one_way],"rebuilt_indexes":[{"type_key":"node:Doc","property":"body"}]}),
             |json, writer| {
                 let mut stderr = Vec::new();
                 let output =
@@ -2322,7 +2397,7 @@ mod tests {
                     if json {
                         Vec::new()
                     } else {
-                        format!("warning: {warning}\n").into_bytes()
+                        format!("warning: {warning}\nwarning: {one_way}\n").into_bytes()
                     }
                 );
                 output
@@ -2411,20 +2486,42 @@ mod tests {
             type_kind: SchemaTypeKind::Node,
             name: "Doc".to_string(),
         };
+        let distance = omnigraph_compiler::schema::one_way::OneWayConstruct {
+            construct: "vector_distance".to_string(),
+            description: "an explicit `distance` on a Vector, `l2` included".to_string(),
+            type_name: "Doc".to_string(),
+            property: "emb".to_string(),
+            line: 1,
+            column: 30,
+        };
+        let one_way = "one-way: Doc.emb (line 1, column 30): an explicit `distance` on a Vector, `l2` included\nbinaries before this release refuse the whole graph after this apply, and only a backup taken before the upgrade restores it\n";
         for (plan, expected) in [
             (
                 SchemaMigrationPlan {
                     supported: true,
                     steps: Vec::new(),
+                    one_way_constructs: Vec::new(),
+                    one_way_note: None,
                 },
-                "schema plan for graph\nsupported: yes\nno table migration steps\n",
+                "schema plan for graph\nsupported: yes\nno schema changes; an apply publishes nothing\n".to_string(),
             ),
             (
                 SchemaMigrationPlan {
                     supported: true,
                     steps: vec![added.clone()],
+                    one_way_constructs: Vec::new(),
+                    one_way_note: None,
                 },
-                "schema plan for graph\nsupported: yes\n- add node type 'Doc'\n",
+                "schema plan for graph\nsupported: yes\n- add node type 'Doc'\n".to_string(),
+            ),
+            (
+                SchemaMigrationPlan {
+                    supported: true,
+                    steps: vec![added.clone()],
+                    one_way_constructs: vec![distance.clone()],
+                    one_way_note: None,
+                },
+                format!("schema plan for graph\nsupported: yes\n- add node type 'Doc'\n{one_way}"),
             ),
             (
                 SchemaMigrationPlan {
@@ -2434,32 +2531,44 @@ mod tests {
                         reason: "type changed".to_string(),
                         code: None,
                     }],
+                    one_way_constructs: Vec::new(),
+                    one_way_note: None,
                 },
-                "schema plan for graph\nsupported: no\n- unsupported change on Doc.body: type changed\n",
+                "schema plan for graph\nsupported: no\n- unsupported change on Doc.body: type changed\n".to_string(),
             ),
         ] {
-            assert_human_format(expected, |writer| {
+            assert_human_format(&expected, |writer| {
                 super::write_schema_plan_human("graph", &plan, writer)
             });
         }
 
-        for (applied, steps, expected) in [
+        for (applied, steps, constructs, expected) in [
             (
                 false,
                 Vec::new(),
-                "schema apply for graph\nsupported: yes\napplied: no\ngraph_manifest_version: 7\nno schema changes\n",
+                Vec::new(),
+                "schema apply for graph\nsupported: yes\napplied: no\ngraph_manifest_version: 7\nno schema changes\n".to_string(),
             ),
             (
                 true,
                 Vec::new(),
-                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\nschema source updated; no table migration steps\n",
+                Vec::new(),
+                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\nschema source updated; no table migration steps\n".to_string(),
+            ),
+            (
+                true,
+                vec![added.clone()],
+                Vec::new(),
+                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\n- add node type 'Doc'\n".to_string(),
             ),
             (
                 true,
                 vec![added],
-                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\n- add node type 'Doc'\n",
+                vec![distance],
+                format!("schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\n- add node type 'Doc'\n{one_way}"),
             ),
         ] {
+            let (one_way_constructs, one_way_note) = omnigraph_api_types::one_way_report(constructs);
             let output = omnigraph_api_types::SchemaApplyOutput {
                 uri: "graph".to_string(),
                 supported: true,
@@ -2467,8 +2576,10 @@ mod tests {
                 step_count: steps.len(),
                 graph_manifest_version: 7,
                 steps,
+                one_way_constructs,
+                one_way_note,
             };
-            assert_human_format(expected, |writer| {
+            assert_human_format(&expected, |writer| {
                 super::write_schema_apply_human(&output, writer)
             });
         }

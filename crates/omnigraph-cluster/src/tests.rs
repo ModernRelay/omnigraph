@@ -3274,6 +3274,73 @@ async fn plan_embeds_migration_preview_for_schema_update() {
             .contains("add_property"),
         "{migration:?}"
     );
+    assert!(migration.one_way_constructs.is_empty(), "{migration:?}");
+    assert!(migration.one_way_note.is_none(), "{migration:?}");
+    let additive = fs::read_to_string(dir.path().join("people.pg")).unwrap();
+
+    // A change that stores a construct an older binary refuses names it.
+    fs::write(
+        dir.path().join("people.pg"),
+        additive.replace("bio: String?", "bio: String? @index(fulltext)"),
+    )
+    .unwrap();
+    let out = plan_config_dir_as(dir.path(), Some("principal:owner".into())).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let migration = out
+        .changes
+        .iter()
+        .find(|change| change.resource == "schema.knowledge")
+        .and_then(|change| change.migration.as_ref())
+        .unwrap();
+    let named: Vec<_> = migration
+        .one_way_constructs
+        .iter()
+        .map(|c| {
+            (
+                c.construct.as_str(),
+                c.type_name.as_str(),
+                c.property.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(named, [("full_text_index", "Person", "bio")]);
+    assert_eq!(
+        migration.one_way_note.as_deref(),
+        Some(omnigraph_compiler::schema::one_way::ONE_WAY_NOTE)
+    );
+
+    // Text that keeps the stored schema plans no step: the engine's apply
+    // would publish nothing, so the ledger would record text the graph does
+    // not hold. Plan and apply refuse it and write nothing.
+    fs::write(
+        dir.path().join("people.pg"),
+        format!("// reworded comment\n{SCHEMA}"),
+    )
+    .unwrap();
+    let state = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let out = plan_config_dir_as(dir.path(), Some("principal:owner".into())).await;
+    assert!(!out.ok, "{out:?}");
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.code == "schema_preflight_failed" && d.message.contains("plans no step")),
+        "{:?}",
+        out.diagnostics
+    );
+    let refused = apply_deployment(
+        dir.path(),
+        None,
+        &DeploymentCaller::storage_owner(Some("principal:owner".into())),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, "schema_preflight_failed", "{refused:?}");
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        state
+    );
+    fs::write(dir.path().join("people.pg"), additive).unwrap();
 
     let caller = DeploymentCaller::storage_owner(Some("principal:owner".into()));
     let root = dir.path().join("graphs/knowledge.omni");

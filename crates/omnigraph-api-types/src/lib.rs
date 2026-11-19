@@ -2050,6 +2050,49 @@ pub struct SchemaApplyOutput {
     pub graph_manifest_version: u64,
     #[schema(value_type = Vec<Value>)]
     pub steps: Vec<SchemaMigrationStep>,
+    /// The stored constructs a binary before this release refuses: after
+    /// this apply such a binary refuses the whole graph. Absent when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_way_constructs: Vec<OneWayConstructOutput>,
+    /// The consequence of `one_way_constructs`, present with them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_way_note: Option<String>,
+}
+
+/// A schema construct that a binary before this release refuses once a graph
+/// stores it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct OneWayConstructOutput {
+    /// The construct's stable name, such as `vector_distance`.
+    pub construct: String,
+    pub description: String,
+    pub type_name: String,
+    pub property: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl From<omnigraph_compiler::schema::one_way::OneWayConstruct> for OneWayConstructOutput {
+    fn from(c: omnigraph_compiler::schema::one_way::OneWayConstruct) -> Self {
+        Self {
+            construct: c.construct,
+            description: c.description,
+            type_name: c.type_name,
+            property: c.property,
+            line: c.line,
+            column: c.column,
+        }
+    }
+}
+
+/// The two report fields of a set of one-way constructs: the constructs and,
+/// when there is one, the note.
+pub fn one_way_report(
+    constructs: Vec<omnigraph_compiler::schema::one_way::OneWayConstruct>,
+) -> (Vec<OneWayConstructOutput>, Option<String>) {
+    let note = (!constructs.is_empty())
+        .then(|| omnigraph_compiler::schema::one_way::ONE_WAY_NOTE.to_string());
+    (constructs.into_iter().map(Into::into).collect(), note)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -3222,6 +3265,7 @@ pub fn snapshot_payload(
 }
 
 pub fn schema_apply_output(uri: &str, result: SchemaApplyResult) -> SchemaApplyOutput {
+    let (one_way_constructs, one_way_note) = one_way_report(result.one_way_constructs);
     SchemaApplyOutput {
         uri: uri.to_string(),
         supported: result.supported,
@@ -3229,6 +3273,8 @@ pub fn schema_apply_output(uri: &str, result: SchemaApplyResult) -> SchemaApplyO
         step_count: result.steps.len(),
         graph_manifest_version: result.graph_manifest_version,
         steps: result.steps,
+        one_way_constructs,
+        one_way_note,
     }
 }
 

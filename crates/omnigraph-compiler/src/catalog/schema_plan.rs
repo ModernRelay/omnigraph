@@ -26,6 +26,29 @@ pub enum SchemaTypeKind {
 pub struct SchemaMigrationPlan {
     pub supported: bool,
     pub steps: Vec<SchemaMigrationStep>,
+    /// The constructs of the desired source that a binary before this release
+    /// refuses once stored ([`crate::schema::one_way`]); empty when the plan
+    /// has no step, since such an apply stores nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_way_constructs: Vec<crate::schema::one_way::OneWayConstruct>,
+    /// [`crate::schema::one_way::ONE_WAY_NOTE`], present with the constructs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_way_note: Option<String>,
+}
+
+impl SchemaMigrationPlan {
+    /// The plan with the one-way constructs `desired_source` writes, when it
+    /// has a step that would store that source.
+    pub fn with_one_way_constructs(mut self, desired_source: &str) -> Result<Self> {
+        self.one_way_constructs = if self.steps.is_empty() {
+            Vec::new()
+        } else {
+            crate::schema::one_way::one_way_constructs(desired_source)?
+        };
+        self.one_way_note = (!self.one_way_constructs.is_empty())
+            .then(|| crate::schema::one_way::ONE_WAY_NOTE.to_string());
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -265,6 +288,8 @@ pub fn plan_schema_migration(
             .iter()
             .any(|step| matches!(step, SchemaMigrationStep::UnsupportedChange { .. })),
         steps,
+        one_way_constructs: Vec::new(),
+        one_way_note: None,
     })
 }
 

@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod ast;
+pub mod one_way;
 pub mod parser;
 pub mod vector;
 

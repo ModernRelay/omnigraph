@@ -14,7 +14,7 @@ use super::ast::*;
 
 #[derive(Parser)]
 #[grammar = "schema/schema.pest"]
-struct SchemaParser;
+pub(super) struct SchemaParser;
 
 pub fn parse_schema(input: &str) -> Result<SchemaFile> {
     parse_schema_diagnostic(input).map_err(|e| CompilerError::Parse(e.to_string()))

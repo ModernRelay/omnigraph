@@ -187,6 +187,10 @@ pub struct SchemaApplyResult {
     pub applied: bool,
     pub graph_manifest_version: u64,
     pub steps: Vec<SchemaMigrationStep>,
+    /// The constructs this publication stored that a binary before this
+    /// release refuses (`omnigraph_compiler::schema::one_way`); empty for a
+    /// no-op, which stores nothing.
+    pub one_way_constructs: Vec<omnigraph_compiler::schema::one_way::OneWayConstruct>,
     /// The exact commit published by this invocation; absent for an exact no-op.
     pub commit: Option<GraphCommit>,
     /// Accepted source and stable schema identity of this invocation's result.
