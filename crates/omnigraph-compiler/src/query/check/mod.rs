@@ -6363,6 +6363,10 @@ impl Ctx<'_> {
                         {
                             continue;
                         }
+                        // `cast`'s target is a type name, read by its row.
+                        if name == "cast" && position == 1 && matches!(e, Expr::Ident(_)) {
+                            continue;
+                        }
                         // The lazy rows evaluate an argument only where the ones
                         // before it select it: `if`'s branches under their
                         // condition, `coalesce`'s later arguments where every
@@ -6673,6 +6677,179 @@ impl Ctx<'_> {
                         },
                         Ty::scalar(ScalarType::String, nullable),
                     )
+                }
+                "lower" | "upper" | "trim" | "ltrim" | "rtrim" => {
+                    no_options(c)?;
+                    let [x] = one_string(name, args)?;
+                    let ty = x.ty.clone();
+                    call(name, vec![x], ty)
+                }
+                "length" => {
+                    no_options(c)?;
+                    if let [x] = args.as_slice()
+                        && matches!(&x.ty, Ty::Value(t) if t.list)
+                    {
+                        return Err(err_fix(
+                            T7,
+                            "`length` counts a String's characters; a list's elements are `size`",
+                            "size(<list>)",
+                        ));
+                    }
+                    let [x] = one_string(name, args)?;
+                    let nullable = x.ty.nullable();
+                    call(name, vec![x], Ty::scalar(ScalarType::I64, nullable))
+                }
+                "left" | "right" => {
+                    no_options(c)?;
+                    let Ok([x, n]) = <[SExpr; 2]>::try_from(args) else {
+                        return Err(err(
+                            T7,
+                            format!("`{name}(s, n)` takes a String and a count"),
+                        ));
+                    };
+                    let [x] = one_string(name, vec![x])?;
+                    let n = integer_arg(name, "count", n)?;
+                    let nullable = x.ty.nullable() || n.ty.nullable();
+                    call(name, vec![x, n], Ty::scalar(ScalarType::String, nullable))
+                }
+                "substring" => {
+                    no_options(c)?;
+                    let Ok([x, start, len]) = <[SExpr; 3]>::try_from(args) else {
+                        return Err(err(
+                            T7,
+                            "`substring(s, start, len)` takes a String, a 1-based start and a length",
+                        ));
+                    };
+                    let [x] = one_string(name, vec![x])?;
+                    let start = integer_arg(name, "start", start)?;
+                    let len = integer_arg(name, "length", len)?;
+                    let nullable = x.ty.nullable() || start.ty.nullable() || len.ty.nullable();
+                    call(
+                        name,
+                        vec![x, start, len],
+                        Ty::scalar(ScalarType::String, nullable),
+                    )
+                }
+                "abs" | "floor" | "ceil" => {
+                    no_options(c)?;
+                    let Ok([x]) = <[SExpr; 1]>::try_from(args) else {
+                        return Err(err(T7, format!("`{name}` takes one number")));
+                    };
+                    let ty = numeric(&x, &format!("`{name}`"))?;
+                    call(name, vec![x], ty)
+                }
+                "round" => {
+                    let Ok([x]) = <[SExpr; 1]>::try_from(args) else {
+                        return Err(err(T7, "`round(x, digits: n)` takes one number"));
+                    };
+                    let ty = numeric(&x, "`round`")?;
+                    let mut digits = None;
+                    for (o, v) in &c.options {
+                        if o != "digits" || digits.is_some() {
+                            return Err(err(
+                                T71,
+                                format!("`round` has no option `{o}`; it admits `digits`"),
+                            ));
+                        }
+                        digits = Some(integer_arg(name, "`digits`", self.expr(sc, v, At::Value)?)?);
+                    }
+                    let digits = digits.unwrap_or_else(|| {
+                        SExpr::new(
+                            SKind::Lit(Literal::Integer(0)),
+                            Ty::scalar(ScalarType::I64, false),
+                        )
+                    });
+                    let ty = ty.with_nullable(ty.nullable() || digits.ty.nullable());
+                    SExpr::new(
+                        SKind::Call {
+                            func: name.into(),
+                            args: vec![x],
+                            options: vec![("digits".into(), digits)],
+                        },
+                        ty,
+                    )
+                }
+                "sqrt" | "exp" | "ln" | "log10" => {
+                    no_options(c)?;
+                    let Ok([x]) = <[SExpr; 1]>::try_from(args) else {
+                        return Err(err(T7, format!("`{name}` takes one number")));
+                    };
+                    numeric(&x, &format!("`{name}`"))?;
+                    let nullable = x.ty.nullable();
+                    let x = widen(x, ScalarType::F64);
+                    call(name, vec![x], Ty::scalar(ScalarType::F64, nullable))
+                }
+                "power" => {
+                    no_options(c)?;
+                    let Ok([b, e]) = <[SExpr; 2]>::try_from(args) else {
+                        return Err(err(T7, "`power(base, exponent)` takes two numbers"));
+                    };
+                    let b = adapt(b, &Ty::scalar(ScalarType::F64, false));
+                    let e = adapt(e, &Ty::scalar(ScalarType::F64, false));
+                    numeric(&b, "`power`'s base")?;
+                    numeric(&e, "`power`'s exponent")?;
+                    let nullable = b.ty.nullable() || e.ty.nullable();
+                    let (b, e) = (widen(b, ScalarType::F64), widen(e, ScalarType::F64));
+                    call(name, vec![b, e], Ty::scalar(ScalarType::F64, nullable))
+                }
+                "size" => {
+                    no_options(c)?;
+                    let Ok([x]) = <[SExpr; 1]>::try_from(args) else {
+                        return Err(err(T7, "`size` takes one list"));
+                    };
+                    if !matches!(&x.ty, Ty::Value(t) if t.list) {
+                        return Err(err(
+                            T7,
+                            format!("`size` counts a list's elements, got {}", x.ty.display()),
+                        ));
+                    }
+                    let nullable = x.ty.nullable();
+                    call(name, vec![x], Ty::scalar(ScalarType::I64, nullable))
+                }
+                "cast" => {
+                    no_options(c)?;
+                    let target = match c.args.get(1) {
+                        Some(Arg::Expr(Expr::Ident(t))) => crate::ir::expr::cast_target(t)
+                            .ok_or_else(|| {
+                                err(T7, format!("`cast` converts to a scalar type, not `{t}`"))
+                            })?,
+                        _ => {
+                            return Err(err(
+                                T7,
+                                "`cast(x, T)` takes a value and a scalar type name",
+                            ));
+                        }
+                    };
+                    let Ok([x]) = <[SExpr; 1]>::try_from(args) else {
+                        return Err(err(T7, "`cast(x, T)` takes a value and a scalar type name"));
+                    };
+                    let from = match &x.ty {
+                        Ty::Value(t) if !t.list => t.scalar,
+                        other => {
+                            return Err(err(
+                                T7,
+                                format!("`cast` converts a scalar, got {}", other.display()),
+                            ));
+                        }
+                    };
+                    // An integer literal is a number of the target's kind.
+                    let x = adapt(x, &Ty::scalar(target, false));
+                    let from = match &x.ty {
+                        Ty::Value(t) => t.scalar,
+                        _ => from,
+                    };
+                    if !crate::ir::expr::cast_converts(from, target) {
+                        return Err(err(
+                            T7,
+                            format!(
+                                "`cast` does not convert {} to {}",
+                                Ty::scalar(from, false).display(),
+                                Ty::scalar(target, false).display()
+                            ),
+                        ));
+                    }
+                    let nullable = x.ty.nullable();
+                    call(name, vec![x], Ty::scalar(target, nullable))
                 }
                 other => {
                     return Err(err(
@@ -8240,6 +8417,59 @@ fn literal_refusal(
 
 /// A branch of `if` or an argument of `coalesce` in the call's common type:
 /// a literal takes it, and another numeric value is widened to it.
+/// A registry row's call node: its arguments and result type; `can_fail`
+/// as the row declares it ([`crate::ir::expr::ScalarFunc::row_can_fail`])
+/// or as an argument does.
+fn call(name: &str, args: Vec<SExpr>, ty: Ty) -> SExpr {
+    SExpr::new(
+        SKind::Call {
+            func: name.into(),
+            args,
+            options: Vec::new(),
+        },
+        ty,
+    )
+}
+
+/// The one String argument of a string row.
+fn one_string(name: &str, args: Vec<SExpr>) -> R<[SExpr; 1]> {
+    let Ok([x]) = <[SExpr; 1]>::try_from(args) else {
+        return Err(err(T7, format!("`{name}` takes one String")));
+    };
+    if !matches!(&x.ty, Ty::Value(t) if t.scalar == ScalarType::String && !t.list) {
+        return Err(err(
+            T7,
+            format!("`{name}` takes a String, got {}", x.ty.display()),
+        ));
+    }
+    Ok([x])
+}
+
+/// An integer argument of a row, an `I64` by an explicit `Cast` where it is
+/// a narrower integer; a float or a `U64` is refused, since no `Cast`
+/// reaches `I64` without a value it cannot hold.
+fn integer_arg(name: &str, what: &str, e: SExpr) -> R<SExpr> {
+    let e = adapt(e, &Ty::scalar(ScalarType::I64, false));
+    match &e.ty {
+        Ty::Value(t)
+            if !t.list
+                && matches!(
+                    t.scalar,
+                    ScalarType::I32 | ScalarType::I64 | ScalarType::U32
+                ) =>
+        {
+            Ok(widen(e, ScalarType::I64))
+        }
+        other => Err(err(
+            T7,
+            format!(
+                "`{name}`'s {what} is an I64, I32 or U32, got {}",
+                other.display()
+            ),
+        )),
+    }
+}
+
 fn fit(e: SExpr, ty: &Ty) -> SExpr {
     let e = adapt(e, ty);
     match ty {

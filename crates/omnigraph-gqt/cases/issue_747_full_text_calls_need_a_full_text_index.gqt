@@ -75,7 +75,7 @@ query ranked($q: String) {
 --- expect error: T27: `bm25` needs a full-text index on `Doc.notes`
 
 --- query
-query lower($q: String) {
+query lowercase_query($q: String) {
     match { $d: Doc } where match_terms($d.title, terms($q, mode: any))
     return { $d.slug }
 }
@@ -88,7 +88,7 @@ query lower($q: String) {
 d.slug: String
 
 --- query
-query upper($q: String) {
+query uppercase_query($q: String) {
     match { $d: Doc } where match_terms($d.title, terms($q, mode: any))
     return { $d.slug }
 }

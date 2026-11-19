@@ -60,6 +60,7 @@ pub(crate) mod plan_source;
 pub(crate) mod push;
 mod report;
 mod run;
+mod scalar_rows;
 mod scan;
 mod search;
 mod typed_value;

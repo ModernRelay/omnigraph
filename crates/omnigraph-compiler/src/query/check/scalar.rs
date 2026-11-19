@@ -196,8 +196,17 @@ impl SExpr {
                 list: right,
             } => left.can_fail || right.can_fail,
             SKind::Not(e) | SKind::Cast(e) | SKind::IsNull { expr: e, .. } => e.can_fail,
-            SKind::Call { args, options, .. } => {
-                args.iter().any(|a| a.can_fail) || options.iter().any(|(_, a)| a.can_fail)
+            SKind::Call {
+                func,
+                args,
+                options,
+            } => {
+                args.iter().any(|a| a.can_fail)
+                    || options.iter().any(|(_, a)| a.can_fail)
+                    || ScalarFunc::from_name(func).is_some_and(|f| {
+                        let arg_types: Vec<_> = args.iter().map(|a| a.ty.expr_type()).collect();
+                        f.row_can_fail(&arg_types, &ty.expr_type())
+                    })
             }
             SKind::Lit(_)
             | SKind::Null
@@ -371,17 +380,19 @@ fn call_to_ir(func: &str, args: &[SExpr], options: &[(String, SExpr)], ty: ExprT
                 ty,
             }
         }
-        "if" | "coalesce" | "concat" | "list" => IRExpr::Call {
-            func: match func {
-                "if" => ScalarFunc::If,
-                "coalesce" => ScalarFunc::Coalesce,
-                "list" => ScalarFunc::List,
-                _ => ScalarFunc::Concat,
+        // `round`'s `digits`, filled with its default, is its second argument.
+        other => match ScalarFunc::from_name(other) {
+            Some(func) => IRExpr::Call {
+                func,
+                args: args
+                    .iter()
+                    .chain(option("digits"))
+                    .map(SExpr::to_ir)
+                    .collect(),
+                ty,
             },
-            args: args.iter().map(SExpr::to_ir).collect(),
-            ty,
+            None => unreachable!("the checker admits no scalar row `{other}`"),
         },
-        other => unreachable!("the checker admits no scalar row `{other}`"),
     }
 }
 

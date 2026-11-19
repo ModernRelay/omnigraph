@@ -32,6 +32,8 @@ use omnigraph_compiler::types::{Direction, ExprType, PropType, ScalarType};
 use omnigraph_compiler::{check_datetime_literal, date_literal_days, datetime_literal_millis};
 use serde_json::{Map, Value as Json};
 
+mod registry;
+
 /// Why the interpreter returned no rows.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Refusal {
@@ -1437,6 +1439,29 @@ impl<'a> Interpreter<'a> {
                                 _ => None,
                             },
                         ),
+                        ScalarFunc::Lower
+                        | ScalarFunc::Upper
+                        | ScalarFunc::Trim
+                        | ScalarFunc::LTrim
+                        | ScalarFunc::RTrim
+                        | ScalarFunc::Length
+                        | ScalarFunc::Left
+                        | ScalarFunc::Right
+                        | ScalarFunc::Substring
+                        | ScalarFunc::Abs
+                        | ScalarFunc::Floor
+                        | ScalarFunc::Ceil
+                        | ScalarFunc::Round
+                        | ScalarFunc::Sqrt
+                        | ScalarFunc::Exp
+                        | ScalarFunc::Ln
+                        | ScalarFunc::Log10
+                        | ScalarFunc::Power
+                        | ScalarFunc::Size
+                        | ScalarFunc::Cast => {
+                            let arg_types: Vec<&ExprType> = args.iter().map(IRExpr::ty).collect();
+                            registry::row(*func, vals, &arg_types, e.ty())?
+                        }
                         ScalarFunc::MatchTerms { mode } => {
                             let max_edits = self.max_edits(args.get(2), 0, row, env)?;
                             self.lexical(
@@ -1477,7 +1502,7 @@ fn finite_distance(d: f64) -> R<f64> {
 /// `YYYY-MM-DDTHH:MM:SS` with `.mmm` where the milliseconds are not zero, so
 /// two spellings of one instant are one value and compare as one. `None`
 /// for a string that names no instant, or a year outside `0..=9999`.
-fn canonical_datetime(s: &str) -> Option<String> {
+pub(crate) fn canonical_datetime(s: &str) -> Option<String> {
     let millis = datetime_literal_millis(s).ok()?;
     let (days, of_day) = (millis.div_euclid(86_400_000), millis.rem_euclid(86_400_000));
     // Days since 1970-01-01 to the civil date (H. Hinnant's algorithm).

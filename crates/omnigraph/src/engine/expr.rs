@@ -508,6 +508,17 @@ pub(super) fn evaluate_expr(
                 }
                 values
             }
+            // The break's rows read their arguments' stored types too: a
+            // `cast` converts from its argument's.
+            IRExpr::Call { func, args, ty } if super::scalar_rows::is_row(*func) => {
+                let arrays = args
+                    .iter()
+                    .map(|arg| evaluate_expr(batch, arg, params))
+                    .collect::<Result<Vec<_>>>()?;
+                let types: Vec<&omnigraph_compiler::types::ExprType> =
+                    args.iter().map(IRExpr::ty).collect();
+                super::scalar_rows::call(*func, &arrays, &types, ty)?
+            }
             IRExpr::Call { func, args, ty } => {
                 let args = args
                     .iter()

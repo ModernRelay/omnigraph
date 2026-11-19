@@ -46,6 +46,13 @@ pub(crate) fn expr(root: &IRExpr) -> Value {
                     IRExpr::IsNull { expr, .. } => ("is_null", vec![expr]),
                     IRExpr::Cast { expr, .. } => ("cast", vec![expr]),
                     IRExpr::Neg { expr, .. } => ("neg", vec![expr]),
+                    // The registry's `cast` row is `cast_value`: `cast` is the
+                    // stored widening conversion's node.
+                    IRExpr::Call {
+                        func: omnigraph_compiler::ir::expr::ScalarFunc::Cast,
+                        args,
+                        ..
+                    } => ("cast_value", args.iter().collect()),
                     IRExpr::Call { func, args, .. } => (func.name(), args.iter().collect()),
                 };
 

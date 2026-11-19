@@ -1054,6 +1054,10 @@ fn typed_node(value: &Value) -> Result<TypedNode, String> {
     let valid_arity = match op {
         "property" | "variable" | "param" | "literal" | "alias" | "count_rows" => args.is_empty(),
         "nearest" | "aggregate" | "not" | "is_null" | "cast" | "neg" => args.len() == 1,
+        "lower" | "upper" | "trim" | "ltrim" | "rtrim" | "length" | "abs" | "floor" | "ceil"
+        | "sqrt" | "exp" | "ln" | "log10" | "size" | "cast_value" => args.len() == 1,
+        "left" | "right" | "round" | "power" => args.len() == 2,
+        "substring" => args.len() == 3,
         "search" | "match_text" | "and" | "or" | "compare" | "arith" => args.len() == 2,
         "fuzzy" => (2..=3).contains(&args.len()),
         "rrf" => (2..=4).contains(&args.len()),

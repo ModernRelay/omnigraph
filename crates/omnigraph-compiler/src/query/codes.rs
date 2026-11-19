@@ -147,6 +147,10 @@ codes! {
     // A write statement's rows give one entity's property two values
     // (the GQ 3 RFC, section 2, the sinks).
     E4 = "one statement's rows give one entity's property two values";
+    // A registry row refused a row (the GQ 3 RFC, section 2, the
+    // registry's scalar rows): the failure keeps its place, as arithmetic's.
+    E5 = "a registry row's argument is outside its domain";
+    E6 = "a value does not convert to the cast's type";
 }
 
 #[cfg(test)]
