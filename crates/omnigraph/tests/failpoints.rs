@@ -1578,7 +1578,7 @@ async fn issue_1331_optimize_company_only(db: &Session) {
         .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap()
-        .tables;
+        .datasets;
     let after = helpers::snapshot_main(db).await.unwrap();
     let company = stats
         .iter()
@@ -1715,7 +1715,7 @@ async fn issue_1331_optimize_person_only(db: &Session) -> u64 {
         .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap()
-        .tables;
+        .datasets;
     let after = helpers::snapshot_main(db).await.unwrap();
     let person = stats
         .iter()
@@ -1840,6 +1840,96 @@ async fn insert_into_a_table_optimize_compacted_meanwhile_keeps_the_compaction_i
     );
     let names = collect_column_strings(&read_table(&db, "node:Person").await, "name");
     assert!(names.iter().any(|name| name == "Eve"));
+}
+
+/// An insert staged before an `optimize` publication cannot be carried once
+/// `cleanup` has collected a link of the run's chain: the links before the
+/// pinned tip are named by no `__manifest` version, so the collector deletes
+/// them (each link's files first, then its manifest), and the chain can no
+/// longer be read down to the insert's captured pin. The insert then treats
+/// the table as changed and prepares again from the current pin, as it did
+/// before a chain was read, instead of failing with the missing link's
+/// storage error. A sweep interrupted before it deleted the manifests leaves
+/// each link's manifest, which holds the link's transaction, so that chain
+/// still reads and the insert is carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn insert_prepares_again_when_cleanup_collected_a_link_of_the_optimize_chain() {
+    for (sweep, expected_reprepares, expected_carried) in [
+        ("complete", 1, 0),
+        ("interrupted before its manifests", 0, 1),
+    ] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(init_and_load(&dir).await);
+        issue_1331_fragment_person(&db, "early").await;
+        // On a branch its process holds, the insert sees another handle's
+        // publication under the gates and tries to carry over it. That handle
+        // runs the maintenance, so the writer's own holds no cached copy of
+        // the chain and reads it from storage.
+        db.claim_branch_writer("main").await.unwrap();
+        let other = Arc::new(helpers::session(
+            Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap(),
+        ));
+        let captured = helpers::pinned_version(&db, "main", "node:Person").await;
+
+        let write = {
+            let db = Arc::clone(&db);
+            async move {
+                mutate_main(
+                    &db,
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+                )
+                .await
+                .map(|_| ())
+            }
+        };
+        let during = {
+            let other = Arc::clone(&other);
+            async move {
+                issue_1331_optimize_person_only(&other).await;
+                let tip =
+                    helpers::open_pinned_dataset_for_test(&other, "main", "node:Person").await;
+                let link = tip.read_transaction().await.unwrap().unwrap().read_version;
+                assert_ne!(
+                    link, captured,
+                    "optimize must chain a link between the captured pin and its tip"
+                );
+                let person_uri = node_table_uri(&other, "Person").await;
+                let swept = if sweep == "complete" {
+                    other.cleanup_as(keep_one(), None).await.unwrap()
+                } else {
+                    let _fp = catalog::CLEANUP_SWEEP_PRE_MANIFEST_DELETE.fire_always();
+                    other.cleanup_as(keep_one(), None).await.unwrap()
+                };
+                let person = swept
+                    .iter()
+                    .find(|stat| stat.type_key == "node:Person")
+                    .expect("cleanup reports node:Person");
+                let link_present = detached_versions(&person_uri).await.contains(&link);
+                if sweep == "complete" {
+                    assert!(
+                        person.error.is_none() && !link_present,
+                        "cleanup must collect the chain's unpinned link: {person:?}"
+                    );
+                } else {
+                    assert!(
+                        person.error.is_some() && link_present,
+                        "the interrupted sweep must leave the link's manifest: {person:?}"
+                    );
+                }
+            }
+        };
+        let (outcome, reprepares, carried) = issue_1331_park_write(&db, write, during).await;
+        outcome.unwrap_or_else(|error| panic!("{sweep} sweep: the insert failed: {error}"));
+        assert_eq!(reprepares, expected_reprepares, "{sweep} sweep");
+        assert_eq!(carried, expected_carried, "{sweep} sweep");
+        assert_eq!(count_rows(&db, "node:Person").await, 7, "{sweep} sweep");
+        let names = collect_column_strings(&read_table(&db, "node:Person").await, "name");
+        assert!(names.iter().any(|name| name == "Eve"), "{sweep} sweep");
+    }
 }
 
 /// The fragment count of `table_key`'s Lance dataset at `version`.
@@ -2119,12 +2209,12 @@ async fn issue_1331_optimize_only(db: &Session, table_key: &str) {
         .optimize_as(
             None,
             omnigraph::db::OptimizeRequest::default()
-                .with_tables([table_key])
+                .with_datasets([table_key])
                 .with_authority(omnigraph::db::AuthorityCapture::UnderGates),
         )
         .await
         .unwrap()
-        .tables;
+        .datasets;
     let stat = stats
         .iter()
         .find(|s| s.type_key == table_key)
@@ -5609,7 +5699,7 @@ async fn optimize_pre_publish_failure_leaves_no_residue() {
         .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .expect("the retry re-plans from the pins")
-        .tables;
+        .datasets;
     assert!(
         stats.iter().any(|stat| stat.committed()),
         "the retry compacts what the failed attempt staged again"
@@ -5702,7 +5792,7 @@ async fn optimize_lost_publish_acknowledgement_leaves_published_detached_pins() 
         .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap()
-        .tables;
+        .datasets;
     assert!(
         stats
             .iter()
@@ -5825,7 +5915,7 @@ node Embedding {
         .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .unwrap()
-        .tables;
+        .datasets;
     let work = stats
         .iter()
         .find(|stat| stat.type_key == "node:Work")
@@ -5893,7 +5983,7 @@ async fn optimize_table_failure_fails_only_that_table_and_publishes_the_rest() {
             .unwrap()
     };
     let failed = report
-        .tables
+        .datasets
         .iter()
         .filter(|stat| stat.outcome == omnigraph::db::TableOptimizeOutcome::Failed)
         .collect::<Vec<_>>();
@@ -5905,7 +5995,7 @@ async fn optimize_table_failure_fails_only_that_table_and_publishes_the_rest() {
         "{failed:?}"
     );
     let published = report
-        .tables
+        .datasets
         .iter()
         .find(|stat| stat.committed())
         .expect("the other table publishes");
@@ -5952,7 +6042,7 @@ async fn optimize_table_failure_fails_only_that_table_and_publishes_the_rest() {
         .await
         .unwrap();
     let compacted = retry
-        .tables
+        .datasets
         .iter()
         .filter(|stat| stat.committed())
         .map(|stat| stat.type_key.as_str())
@@ -5961,6 +6051,305 @@ async fn optimize_table_failure_fails_only_that_table_and_publishes_the_rest() {
         compacted,
         [failed.type_key.as_str()],
         "the next run compacts the failed table: {retry:?}"
+    );
+}
+
+/// The fold and the index build are separate links. When the build fails
+/// after the fold committed, the fold still publishes, whether or not a
+/// rewrite came before it: the table is `optimized` with the reason
+/// `index_failed`, keeps the reason for an unrelated pending index, and
+/// publishes the rebuilt index. The next run builds the index that failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn optimize_keeps_a_tables_fold_when_its_index_build_fails() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let schema = "node Doc {\n    slug: String @key\n    n: I64 @index\n    embedding: Vector(8)? @index\n    secondary: Vector(8)? @index\n}\n";
+    let db = helpers::session(Omnigraph::init(&uri, schema).await.unwrap());
+    // The scalar indexes build. Both vector columns start out empty.
+    db.load_jsonl(
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"n\":1}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"n\":2}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let pending = db.ensure_indices_as(None).await.unwrap();
+    assert_eq!(
+        pending.len(),
+        2,
+        "both vector indexes are pending: {pending:?}"
+    );
+    let secondary = pending
+        .iter()
+        .find(|entry| entry.property == "secondary")
+        .expect("the secondary vector has no training data");
+    // Rows with vectors, in a second fragment the built indexes do not cover:
+    // the fold has work, and the vector index can now be built.
+    db.load_jsonl(
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"n\":3,\"embedding\":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"n\":4,\"embedding\":[0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1]}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let doc = |snapshot: &omnigraph::db::Snapshot| snapshot.dataset("node:Doc").unwrap().clone();
+    let before = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let table = before.open_dataset("node:Doc").await.unwrap();
+    assert!(
+        matches!(
+            table.index_coverage("n").await.unwrap(),
+            omnigraph::IndexCoverage::Degraded { .. }
+        ),
+        "the appended fragment lags the index"
+    );
+    assert!(!table.has_vector_index("embedding").await.unwrap());
+
+    let request = || omnigraph::db::OptimizeRequest::default().with_datasets(["node:Doc"]);
+    let report = {
+        // The table crosses the seam once per index link: its fold first,
+        // then its index build.
+        let _failpoint = catalog::OPTIMIZE_BEFORE_INDEX_LINK.fire_once_at(2);
+        let probes = omnigraph::instrumentation::IndexBuildProbes::rendezvous(2);
+        let request = request().with_concurrency(omnigraph::db::OptimizeConcurrency::new(1, 2));
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            omnigraph::instrumentation::with_index_build_probes(
+                probes.clone(),
+                Box::pin(db.optimize_as(None, request)),
+            ),
+        )
+        .await
+        .expect("the identity and n BTREE folds must overlap")
+        .unwrap();
+        assert_eq!(probes.entered(), 2, "both lagging BTREEs were rebuilt");
+        report
+    };
+    assert!(report.graph_commit_id.is_some(), "{report:?}");
+    let stat = &report.datasets[0];
+    assert_eq!(
+        stat.outcome,
+        omnigraph::db::TableOptimizeOutcome::Optimized,
+        "{stat:?}"
+    );
+    assert_eq!(stat.reason(), Some("index_failed"), "{stat:?}");
+    assert!(stat.pending_indexes.contains(secondary), "{stat:?}");
+    let index_failure = stat
+        .index_failure
+        .as_ref()
+        .unwrap_or_else(|| panic!("the build's failure is reported: {stat:?}"));
+    assert!(
+        index_failure
+            .to_string()
+            .contains("optimize.before_index_link"),
+        "{index_failure}"
+    );
+    let after = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    // Lance 13 plans no compaction across fragments an index covers
+    // differently, so this run may hold no rewrite; the fold is published
+    // either way.
+    assert_eq!(
+        doc(&after).published_dataset_version,
+        doc(&before).published_dataset_version + 1 + u64::from(stat.fragments_removed > 0),
+        "the fold, and the rewrite if the run had one, are the links published"
+    );
+    let table = after.open_dataset("node:Doc").await.unwrap();
+    assert!(
+        matches!(
+            table.index_coverage("n").await.unwrap(),
+            omnigraph::IndexCoverage::Indexed
+        ),
+        "the fold that committed before the failure is published"
+    );
+    assert!(
+        !table.has_vector_index("embedding").await.unwrap(),
+        "the build that failed is not"
+    );
+    assert_eq!(helpers::count_rows(&db, "node:Doc").await, 4);
+
+    // The next run finds the table folded and builds the vector index.
+    let retry = db.optimize_as(None, request()).await.unwrap();
+    let stat = &retry.datasets[0];
+    assert!(stat.committed(), "{stat:?}");
+    assert_eq!(stat.reason(), None, "{stat:?}");
+    assert!(stat.index_failure.is_none(), "{stat:?}");
+    assert!(stat.pending_indexes.contains(secondary), "{stat:?}");
+    let retried = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let table = retried.open_dataset("node:Doc").await.unwrap();
+    assert!(table.has_vector_index("embedding").await.unwrap());
+    assert!(matches!(
+        table.index_coverage("n").await.unwrap(),
+        omnigraph::IndexCoverage::Indexed
+    ));
+    assert_eq!(helpers::count_rows(&db, "node:Doc").await, 4);
+}
+
+/// A table's rewrite and its index link are independent derived state: when
+/// the index link fails after the rewrite committed, the rewrite still
+/// publishes, and the table is `optimized` and reports the failure, instead
+/// of the finished rewrite being discarded and paid for again by every run
+/// until the index builds. The next run stages only the index link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn optimize_publishes_a_tables_rewrite_when_its_index_link_fails() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    use lance::index::DatasetIndexExt;
+
+    seed_two_productive_optimize_tables(&uri).await;
+    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let pin = |snapshot: &omnigraph::db::Snapshot, key: &str| {
+        snapshot.dataset(key).unwrap().published_dataset_version
+    };
+    let snapshot_before = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+
+    let report = {
+        let _failpoint = catalog::OPTIMIZE_BEFORE_INDEX_LINK.fire_always();
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap()
+    };
+    assert!(report.graph_commit_id.is_some(), "{report:?}");
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 1,
+        "the rewrites publish in one commit"
+    );
+    let snapshot_after = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    for key in ["node:Company", "node:Person"] {
+        let stat = report
+            .datasets
+            .iter()
+            .find(|stat| stat.type_key == key)
+            .unwrap();
+        assert_eq!(
+            stat.outcome,
+            omnigraph::db::TableOptimizeOutcome::Optimized,
+            "{stat:?}"
+        );
+        assert!(stat.fragments_removed > 1, "{key} was compacted: {stat:?}");
+        assert!(stat.failure.is_none(), "{stat:?}");
+        let index_failure = stat
+            .index_failure
+            .as_ref()
+            .unwrap_or_else(|| panic!("{key} reports its index link's failure: {stat:?}"));
+        assert_eq!(
+            index_failure.completion_evidence(),
+            Some(omnigraph::error::CompletionEvidence::Unpublished),
+            "{index_failure}"
+        );
+        assert!(
+            index_failure
+                .to_string()
+                .contains("optimize.before_index_link"),
+            "{index_failure}"
+        );
+        assert_eq!(
+            stat.reason(),
+            Some("index_failed"),
+            "{key}: the outcome carries the typed reason: {stat:?}"
+        );
+        assert_eq!(
+            pin(&snapshot_after, key),
+            pin(&snapshot_before, key) + 1,
+            "{key}: the rewrite is the one link published"
+        );
+        let table = helpers::open_pinned_dataset_for_test(&db, "main", key).await;
+        assert_eq!(table.get_fragments().len(), 1, "{key} is compacted");
+        assert!(
+            table.load_indices().await.unwrap().iter().all(|index| {
+                index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|bitmap| bitmap.is_empty())
+            }),
+            "{key}: no index was built"
+        );
+    }
+    // A table with no rewrite has nothing to publish without its index link:
+    // that failure is the table's.
+    for stat in report
+        .datasets
+        .iter()
+        .filter(|stat| !stat.type_key.starts_with("node:"))
+    {
+        assert!(stat.index_failure.is_none(), "{stat:?}");
+        assert_eq!(stat.reason(), None, "{stat:?}");
+        assert!(!stat.committed(), "{stat:?}");
+    }
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 4);
+    assert_eq!(helpers::count_rows(&db, "node:Company").await, 4);
+
+    // Only the index build remains. Even when its subsequent coverage read
+    // fails, the published pin must include that build.
+    let request =
+        || omnigraph::db::OptimizeRequest::default().with_datasets(["node:Company", "node:Person"]);
+    let retry = {
+        let _failpoint = catalog::FULL_TEXT_COVERAGE_READ.fire_always();
+        db.optimize_as(None, request()).await.unwrap()
+    };
+    assert!(retry.graph_commit_id.is_some(), "{retry:?}");
+    let built = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    for key in ["node:Company", "node:Person"] {
+        let stat = retry
+            .datasets
+            .iter()
+            .find(|stat| stat.type_key == key)
+            .unwrap();
+        assert!(stat.committed(), "{stat:?}");
+        assert_eq!(stat.fragments_removed, 0, "{key}: nothing left to compact");
+        assert_eq!(pin(&built, key), pin(&snapshot_after, key) + 1);
+        assert_eq!(stat.reason(), Some("index_failed"), "{stat:?}");
+        assert!(
+            stat.index_failure
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("index.full_text_coverage_read"),
+            "{stat:?}"
+        );
+        let table = helpers::open_pinned_dataset_for_test(&db, "main", key).await;
+        assert!(
+            table.load_indices().await.unwrap().iter().any(|index| {
+                index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| !bitmap.is_empty())
+            }),
+            "{key}: its declared indexes are built"
+        );
+    }
+    let healthy = db.optimize_as(None, request()).await.unwrap();
+    assert!(
+        healthy.graph_commit_id.is_none(),
+        "index build repeated: {healthy:?}"
+    );
+    assert!(
+        healthy
+            .datasets
+            .iter()
+            .all(|stat| stat.outcome == omnigraph::db::TableOptimizeOutcome::Unchanged)
     );
 }
 
@@ -6006,7 +6395,7 @@ async fn optimize_cancelled_mid_run_publishes_nothing_and_the_next_run_does() {
     assert_eq!(report.graph_commit_id, None, "{report:?}");
     for key in ["node:Company", "node:Person"] {
         let stat = report
-            .tables
+            .datasets
             .iter()
             .find(|stat| stat.type_key == key)
             .unwrap();
@@ -6016,7 +6405,7 @@ async fn optimize_cancelled_mid_run_publishes_nothing_and_the_next_run_does() {
             "{stat:?}"
         );
     }
-    assert!(report.tables.iter().all(|stat| !stat.committed()));
+    assert!(report.datasets.iter().all(|stat| !stat.committed()));
     assert_eq!(
         db.list_commits(Some("main")).await.unwrap().len(),
         commits_before,
@@ -6028,7 +6417,7 @@ async fn optimize_cancelled_mid_run_publishes_nothing_and_the_next_run_does() {
         .await
         .unwrap();
     assert_eq!(
-        next.tables.iter().filter(|stat| stat.committed()).count(),
+        next.datasets.iter().filter(|stat| stat.committed()).count(),
         2,
         "{next:?}"
     );
@@ -6103,8 +6492,8 @@ async fn optimize_cancelled_while_queued_for_the_gates_returns_without_them() {
     );
     assert!(report.graph_commit_id.is_none());
     assert_eq!(report.gate_hold, std::time::Duration::ZERO);
-    assert!(!report.tables.is_empty());
-    for stat in &report.tables {
+    assert!(!report.datasets.is_empty());
+    for stat in &report.datasets {
         assert_eq!(
             stat.outcome,
             omnigraph::db::TableOptimizeOutcome::Deferred(omnigraph::db::DeferReason::Cancelled),
@@ -6228,9 +6617,9 @@ async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrit
             .expect("optimize task hung")
             .unwrap()
             .unwrap();
-        assert_eq!(report.tables.len(), 12, "{report:?}");
+        assert_eq!(report.datasets.len(), 12, "{report:?}");
         let deferred = report
-            .tables
+            .datasets
             .iter()
             .filter(|stat| {
                 matches!(
@@ -6246,7 +6635,7 @@ async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrit
         );
         assert_eq!(report.resume_at, None, "planning {planning}");
         assert_eq!(
-            report.tables[0].outcome,
+            report.datasets[0].outcome,
             omnigraph::db::TableOptimizeOutcome::Optimized,
             "planning {planning}: {report:?}"
         );
@@ -6431,7 +6820,7 @@ async fn optimize_captures_its_authority_under_the_gates_when_asked() {
         "the capture under the gates is the attempt's authority: {report:?}"
     );
     assert!(
-        report.tables.iter().any(|stat| stat.committed()),
+        report.datasets.iter().any(|stat| stat.committed()),
         "the seeded compaction work must publish: {report:?}"
     );
     assert_eq!(
@@ -6457,7 +6846,7 @@ async fn optimize_captures_its_authority_under_the_gates_when_asked() {
     );
     assert!(
         report
-            .tables
+            .datasets
             .iter()
             .any(|stat| stat.type_key == "node:Person" && stat.committed()),
         "Person was rewritten on top of the concurrent write: {report:?}",

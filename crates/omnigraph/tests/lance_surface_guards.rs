@@ -9274,7 +9274,7 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
         .await
         .unwrap();
     let person = stats
-        .tables
+        .datasets
         .iter()
         .find(|stat| stat.type_key == "node:Person")
         .expect("optimize reports the Person table");
@@ -9737,5 +9737,101 @@ async fn column_patch_keeps_blob_files_row_ids_and_key_index_coverage_issue_1264
             vec![(id.clone(), expected)],
             "{id}: the kept index finds the row once, with its patched value"
         );
+    }
+}
+
+// --- Guard: an untrainable vector column is `Error::Unprocessable` ---------
+//
+// `TableStore::stage_index_fold` rebuilds a lagging vector index
+// whole and skips, as pending index work, exactly the column Lance cannot
+// train: it matches the typed `lance::Error::Unprocessable` of the uncommitted
+// build and treats every other failure as an error, so a storage fault during
+// a rebuild is never reported as a column that "cannot train". Lance 13 raises
+// `Unprocessable` only from vector training (`train_kmeans` and the PQ
+// trainers), when the finite, non-null vectors are fewer than the centroids to
+// train; a column whose vectors are all null or all non-finite has none. A
+// column with at least one such vector builds, even with fewer vectors than
+// partitions. When this goes red the variant or the training rule moved:
+// re-derive the fold's skip from the new one before changing the test.
+#[tokio::test]
+async fn vector_index_build_without_trainable_vectors_is_unprocessable_lance_13() {
+    use arrow_array::{BooleanArray, FixedSizeListArray, Float32Array};
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    const DIMENSION: usize = 4;
+    const ROWS: usize = 8;
+
+    /// A nullable vector column whose first `valid` rows are non-null and
+    /// hold `value` in every component.
+    async fn vector_dataset(uri: &str, valid: usize, value: f32) -> Dataset {
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(item.clone(), DIMENSION as i32),
+                true,
+            ),
+        ]));
+        let validity = BooleanArray::from((0..ROWS).map(|row| row < valid).collect::<Vec<_>>());
+        let vectors = FixedSizeListArray::new(
+            item,
+            DIMENSION as i32,
+            Arc::new(Float32Array::from(vec![value; ROWS * DIMENSION])),
+            Some(validity.values().clone().into()),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    for (name, valid, value, partitions, trainable) in [
+        ("every vector null", 0, 1.0, 1, false),
+        ("every vector non-finite", ROWS, f32::NAN, 1, false),
+        ("one vector", 1, 1.0, 1, true),
+        ("fewer vectors than partitions", 3, 1.0, 4, true),
+    ] {
+        let uri = format!(
+            "{}/{}.lance",
+            dir.path().to_str().unwrap(),
+            name.replace(' ', "_")
+        );
+        let mut ds = vector_dataset(&uri, valid, value).await;
+        let params = VectorIndexParams::ivf_flat(partitions, MetricType::L2);
+        let built = ds
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("vector_idx".to_string())
+            .replace(true)
+            .execute_uncommitted()
+            .await;
+        match built {
+            Ok(_) => assert!(trainable, "{name}: Lance built an index it cannot train"),
+            Err(error) => {
+                assert!(!trainable, "{name}: {error}");
+                assert!(
+                    matches!(error, lance::Error::Unprocessable { .. }),
+                    "{name}: an untrainable column must surface as Unprocessable: {error:?}"
+                );
+            }
+        }
     }
 }

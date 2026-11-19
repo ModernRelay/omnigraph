@@ -1,0 +1,1 @@
+- Concurrent sign-ins creating the same profile preserve the successful sign-in. If a profile cannot be saved, a previously saved sign-in the CLI reused remains available.

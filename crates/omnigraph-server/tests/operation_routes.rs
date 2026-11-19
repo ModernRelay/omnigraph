@@ -344,7 +344,7 @@ async fn recorded_optimize_keeps_a_record_a_caller_reads_by_id() {
         "{terminal}"
     );
     assert!(
-        operation["outcome"]["tables"]
+        operation["outcome"]["datasets"]
             .as_array()
             .unwrap()
             .iter()
@@ -362,7 +362,7 @@ async fn recorded_optimize_keeps_a_record_a_caller_reads_by_id() {
     let (status, refused) = client
         .submit(
             "op-secret",
-            json!({ "operation_id": OPERATION_ID, "tables": ["node:Person"] }),
+            json!({ "operation_id": OPERATION_ID, "datasets": ["node:Person"] }),
         )
         .await;
     assert_eq!(status, 409, "{refused}");
@@ -465,7 +465,7 @@ async fn a_known_ending_survives_a_failed_final_write_and_a_repeat_answers_the_r
         "the kept ending is applied once the record reads again: {found}"
     );
     assert!(
-        found["operation"]["outcome"]["tables"]
+        found["operation"]["outcome"]["datasets"]
             .as_array()
             .is_some_and(|tables| tables
                 .iter()

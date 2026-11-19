@@ -3783,7 +3783,7 @@ fn carried_write_cost_rows(replay: &str) -> String {
                                 .optimize_as(None, omnigraph::db::OptimizeRequest::default())
                                 .await
                                 .unwrap()
-                                .tables;
+                                .datasets;
                             assert!(
                                 stats
                                     .iter()
@@ -7755,7 +7755,7 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                             .await
                             {
                                 Ok(report) => report
-                                    .tables
+                                    .datasets
                                     .iter()
                                     .filter_map(|table| table.failure.as_ref())
                                     .map(|err| format!("{err:?}"))

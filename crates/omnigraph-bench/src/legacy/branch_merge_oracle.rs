@@ -36,7 +36,7 @@ pub async fn initialize_local_fixture(
                 .chain((0..plan.edge_tables()).map(edge_table_key));
             for key in intended_keys {
                 let outcome = outcomes
-                    .tables
+                    .datasets
                     .iter()
                     .find(|outcome| outcome.type_key == key)
                     .ok_or_else(|| {
