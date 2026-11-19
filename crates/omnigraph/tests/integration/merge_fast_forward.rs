@@ -342,8 +342,8 @@ async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
 }
 
 /// The fast-forward validation shortcut is deliberately narrower than the
-/// provenance route. A row-local constraint still owns a projected ChangeSet
-/// scan even though publication is a pointer switch.
+/// provenance route. A row-local constraint still owns a projected validation
+/// sweep even though publication is a pointer switch.
 #[tokio::test]
 async fn pure_insert_fast_forward_retains_value_constraint_validation() {
     const SCHEMA: &str = r#"
@@ -992,32 +992,62 @@ node Beta {
 }
 "#;
 
-/// Two proven insert chains under a `@range` constraint feed one cross-table
-/// validation delta; its projected batches are charged before retention and
-/// the merge is refused before recovery arm once they cross 32 MiB.
-#[tokio::test]
-async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
-    const LIMIT: u64 = 32 * 1024 * 1024;
-    const PER_TABLE_BYTES: usize = 18 * 1024 * 1024;
+/// The same two types with the wide column under `@unique`: a uniqueness
+/// check judges a group's values across the whole delta, so merge validation
+/// keeps them until judgment ends.
+const WIDE_UNIQUE_VALIDATION_SCHEMA: &str = r#"
+node Alpha {
+    key: String @key
+    payload: String @unique
+    size: I32
+    @range(size, 0..100)
+}
 
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let main = helpers::session(Omnigraph::init(uri, WIDE_VALIDATION_SCHEMA).await.unwrap());
-    main.branch_create("feature").await.unwrap();
+node Beta {
+    key: String @key
+    payload: String @unique
+    size: I32
+    @range(size, 0..100)
+}
+"#;
 
-    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+/// Bytes of the wide `payload` value in each of Alpha and Beta: individually
+/// under the 32 MiB merge validation ceiling, together over it.
+const WIDE_PAYLOAD_BYTES: usize = 18 * 1024 * 1024;
+
+/// One row per type on `branch`, each in its own load: an `alpha` Alpha
+/// holding `a` repeated, a `beta` Beta holding `b` repeated.
+async fn load_wide_payload_rows(db: &Session, branch: &str) {
     for (type_name, key, fill) in [("Alpha", "alpha", 'a'), ("Beta", "beta", 'b')] {
-        let payload = fill.to_string().repeat(PER_TABLE_BYTES);
+        let payload = fill.to_string().repeat(WIDE_PAYLOAD_BYTES);
         let row = serde_json::json!({
             "type": type_name,
             "data": { "key": key, "payload": payload, "size": 1 },
         })
         .to_string();
-        feature
-            .load("feature", &row, LoadMode::Append)
-            .await
-            .unwrap();
+        db.load(branch, &row, LoadMode::Append).await.unwrap();
     }
+}
+
+/// Two proven insert chains whose wide column is `@unique` feed one
+/// cross-table validation delta; the key columns the validator keeps are
+/// charged as each batch is swept, and the merge is refused before recovery
+/// arm once they cross 32 MiB.
+#[tokio::test]
+async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
+    const LIMIT: u64 = 32 * 1024 * 1024;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = helpers::session(
+        Omnigraph::init(uri, WIDE_UNIQUE_VALIDATION_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    main.branch_create("feature").await.unwrap();
+
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+    load_wide_payload_rows(&feature, "feature").await;
 
     let before = snapshot_main(&main).await.unwrap();
     let before_manifest = before.graph_manifest_version();
@@ -1050,9 +1080,9 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
                 ref resource,
                 limit: LIMIT,
                 actual,
-            } if resource == "branch-merge retained validation delta bytes" && actual > LIMIT
+            } if resource == "branch-merge retained validation key bytes" && actual > LIMIT
         ),
-        "wide cross-table validation delta must fail loudly, got {error:?}"
+        "wide cross-table validation keys must fail loudly, got {error:?}"
     );
     assert_eq!(
         probes.proven_insert_history_read_calls(),
@@ -1103,6 +1133,72 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
         !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
         "validation rejection must happen before recovery sidecar arm"
     );
+}
+
+/// #1427: merge validation sweeps its delta from storage a batch at a time
+/// and keeps only key columns, so a value that only a row-local check reads
+/// is never retained, however wide. The same 36 MiB of `payload` that a
+/// `@unique` refuses above sweeps through the `@range` check here, past the
+/// 32 MiB ceiling, and merges: as a fast forward over proven inserts, and as
+/// a three-way merge, once main diverges on both types, over staged deltas.
+#[tokio::test]
+async fn branch_merge_validation_streams_wide_non_key_columns_issue_1427() {
+    const LIMIT: u64 = 32 * 1024 * 1024;
+
+    for three_way in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let main = helpers::session(Omnigraph::init(uri, WIDE_VALIDATION_SCHEMA).await.unwrap());
+        main.branch_create("feature").await.unwrap();
+        if three_way {
+            for type_name in ["Alpha", "Beta"] {
+                let row = serde_json::json!({
+                    "type": type_name,
+                    "data": { "key": "on_main", "payload": "short", "size": 2 },
+                })
+                .to_string();
+                main.load("main", &row, LoadMode::Append).await.unwrap();
+            }
+        }
+        let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+        load_wide_payload_rows(&feature, "feature").await;
+
+        let probes = MergeWriteProbes::default();
+        let merged = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+            .await
+            .unwrap_or_else(|error| panic!("three_way={three_way}: {error:?}"));
+        assert_eq!(
+            merged.outcome,
+            if three_way {
+                MergeOutcome::Merged
+            } else {
+                MergeOutcome::FastForward
+            },
+            "three_way={three_way}"
+        );
+        assert!(
+            probes.validation_scan_batches() >= 2,
+            "three_way={three_way}: both wide rows must be swept by validation"
+        );
+        assert!(
+            probes.validation_scan_projected_bytes() > LIMIT,
+            "three_way={three_way}: validation must sweep more than the retained-key ceiling"
+        );
+        for (type_name, key, fill) in [("Alpha", "alpha", 'a'), ("Beta", "beta", 'b')] {
+            let table_key = format!("node:{type_name}");
+            assert_eq!(
+                count_rows(&main, &table_key).await,
+                if three_way { 2 } else { 1 },
+                "three_way={three_way}: {table_key} rows"
+            );
+            let payload = node_string_value(&main, type_name, key, "payload")
+                .await
+                .flatten()
+                .unwrap_or_else(|| panic!("three_way={three_way}: {table_key} {key} merged"));
+            assert_eq!(payload.len(), WIDE_PAYLOAD_BYTES);
+            assert!(payload.chars().all(|value| value == fill));
+        }
+    }
 }
 
 /// Regression for iss-branch-merge-ordered-scan-row-cap, adopt-fallback route:

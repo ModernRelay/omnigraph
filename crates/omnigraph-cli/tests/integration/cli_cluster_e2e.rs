@@ -117,7 +117,8 @@ fn cluster_e2e_s3_direct_root_deploys_unlocks_and_maintains_issue_1163() {
         "--json",
     ])));
     assert_eq!(observed["lookup"], deployed);
-    let lock_id = observed["lock_id"].as_str().unwrap().to_owned();
+    // The converged apply released its lock on S3 too (#1359).
+    assert!(observed["lock_id"].is_null(), "{observed}");
     let replayed = parse_stdout_json(&output_success(&mut rooted(&[
         "cluster",
         "apply",
@@ -127,7 +128,7 @@ fn cluster_e2e_s3_direct_root_deploys_unlocks_and_maintains_issue_1163() {
         "--json",
     ])));
     assert_eq!(replayed, deployed, "a terminal ID is lookup only");
-    unlock(&lock_id);
+    assert!(status()["lock_id"].is_null());
 
     let plan = parse_stdout_json(&output_success(
         rooted(&["cluster", "plan", "--json", "--config"]).arg(temp.path()),
@@ -152,8 +153,16 @@ fn cluster_e2e_s3_direct_root_deploys_unlocks_and_maintains_issue_1163() {
     );
     assert!(status()["lock_id"].is_null());
 
+    // The graph's applied policy judges maintenance by its actor.
     for maintenance in [
-        vec!["optimize", "--graph", "knowledge", "--json"],
+        vec![
+            "optimize",
+            "--graph",
+            "knowledge",
+            "--as",
+            "act-operator",
+            "--json",
+        ],
         vec![
             "cleanup",
             "--graph",
@@ -162,6 +171,8 @@ fn cluster_e2e_s3_direct_root_deploys_unlocks_and_maintains_issue_1163() {
             "1",
             "--confirm",
             "--yes",
+            "--as",
+            "act-operator",
             "--json",
         ],
     ] {
@@ -628,7 +639,11 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
         ])));
         assert_eq!(status["lookup"], deployed);
         assert_eq!(status["next_sequence"], 3);
-        let lock_id = status["lock_id"].as_str().unwrap();
+        // The converged apply released its lock (#1359); a later direct writer
+        // that stopped without release holds the one recovery must name.
+        assert!(status["lock_id"].is_null(), "{status}");
+        let lock_id = "later-writer-lock";
+        write_cluster_lock(temp.path(), lock_id, "graph_operation");
         let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
         let lock_before = fs::read(temp.path().join("__cluster/lock.json")).unwrap();
         let refused = output_failure(&mut rooted(&[

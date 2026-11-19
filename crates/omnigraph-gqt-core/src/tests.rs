@@ -353,7 +353,7 @@ fn a_fault_section_is_refused() {
 }
 
 const DST_RUNNER: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person {\n    name: String @key\n}\n";
-const BLOCK: &str = "--- concurrent\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 put __manifest/, r1, w1\n";
+const BLOCK: &str = "--- concurrent scripted\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 put __manifest/, r1, w1\n";
 const BLOCK_EXPECT: &str = "--- expect\nw1: ok\nr1: ok\n";
 
 #[test]
@@ -367,52 +367,106 @@ fn a_concurrent_block_parses_with_its_bare_expect() {
     };
     assert_eq!(step.ordinal, 1);
     assert_eq!(step.sessions.len(), 2);
-    assert_eq!(step.sessions[0].kind, SessionKind::Mutation);
-    assert_eq!(step.sessions[1].kind, SessionKind::Query);
+    assert!(matches!(step.sessions[0].kind, SessionKind::Mutation));
+    assert!(matches!(step.sessions[1].kind, SessionKind::Query));
     assert_eq!(step.sessions[0].name, "add");
     assert_eq!(step.order.len(), 3);
     assert_eq!(case.source_lines.get(&1), Some(&15));
 }
 
+const ENGINE_RUNNER: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Person {\n    name: String @key\n}\n";
+
 #[test]
-fn a_concurrent_block_refuses_what_it_cannot_run() {
-    let refused = |block: &str, expect: &str| {
-        refusal("block", &format!("{HDR}{DST_RUNNER}{SEED}{block}{expect}"))
+fn a_block_without_a_script_is_free_running_on_every_host() {
+    let block = "--- concurrent\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{block}{BLOCK_EXPECT}");
+    let case = parse_case("free", &text).unwrap();
+    assert!(!case.needs_dst());
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
     };
-    assert!(refused(BLOCK, "--- expect ok\n").contains("`--- expect` is bare"));
+    assert!(step.is_free_running());
+    assert!(step.order.is_empty());
+    assert_eq!(step.sessions.len(), 2);
+    assert_eq!(step.sessions[0].group, "w1");
+    assert_eq!(step.sessions[0].label, "w1");
+    assert_eq!(case.plain_passes(), 2);
+    assert!(PlainHost.admit_case(&case).is_ok());
+}
+
+#[test]
+fn a_worker_count_declares_one_session_per_worker_under_one_label() {
+    let block = "--- concurrent\nwriter x3 on w${worker}: query put() { insert Person { name: \"bob\" } }\nreader: query all() { match { $p: Person } return { $p.name } }\n";
+    let expect = "--- expect\nwriter: error: conflict\nreader: ok\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{block}{expect}");
+    let case = parse_case("workers", &text).unwrap();
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
+    };
+    let labels: Vec<&str> = step.sessions.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels, ["writer.0", "writer.1", "writer.2", "reader"]);
+    let branches: Vec<&str> = step.sessions.iter().map(|s| s.branch.as_str()).collect();
+    assert_eq!(branches, ["w0", "w1", "w2", "main"]);
+    assert!(step.sessions.iter().take(3).all(|s| s.group == "writer"
+        && s.expect
+            == SessionExpect::Error {
+                needle: "conflict".into()
+            }));
+    assert_eq!(step.sessions[3].expect, SessionExpect::Ok);
+    let nine = parse_case(
+        "nine",
+        &format!(
+            "{HDR}{ENGINE_RUNNER}{SEED}--- concurrent\nwriter x9: query put() {{ insert Person {{ name: \"bob\" }} }}\n--- expect\nwriter: ok\n"
+        ),
+    )
+    .unwrap();
+    assert_eq!(nine.plain_passes(), concurrent::PLAIN_PASSES);
+    let over = admit_workers(&nine).unwrap_err();
     assert!(
-        refused(BLOCK, "--- expect\n# note\nw1: ok\nr1: ok\n")
-            .contains("`#` lines are refused inside the expect section")
+        over.contains("at most 8 workers under one label; step 1 declares 9"),
+        "{over}"
     );
-    assert!(
-        refused(BLOCK, "--- params\n{}\n--- expect\nw1: ok\nr1: ok\n").contains("takes no params")
+    assert!(PlainHost.admit_case(&nine).is_err());
+}
+
+#[test]
+fn a_recipe_or_a_merge_is_a_session_statement() {
+    let recipe = "--- concurrent\nwriter x3: load generate: v1 seed: 42 mode: append\n  tables:\n    - kind: node\n      name: Person\n      rows: 4\n      commits: 1\n      columns:\n        name: {kind: key, prefix: cw-, width: 3}\nreader: query all() { match { $p: Person } return { $p.name } }\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{recipe}--- expect\nwriter: ok\nreader: ok\n");
+    let case = parse_case("recipe", &text).unwrap();
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
+    };
+    assert_eq!(step.sessions.len(), 4);
+    let SessionKind::Load(recipe) = &step.sessions[0].kind else {
+        panic!("expected a dealt recipe");
+    };
+    assert_eq!(step.sessions[2].label, "writer.2");
+    assert_eq!(step.sessions[2].worker, Worker { index: 2, count: 3 });
+    let SessionKind::Load(shared) = &step.sessions[1].kind else {
+        panic!("expected the same dealt recipe");
+    };
+    assert!(Arc::ptr_eq(recipe, shared));
+    assert!(matches!(step.sessions[3].kind, SessionKind::Query));
+
+    let merge = "--- concurrent\nmerger x2: branch merge w${worker} into main\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{merge}--- expect\nmerger: ok\n");
+    let case = parse_case("merge", &text).unwrap();
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
+    };
+    let SessionKind::Merge(merge) = &step.sessions[1].kind else {
+        panic!("expected a merge session");
+    };
+    assert_eq!(
+        *merge,
+        MergeOp {
+            source: "w1".into(),
+            into: Some("main".into()),
+            as_commit: false
+        }
     );
-    assert!(
-        refused(
-            "--- concurrent\nw1: query add($n: String) { insert Person { name: $n } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1, r1\n",
-            BLOCK_EXPECT
-        )
-        .contains("declares parameters")
-    );
-    assert!(
-        refused(
-            "--- concurrent\nw1: branch create feature\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1, r1\n",
-            BLOCK_EXPECT
-        )
-        .contains("must be a query or mutation declaration")
-    );
-    let in_loop = refused(
-        &format!("--- loop $x 1 2\n{BLOCK}"),
-        &format!("{BLOCK_EXPECT}--- endloop\n"),
-    );
-    assert!(in_loop.contains("inside a loop"), "{in_loop}");
-    assert!(
-        refused(
-            "--- concurrent extra\nw1: query a() {}\norder: w1\n",
-            BLOCK_EXPECT
-        )
-        .contains("takes no arguments")
-    );
+    assert_eq!(step.sessions[1].name, "branch merge");
 }
 
 #[test]
@@ -3194,7 +3248,7 @@ async fn open_case_store(
         .await
         .map_err(|e| format!("init failed: {e}"))?;
     let session = case_session(db, case, engine)?;
-    seed_case(&session, &fixture.seed, case.needs_indices).await?;
+    seed_case(&session, fixture, case.needs_indices).await?;
     Ok((session, uri, dir))
 }
 
@@ -3510,6 +3564,10 @@ fn a_plan_section_follows_a_load_or_mutate_steps_expect_only() {
 fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
     use CaseErrorCode::*;
     const INVALID: &[(&str, &[(CaseErrorCode, usize)])] = &[
+        (
+            "batch_bound_branches_recipe_loads_nothing",
+            &[(BatchBound, 14)],
+        ),
         ("batch_bound_commits_above_rows", &[(BatchBound, 12)]),
         ("batch_bound_commits_with_zero_rows", &[(BatchBound, 12)]),
         (
@@ -3517,6 +3575,10 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
             &[(BatchBound, 12)],
         ),
         ("bind_shape_bind_before_any_write", &[(BindShape, 14)]),
+        (
+            "body_shape_branches_count_above_the_cap",
+            &[(BodyShape, 14)],
+        ),
         ("body_shape_recipe_rows_above_the_limit", &[(BodyShape, 12)]),
         ("body_shape_restart_with_an_argument", &[(BodyShape, 20)]),
         (
@@ -3572,12 +3634,21 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
         ),
         ("query_parse_unclosed_brace", &[(QueryParse, 14)]),
         ("runner_config_timeout_as_a_word", &[(RunnerConfig, 2)]),
+        ("section_order_branches_after_a_step", &[(SectionOrder, 19)]),
         (
             "section_order_schema_after_a_step",
             &[(SectionOrder, 12), (SectionOrder, 17)],
         ),
         ("section_order_seam_before_an_expect", &[(SectionOrder, 16)]),
         ("step_kind_mutation_under_query", &[(StepKind, 14)]),
+        (
+            "substitution_placement_branches_header_names_the_marker",
+            &[(SubstitutionPlacement, 14)],
+        ),
+        (
+            "substitution_placement_branches_recipe_names_the_loop",
+            &[(SubstitutionPlacement, 21)],
+        ),
         (
             "substitution_placement_in_a_step_body",
             &[(SubstitutionPlacement, 16)],

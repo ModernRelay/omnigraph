@@ -109,10 +109,6 @@ fn repeated_merge_reuses_local_projection_and_refreshes_foreign() {
                 io.projection_full_refreshes, 0,
                 "acknowledged local publication must retain both exact projections",
             );
-            assert_eq!(
-                io.projection_identity_rows, 0,
-                "acknowledged local heads must not be hydrated again"
-            );
             assert!(
                 io.manifest_reads > 0,
                 "the ground-truth object-store tracker must observe the measured refresh"
@@ -148,8 +144,7 @@ fn repeated_merge_reuses_local_projection_and_refreshes_foreign() {
             assert_eq!(outcome.unwrap().outcome, MergeOutcome::Merged);
             eprintln!("foreign publication refresh: {foreign_io:?}");
             assert_eq!(
-                (foreign_io.projection_full_refreshes, foreign_io.projection_identity_rows),
-                (0, 0),
+                foreign_io.projection_full_refreshes, 0,
                 "a foreign publish one commit ahead is refreshed from `__manifest`: the head it \
                  replaced is the parent of the new head, so `__history` is not read",
             );

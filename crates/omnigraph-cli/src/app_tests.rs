@@ -25,6 +25,7 @@ async fn login_uses_the_default_profile_without_starting_onboarding_issue_1115()
             &mut io::empty(),
             false,
             &mut stdout,
+            false,
             &mut stderr,
         )
         .await
@@ -62,6 +63,7 @@ async fn managed_target_add_uses_the_resolved_default_profile_issue_1115() {
             &mut io::empty(),
             false,
             &mut Vec::new(),
+            false,
             &mut Vec::new(),
         )
         .await
@@ -101,6 +103,7 @@ async fn login_never_creates_or_overwrites_a_profile_implicitly() {
                 &mut io::empty(),
                 terminal,
                 &mut Vec::new(),
+                false,
                 &mut stderr,
             )
             .await;
@@ -118,6 +121,67 @@ async fn login_never_creates_or_overwrites_a_profile_implicitly() {
             );
             assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
         }
+    }
+}
+
+#[test]
+fn onboarding_only_reads_an_answer_for_human_terminal_output() {
+    for terminal in [false, true] {
+        for json in [false, true] {
+            let mut input = io::empty();
+            assert_eq!(
+                matches!(
+                    super::onboarding_choice(&mut input, terminal, json),
+                    crate::managed::OrganizationChoice::Ask(_)
+                ),
+                terminal && !json
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn profile_creation_emits_a_managed_refusal_through_the_cli() {
+    let home = tempfile::tempdir().unwrap();
+    for json in [false, true] {
+        let mut arguments = vec![
+            "omnigraph",
+            "login",
+            "--create-profile",
+            "work",
+            "--organization",
+            "bad id",
+        ];
+        if json {
+            arguments.push("--json");
+        }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = super::execute(
+            crate::invocation::parse_from(arguments).unwrap(),
+            crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+            &mut io::empty(),
+            true,
+            &mut stdout,
+            false,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completion.code(), 2);
+        if json {
+            let refusal: Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(refusal["type"], "organization_invalid");
+            assert!(refusal["detail"].is_string());
+        } else {
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains("organization_invalid:")
+            );
+        }
+        assert!(!home.path().join("config.yaml").exists());
     }
 }
 
@@ -183,6 +247,7 @@ async fn argument_refusal_help_and_success_return_without_terminating_the_caller
             &mut io::empty(),
             false,
             &mut out,
+            false,
             &mut Vec::new(),
         )
         .await
@@ -248,6 +313,7 @@ async fn handled_lint_failure_allows_a_following_successful_invocation() {
                 &mut io::empty(),
                 false,
                 stdout,
+                false,
                 &mut stderr,
             )
             .await;
@@ -1197,6 +1263,7 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
         &mut FailedInput,
         false,
         &mut stdout,
+        false,
         &mut stderr,
     )
     .await
@@ -1352,6 +1419,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
         &mut io::empty(),
         false,
         &mut stdout,
+        false,
         &mut stderr,
     )
     .await
@@ -1694,11 +1762,23 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let results = state["deployment_results"].as_array().unwrap();
             assert_eq!(results.len(), 1);
             let id = results[0]["id"].as_str().unwrap();
-            let lock = status.lock_id.as_deref().unwrap();
             let message = format!("{error:#}");
             assert!(message.contains(id), "{message}");
-            assert!(message.contains(lock), "{message}");
+            assert!(message.contains("Admission lock: "), "{message}");
             assert!(!message.contains("\"disposition\""));
+            // The converged apply released its lock (#1359). A later owner that
+            // stops without release leaves the lock the checks below deliver.
+            assert!(status.lock_id.is_none());
+            let later = omnigraph_cluster::acquire_cluster_admission(
+                root,
+                omnigraph_cluster::ClusterAdmissionPurpose::GraphOperation,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let lock = later.lock_id().to_owned();
+            drop(later);
+            let lock = lock.as_str();
             let receipt = omnigraph_cluster::deployment_status(root, Some(id), &caller)
                 .await
                 .unwrap()
@@ -1723,7 +1803,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let lock_bytes = std::fs::read(&lock_path).unwrap();
 
             // Resubmitting the known identity observes the original result even
-            // while admission is retained. It must not run the deployment again.
+            // while another owner's admission is retained. It must not run the deployment again.
             let mut observed = Vec::new();
             let mut custody = Vec::new();
             apply_source(
@@ -1876,6 +1956,7 @@ async fn run_cli(args: &[&str]) -> (Completion, String, String) {
         &mut io::empty(),
         false,
         &mut stdout,
+        false,
         &mut stderr,
     )
     .await
@@ -2063,6 +2144,64 @@ async fn base_is_refused_where_the_command_has_no_clone_form() {
         "{stdout}{stderr}"
     );
     assert!(!temp.path().join("clone").exists());
+}
+
+/// `--format arrow` writes the result batches of a query run on direct
+/// storage. A served target, whose server answers JSON, refuses it from the
+/// target's kind alone: before the credential is read (the token's variable
+/// is unset) and before any request.
+#[tokio::test]
+async fn query_format_arrow_refuses_a_served_target_before_credentials_issue_1428() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "version: 1\ntargets:\n  prod:\n    kind: server\n    endpoint: https://data.example\n    default_graph: knowledge\n    auth: {provider: token, source: {env: OMNIGRAPH_ISSUE_1428_UNSET_TOKEN}}\n",
+    )
+    .unwrap();
+    for verb_args in [
+        vec![
+            "-e",
+            "query people() { match { $p: Person } return { $p.slug } }",
+        ],
+        vec!["stored_people"],
+    ] {
+        let parsed = crate::invocation::parse_from(
+            [
+                "omnigraph",
+                "query",
+                "--target",
+                "prod",
+                "--format",
+                "arrow",
+            ]
+            .into_iter()
+            .chain(verb_args.iter().copied()),
+        )
+        .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = super::execute(
+            parsed,
+            crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+            &mut io::empty(),
+            false,
+            &mut stdout,
+            false,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert_eq!(completion.code(), 1, "{verb_args:?}: {stderr}");
+        assert!(stdout.is_empty(), "{verb_args:?}");
+        assert_eq!(
+            stderr,
+            "target_kind_unsupported: `--format arrow` writes the result batches of a query \
+             run on direct storage; target 'prod' is served, and its server answers JSON: use \
+             `--format json` or `--format jsonl`\n",
+            "{verb_args:?}"
+        );
+    }
 }
 
 /// Every file under `root` with its length, so a tree can be compared

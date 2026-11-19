@@ -623,9 +623,14 @@ impl ValidateCostInputs {
 }
 
 /// Pick the cheaper supported access. Ties and unknown statistics retain
-/// Probe; cardinality and retained-edge checks only implement Probe, apart
-/// from an overwrite's cardinality scan under a minimum, which the optimizer
-/// chooses before costing.
+/// Probe; cardinality checks only implement Probe, apart from an
+/// overwrite's cardinality scan under a minimum, which the optimizer chooses
+/// before costing. A retained-edge check is planned as Probe, but the engine
+/// chooses its read per edge fragment at run time
+/// (`validate::RemovalEdgeReads`): it probes the fragments a BTREE on each
+/// probed endpoint covers and reads the others once, whole, matched in
+/// memory. The plan cannot choose for it, because the removed ids are known
+/// only when the overwrite runs.
 pub fn choose_validate_access(check: &ValidateCheck, inputs: ValidateCostInputs) -> ValidateAccess {
     if matches!(
         check,
@@ -646,8 +651,9 @@ pub fn choose_validate_access(check: &ValidateCheck, inputs: ValidateCostInputs)
 /// answers the key list and no fragment reads a filter. Lance hands an
 /// unindexed or partly covered table one copy of the whole key list per
 /// uncovered fragment, and its probe reads the id column whole anyway, so
-/// every other coverage scans. Cardinality and retained-edge checks only
-/// implement `Probe`.
+/// every other coverage scans. Cardinality checks only implement `Probe`;
+/// a retained-edge check is planned as `Probe` and split by coverage at run
+/// time (see [`choose_validate_access`]).
 pub fn coverage_validate_access(
     check: &ValidateCheck,
     coverage: ValidateIndexCoverage,

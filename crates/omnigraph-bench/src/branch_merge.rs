@@ -2449,7 +2449,7 @@ mod tests {
             Arc::new(Omnigraph::init(uri, &fixture.schema).await.unwrap()),
             SessionSettings::default(),
         );
-        omnigraph_gqt_core::seed_case(&session, &fixture.seed, case.needs_indices)
+        omnigraph_gqt_core::seed_case(&session, fixture, case.needs_indices)
             .await
             .unwrap();
         let db = omnigraph_gqt_core::execute_steps(

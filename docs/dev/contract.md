@@ -62,7 +62,7 @@ distribution is their sum.
 | Sync | Keeps part of the model in step with a system that stays the record of its own data (CRM, ticketing, mail and calendar, documents, code hosting, a warehouse), as a pipeline it runs or supervises: backfill, then incremental pulls or pushed events, then reconciliation; and feeds other systems from the graph | Idempotent keyed upserts under the source's external identity, every few minutes or per event, mostly rows that did not change; the source's deletes propagated; whole-source reruns; outbound, an ordered read of everything that changed since a cursor |
 | Author | Records what it learned, decided and did: observations, claims with their evidence, confidence and competing alternatives, decisions with reasons, tasks, plans and checkpoints it can resume from, status, and links between things that already exist | Small attributed commits of one to tens of entities, many per task, on the task's branch, append-mostly, each tied to the sources it came from; the most common write and the densest edges |
 | Derive | Computes over what is there: classifies, scores, resolves duplicates, summarizes groups of related entities, infers edges, and consolidates what it observed into new, cited insights (what the agent-memory literature calls reflection [27]) | Reads wide across a type, writes many small updates or a batch per run; periodic, often as a pipeline; later reads depend on how fresh its output is |
-| Coordinate | Shares work with other agents and people: sees who is working on what, claims a task so that no one else takes it, hands one off, checks whether something was already done, avoids writing over a concurrent change | Reads of others' activity; an exclusive claim that exactly one of several claimants wins; conditional writes from the commit it read; one branch per task, so one writer per branch by construction of the work, not by a lock; merges into shared state; a conflict re-decided from a fresh read, not retried blind |
+| Coordinate | Shares work with other agents and people: sees who is working on what, claims a task so that no one else takes it, hands one off, checks whether something was already done, avoids writing over a concurrent change | Reads of others' activity; an exclusive claim that exactly one of several claimants wins; conditional writes from the commit it read; one branch per task, so one writer per task branch by construction of the work, not by a lock, while the shared branch takes merges and several independent sync writers; a conflict re-decided from a fresh read, not retried blind |
 | React | Wakes on a change instead of on a schedule: a new document to extract, a task assigned, a claim contradicted, a branch ready for review, a sync that landed. Reads what changed, decides, and writes, which may wake others | A standing wait on the change feed of a branch, selective enough that an agent wakes only for what concerns it: filtered by type and operation and by a condition over the changed state; delivery in commit order, each change at least once, soon after its commit; a read of the changed entities at that commit; a write conditional on it. Chains of reactions make write load follow write load |
 | Verify and correct | Checks work before others rely on it, its own and other agents': against sources, against constraints, by an independent checker before a branch is integrated; finds drift and duplicates, fixes errors. Unchecked work by parallel agents compounds errors, which makes this larger than it looks [21] [22] | Targeted reads by key and by external identity; a check that runs over a branch and gates its merge; corrections as updates or new facts; deletes rarely; constraint refusals as signal |
 | Propose and review | Puts a change up for a person or another agent to accept; reads what a branch would change; approves, merges, or discards | Branch diffs and merge previews; a merge or a branch delete; unpublished commits that wait |
@@ -80,35 +80,12 @@ sync and owned by its source, authored knowledge is owned by the graph, and
 the two provenances stay distinguishable, because agents read both together
 and write only the second, or propose changes to the first.
 
-### What the evidence says
-
-The hypothesis was checked against the literature on 2026-11-16 ([sources](#sources)).
-No source measures several agents sharing one persistent model, so the
-premise is untested, not confirmed.
-
-- **Supported.** Agents explore schema and metadata heavily, issue many
-  redundant and partial reads, and create and discard branches at many times
-  the human rate [18] [24]. Shared structured state coordinates better than
-  messages passed between agents [20] [23]. Verification is a leading cause
-  of multi-agent failure, and independent checking contains errors that
-  unchecked agents amplify [21] [22]. Long-term memory needs time-aware
-  retrieval and facts that are superseded, not erased [28]. Coordination
-  through a shared medium needs change-triggered activation with a
-  condition, an atomic claim, and hypotheses held side by side with
-  confidence, as blackboard systems and tuple spaces established [25] [26].
-- **Against.** Production multi-agent systems are mostly several readers and
-  one writing lead per task, and strong practitioners argue against agents
-  writing in parallel at all [23]; measured gains from adding agents are
-  small on average and negative for sequential work [22]. The read-to-write
-  ratio is unmeasured, and memory pipelines that write on every turn would
-  bring it near one to one. Most agent-memory systems are schemaless: that
-  the shared model is **typed** is this page's bet, argued from
-  standardization as the way to make one party's output usable by another
-  [29], not an observation.
-- **Outside the store.** Scheduling and control (which agent runs next, and
-  on what) is a separate component in every coordination architecture
-  [25]. The contract owes it the facts it decides from, visible in the
-  state: pending work, claims and who is working on what.
+The hypothesis was checked against the literature on 2026-11-16. No source
+measures several agents sharing one persistent model, so the premise is
+untested, not confirmed, and that the model is typed is this page's bet.
+[Evidence and sources](contract-evidence.md) holds what supports it, what
+argues against it, how it sits against OLTP, OLAP, HTAP and LTAP, and the
+sources behind the bracketed numbers on this page.
 
 ### Quantities
 
@@ -118,35 +95,9 @@ premise is untested, not confirmed.
 | Read capacity | Tens of agents at several retrieve reads a step is more read load than one process should carry, and it grows with agents while write load grows with tasks; reads are served by several processes | One process serves a graph's reads with headroom at the hypothesized actors |
 | Mix | Reads outnumber writes by one to two orders of magnitude; most reads are lookups and exploration, largely overlapping across agents, and a real minority, one in ten or more, are analytical reads over whole types; authored commits dominate writes by count, acquisition and sync by rows; deletes are rare everywhere | Analytical reads become the majority; a write on every agent turn brings reads and writes near one to one; updates or deletes become common; result sets pass 10^4 rows |
 | Volume | 10^4 to 10^7 entities per graph, set by the sources; 10 to 100 types; small scalar properties, text bodies, embeddings on a few types, Blobs for documents; agent batches of 10^2 to 10^5 records, whole-source imports and backfills to 10^7 records and 10^4 documents | 10^8 entities or 10^3 types; batches past 10^6; sync as streaming at thousands of events a second |
-| Rate | 10^2 to 10^4 commits a day; two kinds of branch: tens of task branches with hundreds of commits each and one writer, and many more short speculative branches of a few commits, most of them discarded, about ten live per task and nested deep [24]; incremental sync every few minutes; an additive schema change about weekly; history retained long and read as often as the present | Commit rate or branch count up an order; several writers on one branch; conflict retries common; destructive schema changes frequent; history read rarely; branches rarely abandoned |
+| Rate | 10^2 to 10^4 commits a day; two kinds of branch: tens of task branches with hundreds of commits each and one writer, and many more short speculative branches of a few commits, most of them discarded, about ten live per task and nested deep [24]; incremental sync every few minutes; an additive schema change about weekly; history retained long and read as often as the present | Commit rate or branch count up an order; several writers on one task branch; conflict retries common; destructive schema changes frequent; history read rarely; branches rarely abandoned |
 | Reaction | Tens of standing consumers per graph (agents, pipelines, downstream systems), each filtered to a few types; a change reaches its consumers within seconds of its commit; reaction chains a few steps deep | Hundreds of consumers; sub-second delivery needed; reaction storms |
 | Targets | No latency is measured yet. As a starting hypothesis for a warm handle in the store's region: a retrieve read answers in about 100 ms at the median and under 1 s at the tail; (agent-memory systems report 0.15 to 0.5 s for a search, embedding and network included [30]); a small commit publishes in under 1 s; creating and discarding a branch costs about what a small commit costs; one branch publishes its commits serially, a few a second at most, which the hypothesized rate needs on average at one every several seconds, with bursts on shared state from merges and syncs | Measured figures replace these; shared state needs sustained tens of commits a second |
-
-### Against the usual categories
-
-OLTP, OLAP, HTAP and LTAP each name a workload and usually imply a contract
-and a mechanism ([systems](systems.md#appendix-a-terminology-expansion)).
-Omnigraph is defined by its three parts above, not by a bundle, and matches
-each bundle in some claims and not in others. The first three are categories
-of the literature; LTAP is one vendor's architecture.
-
-| Category | What it bundles | Where Omnigraph matches | Where it does not |
-|---|---|---|---|
-| OLTP [10] [11] | Work: many short transactions that read or update a few records by key, on current data; transaction throughput is the measure. Contract: atomic, isolated transactions, serializable or weaker; often interactive sessions, though some engines run stored procedures one at a time. Mechanism: row storage, B-tree indexes, a write-ahead log, updates in place under locks or multi-version rows | The footprint: small reads by key and small commits on a critical path, each seeing current data; serial execution per branch, as in the engines that run transactions one at a time [12] | The transaction is one request, not an interactive session. A branch's commits are serialized by a compare-and-swap on object storage, so a commit costs object-store round trips and one branch sustains a few commits a second, the rate Delta Lake reports for the same mechanism [15], not thousands. Write concurrency comes from branches |
-| OLAP [10] [16] | Work: few complex ad hoc queries that scan, join and aggregate much historical data consolidated from many sources, loaded in batches; response time is the measure. Contract: read-mostly; a consistent snapshot of the last load, refreshed periodically; often a multidimensional model. Mechanism: star schemas, bitmap indexes, materialized views, parallel scans; later columnar storage and vectorized execution; in the cloud, compute apart from storage | The mechanism: columnar immutable files, batch loads, compute apart from storage; analytical reads are part of the work | The scale, the model and the lag: analytical reads cover one graph of up to 10^7 entities, not a warehouse consolidating many sources; there is no multidimensional model and no pre-aggregated summary; an analytical read sees the latest commit, the one a lookup sees, not the last load |
-| HTAP [12] [13] [14] | Work: transactions and analytical queries on the same data at once, analytics on the latest committed data. Contract: transactions plus analytical reads of a fresh, consistent snapshot; the named requirements are freshness and performance isolation. Mechanism, two families: one copy with snapshots, or a row store plus a columnar replica kept consistent by replication | The mixed read work on one system over one copy, every read at a fresh snapshot: the single-copy family, not the replicated one | With no replica there is no replication lag. Isolation of lookups from analytical reads would come from separate stateless reader processes over the same files, not from separate representations, and it is unmeasured. The transactional half is weaker than OLTP as above, so HTAP's hard case, analytics beside a high write rate, is not this work |
-| LTAP [17] | Databricks' term (June 2026), Lake Transactional/Analytical Processing: separate transactional and analytical engines over one durable copy in open table formats on object storage. Postgres writes with full transactions through a replicated log and a page server that transcodes pages to columns; analytical engines read the same files, scaled independently, at a log position plus the tail not yet written out; row pages are a cache. It unifies at the storage layer, not in one engine | The shape: one copy in an open format on object storage, one write path, readers that scale out, no export to a second system | The unit and the engines: one engine and a typed graph commit published by compare-and-swap, with no log and no row tier, against multi-statement Postgres transactions over a replicated log. Its branches are copies for experiments; Omnigraph's merge three-way. Retrieval over structure, vectors and text is a first-class read, which the term does not name |
-
-What none of the four names, and what this work is mostly made of: isolation
-by branch and merge instead of by lock or session; history read as often as
-the present, where those systems keep it for rollback and reproduction;
-ranked retrieval as the common read; and readers and writers that are
-programs acting on what they just read. Two existing labels sit closer than
-the four and are still only shorthand: data versioning systems, which share
-the branch, commit and merge contract [9], and hybrid serving and analytical
-processing, which names selective latency-bound reads beside analytics. Use
-a category word only as shorthand for the row it points at; a design argues
-from the clauses and the work, never from "it is an HTAP system".
 
 ### What we optimize for
 
@@ -162,8 +113,8 @@ not what was sent.
 Read capacity scales out by adding reader processes; write capacity on one
 branch does not, and need not at the hypothesized rate. Reads that overlap, across agents or across one agent's attempts, should
 share work. An analytical read
-may cost more than a lookup but not in proportion to history, and a lookup
-is never slowed to serve one. Warehouse-scale scans and single-branch write
+may cost more than a lookup but not in proportion to history, and no design
+makes lookups slower to make analytical reads faster. Warehouse-scale scans and single-branch write
 throughput beyond the hypothesized rate are not optimized for, and a design
 may trade them away.
 
@@ -277,8 +228,8 @@ at any instruction; half a step in the shared model misleads every other
 agent.*
 
 - One mutation query, one load batch, one merge, one schema apply or one Blob
-  write becomes visible as one graph commit or not at all. No statement,
-  table or type is visible on its own.
+  write becomes visible in exactly one graph commit, wholly or not at all. No
+  statement, table or type is visible on its own.
 - The commit is the transaction. Not promised: an interactive
   `BEGIN`/`ROLLBACK`, or anything atomic across two commits, two branches or
   two graphs. A multi-step change is a branch, made atomic by its merge.
@@ -297,9 +248,13 @@ workspace others do not see until it is ready.*
   publication [1]. A read names one branch head or one commit, resolves it
   once, and sees exactly that commit, every type together, for its whole
   life; at a head it returns the latest commit published before it answers,
-  which includes every commit acknowledged before it began. A write takes
+  which includes every commit acknowledged before it began. A read whose
+  commit `cleanup` removes before the read ends is refused with a typed
+  error, never answered from part of the commit; retention is chosen longer
+  than the longest read and the longest pinned commit. A write takes
   effect against the head at its publication: that is the head it read, or
-  it was prepared again on the newer head, or it is refused. The reads and
+  it was carried over commits that changed no row, or prepared again on the
+  newer head, or it is refused. The reads and
   commits of one branch are therefore strictly serializable in commit order
   [2]. A write whose outcome is unknown counts as still pending: it is
   concurrent with everything after it until history shows whether it landed.
@@ -399,7 +354,9 @@ stop for a decision where they did, never pick silently.*
 - A merge can be gated: the target names a check that the branch must pass,
   run by a party other than its author, and a branch that fails it does not
   merge.
-- Conflicts and violations are reported per entity, typed, and resolved by
+- Conflicts are reported per entity and violations per entity or, for
+  `cardinality_violation` and `value_constraint_violation`, per type with
+  the entity named in the message; all are typed, and resolved by
   writing to a branch and merging again. Not promised: automatic resolution,
   a precedence rule (ours, theirs or last-writer-wins), or a merge of more
   than two heads.
@@ -516,9 +473,10 @@ change what is part of the state, not of each client.*
   its first durable effect, so a denied write leaves the graph unchanged, and
   a served graph with no policy denies every authenticated request. Policy
   scope is the graph, the action, the branch, and the types and properties
-  an agent may read or change. Not promised: per-row policy, or any policy
-  on the CLI's direct handle, whose caller is trusted as the operator; an
-  embedded caller may install one.
+  an agent may read or change. Not promised: per-row policy, or policy
+  on a direct handle to a standalone graph. A direct write to a graph inside
+  a cluster is checked against that graph's applied policy, for the actor
+  the caller declares; an embedded caller may install a policy itself.
 
 Owners: [search](../user/search/index.md),
 [policy](../user/operations/policy.md),
@@ -535,7 +493,8 @@ is a deliberate limit says so.
 |---|---|---|
 | 1 | A load with a base onto a missing branch publishes the branch first, so a failed load can leave a new empty branch (`effects: partial`) | The branch and its first rows in one commit, or neither |
 | 1 | An update or keyed upsert with unchanged values still publishes a commit, and so does a load with no rows. Only a mutation that stages nothing publishes nothing | A write that changes no row publishes nothing, which continuous sync needs |
-| 2 | Within one process a read's capture can wait behind an exclusive schema apply, branch create or handle open, and behind the writes that operation waits for | Reads never wait for writers |
+| 2 | Within one process, reads and writes on any branch can wait behind an exclusive schema or branch-control operation, and behind the writes that operation waits for | No read or write waits for a control write on another branch |
+| 2, 6 | Nothing coordinates `cleanup` with readers: it retains by `--keep` and `--older-than` only, so it can remove files that an in-flight read or a pinned commit in another process still needs. A later read of a removed commit is refused as reclaimed; a read caught mid-flight fails with a storage error | A typed refusal in both cases, and a stated rule for choosing retention |
 | 2 | One mutation-capable writer process per cluster is supported. Branch create and delete, schema apply, dropping a proposal and `cleanup` are safe only from one process, and schema apply's only-`main` check can miss another process's branch create | Any number of writer processes, every write decided by the same compare-and-swap |
 | 2, 5 | A process that claimed a branch's writer epoch (embedded engine only) reads its bound branch without checking the head: it is stale once another process replaces it or deletes the branch, and can answer some reads with no storage request while the store is unreachable | Deliberate: the owner trades the check for latency. Wanted is a bounded staleness the owner can state |
 | 2 | Read replicas are not a supported topology: a served process takes the cluster's writer admission, so one server serves a cluster, and only read-only CLI commands read beside it | A read-only serving mode that takes no writer admission, so read capacity grows with processes |
@@ -548,6 +507,7 @@ is a deliberate limit says so.
 | 4 | Types and properties carry descriptions, but nothing searches the schema by meaning | *Derived.* Search over the schema's names and descriptions |
 | 4 | Schema apply runs against `main` only, with no other branch live, outside review by branch | A schema change proposed on a branch and merged, with branches live |
 | 5 | Graph writes carry no request identity: a lost answer is resolved by reading history, and only a conditional write is safe to repeat. Recorded operations do carry one | *Derived.* An idempotency identity on every write |
+| 5 | A served request can raise four resource settings up to the larger of the server's value and the built-in default, so a budget an operator set below the default can be raised back to it | The server's value is the ceiling |
 | 5 | Replacing a serving process is stop, then start; `optimize` and schema apply hold writer gates while they run | Continuous service through replacement and maintenance |
 | 6 | A commit records an actor only; a change feed is polled and filters by kind, type and operation, with no condition over state; there is no revert, and undoing is a hand-written inverse commit | *Derived.* Task and reason on the commit, a waiting feed with a condition, revert as an operation |
 | 6 | A branch listing shows head, origin and times, not owner, task or touched entities | *Derived.* Work in progress visible in the state |
@@ -566,8 +526,10 @@ is a deliberate limit says so.
 
 `.pg` is the schema language and `.gq` the read, mutation, load and branch
 language; both are typed and checked against the accepted schema before any
-effect. The three doors share one operation inventory, one error code set and
-one `disposition` object; the HTTP contract is versioned by one request header
+effect. HTTP, MCP and the CLI share one operation inventory, one error code set and
+one `disposition` object, which the CLI also builds for its embedded writes;
+the embedded Rust API returns the engine's typed error with its completion
+evidence, from which those are derived; the HTTP contract is versioned by one request header
 and the CLI exit code follows the disposition. Storage is open Lance plus a
 few control objects under one root, readable by Lance tools as a view, with
 no promise about what a foreign reader infers from it. Storage-format and
@@ -585,15 +547,15 @@ wire compatibility are owned by [versioning](versioning.md).
 - **Clocks.** Timestamps come from writer clocks and are informational:
   ordering authority is the branch history. Time only orders listings of
   proposals and snapshots and selects what `cleanup --older-than` retains.
-- **Topology.** The target is one mutation-capable writer process per
-  cluster and any number of stateless reader processes over the same root,
-  added and removed freely. The writer half is the supported topology today
-  ([support boundaries](invariants.md#current-support-boundaries)); the
-  reader half is wanted.
-  Ordinary writes and merges stay correct across processes; the control
-  writes listed under [today and the target](#today-and-the-target) do not.
-- **Trust.** The server boundary is trusted to resolve actors. An embedded or
-  direct caller is trusted as the operator who gave it the root.
+- **Topology.** The target is any number of writer and reader processes
+  over one root, added and removed freely. Today one mutation-capable writer
+  process per cluster is supported
+  ([support boundaries](invariants.md#current-support-boundaries)), and the
+  only readers beside it are read-only CLI commands; see
+  [today and the target](#today-and-the-target).
+- **Trust.** The server boundary is trusted to resolve actors. A direct or
+  embedded caller is trusted to declare its actor truthfully, since it holds
+  the root; on a cluster graph that declared actor is still judged by policy.
 - **Control.** Deciding which agent runs next, and on what, is a client
   component outside the contract. The contract owes it the facts it decides
   from, readable in the state.
@@ -615,92 +577,12 @@ wire compatibility are owned by [versioning](versioning.md).
   because the engine cannot reach it: an unreached clause is a row of the
   today table. A change that would weaken a clause is a contract change:
   write the RFC first and say what the new history set admits.
+- A change that opens or closes a gap adds, edits or removes its row of the
+  today table in the same pull request. The table is the only thing between
+  a target and a false description of the engine.
 - A *derived* target is a requirement, not a design. Turning one into
   behavior takes its own RFC, which may refine the target.
 - A change tuned for a different workload revises W in the same pull request,
   with the measurement that moved it.
 - A user-facing document states a clause in the user's words and links here
   for the precise form; it never states a stronger or weaker one.
-
-## Sources
-
-Read in full on 2026-11-16 to ground the terms above; the number is the
-citation used in the text. The method's own sources are in
-[systems](systems.md#references-and-source-scope).
-
-1. Herlihy and Wing, "Linearizability: A Correctness Condition for
-   Concurrent Objects", TOPLAS 1990: linearizability and locality.
-2. Papadimitriou, "The Serializability of Concurrent Database Updates",
-   JACM 1979: strict serializability.
-3. Berenson et al., "A Critique of ANSI SQL Isolation Levels", SIGMOD 1995:
-   snapshot isolation, lost update, write skew. Also Adya, Liskov and
-   O'Neil, "Generalized Isolation Level Definitions", ICDE 2000.
-4. Terry et al., "Session Guarantees for Weakly Consistent Replicated
-   Data", PDIS 1994.
-5. Fekete et al., "Making Snapshot Isolation Serializable", TODS 2005:
-   predicate write skew and the read-only anomaly.
-6. Bailis et al., "Coordination Avoidance in Database Systems", PVLDB 2015:
-   invariant confluence and its table of constraints.
-7. Codd, "A Relational Model of Data for Large Shared Data Banks", CACM
-   1970: ordering and indexing dependence.
-8. Khanna, Kunal and Pierce, "A Formal Investigation of Diff3", FSTTCS
-   2007: state-based three-way merge and its properties.
-9. Maddox et al., "Decibel: The Relational Dataset Branching System", PVLDB
-   2016; Huang et al., "OrpheusDB", PVLDB 2017; Bhardwaj et al., "DataHub",
-   CIDR 2015; and the Dolt and lakeFS merge documentation: version graphs
-   and field-level or cell-level merge.
-10. Chaudhuri and Dayal, "An Overview of Data Warehousing and OLAP
-    Technology", SIGMOD Record 1997.
-11. Stonebraker and Cetintemel, "One Size Fits All: An Idea Whose Time Has
-    Come and Gone", ICDE 2005.
-12. Kemper and Neumann, "HyPer: A Hybrid OLTP&OLAP Main Memory Database
-    System Based on Virtual Memory Snapshots", ICDE 2011.
-13. Ozcan, Tian and Tozun, "Hybrid Transactional/Analytical Processing: A
-    Survey", SIGMOD 2017.
-14. Huang et al., "TiDB: A Raft-based HTAP Database", PVLDB 2020.
-15. Armbrust et al., "Delta Lake: High-Performance ACID Table Storage over
-    Cloud Object Stores", PVLDB 2020; and "Lakehouse", CIDR 2021.
-16. Codd, Codd and Salley, "Providing OLAP to User-Analysts: An IT
-    Mandate", 1993.
-17. Databricks, "Databricks Launches LTAP" (press release, 16 June 2026),
-    and R. Xin, "From monolith to Lakebase to LTAP" (30 June 2026).
-
-On the work itself, read on 2026-11-16:
-
-18. Liu et al. (UC Berkeley), "Supporting Our AI Overlords: Redesigning Data
-    Systems to be Agent-First", CIDR 2026; and Parameswaran et al.,
-    "Intelligence is Free, Now What? Data Systems for, of, and by Agents",
-    BAIR blog, 2026.
-19. Lei et al., "Spider 2.0", ICLR 2025: agent query behavior on large
-    schemas.
-20. Hong et al., "MetaGPT", ICLR 2024; Wu et al., "AutoGen", 2023: shared
-    structured pools and message-driven activation.
-21. Cemri et al., "Why Do Multi-Agent LLM Systems Fail?", NeurIPS 2025.
-22. Kim et al., "Towards a Science of Scaling Agent Systems", 2025.
-23. Anthropic, "How we built our multi-agent research system" and
-    "Effective context engineering for AI agents"; Cognition, "Don't Build
-    Multi-Agents", the opposing view.
-24. Pandis, Shamgunov and Xin, "How agentic software development will change
-    databases", Databricks, 2026 (vendor telemetry); Tagliabue and Greco,
-    "Safe, Untrusted, 'Proof-Carrying' AI Agents", 2025; Chang and Geng,
-    "SagaLLM", PVLDB 2025; Rezazadeh et al., "Collaborative Memory", 2025.
-25. Erman et al., "The Hearsay-II Speech-Understanding System", Computing
-    Surveys 1980; Han and Zhang, and Salemi et al., blackboard systems for
-    LLM agents, 2025.
-26. Gelernter, "Generative Communication in Linda", TOPLAS 1985.
-27. Park et al., "Generative Agents", UIST 2023; Packer et al., "MemGPT",
-    2023; Sumers et al., "Cognitive Architectures for Language Agents",
-    TMLR 2024; Edge et al., "From Local to Global: A GraphRAG Approach",
-    2024; Gutierrez et al., "HippoRAG", NeurIPS 2024.
-28. Rasmussen et al., "Zep: A Temporal Knowledge Graph Architecture for
-    Agent Memory", 2025; Wu et al., "LongMemEval", ICLR 2025; Maharana et
-    al., "LoCoMo", ACL 2024.
-29. Malone and Crowston, "The Interdisciplinary Study of Coordination",
-    Computing Surveys 1994; Dourish and Bellotti, "Awareness and
-    Coordination in Shared Workspaces", CSCW 1992; Ellis and Gibbs,
-    "Concurrency Control in Groupware Systems", SIGMOD 1989.
-30. Chhikara et al., "Mem0", 2025: measured memory search latency.
-
-Not grounded in a source read here: the definition of durability; the
-read-to-write ratio, the latency targets and the rate figures in the work,
-which no source measures for a shared model and which remain hypotheses.
