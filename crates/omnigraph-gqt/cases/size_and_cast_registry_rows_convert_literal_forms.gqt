@@ -333,6 +333,20 @@ query cast_from_a_vector() {
 --- expect error: T7: `cast` does not convert Vector(2) to String
 
 --- query
+query cast_to_a_vector() {
+    match { $x: C } return { cast($x.l, Vector(2)) as v }
+}
+
+--- expect error: T7: `cast` converts to a scalar type, not `Vector(2)`
+
+--- query
+query cast_to_a_node_type() {
+    match { $x: C } return { cast($x.l, C) as v }
+}
+
+--- expect error: T7: `cast` converts to a scalar type, not `C`
+
+--- query
 query cast_a_date_to_a_number() {
     match { $x: C } return { cast($x.d, I64) as v }
 }

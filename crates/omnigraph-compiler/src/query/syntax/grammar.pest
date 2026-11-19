@@ -445,7 +445,9 @@ call_args   = { call_arg ~ (("," | missing_comma_rec) ~ call_arg)* }
 call_arg    = _{ call_option | positional }
 // A scalar type name is `cast`'s second argument, `cast($x.n, I64)`.
 positional  = { !(ident ~ ":") ~ (inline_read | expr | type_arg) }
-type_arg    = @{ ("String" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32" | "F64" | "DateTime" | "Date") ~ !(ASCII_ALPHANUMERIC | "_") }
+// Any capitalized type name, so a target `cast` does not convert to
+// (`Vector(3)`, `Blob`, a node type) is the type checker's refusal.
+type_arg    = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* ~ ("(" ~ ASCII_DIGIT+ ~ ")")? ~ !(ASCII_ALPHANUMERIC | "_" | "(" | ".") }
 call_option = { ident ~ ":" ~ expr }
 keyword_call_rec = { call_keyword_word ~ "(" ~ call_args? ~ ")" }
 call_keyword_word = { call_keyword }

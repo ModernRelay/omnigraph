@@ -6458,7 +6458,7 @@ impl Ctx<'_> {
                             continue;
                         }
                         // `cast`'s target is a type name, read by its row.
-                        if name == "cast" && position == 1 && matches!(e, Expr::Ident(_)) {
+                        if name == "cast" && position == 1 {
                             continue;
                         }
                         // The lazy rows evaluate an argument only where the ones
@@ -6907,6 +6907,18 @@ impl Ctx<'_> {
                             .ok_or_else(|| {
                                 err(T7, format!("`cast` converts to a scalar type, not `{t}`"))
                             })?,
+                        // `Vector(3)` reads as a call of a capitalized name.
+                        Some(Arg::Expr(Expr::Call(t)))
+                            if t.name.starts_with(|ch: char| ch.is_ascii_uppercase()) =>
+                        {
+                            return Err(err(
+                                T7,
+                                format!(
+                                    "`cast` converts to a scalar type, not `{}`",
+                                    crate::query::syntax::print::expr(&Expr::Call(t.clone()))
+                                ),
+                            ));
+                        }
                         _ => {
                             return Err(err(
                                 T7,
