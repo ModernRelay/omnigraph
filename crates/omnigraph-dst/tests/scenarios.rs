@@ -2753,6 +2753,16 @@ fn instrument_filtered_update_cost_over_per_commit_fragments() {
 /// vector, which fits the write budget as matched, but its 8 KiB title
 /// assignment takes it past the budget at staging, so the update reads the
 /// Blob, then stages the patch.
+///
+/// The keyed writes beside them: an `insert` of a new key (`InsertNewKey`)
+/// probes the key once in its strict preflight; an `upsert` of a new key
+/// (`UpsertNewKey`) reads the stored row its key would keep values from,
+/// finds none and stages as `replace` does; an `upsert` of an existing key
+/// that omits the Blob (`UpsertKeepBlob1M`) reads that row's omitted columns,
+/// the 1 MiB Blob's bytes included, and rewrites them; one that names the
+/// Blob (`UpsertKeepScalars`) reads only the omitted scalar and vector
+/// columns; and `replace` of an existing key (`ReplaceBlob1M`) reads no
+/// stored row.
 fn update_patch_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    score: I32?\n    content: Blob?\n    emb: Vector(8)?\n}\n";
     const WIDE_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    title: String?\n    content: Blob?\n    emb: Vector(2048)?\n}\n";
@@ -2768,11 +2778,26 @@ query rewrite() {
     match { $x: Doc } where $x.slug = "d1"
     update $x set { score: 2 }
     match { $m: Marker } where $m.name = "nobody"
-    insert Doc { slug: "never", age: 0 }
+    replace Doc { slug: "never", age: 0 }
 }
 query widen($title: String) {
     match { $x: Doc } where $x.slug = "d1"
     update $x set { title: $title }
+}
+query insert_new() {
+    insert Doc { slug: "d9", age: 9 }
+}
+query upsert_new() {
+    upsert Doc { slug: "d9", age: 9 }
+}
+query upsert_keep_blob() {
+    upsert Doc { slug: "d1", age: 7 }
+}
+query upsert_keep_scalars() {
+    upsert Doc { slug: "d1", age: 7, content: null }
+}
+query replace_existing() {
+    replace Doc { slug: "d1", age: 7 }
 }
 "#;
 
@@ -2886,6 +2911,32 @@ query widen($title: String) {
             Some(12 * 1024),
             "UpdateRowsOverBudget",
         ),
+        (SCHEMA, 8, 1024 * 1024, "insert_new", None, "InsertNewKey"),
+        (SCHEMA, 8, 1024 * 1024, "upsert_new", None, "UpsertNewKey"),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "upsert_keep_blob",
+            None,
+            "UpsertKeepBlob1M",
+        ),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "upsert_keep_scalars",
+            None,
+            "UpsertKeepScalars",
+        ),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "replace_existing",
+            None,
+            "ReplaceBlob1M",
+        ),
     ] {
         rows.push_str(&labeled_cost_rows(
             format!("shared-memory://dst-update-cost-{replay}-{label}"),
@@ -2925,7 +2976,7 @@ fn keyed_write_table_size_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = "node Person {\n    slug: String @key\n    age: I32\n}\n";
     const WRITES: &str = r#"
 query insert_one() {
-    insert Person { slug: "new-0", age: 1 }
+    replace Person { slug: "new-0", age: 1 }
 }
 query update_one() {
     match { $x: Person } where $x.slug = "p0003"

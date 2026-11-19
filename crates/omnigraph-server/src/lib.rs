@@ -74,7 +74,9 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::{BranchStartRefusal, ManifestConflictDetails, ManifestErrorKind, OmniError};
+use omnigraph::error::{
+    BranchStartRefusal, KEY_CONFLICT_FIX, ManifestConflictDetails, ManifestErrorKind, OmniError,
+};
 use omnigraph::storage::normalize_root_uri;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::json_params_to_param_map;
@@ -2082,8 +2084,8 @@ fn format_key_conflict(
 ) -> String {
     let subject = graph_type_subject(entity_kind, type_name);
     entity_id.map_or_else(
-        || format!("{subject} already has this id"),
-        |entity_id| format!("{subject} already has id '{entity_id}'"),
+        || format!("{subject} already has this id{KEY_CONFLICT_FIX}"),
+        |entity_id| format!("{subject} already has id '{entity_id}'{KEY_CONFLICT_FIX}"),
     )
 }
 

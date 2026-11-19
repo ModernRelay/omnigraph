@@ -70,6 +70,11 @@ pub(crate) struct PendingTable {
     /// [`PendingMode::ColumnPatch`]: `id` and the assigned columns, schema
     /// order, the columns Lance writes.
     pub(crate) patch_columns: Vec<String>,
+    /// The ids an `insert` statement staged on a keyed table: none of them
+    /// may exist in the pinned table. While the table stays a strict insert
+    /// its preflight proves that; once another statement makes it an
+    /// upsert, these ids are probed before it stages.
+    pub(crate) strict_ids: Vec<String>,
 }
 
 impl PendingTable {
@@ -79,6 +84,7 @@ impl PendingTable {
             mode,
             batches: Vec::new(),
             patch_columns: Vec::new(),
+            strict_ids: Vec::new(),
         }
     }
 
@@ -251,6 +257,41 @@ impl MutationStaging {
         batch: RecordBatch,
     ) -> Result<()> {
         self.append(table_key, schema, mode, batch, None)
+    }
+
+    /// Append one row an `insert` statement stages on a keyed table, whose
+    /// `id` must not exist: [`Self::pending_holds_id`] has already refused one
+    /// an earlier statement staged, and the table's preflight, or the probe
+    /// of its strict ids once the table is an upsert, refuses a committed one.
+    pub(crate) fn append_strict_keyed(
+        &mut self,
+        table_key: &str,
+        schema: SchemaRef,
+        batch: RecordBatch,
+        id: String,
+    ) -> Result<()> {
+        self.append(table_key, schema, PendingMode::StrictInsert, batch, None)?;
+        if let Some(table) = self.pending.get_mut(table_key) {
+            table.strict_ids.push(id);
+        }
+        Ok(())
+    }
+
+    /// Whether an earlier statement of this write staged a row with `id` on
+    /// `table_key`.
+    pub(crate) fn pending_holds_id(
+        &self,
+        table_key: &str,
+        id_column: &str,
+        id: &str,
+    ) -> Result<bool> {
+        for batch in self.pending_batches(table_key) {
+            let ids = id_values(batch, id_column)?;
+            if (0..ids.len()).any(|row| ids.is_valid(row) && ids.value(row) == id) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Append an upsert batch whose rows are the successors, within this
@@ -897,6 +938,9 @@ enum PreparedPendingTable {
     Keyed {
         semantics: KeyedWriteSemantics,
         batch: RecordBatch,
+        /// Ids an `insert` statement staged on a table another statement
+        /// made an upsert: probed against the pinned table before staging.
+        strict_ids: Vec<String>,
     },
     Overwrite {
         batches: Vec<RecordBatch>,
@@ -969,9 +1013,11 @@ fn prepare_pending_table(
         PendingMode::Upsert => PreparedPendingTable::Keyed {
             semantics: KeyedWriteSemantics::Upsert,
             batch: dedupe_merge_batches_by_id(&table.schema, table.batches, system_columns)?,
+            strict_ids: table.strict_ids,
         },
         PendingMode::StrictInsert => PreparedPendingTable::Keyed {
             semantics: KeyedWriteSemantics::StrictInsert,
+            strict_ids: Vec::new(),
             batch: if table.batches.len() == 1 {
                 table.batches.into_iter().next().unwrap()
             } else {
@@ -997,6 +1043,7 @@ fn prepare_pending_table(
                 .collect::<Result<Vec<_>>>()?;
             PreparedPendingTable::Keyed {
                 semantics: KeyedWriteSemantics::KnownPresentColumnPatch,
+                strict_ids: Vec::new(),
                 batch: carried
                     .project(&indices)
                     .map_err(OmniError::arrow_internal)?,
@@ -1026,7 +1073,21 @@ async fn stage_pending_table(
     // Stage produces uncommitted fragments + transaction. Nothing is
     // committed until `commit_all` runs `commit_staged_detached`.
     let staged = match table {
-        PreparedPendingTable::Keyed { semantics, batch } => {
+        PreparedPendingTable::Keyed {
+            semantics,
+            batch,
+            strict_ids,
+        } => {
+            if !strict_ids.is_empty()
+                && let Some(id) = crate::table_store::TableStore::first_existing_id(
+                    ds.dataset(),
+                    &strict_ids,
+                    db.catalog().system_columns,
+                )
+                .await?
+            {
+                return Err(OmniError::key_conflict(&table_key, id));
+            }
             db.storage()
                 .stage_keyed_write(
                     ds.clone(),

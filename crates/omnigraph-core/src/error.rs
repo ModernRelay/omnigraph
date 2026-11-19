@@ -195,8 +195,16 @@ pub fn unwitnessed_graph_property_at_snapshot(table_key: &str, property: &str) -
     )
 }
 
+/// What a `key_conflict` asks of its author: a strict `insert` (or an
+/// `insert` load) met an existing key, which the two other keyed modes write.
+pub const KEY_CONFLICT_FIX: &str =
+    "; `upsert` sets the named properties of an existing entity and `replace` writes its whole row";
+
 fn format_key_conflict(type_key: &str) -> String {
-    format!("{} already has this id", graph_type_subject(type_key))
+    format!(
+        "{} already has this id{KEY_CONFLICT_FIX}",
+        graph_type_subject(type_key)
+    )
 }
 
 /// Why a branch cannot start at a graph commit. Each reason is decided before
@@ -2771,7 +2779,7 @@ mod tests {
     fn graph_facing_error_display_uses_logical_subjects() {
         assert_eq!(
             OmniError::key_conflict("node:Person", "p1").to_string(),
-            "node type 'Person' already has this id"
+            format!("node type 'Person' already has this id{KEY_CONFLICT_FIX}")
         );
         assert_eq!(
             OmniError::KeyConflict {
@@ -2779,7 +2787,7 @@ mod tests {
                 entity_id: None,
             }
             .to_string(),
-            "edge type 'Knows' already has this id"
+            format!("edge type 'Knows' already has this id{KEY_CONFLICT_FIX}")
         );
         assert_eq!(
             OmniError::HistoricalVersionReclaimed {

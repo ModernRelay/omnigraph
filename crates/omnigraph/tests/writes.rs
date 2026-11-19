@@ -665,15 +665,15 @@ async fn public_branch_apis_accept_former_system_names() {
 /// their scope local to the staged-write coverage.
 const STAGED_QUERIES: &str = r#"
 query insert_two_persons($a_name: String, $a_age: I32, $b_name: String, $b_age: I32) {
-    insert Person { name: $a_name, age: $a_age }
-    insert Person { name: $b_name, age: $b_age }
+    replace Person { name: $a_name, age: $a_age }
+    replace Person { name: $b_name, age: $b_age }
 }
 
 query insert_then_update_same_person(
     $name: String, $insert_age: I32, $update_age: I32
 ) {
-    insert Person { name: $name, age: $insert_age }
-    insert Person { name: $name, age: $update_age }
+    replace Person { name: $name, age: $insert_age }
+    replace Person { name: $name, age: $update_age }
 }
 
 query insert_two_friends($from: String, $a: String, $b: String) {
@@ -682,14 +682,14 @@ query insert_two_friends($from: String, $a: String, $b: String) {
 }
 
 query person_with_two_friends($name: String, $age: I32, $a: String, $b: String) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
     insert Knows { @src: $name, @dst: $a }
     insert Knows { @src: $name, @dst: $b }
 }
 
 query mixed_insert_and_delete($name: String, $age: I32, $victim: String) {
     match { $x: Person } where $x.name = $victim
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
     delete $x
 }
 
@@ -734,7 +734,9 @@ fn bulk_insert_mutation(rows: usize) -> String {
     let mut query = String::with_capacity(rows * 48);
     query.push_str("query bulk_insert() {\n");
     for row in 0..rows {
-        query.push_str(&format!("    insert Thing {{ key: \"mutation-{row}\" }}\n"));
+        query.push_str(&format!(
+            "    replace Thing {{ key: \"mutation-{row}\" }}\n"
+        ));
     }
     query.push_str("}\n");
     query
@@ -901,8 +903,8 @@ async fn keyed_bytes_summed_across_tables_refuse_mutation_and_every_load_door_be
         db.mutate(
             "main",
             r#"query wide($payload: String) {
-                insert Thing { key: "one", payload: $payload }
-                insert Other { key: "two", payload: $payload }
+                replace Thing { key: "one", payload: $payload }
+                replace Other { key: "two", payload: $payload }
             }"#,
             "wide",
             &params(&[("$payload", &payload)]),
@@ -967,8 +969,8 @@ async fn keyed_bytes_summed_across_tables_refuse_mutation_and_every_load_door_be
         .mutate(
             "main",
             r#"query small() {
-            insert Thing { key: "one", payload: "fits" }
-            insert Other { key: "two", payload: "fits" }
+            replace Thing { key: "one", payload: "fits" }
+            replace Other { key: "two", payload: "fits" }
         }"#,
             "small",
             &params(&[]),
@@ -1087,9 +1089,9 @@ async fn write_max_bytes_checks_inline_and_repeated_external_payloads_before_rea
     let read_probes = omnigraph::instrumentation::MergeWriteProbes::default();
     let source = r#"set write_max_bytes = 8191;
         query mixed($uri: String, $inline: Blob) {
-            insert Document { title: "one", content: $uri }
-            insert Document { title: "two", content: $uri }
-            insert Image { title: "three", content: $inline }
+            replace Document { title: "one", content: $uri }
+            replace Document { title: "two", content: $uri }
+            replace Image { title: "three", content: $inline }
         }"#;
     use base64::Engine as _;
     let inline = format!(
@@ -1845,7 +1847,7 @@ query update_note($note: String) {
     match { $x: Document } where $x.title = "wide"
     update $x set { note: $note }
     match { $m: Marker } where $m.name = "nobody"
-    insert Document { title: "never" }
+    replace Document { title: "never" }
 }
 
 query patch_note($note: String) {
@@ -2042,7 +2044,7 @@ query update_shelf($note: String) {
     match { $x: Document } where $x.shelf = "a"
     update $x set { note: $note }
     match { $m: Marker } where $m.name = "nobody"
-    insert Document { title: "never", shelf: "never" }
+    replace Document { title: "never", shelf: "never" }
 }
 
 query patch_shelf($note: String) {
@@ -2592,7 +2594,7 @@ query update_note_beside_another($note: String) {
     match { $x: Document } where $x.title = "doc"
     update $x set { note: $note }
     match { $m: Marker } where $m.name = "nobody"
-    insert Document { title: "never" }
+    replace Document { title: "never" }
 }
 
 query set_content($c: Blob?) {
@@ -3047,7 +3049,7 @@ edge Right: Hub -> Leaf
     let accepted = db
         .mutate(
             "main",
-            r#"query add() { insert Leaf { name: "after" } }"#,
+            r#"query add() { replace Leaf { name: "after" } }"#,
             "add",
             &params(&[]),
         )
@@ -3776,7 +3778,7 @@ edge Knows: Person -> Person @card(2..)
 "#;
     const MIN_CARD_QUERY: &str = r#"
 query add_person($name: String, $friend: String) {
-    insert Person { name: $name }
+    replace Person { name: $name }
     insert Knows { @src: $name, @dst: $friend }
 }
 "#;
@@ -3940,8 +3942,8 @@ query assign_blob_then_update_note(
 query upsert_then_replace_blob(
     $title: String, $first: String, $second: String
 ) {
-    insert Document { title: $title, content: $first }
-    insert Document { title: $title, content: $second }
+    replace Document { title: $title, content: $first }
+    replace Document { title: $title, content: $second }
 }
 "#;
 
@@ -5384,16 +5386,17 @@ query bump_all() {
     );
 }
 
-/// A keyed `insert` and a `merge` load replace the whole row on an existing
-/// key: every nullable property the statement or record omits becomes null,
-/// a managed Blob and a vector included, and an explicit `null` clears too.
-/// A missing required property is refused on an existing key as on a new
-/// one. Setting only named properties is `update`'s job. Pinned on main and
-/// on a branch, and across a reopen; the GQT case
-/// `issue_1278_keyed_upsert_replaces_the_whole_row.gqt` pins the scalar,
-/// list and vector rows of the mutation door.
+/// `replace` and a `merge` load replace the whole row on an existing key:
+/// every nullable property the statement or record omits becomes null, a
+/// managed Blob and a vector included, and an explicit `null` clears too. A
+/// missing required property is refused on an existing key as on a new one.
+/// Setting only named properties is `upsert`'s and `update`'s job
+/// (`upsert_keeps_omitted_blob_and_vector_issue_1278`). Pinned on main and on
+/// a branch, and across a reopen; the GQT case
+/// `issue_1278_replace_writes_the_whole_row.gqt` pins the scalar, list and
+/// vector rows of the mutation door.
 #[tokio::test]
-async fn keyed_insert_and_merge_load_replace_the_whole_row_issue_1278() {
+async fn replace_and_merge_load_replace_the_whole_row_issue_1278() {
     use arrow_array::cast::AsArray;
     use base64::Engine as _;
 
@@ -5409,7 +5412,7 @@ node Doc {
 "#;
     const WRITES: &str = r#"
 query retitle($slug: String) {
-    insert Doc { slug: $slug, title: "retitled" }
+    replace Doc { slug: $slug, title: "retitled" }
 }
 "#;
 
@@ -5508,7 +5511,7 @@ query retitle($slug: String) {
     let error = db
         .mutate(
             "main",
-            "query untitled() { insert Doc { slug: \"d2\", n: 1 } }",
+            "query untitled() { replace Doc { slug: \"d2\", n: 1 } }",
             "untitled",
             &params(&[]),
         )
@@ -5571,5 +5574,219 @@ query retitle($slug: String) {
             blob_is_null(&db, "main", "d3").await,
             "{when}: and the Blob"
         );
+    }
+}
+
+/// `upsert` on an existing key keeps every property it does not name, a
+/// managed Blob and a vector included, and an explicit `null` clears one; on
+/// a new key it creates, an omitted nullable property null. A second
+/// `upsert` of a key in the same write keeps what the first wrote. Pinned on
+/// main and on a branch, and across a reopen; the GQT case
+/// `issue_1278_upsert_keeps_omitted_properties.gqt` pins the scalar, list and
+/// vector rows.
+#[tokio::test]
+async fn upsert_keeps_omitted_blob_and_vector_issue_1278() {
+    use arrow_array::cast::AsArray;
+    use base64::Engine as _;
+
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    title: String
+    emb: Vector(3)?
+    file: Blob?
+}
+"#;
+    const WRITES: &str = r#"
+query retitle($slug: String) {
+    upsert Doc { slug: $slug, title: "retitled" }
+}
+query clear_file($slug: String) {
+    upsert Doc { slug: $slug, file: null }
+}
+query twice() {
+    upsert Doc { slug: "d4", title: "four" }
+    upsert Doc { slug: "d4", emb: [7.0, 8.0, 9.0] }
+}
+"#;
+
+    fn full_row(slug: &str, byte: u8) -> String {
+        serde_json::json!({"type": "Doc", "data": {
+            "slug": slug,
+            "title": "full",
+            "emb": [1.0, 2.0, 3.0],
+            "file": format!(
+                "base64:{}",
+                base64::engine::general_purpose::STANDARD.encode(vec![byte; 300])
+            ),
+        }})
+        .to_string()
+    }
+
+    /// `(title, emb)` of a row.
+    async fn row_state(db: &Omnigraph, branch: &str, slug: &str) -> (String, Option<Vec<f32>>) {
+        let ds = open_pinned_dataset_for_test(db, branch, "node:Doc").await;
+        let batch = ds
+            .scan()
+            .project(&["slug", "title", "emb"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let slugs = batch.column_by_name("slug").unwrap().as_string::<i32>();
+        let row = (0..batch.num_rows())
+            .find(|&row| slugs.value(row) == slug)
+            .unwrap_or_else(|| panic!("{branch}: no row {slug}"));
+        let title = batch.column_by_name("title").unwrap().as_string::<i32>();
+        let emb = batch.column_by_name("emb").unwrap().as_fixed_size_list();
+        let emb = emb.is_valid(row).then(|| {
+            emb.value(row)
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .values()
+                .to_vec()
+        });
+        (title.value(row).to_string(), emb)
+    }
+
+    async fn blob(db: &Omnigraph, branch: &str, slug: &str) -> Option<Vec<u8>> {
+        match db
+            .read_blob_at(
+                ReadTarget::branch(branch),
+                node_blob_cell("Doc", slug, "file"),
+            )
+            .await
+        {
+            Ok(_) => Some(
+                read_managed_blob_bytes(
+                    db,
+                    ReadTarget::branch(branch),
+                    node_blob_cell("Doc", slug, "file"),
+                )
+                .await,
+            ),
+            Err(error) => {
+                let text = error.to_string();
+                assert!(text.contains("is null for id"), "{branch}/{slug}: {text}");
+                None
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::session(Omnigraph::init(&uri, SCHEMA).await.unwrap());
+    let seed = [full_row("d1", 1), full_row("d2", 2), full_row("d3", 3)].join("\n");
+    db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+    db.branch_create("feature").await.unwrap();
+
+    db.mutate("main", WRITES, "retitle", &params(&[("$slug", "d1")]))
+        .await
+        .unwrap();
+    db.mutate("feature", WRITES, "retitle", &params(&[("$slug", "d2")]))
+        .await
+        .unwrap();
+    db.mutate("main", WRITES, "clear_file", &params(&[("$slug", "d3")]))
+        .await
+        .unwrap();
+    let result = db
+        .mutate("main", WRITES, "twice", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 2);
+
+    for reopened in [false, true] {
+        let db = if reopened {
+            helpers::session(Omnigraph::open(&uri).await.unwrap())
+        } else {
+            db.clone()
+        };
+        let when = if reopened {
+            "after a reopen"
+        } else {
+            "before a reopen"
+        };
+        assert_eq!(
+            row_state(&db, "main", "d1").await,
+            ("retitled".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: upsert keeps the vector it does not name"
+        );
+        assert_eq!(
+            blob(&db, "main", "d1").await,
+            Some(vec![1_u8; 300]),
+            "{when}"
+        );
+        assert_eq!(
+            row_state(&db, "feature", "d2").await,
+            ("retitled".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: the same on a branch"
+        );
+        assert_eq!(
+            blob(&db, "feature", "d2").await,
+            Some(vec![2_u8; 300]),
+            "{when}"
+        );
+        assert_eq!(
+            row_state(&db, "main", "d2").await,
+            ("full".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: main keeps the row the branch changed"
+        );
+        assert_eq!(
+            row_state(&db, "main", "d3").await,
+            ("full".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: an explicit null clears only the Blob"
+        );
+        assert_eq!(blob(&db, "main", "d3").await, None, "{when}");
+        assert_eq!(
+            row_state(&db, "main", "d4").await,
+            ("four".to_string(), Some(vec![7.0, 8.0, 9.0])),
+            "{when}: a second upsert of a key in one write keeps the first's title"
+        );
+        assert_eq!(
+            blob(&db, "main", "d4").await,
+            None,
+            "{when}: created without a Blob"
+        );
+    }
+}
+
+/// `insert` on an existing key fails with `KeyConflict` and publishes
+/// nothing, whether the key is committed, staged by an earlier statement of
+/// the write, or met while another statement made its table an upsert; the
+/// message names `upsert` and `replace`. The GQT case
+/// `keyed_insert_refuses_an_existing_key.gqt` pins the rows.
+#[tokio::test]
+async fn insert_on_an_existing_key_publishes_nothing_issue_1278() {
+    const WRITES: &str = r#"
+query committed() {
+    insert Person { name: "Alice", age: 1 }
+}
+query same_write() {
+    insert Person { name: "Zed", age: 1 }
+    insert Person { name: "Zed", age: 2 }
+}
+query beside_a_replace() {
+    replace Person { name: "Bob", age: 99 }
+    insert Person { name: "Alice", age: 1 }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let head = head_commit_id(uri).await;
+    for name in ["committed", "same_write", "beside_a_replace"] {
+        let error = db
+            .mutate("main", WRITES, name, &params(&[]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OmniError::KeyConflict { .. }),
+            "{name}: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("`upsert`") && text.contains("`replace`"),
+            "{name}: {text}"
+        );
+        assert_eq!(head_commit_id(uri).await, head, "{name} published nothing");
     }
 }

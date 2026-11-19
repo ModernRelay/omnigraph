@@ -1156,7 +1156,9 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached index batch")),
     ("exec/staging.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
-    ("exec/staging.rs", ".dataset()", 2, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
+    // The third is the read-only probe of the ids an `insert` staged on a
+    // table another statement made an upsert.
+    ("exec/staging.rs", ".dataset()", 3, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
     ("exec/mutation.rs", "commit_updates_on_branch_with_expected(", 1, MUTATION_V9),
     ("loader/mod.rs", "commit_updates_on_branch_with_expected(", 1, LOAD_V9),
     ("exec/merge.rs", "commit_updates_on_branch_with_expected(", 1, MERGE_V9),
@@ -1204,6 +1206,9 @@ durable_calls! {
     // Blob live-branch recheck: lists the table's refs to prove a vanished
     // fork before the incarnation refusal; read-only access to the handle.
     ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    // An `upsert` that omits properties reads which stored columns are Blobs
+    // before it fills the omitted cells; read-only schema access.
+    ("exec/keep_omitted.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("exec/blob_write.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
     // A delete cascade plans its edge-table reads from the edge table's index
     // coverage (`validate::RemovalEdgeReads`); read-only metadata access.

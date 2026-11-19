@@ -1,0 +1,93 @@
+# issue: none
+# notes: `insert` creates; on an existing key it fails with `key_conflict`, whose message names `upsert` and `replace`, and the write publishes nothing. The key may be committed, staged by an earlier statement of the same write, or met while another statement of the write makes the table an upsert.
+# notes: A type with no `@key` has no key to meet: inserting the same edge twice gives two parallel edges.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String
+    n: I64?
+}
+
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","title":"one","n":1}}
+{"type":"Doc","data":{"slug":"d2","title":"two","n":2}}
+
+--- mutate
+query insert_committed_key() {
+    insert Doc { slug: "d1", title: "again" }
+}
+
+--- expect error: already has
+
+--- mutate
+query insert_one_key_twice() {
+    insert Doc { slug: "d3", title: "three" }
+    insert Doc { slug: "d3", title: "three again" }
+}
+
+--- expect error: already has
+
+--- mutate
+query insert_beside_a_replace() {
+    replace Doc { slug: "d2", title: "two replaced" }
+    insert Doc { slug: "d1", title: "again" }
+}
+
+--- expect error: already has
+
+--- mutate
+query insert_new_key() {
+    insert Doc { slug: "d4", title: "four" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query cite_twice() {
+    insert Cites { @src: "d1", @dst: "d2" }
+    insert Cites { @src: "d1", @dst: "d2" }
+}
+
+--- expect affected: nodes=0 edges=2
+
+--- query
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.n }
+}
+
+--- expect unordered
+{"d.n":1,"d.slug":"d1","d.title":"one"}
+{"d.n":2,"d.slug":"d2","d.title":"two"}
+{"d.slug":"d4","d.title":"four"}
+--- expect shape
+d.slug: String
+d.title: String
+d.n: I64?
+
+--- query
+query citations() {
+    match { $a: Doc, $b: Doc, $a $c:cites $b }
+    return { $a.slug, $b.slug }
+}
+
+--- expect unordered
+{"a.slug":"d1","b.slug":"d2"}
+{"a.slug":"d1","b.slug":"d2"}
+--- expect shape
+a.slug: String
+b.slug: String

@@ -15,6 +15,7 @@ use crate::validate::PROBE_CHUNK_KEYS;
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
 use lance_select::mask::{RowAddrTreeMap, RowSetOps};
+use omnigraph_compiler::query::syntax::InsertMode;
 use omnigraph_compiler::query::value::{BinaryOp, CompOp};
 use omnigraph_compiler::settings::SessionSettings;
 use omnigraph_compiler::types::{ExprType, ScalarType};
@@ -534,7 +535,36 @@ fn edge_insert_id(
     })
 }
 
-/// Build a single-row RecordBatch from resolved assignments.
+/// Rows an `upsert` run fills at a time: the stored rows of a run's keys
+/// are read in one scan.
+const KEEP_OMITTED_RUN_ROWS: usize = 1024;
+
+/// The properties an `upsert` row leaves unnamed: every property column but
+/// the identity and endpoint columns that it does not assign.
+fn insert_omitted_cells(
+    schema: &SchemaRef,
+    assignments: &HashMap<String, Literal>,
+    system_columns: SystemColumns,
+) -> super::keep_omitted::OmittedCells {
+    let mut omitted = super::keep_omitted::OmittedCells::default();
+    for field in schema.fields() {
+        let name = field.name().as_str();
+        if name == system_columns.id || name == system_columns.src || name == system_columns.dst {
+            continue;
+        }
+        if !assignments.contains_key(name) {
+            omitted.push(name, vec![true]);
+        }
+    }
+    omitted
+}
+
+/// Build a single-row RecordBatch from resolved assignments. With
+/// `omitted`, an `upsert` row on [`super::keep_omitted::relaxed_schema`]: a
+/// property the statement does not name is a null placeholder the fill
+/// replaces from the stored row, or refuses when the key is new and the
+/// property required; without it, the row on `schema`, a missing required
+/// property refused here.
 fn build_insert_batch(
     schema: &SchemaRef,
     id: &str,
@@ -542,8 +572,13 @@ fn build_insert_batch(
     blob_properties: &HashSet<String>,
     system_columns: SystemColumns,
     write_budget: WriteBudget,
+    omitted: Option<&super::keep_omitted::OmittedCells>,
 ) -> Result<RecordBatch> {
     preflight_blob_assignments(assignments, blob_properties, 1, write_budget)?;
+    let schema = &match omitted {
+        Some(omitted) => super::keep_omitted::relaxed_schema(schema, omitted),
+        None => schema.clone(),
+    };
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields() {
@@ -631,6 +666,54 @@ fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a st
     }
 }
 
+/// The node or edge type an `update` writes: what its whole-row and
+/// column-patch paths read of the type, the same for either kind.
+struct UpdatedType<'a> {
+    key: &'a Option<Vec<String>>,
+    unique_constraints: &'a Vec<Vec<String>>,
+    blob_properties: &'a HashSet<String>,
+    arrow_schema: &'a SchemaRef,
+    table_key: String,
+}
+
+impl<'a> UpdatedType<'a> {
+    fn of(
+        catalog: &'a omnigraph_compiler::catalog::Catalog,
+        target: &MutationTarget,
+    ) -> Result<Self> {
+        match target {
+            MutationTarget::Node { type_name } => {
+                let node = catalog.node_types.get(type_name).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "checked mutation node type '{type_name}' is missing from catalog"
+                    ))
+                })?;
+                Ok(Self {
+                    key: &node.key,
+                    unique_constraints: &node.unique_constraints,
+                    blob_properties: &node.blob_properties,
+                    arrow_schema: &node.arrow_schema,
+                    table_key: format!("node:{type_name}"),
+                })
+            }
+            MutationTarget::Edge { type_name } => {
+                let edge = catalog.edge_types.get(type_name).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "checked mutation edge type '{type_name}' is missing from catalog"
+                    ))
+                })?;
+                Ok(Self {
+                    key: &edge.key,
+                    unique_constraints: &edge.unique_constraints,
+                    blob_properties: &edge.blob_properties,
+                    arrow_schema: &edge.arrow_schema,
+                    table_key: format!("edge:{type_name}"),
+                })
+            }
+        }
+    }
+}
+
 /// How an `update` may stage a column patch (issue #1264): the columns it
 /// leaves unread, what it returns for validation and what Lance writes.
 struct ColumnPatchPlan {
@@ -647,7 +730,7 @@ struct ColumnPatchPlan {
 /// unassigned, or a key or uniqueness group names an omitted column, whose
 /// values validation must read.
 fn column_patch_plan(
-    node_type: &omnigraph_compiler::catalog::NodeType,
+    node_type: &UpdatedType<'_>,
     schema: &SchemaRef,
     resolved: &HashMap<String, Literal>,
     id_column: &str,
@@ -2285,9 +2368,7 @@ impl Omnigraph {
         for op in &ir.ops {
             let result = match op {
                 WriteOp::Insert {
-                    // Every mode stages the keyed upsert for now; the
-                    // modes' own semantics arrive with their engine paths.
-                    mode: _,
+                    mode,
                     target,
                     assignments,
                     rows,
@@ -2319,7 +2400,7 @@ impl Omnigraph {
                             (rows, Some(charge))
                         }
                     };
-                    self.execute_insert(target, rows, branch, staging, txn)
+                    self.execute_insert(*mode, target, rows, branch, staging, txn)
                         .await?
                 }
                 WriteOp::Update {
@@ -2412,15 +2493,25 @@ impl Omnigraph {
         Ok(total)
     }
 
-    /// Stage one `insert` statement's rows: each row's values become a
-    /// one-row batch with its id (the canonical key id of a keyed type, a
-    /// fresh ULID otherwise), refused as a lone insert would be, and the
-    /// statement opens its table once, after its first row is built, however
-    /// many rows its group gave it. Each row is admitted to the staging as it
-    /// is built, so the write budget stops the statement at the row that
-    /// passes it rather than after every row's decoded Blob payload is held.
+    /// Stage one `insert`, `upsert` or `replace` statement's rows: each
+    /// row's values become a one-row batch with its id (the canonical key id
+    /// of a keyed type, a fresh ULID otherwise), and the statement opens its
+    /// table once, after its first row is built, however many rows its group
+    /// gave it. Each row is admitted to the staging as it is built, so the
+    /// write budget stops the statement at the row that passes it rather than
+    /// after every row's decoded Blob payload is held.
+    ///
+    /// On a keyed type the mode decides what an existing key does. `insert`
+    /// refuses it with `KeyConflict`: a key an earlier statement of the write
+    /// staged is refused here, and a committed one by the strict insert's
+    /// preflight when the table stages, or by the probe of the table's strict
+    /// ids when another statement made it an upsert. `replace` stages the
+    /// whole row, an omitted nullable property null. `upsert` stages the row
+    /// with the properties it omits filled from the row its key replaces
+    /// ([`super::keep_omitted`]). A type with no key only creates.
     async fn execute_insert(
         &self,
+        insert_mode: InsertMode,
         target: &MutationTarget,
         rows: Vec<HashMap<String, Literal>>,
         branch: Option<&str>,
@@ -2456,12 +2547,25 @@ impl Omnigraph {
                 )
             }
         };
-        let (insert_kind, mode) = if has_key {
-            (crate::db::MutationOpKind::Merge, PendingMode::Upsert)
-        } else {
-            (crate::db::MutationOpKind::Insert, PendingMode::StrictInsert)
+        // The type checker refuses `upsert` and `replace` on a type with no
+        // key, so a keyless statement is an `insert` and only creates.
+        let keyed_mode = has_key.then_some(insert_mode);
+        let (insert_kind, mode) = match keyed_mode {
+            Some(InsertMode::Upsert | InsertMode::Replace) => {
+                (crate::db::MutationOpKind::Merge, PendingMode::Upsert)
+            }
+            Some(InsertMode::Insert) | None => {
+                (crate::db::MutationOpKind::Insert, PendingMode::StrictInsert)
+            }
         };
+        let system_columns = catalog.system_columns;
         let mut staged = 0usize;
+        // `upsert` rows that omit a property wait here, a bounded run at a
+        // time, so the stored rows they keep values from are read once per
+        // run.
+        let mut keeping: Vec<RecordBatch> = Vec::new();
+        let mut keeping_ids: HashSet<String> = HashSet::new();
+        let mut keeping_omitted = super::keep_omitted::OmittedCells::default();
         for resolved in rows {
             refuse_null_on_required(target.type_name(), &schema, &resolved)?;
             let id = match target {
@@ -2472,13 +2576,24 @@ impl Omnigraph {
                     edge_insert_id(catalog, type_name, &resolved)?
                 }
             };
+            if keyed_mode == Some(InsertMode::Insert)
+                && staging.pending_holds_id(&table_key, system_columns.id, &id)?
+            {
+                return Err(OmniError::key_conflict(&table_key, id));
+            }
+            // Every row of one statement names the same properties, so the
+            // rows of an `upsert` share one relaxed shape.
+            let omitted = (keyed_mode == Some(InsertMode::Upsert))
+                .then(|| insert_omitted_cells(&schema, &resolved, system_columns))
+                .filter(|omitted| !omitted.is_empty());
             let batch = build_insert_batch(
                 &schema,
                 &id,
                 &resolved,
                 blob_props,
-                catalog.system_columns,
+                system_columns,
                 staging.write_budget(),
+                omitted.as_ref(),
             )?;
             if staged == 0 {
                 let (_handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -2491,17 +2606,67 @@ impl Omnigraph {
                 )
                 .await?;
             }
-            if mode == PendingMode::Upsert {
-                staging.append_successors(
+            staged += 1;
+            if let Some(omitted) = omitted {
+                // A run ends before a second row of one key, which must see
+                // the first, and after a row holding Blob bytes, so a run
+                // never holds more than one row's decoded payload.
+                if keeping_ids.contains(&id) {
+                    self.stage_keeping_omitted(
+                        target,
+                        &schema,
+                        &table_key,
+                        std::mem::take(&mut keeping),
+                        &keeping_omitted,
+                        system_columns.id,
+                        staging,
+                    )
+                    .await?;
+                    keeping_ids.clear();
+                }
+                let holds_payload = crate::table_store::write_batch_bytes(&batch)?.payload > 0;
+                keeping_omitted = omitted;
+                keeping.push(batch);
+                keeping_ids.insert(id);
+                if holds_payload || keeping.len() >= KEEP_OMITTED_RUN_ROWS {
+                    self.stage_keeping_omitted(
+                        target,
+                        &schema,
+                        &table_key,
+                        std::mem::take(&mut keeping),
+                        &keeping_omitted,
+                        system_columns.id,
+                        staging,
+                    )
+                    .await?;
+                    keeping_ids.clear();
+                }
+                continue;
+            }
+            match keyed_mode {
+                Some(InsertMode::Upsert | InsertMode::Replace) => staging.append_successors(
                     &table_key,
                     schema.clone(),
                     batch,
-                    catalog.system_columns.id,
-                )?;
-            } else {
-                staging.append_batch(&table_key, schema.clone(), mode, batch)?;
+                    system_columns.id,
+                )?,
+                Some(InsertMode::Insert) => {
+                    staging.append_strict_keyed(&table_key, schema.clone(), batch, id)?
+                }
+                None => staging.append_batch(&table_key, schema.clone(), mode, batch)?,
             }
-            staged += 1;
+        }
+        if !keeping.is_empty() {
+            self.stage_keeping_omitted(
+                target,
+                &schema,
+                &table_key,
+                keeping,
+                &keeping_omitted,
+                system_columns.id,
+                staging,
+            )
+            .await?;
         }
         Ok(match target {
             MutationTarget::Node { .. } => MutationResult {
@@ -2520,6 +2685,81 @@ impl Omnigraph {
         })
     }
 
+    /// Fill a run of `upsert` rows that omit properties from the rows their
+    /// keys replace and stage each as its key's next version.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_keeping_omitted(
+        &self,
+        target: &MutationTarget,
+        schema: &SchemaRef,
+        table_key: &str,
+        rows: Vec<RecordBatch>,
+        omitted: &super::keep_omitted::OmittedCells,
+        id_column: &str,
+        staging: &mut MutationStaging,
+    ) -> Result<()> {
+        let Some(first) = rows.first() else {
+            return Ok(());
+        };
+        let run = arrow_select::concat::concat_batches(&first.schema(), &rows)
+            .map_err(OmniError::arrow_internal)?;
+        drop(rows);
+        let omitted = omitted.repeated(run.num_rows());
+        let type_name = target.type_name().to_string();
+        let filled = super::keep_omitted::keep_omitted_properties(
+            self,
+            staging,
+            table_key,
+            schema,
+            run,
+            &omitted,
+            id_column,
+            super::keep_omitted::EarlierEffects::Seen,
+            &|property, id, _omitted| {
+                OmniError::manifest(format!(
+                    "missing required property '{property}': `upsert` creates {type_name} \
+                     '{id}', which has no stored row to keep it from"
+                ))
+            },
+        )
+        .await?;
+        for row in 0..filled.num_rows() {
+            staging.append_successors(
+                table_key,
+                schema.clone(),
+                filled.slice(row, 1),
+                id_column,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The counts an `update` of `affected` rows reports, on the side its
+    /// target's kind names; an edge update also drops the graph index its
+    /// table feeds, as an edge insert does.
+    async fn updated(
+        &self,
+        target: &MutationTarget,
+        table_key: &str,
+        affected: usize,
+    ) -> MutationResult {
+        match target {
+            MutationTarget::Node { .. } => MutationResult {
+                affected_nodes: affected,
+                affected_edges: 0,
+            },
+            MutationTarget::Edge { .. } => {
+                if affected > 0 {
+                    self.invalidate_graph_index_for([table_key]).await;
+                }
+                MutationResult {
+                    affected_nodes: 0,
+                    affected_edges: affected,
+                }
+            }
+        }
+    }
+
     async fn execute_update(
         &self,
         target: &MutationTarget,
@@ -2533,20 +2773,8 @@ impl Omnigraph {
         only_write: bool,
     ) -> Result<MutationResult> {
         let catalog = &txn.catalog;
-        let type_name = match target {
-            MutationTarget::Node { type_name } => type_name,
-            MutationTarget::Edge { type_name } => {
-                return Err(OmniError::manifest(format!(
-                    "update is only supported for node types, not '{}'",
-                    type_name
-                )));
-            }
-        };
-        let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "checked mutation node type '{type_name}' is missing from catalog"
-            ))
-        })?;
+        let type_name = target.type_name();
+        let node_type = UpdatedType::of(catalog, target)?;
         let row_values = match selection {
             UpdateSelection::Predicate(_) => None,
             UpdateSelection::Entities(entities) => Some(&entities.values),
@@ -2608,7 +2836,7 @@ impl Omnigraph {
             )
         };
 
-        let table_key = format!("node:{}", type_name);
+        let table_key = node_type.table_key.clone();
         let membership;
         let (predicate, pred_expr) = match (selection, own_pred_expr) {
             (UpdateSelection::Predicate(predicate), Some(pred_expr)) => (predicate, pred_expr),
@@ -2658,7 +2886,7 @@ impl Omnigraph {
         };
         let id_column = catalog.system_columns.id;
         if let Some(plan) = sole_write
-            .then(|| column_patch_plan(node_type, &schema, &planned, id_column, only_write))
+            .then(|| column_patch_plan(&node_type, &schema, &planned, id_column, only_write))
             .transpose()?
             .flatten()
         {
@@ -2754,10 +2982,7 @@ impl Omnigraph {
                     }
                 }
             }
-            return Ok(MutationResult {
-                affected_nodes: affected_count,
-                affected_edges: 0,
-            });
+            return Ok(self.updated(target, &table_key, affected_count).await);
         }
 
         // Scan committed via Lance + apply the same predicate to pending
@@ -2836,10 +3061,7 @@ impl Omnigraph {
         let updated_schema = updated.schema();
         staging.append_successors(&table_key, updated_schema, updated, id_column)?;
 
-        Ok(MutationResult {
-            affected_nodes: affected_count,
-            affected_edges: 0,
-        })
+        Ok(self.updated(target, &table_key, affected_count).await)
     }
 
     async fn execute_delete(
@@ -3562,19 +3784,16 @@ edge Shared: Endpoint -> Endpoint { label: String }
             panic!("expected update");
         };
         assert_eq!(retained, &target);
+        // An update takes the edge type too, and writes only its table.
         let mut staging = MutationStaging::default();
-        let error = db
+        let result = db
             .execute_named_mutation(&ir, &ParamMap::new(), None, &mut staging, &txn, &reader)
             .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("update is only supported for node types"),
-            "{error}"
-        );
-        assert!(staging.is_empty());
-        assert!(staging.paths.is_empty());
+            .unwrap();
+        assert_eq!((result.affected_nodes, result.affected_edges), (0, 1));
+        assert_eq!(staging.paths.len(), 1);
+        assert!(staging.paths.contains_key("edge:Shared"));
+        assert!(staging.pending_batches("node:Shared").is_empty());
         assert!(staging.deleted_ids.is_empty());
     }
 }

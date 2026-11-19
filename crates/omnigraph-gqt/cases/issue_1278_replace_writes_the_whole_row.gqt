@@ -1,6 +1,6 @@
 # issue: 1278
-# red_on: none; guard case pinning whole-row replacement, which head already does
-# notes: A keyed `insert` on an existing key replaces the whole row: every nullable property the statement omits becomes null (scalar, list and vector here; Blob in writes.rs), an explicit `null` clears too, and a missing required property is refused on an existing key as on a new one. `update` is the way to set only named properties.
+# red_on: none; guard case pinning whole-row replacement, edition 2's keyed insert, which `replace` keeps
+# notes: `replace` on an existing key writes the whole row: every nullable property the statement omits becomes null (scalar, list and vector here; Blob in writes.rs), an explicit `null` clears too, and a missing required property is refused on an existing key as on a new one. `upsert` and `update` set only named properties (issue_1278_upsert_keeps_omitted_properties.gqt).
 # notes: The same holds on a branch, leaves main untouched, and survives a restart.
 
 --- runner
@@ -28,14 +28,14 @@ node Doc {
 
 --- mutate
 query replace_d1() {
-    insert Doc { slug: "d1", title: "new" }
+    replace Doc { slug: "d1", title: "new" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query clear_d2_n() {
-    insert Doc { slug: "d2", title: "two", n: null, tags: ["c"], emb: [4.0, 5.0, 6.0] }
+    replace Doc { slug: "d2", title: "two", n: null, tags: ["c"], emb: [4.0, 5.0, 6.0] }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -59,7 +59,7 @@ d.emb: Vector(3)?
 
 --- mutate
 query existing_key_without_title() {
-    insert Doc { slug: "d3", n: 1 }
+    replace Doc { slug: "d3", n: 1 }
 }
 
 --- expect error: type error: T12:
@@ -71,7 +71,7 @@ branch create feature
 
 --- mutate branch: feature
 query replace_d3_on_feature() {
-    insert Doc { slug: "d3", title: "branch" }
+    replace Doc { slug: "d3", title: "branch" }
 }
 
 --- expect affected: nodes=1 edges=0

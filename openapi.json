@@ -14999,8 +14999,8 @@
           },
           "query": {
             "type": "string",
-            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `name`. May instead\nbe one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),\nsent with no `name`, `params`, or `branch`.",
-            "example": "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
+            "description": "GQ mutation source containing `insert`, `upsert`, `replace`, `update` or\n`delete` statements.\nMay declare multiple named mutations; pick one with `name`. May instead\nbe one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),\nsent with no `name`, `params`, or `branch`.",
+            "example": "query insert_person($name: String, $age: I32) {\n    replace Person { name: $name, age: $age }\n}"
           },
           "settings": {
             "oneOf": [

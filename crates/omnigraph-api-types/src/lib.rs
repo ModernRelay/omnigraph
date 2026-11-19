@@ -1786,12 +1786,13 @@ pub fn parse_blob_if_match<'a>(
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeRequest {
-    /// GQ mutation source containing `insert`, `update`, or `delete` statements.
+    /// GQ mutation source containing `insert`, `upsert`, `replace`, `update` or
+    /// `delete` statements.
     /// May declare multiple named mutations; pick one with `name`. May instead
     /// be one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),
     /// sent with no `name`, `params`, or `branch`.
     #[schema(
-        example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
+        example = "query insert_person($name: String, $age: I32) {\n    replace Person { name: $name, age: $age }\n}"
     )]
     pub query: String,
     /// Name of the mutation to run when `query` declares multiple.
