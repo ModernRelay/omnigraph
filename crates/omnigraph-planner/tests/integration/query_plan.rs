@@ -196,6 +196,7 @@ fn ir(pipeline: Vec<PatternStep>, returns: Vec<IRExpr>, order_by: Vec<IRExpr>) -
             .map(|expr| IROrdering {
                 expr,
                 descending: false,
+                nulls_first: None,
             })
             .collect(),
         limit: Some(10),

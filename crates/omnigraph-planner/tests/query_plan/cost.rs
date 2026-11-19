@@ -1072,10 +1072,12 @@ fn hydration_keeps_every_column_something_besides_the_output_reads() {
             IROrdering {
                 expr: prop("c", "rank"),
                 descending: false,
+                nulls_first: None,
             },
             IROrdering {
                 expr: IRExpr::AliasRef("t".to_string(), property_type("title")),
                 descending: true,
+                nulls_first: None,
             },
         ],
         limit: Some(5),

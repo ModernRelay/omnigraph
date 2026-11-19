@@ -2116,6 +2116,9 @@ impl From<InnerReadMirror> for InnerRead {
 pub struct OrderingMirror {
     pub expr: ExprMirror,
     pub descending: bool,
+    /// The written null placement; absent, the direction's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nulls_first: Option<bool>,
 }
 
 impl From<&IROrdering> for OrderingMirror {
@@ -2123,6 +2126,7 @@ impl From<&IROrdering> for OrderingMirror {
         Self {
             expr: ExprMirror::from(&ordering.expr),
             descending: ordering.descending,
+            nulls_first: ordering.nulls_first,
         }
     }
 }
@@ -2132,6 +2136,7 @@ impl From<OrderingMirror> for IROrdering {
         Self {
             expr: IRExpr::from(mirror.expr),
             descending: mirror.descending,
+            nulls_first: mirror.nulls_first,
         }
     }
 }

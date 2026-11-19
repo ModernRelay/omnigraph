@@ -233,9 +233,11 @@ fn physical_anti_join_predicate_reads_back_equal() {
     assert_eq!(restored, printed);
 }
 
-/// A plan's words are GQ: `Sort` keys carry their direction, a leading search
-/// function leads the declared ordering with its score column, and a query
-/// node prints no `schema` and the root scan its pinned version.
+/// A plan's words are GQ: `Sort` keys carry their direction and a written
+/// null placement (the declared ordering prints one only where it is not the
+/// direction's own), a leading search function leads the declared ordering
+/// with its score column, and a query node prints no `schema` and the root
+/// scan its pinned version.
 #[test]
 fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
     let op = Operation::Query(Box::new(ReadShape {
@@ -256,10 +258,12 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
                     ty: value_type(ScalarType::F32, false),
                 },
                 descending: false,
+                nulls_first: None,
             },
             IROrdering {
                 expr: prop("c", "rank"),
                 descending: true,
+                nulls_first: Some(true),
             },
         ],
         limit: Some(10),
@@ -292,12 +296,12 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
     assert_eq!(sort["node"], "Sort");
     assert_eq!(
         sort["keys"],
-        serde_json::json!(["$c._distance asc", "$c.rank desc"])
+        serde_json::json!(["$c._distance asc", "$c.rank desc nulls first"])
     );
     assert_eq!(sort["fetch"], 10);
     assert_eq!(
         sort["properties"]["ordering"],
-        serde_json::json!(["$c._distance asc", "$c.rank desc", "$c.@id asc"]),
+        serde_json::json!(["$c._distance asc", "$c.rank desc nulls first", "$c.@id asc"]),
         "a sort's output order is its whole comparator, identity keys included"
     );
     assert!(sort["properties"].get("schema").is_none());

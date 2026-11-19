@@ -2460,6 +2460,26 @@ pub struct IRProjection {
 pub struct IROrdering {
     pub expr: IRExpr,
     pub descending: bool,
+    /// The written null placement: `nulls first` (`Some(true)`) or `nulls
+    /// last` (`Some(false)`). `None` keeps the fixed value order's
+    /// placement: nulls first ascending, last descending.
+    pub nulls_first: Option<bool>,
+}
+
+impl IROrdering {
+    /// A key with the fixed value order's null placement.
+    pub fn new(expr: IRExpr, descending: bool) -> Self {
+        Self {
+            expr,
+            descending,
+            nulls_first: None,
+        }
+    }
+
+    /// Whether this key sorts its nulls before every non-null value.
+    pub fn places_nulls_first(&self) -> bool {
+        self.nulls_first.unwrap_or(!self.descending)
+    }
 }
 
 #[cfg(test)]

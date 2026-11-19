@@ -290,6 +290,46 @@ fn order_and_cut_take_the_first_rows_by_the_keys_then_the_tie_rule() {
     );
 }
 
+/// A key's null placement: by default nulls come first ascending and last
+/// descending; `nulls first` and `nulls last` place them whatever the
+/// direction, and the non-null values keep the key's direction.
+#[test]
+fn order_places_a_keys_nulls_as_written() {
+    let names = |order: &str| -> Vec<Json> {
+        let src = format!(
+            "query q() {{ match {{ $p: Person }} return {{ $p.name }} order {{ {order} }} }}"
+        );
+        rows(&src)
+            .into_iter()
+            .map(|row| row["p.name"].clone())
+            .collect()
+    };
+    assert_eq!(
+        names("$p.city"),
+        vec![json!("bob"), json!("ann"), json!("cyd")]
+    );
+    assert_eq!(
+        names("$p.city desc"),
+        vec![json!("cyd"), json!("ann"), json!("bob")]
+    );
+    assert_eq!(
+        names("$p.city nulls last"),
+        vec![json!("ann"), json!("cyd"), json!("bob")]
+    );
+    assert_eq!(
+        names("$p.city nulls first"),
+        vec![json!("bob"), json!("ann"), json!("cyd")]
+    );
+    assert_eq!(
+        names("$p.city desc nulls first"),
+        vec![json!("bob"), json!("cyd"), json!("ann")]
+    );
+    assert_eq!(
+        names("$p.city desc nulls last"),
+        vec![json!("cyd"), json!("ann"), json!("bob")]
+    );
+}
+
 #[test]
 fn approx_top_k_keeps_the_k_nearest_targets() {
     let out = rows(

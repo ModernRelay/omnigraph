@@ -1428,6 +1428,65 @@ fn a_dropped_or_reversed_key_fails_the_order() {
         |order_by: &mut Vec<omnigraph_compiler::ir::IROrdering>| {
             order_by.remove(0);
         },
+        |order_by: &mut Vec<omnigraph_compiler::ir::IROrdering>| {
+            order_by.last_mut().unwrap().nulls_first = Some(false);
+        },
+        // The direction's own placement, written, is another key too.
+        |order_by: &mut Vec<omnigraph_compiler::ir::IROrdering>| {
+            order_by.last_mut().unwrap().nulls_first = Some(true);
+        },
+    ] {
+        let mut plan = fixture.plan();
+        for id in node_ids(&plan, |node| matches!(node, PhysicalNode::Sort { .. })) {
+            if let Some(PhysicalNode::Sort { order_by, .. }) = plan.node_mut(id) {
+                edit(order_by);
+            }
+        }
+        let (check, detail) = fixture.refused(plan);
+        assert_eq!(check, "order", "{detail}");
+    }
+}
+
+/// A written null placement is part of the key the final sort must keep:
+/// a plan that drops it, flips it, or keeps it on a key the query placed
+/// differently is refused.
+#[test]
+fn a_dropped_or_moved_null_placement_fails_the_order() {
+    let query = r#"query q() {
+    match { $d: Doc }
+    return { $d.slug, $d.rank as rank }
+    order { $d.rank desc nulls first, $d.year nulls last }
+    limit 2
+}"#;
+    let fixture = Fixture::new(query, &[]);
+    let plan = fixture.plan();
+    let placements: Vec<Vec<Option<bool>>> =
+        node_ids(&plan, |node| matches!(node, PhysicalNode::Sort { .. }))
+            .into_iter()
+            .map(|id| match plan.node(id) {
+                Some(PhysicalNode::Sort { order_by, .. }) => {
+                    order_by.iter().map(|key| key.nulls_first).collect()
+                }
+                _ => unreachable!("the id names a sort"),
+            })
+            .collect();
+    assert_eq!(placements, vec![vec![Some(true), Some(false)]]);
+    fixture
+        .accept(fixture.plan())
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    for edit in [
+        |order_by: &mut Vec<omnigraph_compiler::ir::IROrdering>| {
+            order_by[0].nulls_first = None;
+        },
+        |order_by: &mut Vec<omnigraph_compiler::ir::IROrdering>| {
+            order_by[0].nulls_first = Some(false);
+        },
+        |order_by: &mut Vec<omnigraph_compiler::ir::IROrdering>| {
+            order_by[1].nulls_first = None;
+        },
+        |order_by: &mut Vec<omnigraph_compiler::ir::IROrdering>| {
+            order_by.swap(0, 1);
+        },
     ] {
         let mut plan = fixture.plan();
         for id in node_ids(&plan, |node| matches!(node, PhysicalNode::Sort { .. })) {

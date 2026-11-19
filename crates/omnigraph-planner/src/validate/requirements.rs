@@ -708,7 +708,7 @@ impl Requirements {
             .iter()
             .map(|key| IROrdering {
                 expr: crate::optimizer::bind_order_key(&key.expr, return_exprs, grouped),
-                descending: key.descending,
+                ..key.clone()
             })
             .filter(|key| !matches!(key.expr, IRExpr::Literal(_, _)))
             .collect();

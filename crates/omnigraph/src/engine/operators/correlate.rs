@@ -468,7 +468,7 @@ fn ordered_cut(rows: &RecordBatch, tag: Option<&str>, read: &CorrelateRead) -> R
             values: evaluate_expr(rows, &key.expr, &read.params)?,
             options: Some(SortOptions {
                 descending: key.descending,
-                nulls_first: !key.descending,
+                nulls_first: key.places_nulls_first(),
             }),
         });
     }

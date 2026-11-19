@@ -26,7 +26,7 @@ use crate::error::CompilerError;
 use crate::ir::core::MutationTarget;
 use crate::ir::core::WriteGroup;
 use crate::ir::core::*;
-use crate::ir::expr::IRExpr;
+use crate::ir::expr::{IRExpr, IROrdering};
 use crate::query::codes::*;
 use crate::query::diagnostic::{
     Applicability, Position, QueryCode, QueryDiagnostic, Suggestion, TextEdit,
@@ -2474,7 +2474,7 @@ impl Ctx<'_> {
                     sc.refused = true;
                     continue;
                 };
-                order.push((k, o.descending.unwrap_or(false)));
+                order.push((k, o.descending.unwrap_or(false), o.nulls_first));
             }
             let keys: Vec<(String, IRExpr)> =
                 keys.into_iter().map(|(n, k)| (n, k.to_ir())).collect();
@@ -2524,7 +2524,14 @@ impl Ctx<'_> {
             if !order.is_empty() {
                 term = Term::Order {
                     input: term.boxed(),
-                    keys: order.into_iter().map(|(k, d)| (k.to_ir(), d)).collect(),
+                    keys: order
+                        .into_iter()
+                        .map(|(k, descending, nulls_first)| IROrdering {
+                            expr: k.to_ir(),
+                            descending,
+                            nulls_first,
+                        })
+                        .collect(),
                 };
                 self.charge_top(&term)?;
             }
@@ -2567,7 +2574,7 @@ impl Ctx<'_> {
                     sc.refused = true;
                     continue;
                 };
-                order.push((k, o.descending.unwrap_or(false)));
+                order.push((k, o.descending.unwrap_or(false), o.nulls_first));
             }
             term = Term::Project {
                 input: term.boxed(),
@@ -2579,7 +2586,14 @@ impl Ctx<'_> {
             if !order.is_empty() {
                 term = Term::Order {
                     input: term.boxed(),
-                    keys: order.into_iter().map(|(k, d)| (k.to_ir(), d)).collect(),
+                    keys: order
+                        .into_iter()
+                        .map(|(k, descending, nulls_first)| IROrdering {
+                            expr: k.to_ir(),
+                            descending,
+                            nulls_first,
+                        })
+                        .collect(),
                 };
                 self.charge_top(&term)?;
             }

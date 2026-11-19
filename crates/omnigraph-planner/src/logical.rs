@@ -1461,10 +1461,16 @@ pub(crate) fn fragment_write_json(spec: &FragmentWriteSpec) -> Value {
     })
 }
 
-/// One `order` key as GQ text with its direction: `$p.name desc`.
+/// One `order` key as GQ text with its direction and its written null
+/// placement: `$p.name desc`, `$p.age asc nulls last`.
 pub(crate) fn ordering_text(ordering: &IROrdering) -> String {
     let direction = if ordering.descending { "desc" } else { "asc" };
-    format!("{} {direction}", ordering.expr)
+    let placement = match ordering.nulls_first {
+        None => "",
+        Some(true) => " nulls first",
+        Some(false) => " nulls last",
+    };
+    format!("{} {direction}{placement}", ordering.expr)
 }
 
 fn rendered(reads: &[ColumnRef]) -> Vec<String> {

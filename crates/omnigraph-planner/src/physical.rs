@@ -309,10 +309,7 @@ impl RankedAccess {
     /// The score ordering this ranking imposes on `binding`'s rows: the
     /// distance, nearest first.
     pub fn ordering(&self, _binding: &str) -> IROrdering {
-        IROrdering {
-            expr: self.score.clone(),
-            descending: false,
-        }
+        IROrdering::new(self.score.clone(), false)
     }
 
     /// The explain object; `kind` stays `nearest`, the documented name of
@@ -425,13 +422,14 @@ pub enum OrderKey {
 }
 
 impl OrderKey {
-    /// A written or score sort key: ascending keys place nulls first,
-    /// descending keys nulls last (RFC 0047, "One total order").
+    /// A written or score sort key: its written null placement, else
+    /// ascending keys place nulls first and descending keys nulls last
+    /// (RFC 0047, "One total order").
     pub fn of(ordering: &IROrdering) -> Self {
         Self::Expr {
             expr: ordering.expr.clone(),
             descending: ordering.descending,
-            nulls_first: !ordering.descending,
+            nulls_first: ordering.places_nulls_first(),
         }
     }
 }
@@ -441,8 +439,18 @@ impl std::fmt::Display for OrderKey {
         match self {
             Self::Column(column) => f.write_str(column),
             Self::Expr {
-                expr, descending, ..
-            } => write!(f, "{expr} {}", if *descending { "desc" } else { "asc" }),
+                expr,
+                descending,
+                nulls_first,
+            } => {
+                write!(f, "{expr} {}", if *descending { "desc" } else { "asc" })?;
+                // The placement is printed where it is not the direction's.
+                match (*descending, *nulls_first) {
+                    (false, false) => f.write_str(" nulls last"),
+                    (true, true) => f.write_str(" nulls first"),
+                    _ => Ok(()),
+                }
+            }
             Self::Identity(column) => write!(f, "${column} asc"),
         }
     }

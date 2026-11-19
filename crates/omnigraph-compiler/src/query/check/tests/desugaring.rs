@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{Catalog, build_catalog};
 use crate::ir::core::*;
-use crate::ir::expr::IRExpr;
+use crate::ir::expr::{IRExpr, IROrdering};
 use crate::query::check::{SExpr, SKind, type_source};
 use crate::query::value::{AggFunc, CompOp, Literal};
 use crate::schema::parser::parse_schema;
@@ -540,7 +540,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
                     keep: true,
                 }
                 .boxed(),
-                keys: vec![(prop("p", "age", age()), true)],
+                keys: vec![IROrdering::new(prop("p", "age", age()), true)],
             }
             .boxed(),
             k: Count::Literal(3),
@@ -550,6 +550,26 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
         keep: false,
     };
     assert_eq!(term(&got), &want);
+    // A written null placement stays on its key; `nulls first` over a
+    // descending key is not the default placement, so it is a different term.
+    let placed = |placement: &str| {
+        let got = lower(&format!(
+            "query f() {{ match {{ $p: Person }} return {{ $p.name }} order {{ $p.age desc{placement} }} limit 3 }}"
+        ));
+        let mut t = term(&got);
+        loop {
+            match t {
+                Term::Order { keys, .. } => return keys.clone(),
+                Term::Project { input, .. } | Term::Cut { input, .. } => t = input,
+                other => panic!("no `Order` in {other:?}"),
+            }
+        }
+    };
+    assert_eq!(placed("")[0].nulls_first, None);
+    assert_eq!(placed(" nulls first")[0].nulls_first, Some(true));
+    assert_eq!(placed(" nulls last")[0].nulls_first, Some(false));
+    assert!(placed(" nulls first")[0].places_nulls_first());
+    assert!(!placed("")[0].places_nulls_first());
     // `return distinct { … }`: Group with no aggregates.
     let got = lower("query f() { match { $p: Person } return distinct { $p.city } }");
     let city = Ty::Value(PropType::scalar(ScalarType::String, true));

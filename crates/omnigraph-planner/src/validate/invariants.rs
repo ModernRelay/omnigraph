@@ -1652,17 +1652,19 @@ impl Requirements {
         };
         Some(
             lead.into_iter()
-                .map(|(binding, column, descending)| IROrdering {
-                    expr: IRExpr::PropAccess {
-                        variable: binding.to_string(),
-                        property: column.to_string(),
-                        ty: ExprType::Value {
-                            scalar: ScalarType::F64,
-                            list: false,
-                            nullable: false,
+                .map(|(binding, column, descending)| {
+                    IROrdering::new(
+                        IRExpr::PropAccess {
+                            variable: binding.to_string(),
+                            property: column.to_string(),
+                            ty: ExprType::Value {
+                                scalar: ScalarType::F64,
+                                list: false,
+                                nullable: false,
+                            },
                         },
-                    },
-                    descending,
+                        descending,
+                    )
                 })
                 .chain(self.order.iter().cloned())
                 .collect(),
@@ -1685,10 +1687,10 @@ impl Requirements {
                 expr => *expr == projection.expr,
             });
             if !written {
-                keys.push(IROrdering {
-                    expr: IRExpr::AliasRef(projection.column.clone(), projection.ty.clone()),
-                    descending: false,
-                });
+                keys.push(IROrdering::new(
+                    IRExpr::AliasRef(projection.column.clone(), projection.ty.clone()),
+                    false,
+                ));
             }
         }
         keys
@@ -1783,8 +1785,10 @@ impl Requirements {
                 .all(|(index, (planned, key))| {
                     if !self.aggregate && index < lead {
                         // A score key reads the ranked scan's (or the fusion's)
-                        // score column of the binding, in the score's direction.
+                        // score column of the binding, in the score's direction
+                        // and null placement.
                         planned.descending == key.descending
+                            && planned.nulls_first == key.nulls_first
                             && matches!((&planned.expr, &key.expr), (
                             IRExpr::PropAccess { variable, property, .. },
                             IRExpr::PropAccess { variable: v, property: p, .. },
@@ -2104,7 +2108,15 @@ fn projections_of<'p>(plan: &'p PhysicalPlan, top: &[NodeId]) -> Vec<&'p Vec<IRP
 
 fn keys_text(keys: &[IROrdering]) -> String {
     keys.iter()
-        .map(|key| format!("{}{}", key.expr, if key.descending { " desc" } else { "" }))
+        .map(|key| {
+            let placement = match key.nulls_first {
+                None => "",
+                Some(true) => " nulls first",
+                Some(false) => " nulls last",
+            };
+            let direction = if key.descending { " desc" } else { "" };
+            format!("{}{direction}{placement}", key.expr)
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }

@@ -188,6 +188,20 @@ fn cmp_values(a: &Value, b: &Value) -> Ordering {
     }
 }
 
+/// One order key's comparison: a null is placed by `nulls_first` whatever
+/// the direction, and two non-null values compare by the total value order,
+/// reversed when descending.
+fn cmp_key(a: &Value, b: &Value, descending: bool, nulls_first: bool) -> Ordering {
+    let null_first = |o: Ordering| if nulls_first { o } else { o.reverse() };
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => null_first(Ordering::Less),
+        (_, Value::Null) => null_first(Ordering::Greater),
+        _ if descending => cmp_values(a, b).reverse(),
+        _ => cmp_values(a, b),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Entity {
     id: String,
@@ -809,14 +823,13 @@ impl<'a> Interpreter<'a> {
                     for row in input.rows {
                         let k = keys
                             .iter()
-                            .map(|(e, desc)| Ok((self.expr(e, &row, env)?, *desc)))
+                            .map(|key| self.expr(&key.expr, &row, env))
                             .collect::<R<Vec<_>>>()?;
                         keyed.push((k, row));
                     }
                     keyed.sort_by(|(ka, ra), (kb, rb)| {
-                        for ((a, desc), (b, _)) in ka.iter().zip(kb) {
-                            let o = cmp_values(a, b);
-                            let o = if *desc { o.reverse() } else { o };
+                        for ((a, b), key) in ka.iter().zip(kb).zip(keys) {
+                            let o = cmp_key(a, b, key.descending, key.places_nulls_first());
                             if o != Ordering::Equal {
                                 return o;
                             }

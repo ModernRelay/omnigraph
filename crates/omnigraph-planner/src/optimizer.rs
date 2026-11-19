@@ -419,7 +419,7 @@ fn resolve_query(
             .iter()
             .map(|ordering| IROrdering {
                 expr: bind_order_key(&ordering.expr, return_exprs, grouped),
-                descending: ordering.descending,
+                ..ordering.clone()
             })
             .filter(|ordering| !matches!(ordering.expr, IRExpr::Literal(_, _)))
             .collect();
@@ -614,10 +614,7 @@ fn resolve_pipeline(
                     LogicalNode::Sort {
                         input: ranked,
                         keys,
-                        order_by: vec![IROrdering {
-                            expr: score,
-                            descending: false,
-                        }],
+                        order_by: vec![IROrdering::new(score, false)],
                         fetch: None,
                         tiebreak,
                     },
@@ -928,8 +925,8 @@ pub(crate) fn arm_score(target: &str, rank: ArmRank) -> Option<IROrdering> {
             omnigraph_compiler::types::ScalarType::F64
         }
     };
-    Some(IROrdering {
-        expr: IRExpr::PropAccess {
+    Some(IROrdering::new(
+        IRExpr::PropAccess {
             variable: target.to_string(),
             property: column.to_string(),
             ty: omnigraph_compiler::types::ExprType::from_prop(
@@ -937,7 +934,7 @@ pub(crate) fn arm_score(target: &str, rank: ArmRank) -> Option<IROrdering> {
             ),
         },
         descending,
-    })
+    ))
 }
 
 /// The columns a correlated read's tie rule reads after its `order` keys:
@@ -1177,10 +1174,10 @@ fn with_group_keys(
             expr => *expr == projection.expr,
         });
         if !written {
-            keys.push(IROrdering {
-                expr: IRExpr::AliasRef(column, projection.ty.clone()),
-                descending: false,
-            });
+            keys.push(IROrdering::new(
+                IRExpr::AliasRef(column, projection.ty.clone()),
+                false,
+            ));
         }
     }
     keys

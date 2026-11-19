@@ -1582,7 +1582,7 @@ impl Lower for Walk<'_, '_> {
             keys.push(SortKey {
                 column,
                 descending: key.descending,
-                nulls_first: !key.descending,
+                nulls_first: key.places_nulls_first(),
             });
         }
         for key in tiebreak {

@@ -295,7 +295,7 @@ fn term_exprs(t: &Term) -> usize {
                     .map(expr_nodes)
                     .sum::<usize>()
         }
-        Term::Order { keys, .. } => keys.iter().map(|(e, _)| expr_nodes(e)).sum(),
+        Term::Order { keys, .. } => keys.iter().map(|k| expr_nodes(&k.expr)).sum(),
         Term::Call { bindings, .. } => bindings.iter().map(|(_, e)| expr_nodes(e)).sum(),
         _ => 0,
     }

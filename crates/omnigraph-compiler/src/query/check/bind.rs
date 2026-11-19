@@ -199,8 +199,8 @@ impl Binder<'_> {
                 }
                 Term::Order { input, keys } => {
                     let scope = self.child(input, outer)?;
-                    for (e, _) in keys {
-                        *e = self.expr(e, &scope)?;
+                    for key in keys {
+                        key.expr = self.expr(&key.expr, &scope)?;
                     }
                     scope
                 }

@@ -240,6 +240,7 @@ mod tests {
                     ty: typed(ScalarType::F32, false),
                 },
                 descending: false,
+                nulls_first: None,
             }],
             limit: Some(2),
             limit_param: None,

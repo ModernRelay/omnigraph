@@ -92,6 +92,7 @@ fn query(order_by: IRExpr) -> ReadShape {
         order_by: vec![IROrdering {
             expr: order_by,
             descending: false,
+            nulls_first: None,
         }],
         limit: Some(3),
         limit_param: None,
@@ -332,6 +333,7 @@ fn fused_query() -> ReadShape {
             ty: value_type(ScalarType::F64, false),
         },
         descending: true,
+        nulls_first: None,
     }];
     shape
 }
@@ -580,6 +582,49 @@ fn a_filtered_cross_join_has_its_own_tag_and_a_plain_one_the_old_shape() {
     let old = serde_json::from_value::<OldReader>(node).expect("the old reader reads it");
     assert!(matches!(old, OldReader::CrossJoin { .. }));
     assert_eq!(round_trip(&plain), plain);
+}
+
+/// A written null placement is part of the sort's key and reads back; a key
+/// with none keeps the shape without the field, and that shape reads back as
+/// the direction's default placement, a different plan.
+#[test]
+fn a_sort_key_reads_back_with_its_null_placement() {
+    let sort_keys = |bound: &BoundPlan| -> serde_json::Value {
+        let value = serde_json::to_value(bound).expect("the bound plan serializes");
+        value["body"]["plan"]["slots"]
+            .as_array()
+            .expect("the plan's slots")
+            .iter()
+            .find(|slot| slot["node"] == "Sort")
+            .unwrap_or_else(|| panic!("no `Sort` node in {value}"))["order_by"]
+            .clone()
+    };
+    let default = bound(plan(prop("d", "slug")));
+    assert!(sort_keys(&default)[0].get("nulls_first").is_none());
+    assert_eq!(round_trip(&default), default);
+    for placement in [true, false] {
+        let mut placed = query(prop("d", "slug"));
+        placed.order_by[0].nulls_first = Some(placement);
+        let placed = bound(
+            futures::executor::block_on(plan_query(&placed, &source(), &fixture_bounds::BOUNDS))
+                .expect("the query plans"),
+        );
+        assert_eq!(sort_keys(&placed)[0]["nulls_first"], placement);
+        let back = round_trip(&placed);
+        assert_eq!(back, placed);
+        assert_ne!(back, default);
+        let mut stripped = serde_json::to_value(&placed).unwrap();
+        for slot in stripped["body"]["plan"]["slots"].as_array_mut().unwrap() {
+            if slot["node"] == "Sort" {
+                slot["order_by"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("nulls_first");
+            }
+        }
+        let stripped: BoundPlan = serde_json::from_value(stripped).unwrap();
+        assert_ne!(stripped, placed);
+    }
 }
 
 /// A top-k whose return-only column is fetched by row address reads back

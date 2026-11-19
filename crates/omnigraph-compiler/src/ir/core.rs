@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::expr::IRExpr;
+use super::expr::{IRExpr, IROrdering};
 use crate::query::file::MutationWriteMode;
 use crate::query::value::{AggFunc, Literal};
 use crate::traversal::EdgeSelection;
@@ -259,8 +259,8 @@ pub enum Term {
     },
     Order {
         input: Arc<Term>,
-        /// (key, descending)
-        keys: Vec<(IRExpr, bool)>,
+        /// The keys, each with its direction and written null placement.
+        keys: Vec<IROrdering>,
     },
     Cut {
         input: Arc<Term>,
@@ -348,7 +348,7 @@ impl Term {
                         .iter()
                         .any(|(_, agg)| agg.arg.as_ref().is_some_and(IRExpr::can_fail))
             }
-            Self::Order { keys, .. } => keys.iter().any(|(e, _)| e.can_fail()),
+            Self::Order { keys, .. } => keys.iter().any(|k| k.expr.can_fail()),
             _ => false,
         }
     }
@@ -543,7 +543,7 @@ impl Term {
                         .map(|(_, a)| 1 + a.arg.as_ref().map_or(0, IRExpr::nodes))
                         .sum::<usize>()
             }
-            Self::Order { keys, .. } => keys.iter().map(|(e, _)| e.nodes()).sum(),
+            Self::Order { keys, .. } => keys.iter().map(|k| k.expr.nodes()).sum(),
             Self::ApproxTopK { query, .. } => query.nodes(),
             Self::Score {
                 query: ScoreQuery::Vector(query),
