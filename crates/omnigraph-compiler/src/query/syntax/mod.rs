@@ -248,9 +248,35 @@ impl PartialEq for GroupSpans {
     }
 }
 
+/// What a keyed statement does when an entity already has its key (the GQ 3
+/// RFC, section 3, Keyed writes). On a new key every mode creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InsertMode {
+    /// `insert`: an existing key is a `key_conflict`.
+    Insert,
+    /// `upsert`: sets the named properties and keeps the others.
+    Upsert,
+    /// `replace`: writes the whole row; an omitted nullable property becomes
+    /// null.
+    Replace,
+}
+
+impl InsertMode {
+    /// The statement word.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Upsert => "upsert",
+            Self::Replace => "replace",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Insert {
+        mode: InsertMode,
         type_name: String,
         assignments: Vec<Assignment>,
     },
@@ -265,8 +291,12 @@ pub enum Stmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Assignment {
+    /// The property as written; an edge's endpoints are `@src` and `@dst`.
     pub property: String,
     pub value: Expr,
+    /// Where the property's name was written: what a fix of the name
+    /// replaces. No part of tree equality.
+    pub at: SourceSpan,
 }
 
 /// An element of `match { … }`: a form that produces rows.

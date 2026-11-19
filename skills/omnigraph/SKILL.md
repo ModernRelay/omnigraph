@@ -106,7 +106,7 @@ query add_signal($slug: String, $name: String, $brief: String, $createdAt: DateT
     insert Signal { slug: $slug, name: $name, brief: $brief,
                     stagingTimestamp: $createdAt, createdAt: $createdAt, updatedAt: $createdAt }
 }
-query link($from: String, $to: String) { insert FormsPattern { from: $from, to: $to } }
+query link($from: String, $to: String) { insert FormsPattern { @src: $from, @dst: $to } }
 query retitle($slug: String, $t: String) { match { $x: Signal } where $x.slug = $slug  update $x set { name: $t } }
 query remove($slug: String)              { match { $x: Signal } where $x.slug = $slug  delete $x }
 ```
@@ -118,7 +118,7 @@ query remove($slug: String)              { match { $x: Signal } where $x.slug = 
   embed automatically.
 - A single mutation is insert/update-only **or** delete-only — never both (`T76`, which `lint` reports); split them.
 - A write group's `match … where` is a read's: traversals, edge bindings (`delete $k`; `$k: Knows` alone binds every edge of the type, in a read too), blocks, `let` and `from`; assignments may read the row (`city: $c.city`, `to: $c`). A `Blob` read from a row is `T86`; every group selects on the graph the write started from, so a selection reading a type an earlier group of the write changes is `T91` (use a second write, or several statements after one `match`); one statement giving an entity two values is `E4`.
-- Edge inserts give logical `from`/`to` endpoint IDs; a propertyless edge needs only those, and there is no nested `data` block in GQ. An unkeyed edge insert is strict (inserting twice creates two edges). An edge type may declare `@key(@src, @dst[, prop…])` in its body when created; inserts then upsert by the derived id, and identical inserts on two branches converge on merge. Edges cannot be `update`d (T16).
+- Edge inserts assign their endpoints as `@src` and `@dst` (`from:` and `to:` are refused with that fix); a propertyless edge needs only those, and there is no nested `data` block in GQ. An unkeyed edge insert is strict (inserting twice creates two edges). An edge type may declare `@key(@src, @dst[, prop…])` in its body when created; inserts then upsert by the derived id, and identical inserts on two branches converge on merge. `update $k set { … }` changes an edge's properties, never its endpoints or key (T93).
 
 ### Bulk load (JSONL)
 

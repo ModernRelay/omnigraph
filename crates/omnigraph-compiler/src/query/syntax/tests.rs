@@ -509,10 +509,50 @@ fn any_word_is_an_edge_name_inside_match() {
         ));
         assert_eq!(e.code.as_str(), "Q019", "{word}");
     }
-    // An edge insert: `from` and `to` as assignment names.
+    // An edge insert assigns its endpoints as `@src` and `@dst`; `from` and
+    // `to` still parse as names, and the type checker refuses them on an
+    // edge with the fix.
     let w =
-        write("query hire($h: String, $slug: String) { insert WorksAt { from: $h, to: $slug } }");
-    assert_eq!(w.all_statements().len(), 1);
+        write("query hire($h: String, $slug: String) { insert WorksAt { @src: $h, @dst: $slug } }");
+    assert!(matches!(
+        &w.all_statements()[0],
+        Stmt::Insert { assignments, .. } if assignments[0].property == "@src" && assignments[1].property == "@dst"
+    ));
+}
+
+/// `upsert` and `replace` are statement words only where a statement
+/// starts (the GQ 3 RFC, section 3, Keyed writes), so `replace` stays free
+/// as a call name, and each keyed statement carries its mode.
+#[test]
+fn upsert_and_replace_are_statement_words_only_at_statement_start() {
+    for (word, mode) in [
+        ("insert", InsertMode::Insert),
+        ("upsert", InsertMode::Upsert),
+        ("replace", InsertMode::Replace),
+    ] {
+        let w = write(&format!(
+            "query w() {{ match {{ $p: Person }} {word} Tag {{ name: $p.name }} }}"
+        ));
+        assert!(
+            matches!(&w.all_statements()[0], Stmt::Insert { mode: m, .. } if *m == mode),
+            "{word}"
+        );
+    }
+    // A call named `replace` in an expression is a call, not a statement.
+    let r =
+        read(r#"query q() { match { $p: Person } return { replace($p.name, "a", "b") as r } }"#);
+    assert!(
+        matches!(&r.projections[0].expr, Expr::Call(c) if c.name == "replace"),
+        "{:?}",
+        r.projections[0].expr
+    );
+    let w = write(
+        r#"query w() { match { $p: Person } update $p set { name: replace($p.name, "a", "b") } }"#,
+    );
+    assert!(matches!(
+        &w.all_statements()[0],
+        Stmt::Update { assignments, .. } if matches!(&assignments[0].value, Expr::Call(c) if c.name == "replace")
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -761,6 +801,8 @@ const CONTEXTUAL: &[&str] = &[
     "diff",
     "list",
     "create",
+    "upsert",
+    "replace",
 ];
 const RESERVED: &[&str] = &["and", "or", "not", "is", "null", "in"];
 
@@ -1371,6 +1413,7 @@ const SYNTAX_RULES: &[&str] = &[
     "element",
     "elements",
     "empty_args_rec",
+    "endpoint_field",
     "eq_assign_rec",
     "exp_float_rec",
     "explain_stmt",
@@ -1411,6 +1454,7 @@ const SYNTAX_RULES: &[&str] = &[
     "inner_where_rec",
     "insert_paren_rec",
     "insert_stmt",
+    "insert_word",
     "integer",
     "keyword_call_rec",
     "kw_after",
@@ -1457,6 +1501,7 @@ const SYNTAX_RULES: &[&str] = &[
     "kw_page",
     "kw_publish",
     "kw_query",
+    "kw_replace",
     "kw_reset",
     "kw_return",
     "kw_run",
@@ -1466,6 +1511,7 @@ const SYNTAX_RULES: &[&str] = &[
     "kw_unattached",
     "kw_unwind",
     "kw_update",
+    "kw_upsert",
     "kw_view",
     "kw_where",
     "let_clause",
@@ -1726,14 +1772,6 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
   return { $d.title }
 }"#,
         r#"query q($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 20) as $distance } return { $d.title } }"#,
-    ),
-    (
-        r#"an endpoint written as a meta-field"#,
-        "Q005",
-        r#"query hire($h: String, $slug: String) {
-  insert WorksAt { @src: $h, @dst: $slug }
-}"#,
-        r#"query hire($h: String, $slug: String) { insert WorksAt { from: $h, to: $slug } }"#,
     ),
     (
         r#"an assignment with ="#,
@@ -2118,6 +2156,14 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
   CREATE (p:Person {handle: "x", name: "x"})
 }"#,
         r#"query w() { insert Person { handle: "x", name: "x" } }"#,
+    ),
+    (
+        r#"MERGE"#,
+        "Q014",
+        r#"query w() {
+  MERGE (p:Person {handle: "x", name: "x"})
+}"#,
+        r#"query w() { upsert Person { handle: "x", name: "x" } }"#,
     ),
     (
         r#"SET"#,

@@ -305,6 +305,10 @@ const INTENDED: &[(&str, &str)] = &[
         r#"query differs_from_null() { match { $p: Person } where $p.city is not null return { $p.handle } }"#,
     ),
     (
+        "diagnostics/t11_edge_endpoint_written_from_and_to.gqt step 3",
+        r#"query befriend() { insert Knows { @src: "ada", @dst: "ada" } }"#,
+    ),
+    (
         "diagnostics/t65_ranking_in_order.gqt step 3",
         r#"query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 3) as $distance } return { $d.title } order { $distance } limit 3 }"#,
     ),
@@ -391,6 +395,14 @@ const INTENDED: &[(&str, &str)] = &[
     (
         "diagnostics/t90_triple_reads_a_reference_an_optional_introduced.gqt step 5",
         "query admirers_of_staff() { match { $c: Company, optional { $p: Person, $p worksAt $c, $q: Person, $q knows $p } } return { $c.name, $q.name } }",
+    ),
+    (
+        "diagnostics/t92_upsert_or_replace_without_a_key.gqt step 3",
+        r#"query befriend() { insert Knows { @src: "ada", @dst: "ada" } }"#,
+    ),
+    (
+        "diagnostics/t92_upsert_or_replace_without_a_key.gqt step 5",
+        r#"query befriend_again() { insert Knows { @src: "ada", @dst: "ada" } }"#,
     ),
     (
         "issue_640_search_score_projection.gqt step 23",

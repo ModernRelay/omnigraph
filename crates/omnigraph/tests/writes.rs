@@ -677,14 +677,14 @@ query insert_then_update_same_person(
 }
 
 query insert_two_friends($from: String, $a: String, $b: String) {
-    insert Knows { from: $from, to: $a }
-    insert Knows { from: $from, to: $b }
+    insert Knows { @src: $from, @dst: $a }
+    insert Knows { @src: $from, @dst: $b }
 }
 
 query person_with_two_friends($name: String, $age: I32, $a: String, $b: String) {
     insert Person { name: $name, age: $age }
-    insert Knows { from: $name, to: $a }
-    insert Knows { from: $name, to: $b }
+    insert Knows { @src: $name, @dst: $a }
+    insert Knows { @src: $name, @dst: $b }
 }
 
 query mixed_insert_and_delete($name: String, $age: I32, $victim: String) {
@@ -3777,7 +3777,7 @@ edge Knows: Person -> Person @card(2..)
     const MIN_CARD_QUERY: &str = r#"
 query add_person($name: String, $friend: String) {
     insert Person { name: $name }
-    insert Knows { from: $name, to: $friend }
+    insert Knows { @src: $name, @dst: $friend }
 }
 "#;
 
@@ -5108,13 +5108,13 @@ async fn keyed_edge_delete_then_reinsert_spans_two_mutations() {
 
     const MUTATIONS: &str = r#"
 query seed_knows() {
-    insert Knows { from: "Alice", to: "Bob", since: "2020" }
+    insert Knows { @src: "Alice", @dst: "Bob", since: "2020" }
 }
 
 query replace_knows() {
     match { $x: Knows } where $x.@src = "Alice"
     delete $x
-    insert Knows { from: "Alice", to: "Bob", since: "2021" }
+    insert Knows { @src: "Alice", @dst: "Bob", since: "2021" }
 }
 
 query drop_knows() {
@@ -5142,12 +5142,11 @@ query drop_knows() {
     assert_eq!(count_rows(&db, "edge:Knows").await, 1);
 }
 
-/// Edge key immutability is enforced structurally: the typechecker refuses
-/// every edge update (T16; the mutation executor carries a second refusal
-/// behind it). A future edge-update feature must revisit the key-column
-/// rule when this pin goes red.
+/// Edge key immutability is enforced structurally: an edge's endpoints and
+/// key are its identity, and the type checker refuses an `update` that
+/// assigns one (`T93`), so nothing reaches the executor.
 #[tokio::test]
-async fn update_refuses_edge_types_pinning_key_immutability() {
+async fn update_refuses_an_edge_endpoint_pinning_key_immutability() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = helpers::session(Omnigraph::init(uri, EDGE_KEY_WRITE_SCHEMA).await.unwrap());
@@ -5156,17 +5155,16 @@ async fn update_refuses_edge_types_pinning_key_immutability() {
         .unwrap();
 
     const MUTATIONS: &str = r#"
-query set_since() {
+query move_edge() {
     match { $x: Knows } where $x.@src = "Alice"
-    update $x set { since: "2021" }
+    update $x set { @dst: "Bob" }
 }
 "#;
-    let err = mutate_main(&db, MUTATIONS, "set_since", &params(&[]))
+    let err = mutate_main(&db, MUTATIONS, "move_edge", &params(&[]))
         .await
-        .expect_err("update on an edge type must be refused");
+        .expect_err("an update of an edge's endpoint must be refused");
     assert!(
-        err.to_string()
-            .contains("update mutation for edge type `Knows` is not supported"),
+        err.to_string().contains("T93") && err.to_string().contains("an endpoint of `Knows`"),
         "got: {}",
         err
     );

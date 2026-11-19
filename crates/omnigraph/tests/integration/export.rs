@@ -19,7 +19,7 @@ query insert_person($name: String, $age: I32) {
 }
 
 query add_friend($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 "#;
 
@@ -755,7 +755,7 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
     assert!(
         key_update
             .to_string()
-            .contains("cannot update @key property 'slot'"),
+            .contains("`slot`, a key property of `Membership`"),
         "every composite component is immutable: {key_update}"
     );
     assert_eq!(count_rows(&db, "node:Membership").await, 1);

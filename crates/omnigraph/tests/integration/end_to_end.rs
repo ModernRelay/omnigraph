@@ -973,7 +973,11 @@ query rename_person($old_name: String, $new_name: String) {
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("@key"), "error should mention @key: {}", err);
+    assert!(
+        err.contains("T93") && err.contains("a key property"),
+        "error should name the key property: {}",
+        err
+    );
 }
 
 // ─── Blob support ────────────────────────────────────────────────────────────

@@ -87,9 +87,9 @@ a key on an existing edge type is refused by the planner. Repeated inserts of
 the same key upsert the edge; without a key, repeated endpoint pairs remain
 distinct edges. The derived id orders `@src`, `@dst`, then scalar members in
 catalog order (not declaration order), so omit `id` rather than building it by
-hand. Edges cannot be `update`d (`T16`): re-insert a keyed edge to change its
-non-key properties. The property-level `@key` shorthand is refused on edge
-properties.
+hand. `update $k set { … }` changes an edge's properties; its endpoints and
+key are its identity, which an `update` refuses (`T93`). The property-level
+`@key` shorthand is refused on edge properties.
 
 ### Lint after every edit
 

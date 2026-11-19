@@ -606,15 +606,33 @@ fn statement() -> impl Strategy<Value = Stmt> {
         1 => Just(Expr::Literal(Literal::Null)),
     ];
     let assignments = proptest::collection::vec(
-        (pick(PROPS), value).prop_map(|(property, value)| Assignment { property, value }),
+        (
+            prop_oneof![9 => pick(PROPS), 1 => pick(&["@src", "@dst"])],
+            value,
+        )
+            .prop_map(|(property, value)| Assignment {
+                property,
+                value,
+                at: SourceSpan::default(),
+            }),
         1..3,
     )
     .boxed();
     prop_oneof![
-        (pick(TYPES), assignments.clone()).prop_map(|(type_name, assignments)| Stmt::Insert {
-            type_name,
-            assignments
-        }),
+        (
+            prop_oneof![
+                Just(InsertMode::Insert),
+                Just(InsertMode::Upsert),
+                Just(InsertMode::Replace)
+            ],
+            pick(TYPES),
+            assignments.clone()
+        )
+            .prop_map(|(mode, type_name, assignments)| Stmt::Insert {
+                mode,
+                type_name,
+                assignments
+            }),
         (pick(VARS), assignments).prop_map(|(variable, assignments)| Stmt::Update {
             variable,
             assignments

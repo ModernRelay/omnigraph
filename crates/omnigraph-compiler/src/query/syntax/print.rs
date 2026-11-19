@@ -141,9 +141,10 @@ pub(crate) fn statement(s: &Stmt) -> String {
     };
     match s {
         Stmt::Insert {
+            mode,
             type_name,
             assignments: a,
-        } => format!("insert {type_name} {{ {} }}", assignments(a)),
+        } => format!("{} {type_name} {{ {} }}", mode.keyword(), assignments(a)),
         Stmt::Update {
             variable,
             assignments: a,

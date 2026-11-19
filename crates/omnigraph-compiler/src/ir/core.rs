@@ -681,6 +681,9 @@ pub enum AssignValue {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Sink {
     Insert {
+        /// What the write does on an existing key (the GQ 3 RFC, section 3,
+        /// Keyed writes).
+        mode: crate::query::syntax::InsertMode,
         target: MutationTarget,
         assignments: Vec<(String, AssignValue)>,
     },

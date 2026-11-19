@@ -341,20 +341,27 @@ trailing_elements_rec = { (!("}" | kw_match) ~ write_element ~ ","?)+ }
 // A `match { … }` after the last statement, with no statement of its own.
 trailing_match_rec = { match_clause ~ where_clause? ~ &"}" }
 write_element = _{ detach_rec | element }
-// Section 7's `stmt_keyword` is the three statement words; `create`, `merge`
-// and `set` are recognised here too, so Cypher's and SQL's write words at a
-// write body's statement start are refused as statements with `insert` or
+// Section 7's `stmt_keyword` is the five statement words; `upsert` and
+// `replace` are contextual, words only here, where no expression begins, so
+// `replace` stays free as a call name. `create`, `merge` and `set` are
+// recognised here too, so Cypher's and SQL's write words at a write body's
+// statement start are refused as statements with `insert`, `upsert` or
 // `update` as the fix. No element can begin with those words, so the
 // accepted texts are section 7's.
-stmt_keyword   = @{ ("insert" | "update" | "delete" | "create" | "merge" | "set") ~ !(ASCII_ALPHANUMERIC | "_") }
+stmt_keyword   = @{ ("insert" | "upsert" | "replace" | "update" | "delete" | "create" | "merge" | "set") ~ !(ASCII_ALPHANUMERIC | "_") }
 mutation_stmt = { where_stmt | create_rec | set_rec | delete_multi_rec | delete_type_rec | insert_paren_rec | update_noset_rec | stmt_var_rec | insert_stmt | update_stmt | delete_stmt }
 // `insert $b`, `update $b` with no `set`.
 stmt_var_rec = { (kw_insert | kw_update) ~ variable ~ !(kw_set | "{") }
-insert_stmt   = { kw_insert ~ type_name ~ "{" ~ assignments ~ "}" }
+insert_stmt   = { insert_word ~ type_name ~ "{" ~ assignments ~ "}" }
+// The keyed statement's mode: `insert`, `upsert` or `replace`.
+insert_word   = { kw_insert | kw_upsert | kw_replace }
 update_stmt   = { kw_update ~ variable ~ kw_set ~ "{" ~ assignments ~ "}" }
 delete_stmt   = { kw_delete ~ variable }
 assignments   = { assignment ~ (("," | missing_comma_rec) ~ assignment)* ~ ","? }
-assignment    = { ident ~ ":" ~ (null_value | expr) | eq_assign_rec | qualified_assign_rec | meta_assign_rec }
+// An edge's endpoints are assigned as `@src:` and `@dst:`; another
+// meta-field is refused by `meta_assign_rec`.
+assignment    = { (ident | endpoint_field) ~ ":" ~ (null_value | expr) | eq_assign_rec | qualified_assign_rec | meta_assign_rec }
+endpoint_field = @{ ("@src" | "@dst") ~ !(ASCII_ALPHANUMERIC | "_") }
 null_value     = { kw_null ~ &("," | "}" | ident ~ ":") }
 // Edition 2's statement `where`, recognised to print the group form. The
 // predicate admits bare names (section 7: "where_expr admits bare names"),
@@ -466,6 +473,8 @@ kw_let      = @{ "let" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_optional = @{ "optional" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_exists   = @{ "exists" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_insert   = @{ "insert" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_upsert   = @{ "upsert" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_replace  = @{ "replace" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_update   = @{ "update" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_where    = @{ "where" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_for      = @{ "for" ~ !(ASCII_ALPHANUMERIC | "_") }

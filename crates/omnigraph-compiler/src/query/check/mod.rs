@@ -2259,7 +2259,7 @@ impl Ctx<'_> {
                 if sc.depends_on_refused(&statement_names(s)) {
                     continue;
                 }
-                let typed = self.statement(&mut sc, s);
+                let typed = self.statement(&mut sc, s, group.spans.statements.get(i));
                 let Some((sink, this)) = self.recover(typed)? else {
                     continue;
                 };
@@ -4938,44 +4938,73 @@ impl Ctx<'_> {
 
     /// Whether `insert T { … }` writes the edge type `T` rather than the node
     /// type `T`. A node type and an edge type may share a name, and the
-    /// statement's form decides between them: an edge insert assigns its
-    /// endpoints `from` and `to`, which an edge type reserves, and a node
-    /// insert assigns neither. Only a statement that assigns an endpoint name
-    /// the node type also declares as a property fits both, and is refused.
-    fn insert_targets_edge(&self, type_name: &str, assignments: &[Assignment]) -> R<bool> {
+    /// statement's form decides between them: an edge write assigns its
+    /// endpoints as `@src` and `@dst`, which no node type declares. Edition
+    /// 2's `from` and `to` select the edge too where the node type declares
+    /// no such property, so the edge's refusal prints the `@src`/`@dst` fix.
+    fn insert_targets_edge(&self, type_name: &str, assignments: &[Assignment]) -> bool {
         let node = self.catalog.node_types.get(type_name);
         let edge = self.catalog.edge_types.get(type_name);
         let (Some(node), Some(_)) = (node, edge) else {
-            return Ok(node.is_none() && edge.is_some());
+            return node.is_none() && edge.is_some();
         };
-        let ends: Vec<&str> = assignments
-            .iter()
-            .map(|a| a.property.as_str())
-            .filter(|p| matches!(*p, "from" | "to"))
-            .collect();
-        if ends.is_empty() {
-            return Ok(false);
-        }
-        if let Some(shared) = ends.iter().find(|p| node.properties.contains_key(**p)) {
-            return Err(err_fix(
-                T11,
-                format!(
-                    "`insert {type_name}` fits both the node type `{type_name}`, which declares a property `{shared}`, and the edge type `{type_name}`, whose endpoint `{shared}` is; a statement cannot tell them apart"
-                ),
-                format!(
-                    "rename the node type's property `{shared}` or one of the two types in the schema"
-                ),
-            ));
-        }
-        Ok(true)
+        assignments.iter().any(|a| match a.property.as_str() {
+            "@src" | "@dst" => true,
+            end @ ("from" | "to") => !node.properties.contains_key(end),
+            _ => false,
+        })
     }
 
-    fn statement(&mut self, sc: &mut Scope, s: &Stmt) -> R<(Sink, WriteClass)> {
+    /// `T92`: `upsert` or `replace` names an existing entity by its key, so a
+    /// type with no `@key` has none to name; the fix writes `insert`, which
+    /// always creates.
+    fn keyless_mode(
+        &self,
+        mode: InsertMode,
+        type_name: &str,
+        keyed: bool,
+        at: Option<&SourceSpan>,
+    ) -> Option<E> {
+        if mode == InsertMode::Insert || keyed {
+            return None;
+        }
+        let word = mode.keyword();
+        let mut d = QueryDiagnostic::typecheck(
+            T92,
+            format!(
+                "`{word} {type_name}`: `{type_name}` declares no `@key`, so `{word}` has no existing entity to name; `insert` creates one"
+            ),
+        )
+        .with_fix(format!("insert {type_name} {{ … }}"));
+        if let Some(at) = at.filter(|at| at.end > at.start) {
+            d.position = Some(at.position);
+            d.end = Some(at.end_position);
+            d = d.with_suggestion(Suggestion {
+                applicability: Applicability::MachineApplicable,
+                edits: vec![TextEdit {
+                    start: at.start,
+                    end: at.start + word.len(),
+                    replacement: "insert".to_string(),
+                }],
+            });
+        }
+        Some(E::D(d))
+    }
+
+    fn statement(
+        &mut self,
+        sc: &mut Scope,
+        s: &Stmt,
+        at: Option<&SourceSpan>,
+    ) -> R<(Sink, WriteClass)> {
         match s {
             Stmt::Insert {
+                mode,
                 type_name,
                 assignments,
             } => {
+                let mode = *mode;
+                let word = mode.keyword();
                 if crate::catalog::catalogue::is_catalogue_type_name(type_name) {
                     return Err(err(
                         T10,
@@ -4985,16 +5014,21 @@ impl Ctx<'_> {
                     ));
                 }
                 if assignments.is_empty() {
-                    return Err(err(T10, "insert requires at least one assignment"));
+                    return Err(err(T10, format!("{word} requires at least one assignment")));
                 }
                 dup_assignments(assignments)?;
-                let edge_insert = self.insert_targets_edge(type_name, assignments)?;
+                let edge_insert = self.insert_targets_edge(type_name, assignments);
                 if let Some(node) = self
                     .catalog
                     .node_types
                     .get(type_name)
                     .filter(|_| !edge_insert)
                 {
+                    if let Some(e) = self.keyless_mode(mode, type_name, node.key.is_some(), at) {
+                        return Err(e);
+                    }
+                    let key: HashSet<&str> =
+                        node.key.iter().flatten().map(String::as_str).collect();
                     let mut out = Vec::new();
                     // Each assignment is checked; an unknown property may be
                     // the misspelled required one, so the required check
@@ -5003,6 +5037,16 @@ impl Ctx<'_> {
                     let mut unknown = false;
                     for a in assignments {
                         let typed = match node.properties.get(&a.property).cloned() {
+                            None if matches!(a.property.as_str(), "@src" | "@dst") => {
+                                unknown = true;
+                                Err(err(
+                                    T11,
+                                    format!(
+                                        "node type `{type_name}` has no endpoints; `{}` is assigned on an edge",
+                                        a.property
+                                    ),
+                                ))
+                            }
                             None => {
                                 unknown = true;
                                 Err(err(
@@ -5032,6 +5076,13 @@ impl Ctx<'_> {
                         if t.nullable || assigned.contains(p.as_str()) {
                             continue;
                         }
+                        // `upsert` on an existing key keeps every property
+                        // it omits, so only its key is required here; a
+                        // new key without a required property is refused
+                        // when it runs.
+                        if mode == InsertMode::Upsert && !key.contains(p.as_str()) {
+                            continue;
+                        }
                         if let Some(e) = node.embed_sources.get(p)
                             && assigned.contains(e.source.as_str())
                         {
@@ -5040,7 +5091,7 @@ impl Ctx<'_> {
                         missing = Some(err(
                             T12,
                             format!(
-                                "insert for `{type_name}` must provide non-nullable property `{p}`"
+                                "{word} for `{type_name}` must provide non-nullable property `{p}`"
                             ),
                         ));
                         break;
@@ -5053,6 +5104,7 @@ impl Ctx<'_> {
                     }
                     return Ok((
                         Sink::Insert {
+                            mode,
                             target: MutationTarget::Node {
                                 type_name: type_name.clone(),
                             },
@@ -5062,30 +5114,38 @@ impl Ctx<'_> {
                     ));
                 }
                 if let Some(edge) = self.catalog.edge_types.get(type_name) {
+                    if let Some(e) = self.keyless_mode(mode, type_name, edge.key.is_some(), at) {
+                        return Err(e);
+                    }
                     let mut out = Vec::new();
-                    let (mut from, mut to) = (false, false);
+                    let (mut src, mut dst) = (false, false);
                     let mut failed: Option<E> = None;
                     for a in assignments {
-                        let v = (|| -> R<AssignValue> {
+                        let v = (|| -> R<(String, AssignValue)> {
                             Ok(match a.property.as_str() {
-                                end @ ("from" | "to") => {
-                                    if end == "from" {
-                                        from = true
+                                end @ ("@src" | "@dst") => {
+                                    // The IR names an endpoint by the edge
+                                    // table's logical `from` and `to`.
+                                    let (endpoint, name) = if end == "@src" {
+                                        src = true;
+                                        (&edge.from_type, "from")
                                     } else {
-                                        to = true
-                                    }
-                                    let endpoint = if end == "from" {
-                                        &edge.from_type
-                                    } else {
-                                        &edge.to_type
+                                        dst = true;
+                                        (&edge.to_type, "to")
                                     };
-                                    self.endpoint(sc, &a.value, endpoint, end, type_name)?
+                                    (
+                                        name.to_string(),
+                                        self.endpoint(sc, &a.value, endpoint, end, type_name)?,
+                                    )
+                                }
+                                end @ ("from" | "to") => {
+                                    return Err(endpoint_respelling(end, &a.at));
                                 }
                                 p => {
                                     let Some(pt) = edge.properties.get(p).cloned() else {
                                         let mut names = nearest::properties(&edge.properties);
-                                        names.push(("from".into(), edge.from_type.clone()));
-                                        names.push(("to".into(), edge.to_type.clone()));
+                                        names.push(("@src".into(), edge.from_type.clone()));
+                                        names.push(("@dst".into(), edge.to_type.clone()));
                                         return Err(err(
                                             T11,
                                             format!(
@@ -5095,39 +5155,43 @@ impl Ctx<'_> {
                                             ),
                                         ));
                                     };
-                                    self.assign(sc, &a.value, &pt, p)?
+                                    (p.to_string(), self.assign(sc, &a.value, &pt, p)?)
                                 }
                             })
                         })();
                         match v {
-                            Ok(v) => out.push((a.property.clone(), v)),
+                            Ok(v) => out.push(v),
                             Err(e) => failed = Some(self.join_failed(sc, failed.take(), e)),
                         }
                     }
                     if let Some(e) = failed {
                         return Err(e);
                     }
-                    if !from || !to {
+                    if !src || !dst {
                         return Err(err(
                             T12,
                             format!(
-                                "insert for `{type_name}` must provide required endpoint `{}`",
-                                if from { "to" } else { "from" }
+                                "{word} for `{type_name}` must provide required endpoint `{}`",
+                                if src { "@dst" } else { "@src" }
                             ),
                         ));
                     }
                     for (p, t) in &edge.properties {
-                        if !t.nullable && !assignments.iter().any(|a| &a.property == p) {
+                        if !t.nullable
+                            && mode != InsertMode::Upsert
+                            && !assignments.iter().any(|a| &a.property == p)
+                        {
                             return Err(err(
                                 T12,
                                 format!(
-                                    "insert for `{type_name}` must provide non-nullable property `{p}`"
+                                    "{word} for `{type_name}` must provide non-nullable property `{p}`"
                                 ),
                             ));
                         }
                     }
                     return Ok((
                         Sink::Insert {
+                            mode,
                             target: MutationTarget::Edge {
                                 type_name: type_name.clone(),
                             },
@@ -5149,37 +5213,69 @@ impl Ctx<'_> {
                 assignments,
             } => {
                 let target = self.statement_target(sc, variable, "update")?;
-                let type_name = match &target {
-                    MutationTarget::Node { type_name } => type_name,
-                    MutationTarget::Edge { type_name } => {
-                        return Err(err(
-                            T16,
-                            format!(
-                                "update mutation for edge type `{type_name}` is not supported (`${variable}`); delete the edge and insert it again"
-                            ),
-                        ));
-                    }
-                };
                 if assignments.is_empty() {
                     return Err(err(T10, "update requires at least one assignment"));
                 }
                 dup_assignments(assignments)?;
-                let props = self.node_props(type_name).cloned().unwrap_or_default();
+                // A key property and an edge's endpoints are its identity:
+                // `update` sets the others, and moving an edge is a delete
+                // and an insert.
+                let (type_name, props, key) = match &target {
+                    MutationTarget::Node { type_name } => {
+                        let node = self.catalog.node_types.get(type_name);
+                        (
+                            type_name,
+                            node.map(|n| n.properties.clone()).unwrap_or_default(),
+                            node.and_then(|n| n.key.clone()).unwrap_or_default(),
+                        )
+                    }
+                    MutationTarget::Edge { type_name } => {
+                        let edge = self.catalog.edge_types.get(type_name);
+                        (
+                            type_name,
+                            edge.map(|e| e.properties.clone()).unwrap_or_default(),
+                            edge.and_then(|e| e.key.clone()).unwrap_or_default(),
+                        )
+                    }
+                };
+                let edge = matches!(target, MutationTarget::Edge { .. });
                 let mut out = Vec::new();
                 // Each assignment is checked.
                 let mut failed: Option<E> = None;
                 for a in assignments {
-                    let typed = match props.get(&a.property).cloned() {
-                        None => Err(err(
+                    let p = a.property.as_str();
+                    let identity = if edge && matches!(p, "@src" | "@dst" | "from" | "to") {
+                        Some("an endpoint")
+                    } else if key.iter().any(|k| k == p) {
+                        Some("a key property")
+                    } else {
+                        None
+                    };
+                    let typed = match (identity, props.get(p).cloned()) {
+                        (Some(what), _) => Err(err_fix(
+                            T93,
+                            format!(
+                                "`update ${variable}` assigns `{p}`, {what} of `{type_name}`; a key and an edge's endpoints are its identity, which `update` does not change"
+                            ),
+                            if edge {
+                                format!(
+                                    "delete the edge and insert it with its new endpoints, or leave `{p}` out of the `set`"
+                                )
+                            } else {
+                                format!(
+                                    "insert an entity with the new key and delete the old one, or leave `{p}` out of the `set`"
+                                )
+                            },
+                        )),
+                        (None, None) => Err(err(
                             T11,
                             format!(
-                                "type `{type_name}` has no property `{}`{}{}",
-                                a.property,
-                                system_assignment_hint(&a.property),
-                                nearest::listing(&a.property, nearest::properties(&props))
+                                "type `{type_name}` has no property `{p}`{}{}",
+                                system_assignment_hint(p),
+                                nearest::listing(p, nearest::properties(&props))
                             ),
                         )),
-                        Some(pt) => self.assign(sc, &a.value, &pt, &a.property),
+                        (None, Some(pt)) => self.assign(sc, &a.value, &pt, p),
                     };
                     match typed {
                         Ok(v) => out.push((a.property.clone(), v)),
@@ -7554,6 +7650,33 @@ fn class_word(c: WriteClass) -> &'static str {
         WriteClass::Constructive => "constructive",
         WriteClass::Destructive => "destructive",
     }
+}
+
+/// Edition 2's `from:` or `to:` in an edge write: an edge's endpoints are
+/// assigned as `@src` and `@dst`, the names a read and a `where` use, so
+/// `from` has one meaning in edition 3. A node type may declare a property
+/// named `from`, so only the type checker, which knows the target is an
+/// edge, can refuse the spelling.
+fn endpoint_respelling(end: &str, at: &SourceSpan) -> E {
+    let fixed = if end == "from" { "@src" } else { "@dst" };
+    let mut d = QueryDiagnostic::typecheck(
+        T11,
+        format!("an edge's endpoints are assigned as `@src` and `@dst`; `{end}:` is edition 2's spelling of `{fixed}:`"),
+    )
+    .with_fix(format!("{fixed}: <endpoint>"));
+    if at.end > at.start {
+        d.position = Some(at.position);
+        d.end = Some(at.end_position);
+        d = d.with_suggestion(Suggestion {
+            applicability: Applicability::MachineApplicable,
+            edits: vec![TextEdit {
+                start: at.start,
+                end: at.end,
+                replacement: fixed.to_string(),
+            }],
+        });
+    }
+    E::D(d)
 }
 
 fn dup_assignments(a: &[Assignment]) -> R<()> {

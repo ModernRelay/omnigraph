@@ -2285,6 +2285,9 @@ impl Omnigraph {
         for op in &ir.ops {
             let result = match op {
                 WriteOp::Insert {
+                    // Every mode stages the keyed upsert for now; the
+                    // modes' own semantics arrive with their engine paths.
+                    mode: _,
                     target,
                     assignments,
                     rows,
@@ -3497,6 +3500,7 @@ edge Shared: Endpoint -> Endpoint { label: String }
         for (ir, is_insert) in [
             (
                 mutation(WriteOp::Insert {
+                    mode: omnigraph_compiler::query::syntax::InsertMode::Replace,
                     target: target.clone(),
                     assignments: vec![
                         assignment("from", "a"),

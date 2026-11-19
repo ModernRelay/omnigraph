@@ -56,7 +56,8 @@ codes! {
     T12 = "insert omits a required property";
     T13 = "duplicate assignment";
     T15 = "traversal hop bounds or nearest operands are invalid";
-    T16 = "update is not supported for edge types";
+    // T16 is withdrawn: `update` takes an edge variable as it takes a node
+    // variable (the GQ 3 RFC, section 3, Keyed writes).
     T17 = "a `nearest` call lacks its window `k`";
     T19 = "a full-text call's field or `terms` operand is invalid";
     T20 = "a lexical query is not a String or `terms` value, or has no searchable terms";
@@ -122,6 +123,11 @@ codes! {
     // The GQ 3 RFC, section 2, the sinks: every group of a write selects on
     // the write's one snapshot, never on the effects earlier groups staged.
     T91 = "a write group's selection reads a type an earlier group of the write changes; every group selects on the snapshot the write started from";
+    // The GQ 3 RFC, section 3, Keyed writes: `upsert` and `replace` name an
+    // existing entity by its key, and a key and an edge's endpoints are its
+    // identity, which `update` does not change.
+    T92 = "`upsert` or `replace` on a type with no `@key`; the fix is `insert`";
+    T93 = "an `update` assigns a key property or an edge endpoint";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
     // the binding it ranks, and `rrf` arms that rank two bindings are T75.

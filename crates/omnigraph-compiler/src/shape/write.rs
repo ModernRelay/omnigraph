@@ -35,6 +35,7 @@ use crate::ir::core::{
     AssignValue, CoreRead, CoreWrite, MutationTarget, RelTy, Sink, Term, Ty, WriteGroup,
 };
 use crate::query::file::Param;
+use crate::query::syntax::InsertMode;
 use crate::query::value::{BinaryOp, Literal};
 use crate::types::{ExprType, PropType, ScalarType};
 
@@ -95,6 +96,8 @@ pub enum Selection {
 #[derive(Debug, Clone)]
 pub enum WriteOp {
     Insert {
+        /// What the statement does on an existing key.
+        mode: InsertMode,
         target: MutationTarget,
         assignments: Vec<Assignment>,
         rows: InsertRows,
@@ -338,11 +341,13 @@ fn lower_staged(
         let op = match (sink, &selection) {
             (
                 Sink::Insert {
+                    mode,
                     target,
                     assignments,
                 },
                 _,
             ) => WriteOp::Insert {
+                mode: *mode,
                 target: target.clone(),
                 assignments: constants(assignments),
                 rows: match selection {
@@ -411,6 +416,7 @@ fn lower_selected(
             Sink::Insert {
                 target,
                 assignments,
+                ..
             }
             | Sink::Update {
                 target,
@@ -460,7 +466,8 @@ fn lower_selected(
             statement: statement.clone(),
         };
         ops.push(match sink {
-            Sink::Insert { .. } => WriteOp::Insert {
+            Sink::Insert { mode, .. } => WriteOp::Insert {
+                mode: *mode,
                 target: target.clone(),
                 assignments: constant,
                 rows: InsertRows::Selected(rows(None)),

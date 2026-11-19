@@ -1643,19 +1643,19 @@ fn write_groups_type_their_sinks() {
     );
     // `insert` with no clauses runs once over the one empty row.
     let w = ok(
-        "query hire($h: String, $slug: String) { insert Person { handle: $h, name: $h }  insert WorksAt { from: $h, to: $slug } }",
+        "query hire($h: String, $slug: String) { insert Person { handle: $h, name: $h }  insert WorksAt { @src: $h, @dst: $slug } }",
     );
     assert_eq!(write_of(&w).groups[0].input, Term::Unit);
     // An endpoint by bound reference, and the mismatch.
     ok(
-        "query link($a: String, $b: String) { match { $x: Person, $y: Person } where $x.handle = $a and $y.handle = $b  insert Knows { from: $x, to: $y } }",
+        "query link($a: String, $b: String) { match { $x: Person, $y: Person } where $x.handle = $a and $y.handle = $b  insert Knows { @src: $x, @dst: $y } }",
     );
     let m = refused(
-        "query link($a: String, $b: String) { match { $x: Person, $d: Doc } where $x.handle = $a and $d.id = $b  insert Knows { from: $x, to: $d } }",
+        "query link($a: String, $b: String) { match { $x: Person, $d: Doc } where $x.handle = $a and $d.id = $b  insert Knows { @src: $x, @dst: $d } }",
         "T78",
     );
     assert!(
-        m.contains("`to` of `Knows` is a `Person`") && m.contains("node Doc"),
+        m.contains("`@dst` of `Knows` is a `Person`") && m.contains("node Doc"),
         "{m}"
     );
     // A write fed by a ranked read, a `let` and an `optional`.
@@ -1682,11 +1682,97 @@ fn write_groups_type_their_sinks() {
         "query w() { match { $p: Person, let $n = 1 }  delete $n }",
         "T77",
     );
-    // Update of an edge is refused, as today (T16).
-    refused(
+    // `update` takes an edge variable as it takes a node variable, its
+    // assignments typed against the edge's properties.
+    let m = refused(
         "query w() { match { $p $k:worksAt $c }  update $k set { since: 1 } }",
-        "T16",
+        "T11",
     );
+    assert!(m.contains("`WorksAt` has no property `since`"), "{m}");
+    let catalog = build_catalog(
+        &parse_schema("node P { k: String @key }\nedge E: P -> P { since: I32? }").unwrap(),
+    )
+    .unwrap();
+    let (_, checked) = type_source(
+        &catalog,
+        "query w() { match { $a $e:e $b }  update $e set { since: 1 } }",
+    )
+    .unwrap()
+    .remove(0);
+    let CoreDecl::Write(w) = checked.expect("an edge update").core else {
+        panic!("a write")
+    };
+    assert!(matches!(
+        &w.groups[0].sinks[0],
+        Sink::Update { target, .. } if target.is_edge()
+    ));
+}
+
+/// The GQ 3 RFC, section 3, Keyed writes: `insert`, `upsert` and `replace`
+/// are one sink with a mode; `upsert` and `replace` need a `@key` (`T92`,
+/// whose fix writes `insert`); an `update` of a key property or an edge's
+/// endpoint is `T93`; an edge's endpoints are `@src` and `@dst`, and
+/// edition 2's `from:` is refused with the fix.
+#[test]
+fn keyed_writes_carry_their_mode_and_refuse_identity_changes() {
+    use crate::query::syntax::InsertMode;
+    use crate::query::syntax::parse::apply_edits;
+    for (word, mode) in [
+        ("insert", InsertMode::Insert),
+        ("upsert", InsertMode::Upsert),
+        ("replace", InsertMode::Replace),
+    ] {
+        let w = ok(&format!(
+            "query w($h: String) {{ {word} Person {{ handle: $h, name: $h }} }}"
+        ));
+        assert!(
+            matches!(&write_of(&w).groups[0].sinks[0], Sink::Insert { mode: m, .. } if *m == mode),
+            "{word}"
+        );
+    }
+    // `upsert` on an existing key keeps what it omits, so only the key is
+    // required; `insert` and `replace` create or write the whole row.
+    ok("query w($h: String) { upsert Person { handle: $h } }");
+    refused(
+        "query w($h: String) { replace Person { handle: $h } }",
+        "T12",
+    );
+    refused(
+        "query w($h: String) { insert Person { handle: $h } }",
+        "T12",
+    );
+    refused("query w() { upsert Person { name: \"n\" } }", "T12");
+    // A type with no `@key` (the edge `Knows`): `upsert` and `replace` are
+    // T92, fixed to `insert`.
+    for word in ["upsert", "replace"] {
+        let source = format!("query w() {{ {word} Knows {{ @src: \"a\", @dst: \"b\" }} }}");
+        let d = refused_with(&source, "T92");
+        let edits = &d.suggestion.as_ref().expect("a machine fix").edits;
+        assert_eq!(
+            apply_edits(&source, edits),
+            "query w() { insert Knows { @src: \"a\", @dst: \"b\" } }"
+        );
+    }
+    // An edge's endpoints: `@src` and `@dst`; `from:` and `to:` are refused
+    // with the fix.
+    let source = "query w($h: String, $s: String) { insert WorksAt { from: $h, @dst: $s } }";
+    let d = refused_with(source, "T11");
+    let fixed = apply_edits(source, &d.suggestion.as_ref().expect("a machine fix").edits);
+    assert_eq!(
+        fixed,
+        "query w($h: String, $s: String) { insert WorksAt { @src: $h, @dst: $s } }"
+    );
+    // A key property and an edge's endpoint are identity.
+    let m = refused(
+        "query w($h: String) { match { $p: Person } where $p.handle = $h  update $p set { handle: \"x\" } }",
+        "T93",
+    );
+    assert!(m.contains("`handle`") && m.contains("key"), "{m}");
+    let m = refused(
+        "query w() { match { $p $k:worksAt $c }  update $k set { @dst: \"x\" } }",
+        "T93",
+    );
+    assert!(m.contains("`@dst`") && m.contains("endpoint"), "{m}");
 }
 
 #[test]
@@ -2812,7 +2898,7 @@ fn an_insert_targets_the_edge_type_sharing_a_node_types_name_by_its_endpoints_is
     assert_eq!(
         target(
             shared,
-            r#"query q() { insert Link { from: "a", to: "b", weight: 1 } }"#
+            r#"query q() { insert Link { @src: "a", @dst: "b", weight: 1 } }"#
         ),
         Ok(MutationTarget::Edge {
             type_name: "Link".into()
@@ -2826,26 +2912,40 @@ fn an_insert_targets_the_edge_type_sharing_a_node_types_name_by_its_endpoints_is
     );
     // An edge insert missing one endpoint is still an edge insert, refused
     // for the endpoint it omits.
-    let missing = target(shared, r#"query q() { insert Link { from: "a" } }"#).unwrap_err();
+    let missing = target(shared, r#"query q() { insert Link { @src: "a" } }"#).unwrap_err();
     assert!(
-        missing.starts_with("T12") && missing.contains("`to`"),
+        missing.starts_with("T12") && missing.contains("`@dst`"),
         "{missing}"
     );
-    // A node type may declare `from`, which an edge type reserves for its
-    // endpoint: a statement assigning it fits both types.
-    let ambiguous = "node Link { name: String @key  from: String? }\nedge Link: Link -> Link";
-    let refused = target(
-        ambiguous,
-        r#"query q() { insert Link { name: "a", from: "b" } }"#,
+    // Edition 2's `from:` against the shared name selects the edge, whose
+    // refusal prints `@src:`.
+    let respelled = target(
+        shared,
+        r#"query q() { insert Link { from: "a", to: "b" } }"#,
     )
     .unwrap_err();
     assert!(
-        refused.starts_with("T11") && refused.contains("both"),
-        "{refused}"
+        respelled.starts_with("T11") && respelled.contains("`@src`"),
+        "{respelled}"
+    );
+    // A node type may declare `from`; the edge's endpoints are `@src` and
+    // `@dst`, so a statement assigning `from` is the node's.
+    let declared = "node Link { name: String @key  from: String? }\nedge Link: Link -> Link";
+    assert_eq!(
+        target(
+            declared,
+            r#"query q() { insert Link { name: "a", from: "b" } }"#
+        ),
+        Ok(MutationTarget::Node {
+            type_name: "Link".into()
+        })
     );
     assert_eq!(
-        target(ambiguous, r#"query q() { insert Link { name: "a" } }"#),
-        Ok(MutationTarget::Node {
+        target(
+            declared,
+            r#"query q() { insert Link { @src: "a", @dst: "b" } }"#
+        ),
+        Ok(MutationTarget::Edge {
             type_name: "Link".into()
         })
     );

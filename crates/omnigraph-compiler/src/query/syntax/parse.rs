@@ -2015,13 +2015,17 @@ fn statement_inner(input: &str, s: Pair<Rule>) -> R<Stmt> {
     let span = span_of(&s);
     match s.as_rule() {
         Rule::insert_stmt => {
-            let mut inner = s
-                .clone()
-                .into_inner()
-                .filter(|p| p.as_rule() != Rule::kw_insert);
+            let mut inner = s.clone().into_inner();
+            let word = inner.next().unwrap().into_inner().next().unwrap();
+            let mode = match word.as_rule() {
+                Rule::kw_upsert => InsertMode::Upsert,
+                Rule::kw_replace => InsertMode::Replace,
+                _ => InsertMode::Insert,
+            };
             let type_name = inner.next().unwrap().as_str().to_string();
             let assignments = assignment_list(input, &assigns(&s))?;
             Ok(Stmt::Insert {
+                mode,
                 type_name,
                 assignments,
             })
@@ -2057,6 +2061,9 @@ fn statement_inner(input: &str, s: Pair<Rule>) -> R<Stmt> {
                 .as_str()
                 .to_ascii_lowercase();
             let body = s.clone().into_inner().nth(1).unwrap();
+            // Cypher's `CREATE` creates; its `MERGE` creates or matches, and
+            // its `ON MATCH SET` sets named properties: GQ's `upsert`.
+            let stmt = if word == "merge" { "upsert" } else { "insert" };
             let replacement = match body.as_rule() {
                 Rule::cypher_node => {
                     let mut ty = None;
@@ -2068,19 +2075,23 @@ fn statement_inner(input: &str, s: Pair<Rule>) -> R<Stmt> {
                             _ => {}
                         }
                     }
-                    ty.map(|t| format!("insert {t} {{ {} }}", props.join(", ")))
+                    ty.map(|t| format!("{stmt} {t} {{ {} }}", props.join(", ")))
                 }
                 _ => {
                     let ty = body.as_str();
                     Some(format!(
-                        "insert {ty} {{ {} }}",
+                        "{stmt} {ty} {{ {} }}",
                         assignments_text(&assigns(&s))
                     ))
                 }
             };
-            let message = format!(
-                "`{word}` is Cypher's; GQ's keyed `insert T {{ … }}` creates the node, or replaces the one with the same key"
-            );
+            let message = if word == "merge" {
+                format!(
+                    "`{word}` is Cypher's; GQ's `upsert T {{ … }}` creates the node, or sets the named properties of the one with the same key"
+                )
+            } else {
+                format!("`{word}` is Cypher's; GQ's `insert T {{ … }}` creates the node")
+            };
             Err(match replacement {
                 Some(r) => refusal(
                     input,
@@ -2095,7 +2106,7 @@ fn statement_inner(input: &str, s: Pair<Rule>) -> R<Stmt> {
                     Q014,
                     message,
                     span,
-                    "insert <Type> { <property>: <value> }",
+                    format!("{stmt} <Type> {{ <property>: <value> }}"),
                 ),
             })
         }
@@ -2235,24 +2246,7 @@ fn assignment_list(input: &str, pairs: &[Pair<Rule>]) -> R<Vec<Assignment>> {
                     span,
                 ));
             }
-            Rule::meta_assign_rec => {
-                let meta = a.clone().into_inner().next().unwrap();
-                let name = match meta.as_str() {
-                    "@src" => Some("from"),
-                    "@dst" => Some("to"),
-                    _ => None,
-                };
-                match name {
-                    Some(n) => {
-                        edits.push(edit(meta.as_span().start(), meta.as_span().end(), n));
-                        first.get_or_insert((
-                            "an edge's endpoints are assigned as `from:` and `to:`",
-                            span,
-                        ));
-                    }
-                    None => note = Some(span),
-                }
-            }
+            Rule::meta_assign_rec => note = Some(span),
             _ => {}
         }
     }
@@ -2422,14 +2416,21 @@ fn qualify_bare_names(pair: &Pair<Rule>, var: &str) -> String {
 }
 
 fn assignment(pair: Pair<Rule>) -> R<Assignment> {
+    let input = input_of(&pair);
     let mut inner = pair.into_inner();
-    let property = inner.next().unwrap().as_str().to_string();
+    let name = inner.next().unwrap();
+    let at = SourceSpan::of(input, name.as_span().start(), name.as_span().end());
+    let property = name.as_str().to_string();
     let value = inner.next().unwrap();
     let value = match value.as_rule() {
         Rule::null_value => Expr::Literal(Literal::Null),
         _ => expr(value)?,
     };
-    Ok(Assignment { property, value })
+    Ok(Assignment {
+        property,
+        value,
+        at,
+    })
 }
 
 /// Descend through single-child expression rules to a pair of `rule`.

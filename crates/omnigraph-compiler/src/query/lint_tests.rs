@@ -223,7 +223,7 @@ insert Person { slug: "p1", name: "P1" }
 }
 
 query insert_knows($from: String, $to: String) {
-insert Knows { from: $from, to: $to }
+insert Knows { @src: $from, @dst: $to }
 }
 "#,
         "/tmp/queries.gq",
@@ -552,7 +552,7 @@ edge Shared: Shared -> Shared
         ),
         r#"
 query link_shared($from: String, $to: String) {
-insert Shared { from: $from, to: $to }
+insert Shared { @src: $from, @dst: $to }
 }
 "#,
         "/tmp/queries.gq",
