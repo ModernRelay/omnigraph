@@ -108,7 +108,7 @@ fn a_composite_key_pins_with_every_column() {
 /// The refusal points at the second component and names both; with one edge
 /// type from one to the other, the fix inserts the triple, source first.
 #[test]
-fn the_refusal_is_at_the_second_component_and_one_edge_joins_them() {
+fn the_refusal_is_at_the_second_component_and_names_the_edge_and_the_product() {
     let src = "query q() {\n  match { $c: Company, $p: Person }\n  return { $p.name, $c.name }\n}";
     let d = t81(src);
     let at = d.position.expect("a position");
@@ -123,10 +123,12 @@ fn the_refusal_is_at_the_second_component_and_one_edge_joins_them() {
             "join them through the edge, `$p worksAt $c`, or write the intended product as a named relation, `let $ps = { match { $p: Person } return { $p } }, from $ps`"
         )
     );
+    // Joining through the edge changes the product's rows; the suggestion is
+    // the named relation, which keeps them, for the author to review.
     repaired(
         src,
-        Applicability::MachineApplicable,
-        "query q() { match { $c: Company, $p: Person, $p worksAt $c } return { $p.name, $c.name } }",
+        Applicability::NeedsReview,
+        "query q() { match { $c: Company, let $ps = { match { $p: Person } return { $p } }, from $ps } return { $p.name, $c.name } }",
     );
 }
 

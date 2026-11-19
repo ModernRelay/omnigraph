@@ -2005,7 +2005,7 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"two components one edge type joins"#,
         "T81",
         r#"query staff() { match { $c: Company, $p: Person } return { $p.name, $c.name } }"#,
-        r#"query staff() { match { $c: Company, $p: Person, $p worksAt $c } return { $p.name, $c.name } }"#,
+        r#"query staff() { match { $c: Company, let $ps = { match { $p: Person } return { $p } }, from $ps } return { $p.name, $c.name } }"#,
     ),
     (
         r#"two components no edge type joins"#,

@@ -345,10 +345,6 @@ const INTENDED: &[(&str, &str)] = &[
         r#"query q() { match { $d: Doc } where "rust" in $d.tags return { $d.title } }"#,
     ),
     (
-        "diagnostics/t81_pattern_components_share_no_variable.gqt step 3",
-        r#"query staff() { match { $c: Company, $p: Person, $p worksAt $c } return { $p.name, $c.name } }"#,
-    ),
-    (
         "diagnostics/t82_triple_written_against_its_edge_direction.gqt step 3",
         r#"query staff($slug: String) { match { $c: Company, $p worksAt $c } where $c.slug = $slug return { $p.name } }"#,
     ),

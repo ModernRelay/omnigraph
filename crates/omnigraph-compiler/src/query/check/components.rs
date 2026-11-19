@@ -316,18 +316,21 @@ impl Parts {
         };
         d = d.with_fix(fix);
         let last = spans.last().map(|s| s.end);
+        // Joining through the edge changes the rows a product gives, and the
+        // named relation keeps them: the named relation is the suggestion
+        // where there is one, and neither applies without review.
         match (triples.as_slice(), last, named) {
-            ([one], Some(end), _) => d.with_suggestion(Suggestion {
-                applicability: Applicability::MachineApplicable,
+            (_, _, Some((_, edits))) => d.with_suggestion(Suggestion {
+                applicability: Applicability::NeedsReview,
+                edits,
+            }),
+            ([one], Some(end), None) => d.with_suggestion(Suggestion {
+                applicability: Applicability::NeedsReview,
                 edits: vec![TextEdit {
                     start: end,
                     end,
                     replacement: format!(", {one}"),
                 }],
-            }),
-            (_, _, Some((_, edits))) => d.with_suggestion(Suggestion {
-                applicability: Applicability::NeedsReview,
-                edits,
             }),
             _ => d,
         }

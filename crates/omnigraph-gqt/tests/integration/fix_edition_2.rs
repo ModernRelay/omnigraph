@@ -58,10 +58,6 @@ const REASONS: &[(&str, &str)] = &[
         "open:fix-conjunct-order",
         "Applied pass by pass, the printed fixes of a property brace and of filters among nested blocks write the `where` conjuncts in another order than section 6's map (the brace's conjuncts leading, the rest in written order); the hand rewrite follows the map.",
     ),
-    (
-        "open:t81-joins-a-product",
-        "`T81` prints a machine-applicable fix that joins two components through the one edge between their types, which changes the product edition 2 wrote; section 6's map writes the product as a named relation, as the hand rewrite does.",
-    ),
 ];
 
 const TABLE: &str = "lint-fix-edition-2.tsv";
