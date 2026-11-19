@@ -130,6 +130,7 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
     counted.limit = None;
     counted.return_exprs = vec![IRProjection {
         expr: IRExpr::Aggregate {
+            fraction: None,
             func: omnigraph_compiler::query::value::AggFunc::Count,
             distinct: true,
             arg: Box::new(prop("d", "slug")),

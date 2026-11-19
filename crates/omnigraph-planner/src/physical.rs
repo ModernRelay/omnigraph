@@ -1638,15 +1638,21 @@ impl PhysicalPlan {
                     "typed_exprs": crate::typed::returns(return_exprs),
                     "aggregates": return_exprs.iter().zip(aggregates).map(|(projection, spec)| {
                         match (&projection.expr, spec) {
-                            (IRExpr::Aggregate { func, distinct, signature, .. }, Some(spec)) => json!({
-                                "column": crate::optimizer::result_column(projection),
-                                "func": func.to_string(),
-                                "distinct": distinct,
-                                "input": signature.arg.spelling(),
-                                "accumulator": spec.accumulator,
-                                "overflow": spec.overflow,
-                                "result": signature.result.spelling(),
-                            }),
+                            (IRExpr::Aggregate { func, distinct, fraction, signature, .. }, Some(spec)) => {
+                                let mut aggregate = json!({
+                                    "column": crate::optimizer::result_column(projection),
+                                    "func": func.to_string(),
+                                    "distinct": distinct,
+                                    "input": signature.arg.spelling(),
+                                    "accumulator": spec.accumulator,
+                                    "overflow": spec.overflow,
+                                    "result": signature.result.spelling(),
+                                });
+                                if let Some(p) = fraction {
+                                    aggregate["fraction"] = Value::String(p.to_string());
+                                }
+                                aggregate
+                            }
                             _ => Value::Null,
                         }
                     }).collect::<Vec<_>>(),

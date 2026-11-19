@@ -239,7 +239,12 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             out.insert(name.clone());
         }
         IRExpr::Nearest { query, .. } => params_of_expr(query, out),
-        IRExpr::Aggregate { arg, .. } => params_of_expr(arg, out),
+        IRExpr::Aggregate { arg, fraction, .. } => {
+            params_of_expr(arg, out);
+            if let Some(p) = fraction {
+                params_of_expr(p, out);
+            }
+        }
         IRExpr::Binary { left, right, .. } => {
             params_of_expr(left, out);
             params_of_expr(right, out);

@@ -102,6 +102,14 @@ pub enum AggFunc {
     /// order. A reference argument waits for stage Path, which admits
     /// references as list elements.
     Collect,
+    /// The sample standard deviation of a group's non-null numeric values:
+    /// `F64`, dividing by n − 1, null over fewer than two values.
+    Stddev,
+    /// `percentile(x, p)`: the exact percentile of a group's non-null
+    /// numeric values with linear interpolation, `F64`, null over empty
+    /// input. Its `p`, a literal or a parameter in [0, 1], is the
+    /// aggregate's fraction ([`AggFunc::takes_fraction`]).
+    Percentile,
 }
 
 impl AggFunc {
@@ -130,6 +138,14 @@ impl AggFunc {
                 },
             ) => scalar.is_numeric().then_some(value(ScalarType::F64)),
             (
+                Self::Stddev | Self::Percentile,
+                ExprType::Value {
+                    scalar,
+                    list: false,
+                    nullable: _,
+                },
+            ) => scalar.is_numeric().then_some(value(ScalarType::F64)),
+            (
                 Self::Min | Self::Max,
                 ExprType::Value {
                     scalar,
@@ -150,7 +166,13 @@ impl AggFunc {
                 nullable: true,
             }),
             (
-                Self::Sum | Self::Avg | Self::Min | Self::Max | Self::Collect,
+                Self::Sum
+                | Self::Avg
+                | Self::Min
+                | Self::Max
+                | Self::Collect
+                | Self::Stddev
+                | Self::Percentile,
                 ExprType::Value {
                     scalar: _,
                     list: true,
@@ -168,6 +190,19 @@ impl AggFunc {
     pub fn defined_on_empty(self) -> bool {
         matches!(self, Self::Count | Self::Collect)
     }
+
+    /// Whether the aggregate takes a fraction beside its argument:
+    /// `percentile`'s `p`.
+    pub fn takes_fraction(self) -> bool {
+        self == Self::Percentile
+    }
+
+    /// Whether the aggregate holds a group's values to finish them in the
+    /// fixed value order (`collect`, `stddev`, `percentile`), rather than a
+    /// running total a correlated block's semi-join folds.
+    pub fn holds_values(self) -> bool {
+        matches!(self, Self::Collect | Self::Stddev | Self::Percentile)
+    }
 }
 
 impl std::fmt::Display for AggFunc {
@@ -179,6 +214,8 @@ impl std::fmt::Display for AggFunc {
             Self::Min => write!(f, "min"),
             Self::Max => write!(f, "max"),
             Self::Collect => write!(f, "collect"),
+            Self::Stddev => write!(f, "stddev"),
+            Self::Percentile => write!(f, "percentile"),
         }
     }
 }

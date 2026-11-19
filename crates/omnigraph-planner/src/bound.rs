@@ -37,8 +37,9 @@ use crate::physical::{NodeId, PhysicalPlan};
 /// assumptions' `plan_work`, the read's plan budget and the work typing,
 /// shaping and planning charged to it, which a replay's compile must
 /// charge again. Version 17 adds to version 16 the `collect` aggregate and
-/// its `list` accumulator.
-pub const BOUND_PLAN_VERSION: u32 = 17;
+/// its `list` accumulator. Version 18 adds to version 17 the `stddev` and
+/// `percentile` aggregates and an aggregate's `fraction`.
+pub const BOUND_PLAN_VERSION: u32 = 18;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

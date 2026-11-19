@@ -381,10 +381,15 @@ fn write_skeleton(e: &IRExpr, reads: &HashMap<*const IRExpr, bool>, out: &mut St
                 func,
                 distinct,
                 arg,
+                fraction,
                 ..
             } => {
                 let _ = write!(out, "{func:?}({distinct},");
                 write_skeleton(arg, reads, out);
+                if let Some(p) = fraction {
+                    out.push(',');
+                    write_skeleton(p, reads, out);
+                }
                 out.push(')');
             }
             IRExpr::Binary {

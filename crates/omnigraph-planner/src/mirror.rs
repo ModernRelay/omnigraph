@@ -1646,6 +1646,8 @@ pub enum AggFuncMirror {
     Min,
     Max,
     Collect,
+    Stddev,
+    Percentile,
 }
 
 impl From<AggFunc> for AggFuncMirror {
@@ -1657,6 +1659,8 @@ impl From<AggFunc> for AggFuncMirror {
             AggFunc::Min => Self::Min,
             AggFunc::Max => Self::Max,
             AggFunc::Collect => Self::Collect,
+            AggFunc::Stddev => Self::Stddev,
+            AggFunc::Percentile => Self::Percentile,
         }
     }
 }
@@ -1670,6 +1674,8 @@ impl From<AggFuncMirror> for AggFunc {
             AggFuncMirror::Min => Self::Min,
             AggFuncMirror::Max => Self::Max,
             AggFuncMirror::Collect => Self::Collect,
+            AggFuncMirror::Stddev => Self::Stddev,
+            AggFuncMirror::Percentile => Self::Percentile,
         }
     }
 }
@@ -1804,6 +1810,10 @@ pub enum ExprMirror {
         func: AggFuncMirror,
         distinct: bool,
         arg: Box<ExprMirror>,
+        /// `percentile`'s fraction; absent for every other aggregate, so a
+        /// plan without one reads as it was written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fraction: Option<Box<ExprMirror>>,
         signature: AggSignature,
     },
     AliasRef {
@@ -1886,11 +1896,13 @@ impl From<&IRExpr> for ExprMirror {
                 func,
                 distinct,
                 arg,
+                fraction,
                 signature,
             } => Self::Aggregate {
                 func: AggFuncMirror::from(*func),
                 distinct: *distinct,
                 arg: boxed(arg),
+                fraction: fraction.as_deref().map(boxed),
                 signature: signature.clone(),
             },
             IRExpr::AliasRef(alias, ty) => Self::AliasRef {
@@ -1964,11 +1976,13 @@ impl From<ExprMirror> for IRExpr {
                 func,
                 distinct,
                 arg,
+                fraction,
                 signature,
             } => Self::Aggregate {
                 func: AggFunc::from(func),
                 distinct,
                 arg: unboxed(*arg),
+                fraction: fraction.map(|p| unboxed(*p)),
                 signature,
             },
             ExprMirror::AliasRef { alias, ty } => Self::AliasRef(alias, ty),

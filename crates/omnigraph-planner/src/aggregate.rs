@@ -14,7 +14,8 @@ pub enum Accumulator {
     Float64,
     Extremum,
     /// A group's non-null values in the fixed value order, held in the
-    /// query's memory pool as they arrive (`collect`).
+    /// query's memory pool as they arrive: `collect`'s list, and the values
+    /// `stddev` and `percentile` finish.
     List,
 }
 
@@ -86,6 +87,9 @@ pub fn plan_aggregate(func: AggFunc, signature: &AggSignature) -> Result<Aggrega
         },
         AggFunc::Min | AggFunc::Max => (Accumulator::Extremum, Overflow::Error),
         AggFunc::Collect => (Accumulator::List, Overflow::Error),
+        // The group's values, held as `collect` holds them and finished in
+        // `F64`: an integer value rounds to the nearest `F64`.
+        AggFunc::Stddev | AggFunc::Percentile => (Accumulator::List, Overflow::RoundToNearest),
     };
     Ok(AggregateSpec {
         accumulator,

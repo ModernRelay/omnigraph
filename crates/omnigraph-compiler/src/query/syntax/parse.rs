@@ -3893,6 +3893,8 @@ fn agg_func(name: &str) -> AggFunc {
         "avg" => AggFunc::Avg,
         "min" => AggFunc::Min,
         "collect" => AggFunc::Collect,
+        "stddev" => AggFunc::Stddev,
+        "percentile" => AggFunc::Percentile,
         _ => AggFunc::Max,
     }
 }
@@ -4345,12 +4347,14 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
                 let at = source_span(&inner);
                 let mut func = None;
                 let mut arg = None;
+                let mut fraction = None;
                 let mut pattern = Pattern::default();
                 for part in inner.into_inner() {
                     match part.as_rule() {
                         Rule::agg_name => func = Some(BlockFunc::Agg(agg_func(part.as_str()))),
                         Rule::kw_exists => func = Some(BlockFunc::Exists),
-                        Rule::expr => arg = Some(Box::new(expr(part)?)),
+                        Rule::expr if arg.is_none() => arg = Some(Box::new(expr(part)?)),
+                        Rule::expr => fraction = Some(Box::new(expr(part)?)),
                         Rule::block_body => pattern = block_pattern(&part)?,
                         _ => {}
                     }
@@ -4358,6 +4362,7 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
                 Ok(Expr::Block(Box::new(Block {
                     func: func.unwrap(),
                     arg,
+                    fraction,
                     pattern,
                     at,
                 })))
@@ -4365,10 +4370,13 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
             Rule::agg_distinct => {
                 let mut parts = inner.into_inner();
                 let func = agg_func(parts.next().unwrap().as_str());
-                let arg = parts.find(|p| p.as_rule() == Rule::expr).unwrap();
+                let mut exprs = parts.filter(|p| p.as_rule() == Rule::expr);
+                let arg = exprs.next().unwrap();
+                let fraction = exprs.next().map(expr).transpose()?.map(Box::new);
                 Ok(Expr::AggDistinct {
                     func,
                     arg: Box::new(expr(arg)?),
+                    fraction,
                 })
             }
             Rule::count_star_rec => {

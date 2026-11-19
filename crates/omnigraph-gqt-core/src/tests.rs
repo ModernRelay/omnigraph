@@ -1974,6 +1974,7 @@ mod result_contract {
                 ty: ty(ScalarType::F32, false),
             },
             IRExpr::Aggregate {
+                fraction: None,
                 func: AggFunc::Count,
                 distinct: false,
                 arg: Box::new(node()),

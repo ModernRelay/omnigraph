@@ -1,0 +1,173 @@
+# issue: none
+# notes: `percentile(x, p)` takes p as a numeric literal or a declared numeric parameter. A literal
+# notes: outside [0, 1], a column and a missing p are type errors (T8); a parameter bound outside
+# notes: [0, 1] or to null refuses the read before it reads a row (E5), with keys over no rows too.
+# notes: `distinct` applies to neither `stddev` nor `percentile` (T57).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Sale {
+    id: String @key
+    region: String?
+    small: I32?
+    share: F64?
+}
+
+--- seed
+{"type":"Sale","data":{"id":"e1","region":"east","small":10,"share":0.5}}
+{"type":"Sale","data":{"id":"e2","region":"east","small":20}}
+{"type":"Sale","data":{"id":"e3","region":"east","small":40}}
+{"type":"Sale","data":{"id":"w1","region":"west","small":5}}
+
+--- query
+query at_fraction($p: F64) {
+    match { $s: Sale }
+    return { $s.region as region, percentile($s.small, $p) as value }
+}
+
+--- params
+{"p": 0.25}
+
+--- expect unordered
+{"region":"east","value":15}
+{"region":"west","value":5}
+
+--- expect shape
+region: String?
+value: F64?
+
+--- query
+query at_whole_fraction($p: I32) {
+    match { $s: Sale }
+    return { percentile($s.small, $p) as value }
+}
+
+--- params
+{"p": 1}
+
+--- expect unordered
+{"value":40}
+
+--- expect shape
+value: F64?
+
+--- query
+query at_fraction($p: F64) {
+    match { $s: Sale }
+    return { percentile($s.small, $p) as value }
+}
+
+--- params
+{"p": 1.5}
+
+--- expect error: E5: `percentile`'s fraction p is 1.5, outside [0, 1]
+
+--- query
+query at_fraction($p: F64) {
+    match { $s: Sale }
+    where $s.id = "none"
+    return { $s.region as region, percentile($s.small, $p) as value }
+}
+
+--- params
+{"p": -0.25}
+
+--- expect error: E5: `percentile`'s fraction p is -0.25, outside [0, 1]
+
+--- query
+query at_optional_fraction($p: F64?) {
+    match { $s: Sale }
+    return { percentile($s.small, $p) as value }
+}
+
+--- params
+{"p": null}
+
+--- expect error: E5: `percentile`'s fraction p is null
+
+--- query
+query literal_above_one() {
+    match { $s: Sale }
+    return { percentile($s.small, 1.5) as value }
+}
+
+--- expect error: T8: `percentile`'s fraction p is in [0, 1], got 1.5
+
+--- query
+query negative_literal() {
+    match { $s: Sale }
+    return { percentile($s.small, -0.5) as value }
+}
+
+--- expect error: T8: `percentile`'s fraction p is in [0, 1], got -0.5
+
+--- query
+query fraction_from_a_column() {
+    match { $s: Sale }
+    return { percentile($s.small, $s.share) as value }
+}
+
+--- expect error: T8: `percentile`'s fraction p is a number literal in [0, 1] or a numeric parameter, got F64?
+
+--- query
+query fraction_missing() {
+    match { $s: Sale }
+    return { percentile($s.small) as value }
+}
+
+--- expect error: T8: `percentile` takes two arguments
+
+--- query
+query a_string_fraction() {
+    match { $s: Sale }
+    return { percentile($s.small, "half") as value }
+}
+
+--- expect error: T8: `percentile`'s fraction p is a number literal in [0, 1] or a numeric parameter, got String
+
+--- query
+query stddev_takes_one_argument() {
+    match { $s: Sale }
+    return { stddev($s.small, 0.5) as value }
+}
+
+--- expect error: T8: `stddev` takes one argument
+
+--- query
+query stddev_of_a_string() {
+    match { $s: Sale }
+    return { stddev($s.region) as value }
+}
+
+--- expect error: T8: stddev requires numeric type, got String?
+
+--- query
+query distinct_stddev() {
+    match { $s: Sale }
+    return { stddev(distinct $s.small) as value }
+}
+
+--- expect error: T57: distinct applies only to count and collect
+
+--- query
+query distinct_percentile() {
+    match { $s: Sale }
+    return { percentile(distinct $s.small, 0.5) as value }
+}
+
+--- expect error: T57: distinct applies only to count and collect
+
+--- query
+query count_takes_no_fraction() {
+    match { $s: Sale }
+    return { count(distinct $s.small, 0.5) as value }
+}
+
+--- expect error: T8: `count` takes one argument

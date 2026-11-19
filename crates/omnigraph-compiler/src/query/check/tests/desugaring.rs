@@ -190,6 +190,7 @@ fn count_rows() -> Agg {
         func: AggFunc::Count,
         distinct: false,
         arg: None,
+        fraction: None,
         ty: val(ScalarType::I64, false),
     }
 }

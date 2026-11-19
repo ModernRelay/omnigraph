@@ -427,9 +427,9 @@ unary_minus = { "-" }
 operand    = { "(" ~ expr ~ ")" | block_value | agg_distinct | count_star_rec | case_expr | keyword_call_rec | literal | value_list | type_prop_rec | call | prop_method_rec | prop_chain_rec | prop_star_rec | prop_access | meta_field | variable | reserved_property | bare_name_rec }
 // A block is an operand and nothing else: its elements and its own `where`
 // inside its braces.
-block_value = { (agg_name ~ ("(" ~ expr ~ ")")? | kw_exists) ~ "{" ~ block_body ~ "}" }
-agg_name    = @{ (^"count" | ^"sum" | ^"avg" | ^"min" | ^"max" | ^"collect") ~ !(ASCII_ALPHANUMERIC | "_") }
-agg_distinct = { agg_name ~ "(" ~ kw_distinct ~ expr ~ ")" }
+block_value = { (agg_name ~ ("(" ~ expr ~ ("," ~ expr)? ~ ")")? | kw_exists) ~ "{" ~ block_body ~ "}" }
+agg_name    = @{ (^"count" | ^"sum" | ^"avg" | ^"min" | ^"max" | ^"collect" | ^"stddev" | ^"percentile") ~ !(ASCII_ALPHANUMERIC | "_") }
+agg_distinct = { agg_name ~ "(" ~ kw_distinct ~ expr ~ ("," ~ expr)? ~ ")" }
 count_star_rec = { agg_name ~ "(" ~ "*" ~ ")" }
 // A call's name is never a reserved word or a keyword of a declaration
 // (section 7): a registry row is never named `let`, `from`, `where`,

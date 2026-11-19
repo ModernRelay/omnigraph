@@ -155,6 +155,9 @@ pub struct Agg {
     pub func: AggFunc,
     pub distinct: bool,
     pub arg: Option<IRExpr>,
+    /// `percentile`'s `p`, a numeric literal in [0, 1] or a declared
+    /// numeric parameter; `None` for every other aggregate.
+    pub fraction: Option<IRExpr>,
     pub ty: Ty,
 }
 

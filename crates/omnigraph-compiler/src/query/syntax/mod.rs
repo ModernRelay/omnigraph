@@ -402,6 +402,9 @@ pub enum RelExpr {
 pub struct Block {
     pub func: BlockFunc,
     pub arg: Option<Box<Expr>>,
+    /// A second argument, `percentile($x.p, 0.5) { … }`'s fraction; the
+    /// type checker refuses one for any other function.
+    pub fraction: Option<Box<Expr>>,
     /// The block's elements and its own `where`, inside its braces.
     pub pattern: Pattern,
     /// Where the block was written, from its function word to its closing
@@ -463,10 +466,13 @@ pub enum Expr {
     Ident(String),
     Call(Call),
     /// `count(distinct x)`; any aggregate name parses, the type checker
-    /// keeps today's T57 for the others.
+    /// keeps today's T57 for the others. `fraction` is a second argument,
+    /// `percentile(distinct x, p)`'s, which the type checker refuses with
+    /// the rest of the call.
     AggDistinct {
         func: AggFunc,
         arg: Box<Expr>,
+        fraction: Option<Box<Expr>>,
     },
     Block(Box<Block>),
     Neg(Box<Expr>),
@@ -535,10 +541,13 @@ impl Expr {
             }
         };
         match self {
-            Self::AggDistinct { arg: child, .. }
-            | Self::Neg(child)
-            | Self::IsNull { expr: child, .. }
-            | Self::Not(child) => take(child),
+            Self::AggDistinct { arg, fraction, .. } => {
+                take(arg);
+                if let Some(p) = fraction {
+                    take(p);
+                }
+            }
+            Self::Neg(child) | Self::IsNull { expr: child, .. } | Self::Not(child) => take(child),
             Self::Arith { left, right, .. }
             | Self::Compare { left, right, .. }
             | Self::In {
@@ -580,9 +589,14 @@ impl Clone for Expr {
             Self::Meta(f0) => Self::Meta(f0.clone()),
             Self::Ident(f0) => Self::Ident(f0.clone()),
             Self::Call(f0) => Self::Call(f0.clone()),
-            Self::AggDistinct { func, arg } => Self::AggDistinct {
+            Self::AggDistinct {
+                func,
+                arg,
+                fraction,
+            } => Self::AggDistinct {
                 func: *func,
                 arg: arg.clone(),
+                fraction: fraction.clone(),
             },
             Self::Block(f0) => Self::Block(f0.clone()),
             Self::Neg(f0) => Self::Neg(f0.clone()),
@@ -661,12 +675,14 @@ impl PartialEq for Expr {
                 Self::AggDistinct {
                     func: func1,
                     arg: arg1,
+                    fraction: fraction1,
                 },
                 Self::AggDistinct {
                     func: func2,
                     arg: arg2,
+                    fraction: fraction2,
                 },
-            ) => func1 == func2 && arg1 == arg2,
+            ) => func1 == func2 && arg1 == arg2 && fraction1 == fraction2,
             (Self::Block(f01), Self::Block(f02)) => f01 == f02,
             (Self::Neg(f01), Self::Neg(f02)) => f01 == f02,
             (
@@ -757,10 +773,15 @@ impl std::fmt::Debug for Expr {
             Self::Meta(f0) => f.debug_tuple("Meta").field(f0).finish(),
             Self::Ident(f0) => f.debug_tuple("Ident").field(f0).finish(),
             Self::Call(f0) => f.debug_tuple("Call").field(f0).finish(),
-            Self::AggDistinct { func, arg } => f
+            Self::AggDistinct {
+                func,
+                arg,
+                fraction,
+            } => f
                 .debug_struct("AggDistinct")
                 .field("func", func)
                 .field("arg", arg)
+                .field("fraction", fraction)
                 .finish(),
             Self::Block(f0) => f.debug_tuple("Block").field(f0).finish(),
             Self::Neg(f0) => f.debug_tuple("Neg").field(f0).finish(),

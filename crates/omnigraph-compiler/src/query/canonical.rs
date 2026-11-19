@@ -265,9 +265,14 @@ fn expr(e: &Expr, at: Option<Position>, out: &mut Vec<CanonicalForm>) {
             | Expr::Meta(_)
             | Expr::Ident(_) => {}
             Expr::Call(c) => call(c, at, out),
-            Expr::AggDistinct { arg, .. } => expr(arg, at, out),
+            Expr::AggDistinct { arg, fraction, .. } => {
+                expr(arg, at, out);
+                if let Some(p) = fraction {
+                    expr(p, at, out);
+                }
+            }
             Expr::Block(b) => {
-                if let Some(a) = &b.arg {
+                for a in b.arg.iter().chain(&b.fraction) {
                     expr(a, Some(b.at.position), out);
                 }
                 pattern(&b.pattern, out);

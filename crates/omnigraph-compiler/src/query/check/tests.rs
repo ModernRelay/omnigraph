@@ -2167,6 +2167,163 @@ fn t8_prints_the_block_an_aggregate_filter_means() {
     assert_eq!(d.fix.as_deref(), Some("return { count($p) as count_p }"));
 }
 
+/// Every aggregate of `c`'s groups, in the order the walk reaches them.
+fn aggregates(c: &CoreDecl) -> Vec<Agg> {
+    read_of(c)
+        .term
+        .stored_nodes()
+        .into_iter()
+        .filter_map(|t| match t {
+            Term::Group { aggs, .. } => Some(aggs.iter().map(|(_, a)| a.clone())),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// `stddev(x)` and `percentile(x, p)` take a numeric `x` and are a nullable
+/// `F64`, in `return` and as a block value. `p` is held as the aggregate's
+/// fraction: a numeric literal in [0, 1] as an `F64` literal (`-0` is `0`),
+/// a numeric parameter as itself, whose value the engine checks. Anything
+/// else is `T8`, naming the fraction; `distinct` applies to neither (`T57`).
+#[test]
+fn stddev_and_percentile_type_their_fraction() {
+    use crate::query::value::AggFunc;
+    let c = ok(
+        "query q($p: I32?) { match { $p2: Person } return { stddev($p2.age) as sd, percentile($p2.age, -0) as low, percentile($p2.age, $p) as at } }",
+    );
+    assert_eq!(
+        cols(&c),
+        vec![
+            ("sd".into(), "F64?".into()),
+            ("low".into(), "F64?".into()),
+            ("at".into(), "F64?".into()),
+        ]
+    );
+    let aggs = aggregates(&c);
+    let fraction = |func: AggFunc| {
+        aggs.iter()
+            .filter(|a| a.func == func)
+            .map(|a| a.fraction.as_ref().map(ToString::to_string))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(fraction(AggFunc::Stddev), vec![None]);
+    assert_eq!(
+        fraction(AggFunc::Percentile),
+        vec![Some("0.0".to_string()), Some("$p".to_string())]
+    );
+    let low = aggs
+        .iter()
+        .find_map(|a| match &a.fraction {
+            Some(crate::ir::expr::IRExpr::Literal(Literal::Float(v), ty)) => Some((*v, ty)),
+            _ => None,
+        })
+        .expect("a literal fraction");
+    assert_eq!(low.0.to_bits(), 0.0f64.to_bits(), "-0 is held as 0");
+    assert_eq!(low.1.spelling(), "F64");
+    // A block value holds its fraction too, and is nullable.
+    let c = ok(
+        "query q() { match { $c: Company } return { percentile($p.age, 0.25) { $p: Person, $p worksAt $c } as quartile } }",
+    );
+    assert_eq!(cols(&c), vec![("quartile".into(), "F64?".into())]);
+    assert!(
+        aggregates(&c)
+            .iter()
+            .any(|a| a.func == AggFunc::Percentile && a.fraction.is_some())
+    );
+    for (src, code, says) in [
+        (
+            "query q() { match { $p: Person } return { percentile($p.age, 1.5) } }",
+            "T8",
+            "fraction p is in [0, 1], got 1.5",
+        ),
+        (
+            "query q() { match { $p: Person } return { percentile($p.age, -0.5) } }",
+            "T8",
+            "fraction p is in [0, 1], got -0.5",
+        ),
+        (
+            "query q() { match { $p: Person } return { percentile($p.age, 2) } }",
+            "T8",
+            "fraction p is in [0, 1], got 2",
+        ),
+        (
+            "query q() { match { $p: Person } return { percentile($p.age, $p.age) } }",
+            "T8",
+            "a number literal in [0, 1] or a numeric parameter",
+        ),
+        (
+            "query q($s: String) { match { $p: Person } return { percentile($p.age, $s) } }",
+            "T8",
+            "a number literal in [0, 1] or a numeric parameter",
+        ),
+        (
+            "query q($l: [F64]) { match { $p: Person } return { percentile($p.age, $l) } }",
+            "T8",
+            "a number literal in [0, 1] or a numeric parameter",
+        ),
+        (
+            "query q() { match { $p: Person } return { percentile($p.age) } }",
+            "T8",
+            "`percentile` takes two arguments",
+        ),
+        (
+            "query q() { match { $p: Person } return { stddev($p.age, 0.5) } }",
+            "T8",
+            "`stddev` takes one argument",
+        ),
+        (
+            "query q() { match { $p: Person } return { stddev($p.name) } }",
+            "T8",
+            "stddev requires numeric type",
+        ),
+        (
+            "query q() { match { $p: Person } return { percentile($p.name, 0.5) } }",
+            "T8",
+            "percentile requires numeric type",
+        ),
+        (
+            "query q() { match { $c: Company } return { percentile($p.age, 3) { $p: Person, $p worksAt $c } } }",
+            "T8",
+            "fraction p is in [0, 1], got 3",
+        ),
+        (
+            "query q() { match { $c: Company } return { stddev($p.age, 0.5) { $p: Person, $p worksAt $c } } }",
+            "T8",
+            "`stddev` takes one argument",
+        ),
+        (
+            "query q() { match { $p: Person } return { stddev(distinct $p.age) } }",
+            "T57",
+            "distinct applies only to count and collect",
+        ),
+        (
+            "query q() { match { $p: Person } return { percentile(distinct $p.age, 0.5) } }",
+            "T57",
+            "distinct applies only to count and collect",
+        ),
+        (
+            "query q() { match { $p: Person } return { count(distinct $p.age, 0.5) } }",
+            "T8",
+            "`count` takes one argument",
+        ),
+    ] {
+        let d = refused_with(src, code);
+        assert!(d.message.contains(says), "{src}: {d}");
+    }
+    // An aggregate filter's fix keeps the fraction in the block it prints.
+    let d = refused_with(
+        "query q() { match { $c: Company, $p: Person, $p worksAt $c } where percentile($p.age, 0.5) > 30 return { $c.name } }",
+        "T8",
+    );
+    let fix = d.fix.expect("a fix");
+    assert_eq!(
+        fix,
+        "match { $c: Company } where percentile($p.age, 0.5) { $p: Person, $p worksAt $c } > 30"
+    );
+    ok(&format!("query q() {{ {fix} return {{ $c.name }} }}"));
+}
+
 /// A ranked `from` names its score with `as` (`T85`): the score enters
 /// scope under the written name and no other. The rule reads the relation's
 /// type: a ranking function's result and a named relation bound to one

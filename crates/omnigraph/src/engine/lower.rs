@@ -36,7 +36,7 @@ use omnigraph_planner::{
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
-use super::collect_aggregate::CollectUdaf;
+use super::collect_aggregate::{CollectUdaf, Finish};
 use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerAvgUdaf, ExactIntegerUdaf};
 use super::operators::{
     AntiJoinMaskExec, CatalogueExec, ContainsJoinExec, CorrelateExec, CorrelateGroup,
@@ -493,6 +493,7 @@ impl<'l, 'a> Walk<'l, 'a> {
             func,
             distinct,
             arg,
+            fraction,
             signature,
         } = expr
         else {
@@ -547,6 +548,17 @@ impl<'l, 'a> Walk<'l, 'a> {
                     CollectUdaf::new(data_type.clone(), result.clone()),
                 ))
             }
+            (AggFunc::Stddev, Accumulator::List) => {
+                Arc::new(datafusion::logical_expr::AggregateUDF::from(
+                    CollectUdaf::finishing(data_type.clone(), Finish::Stddev),
+                ))
+            }
+            (AggFunc::Percentile, Accumulator::List) => {
+                let p = self.percentile_fraction(fraction.as_deref())?;
+                Arc::new(datafusion::logical_expr::AggregateUDF::from(
+                    CollectUdaf::finishing(data_type.clone(), Finish::Percentile(p.to_bits())),
+                ))
+            }
             (
                 AggFunc::Count,
                 Accumulator::ExactInteger | Accumulator::Float64 | Accumulator::Extremum,
@@ -562,7 +574,7 @@ impl<'l, 'a> Walk<'l, 'a> {
                 Accumulator::List,
             )
             | (
-                AggFunc::Collect,
+                AggFunc::Collect | AggFunc::Stddev | AggFunc::Percentile,
                 Accumulator::Count
                 | Accumulator::ExactInteger
                 | Accumulator::Float64
@@ -589,6 +601,41 @@ impl<'l, 'a> Walk<'l, 'a> {
             .into());
         }
         Ok(aggregate)
+    }
+
+    /// `percentile`'s fraction `p`, a literal or a bound parameter, read
+    /// once as the plan is lowered: a value outside [0, 1], `NaN` or null
+    /// refuses the read before it reads a row (`E5`).
+    fn percentile_fraction(&self, fraction: Option<&IRExpr>) -> Lowers<f64> {
+        let p = fraction.ok_or_else(|| {
+            OmniError::manifest_internal("a percentile aggregate without its fraction")
+        })?;
+        let value = match super::constant::evaluate_constant(p, self.lowering.params())? {
+            Literal::Float(v) => Some(v),
+            Literal::Integer(v) => Some(v as f64),
+            Literal::Null => None,
+            other => {
+                return Err(OmniError::manifest_internal(format!(
+                    "a percentile fraction evaluated to {other:?}"
+                ))
+                .into());
+            }
+        };
+        let domain = |message: String| {
+            OmniError::Compiler(omnigraph_compiler::error::CompilerError::query(
+                omnigraph_compiler::query::diagnostic::QueryDiagnostic::execution(
+                    omnigraph_compiler::query::codes::E5,
+                    message,
+                ),
+            ))
+        };
+        match value {
+            Some(v) if (0.0..=1.0).contains(&v) => Ok(v),
+            Some(v) => {
+                Err(domain(format!("`percentile`'s fraction p is {v}, outside [0, 1]")).into())
+            }
+            None => Err(domain("`percentile`'s fraction p is null".into()).into()),
+        }
     }
 
     fn not_a_pipeline_node(name: &str) -> LowerError {

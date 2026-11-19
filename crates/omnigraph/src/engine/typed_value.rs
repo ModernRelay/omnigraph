@@ -944,9 +944,13 @@ pub(super) fn validate_plan_values(
                     func: _,
                     distinct: _,
                     arg,
+                    fraction,
                     signature: _,
+                } => {
+                    pending.push(arg);
+                    pending.extend(fraction.as_deref());
                 }
-                | IRExpr::Not(arg, _)
+                IRExpr::Not(arg, _)
                 | IRExpr::Cast { expr: arg, ty: _ }
                 | IRExpr::Neg { expr: arg, ty: _ }
                 | IRExpr::IsNull {

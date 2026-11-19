@@ -328,6 +328,8 @@ fn agg() -> impl Strategy<Value = AggFunc> {
             AggFunc::Avg,
             AggFunc::Min,
             AggFunc::Max,
+            AggFunc::Stddev,
+            AggFunc::Percentile,
         ][..],
     )
 }
@@ -352,7 +354,7 @@ fn expr(depth: u32) -> BoxedStrategy<Expr> {
         1 => (sub(), sub()).prop_map(|(l, r)| Expr::And(Box::new(l), Box::new(r))),
         1 => (sub(), sub()).prop_map(|(l, r)| Expr::Or(Box::new(l), Box::new(r))),
         2 => call(depth - 1).prop_map(Expr::Call),
-        1 => (agg(), sub()).prop_map(|(func, arg)| Expr::AggDistinct { func, arg: Box::new(arg) }),
+        1 => (agg(), sub()).prop_map(|(func, arg)| Expr::AggDistinct { func, arg: Box::new(arg), fraction: None }),
         1 => block(depth - 1).prop_map(|b| Expr::Block(Box::new(b))),
     ]
     .boxed()
@@ -414,10 +416,13 @@ fn block(depth: u32) -> BoxedStrategy<Block> {
         (
             agg(),
             proptest::option::of(expr(depth)),
+            proptest::option::of(expr(depth)),
             pattern(depth, 1..3)
         )
-            .prop_map(|(f, arg, pattern)| Block {
+            .prop_map(|(f, arg, fraction, pattern)| Block {
                 func: BlockFunc::Agg(f),
+                // A second argument is written only beside a first.
+                fraction: fraction.filter(|_| arg.is_some()).map(Box::new),
                 arg: arg.map(Box::new),
                 pattern,
                 at: SourceSpan::default(),
@@ -425,6 +430,7 @@ fn block(depth: u32) -> BoxedStrategy<Block> {
         pattern(depth, 1..3).prop_map(|pattern| Block {
             func: BlockFunc::Exists,
             arg: None,
+            fraction: None,
             pattern,
             at: SourceSpan::default(),
         }),

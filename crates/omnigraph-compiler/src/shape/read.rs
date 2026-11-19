@@ -1877,6 +1877,7 @@ impl<'a> Shaper<'a> {
             func: agg.func,
             distinct: agg.distinct,
             arg: Box::new(arg.clone()),
+            fraction: agg.fraction.clone().map(Box::new),
             signature: AggSignature {
                 arg: arg.ty().clone(),
                 result,
@@ -3438,12 +3439,13 @@ impl<'a> Shaper<'a> {
         // One semi-join per comparison; `not (c > 0)` is the row-count zero
         // test. The right side is evaluated over the outer rows: it reads
         // their columns, not another block's value nor a full-text call. A
-        // `collect` block is read as a value: its list is a group's, not a
-        // running scalar a semi-join folds.
+        // block that holds its group's values (`collect`, `stddev`,
+        // `percentile`) is read as a value: it finishes a group's values,
+        // not a running scalar a semi-join folds.
         let comparisons: Option<Vec<(CompOp, IRExpr)>> = groups
             .iter()
             .map(|(_, column, agg, _, _)| {
-                if agg.func == AggFunc::Collect {
+                if agg.func.holds_values() {
                     return None;
                 }
                 block_comparison(pred, column).filter(|(_, right)| {
@@ -3568,22 +3570,24 @@ impl<'a> Shaper<'a> {
             }
             Some(_) => false,
         };
-        let (func, distinct, mut arg) = if counts_rows {
+        let (func, distinct, mut arg, fraction) = if counts_rows {
             (
                 AggFunc::Count,
                 false,
                 IRExpr::Literal(Literal::Bool(true), scalar(ScalarType::Bool)),
+                None,
             )
         } else {
             let arg = agg.arg.clone().ok_or_else(|| {
                 ShapeError::Internal("an aggregate block without its argument".into())
             })?;
-            (agg.func, agg.distinct, arg)
+            (agg.func, agg.distinct, arg, agg.fraction.clone())
         };
         rename_expr(&mut arg, &rename);
         let aggregate = IRExpr::Aggregate {
             func,
             distinct,
+            fraction: fraction.map(Box::new),
             signature: AggSignature {
                 arg: arg.ty().clone(),
                 result: nullable_result(&agg),
@@ -4737,8 +4741,14 @@ fn bind_params(expr: &mut IRExpr, bindings: &[(String, IRExpr)]) {
         let recurse = |e: &mut IRExpr| bind_params(e, bindings);
         match expr {
             IRExpr::Nearest { query, .. } => recurse(query),
-            IRExpr::Aggregate { arg, .. }
-            | IRExpr::Not(arg, _)
+            // `percentile`'s fraction may be the called read's parameter.
+            IRExpr::Aggregate { arg, fraction, .. } => {
+                recurse(arg);
+                if let Some(p) = fraction {
+                    recurse(p);
+                }
+            }
+            IRExpr::Not(arg, _)
             | IRExpr::IsNull { expr: arg, .. }
             | IRExpr::Neg { expr: arg, .. }
             | IRExpr::Cast { expr: arg, .. } => recurse(arg),

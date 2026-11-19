@@ -91,12 +91,13 @@ impl ValueAccumulator {
                     "block function differs from its aggregate specification",
                 ));
             }
-            // A `collect` block is read as a value, through the plan's
+            // A block that holds its group's values (`collect`, `stddev`,
+            // `percentile`) is read as a value, through the plan's
             // aggregate, never folded by a semi-join.
-            (AggFunc::Collect, _) => {
-                return Err(OmniError::manifest_internal(
-                    "a collect block reached a semi-join comparison",
-                ));
+            (AggFunc::Collect | AggFunc::Stddev | AggFunc::Percentile, _) => {
+                return Err(OmniError::manifest_internal(format!(
+                    "a {func} block reached a semi-join comparison"
+                )));
             }
         })
     }

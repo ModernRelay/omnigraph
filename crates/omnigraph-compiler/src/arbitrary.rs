@@ -1386,7 +1386,16 @@ impl ReadGen<'_, '_, '_> {
     }
 
     fn aggregate(&mut self, scope: &[Var]) -> String {
-        match self.c.below(9) {
+        match self.c.below(11) {
+            9 => {
+                let class = *self.c.pick(&[Class::Int, Class::Float]);
+                format!("stddev({})", self.expr(class, scope, 1))
+            }
+            10 => {
+                let class = *self.c.pick(&[Class::Int, Class::Float]);
+                let p = *self.c.pick(&["0", "0.25", "0.5", "0.3", "1"]);
+                format!("percentile({}, {p})", self.expr(class, scope, 1))
+            }
             7 => format!("collect({})", self.any_expr(scope, 1)),
             8 => format!("collect(distinct {})", self.any_expr(scope, 1)),
             0 | 1 => {

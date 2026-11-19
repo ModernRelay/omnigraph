@@ -94,6 +94,15 @@ impl BlockAggregateExpr {
                             "counting a node binding must use CountRows".into(),
                         ));
                     }
+                    // A block that holds values to finish them (`stddev`,
+                    // `percentile`) is read as a value through its plan's
+                    // aggregate, which holds `percentile`'s fraction; no
+                    // semi-join folds one.
+                    if matches!(func, AggFunc::Stddev | AggFunc::Percentile) {
+                        return Err(CompilerError::Plan(format!(
+                            "a {func} block is read as a value, never folded by a semi-join"
+                        )));
+                    }
                     check_aggregate_types(*func, arg, signature)?;
                     return arg.check_types();
                 }
@@ -389,11 +398,16 @@ impl IRExpr {
                     func,
                     distinct,
                     arg,
+                    fraction,
                     signature,
                 } => Self::Aggregate {
                     func: *func,
                     distinct: *distinct,
                     arg: b(arg)?,
+                    fraction: match fraction {
+                        Some(p) => Some(b(p)?),
+                        None => None,
+                    },
                     signature: signature.clone(),
                 },
                 Self::Binary {
@@ -442,8 +456,11 @@ impl IRExpr {
             | Self::Literal(_, _)
             | Self::AliasRef(_, _) => Vec::new(),
             Self::Nearest { query, .. } => vec![query],
-            Self::Aggregate { arg, .. }
-            | Self::Not(arg, _)
+            Self::Aggregate { arg, fraction, .. } => std::iter::once(arg)
+                .chain(fraction.as_ref())
+                .map(|b| &**b)
+                .collect(),
+            Self::Not(arg, _)
             | Self::IsNull { expr: arg, .. }
             | Self::Neg { expr: arg, .. }
             | Self::Cast { expr: arg, .. } => vec![arg],
@@ -496,8 +513,11 @@ impl IRExpr {
                 | Self::Literal(_, _)
                 | Self::AliasRef(_, _) => {}
                 Self::Nearest { query, .. } => pending.push(query),
-                Self::Aggregate { arg, .. }
-                | Self::Not(arg, _)
+                Self::Aggregate { arg, fraction, .. } => {
+                    pending.push(arg);
+                    pending.extend(fraction.as_deref());
+                }
+                Self::Not(arg, _)
                 | Self::IsNull { expr: arg, .. }
                 | Self::Neg { expr: arg, .. }
                 | Self::Cast { expr: arg, .. } => pending.push(arg),
@@ -539,8 +559,11 @@ impl IRExpr {
                 | Self::Literal(_, _)
                 | Self::AliasRef(_, _) => {}
                 Self::Nearest { query, .. } => pending.push(query),
-                Self::Aggregate { arg, .. }
-                | Self::Not(arg, _)
+                Self::Aggregate { arg, fraction, .. } => {
+                    pending.push(arg);
+                    pending.extend(fraction.as_deref());
+                }
+                Self::Not(arg, _)
                 | Self::IsNull { expr: arg, .. }
                 | Self::Cast { expr: arg, .. } => pending.push(arg),
                 Self::Binary { left, right, .. } => pending.extend([left.as_ref(), right.as_ref()]),
@@ -570,8 +593,11 @@ impl IRExpr {
                     pending.push(query);
                 }
                 Self::Param(_, _) | Self::Literal(_, _) => {}
-                Self::Aggregate { arg, .. }
-                | Self::Not(arg, _)
+                Self::Aggregate { arg, fraction, .. } => {
+                    pending.extend(fraction.as_deref());
+                    pending.push(arg);
+                }
+                Self::Not(arg, _)
                 | Self::IsNull { expr: arg, .. }
                 | Self::Neg { expr: arg, .. }
                 | Self::Cast { expr: arg, .. } => pending.push(arg),
@@ -634,9 +660,11 @@ impl IRExpr {
                     func,
                     distinct: _,
                     arg,
+                    fraction,
                     signature,
                 } => {
                     check_aggregate_types(*func, arg, signature)?;
+                    check_aggregate_fraction(*func, fraction.as_deref())?;
                     pending.push(arg);
                 }
                 Self::Nearest { query, ty, .. } => {
@@ -923,6 +951,14 @@ impl std::fmt::Display for IRExpr {
                     func,
                     distinct: false,
                     arg,
+                    fraction: Some(p),
+                    ..
+                } => write!(f, "{func}({arg}, {p})"),
+                IRExpr::Aggregate {
+                    func,
+                    distinct: false,
+                    arg,
+                    fraction: None,
                     ..
                 } => write!(f, "{func}({arg})"),
                 IRExpr::AliasRef(alias, _) => f.write_str(alias),
@@ -1055,6 +1091,7 @@ mod render_tests {
     fn aggregate_signature_must_match_its_stored_argument_leaf() {
         let arg_type = ExprType::from_prop(&PropType::scalar(crate::types::ScalarType::I32, true));
         let mut expression = IRExpr::Aggregate {
+            fraction: None,
             func: AggFunc::Sum,
             distinct: false,
             arg: Box::new(IRExpr::Param("amount".into(), arg_type.clone())),
@@ -1080,6 +1117,7 @@ mod render_tests {
         );
 
         let expression = IRExpr::Aggregate {
+            fraction: None,
             func: AggFunc::Count,
             distinct: false,
             arg: Box::new(IRExpr::Variable(
@@ -1223,6 +1261,7 @@ mod render_tests {
             assert_eq!(rrf_weight_values(&weights, 2), None, "{bad:?}");
         }
         let count = IRExpr::Aggregate {
+            fraction: None,
             func: AggFunc::Count,
             distinct: false,
             arg: Box::new(IRExpr::Variable(
@@ -1560,6 +1599,29 @@ fn integer_type(ty: &ExprType) -> bool {
     )
 }
 
+/// `percentile` holds its fraction, a numeric literal or a numeric
+/// parameter; no other aggregate holds one.
+fn check_aggregate_fraction(func: AggFunc, fraction: Option<&IRExpr>) -> Result<()> {
+    let numeric = |ty: &ExprType| matches!(ty, ExprType::Value { scalar, list: false, .. } if scalar.is_numeric());
+    let valid = match (func.takes_fraction(), fraction) {
+        (false, None) => true,
+        (false, Some(_)) | (true, None) => false,
+        // A literal's value is checked where it is written (and, bound to a
+        // called read's parameter, where the engine reads it, as a
+        // parameter's is).
+        (true, Some(IRExpr::Literal(Literal::Float(_) | Literal::Integer(_), ty)))
+        | (true, Some(IRExpr::Param(_, ty))) => numeric(ty),
+        (true, Some(_)) => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(CompilerError::Plan(format!(
+            "{func} holds an invalid fraction"
+        )))
+    }
+}
+
 fn check_aggregate_types(func: AggFunc, arg: &IRExpr, signature: &AggSignature) -> Result<()> {
     let expected = func.result_type(&signature.arg).ok_or_else(|| {
         CompilerError::Plan(format!(
@@ -1827,10 +1889,15 @@ pub enum IRExpr {
     Variable(String, ExprType),
     Param(String, ExprType),
     Literal(Literal, ExprType),
+    /// An aggregate over a group's rows. `fraction` is `percentile`'s `p`
+    /// (a numeric literal in [0, 1] or a declared numeric parameter, which
+    /// changes the result, so it is the aggregate's own child); `None` for
+    /// every other aggregate.
     Aggregate {
         func: AggFunc,
         distinct: bool,
         arg: Box<IRExpr>,
+        fraction: Option<Box<IRExpr>>,
         signature: AggSignature,
     },
     AliasRef(String, ExprType),
@@ -1893,11 +1960,13 @@ impl Clone for IRExpr {
                 func,
                 distinct,
                 arg,
+                fraction,
                 signature,
             } => Self::Aggregate {
                 func: *func,
                 distinct: *distinct,
                 arg: arg.clone(),
+                fraction: fraction.clone(),
                 signature: signature.clone(),
             },
             Self::AliasRef(name, ty) => Self::AliasRef(name.clone(), ty.clone()),
@@ -1973,15 +2042,17 @@ impl PartialEq for IRExpr {
                     func: f1,
                     distinct: d1,
                     arg: a1,
+                    fraction: p1,
                     signature: s1,
                 },
                 Self::Aggregate {
                     func: f2,
                     distinct: d2,
                     arg: a2,
+                    fraction: p2,
                     signature: s2,
                 },
-            ) => f1 == f2 && d1 == d2 && a1 == a2 && s1 == s2,
+            ) => f1 == f2 && d1 == d2 && a1 == a2 && p1 == p2 && s1 == s2,
             (
                 Self::Binary {
                     left: l1,
@@ -2069,11 +2140,13 @@ impl std::hash::Hash for IRExpr {
                     func,
                     distinct,
                     arg,
+                    fraction,
                     signature,
                 } => {
                     func.hash(state);
                     distinct.hash(state);
                     arg.hash(state);
+                    fraction.hash(state);
                     signature.hash(state);
                 }
                 Self::Binary {
@@ -2142,12 +2215,14 @@ impl std::fmt::Debug for IRExpr {
                 func,
                 distinct,
                 arg,
+                fraction,
                 signature,
             } => f
                 .debug_struct("Aggregate")
                 .field("func", func)
                 .field("distinct", distinct)
                 .field("arg", arg)
+                .field("fraction", fraction)
                 .field("signature", signature)
                 .finish(),
             Self::AliasRef(name, ty) => f.debug_tuple("AliasRef").field(name).field(ty).finish(),
@@ -2655,6 +2730,7 @@ mod block_type_tests {
         assert!(outer.check_types().is_ok());
         let mut forged = base.clone();
         forged.right = IRExpr::Aggregate {
+            fraction: None,
             func: AggFunc::Sum,
             distinct: false,
             arg: Box::new(outer.right.clone()),
@@ -2748,8 +2824,17 @@ impl IRExpr {
             | Self::Param(_, _)
             | Self::Literal(_, _)
             | Self::AliasRef(_, _) => {}
+            Self::Aggregate {
+                arg: child,
+                fraction,
+                ..
+            } => {
+                out.push(Self::take(child));
+                if let Some(p) = fraction {
+                    out.push(Self::take(p));
+                }
+            }
             Self::Nearest { query: child, .. }
-            | Self::Aggregate { arg: child, .. }
             | Self::Not(child, _)
             | Self::IsNull { expr: child, .. }
             | Self::Neg { expr: child, .. }

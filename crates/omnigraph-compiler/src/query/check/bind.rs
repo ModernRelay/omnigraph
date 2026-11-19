@@ -413,11 +413,16 @@ impl Binder<'_> {
                     func,
                     distinct,
                     arg,
+                    fraction,
                     signature,
                 } => IRExpr::Aggregate {
                     func: *func,
                     distinct: *distinct,
                     arg: b(arg)?,
+                    fraction: match fraction {
+                        Some(p) => Some(b(p)?),
+                        None => None,
+                    },
                     signature: signature.clone(),
                 },
                 other => other.clone(),

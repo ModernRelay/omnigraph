@@ -2870,12 +2870,21 @@ impl Ctx<'_> {
 
     /// An aggregate return item, or `None`.
     fn aggregate(&mut self, sc: &mut Scope, e: &Expr) -> R<Option<Agg>> {
-        let (func, distinct, arg) = match e {
+        let (func, distinct, arg, fraction) = match e {
             Expr::Call(c) if AGGREGATES.contains(&c.name.as_str()) => {
-                if !c.options.is_empty() || c.args.len() != 1 {
-                    return Err(err(T8, format!("`{}` takes one argument", c.name)));
+                let func = agg_func(&c.name);
+                let arity = if func.takes_fraction() { 2 } else { 1 };
+                if !c.options.is_empty() || c.args.len() != arity {
+                    return Err(err(
+                        T8,
+                        if func.takes_fraction() {
+                            format!("`{func}` takes two arguments: `{func}($x.p, 0.5)`")
+                        } else {
+                            format!("`{}` takes one argument", c.name)
+                        },
+                    ));
                 }
-                let Arg::Expr(a) = &c.args[0] else {
+                let [Arg::Expr(a), rest @ ..] = c.args.as_slice() else {
                     return Err(err(
                         T69,
                         format!(
@@ -2884,9 +2893,18 @@ impl Ctx<'_> {
                         ),
                     ));
                 };
-                (agg_func(&c.name), false, a)
+                let fraction = match rest {
+                    [] => None,
+                    [Arg::Expr(p)] => Some(p),
+                    _ => return Err(err(T8, format!("`{func}`'s fraction is a number"))),
+                };
+                (func, false, a, fraction)
             }
-            Expr::AggDistinct { func, arg } => (*func, true, arg.as_ref()),
+            Expr::AggDistinct {
+                func,
+                arg,
+                fraction,
+            } => (*func, true, arg.as_ref(), fraction.as_deref()),
             _ => return Ok(None),
         };
         if distinct && !matches!(func, AggFunc::Count | AggFunc::Collect) {
@@ -2897,12 +2915,71 @@ impl Ctx<'_> {
         }
         let a = self.expr(sc, arg, At::Value)?;
         let ty = agg_type(func, &a.ty)?;
+        let fraction = self.agg_fraction(sc, func, fraction)?;
         Ok(Some(Agg {
             func,
             distinct,
             arg: Some(a.to_ir()),
+            fraction,
             ty,
         }))
+    }
+
+    /// `percentile`'s fraction `p`: a numeric literal in [0, 1], kept as an
+    /// `F64` literal, or a declared numeric parameter, whose value the
+    /// engine checks against [0, 1] before the read reads a row (`E5`). Any
+    /// other aggregate takes none.
+    fn agg_fraction(
+        &mut self,
+        sc: &mut Scope,
+        func: AggFunc,
+        written: Option<&Expr>,
+    ) -> R<Option<IRExpr>> {
+        let p = match (func.takes_fraction(), written) {
+            (false, None) => return Ok(None),
+            (false, Some(_)) => return Err(err(T8, format!("`{func}` takes one argument"))),
+            (true, None) => {
+                return Err(err(
+                    T8,
+                    format!("`{func}` takes two arguments: `{func}($x.p, 0.5)`"),
+                ));
+            }
+            (true, Some(p)) => p,
+        };
+        let typed = self.expr(sc, p, At::Value)?;
+        let numeric = matches!(&typed.ty, Ty::Value(t) if !t.list && t.scalar.is_numeric());
+        let literal = |kind: &SKind| match kind {
+            SKind::Lit(Literal::Integer(n)) => Some(*n as f64),
+            SKind::Lit(Literal::Float(f)) => Some(*f),
+            _ => None,
+        };
+        let value = match &typed.kind {
+            SKind::Param(_) if numeric => return Ok(Some(typed.to_ir())),
+            SKind::Neg(inner) => literal(&inner.kind).map(|v| -v),
+            kind => literal(kind),
+        };
+        match value {
+            // `-0` is `0`: the fraction is a value, not a spelling.
+            Some(v) if (0.0..=1.0).contains(&v) => Ok(Some(IRExpr::Literal(
+                Literal::Float(if v == 0.0 { 0.0 } else { v }),
+                crate::types::ExprType::Value {
+                    scalar: ScalarType::F64,
+                    list: false,
+                    nullable: false,
+                },
+            ))),
+            Some(v) => Err(err(
+                T8,
+                format!("`{func}`'s fraction p is in [0, 1], got {v}"),
+            )),
+            None => Err(err(
+                T8,
+                format!(
+                    "`{func}`'s fraction p is a number literal in [0, 1] or a numeric parameter, got {}",
+                    typed.ty.display()
+                ),
+            )),
+        }
     }
 
     /// Fold a scope's steps into its term, after the last pending filters.
@@ -5927,10 +6004,13 @@ impl Ctx<'_> {
                                 (Some(arg), f) => {
                                     let ty = agg_type(f, &arg.ty)?;
                                     let ty = ty.with_nullable(!f.defined_on_empty());
+                                    let fraction =
+                                        self.agg_fraction(sc, f, b.fraction.as_deref())?;
                                     Agg {
                                         func: f,
                                         distinct: false,
                                         arg: Some(arg.to_ir()),
+                                        fraction,
                                         ty,
                                     }
                                 }
@@ -7937,6 +8017,7 @@ fn count_rows() -> Agg {
         func: AggFunc::Count,
         distinct: false,
         arg: None,
+        fraction: None,
         ty: Ty::scalar(ScalarType::I64, false),
     }
 }
@@ -7970,12 +8051,14 @@ fn agg_func(name: &str) -> AggFunc {
         "avg" => AggFunc::Avg,
         "min" => AggFunc::Min,
         "collect" => AggFunc::Collect,
+        "stddev" => AggFunc::Stddev,
+        "percentile" => AggFunc::Percentile,
         _ => AggFunc::Max,
     }
 }
 
-/// An aggregate's result type: `count` is a non-null `I64`; `sum` and `avg`
-/// are `F64` as today; `min` and `max` keep the argument's type; all but
+/// An aggregate's result type: `count` is a non-null `I64`; `sum`, `avg`,
+/// `stddev` and `percentile` are `F64` over a numeric argument; `min` and `max` keep the argument's type; all but
 /// `count` and `collect` are nullable over an empty input. `collect` is a
 /// list of its argument's type, the empty list over empty input.
 fn agg_type(func: AggFunc, arg: &Ty) -> R<Ty> {
@@ -8011,13 +8094,17 @@ fn agg_type(func: AggFunc, arg: &Ty) -> R<Ty> {
             T8,
             format!("{func} cannot take a reference bare; access one of its properties"),
         )),
-        (AggFunc::Sum | AggFunc::Avg, Ty::Value(t)) if t.list || !t.scalar.is_numeric() => {
+        (AggFunc::Sum | AggFunc::Avg | AggFunc::Stddev | AggFunc::Percentile, Ty::Value(t))
+            if t.list || !t.scalar.is_numeric() =>
+        {
             Err(err(
                 T8,
                 format!("{func} requires numeric type, got {}", t.display_name()),
             ))
         }
-        (AggFunc::Sum | AggFunc::Avg, Ty::Value(_)) => Ok(Ty::scalar(ScalarType::F64, true)),
+        (AggFunc::Sum | AggFunc::Avg | AggFunc::Stddev | AggFunc::Percentile, Ty::Value(_)) => {
+            Ok(Ty::scalar(ScalarType::F64, true))
+        }
         (_, Ty::Value(t)) if t.list || !t.scalar.is_orderable() => Err(err(
             T8,
             format!(
@@ -8848,6 +8935,10 @@ fn aggregate_filter_fix(catalog: &Catalog, pattern: &Pattern, in_write: bool) ->
     let block = Expr::Block(Box::new(Block {
         func: BlockFunc::Agg(func),
         arg: Some(Box::new(arg.clone())),
+        fraction: match call.args.get(1) {
+            Some(Arg::Expr(p)) => Some(Box::new(p.clone())),
+            _ => None,
+        },
         pattern: Pattern {
             elements: moved,
             ..Pattern::default()
@@ -9652,7 +9743,7 @@ fn block_vars(e: &Expr, out: &mut Vec<String>) {
     crate::stack::deep(|| match e {
         Expr::Block(b) => {
             pattern_vars(&b.pattern, out);
-            if let Some(a) = &b.arg {
+            for a in b.arg.iter().chain(&b.fraction) {
                 expr_vars(a, out);
             }
         }
@@ -9739,7 +9830,9 @@ impl SyntaxSize {
             }
             match e {
                 Expr::Block(b) => {
-                    self.pattern(&b.pattern) && b.arg.as_deref().is_none_or(|a| self.expr(a))
+                    self.pattern(&b.pattern)
+                        && b.arg.as_deref().is_none_or(|a| self.expr(a))
+                        && b.fraction.as_deref().is_none_or(|p| self.expr(p))
                 }
                 Expr::Call(c) => self.call(c),
                 other => {
@@ -9779,7 +9872,13 @@ fn for_each_child(e: &Expr, f: &mut dyn FnMut(&Expr)) {
                 f(e);
             }
         }
-        Expr::AggDistinct { arg, .. } | Expr::Neg(arg) | Expr::Not(arg) => f(arg),
+        Expr::AggDistinct { arg, fraction, .. } => {
+            f(arg);
+            if let Some(p) = fraction {
+                f(p);
+            }
+        }
+        Expr::Neg(arg) | Expr::Not(arg) => f(arg),
         Expr::IsNull { expr, .. } => f(expr),
         Expr::Arith { left, right, .. }
         | Expr::Compare { left, right, .. }
@@ -9954,11 +10053,17 @@ fn expr_vars(e: &Expr, out: &mut Vec<String>) {
                 expr_vars(e, out);
             }
         }
-        Expr::AggDistinct { arg, .. } | Expr::Neg(arg) | Expr::Not(arg) => expr_vars(arg, out),
+        Expr::AggDistinct { arg, fraction, .. } => {
+            expr_vars(arg, out);
+            if let Some(p) = fraction {
+                expr_vars(p, out);
+            }
+        }
+        Expr::Neg(arg) | Expr::Not(arg) => expr_vars(arg, out),
         Expr::IsNull { expr, .. } => expr_vars(expr, out),
         Expr::Block(b) => {
             pattern_vars(&b.pattern, out);
-            if let Some(a) = &b.arg {
+            for a in b.arg.iter().chain(&b.fraction) {
                 expr_vars(a, out);
             }
         }

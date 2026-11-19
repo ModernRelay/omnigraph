@@ -29,7 +29,8 @@ pub(crate) fn expr(root: &IRExpr) -> Value {
                     IRExpr::Variable(_, _) => ("variable", vec![]),
                     IRExpr::Param(_, _) => ("param", vec![]),
                     IRExpr::Literal(_, _) => ("literal", vec![]),
-                    IRExpr::Aggregate { arg, .. } => ("aggregate", vec![arg]),
+                    // The argument, then `percentile`'s fraction.
+                    IRExpr::Aggregate { .. } => ("aggregate", expr.children()),
                     IRExpr::AliasRef(_, _) => ("alias", vec![]),
                     IRExpr::Binary {
                         left, op, right, ..

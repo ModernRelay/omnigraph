@@ -479,6 +479,10 @@ query collected_ages() {
     match { $p: Person }
     return { collect(distinct $p.age) as ages, collect($p.name) as names }
 }
+query spread_ages($f: F64) {
+    match { $p: Person }
+    return { stddev($p.age) as sd, percentile($p.age, $f) as at, percentile($p.age, 0.5) as median }
+}
 query old_or_liking() {
     match {
         from union(
@@ -1843,6 +1847,25 @@ async fn the_skip_shapes_and_the_aggregate_replay() {
             "overflow": "error", "result": "[I64]?"
         })
     );
+    // `percentile`'s fraction is part of the plan: the replay answers at the
+    // run's parameter, and the explain names it.
+    let spread = replayed(
+        &db,
+        PEOPLE_QUERIES,
+        "spread_ages",
+        &ParamMap::from([("f".to_string(), Literal::Float(0.25))]),
+    )
+    .await;
+    let aggregates = spread.plan.plan.to_json()["aggregates"].clone();
+    assert_eq!(
+        aggregates[0],
+        serde_json::json!({
+            "column": "sd", "func": "stddev", "distinct": false, "input": "I64", "accumulator": "list",
+            "overflow": "round_to_nearest", "result": "F64?"
+        })
+    );
+    assert_eq!(aggregates[1]["fraction"], "$f");
+    assert_eq!(aggregates[2]["fraction"], "0.5");
     let encoded = serde_json::to_value(plan).unwrap();
     for (label, replacement) in [
         (

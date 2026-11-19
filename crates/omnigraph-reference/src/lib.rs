@@ -385,6 +385,20 @@ impl<'a> Interpreter<'a> {
             let value = bind_param(name, value, ty)?;
             self.params.insert(name.clone(), value);
         }
+        // A `percentile`'s fraction is a constant of the read: one outside
+        // its domain refuses the read before it reads a row. A called
+        // read's is its caller's argument, checked where its group is read.
+        let mut pending = vec![&read.term];
+        while let Some(term) = pending.pop() {
+            if let Term::Group { aggs, .. } = term {
+                for (_, agg) in aggs {
+                    self.fraction(agg, &Vec::new())?;
+                }
+            }
+            if !matches!(term, Term::Call { .. }) {
+                pending.extend(term.children());
+            }
+        }
         let rel = self.term(&read.term, &Vec::new())?;
         let rows = rel
             .rows
@@ -759,6 +773,9 @@ impl<'a> Interpreter<'a> {
                     if keys.is_empty() && groups.is_empty() {
                         groups.push((Vec::new(), Vec::new()));
                     }
+                    for (_, agg) in aggs {
+                        self.fraction(agg, env)?;
+                    }
                     let mut rows = Vec::new();
                     for (key, members) in groups {
                         let mut out: Row = keys.iter().map(|(n, _)| n.clone()).zip(key).collect();
@@ -1072,6 +1089,28 @@ impl<'a> Interpreter<'a> {
         Ok(best.into_iter().map(|(t, _)| t).collect())
     }
 
+    /// `percentile`'s fraction `p`: a number in [0, 1], or `E5` (a null
+    /// parameter included). `None` for every other aggregate.
+    fn fraction(&self, agg: &Agg, env: &Row) -> R<Option<f64>> {
+        let Some(p) = &agg.fraction else {
+            return Ok(None);
+        };
+        match self.expr(p, &Vec::new(), env)? {
+            Value::Null => Err(Refusal::Runtime(
+                "E5",
+                "`percentile`'s fraction p is null".into(),
+            )),
+            v => match v.as_f64() {
+                Some(p) if (0.0..=1.0).contains(&p) => Ok(Some(p)),
+                Some(p) => Err(Refusal::Runtime(
+                    "E5",
+                    format!("`percentile`'s fraction p is {p}, outside [0, 1]"),
+                )),
+                None => Err(Refusal::Input(format!("a percentile fraction is {v:?}"))),
+            },
+        }
+    }
+
     fn aggregate(&self, agg: &Agg, rows: &[Row], env: &Row) -> R<Value> {
         let Some(arg) = &agg.arg else {
             return Ok(Value::Int(rows.len() as i128));
@@ -1099,6 +1138,52 @@ impl<'a> Interpreter<'a> {
             AggFunc::Avg => Value::Float(exact_sum(&values) / values.len() as f64),
             AggFunc::Min => values.into_iter().min_by(cmp_values).unwrap(),
             AggFunc::Max => values.into_iter().max_by(cmp_values).unwrap(),
+            // The group's values ascending in the fixed value order, each
+            // the nearest `F64`, so the answer does not depend on the order
+            // the rows arrive in.
+            AggFunc::Stddev | AggFunc::Percentile => {
+                values.sort_by(cmp_values);
+                let x = values
+                    .iter()
+                    .map(|v| {
+                        v.as_f64()
+                            .ok_or_else(|| Refusal::Input(format!("{} of {v:?}", agg.func)))
+                    })
+                    .collect::<R<Vec<f64>>>()?;
+                let n = x.len();
+                match self.fraction(agg, env)? {
+                    // The sample deviation: squared differences from the
+                    // mean over n − 1, each sum added in the sorted order;
+                    // null over one value.
+                    None if n < 2 => Value::Null,
+                    None => {
+                        let mut total = 0.0;
+                        for v in &x {
+                            total += v;
+                        }
+                        let mean = total / n as f64;
+                        let mut squares = 0.0;
+                        for v in &x {
+                            squares += (v - mean) * (v - mean);
+                        }
+                        Value::Float((squares / (n - 1) as f64).sqrt())
+                    }
+                    // PERCENTILE_CONT: the value at the index p · (n − 1)
+                    // when it is whole, otherwise interpolated linearly
+                    // between its two neighbors.
+                    Some(p) => {
+                        let h = p * (n - 1) as f64;
+                        let lo = h.floor();
+                        let below = x[lo as usize];
+                        if h == lo {
+                            Value::Float(below)
+                        } else {
+                            let above = x[lo as usize + 1];
+                            Value::Float(below + (above - below) * (h - lo))
+                        }
+                    }
+                }
+            }
         })
     }
 

@@ -1053,7 +1053,9 @@ fn typed_node(value: &Value) -> Result<TypedNode, String> {
         .ok_or_else(bad)?;
     let valid_arity = match op {
         "property" | "variable" | "param" | "literal" | "alias" | "count_rows" => args.is_empty(),
-        "nearest" | "aggregate" | "not" | "is_null" | "cast" | "neg" => args.len() == 1,
+        "nearest" | "not" | "is_null" | "cast" | "neg" => args.len() == 1,
+        // The argument, then `percentile`'s fraction.
+        "aggregate" => (1..=2).contains(&args.len()),
         "lower" | "upper" | "trim" | "ltrim" | "rtrim" | "length" | "abs" | "floor" | "ceil"
         | "sqrt" | "exp" | "ln" | "log10" | "size" | "cast_value" => args.len() == 1,
         "left" | "right" | "round" | "power" => args.len() == 2,

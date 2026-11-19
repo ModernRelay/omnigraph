@@ -736,6 +736,65 @@ fn limit_reads_its_count_from_a_parameter() {
     );
 }
 
+/// `stddev` is the sample deviation of a group's non-null values, null
+/// below two; `percentile(x, p)` interpolates linearly between the values
+/// around p · (n − 1) in the fixed value order, null over none. A fraction
+/// parameter outside [0, 1] or null is `E5` before any row is read, over no
+/// group too.
+#[test]
+fn stddev_and_percentile_over_a_group() {
+    let one = |src: &str, params: &[(&str, Literal)]| -> Json {
+        let rows = outcome(src, params).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        rows[0].clone()
+    };
+    let row = one(
+        "query q() { match { $p: Person } return { stddev($p.age) as sd, percentile($p.age, 0.5) as median, percentile($p.age, 0.75) as upper } }",
+        &[],
+    );
+    // [30, 30, 40]: the squared differences from 100 / 3 sum to 200 / 3.
+    let sd = row["sd"].as_f64().unwrap();
+    assert!((sd - (100.0f64 / 3.0).sqrt()).abs() < 1e-12, "{sd}");
+    assert_eq!(row["median"], json!(30.0));
+    assert_eq!(row["upper"], json!(35.0));
+    // One value per city: no deviation, the value itself at any fraction.
+    assert_eq!(
+        sorted(rows(
+            "query q() { match { $p: Person } return { $p.city, stddev($p.age) as sd, percentile($p.age, 0.3) as at } }"
+        )),
+        vec![
+            json!({"at": 30.0, "p.city": "Oslo"}),
+            json!({"at": 30.0, "p.city": "Rome"}),
+            json!({"at": 40.0})
+        ]
+    );
+    // The fixed value order puts -0.0 before 0.0.
+    let row = one(
+        "query q() { match { $r: Reading } return { percentile($r.x, 0) as low, percentile($r.x, 1) as high } }",
+        &[],
+    );
+    assert_eq!(row["low"].as_f64().unwrap().to_bits(), (-0.0f64).to_bits());
+    assert_eq!(row["high"], json!(2.0));
+    // Over no row: one row with no value, or no row under keys.
+    assert_eq!(
+        rows(
+            "query q() { match { $p: Person } where $p.age > 99 return { stddev($p.age) as sd, percentile($p.age, 0.5) as m } }"
+        ),
+        vec![json!({})]
+    );
+    let at = "query q($f: F64?) { match { $p: Person } where $p.age > 99 return { $p.city, percentile($p.age, $f) as m } }";
+    assert_eq!(
+        outcome(at, &[("f", Literal::Float(0.5))]).unwrap(),
+        Vec::<Json>::new()
+    );
+    for f in [Literal::Float(1.5), Literal::Float(-0.25), Literal::Null] {
+        match outcome(at, &[("f", f.clone())]) {
+            Err(Refusal::Runtime("E5", _)) => {}
+            other => panic!("{f:?}: {other:?}"),
+        }
+    }
+}
+
 /// The outcome of the one read in `src` under `params`.
 #[track_caller]
 fn outcome(src: &str, params: &[(&str, Literal)]) -> R<Vec<Json>> {

@@ -66,6 +66,7 @@ fn metadata_count_rewrite_converges() {
     let op = ir(
         vec![scan("c")],
         vec![IRExpr::Aggregate {
+            fraction: None,
             func: AggFunc::Count,
             distinct: false,
             arg: Box::new(IRExpr::Variable(

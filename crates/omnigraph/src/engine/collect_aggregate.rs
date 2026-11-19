@@ -3,6 +3,26 @@
 //! list over empty input. The values it holds are its accumulator's size,
 //! which `AggregateExec` reserves in the query's memory pool as they arrive,
 //! so a list beyond `query_memory_bytes` refuses the read.
+//!
+//! `stddev` and `percentile` hold a group's values the same way and finish
+//! them in `F64` on GQ kernels, over the values ascending in the fixed value
+//! order (the total order on floats, so `-0.0` before `0.0`), each converted
+//! to the nearest `F64` (exact for every integer up to 2^53 and every `F32`):
+//!
+//! - `stddev(x)` is the sample standard deviation: the mean is the values'
+//!   sum, added in that order, over n; the result is the square root of the
+//!   squared differences from the mean, added in that order, over n − 1;
+//!   null over fewer than two values. DataFusion's `stddev` folds Welford's
+//!   running moments in arrival order and merges partitions by Chan's
+//!   formula, so its last bits follow the physical layout; sorting first
+//!   makes the answer a function of the group's values alone.
+//! - `percentile(x, p)` is exact with linear interpolation (SQL's
+//!   `PERCENTILE_CONT`): with n values and the index i = p · (n − 1), the
+//!   value at ⌊i⌋ when i is whole, otherwise lower + (upper − lower) · (i −
+//!   ⌊i⌋) between the values at ⌊i⌋ and ⌊i⌋ + 1; null over empty input.
+//!   DataFusion's `percentile_cont` holds every value too, but rounds the
+//!   interpolation fraction to 1e-6 and casts the result back to the
+//!   argument's type, so it is not this row's implementation.
 
 use std::sync::Arc;
 
@@ -17,11 +37,35 @@ use datafusion::logical_expr::{Accumulator, AggregateUDFImpl, Signature, Volatil
 /// one sorted array (and, for `distinct`, drops the repeats).
 const PIECES_BEFORE_FOLD: usize = 32;
 
+/// What an accumulator makes of the group's values it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum Finish {
+    /// `collect`: the values as one list.
+    List,
+    /// `stddev`: their sample standard deviation.
+    Stddev,
+    /// `percentile`: the percentile at the fraction whose `F64` bits these
+    /// are, checked to lie in [0, 1] before the read reads a row.
+    Percentile(u64),
+}
+
+impl Finish {
+    fn name(self) -> &'static str {
+        match self {
+            Self::List => "collect",
+            Self::Stddev => "stddev",
+            Self::Percentile(_) => "percentile",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct CollectUdaf {
     signature: Signature,
-    /// The declared result, `List` of the argument's type.
-    result: DataType,
+    /// The list of the argument's values: the state every accumulator
+    /// reports, and `collect`'s declared result.
+    list: DataType,
+    finish: Finish,
 }
 
 impl CollectUdaf {
@@ -30,12 +74,23 @@ impl CollectUdaf {
     pub(super) fn new(element: DataType, result: DataType) -> Self {
         Self {
             signature: Signature::exact(vec![element], Volatility::Immutable),
-            result,
+            list: result,
+            finish: Finish::List,
+        }
+    }
+
+    /// `stddev` or `percentile` over a numeric argument of type `element`,
+    /// returning `F64`.
+    pub(super) fn finishing(element: DataType, finish: Finish) -> Self {
+        Self {
+            signature: Signature::exact(vec![element.clone()], Volatility::Immutable),
+            list: DataType::List(Arc::new(Field::new("item", element, true))),
+            finish,
         }
     }
 
     fn item(&self) -> Result<FieldRef> {
-        match &self.result {
+        match &self.list {
             DataType::List(item) => Ok(Arc::clone(item)),
             other => Err(DataFusionError::Internal(format!(
                 "`collect` returns a list, declared {other}"
@@ -46,7 +101,7 @@ impl CollectUdaf {
 
 impl AggregateUDFImpl for CollectUdaf {
     fn name(&self) -> &str {
-        "collect"
+        self.finish.name()
     }
 
     fn signature(&self) -> &Signature {
@@ -54,18 +109,22 @@ impl AggregateUDFImpl for CollectUdaf {
     }
 
     fn return_type(&self, _: &[DataType]) -> Result<DataType> {
-        Ok(self.result.clone())
+        Ok(match self.finish {
+            Finish::List => self.list.clone(),
+            Finish::Stddev | Finish::Percentile(_) => DataType::Float64,
+        })
     }
 
-    /// Never null: empty input is the empty list.
+    /// `collect` is never null (empty input is the empty list); `stddev` and
+    /// `percentile` are null over too few values.
     fn is_nullable(&self) -> bool {
-        false
+        self.finish != Finish::List
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         Ok(vec![Arc::new(Field::new(
             format!("{}[values]", args.name),
-            self.result.clone(),
+            self.list.clone(),
             true,
         ))])
     }
@@ -74,6 +133,7 @@ impl AggregateUDFImpl for CollectUdaf {
         Ok(Box::new(CollectAccumulator {
             item: self.item()?,
             distinct: args.is_distinct,
+            finish: self.finish,
             pieces: Vec::new(),
         }))
     }
@@ -83,6 +143,7 @@ impl AggregateUDFImpl for CollectUdaf {
 struct CollectAccumulator {
     item: FieldRef,
     distinct: bool,
+    finish: Finish,
     /// The non-null values seen so far, each piece an owned copy, so its
     /// memory is exactly what the accumulator holds.
     pieces: Vec<ArrayRef>,
@@ -131,6 +192,70 @@ impl CollectAccumulator {
         )?;
         Ok(ScalarValue::List(Arc::new(list)))
     }
+
+    /// The values held, ascending in the fixed value order, each as the
+    /// nearest `F64`.
+    fn sorted_f64(&mut self) -> Result<Vec<f64>> {
+        self.fold()?;
+        let Some(values) = self.pieces.first() else {
+            return Ok(Vec::new());
+        };
+        let floats = arrow_cast::cast::cast(values.as_ref(), &DataType::Float64)?;
+        let floats = floats
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .ok_or_else(|| DataFusionError::Internal("a numeric value is not an F64".into()))?;
+        Ok(floats.values().to_vec())
+    }
+
+    /// The accumulator's result: `collect`'s list, or the value `stddev` or
+    /// `percentile` makes of the held values.
+    fn finish(&mut self) -> Result<ScalarValue> {
+        Ok(match self.finish {
+            Finish::List => return self.list(),
+            Finish::Stddev => ScalarValue::Float64(sample_stddev(&self.sorted_f64()?)),
+            Finish::Percentile(bits) => ScalarValue::Float64(interpolated_percentile(
+                &self.sorted_f64()?,
+                f64::from_bits(bits),
+            )),
+        })
+    }
+}
+
+/// The sample standard deviation of `values`, ascending in the fixed value
+/// order: the mean is their sum, added in that order, over n, and the result
+/// the square root of the squared differences from the mean, added in that
+/// order, over n − 1. `None` below two values.
+fn sample_stddev(values: &[f64]) -> Option<f64> {
+    let n = values.len();
+    if n < 2 {
+        return None;
+    }
+    let mean = values.iter().fold(0.0, |sum, v| sum + v) / n as f64;
+    let squares = values.iter().fold(0.0, |sum, v| {
+        let d = v - mean;
+        sum + d * d
+    });
+    Some((squares / (n - 1) as f64).sqrt())
+}
+
+/// The percentile at `p` in [0, 1] of `values`, ascending in the fixed value
+/// order, with linear interpolation: with the index i = p · (n − 1), the
+/// value at ⌊i⌋ when i is whole, otherwise lower + (upper − lower) · (i −
+/// ⌊i⌋). `None` over no value.
+fn interpolated_percentile(values: &[f64], p: f64) -> Option<f64> {
+    let last = values.len().checked_sub(1)?;
+    let index = p * last as f64;
+    let below = index.floor();
+    let fraction = index - below;
+    // `p` lies in [0, 1], so `index` lies in [0, last].
+    let at = (below as usize).min(last);
+    let lower = values[at];
+    if fraction == 0.0 {
+        return Some(lower);
+    }
+    let upper = values[(at + 1).min(last)];
+    Some(lower + (upper - lower) * fraction)
 }
 
 /// `values` sorted in the fixed value order (the total order on floats, so
@@ -160,7 +285,7 @@ impl Accumulator for CollectAccumulator {
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        self.list()
+        self.finish()
     }
 
     fn size(&self) -> usize {
@@ -277,6 +402,116 @@ mod tests {
             .map(|v| v.to_bits())
             .collect();
         assert_eq!(bits, expected);
+    }
+
+    /// `finish` over `values`, split at `at` into two partial accumulators
+    /// merged in either order: the result must not depend on the split.
+    fn finished(values: ArrayRef, finish: Finish, at: usize) -> Option<f64> {
+        let element = values.data_type().clone();
+        let udaf = CollectUdaf::finishing(element.clone(), finish);
+        let input = Arc::new(Field::new("x", element, true));
+        let schema = Schema::new(vec![input.clone()]);
+        let exprs: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("x", 0))];
+        let fields = [input];
+        let args = || AccumulatorArgs {
+            return_field: Arc::new(Field::new("c", DataType::Float64, true)),
+            schema: &schema,
+            ignore_nulls: false,
+            order_bys: &[],
+            is_reversed: false,
+            name: "c",
+            is_distinct: false,
+            exprs: &exprs,
+            expr_fields: &fields,
+        };
+        let mut results = Vec::new();
+        let (first, second) = (values.slice(0, at), values.slice(at, values.len() - at));
+        for (early, late) in [(&first, &second), (&second, &first)] {
+            let mut partial = udaf.accumulator(args()).unwrap();
+            partial.update_batch(&[Arc::clone(early)]).unwrap();
+            let state = partial.state().unwrap();
+            let mut merged = udaf.accumulator(args()).unwrap();
+            merged.update_batch(&[Arc::clone(late)]).unwrap();
+            merged
+                .merge_batch(&[state[0].to_array_of_size(1).unwrap()])
+                .unwrap();
+            let ScalarValue::Float64(value) = merged.evaluate().unwrap() else {
+                panic!("an F64 result");
+            };
+            results.push(value.map(f64::to_bits));
+        }
+        assert_eq!(
+            results[0], results[1],
+            "the result depends on arrival order"
+        );
+        results[0].map(f64::from_bits)
+    }
+
+    fn percentile(p: f64) -> Finish {
+        Finish::Percentile(p.to_bits())
+    }
+
+    #[test]
+    fn stddev_is_the_sample_deviation_whatever_the_arrival_order() {
+        let values: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![
+            Some(9),
+            Some(4),
+            None,
+            Some(2),
+            Some(5),
+            Some(4),
+            Some(7),
+            Some(4),
+            Some(5),
+        ]));
+        // [2, 4, 4, 4, 5, 5, 7, 9]: squared differences from 5 sum to 32.
+        let sd = finished(Arc::clone(&values), Finish::Stddev, 3).unwrap();
+        assert_eq!(sd.to_bits(), (32.0f64 / 7.0).sqrt().to_bits());
+        let floats: ArrayRef = Arc::new(Float64Array::from(vec![0.1, 0.7, 1e9, 0.2, -3.3]));
+        let at_one = finished(Arc::clone(&floats), Finish::Stddev, 1);
+        let at_four = finished(floats, Finish::Stddev, 4);
+        assert_eq!(at_one.map(f64::to_bits), at_four.map(f64::to_bits));
+        let one: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![Some(3), None]));
+        assert_eq!(finished(one, Finish::Stddev, 1), None, "below two values");
+    }
+
+    #[test]
+    fn percentile_interpolates_exactly_between_neighbors() {
+        let values: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![
+            Some(4),
+            None,
+            Some(2),
+            Some(9),
+        ]));
+        // [2, 4, 9]: the index p · 2.
+        assert_eq!(finished(Arc::clone(&values), percentile(0.0), 2), Some(2.0));
+        assert_eq!(finished(Arc::clone(&values), percentile(0.5), 2), Some(4.0));
+        assert_eq!(finished(Arc::clone(&values), percentile(1.0), 2), Some(9.0));
+        assert_eq!(
+            finished(Arc::clone(&values), percentile(0.75), 1),
+            Some(6.5)
+        );
+        // The fraction keeps every digit (DataFusion's `percentile_cont`
+        // rounds it to 1e-6).
+        let p = 0.123456789;
+        let index = p * 2.0;
+        assert_eq!(
+            finished(values, percentile(p), 1).map(f64::to_bits),
+            Some((2.0 + 2.0 * index).to_bits())
+        );
+        // An integer beyond 2^53 is its nearest `F64`; -0.0 sorts before 0.0.
+        let wide: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![(1i64 << 53) + 1]));
+        assert_eq!(
+            finished(wide, percentile(1.0), 1),
+            Some(9_007_199_254_740_992.0)
+        );
+        let zeros: ArrayRef = Arc::new(Float64Array::from(vec![0.0, -0.0]));
+        assert_eq!(
+            finished(zeros, percentile(0.0), 1).map(f64::to_bits),
+            Some((-0.0f64).to_bits())
+        );
+        let none: ArrayRef = Arc::new(Float64Array::from(vec![None, None]));
+        assert_eq!(finished(none, percentile(0.5), 1), None);
     }
 
     #[test]
