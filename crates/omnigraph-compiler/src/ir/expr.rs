@@ -2321,13 +2321,17 @@ pub fn cast_can_fail(from: ScalarType, to: ScalarType) -> bool {
     if from == to || to == String || to == Bool || from == Bool {
         return false;
     }
-    match (from, to) {
-        (Date, DateTime) | (DateTime, Date) => false,
-        (I32, I64 | F64) | (U32, I64 | U64 | F64) | (U64, F64) | (I64, F64) => false,
-        (I32 | U32 | I64 | U64, F32) => false,
-        (F32, F64) => false,
-        _ => true,
-    }
+    !matches!(
+        (from, to),
+        (Date, DateTime)
+            | (DateTime, Date)
+            | (I32, I64 | F64)
+            | (U32, I64 | U64 | F64)
+            | (U64, F64)
+            | (I64, F64)
+            | (I32 | U32 | I64 | U64, F32)
+            | (F32, F64)
+    )
 }
 
 /// How a `terms(…)` value matches: every term, or any one.
