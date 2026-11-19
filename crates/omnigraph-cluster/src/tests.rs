@@ -4776,3 +4776,81 @@ async fn plan_observes_graph_removal_and_policy_rebinding() {
         assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
     }
 }
+
+/// `stored_query_files` names, per graph, the files `queries:` declares as
+/// validation reads them (a declared file, a directory's top-level `.gq`
+/// files, an explicit map's files), without reading them: a file that does
+/// not parse is named like any other. A path leaving the directory is
+/// refused.
+#[test]
+fn stored_query_files_names_every_declared_file_unread() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("queries/nested")).unwrap();
+    for (path, text) in [
+        ("people.pg", "node Person { name: String @key }\n"),
+        (
+            "queries/one.gq",
+            "query one() { match { $p: Person } return { $p.name } }\n",
+        ),
+        (
+            "queries/two.gq",
+            "mutation two() { insert Person { name: \"a\" } }\n",
+        ),
+        ("queries/notes.txt", "not a query\n"),
+        ("queries/nested/three.gq", "query three() {}\n"),
+        ("extra.gq", "query extra( {\n"),
+        (
+            "named.gq",
+            "query named() { match { $p: Person } return { $p } }\n",
+        ),
+    ] {
+        fs::write(root.join(path), text).unwrap();
+    }
+    fs::write(
+        root.join("cluster.yaml"),
+        "version: 1\ngraphs:\n  a:\n    schema: ./people.pg\n    queries: ./queries/\n  b:\n    schema: ./people.pg\n    queries: [./extra.gq, ./queries/]\n  c:\n    schema: ./people.pg\n    queries:\n      named:\n        file: ./named.gq\n  d:\n    schema: ./people.pg\n",
+    )
+    .unwrap();
+    let graphs = stored_query_files(root).unwrap();
+    let listed: Vec<(&str, Vec<String>)> = graphs
+        .iter()
+        .map(|g| {
+            assert_eq!(g.schema, root.join("./people.pg"));
+            (
+                g.graph_id.as_str(),
+                g.files
+                    .iter()
+                    .map(|f| f.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("a", vec!["queries/one.gq".into(), "queries/two.gq".into()]),
+            (
+                "b",
+                vec![
+                    "extra.gq".into(),
+                    "queries/one.gq".into(),
+                    "queries/two.gq".into()
+                ]
+            ),
+            ("c", vec!["named.gq".into()]),
+            ("d", Vec::<String>::new()),
+        ]
+    );
+
+    fs::write(
+        root.join("cluster.yaml"),
+        "version: 1\ngraphs:\n  a:\n    schema: ./people.pg\n    queries: ../outside.gq\n",
+    )
+    .unwrap();
+    let refused = stored_query_files(root).unwrap_err();
+    assert!(
+        refused.iter().any(|d| d.code == "config_path_escape"),
+        "{refused:?}"
+    );
+}

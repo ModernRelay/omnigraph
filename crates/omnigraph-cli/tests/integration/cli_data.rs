@@ -2032,6 +2032,248 @@ query bad_update($slug: String) {
     );
 }
 
+/// `lint --fix` over a directory applies the printed fixes to every `.gq`
+/// file below it and writes each changed file in place; a file holding a
+/// refusal with no fix, or one printed for review, is left as it was and
+/// listed, and the exit status says so. `--dry-run` writes nothing.
+#[test]
+fn lint_fix_rewrites_the_files_of_a_directory_in_place() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    write_file(
+        &schema_path,
+        "node Person {\n    name: String @key\n    age: I32?\n}\n",
+    );
+    let dir = temp.path().join("queries");
+    fs::create_dir_all(dir.join("nested")).unwrap();
+    let respelled = dir.join("respelled.gq");
+    let edition_2 = "mutation add($n: String) { insert Person { name: $n } }\n\
+                     query older() { match { $p: Person  $p.age > 30 } return { $p.name  $p.age } order { $p.age asc } }\n";
+    write_query_file(&respelled, edition_2);
+    let current = dir.join("nested/current.gq");
+    let compiles = "query names() { match { $p: Person } return { $p.name } }\n";
+    write_query_file(&current, compiles);
+    let unknown = dir.join("nested/unknown.gq");
+    let refused = "query ages() { match { $p: Person } return { $p.years } }\n";
+    write_query_file(&unknown, refused);
+    let paged = dir.join("paged.gq");
+    let review = "query page() { match { $p: Person } return { $p.name } offset 2 }\n";
+    write_query_file(&paged, review);
+    write_file(&dir.join("notes.txt"), "not a query");
+
+    let lint_fix = |extra: &[&str]| {
+        let mut command = cli();
+        command
+            .arg("lint")
+            .arg("--query")
+            .arg(&dir)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--fix")
+            .args(extra);
+        command
+    };
+
+    let dry = output_failure(&mut lint_fix(&["--dry-run"]));
+    assert_eq!(dry.status.code(), Some(1));
+    let stdout = stdout_string(&dry);
+    assert!(
+        stdout.contains(
+            "respelled.gq: 2 passes; L208 ×1, Q009 ×1, Q016 ×1, Q017 ×1 [dry run, not written]"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&respelled).unwrap(), edition_2);
+
+    let output = output_failure(&mut lint_fix(&["--json"]));
+    assert_eq!(output.status.code(), Some(1));
+    let run: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(run["status"], "error", "{run}");
+    assert_eq!(
+        (
+            &run["files_processed"],
+            &run["fixed"],
+            &run["unchanged"],
+            &run["unfixed"],
+            &run["written"]
+        ),
+        (
+            &Value::from(4),
+            &Value::from(1),
+            &Value::from(1),
+            &Value::from(2),
+            &Value::from(1)
+        ),
+        "{run}"
+    );
+    let file = |name: &str| {
+        run["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["query_path"].as_str().unwrap().ends_with(name))
+            .unwrap_or_else(|| panic!("{name} in {run}"))
+            .clone()
+    };
+    let fixed = file("respelled.gq");
+    assert_eq!(fixed["fix"]["status"], "fixed");
+    assert_eq!(fixed["fix"]["written"], true);
+    assert_eq!(fixed["fix"]["passes"], 2);
+    assert_eq!(
+        fixed["fix"]["applied"],
+        serde_json::json!({"L208": 1, "Q009": 1, "Q016": 1, "Q017": 1})
+    );
+    // The lint report is of the text written: it compiles.
+    assert_eq!(fixed["status"], "ok");
+    assert_eq!(fixed["queries_processed"], 2);
+    assert_eq!(
+        fs::read_to_string(&respelled).unwrap(),
+        "query add($n: String) { insert Person { name: $n } }\n\
+         query older() { match { $p: Person } where $p.age > 30 return { $p.name,  $p.age } order { $p.age } }\n"
+    );
+    assert_eq!(file("current.gq")["fix"]["status"], "unchanged");
+    let stuck = file("unknown.gq");
+    assert_eq!(stuck["fix"]["status"], "unfixed");
+    assert_eq!(stuck["fix"]["written"], false);
+    assert_eq!(stuck["fix"]["stopped_at_pass"], 0);
+    assert_eq!(stuck["fix"]["unfixed"][0]["code"], "T6");
+    assert_eq!(stuck["fix"]["unfixed"][0]["position"]["line"], 1);
+    let for_review = file("paged.gq");
+    assert_eq!(for_review["fix"]["status"], "unfixed");
+    assert_eq!(
+        for_review["fix"]["unfixed"][0]["suggestion"]["applicability"],
+        "needs_review"
+    );
+    for (path, text) in [(&current, compiles), (&unknown, refused), (&paged, review)] {
+        assert_eq!(fs::read_to_string(path).unwrap(), text);
+    }
+    assert_eq!(
+        fs::read_dir(&dir).unwrap().count(),
+        4,
+        "no temporary file is left beside the written one"
+    );
+
+    // Fixes printed for review apply when asked, and say so.
+    let output = output_failure(&mut lint_fix(&["--review-fixes"]));
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("paged.gq: 1 pass; Q015 ×1 [written]")
+            && stdout.contains("applied for review (read these changes): Q015 ×1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("UNFIXED   ")
+            && stdout.contains("unknown.gq: a refusal prints no fix it can apply; nothing written")
+            && stdout.contains("error[T6] at line 1, column "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("4 files: 1 fixed, 2 unchanged, 1 unfixed, 0 not converging; 1 written"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&paged).unwrap(),
+        "query page() { match { $p: Person } return { $p.name } }\n"
+    );
+    assert_eq!(fs::read_to_string(&unknown).unwrap(), refused);
+}
+
+/// `lint --fix` over one file prints lint's report of the fixed text with a
+/// `fix` field added; without `--fix`, lint reads one file and changes
+/// nothing, and `--fix`'s own flags require it.
+#[test]
+fn lint_fix_over_one_file_adds_the_fix_to_the_lint_report() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    write_file(&schema_path, "node Person {\n    name: String @key\n}\n");
+    let query_path = temp.path().join("queries.gq");
+    let edition_2 =
+        "query named($n: String) { match { $p: Person { name: $n } } return { $p.name } }\n";
+    write_query_file(&query_path, edition_2);
+
+    let unfixed = output_failure(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let report: Value = serde_json::from_slice(&unfixed.stdout).unwrap();
+    assert_eq!(report["status"], "error");
+    assert!(report.get("fix").is_none(), "{report}");
+    assert_eq!(fs::read_to_string(&query_path).unwrap(), edition_2);
+
+    let output = output_success(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--fix")
+            .arg("--json"),
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "ok", "{report}");
+    assert_eq!(report["results"][0]["name"], "named");
+    assert_eq!(report["fix"]["status"], "fixed");
+    assert_eq!(report["fix"]["written"], true);
+    assert_eq!(report["fix"]["applied"], serde_json::json!({"Q010": 1}));
+    assert_eq!(
+        fs::read_to_string(&query_path).unwrap(),
+        "query named($n: String) { match { $p: Person } where $p.name = $n return { $p.name } }\n"
+    );
+
+    // A second run finds nothing to fix.
+    let again: Value = serde_json::from_slice(
+        &output_success(
+            cli()
+                .arg("lint")
+                .arg("--query")
+                .arg(&query_path)
+                .arg("--schema")
+                .arg(&schema_path)
+                .arg("--fix")
+                .arg("--json"),
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(again["fix"]["status"], "unchanged");
+    assert_eq!(again["fix"]["written"], false);
+
+    let directory = output_failure(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(temp.path())
+            .arg("--schema")
+            .arg(&schema_path),
+    );
+    assert!(
+        String::from_utf8_lossy(&directory.stderr).contains("is a directory"),
+        "{directory:?}"
+    );
+    for flag in ["--dry-run", "--review-fixes"] {
+        let refused = output_failure(
+            cli()
+                .arg("lint")
+                .arg("--query")
+                .arg(&query_path)
+                .arg("--schema")
+                .arg(&schema_path)
+                .arg(flag),
+        );
+        assert_eq!(refused.status.code(), Some(64), "{flag}: {refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("--fix"),
+            "{flag}: {refused:?}"
+        );
+    }
+}
+
 #[test]
 fn load_json_outputs_summary_for_main_branch() {
     let temp = tempdir().unwrap();

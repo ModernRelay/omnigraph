@@ -13,6 +13,7 @@ use crate::targets::ResolvedTarget;
 pub(crate) mod args;
 mod init;
 pub(crate) mod lint;
+mod lint_fix;
 
 pub(crate) use args::{InitArgs, LintArgs, SchemaCommand};
 pub(crate) use init::run_init;

@@ -776,6 +776,106 @@ fn cluster_e2e_apply_schema_query_and_noop_each_have_exact_receipts() {
     assert_ne!(repeated["result"]["id"], evolved["result"]["id"]);
 }
 
+/// A stored query in edition-2 text is refused at deployment; `lint --fix
+/// --config` respells the configuration directory's query files against
+/// each graph's schema, and `cluster apply` through the running server, the
+/// route a user registers a stored query by, registers and serves it.
+#[test]
+fn cluster_e2e_lint_fix_respells_a_stored_query_that_apply_then_serves() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    fs::write(temp.path().join("live.policy.yaml"), "version: 1\ngroups:\n  operators: [act-live]\nrules:\n  - id: operator\n    allow:\n      actors: { group: operators }\n      actions: [config_manage]\n").unwrap();
+    fs::write(temp.path().join("graph.policy.yaml"), "version: 1\ngroups:\n  operators: [act-live]\nrules:\n  - id: operator\n    allow:\n      actors: { group: operators }\n      actions: [schema_apply, read, change, invoke_query]\n").unwrap();
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        "version: 1\nmetadata:\n  name: lint-fix\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: [./people.gq, ./reports/]\npolicies:\n  operators:\n    file: ./live.policy.yaml\n    applies_to: [cluster]\n  graph_operators:\n    file: ./graph.policy.yaml\n    applies_to: [knowledge]\n",
+    )
+    .unwrap();
+    fs::create_dir(temp.path().join("reports")).unwrap();
+    fs::write(
+        temp.path().join("reports/adults.gq"),
+        "query adults() { match { $p: Person } where $p.age >= 18 return { $p.name } }\n",
+    )
+    .unwrap();
+    let root = format!("file://{}", temp.path().display());
+    bootstrap_cluster_fixture(temp.path(), &root);
+    let server = spawn_server_with_cluster_env(
+        temp.path(),
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-live":"live-deployment-token"}"#,
+        )],
+    );
+    fs::write(
+        temp.path().join("seed.jsonl"),
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":31}}\n",
+    )
+    .unwrap();
+    output_success(
+        cli()
+            .envs(server.credential("live-deployment-token"))
+            .args(["load", "--data"])
+            .arg(temp.path().join("seed.jsonl"))
+            .args([
+                "--mode",
+                "replace",
+                "--target",
+                KEYED_SERVER_NAME,
+                "--graph",
+                "knowledge",
+            ]),
+    );
+
+    // The stored query as edition 2 wrote it: refused before deployment.
+    let edition_2 = "query find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name $p.age }\n}\n";
+    fs::write(temp.path().join("people.gq"), edition_2).unwrap();
+    let refused = parse_stdout_json(&output_failure(
+        cli()
+            .args(["cluster", "validate", "--config"])
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert!(
+        refused["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "query_parse_error"),
+        "{refused}"
+    );
+
+    let fixed = parse_stdout_json(&output_success(
+        cli()
+            .args(["lint", "--fix", "--config"])
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(fixed["status"], "ok", "{fixed}");
+    assert_eq!(
+        (&fixed["fixed"], &fixed["unchanged"]),
+        (&1.into(), &1.into())
+    );
+    let files = fixed["files"].as_array().unwrap();
+    let people = files
+        .iter()
+        .find(|f| f["query_path"].as_str().unwrap().ends_with("people.gq"))
+        .unwrap();
+    assert_eq!(people["fix"]["graphs"], serde_json::json!(["knowledge"]));
+    assert_eq!(people["fix"]["written"], true);
+    assert_eq!(
+        people["fix"]["applied"],
+        serde_json::json!({"Q010": 1, "Q016": 1}),
+        "{people}"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("people.gq")).unwrap(),
+        "query find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name, $p.age }\n}\n"
+    );
+
+    live_apply(temp.path(), &server, "live-deployment-token");
+    assert_live_person_query(&server);
+}
+
 #[test]
 fn cluster_e2e_force_unlock_unblocks_apply() {
     let temp = tempdir().unwrap();

@@ -57,6 +57,7 @@ use config::{
     QueriesDecl, graph_address, load_desired, observe_declared_graphs, parse_cluster_config,
     schema_address, state_resource_digests, validate_cluster_header,
 };
+pub use config::{StoredQueryFiles, stored_query_files};
 pub use deployment::*;
 use diff::{ResourceKind, compute_blast_radius, resource_kind};
 pub use graph_read::GraphReadAuthority;

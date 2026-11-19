@@ -103,7 +103,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
             catalogue: false,
         },
         Command::Lint(args) => {
-            if args.schema.is_some() {
+            if args.schema.is_some() || args.config.is_some() {
                 Local
             } else {
                 Graph {
