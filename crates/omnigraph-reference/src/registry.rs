@@ -86,6 +86,22 @@ pub(crate) fn row(
     if vals.contains(&Value::Null) {
         return Ok(Value::Null);
     }
+    // A number is a value of its argument's declared type: an integer
+    // literal or parameter typed as a float (`cast(0, F64)`, a `F64`
+    // parameter bound to `3`) is that float, so `abs` and `floor` return a
+    // float and `cast` to String writes `0.0`.
+    let vals: Vec<Value> = vals
+        .into_iter()
+        .zip(
+            args.iter()
+                .map(|t| scalar(t))
+                .chain(std::iter::repeat(None)),
+        )
+        .map(|(v, t)| match (v, t) {
+            (Value::Int(i), Some(ScalarType::F32 | ScalarType::F64)) => Value::Float(i as f64),
+            (v, _) => v,
+        })
+        .collect();
     let out = scalar(ty);
     let single = out == Some(ScalarType::F32);
     Ok(match func {

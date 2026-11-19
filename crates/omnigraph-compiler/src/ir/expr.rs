@@ -2390,16 +2390,19 @@ pub fn cast_converts(from: ScalarType, to: ScalarType) -> bool {
 
 /// Whether a `cast` from `from` to `to` can refuse a value (`E6`): every
 /// conversion but a widening that holds every value, a conversion to
-/// String or Bool, a Bool to an integer, and between `Date` and `DateTime`.
+/// String, an integer to Bool, a Bool to an integer, and between `Date` and
+/// `DateTime`. A String read as a Bool is refused unless it is `true` or
+/// `false`.
 pub fn cast_can_fail(from: ScalarType, to: ScalarType) -> bool {
     use ScalarType::*;
-    if from == to || to == String || to == Bool || from == Bool {
+    if from == to || to == String || from == Bool {
         return false;
     }
     !matches!(
         (from, to),
         (Date, DateTime)
             | (DateTime, Date)
+            | (I32 | U32 | I64 | U64, Bool)
             | (I32, I64 | F64)
             | (U32, I64 | U64 | F64)
             | (U64, F64)

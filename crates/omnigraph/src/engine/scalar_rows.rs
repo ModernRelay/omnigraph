@@ -29,6 +29,8 @@
 //!   is not finite (`E3`).
 //! - `abs`: DataFusion's checked kernel refuses the smallest integer with an
 //!   untyped error; GQ checks it first (`E1`).
+//! - `power`: DataFusion refuses zero to a negative power with an untyped
+//!   error; GQ's result is not finite (`E3`), checked before the kernel.
 //! - `cast`: Arrow's cast with `safe: false` refuses an overflow and an
 //!   unparsable string, but reads strings more widely than GQ (Arrow's Bool
 //!   reads `yes`, `on`, `1` and their prefixes; its floats read `inf` and
@@ -168,25 +170,49 @@ fn require_finite(row: &str, values: &ArrayRef) -> Result<()> {
     }
 }
 
-/// Refuse with `code` where a valid row of `values` meets `bad`.
+/// Refuse with `code` where `values` meets `bad` on a row whose every
+/// argument is valid (`valid`, from [`all_valid`]): a row with a null
+/// argument is null, never refused.
 fn check_each<T: ArrowPrimitiveType>(
     values: &PrimitiveArray<T>,
+    valid: &[bool],
     bad: impl Fn(T::Native) -> bool,
     code: QueryCode,
     message: &str,
 ) -> Result<()> {
-    if values.iter().flatten().any(bad) {
+    if values
+        .iter()
+        .zip(valid)
+        .any(|(v, ok)| *ok && v.is_some_and(&bad))
+    {
         Err(refused(code, message))
     } else {
         Ok(())
     }
 }
 
-fn i64_to_i32(values: &ArrayRef, row: &str, what: &str) -> Result<ArrayRef> {
+/// `values` with the rows outside `valid` set to `0`, so a kernel never
+/// refuses a value the row's null result discards.
+fn zero_outside(values: &Int64Array, valid: &[bool]) -> ArrayRef {
+    let kept: Int64Array = values
+        .iter()
+        .zip(valid)
+        .map(|(v, ok)| if *ok { v } else { Some(0) })
+        .collect();
+    Arc::new(kept)
+}
+
+/// The `I64` argument `values` narrowed to `I32` on the rows of `valid`,
+/// null elsewhere; a value outside `I32` there is `E5`.
+fn i64_to_i32(values: &ArrayRef, valid: &[bool], row: &str, what: &str) -> Result<ArrayRef> {
     let values = int64s(values, row)?;
     let narrowed: Int32Array = values
         .iter()
-        .map(|v| v.map(i32::try_from).transpose())
+        .zip(valid)
+        .map(|(v, ok)| match ok {
+            true => v.map(i32::try_from).transpose(),
+            false => Ok(None),
+        })
         .collect::<std::result::Result<_, _>>()
         .map_err(|_| refused(E5, format!("`{row}`'s {what} is outside I32")))?;
     Ok(Arc::new(narrowed))
@@ -228,6 +254,9 @@ pub(super) fn call(
             OmniError::manifest_internal(format!("`{name}` is missing argument {i}"))
         })
     };
+    // The rows whose every argument is valid: a domain check reads only
+    // these, since every other row is null.
+    let valid = all_valid(args);
     let out: ArrayRef = match func {
         ScalarFunc::Lower => udf(string::lower(), args, DataType::Utf8)?,
         ScalarFunc::Upper => udf(string::upper(), args, DataType::Utf8)?,
@@ -251,6 +280,7 @@ pub(super) fn call(
             let counts = int64s(arg(1)?, name)?;
             check_each(
                 counts,
+                &valid,
                 |n| n < 0,
                 E5,
                 &format!("`{name}`'s count is negative"),
@@ -260,18 +290,28 @@ pub(super) fn call(
             } else {
                 unicode::right()
             };
-            udf(f, args, DataType::Utf8)?
+            udf(
+                f,
+                &[Arc::clone(arg(0)?), zero_outside(counts, &valid)],
+                DataType::Utf8,
+            )?
         }
         ScalarFunc::Substring => {
             let lengths = int64s(arg(2)?, name)?;
-            check_each(lengths, |n| n < 0, E5, "`substring`'s length is negative")?;
+            check_each(
+                lengths,
+                &valid,
+                |n| n < 0,
+                E5,
+                "`substring`'s length is negative",
+            )?;
             // The smallest start overflows DataFusion's 1-based offset; any
             // start at or before `1 - length` gives the same empty window.
             let starts: Int64Array = int64s(arg(1)?, name)?.unary(|s| s.max(i64::MIN + 1));
             let starts: ArrayRef = Arc::new(starts);
             udf(
                 unicode::substr(),
-                &[Arc::clone(arg(0)?), starts, Arc::clone(arg(2)?)],
+                &[Arc::clone(arg(0)?), starts, zero_outside(lengths, &valid)],
                 DataType::Utf8,
             )?
         }
@@ -302,10 +342,10 @@ pub(super) fn call(
             }
             _ => Arc::clone(arg(0)?),
         },
-        ScalarFunc::Round => round(arg(0)?, arg(1)?, &returns)?,
+        ScalarFunc::Round => round(arg(0)?, arg(1)?, &valid, &returns)?,
         ScalarFunc::Sqrt => {
             let x = float64s(arg(0)?, name)?;
-            check_each(x, |v| v < 0.0, E5, "`sqrt` of a negative number")?;
+            check_each(x, &valid, |v| v < 0.0, E5, "`sqrt` of a negative number")?;
             udf(math::sqrt(), args, DataType::Float64)?
         }
         ScalarFunc::Exp => udf(math::exp(), args, DataType::Float64)?,
@@ -313,6 +353,7 @@ pub(super) fn call(
             let x = float64s(arg(0)?, name)?;
             check_each(
                 x,
+                &valid,
                 |v| v <= 0.0,
                 E5,
                 &format!("`{name}` of a number that is not positive"),
@@ -325,11 +366,21 @@ pub(super) fn call(
             udf(f, args, DataType::Float64)?
         }
         ScalarFunc::Power => {
+            // DataFusion refuses zero to a negative power with an untyped
+            // error (PostgreSQL's rule); GQ's result is not finite (`E3`).
+            let (bases, exponents) = (float64s(arg(0)?, name)?, float64s(arg(1)?, name)?);
+            if bases
+                .iter()
+                .zip(exponents.iter())
+                .zip(valid.iter())
+                .any(|((b, e), ok)| *ok && b == Some(0.0) && e.is_some_and(|e| e < 0.0))
+            {
+                return Err(refused(E3, "`power` produced a float that is not finite"));
+            }
             let r = udf(math::power(), args, DataType::Float64)?;
-            let valid = all_valid(args);
             if float64s(&r, name)?
                 .iter()
-                .zip(valid)
+                .zip(valid.iter().copied())
                 .any(|(v, ok)| ok && v.is_some_and(f64::is_nan))
             {
                 return Err(refused(
@@ -379,11 +430,11 @@ pub(super) fn call(
 /// `round(x, digits)`: DataFusion's float kernel, `(x · 10^d).round() /
 /// 10^d` in the float's own width, half away from zero; an integer on a GQ
 /// kernel, exact.
-fn round(x: &ArrayRef, digits: &ArrayRef, returns: &DataType) -> Result<ArrayRef> {
+fn round(x: &ArrayRef, digits: &ArrayRef, valid: &[bool], returns: &DataType) -> Result<ArrayRef> {
     let digits_valid = int64s(digits, "round")?;
     match x.data_type() {
         DataType::Float32 | DataType::Float64 => {
-            let d = i64_to_i32(digits, "round", "digits")?;
+            let d = i64_to_i32(digits, valid, "round", "digits")?;
             // A null `digits` is null, not DataFusion's 0: the row is
             // nulled after the kernel.
             udf(
