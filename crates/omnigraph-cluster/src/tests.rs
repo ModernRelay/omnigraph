@@ -235,14 +235,22 @@ fn future_phase_field_rejection() {
 }
 
 /// A graph id the server refuses at boot is refused when the configuration is
-/// validated, before apply writes anything (issue 1490). Other names keep the
-/// wider resource charset.
+/// validated, before apply writes anything (issue 1490). So is one the server
+/// accepts but deployment addresses do not (a digit or `-` first). Other names
+/// keep the wider resource charset.
 #[tokio::test]
 async fn graph_id_follows_the_server_rule_issue_1490() {
     let dir = fixture();
     let config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
     let long = "g".repeat(65);
-    for refused in ["probe_under", "_lead", "policies", long.as_str()] {
+    for refused in [
+        "probe_under",
+        "_lead",
+        "policies",
+        long.as_str(),
+        "1tenant",
+        "-tenant",
+    ] {
         fs::write(
             dir.path().join(CLUSTER_CONFIG_FILE),
             config.replace("knowledge", refused),
@@ -256,8 +264,10 @@ async fn graph_id_follows_the_server_rule_issue_1490() {
             .find(|diagnostic| diagnostic.path == format!("graphs.{refused}"))
             .unwrap_or_else(|| panic!("{refused}: {:?}", out.diagnostics));
         assert_eq!(diagnostic.code, "invalid_resource_id");
-        // The server's own refusal text (`GraphId` applies the same rule).
-        let rule = crate::graph_id_violation(refused).expect("the server refuses it");
+        // The server's own refusal text (`GraphId` applies the same rule),
+        // or, for an id the server accepts, the cluster's letter-first rule.
+        let rule = crate::graph_id_violation(refused)
+            .unwrap_or_else(|| format!("graph_id '{refused}' must start with an ASCII letter"));
         assert_eq!(diagnostic.message, format!("graph id `{refused}`: {rule}"));
 
         let caller = DeploymentCaller::storage_owner(None);

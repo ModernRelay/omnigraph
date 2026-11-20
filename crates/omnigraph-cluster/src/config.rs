@@ -909,9 +909,17 @@ fn load_desired_captured(
     }
 
     for (graph_id, graph) in &raw.graphs {
-        // The server's rule, not the wider resource charset: a declared graph
-        // the server would refuse to serve is refused before apply writes.
-        if let Some(violation) = crate::graph_id::graph_id_violation(graph_id) {
+        // Both rules: the server's, so a declared graph the server would refuse
+        // to serve is refused before apply writes, and the resource-name rule
+        // deployment addresses and recorded state apply (`validate_id`). Past
+        // the server's rule, the second adds only "a letter first".
+        let violation = crate::graph_id::graph_id_violation(graph_id).or_else(|| {
+            let mut refused = Vec::new();
+            validate_id("graph id", graph_id, graph_id, &mut refused);
+            (!refused.is_empty())
+                .then(|| format!("graph_id '{graph_id}' must start with an ASCII letter"))
+        });
+        if let Some(violation) = violation {
             diagnostics.push(Diagnostic::error(
                 "invalid_resource_id",
                 format!("graphs.{graph_id}"),
