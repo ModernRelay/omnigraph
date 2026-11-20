@@ -1,1 +1,1 @@
-- A focused test lookup utility (`scripts/lookup-focused-test.py`) maps modified files to their owning package and focused test command, and initial agent instincts are documented under `.omnigraph/instincts/`.
+- Focused test lookup script (`scripts/lookup-focused-test.py`) maps source files to test commands, with seed agent instincts under `.omnigraph/instincts/`.
