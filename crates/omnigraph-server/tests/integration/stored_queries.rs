@@ -905,10 +905,17 @@ async fn invoke_query_holder_without_read_sees_403_not_404() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn list_queries_returns_only_exposed_with_typed_params() {
+async fn list_queries_describes_only_exposed_operations_issue_468() {
     let (_temp, app) = app_with_stored_queries(
         &[
-            ("find_person", FIND_PERSON_GQ, true),
+            (
+                "find_person",
+                r#"query find_person($name: String) {
+                    match { $p: Person { name: $name } $friend: Person $p knows $friend }
+                    return { $friend.age as years, $p.name, $friend.name }
+                }"#,
+                true,
+            ),
             (
                 "add_person",
                 "query add_person($name: String) { insert Person { name: $name } }",
@@ -948,6 +955,39 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
     assert_eq!(fp["params"][0]["kind"], "string");
     let ap = entries.iter().find(|q| q["name"] == "add_person").unwrap();
     assert_eq!(ap["mutation"], true, "stored insert → mutation");
+    let (status, result) = json_response(
+        &app,
+        invoke_request(
+            "find_person",
+            "t-invoke",
+            json!({"params": {"name": "Bob"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        result["rows"],
+        json!([{"years": 28, "p.name": "Bob", "friend.name": "Diana"}])
+    );
+    let person = json!({"kind": "node", "type_name": "Person"});
+    assert_eq!(
+        fp["operation"],
+        json!({
+            "result": [
+                {"name": "years", "kind": "int", "nullable": true},
+                {"name": "p.name", "kind": "string", "nullable": false},
+                {"name": "friend.name", "kind": "string", "nullable": false}
+            ],
+            "reads": [person, {"kind": "edge", "type_name": "Knows"}],
+            "writes": []
+        })
+    );
+    assert_eq!(
+        ap["operation"],
+        json!({
+            "result": [], "reads": [person], "writes": [person]
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

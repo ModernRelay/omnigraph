@@ -17,8 +17,11 @@ use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::QueryDecl;
+use omnigraph_compiler::query::descriptor::{
+    QueryOperationDescriptor, describe_checked_query_operation,
+};
 use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::query::typecheck::typecheck_query_decl;
+use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query_decl};
 use omnigraph_compiler::settings::STORED_QUERY_CARRIES_NO_SETTINGS;
 use omnigraph_compiler::types::{PropType, ScalarType};
 
@@ -34,6 +37,8 @@ pub struct StoredQuery {
     pub source: Arc<str>,
     /// Parsed declaration (params, mutations, description, …).
     pub decl: QueryDecl,
+    /// Derived from the serving schema at attachment, never from the request.
+    pub(crate) operation: Option<QueryOperationDescriptor>,
     /// Whether this query is listed in the MCP tool catalog (`GET /queries`).
     /// Default `true` (the manifest entry is the opt-in); `expose: false`
     /// keeps it HTTP/service-callable but hidden from the agent tool list.
@@ -134,6 +139,7 @@ impl QueryRegistry {
                                 name: spec.name,
                                 source: Arc::from(spec.source),
                                 decl,
+                                operation: None,
                                 expose: spec.expose,
                                 tool_name: spec.tool_name,
                             },
@@ -262,35 +268,71 @@ impl CheckReport {
 pub fn check(registry: &QueryRegistry, catalog: &Catalog) -> CheckReport {
     let mut report = CheckReport::default();
     for query in registry.iter() {
-        if let Err(err) = typecheck_query_decl(catalog, &query.decl) {
+        let _ = check_query(query, catalog, &mut report);
+    }
+    report
+}
+
+impl QueryRegistry {
+    pub(crate) fn check_and_describe(&mut self, catalog: &Catalog) -> CheckReport {
+        let mut report = CheckReport::default();
+        for query in self.by_name.values_mut() {
+            let Some(checked) = check_query(query, catalog, &mut report) else {
+                continue;
+            };
+            if query.expose {
+                query.operation = match describe_checked_query_operation(catalog, &checked) {
+                    Ok(operation) => Some(operation),
+                    Err(error) => {
+                        report.warnings.push(Warning {
+                            query: query.name.clone(),
+                            message: format!("catalog operation descriptor unavailable: {error}"),
+                        });
+                        None
+                    }
+                };
+            }
+        }
+        report
+    }
+}
+
+fn check_query(
+    query: &StoredQuery,
+    catalog: &Catalog,
+    report: &mut CheckReport,
+) -> Option<CheckedQuery> {
+    if query.expose {
+        for param in &query.decl.params {
+            // Resolve to the structured type via the compiler's own
+            // resolver rather than string-matching `Vector(` — one
+            // canonical definition of "is a vector", so this lint can't
+            // drift from how the parser/type system spells the type.
+            let is_vector = PropType::from_param_type_name(&param.type_name, param.nullable)
+                .is_some_and(|pt| matches!(pt.scalar, ScalarType::Vector(_)));
+            if is_vector {
+                report.warnings.push(Warning {
+                    query: query.name.clone(),
+                    message: format!(
+                        "MCP-exposed query declares a `{}` parameter `${}` that agents \
+                             cannot supply; use a `String` parameter for server-side embedding",
+                        param.type_name, param.name
+                    ),
+                });
+            }
+        }
+    }
+    match typecheck_query_decl(catalog, &query.decl) {
+        Ok(checked) => Some(checked),
+        Err(err) => {
             report.breakages.push(Breakage {
                 query: query.name.clone(),
                 message: err.to_string(),
                 diagnostic: err.diagnostic().cloned(),
             });
-        }
-        if query.expose {
-            for param in &query.decl.params {
-                // Resolve to the structured type via the compiler's own
-                // resolver rather than string-matching `Vector(` — one
-                // canonical definition of "is a vector", so this lint can't
-                // drift from how the parser/type system spells the type.
-                let is_vector = PropType::from_param_type_name(&param.type_name, param.nullable)
-                    .is_some_and(|pt| matches!(pt.scalar, ScalarType::Vector(_)));
-                if is_vector {
-                    report.warnings.push(Warning {
-                        query: query.name.clone(),
-                        message: format!(
-                            "MCP-exposed query declares a `{}` parameter `${}` that agents \
-                             cannot supply; use a `String` parameter for server-side embedding",
-                            param.type_name, param.name
-                        ),
-                    });
-                }
-            }
+            None
         }
     }
-    report
 }
 
 /// Format every breakage in a registry check report into a multi-line

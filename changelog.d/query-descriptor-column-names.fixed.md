@@ -1,0 +1,1 @@
+- `omnigraph lint --json` now reports executed row keys in `operation.result[].name`. For example, an unaliased `$p.name` now appears as `p.name` instead of `name`.

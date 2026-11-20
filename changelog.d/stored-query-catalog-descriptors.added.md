@@ -1,0 +1,1 @@
+- The stored-query catalog now reports ordered result fields and the node and edge types each query may read or write in an optional `operation` descriptor.

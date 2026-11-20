@@ -8,6 +8,9 @@ repository = "https://github.com/ModernRelay/omnigraph"
 homepage = "https://github.com/ModernRelay/omnigraph"
 documentation = "https://docs.rs/omnigraph-compiler"
 
+[features]
+openapi = ["dep:utoipa"]
+
 [dependencies]
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
@@ -21,6 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 ulid = { workspace = true }
+utoipa = { workspace = true, optional = true }
 
 [lints]
 workspace = true

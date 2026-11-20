@@ -179,10 +179,8 @@ pub(crate) enum CheckedBlockAggregate {
     },
 }
 
-/// A return item: its typed expression, its alias, and the two names the
-/// result carries (`projection_name` for the inferred schema and
-/// descriptors, `executed_column_name` for the executed batch), computed
-/// once from the source spelling.
+/// A return item retains its typed expression, alias, inferred schema name,
+/// and the executed column name shared by result batches and descriptors.
 #[derive(Debug, Clone)]
 pub(crate) struct CheckedReturn {
     pub(crate) expr: TypedExpr,

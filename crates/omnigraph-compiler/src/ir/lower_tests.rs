@@ -1707,14 +1707,14 @@ fn future_outer_column_does_not_capture_inner_binding_issue_659() {
 }
 
 #[test]
-fn return_declarations_share_types_and_preserve_descriptor_names() {
+fn return_declarations_share_types_and_descriptors_use_executed_columns() {
     use crate::query::descriptor::describe_query_operation;
     use crate::query::typecheck::infer_query_result_schema;
 
     let catalog = build_catalog(&parse_schema(
         "node Person { name: String @key age: I32? tags: [String]? payload: Blob? embedding: Vector(2)? }"
     ).unwrap()).unwrap();
-    for (source, columns, names, types) in [
+    for (source, columns, inferred_names, types) in [
         (
             "query q() { match { $p: Person } return { $p.name, $p.age, $p.@id, now(), $p, $p.tags, $p.embedding } }",
             vec![
@@ -1769,6 +1769,14 @@ fn return_declarations_share_types_and_preserve_descriptor_names() {
             types
         );
         let inferred = infer_query_result_schema(&catalog, &ctx).unwrap();
+        assert_eq!(
+            inferred
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            inferred_names
+        );
         for (projection, field) in ir.return_exprs.iter().zip(inferred.fields()) {
             let lowered =
                 crate::query::typecheck::projection_field(&catalog, field.name(), &projection.ty)
@@ -1782,7 +1790,7 @@ fn return_declarations_share_types_and_preserve_descriptor_names() {
                 .iter()
                 .map(|f| f.name.as_str())
                 .collect::<Vec<_>>(),
-            names
+            columns
         );
         assert_eq!(
             descriptor
