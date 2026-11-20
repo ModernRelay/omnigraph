@@ -77,6 +77,7 @@ jobs:
             law_canonical_forms::generated_reads_keep_one_plan_under_the_listed_rewrites_at_nightly_breadth
             law_engine_reference::engine_equals_reference_on_generated_reads_at_nightly_breadth
             law_engine_reference::engine_equals_reference_on_generated_placements_at_nightly_breadth
+            law_index_cost::generated_index_paths_are_cheaper_than_their_scans_at_nightly_breadth
             law_refusal_soundness::every_refusal_resting_on_a_claim_about_every_graph_holds_it_at_nightly_breadth
             law_scalar_evaluators::scalar_evaluators_agree_on_generated_expressions_at_nightly_breadth
             law_two_editions::edition_2_and_edition_3_answer_generated_reads_alike_at_nightly_breadth

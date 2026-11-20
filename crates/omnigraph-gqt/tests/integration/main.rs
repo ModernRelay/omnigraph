@@ -7,6 +7,7 @@ mod fix_coverage;
 mod fix_edition_2;
 mod law_canonical_forms;
 mod law_engine_reference;
+mod law_index_cost;
 mod law_refusal_soundness;
 mod law_scalar_evaluators;
 mod law_two_editions;
