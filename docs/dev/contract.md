@@ -53,15 +53,15 @@ source. [Position](#position) places the whole contract against the
 standard anomalies and models. The page says what a caller can observe,
 never how the engine does it.
 
-## How to read this page
+## Addresses and marks
 
 Every statement has an address, so a change can say which one it touches.
 
 | Thing | Address | Example |
 |---|---|---|
 | A rule for every operation | `E` and a number | `E2` |
-| A cell of the grid | `kind.column` | `write.sees` |
-| A cell of the pairs table | `kind+kind`, in table order | `read+forget` |
+| A cell of the table of rules per kind | `kind.column` | `write.sees` |
+| A cell of the concurrency table | `kind+kind`, in table order | `read+forget` |
 | A detail | `kind:` and a number | `merge:3` |
 | A gap | `G` and a number | `G2` |
 | An open decision | `D` and a number | `D1` |
@@ -77,7 +77,7 @@ A mark after a statement says how far to trust it.
 | `D1` | The target is not yet chosen. The statement describes what the code does; the decision row says what is open |
 | `?` | Nobody has stated it |
 
-## Words
+## Definitions
 
 - **Graph:** nodes and edges under one schema, at one storage root. Every
   promise on this page is about one graph.
@@ -101,7 +101,7 @@ A mark after a statement says how far to trust it.
 - **Physical state:** files, indexes, caches and layout. It is not part of
   the graph.
 
-## Kinds
+## Kinds of operation
 
 An operation's kind is what it is allowed to change. Operation names are
 those of the shared inventory in
@@ -125,7 +125,7 @@ Two operations are two steps:
 The steps are not all-or-nothing together. If a later step fails, the earlier
 one stays, and the answer says so (`effects: partial`) `D12`.
 
-## Every operation
+## Rules for every operation
 
 **E1. It sees one commit.** An operation reads the graph as of one commit,
 every type together, for its whole run. It never sees part of another
@@ -204,7 +204,7 @@ the coverage of indexes and the freshness of values derived by a pipeline
 are timeliness: they may lag and catch up. `read:2` is the one timeliness
 this page promises.
 
-## Each kind
+## Rules for each kind of operation
 
 | | sees | changes | refuses when | cost grows with |
 |---|---|---|---|---|
@@ -226,10 +226,10 @@ this page promises.
 - **Named head:** the caller says "only if the head is still commit X".
 
 Not allowed (`E6`) and over a limit (`E5`) apply to every kind and are not
-repeated in the grid. The cost column restates invariant 11 for each kind;
+repeated in the table. The cost column restates invariant 11 for each kind;
 the quantities behind it are in [the work](workload.md).
 
-## Two at once
+## Concurrent operations
 
 What happens when two operations run at the same time. A merge acts as a
 write on its target and reads its source at the start.
@@ -289,12 +289,12 @@ under snapshot isolation.
 | Integrity | Which rules always hold | Every declared constraint at every commit; no rule the schema does not declare | `E3` |
 | Durability | What an acknowledged write survives | What the store survives; on a local filesystem, a crash of the process only | `E4`, `G1` |
 | Availability | What is served when the store cannot be reached | Nothing: reads and writes are refused, never served stale or queued. Consistency is chosen over availability [K17, ch. 9] | `E5`, Scope |
-| Time | Which times a fact carries | The time it was committed. When it held true in the world is modeled by the schema | Words |
+| Time | Which times a fact carries | The time it was committed. When it held true in the world is modeled by the schema | Definitions |
 | Delivery of changes | How often a consumer sees a change | At least once, in commit order, with no gaps; exactly once is the consumer's, by storing the cursor with its effect | `read:5`, `read:7` |
-| Data model | What the state is | A property graph with a declared schema, checked on write | Words, `E3` |
+| Data model | What the state is | A property graph with a declared schema, checked on write | Definitions, `E3` |
 | Queries | How a read is stated | Declarative: a read says what it wants, never how to find it, so results do not depend on what has been built to speed it up | `E7` |
 
-## Details
+## Rules specific to one kind
 
 Statements that only one kind needs. Where a guide already owns the topic,
 the guide has the full rules and this page keeps the promise.
@@ -509,7 +509,7 @@ in its contract line.
 | A change feed that waits, with a condition | Agents and pipelines react to changes without polling, and wake only for what concerns them. A read names the commit it saw and a wait starts after it, so the two join without a gap | `read:5` |
 | Work in progress visible in the state | Agents avoid duplicate work only if they can see who is working on what | `branch` |
 | Search over the schema | Finding which type or property holds something is among an agent's most frequent reads | `read` |
-| Valid time and supersession | The work asks what was the case, not only what was recorded | Words |
+| Valid time and supersession | The work asks what was the case, not only what was recorded | Definitions |
 | Any number of reader and writer processes | Read load grows with agents, and writers work on many branches at once. Added readers keep the freshness check: a cached head would bring back lag and break `read:2` | `G2`, `D13` |
 | Service through maintenance and process replacement | The work is continuous, which includes old and new binaries serving one graph during a replacement | `D8`, Scope |
 | A check of stored state against its history | Errors in a shared graph compound, and storage that lies is outside the contract, so it should at least be detectable | Scope |
