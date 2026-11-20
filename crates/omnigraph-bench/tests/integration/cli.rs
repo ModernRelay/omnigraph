@@ -1091,12 +1091,19 @@ fn clone_route_at_two_refs_puts_records_the_report_reads_back() {
     );
     let groups = series["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 2, "{series}");
+    let harness = commit_of("HEAD");
     let mut order = Vec::new();
     for group in groups {
+        assert_eq!(
+            group["harness_commits"],
+            serde_json::json!([harness]),
+            "one instrument measured both refs: {group}"
+        );
         let rows = group["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "{series}");
         for row in rows {
             assert_eq!(row["sut"], "product-binary", "{row}");
+            assert_eq!(row["harness_commit"], harness.as_str(), "{row}");
             assert_eq!(row["status"], "complete", "{row}");
             assert_eq!(row["observed_repetitions"], 1, "{row}");
             order.push((
