@@ -86,20 +86,33 @@ Each operation obeys seven rules:
 7. It changes only what its kind of operation can change. Only `cleanup`
    removes history. An index does not change an answer (`E7`).
 
+Rules 2, 3 and 4, with the isolation that the list after this paragraph
+describes, are the ACID properties. Atomicity is rule 2. Consistency is
+rule 3, for the rules that the schema gives. Durability is rule 4. If the
+storage does not answer, Omnigraph refuses the request: it selects
+consistency before availability.
+
 The promise changes with the distance between two operations:
 
 - In one request, other operations have no effect on it. A request is the
   only transaction (a set of changes that is applied fully or not at all).
 - On one branch, the result is the same as if the requests occurred one at a
-  time. A read sees each change that the system acknowledged before the read
-  started. To connect two requests, the second request must name the commit
+  time, in their sequence in real time. The name of this property is strict
+  serializability. A read sees each change that the system acknowledged
+  before the read started. The name of this property is linearizability. To
+  connect two requests, the second request must name the commit
   that the first request read. If it does not, a value that you read and
-  then write can replace the change of a different writer.
+  then write can replace the change of a different writer. The name of this
+  problem is a lost update.
 - Between branches, nothing is shared until a merge. A merge compares the
   two branches one entity at a time. The merge refuses if the two branches
   changed the same entity differently. It also refuses if the result breaks
   the schema. It does not correct a conflict automatically. It examines what
-  each branch wrote, not what each branch read.
+  each branch wrote, not what each branch read. Thus the isolation between
+  branches is weaker than snapshot isolation.
+
+[Position](#position) compares the contract with each standard anomaly and
+model, and gives the source of each name.
 
 The sections that follow give the other rules for each kind of operation,
 the pairs of operations that refuse each other, and the conditions that the

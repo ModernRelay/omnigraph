@@ -79,9 +79,13 @@ These are the parts of the hypothesis:
 - Not optimized: Scans of warehouse size, and a high write rate on one
   branch. Writers use different branches.
 
+This work is not the same as OLTP (many short transactions), OLAP (large
+analytical queries), or HTAP (the two together on the same data). It has
+parts of each. [Against the usual categories](#against-the-usual-categories)
+gives the comparison.
+
 The sections that follow give each part as a table. They also derive what
-the shared state must do. Then they compare the hypothesis with the evidence
-and with the usual database categories.
+the shared state must do, and compare the hypothesis with the evidence.
 
 ## The hypothesis
 
