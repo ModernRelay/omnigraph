@@ -90,6 +90,28 @@ impl Ty {
         }
     }
 
+    /// The join of two types of one base (`Union`'s rule, and a branch's):
+    /// nullable when either is; an enum's members the union of both sides'
+    /// when both are enums, and no member set when either is a plain value,
+    /// so every value either side holds holds the join.
+    pub fn joined(&self, other: &Self) -> Self {
+        let mut out = self.with_nullable(self.nullable() || other.nullable());
+        if let (Self::Value(p), Self::Value(q)) = (&mut out, other)
+            && p.enum_values != q.enum_values
+        {
+            p.enum_values = match (p.enum_values.take(), &q.enum_values) {
+                (Some(mut members), Some(more)) => {
+                    members.extend(more.iter().cloned());
+                    members.sort();
+                    members.dedup();
+                    Some(members)
+                }
+                _ => None,
+            };
+        }
+        out
+    }
+
     /// The expression type of a value of this type: a reference's
     /// nullability is the column's, so the reference type carries none.
     pub fn expr_type(&self) -> ExprType {

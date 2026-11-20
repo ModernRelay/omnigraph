@@ -3205,3 +3205,51 @@ fn t90_refuses_a_triple_outside_the_optional_that_introduced_its_end() {
         ok(legal);
     }
 }
+
+/// A `union` column or a `case` whose sides are an enum and a plain String
+/// is a plain String, and two enums join to the union of their members: the
+/// join holds every value either side holds. The first side's members were
+/// kept, so the type claimed a domain the other side's values leave.
+#[test]
+fn a_join_of_an_enum_and_a_string_holds_both_sides_values() {
+    let catalog = build_catalog(
+        &parse_schema(
+            "node Ticket { slug: String @key  state: enum(open, closed)  note: String? }
+node Task { slug: String @key  phase: enum(draft, closed) }",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let column = |src: &str| {
+        let (_, outcome) = type_source(&catalog, src).unwrap().pop().unwrap();
+        let core = outcome.unwrap_or_else(|e| panic!("{e}\n{src}")).core;
+        read_of(&core).result.cols[0].ty.clone()
+    };
+    let string = |nullable| Ty::scalar(ScalarType::String, nullable);
+    let members = |names: &[&str]| {
+        Ty::Value(crate::types::PropType {
+            scalar: ScalarType::String,
+            nullable: false,
+            list: false,
+            enum_values: Some(names.iter().map(|n| n.to_string()).collect()),
+        })
+    };
+    assert_eq!(
+        column(
+            "query q() { match { from union({ match { $t: Ticket } return { $t.state as s } }, { match { $u: Ticket } return { $u.slug as s } }) } return { $s } }"
+        ),
+        string(false)
+    );
+    assert_eq!(
+        column(
+            "query q() { match { from union({ match { $t: Ticket } return { $t.state as s } }, { match { $k: Task } return { $k.phase as s } }) } return { $s } }"
+        ),
+        members(&["closed", "draft", "open"])
+    );
+    assert_eq!(
+        column(
+            "query q() { match { $t: Ticket } return { case when $t.note is null then $t.state else $t.note end as s } }"
+        ),
+        string(true)
+    );
+}

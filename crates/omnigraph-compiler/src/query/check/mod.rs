@@ -4179,7 +4179,7 @@ impl Ctx<'_> {
                 }
                 cols.push(Col {
                     name: a.name.clone(),
-                    ty: a.ty.with_nullable(a.ty.nullable() || b.ty.nullable()),
+                    ty: a.ty.joined(&b.ty),
                 });
             }
             let mut free = acc.free.clone();
@@ -8800,7 +8800,7 @@ fn common(a: &SExpr, b: &SExpr, what: &str) -> R<Ty> {
     let nullable = a_ty.nullable() || b_ty.nullable();
     match (&a_ty, &b_ty) {
         (Ty::Value(x), Ty::Value(y)) if x.scalar == y.scalar && x.list == y.list => {
-            Ok(a_ty.with_nullable(nullable))
+            Ok(a_ty.joined(&b_ty))
         }
         (Ty::Value(x), Ty::Value(y))
             if x.scalar.is_numeric() && y.scalar.is_numeric() && !x.list && !y.list =>
