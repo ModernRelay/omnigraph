@@ -55,6 +55,17 @@ CRATE_PACKAGE_MAP: dict[str, str] = {
     "tools/omnigraph-vocabulary-guard": "omnigraph-vocabulary-guard",
 }
 
+# Test suites and integration modules requiring the failpoints feature gate
+FAILPOINT_TEST_BINARIES: set[str] = {
+    "failpoints",
+    "system_column_upgrade",
+    "detached_commit_matrix",
+    "identity_recovery",
+}
+FAILPOINT_INTEGRATION_MODULES: set[str] = {
+    "legacy_columns",
+}
+
 
 def normalize_path(path_str: str, repo_root: Path) -> Path:
     """Normalize input path relative to repository root."""
@@ -95,6 +106,16 @@ def resolve_mapping(path_str: str, repo_root: Path | None = None) -> TestMapping
             category="gqt-logic-test",
             recommended_command=f"cargo test -p omnigraph-gqt --locked --test gq_logic_tests -- {case_name}",
             notes=f"Single GQT test case execution for {case_name}",
+        )
+
+    if posix_path.startswith("crates/omnigraph-gqt/cases_slow/") and posix_path.endswith(".gqt"):
+        return TestMapping(
+            file_path=posix_path,
+            package="omnigraph-gqt",
+            crate_dir="crates/omnigraph-gqt",
+            category="gqt-slow-test",
+            recommended_command=f"cargo run -p omnigraph-gqt --bin omnigraph-gqt -- {posix_path}",
+            notes="Slow GQT test case execution via omnigraph-gqt binary",
         )
 
     # 3. Skills directory
@@ -143,6 +164,7 @@ def resolve_mapping(path_str: str, repo_root: Path | None = None) -> TestMapping
     # Integration test module: tests/integration/<module>.rs
     if sub_path.startswith("tests/integration/") and sub_path.endswith(".rs"):
         module_name = Path(sub_path).stem
+        features_flag = " --features failpoints" if module_name in FAILPOINT_INTEGRATION_MODULES else ""
         if module_name == "main":
             return TestMapping(
                 file_path=posix_path,
@@ -157,21 +179,21 @@ def resolve_mapping(path_str: str, repo_root: Path | None = None) -> TestMapping
             package=package,
             crate_dir=matching_prefix,
             category="focused-integration-module",
-            recommended_command=f"cargo test -p {package} --test integration {module_name}::",
-            notes=f"Runs integration module '{module_name}'",
+            recommended_command=f"cargo test -p {package}{features_flag} --test integration {module_name}::",
+            notes=f"Runs integration module '{module_name}'" + (" (requires --features failpoints)" if features_flag else ""),
         )
 
     # Standalone integration test: tests/<binary>.rs
     if sub_path.startswith("tests/") and sub_path.endswith(".rs") and "/" not in sub_path[len("tests/") :]:
         binary_name = Path(sub_path).stem
-        if binary_name == "failpoints":
+        if binary_name in FAILPOINT_TEST_BINARIES:
             return TestMapping(
                 file_path=posix_path,
                 package=package,
                 crate_dir=matching_prefix,
                 category="standalone-integration-test",
-                recommended_command=f"cargo test -p {package} --features failpoints --test failpoints",
-                notes="Failpoint integration test requires --features failpoints",
+                recommended_command=f"cargo test -p {package} --features failpoints --test {binary_name}",
+                notes=f"Failpoint integration test '{binary_name}' requires --features failpoints",
             )
         return TestMapping(
             file_path=posix_path,
@@ -206,14 +228,23 @@ def resolve_mapping(path_str: str, repo_root: Path | None = None) -> TestMapping
                 notes="Traversal source file: fastest coverage via traversal_indexed:: module",
             )
 
-        if stem not in ("lib", "main", "mod"):
+        if stem.endswith("_tests"):
+            mod_filter = stem[:-6]
+        elif stem.endswith("_test"):
+            mod_filter = stem[:-5]
+        elif stem == "tests":
+            mod_filter = Path(sub_path).parent.name
+        else:
+            mod_filter = stem
+
+        if mod_filter not in ("lib", "main", "mod", ""):
             return TestMapping(
                 file_path=posix_path,
                 package=package,
                 crate_dir=matching_prefix,
                 category="unit-test",
-                recommended_command=f"cargo test -p {package} --lib {stem}::",
-                notes=f"Focused unit tests for module '{stem}'",
+                recommended_command=f"cargo test -p {package} --lib {mod_filter}::",
+                notes=f"Focused unit tests for module '{mod_filter}'",
             )
         return TestMapping(
             file_path=posix_path,
@@ -243,9 +274,15 @@ def self_test() -> None:
         ("crates/omnigraph/tests/integration/traversal_indexed.rs", "omnigraph-engine", "--test integration traversal_indexed::"),
         ("crates/omnigraph/tests/writes.rs", "omnigraph-engine", "--test writes"),
         ("crates/omnigraph/tests/failpoints.rs", "omnigraph-engine", "--features failpoints --test failpoints"),
+        ("crates/omnigraph/tests/system_column_upgrade.rs", "omnigraph-engine", "--features failpoints --test system_column_upgrade"),
+        ("crates/omnigraph/tests/detached_commit_matrix.rs", "omnigraph-engine", "--features failpoints --test detached_commit_matrix"),
+        ("crates/omnigraph-cluster/tests/identity_recovery.rs", "omnigraph-cluster", "--features failpoints --test identity_recovery"),
+        ("crates/omnigraph/tests/integration/legacy_columns.rs", "omnigraph-engine", "--features failpoints --test integration legacy_columns::"),
         ("crates/omnigraph/src/exec/staging.rs", "omnigraph-engine", "--test writes"),
         ("crates/omnigraph-compiler/src/lexer.rs", "omnigraph-compiler", "--lib lexer::"),
+        ("crates/omnigraph-compiler/src/query/parser_tests.rs", "omnigraph-compiler", "--lib parser::"),
         ("crates/omnigraph-gqt/cases/match_simple.gqt", "omnigraph-gqt", "gq_logic_tests -- match_simple"),
+        ("crates/omnigraph-gqt/cases_slow/v2/issue_782_multi_hop_limit_stops_early.gqt", "omnigraph-gqt", "cargo run -p omnigraph-gqt --bin omnigraph-gqt --"),
         ("crates/omnigraph-dst/src/harness.rs", "omnigraph-dst", "(cd crates/omnigraph-dst && cargo test --locked)"),
         ("docs/dev/invariants.md", "docs", "scripts/check-docs.py"),
         ("skills/omnigraph/SKILL.md", "omnigraph-skill", "cli_schema_config::"),
