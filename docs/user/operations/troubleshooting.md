@@ -108,12 +108,10 @@ mode writes the failure to stdout, or to stderr when part of the result, such as
 a streamed page, already reached stdout. Stdout then keeps the bytes already written, which can end inside an
 unfinished object, as for `diff`, `branch diff`, `commit changes` and
 `changes poll` with `--json` when they follow every page, and the failure
-document is on stderr. Human mode prints the `disposition` line on
-stderr. A target refusal on these commands exits 1 with `action: fix`; a
-target that holds no graph is one, refused as `not_found` with `effects: none`
-before the command writes anything. HTTP
-failures also retain `http_status` and, when present, the original
-`retry_after` string.
+document is on stderr. Human mode prints the `disposition` line on stderr. A
+target refusal on these commands, such as a target that holds no graph
+(`not_found`, `effects: none`), exits 1 with `action: fix`. HTTP failures also
+retain `http_status` and, when present, the original `retry_after` string.
 
 This includes `commit publish` and `commit drop`, as well as their `mutate`
 statement forms. If a response or result output is lost, inspect the commit's
