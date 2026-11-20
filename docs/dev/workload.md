@@ -361,14 +361,14 @@ On the work itself, read on 2026-11-16:
     "Concurrency Control in Groupware Systems", SIGMOD 1989.
 30. Chhikara et al., "Mem0", 2025: measured memory search latency.
 
-31. Kleppmann, "Designing Data-Intensive Applications", O'Reilly 2017,
-    read in full on 2026-11-20: describing load and tail latency (ch. 1),
-    schema-on-read (ch. 2), OLTP, OLAP and compaction (ch. 3), evolution
-    across program versions (ch. 4), conflict handling (ch. 5), isolation
-    anomalies, serial execution and durability (ch. 7), clocks, leases and
-    fencing (ch. 8), linearizability, ordering and consensus (ch. 9), change
-    capture and effectively-once delivery (ch. 11), the end-to-end argument,
-    timeliness against integrity and auditability (ch. 12).
+31. Kleppmann, "Designing Data-Intensive Applications", O'Reilly 2017:
+    describing load and tail latency (ch. 1), schema-on-read (ch. 2), OLTP,
+    OLAP and compaction (ch. 3), evolution across program versions (ch. 4),
+    conflict handling (ch. 5), isolation anomalies, serial execution and
+    durability (ch. 7), clocks, leases and fencing (ch. 8), linearizability,
+    ordering and consensus (ch. 9), change capture and effectively-once
+    delivery (ch. 11), the end-to-end argument, timeliness against integrity
+    and auditability (ch. 12).
 
 Not grounded in a source read here: the
 read-to-write ratio, the latency targets and the rate figures in the work,
