@@ -1,0 +1,57 @@
+# issue: 1459
+# red_on: 032179335bb2 (local debug run): step 1 (query) fails with `resource limit exceeded for query_memory_bytes: actual 33867236, limit 33554432`
+# traversal: indexed
+# notes: An indexed hop consumes its edge probe one batch at a time. With a BTREE on the
+# notes: endpoint columns, Lance answers each `key IN (...)` probe with one batch per
+# notes: contiguous row range; uniform random endpoints scatter the matches, so a probe
+# notes: held whole kept many decode buffers alive and the pool charged each by capacity.
+# notes: Main needs about 1.6 times this pool. With the same 1 MiB scan batches, main is
+# notes: refused at every pool from 32 to 51 MiB and answers from 52 MiB up. A refusal
+# notes: names only the first reservation over the limit, so `actual` is under 1% over at
+# notes: each of those pools and changes between runs. It does not show the margin. At
+# notes: 16 MiB the scan batches are smaller and main answers, so the 32 MiB setting is
+# notes: specific to this shape. Rust twin, which main fails even at 128 MiB:
+# notes: engine_v2_memory::hub_traversal_fits_one_pool_before_and_after_indexing_issue_1459.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key }
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 0
+tables:
+  - kind: node
+    name: Person
+    rows: 16384
+    commits: 4
+    columns:
+      name: {kind: key, prefix: p, width: 5}
+  - kind: edge
+    name: Knows
+    rows: 131072
+    commits: 32
+    from: {kind: endpoint, prefix: p, width: 5, population: 16384, distribution: {kind: uniform}}
+    to: {kind: endpoint, prefix: p, width: 5, population: 16384, distribution: {kind: uniform}}
+    columns: {}
+
+--- query
+set traversal_work_limit = 1000000000000;
+set query_memory_bytes = 33554432;
+query reach() {
+    match {
+        $t: Person { name: "p00000" }
+        $c knows{1,4} $t
+    }
+    return { count($c) as n }
+}
+
+--- expect unordered
+{"n":4788}
+
+--- expect shape
+n: I64

@@ -1,1 +1,1 @@
-- An MCP `tools/call`, even `health`, no longer aborts `omnigraph-server` with a stack overflow that took every graph down.
+- In 0.15.0 any MCP tool call, even `health`, crashed `omnigraph-server` with a stack overflow, taking every graph down, for any credential. Each tool call now runs in its own heap allocation.

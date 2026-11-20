@@ -291,11 +291,9 @@ pub struct IoCounts {
     /// rows paired by stable row id, or the exact ordered merge.
     pub change_intervals_row_identity: u64,
     pub change_intervals_exact_merge: u64,
-    /// Incremental vs full merge-authority projection refreshes and the exact
-    /// number of physical manifest rows hydrated to classify DV additions.
+    /// Incremental vs full merge-authority projection refreshes.
     pub projection_incremental_refreshes: u64,
     pub projection_full_refreshes: u64,
-    pub projection_identity_rows: u64,
 }
 
 impl IoCounts {
@@ -591,7 +589,6 @@ struct OpProbes {
     change_intervals_exact_merge: Arc<AtomicU64>,
     projection_incremental_refreshes: Arc<AtomicU64>,
     projection_full_refreshes: Arc<AtomicU64>,
-    projection_identity_rows: Arc<AtomicU64>,
 }
 
 impl OpProbes {
@@ -622,7 +619,6 @@ impl OpProbes {
             change_intervals_exact_merge: Arc::new(AtomicU64::new(0)),
             projection_incremental_refreshes: Arc::new(AtomicU64::new(0)),
             projection_full_refreshes: Arc::new(AtomicU64::new(0)),
-            projection_identity_rows: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
@@ -642,7 +638,6 @@ impl OpProbes {
             change_intervals_exact_merge: Arc::clone(&h.change_intervals_exact_merge),
             projection_incremental_refreshes: Arc::clone(&h.projection_incremental_refreshes),
             projection_full_refreshes: Arc::clone(&h.projection_full_refreshes),
-            projection_identity_rows: Arc::clone(&h.projection_identity_rows),
             // graph_build_count / graph_edges_built unused by this harness.
             ..Default::default()
         };
@@ -697,7 +692,6 @@ impl OpProbes {
                 .projection_incremental_refreshes
                 .load(Ordering::Relaxed),
             projection_full_refreshes: self.projection_full_refreshes.load(Ordering::Relaxed),
-            projection_identity_rows: self.projection_identity_rows.load(Ordering::Relaxed),
         }
     }
 }
