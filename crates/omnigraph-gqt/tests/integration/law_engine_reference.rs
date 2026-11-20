@@ -12,7 +12,8 @@
 //! `coalesce`, `and`, `or`, arithmetic with nulls over `I32`, `I64`, `F32`
 //! and `F64`, comparisons over every scalar, `in` over list literals,
 //! list and enum properties, parameters (nullable, omitted), `return`,
-//! `return distinct`, groups with every aggregate and `count(distinct …)`,
+//! `return distinct`, groups with every aggregate, `count(distinct …)`,
+//! `collect` and `collect(distinct …)`, `collect` blocks as a return item,
 //! the registry's scalar rows (`lower`, `upper`, `trim`, `ltrim`, `rtrim`,
 //! `length`, `left`, `right`, `substring`, `abs`, `floor`, `ceil`, `round`
 //! with and without `digits:`, `sqrt`, `power`, `exp`, `ln`, `log10`,
@@ -33,8 +34,11 @@
 //!
 //! The metamorphic layer reruns each read rewritten to an equal one: a
 //! tautology conjoined to its `where`, its top-level conjuncts reversed
-//! when none can fail, and an `rrf`'s arms swapped with their weights (the
-//! fusion is invariant under permuting its arms).
+//! when none can fail, the read respelled with the admitted non-canonical
+//! spellings (`case`, `||`, `<>`, single quotes and another letter case,
+//! by `arbitrary::respell_spellings` from the parse tree), and an `rrf`'s
+//! arms swapped with their weights (the fusion is invariant under
+//! permuting its arms).
 //!
 //! A failure prints the shrunk read, the schema, the graph and both
 //! answers. Seeds are deterministic; a failing case's seed is written to
@@ -49,7 +53,8 @@ use omnigraph::loader::LoadMode;
 use omnigraph::settings::{SessionSettings, Traversal};
 use omnigraph_compiler::ParamMap;
 use omnigraph_compiler::arbitrary::{
-    Choices, GenGraph, GenRead, GenSchema, ReadOptions, SchemaOptions, choices,
+    Choices, GenGraph, GenRead, GenSchema, ReadOptions, SchemaOptions, Spelling, choices,
+    respell_spellings,
 };
 use proptest::test_runner::{
     Config, FileFailurePersistence, RngAlgorithm, TestCaseError, TestRng, TestRunner,
@@ -165,7 +170,8 @@ async fn judge(
     .await
     .map_err(|e| format!("{label}: {e}\n{}", sample.describe()))?;
     let rows = judgment.engine.starts_with("[{");
-    if judgment.verdict.is_err() && refused_in_two_ways(source, &judgment) {
+    // A respelled read may write a registry name in another letter case.
+    if judgment.verdict.is_err() && refused_in_two_ways(&source.to_lowercase(), &judgment) {
         MIXED_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(false);
     }
@@ -303,6 +309,14 @@ fn rrf_arms_swapped(source: &str) -> Option<String> {
     ))
 }
 
+/// The respelling stream's seed: the read's text, hashed, so a case replays
+/// the same respelling.
+fn spelling_seed(source: &str) -> u64 {
+    source.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
 /// Whether a conjunct may hold a term that can fail: arithmetic, an
 /// aggregate that can overflow, or a registry row that can fail
 /// (`ScalarFunc::row_can_fail`).
@@ -385,6 +399,8 @@ fn balanced(s: &str) -> bool {
 /// over empty answers alone.
 static NONEMPTY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Samples whose read the respelling step rewrote.
+static RESPELLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 async fn check(sample: &Sample) -> Result<(), String> {
     TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -419,6 +435,14 @@ async fn check(sample: &Sample) -> Result<(), String> {
     if let Some(reversed) = rewritten(source, "", true) {
         judge(&session, sample, &reversed, "conjuncts reversed").await?;
     }
+    // The admitted spellings (`case`, `||`, `<>`, single quotes, another
+    // letter case) parse to their canonical forms' trees, so the respelled
+    // read answers as the reference does for the canonical one.
+    let (respelled, written) = respell_spellings(source, spelling_seed(source), &Spelling::ALL);
+    if !written.is_empty() {
+        RESPELLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        judge(&session, sample, &respelled, "respelled").await?;
+    }
     // `rrf` is invariant under permuting its arms with their weights.
     if let Some(permuted) = rrf_arms_swapped(source) {
         judge(&session, sample, &permuted, "rrf arms swapped").await?;
@@ -444,8 +468,10 @@ fn run_law(cases: u32) {
     }
     let nonempty = NONEMPTY.load(std::sync::atomic::Ordering::Relaxed);
     let total = TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+    let respelled = RESPELLED.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!(
-        "{nonempty} of {total} generated reads returned a row; {} judgments refused in two ways",
+        "{nonempty} of {total} generated reads returned a row, {respelled} were respelled; {} \
+         judgments refused in two ways",
         MIXED_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
     );
     assert!(

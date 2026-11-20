@@ -3036,8 +3036,9 @@ mod tests {
         assert!(missing.is_empty(), "no generated read draws {missing:?}");
     }
 
-    /// The registry rows and order placements the generator must reach.
-    const DRAWN: [&str; 26] = [
+    /// The registry rows, `collect` and order placements the generator must
+    /// reach.
+    const DRAWN: [&str; 28] = [
         "lower(",
         "upper(",
         "trim(",
@@ -3061,6 +3062,8 @@ mod tests {
         "cast(",
         "stddev(",
         "percentile(",
+        "collect(",
+        "collect(distinct ",
         " nulls first",
         " nulls last",
         "\u{a0}",
