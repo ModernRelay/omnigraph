@@ -1302,6 +1302,7 @@ val: I64
             server_receipt_sha256: Some(input.receipt.digest().unwrap()),
             client_peak_rss_bytes: None,
             base_manifest_sha256: None,
+            concurrent: None,
         }
     }
 
@@ -1708,6 +1709,7 @@ exit 0
             server_receipt_sha256: Some(server_receipt_sha256),
             client_peak_rss_bytes: None,
             base_manifest_sha256: None,
+            concurrent: None,
         }
     }
 

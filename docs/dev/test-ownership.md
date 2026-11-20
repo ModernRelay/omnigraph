@@ -891,7 +891,11 @@ production core used by GQT correctness tests. It selects one engine operation
 by ordinal and exact header/body echo, then closes its clock and logical
 counters before expectations and subsequent explicit verification. Reads,
 mutations, branch controls, single-call generated loads, and engine restart
-use the same adapter. Bench wall-clock still requires a qualified release
+use the same adapter. A workload's `--- concurrent measured` block is the one
+selected step that is not a single operation: the adapter loops its workers
+for the declared warmup and duration, and the sample carries the block's
+observation ([measured blocks](../../crates/omnigraph-bench/README.md#measured-blocks)).
+Bench wall-clock still requires a qualified release
 binary; GQT correctness and DST execution do not acquire benchmark timings.
 
 Every embedded repetition uses a fresh SHA-attested process and restores the dataset
@@ -922,7 +926,15 @@ into a passing sample.
 `gqt_tests.rs` owns public pair/directory discovery, selection, engine receipts,
 index preparation, and mixed archive/projection coverage. `gqt_served_tests.rs`
 owns served admission, client/server evidence separation, protocol containment
-and measured HTTP callback ordering. `dataset_identity`,
+and measured HTTP callback ordering. `gqt_concurrent_tests.rs` owns the
+measured block: one point per swept value, the looped block's observation
+with and without a warmup, the concurrent record, the run settings, the
+readback of two labels by their own key columns, the block's failure routes
+(a failed statement, a dealt stream that runs out, an acknowledged row
+missing at the readback), a free-running block beside the measured one, and
+the one-point routes' refusal of a sweep; `concurrent_host` owns the driver's
+counting, service-time buckets and percentile arithmetic, and `projection` the
+claim eligibility of a concurrent record. `dataset_identity`,
 `dataset_cache`, and `dataset_worker` own logical history, cache integrity,
 and contained building; `gqt_runner`, `gqt_supervisor`, and `gqt_protocol` own
 operation boundaries and worker admission. `registered_fixture`, `reset`, and

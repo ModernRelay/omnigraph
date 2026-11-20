@@ -1298,10 +1298,33 @@ cycling its own orders through the passes); the DST runner runs every session on
 the same time, the seed deciding
 the interleaving, so the block is the interleaving search a scripted block
 never is, recorded in the same `concurrent_block` evidence row; a measuring
-host (`omnigraph-bench`, a later amendment) runs every session's statement
-repeatedly for its protocol's duration on a real clock. The file says who
-does what; the host says how many times and on which clock. A scripted
-block runs under the DST runner only, as before.
+host (`omnigraph-bench`) runs every session's statement repeatedly for a
+declared duration on a real clock. The file says who does what; the host
+says how many times and on which clock. A scripted block runs under the DST
+runner only, as before.
+
+**Measured block.** `--- concurrent measured` is the free-running block a
+measuring host times, and a `--- bench` section directly after `--- runner`
+says how: `duration_seconds` (1 to 3600), optionally `warmup_seconds` (0 to
+3600), `repetitions`, and `sweep: { <NAME>: [<n>, ...] }`, one upper-case
+name with 1 to 16 rising values up to 4096. The two require each other, a
+case holds one measured block, and a `rate:` key is refused: it belongs to
+an open-loop driver no host runs yet. `${<NAME>}` anywhere in the file
+outside the section reads as one value of the sweep, replaced before
+anything is parsed, so `writer x${W}` is a worker count: a measuring host
+runs the case once per value, and a host with a scripted clock runs the
+block once, as any free-running block, at the first value. Under
+`omnigraph-bench` every worker loops its statement on a task of its own,
+over a clone of the case session, through the warmup and then the duration;
+a statement belongs to the measured window when it started inside it, a
+failed statement stops every worker and fails the run, and a dealt session
+takes the next row of its recipe on every run. After the workers stop, a
+fresh handle reads every acknowledged dealt key in one scan of its table
+and compares a bounded sample of the rows column by column. The driver is
+closed-loop, each worker issuing its next statement when the last one is
+acknowledged, so its service times carry coordinated omission: every
+observation states `driver: closed-loop` and `claim_grade: false`, and
+no number of it is a throughput or latency claim.
 
 The paused clock is a scripted block's one subtlety: the runtime advances it to
 the earliest pending timer whenever it is idle, and never while a task of
@@ -1342,11 +1365,13 @@ by seed, the DST fleet's job, which the first form of this section refused
 scripted block is spelled `--- concurrent scripted`, `x<n>`, `${worker}`,
 the dealt stream and its readback, `branch merge` as a session, the
 authority conflict count as a measurement, the plain host's pass per
-session order).
+session order; a second amendment the same day: `--- concurrent measured`
+and the `--- bench` section).
 Store requests
 are the only points a v1 entry can name; engine seams and in-process gates
-as entries, the other control statements as sessions, a measured block and
-its run settings, and sessions on separate handles are later amendments.
+as entries, the other control statements as sessions, an open-loop driver
+with a `rate:` per label, a scripted block on a real clock, and sessions on
+separate handles are later amendments.
 
 ### Sequential server lifecycle steps
 

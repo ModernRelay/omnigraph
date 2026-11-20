@@ -137,6 +137,12 @@ struct RunArgs {
     queries: Option<PathBuf>,
     #[arg(long)]
     repetitions: Option<u32>,
+    /// Warmup of a scenario's `--- concurrent measured` block, in place of its workload's `--- bench` value; the record carries the value used.
+    #[arg(long, value_name = "SECONDS")]
+    warmup_seconds: Option<u32>,
+    /// Measured window of a scenario's `--- concurrent measured` block, in place of its workload's `--- bench` value; the record carries the value used.
+    #[arg(long, value_name = "SECONDS")]
+    duration_seconds: Option<u32>,
     #[arg(long, default_value = "target/gqt-datasets")]
     dataset_cache: PathBuf,
     #[arg(long)]
@@ -687,6 +693,8 @@ async fn main() -> ExitCode {
                 dataset,
                 queries,
                 repetitions,
+                warmup_seconds,
+                duration_seconds,
                 dataset_cache,
                 no_build,
                 fixtures,
@@ -744,6 +752,16 @@ async fn main() -> ExitCode {
             } else {
                 false
             };
+            if legacy && (warmup_seconds.is_some() || duration_seconds.is_some()) {
+                return bench_cli::failure(
+                    vec![Diagnostic::error(
+                        "invalid_run_input",
+                        "$",
+                        "--warmup-seconds and --duration-seconds set the run of a catalog scenario's `--- concurrent measured` block; a legacy case has none",
+                    )],
+                    json,
+                );
+            }
             if !legacy {
                 if dataset.is_some() || queries.is_some() {
                     return bench_cli::failure(
@@ -790,11 +808,13 @@ async fn main() -> ExitCode {
                     (None, Some(environment)) => environment,
                     (None, None) => omnigraph_bench::catalog::local_environment(),
                 };
-                let suite =
-                    match catalog.resolve_with(selector, repetitions, &environment, run_reset) {
-                        Ok(s) => s,
-                        Err(e) => return bench_cli::failure(e, json),
-                    };
+                let suite = match catalog
+                    .resolve_with(selector, repetitions, &environment, run_reset)
+                    .and_then(|suite| with_block_runs(suite, warmup_seconds, duration_seconds))
+                {
+                    Ok(s) => s,
+                    Err(e) => return bench_cli::failure(e, json),
+                };
                 if !at.is_empty() {
                     let store = store.expect("--at requires --store");
                     return run_at(
@@ -2018,7 +2038,7 @@ async fn execute_resolved_suite(
             }
         } else {
             if let Some((store, session)) = &store {
-                let record = match omnigraph_bench::gqt_record::build(
+                let record = match omnigraph_bench::gqt_record::build_any(
                     &execution,
                     invocation_in_session(*session),
                     None,
@@ -2068,6 +2088,28 @@ async fn execute_resolved_suite(
             records: store_receipts,
         }),
     })
+}
+
+/// The suite with the run of every measured block replaced by the command
+/// line's warmup and duration; a scenario that measures no block refuses them.
+fn with_block_runs(
+    mut suite: omnigraph_bench::suite::ResolvedSuite,
+    warmup_seconds: Option<u32>,
+    duration_seconds: Option<u32>,
+) -> Result<omnigraph_bench::suite::ResolvedSuite, Vec<Diagnostic>> {
+    if warmup_seconds.is_none() && duration_seconds.is_none() {
+        return Ok(suite);
+    }
+    for run in &mut suite.runs {
+        let id = run.case.id().to_owned();
+        let refused = |message: String| vec![Diagnostic::error("invalid_run_input", &id, message)];
+        let plan = run.case.gqt().map_err(|e| refused(e.to_string()))?.clone();
+        run.case = ValidatedCase::Gqt(
+            plan.with_block_run(warmup_seconds, duration_seconds)
+                .map_err(refused)?,
+        );
+    }
+    Ok(suite)
 }
 
 /// One invocation identity inside a session: never below the session's
@@ -2510,6 +2552,10 @@ struct ReportRow {
     sut: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     commit: Option<String>,
+    /// The harness build that drove and timed the row: its instrument, apart
+    /// from `commit`, the product it measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    harness_commit: Option<String>,
     version: String,
     status: String,
     requested_repetitions: u32,
@@ -2520,6 +2566,77 @@ struct ReportRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     p95_us: Option<u64>,
     record: String,
+    /// The labels of a concurrent record, whose `*_us` columns above time
+    /// the whole block and say nothing of a statement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block: Option<ReportBlock>,
+}
+
+/// A concurrent record's run and, per label, the value each repetition
+/// recorded, in repetition order; nothing is summarized across repetitions.
+#[derive(Debug, Serialize)]
+struct ReportBlock {
+    driver: omnigraph_bench::concurrent_host::Driver,
+    claim_grade: bool,
+    warmup_seconds: u32,
+    measured_seconds: u32,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    sweep: std::collections::BTreeMap<String, u64>,
+    labels: Vec<ReportLabel>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportLabel {
+    label: String,
+    workers: u32,
+    acked_per_second_millis: Vec<u64>,
+    service_time_p50_us: Vec<u64>,
+    service_time_p99_us: Vec<u64>,
+    authority_conflicts: Vec<u64>,
+}
+
+/// One row per label, each column holding what every repetition recorded.
+fn report_labels<'a>(
+    observed: impl Iterator<Item = &'a omnigraph_bench::concurrent_host::ConcurrentObservation>,
+) -> Vec<ReportLabel> {
+    let mut labels: Vec<ReportLabel> = Vec::new();
+    for observation in observed {
+        for (index, label) in observation.labels.iter().enumerate() {
+            if labels.len() == index {
+                labels.push(ReportLabel {
+                    label: label.label.clone(),
+                    workers: label.workers,
+                    acked_per_second_millis: Vec::new(),
+                    service_time_p50_us: Vec::new(),
+                    service_time_p99_us: Vec::new(),
+                    authority_conflicts: Vec::new(),
+                });
+            }
+            let row = &mut labels[index];
+            row.acked_per_second_millis
+                .push(label.acked_per_second_millis);
+            row.service_time_p50_us.push(label.service_time_us.p50);
+            row.service_time_p99_us.push(label.service_time_us.p99);
+            row.authority_conflicts.push(label.authority_conflicts);
+        }
+    }
+    labels
+}
+
+fn report_block(record: &omnigraph_bench::gqt_record::ConcurrentRunRecordV1) -> ReportBlock {
+    let samples = &record.record.measurements.raw_samples;
+    ReportBlock {
+        driver: record.driver,
+        claim_grade: record.claim_grade,
+        warmup_seconds: record.warmup_seconds,
+        measured_seconds: record.measured_seconds,
+        sweep: record.sweep.clone(),
+        labels: report_labels(
+            samples
+                .iter()
+                .filter_map(|sample| sample.concurrent.as_ref()),
+        ),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2528,6 +2645,9 @@ struct ReportGroup {
     point_id: String,
     point_name: String,
     machine: String,
+    /// The distinct harness commits of the rows, in order of first appearance;
+    /// more than one means the group was measured by two instruments.
+    harness_commits: Vec<String>,
     rows: Vec<ReportRow>,
 }
 
@@ -2597,13 +2717,19 @@ async fn run_report(
                     );
                 }
             };
-        let omnigraph_bench::gqt_record::AnyRunRecordV1::Gqt(record) = record else {
-            continue;
+        use omnigraph_bench::gqt_record::AnyRunRecordV1;
+        let (record, block) = match &record {
+            AnyRunRecordV1::Gqt(record) => (&**record, None),
+            AnyRunRecordV1::Concurrent(block) => (&block.record, Some(report_block(block))),
+            AnyRunRecordV1::Legacy(_) => continue,
         };
         if !scenarios.contains(&record.run.case_id) {
             continue;
         }
-        rows.push(report_row(&record, uri));
+        rows.push(ReportRow {
+            block,
+            ..report_row(record, uri)
+        });
     }
     rows.sort_by(|a, b| {
         (&a.case_id, &a.point_id, &a.machine, a.invoked_at_unix_ms).cmp(&(
@@ -2621,6 +2747,11 @@ async fn run_report(
                     && group.point_id == row.point_id
                     && group.machine == row.machine =>
             {
+                if let Some(harness) = &row.harness_commit
+                    && !group.harness_commits.contains(harness)
+                {
+                    group.harness_commits.push(harness.clone());
+                }
                 group.rows.push(row)
             }
             _ => groups.push(ReportGroup {
@@ -2628,6 +2759,7 @@ async fn run_report(
                 point_id: row.point_id.clone(),
                 point_name: row.point_name.clone(),
                 machine: row.machine.clone(),
+                harness_commits: row.harness_commit.iter().cloned().collect(),
                 rows: vec![row],
             }),
         }
@@ -2642,16 +2774,27 @@ async fn run_report(
         return print_json_success(&output);
     }
     for group in &output.groups {
+        let harness = match group.harness_commits.as_slice() {
+            [] => "-".to_string(),
+            [one] => one[..one.len().min(12)].to_string(),
+            several => format!("mixed({})", several.len()),
+        };
         println!(
-            "## {} point={} machine={}",
-            group.case_id, group.point_name, group.machine
+            "## {} point={} machine={} harness={}",
+            group.case_id, group.point_name, group.machine, harness
         );
-        println!("invoked_at_unix_ms\tcommit\tsut\tversion\tn\tmin_us\tp50_us\tmax_us\tstatus");
+        println!(
+            "invoked_at_unix_ms\tcommit\tharness\tsut\tversion\tn\tmin_us\tp50_us\tmax_us\tstatus"
+        );
         for row in &group.rows {
             println!(
-                "{}\t{}\t{}\t{}\t{}/{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}/{}\t{}\t{}\t{}\t{}",
                 row.invoked_at_unix_ms,
                 row.commit
+                    .as_deref()
+                    .map(|c| &c[..c.len().min(12)])
+                    .unwrap_or("-"),
+                row.harness_commit
                     .as_deref()
                     .map(|c| &c[..c.len().min(12)])
                     .unwrap_or("-"),
@@ -2664,6 +2807,24 @@ async fn run_report(
                 row.max_us,
                 row.status
             );
+            let Some(block) = &row.block else {
+                continue;
+            };
+            println!(
+                "  block\tclosed-loop\tclaim_grade={}\twarmup_seconds={}\tmeasured_seconds={}\tsweep={:?}",
+                block.claim_grade, block.warmup_seconds, block.measured_seconds, block.sweep
+            );
+            for label in &block.labels {
+                println!(
+                    "  {} x{}\tacked_per_second_millis={:?}\tservice_time_p50_us={:?}\tservice_time_p99_us={:?}\tauthority_conflicts={:?}",
+                    label.label,
+                    label.workers,
+                    label.acked_per_second_millis,
+                    label.service_time_p50_us,
+                    label.service_time_p99_us,
+                    label.authority_conflicts
+                );
+            }
         }
     }
     if output.groups.is_empty() {
@@ -2677,9 +2838,10 @@ async fn run_report(
 
 fn report_row(record: &omnigraph_bench::gqt_record::GqtRunRecordV1, uri: String) -> ReportRow {
     use omnigraph_bench::gqt_record::GqtSutIdentityV1;
-    let (sut, commit, version, declared_machine) = match &record.sut {
+    let (sut, commit, harness_commit, version, declared_machine) = match &record.sut {
         GqtSutIdentityV1::Embedded(sut) => (
             "embedded",
+            Some(sut.source_commit.clone()),
             Some(sut.source_commit.clone()),
             sut.package_version.clone(),
             None,
@@ -2687,6 +2849,7 @@ fn report_row(record: &omnigraph_bench::gqt_record::GqtRunRecordV1, uri: String)
         GqtSutIdentityV1::Served(sut) => (
             "declared-deployment",
             Some(sut.receipt.server.source_commit.clone()),
+            Some(sut.client_build.source_commit.clone()),
             sut.receipt.server.package_version.clone(),
             sut.receipt
                 .machine
@@ -2698,6 +2861,7 @@ fn report_row(record: &omnigraph_bench::gqt_record::GqtRunRecordV1, uri: String)
             sut.source_commit
                 .clone()
                 .or_else(|| sut.requested_commit.clone()),
+            Some(sut.harness.source_commit.clone()),
             sut.package_version.clone(),
             None,
         ),
@@ -2717,6 +2881,7 @@ fn report_row(record: &omnigraph_bench::gqt_record::GqtRunRecordV1, uri: String)
         invoked_at_unix_ms: record.invocation.invoked_at_unix_ms,
         sut,
         commit,
+        harness_commit,
         version,
         status: serde_json::to_value(record.acquisition.status)
             .ok()
@@ -2729,6 +2894,7 @@ fn report_row(record: &omnigraph_bench::gqt_record::GqtRunRecordV1, uri: String)
         max_us: wall.max_us,
         p95_us: wall.p95_us,
         record: uri,
+        block: None,
     }
 }
 
@@ -2972,7 +3138,7 @@ impl RecordingContext {
         invocation: InvocationIdentityV1,
     ) -> Result<ArchiveReceiptV1, RecordingError> {
         self.validate_worker_source(execution)?;
-        let record = omnigraph_bench::gqt_record::build(execution, invocation, None)
+        let record = omnigraph_bench::gqt_record::build_any(execution, invocation, None)
             .map_err(RecordingError::from_record)?;
         publish_record(&self.archive_root, &record).map_err(RecordingError::from_archive)
     }
@@ -2984,7 +3150,7 @@ impl RecordingContext {
         terminal: AcquisitionTerminalV1,
     ) -> Result<ArchiveReceiptV1, RecordingError> {
         self.validate_worker_source(execution)?;
-        let record = omnigraph_bench::gqt_record::build(execution, invocation, Some(terminal))
+        let record = omnigraph_bench::gqt_record::build_any(execution, invocation, Some(terminal))
             .map_err(RecordingError::from_record)?;
         publish_record(&self.archive_root, &record).map_err(RecordingError::from_archive)
     }
@@ -3270,6 +3436,64 @@ mod tests {
         let error = RecordingContext::new(archive.clone()).unwrap_err();
         assert_eq!(error.code, "release_build_required");
         assert!(!archive.exists());
+    }
+
+    #[test]
+    fn a_block_report_keeps_every_repetition_of_a_label_in_order() {
+        use omnigraph_bench::concurrent_host::{
+            ConcurrentObservation, Driver, LabelKind, LabelObservation, PerWorker,
+            ReadbackObservation, ServiceTime,
+        };
+        let repetition = |writer: u64, reader: u64| ConcurrentObservation {
+            driver: Driver::ClosedLoop,
+            claim_grade: false,
+            warmup_seconds: 0,
+            measured_seconds: 1,
+            sweep: Default::default(),
+            window_us: 1_000_000,
+            drain_us: 0,
+            tokio_unstable: false,
+            readback: ReadbackObservation {
+                rows: writer,
+                compared: 1,
+            },
+            labels: [
+                ("writer", LabelKind::Load, writer),
+                ("reader", LabelKind::Query, reader),
+            ]
+            .into_iter()
+            .map(|(label, kind, acked)| LabelObservation {
+                label: label.into(),
+                kind,
+                workers: 2,
+                acked,
+                warmup_acked: 0,
+                acked_in_drain: 0,
+                acked_per_second_millis: acked * 1000,
+                per_worker: PerWorker {
+                    min: acked / 2,
+                    max: acked - acked / 2,
+                },
+                service_time_us: ServiceTime {
+                    p50: acked,
+                    p99: acked + 1,
+                    max: acked + 2,
+                },
+                authority_conflicts: acked % 3,
+                acked_by_second: vec![acked],
+            })
+            .collect(),
+        };
+        let observed = [repetition(10, 400), repetition(14, 380)];
+        let rows = report_labels(observed.iter());
+        assert_eq!(rows.len(), 2, "one row per label, not per repetition");
+        assert_eq!((rows[0].label.as_str(), rows[0].workers), ("writer", 2));
+        assert_eq!(rows[0].acked_per_second_millis, [10_000, 14_000]);
+        assert_eq!(rows[0].service_time_p50_us, [10, 14]);
+        assert_eq!(rows[0].service_time_p99_us, [11, 15]);
+        assert_eq!(rows[0].authority_conflicts, [1, 2]);
+        assert_eq!(rows[1].label, "reader");
+        assert_eq!(rows[1].acked_per_second_millis, [400_000, 380_000]);
     }
 
     #[test]

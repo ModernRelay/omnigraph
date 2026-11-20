@@ -632,7 +632,7 @@ fn clone_is_a_reset_level_of_its_own_on_local_and_s3_stores() {
 fn an_s3_environment_derives_the_clone_reset() {
     let catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
     assert_eq!(catalog.definition.defaults.protocol.reset, None);
-    assert_eq!(catalog.definition.scenarios.len(), 79);
+    assert_eq!(catalog.definition.scenarios.len(), 80);
     let plan = catalog
         .plan_in("tiny-read", &GqtEnvironment::embedded(s3_backend()))
         .unwrap();
@@ -1076,11 +1076,18 @@ fn request_budget_and_projection_budget_are_admitted_before_io() {
 }
 
 pub(crate) async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
+    let record = authority_record(plan("tiny-read")).await;
+    crate::gqt_record::validate(&record).unwrap();
+    record
+}
+
+/// One repetition of `plan` on a fresh dataset under the legacy fixture's
+/// machine, build and backend evidence, as the record a run would publish.
+async fn authority_record(plan: PlannedGqt) -> crate::gqt_record::GqtRunRecordV1 {
     use crate::gqt_record::{GqtMeasurementsV1, GqtRunIdentityV1, GqtRunRecordV1};
     use crate::record::{
         AcquisitionStatusV1, AcquisitionV1, EvidenceStrengthV1, WallClockSummaryV1,
     };
-    let plan = plan("tiny-read");
     let directory = tempfile::tempdir().unwrap();
     let active = directory.path().join("active");
     let scratch = directory.path().join("scratch");
@@ -1118,7 +1125,7 @@ pub(crate) async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
     let mut invocation = legacy.invocation;
     invocation.invocation_id.replace_range(25..26, "C");
     let elapsed = sample.elapsed_us;
-    let record = GqtRunRecordV1 {
+    GqtRunRecordV1 {
         format_version: 1,
         invocation,
         run: GqtRunIdentityV1 {
@@ -1167,9 +1174,7 @@ pub(crate) async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
             layer_presence: legacy.measurements.layer_presence,
             claim_policy: legacy.measurements.claim_policy,
         },
-    };
-    crate::gqt_record::validate(&record).unwrap();
-    record
+    }
 }
 fn rehash_record(record: &mut crate::gqt_record::GqtRunRecordV1) {
     record.run.point_id = crate::model::typed_sha256(&record.run.run_spec).unwrap();
@@ -1518,6 +1523,9 @@ async fn expected_parameter_error_does_not_claim_a_warming_engine_read() {
 
 #[path = "gqt_served_tests.rs"]
 mod served;
+
+#[path = "gqt_concurrent_tests.rs"]
+mod concurrent;
 
 #[tokio::test]
 async fn gqt_record_build_rejects_receipts_outside_the_frozen_program() {

@@ -471,6 +471,85 @@ fn a_recipe_or_a_merge_is_a_session_statement() {
     assert_eq!(step.sessions[1].name, "branch merge");
 }
 
+const BARE_RUNNER: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n";
+const PERSON: &str = "--- schema\nnode Person {\n    name: String @key\n}\n";
+const SWEPT: &str =
+    "--- bench\nwarmup_seconds: 2\nduration_seconds: 30\nrepetitions: 3\nsweep: { W: [2, 4, 8] }\n";
+
+/// A case whose one block is `header` with a `writer` label of `workers`
+/// (`x2`, `x${W}`) beside one reader, under the bench section `bench`.
+fn block_case(bench: &str, header: &str, workers: &str) -> String {
+    format!(
+        "{HDR}{BARE_RUNNER}{bench}{PERSON}{SEED}{header}\nwriter {workers}: query put() {{ insert Person {{ name: \"bob\" }} }}\nreader: query all() {{ match {{ $p: Person }} return {{ $p.name }} }}\n--- expect\nwriter: ok\nreader: ok\n"
+    )
+}
+
+#[test]
+fn a_measured_block_runs_under_a_bench_section_whose_swept_name_binds_before_parsing() {
+    let text = block_case(SWEPT, "--- concurrent measured", "x${W}");
+    let case = parse_case("measured", &text).unwrap();
+    assert_eq!(
+        case.bench,
+        Some(BenchSection {
+            warmup_seconds: 2,
+            duration_seconds: 30,
+            repetitions: Some(3),
+            sweep: Some(Sweep {
+                name: "W".into(),
+                values: vec![2, 4, 8]
+            }),
+        })
+    );
+    assert_eq!(case.swept(), Some(("W", 2)), "a bare parse binds the first");
+    let block = case.measured_block().unwrap();
+    assert_eq!(block.sessions.len(), 3);
+    assert!(block.is_free_running() && !case.needs_dst());
+    assert!(PlainHost.admit_case(&case).is_ok());
+    assert!(
+        case.steps()[0]
+            .source
+            .starts_with("--- concurrent measured\nwriter x${W}:"),
+        "the case keeps the text as written"
+    );
+
+    let at_eight = parse_case_at("measured", &text, Some(8)).unwrap();
+    assert_eq!(at_eight.swept(), Some(("W", 8)));
+    assert_eq!(at_eight.measured_block().unwrap().sessions.len(), 9);
+    let outside = parse_case_at("measured", &text, Some(3)).unwrap_err();
+    assert!(
+        outside
+            .first()
+            .message
+            .contains("W = 3 is not a value of the sweep [2, 4, 8]")
+    );
+
+    let fixed = "--- bench\nduration_seconds: 5\n";
+    let unswept = parse_case(
+        "measured",
+        &block_case(fixed, "--- concurrent measured", "x2"),
+    )
+    .unwrap();
+    assert_eq!(unswept.swept(), None);
+    assert_eq!(unswept.bench.as_ref().unwrap().warmup_seconds, 0);
+    assert!(parse_case_at("measured", unswept.source(), Some(2)).is_err());
+}
+
+#[test]
+fn a_measured_block_with_an_order_line_is_refused_under_its_own_header() {
+    let fixed = "--- bench\nduration_seconds: 5\n";
+    let text = block_case(fixed, "--- concurrent measured", "x2").replace(
+        "--- expect\n",
+        "order: writer start, reader start\n--- expect\n",
+    );
+    let refused = refusal_at("measured", &text);
+    assert!(
+        refused.starts_with(
+            "line 18: `--- concurrent measured` is a free-running block and takes no `order:` line"
+        ),
+        "{refused}"
+    );
+}
+
 #[test]
 fn header_notes_repeat_and_continuation_lines_are_refused() {
     let text = format!(
@@ -3656,6 +3735,22 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
             &[(BatchBound, 12)],
         ),
         ("bind_shape_bind_before_any_write", &[(BindShape, 14)]),
+        ("body_shape_bench_duration_of_zero", &[(BodyShape, 7)]),
+        ("body_shape_bench_names_a_rate", &[(BodyShape, 7)]),
+        (
+            "body_shape_bench_names_a_rate_with_no_value",
+            &[(BodyShape, 7)],
+        ),
+        (
+            "body_shape_bench_sweep_values_do_not_rise",
+            &[(BodyShape, 7)],
+        ),
+        (
+            "body_shape_bench_sweeps_a_lower_case_name",
+            &[(BodyShape, 7)],
+        ),
+        ("body_shape_bench_sweeps_two_names", &[(BodyShape, 7)]),
+        ("body_shape_bench_without_a_duration", &[(BodyShape, 7)]),
         (
             "body_shape_branches_count_above_the_cap",
             &[(BodyShape, 14)],
@@ -3717,12 +3812,23 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
         ("reference_skip_after_a_mutate_step", &[(ReferenceSkip, 18)]),
         ("reference_skip_without_a_reason", &[(ReferenceSkip, 19)]),
         ("runner_config_timeout_as_a_word", &[(RunnerConfig, 2)]),
+        ("section_order_bench_after_the_steps", &[(SectionOrder, 20)]),
+        (
+            "section_order_bench_without_a_measured_block",
+            &[(SectionOrder, 7)],
+        ),
         ("section_order_branches_after_a_step", &[(SectionOrder, 19)]),
+        (
+            "section_order_measured_block_without_a_bench_section",
+            &[(SectionOrder, 14)],
+        ),
         (
             "section_order_schema_after_a_step",
             &[(SectionOrder, 12), (SectionOrder, 17)],
         ),
         ("section_order_seam_before_an_expect", &[(SectionOrder, 16)]),
+        ("section_order_two_measured_blocks", &[(SectionOrder, 22)]),
+        ("step_kind_concurrent_scripted_measured", &[(StepKind, 16)]),
         ("step_kind_mutation_under_query", &[(StepKind, 14)]),
         (
             "substitution_placement_branches_header_names_the_marker",

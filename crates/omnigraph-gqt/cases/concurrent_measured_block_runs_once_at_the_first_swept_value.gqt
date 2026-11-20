@@ -1,0 +1,48 @@
+# issue: none
+# red_on: 766fa7ad; the parser refuses `--- bench` as an unknown section and `measured` as a block kind, so no step runs on either host.
+# notes: A `--- concurrent measured` block is a free-running block to a host with a scripted clock. The `--- bench` section's durations belong to a measuring host and are not read here: every worker runs once. `${W}` reads as the sweep's first value before anything is parsed, so `writer x${W}` is two writers, each dealing one row beside a reader; the count after the block is the seed plus two, where four writers would have left four.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- bench
+warmup_seconds: 5
+duration_seconds: 30
+sweep: { W: [2, 4] }
+
+--- schema
+node Chunk { slug: String @key n: I64 }
+
+--- seed
+{"type":"Chunk","data":{"slug":"seed","n":0}}
+
+--- concurrent measured
+writer x${W}: load generate: v1 seed: 42 mode: insert
+  tables:
+    - kind: node
+      name: Chunk
+      rows: 4
+      commits: 1
+      columns:
+        slug: {kind: key, prefix: cw-, width: 3}
+        n: {kind: ordinal, start: 100, step: 1}
+reader: query seed_row() { match { $c: Chunk } where $c.slug = "seed" return { $c.n } }
+--- expect
+writer: ok
+reader: ok
+
+--- query
+query all_chunks() { match { $c: Chunk } return { $c.slug, $c.n } }
+--- expect unordered
+{"c.slug":"seed","c.n":0}
+{"c.slug":"cw-000","c.n":100}
+{"c.slug":"cw-001","c.n":101}
+--- expect shape
+c.slug: String
+c.n: I64

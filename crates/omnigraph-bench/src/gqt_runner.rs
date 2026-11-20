@@ -1,10 +1,11 @@
 //! One engine operation selected from a frozen GQT program. Dataset building,
 //! process supervision, result assertions and archive work are outside its clock.
 use crate::case::{Backend, ResetMode};
+use crate::concurrent_host::{ConcurrentObservation, Driver, ReadbackObservation};
 use crate::counting::LogicalCallCounter;
 use crate::dataset_cache::DatasetManifestV1;
 use crate::gqt_case::{
-    BoundGqt, DatasetBuildPlan, PlannedGqt, SERVED_READ_KINDS, Target, engine_preparation,
+    BlockRun, BoundGqt, DatasetBuildPlan, PlannedGqt, SERVED_READ_KINDS, Target, engine_preparation,
 };
 use crate::gqt_evidence::{
     CloneInput, LocalRoute, LocalRouteKind, PreparationProofV2, RepetitionInputV2,
@@ -30,7 +31,10 @@ use omnigraph::instrumentation::{
 };
 use omnigraph::storage::StorageAdapter;
 use omnigraph_gqt_core::runner_config::SeamDirective;
-use omnigraph_gqt_core::{ExecutionHost, Step, StepKind, case_session, execute_steps};
+use omnigraph_gqt_core::{
+    Case, ConcurrentStep, ExecutionHost, PlainHost, Step, StepFail, StepKind, case_session,
+    execute_steps, readback_acked_rows, run_block_once,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -127,6 +131,11 @@ pub struct GqtRepObservation {
     /// through; absent on the other routes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_manifest_sha256: Option<String>,
+    /// The measured block's run, when the measured step is a `--- concurrent
+    /// measured` block: `elapsed_us` is then the whole block, warmup and
+    /// drain included, and the rates are in here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrent: Option<ConcurrentObservation>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
@@ -296,6 +305,7 @@ struct HostState {
     /// The measured child's peak resident set on the process route, from
     /// its `--stats` document.
     engine_rss: Option<u64>,
+    concurrent: Option<ConcurrentObservation>,
 }
 impl HostState {
     fn new(local: Option<LocalInstrumentation>) -> Self {
@@ -318,6 +328,7 @@ impl HostState {
             settled: false,
             merge: None,
             engine_rss: None,
+            concurrent: None,
         }
     }
 }
@@ -328,6 +339,10 @@ struct BenchHost<'a, S> {
     kinds: BTreeMap<usize, StepKind>,
     expected_reads: u32,
     attribution: crate::case::Attribution,
+    /// The run of the measured block and the swept binding it runs at, when
+    /// the selected step is that block.
+    block: Option<BlockRun>,
+    sweep: BTreeMap<String, u64>,
 }
 fn failure(message: impl std::fmt::Display) -> RunnerError {
     RunnerError::new("gqt_prepare_failed", message.to_string())
@@ -486,9 +501,91 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
             message
         })
     }
+
+    /// Discards what the counters saw of the block's warmup, so the sample's
+    /// store calls are the measured window's and its drain's.
+    fn rebaseline(&self) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(local) = &mut state.local {
+            local.manifest.take();
+            local.table.take();
+            local.baseline = Some(ControlSnapshot::read(&local.generation.counts));
+        }
+        Ok(())
+    }
+
+    /// The selected `--- concurrent measured` block: the driver between the
+    /// two signals, then the readback of every acknowledged dealt row on a
+    /// handle the workers never held.
+    async fn measured_block(
+        &self,
+        session: &omnigraph::Session,
+        case: &Case,
+        step: &ConcurrentStep,
+    ) -> Result<(), String> {
+        let run = self
+            .block
+            .ok_or("the plan carries no run for the measured block")?;
+        self.operation_started(step.ordinal)?;
+        let driven =
+            crate::concurrent_host::drive(session, step, run, || self.rebaseline()).await?;
+        self.operation_finished(step.ordinal)?;
+        let (uri, route) = {
+            let state = self.state.lock().unwrap();
+            let local = state
+                .local
+                .as_ref()
+                .ok_or("a measured block runs embedded")?;
+            (local.uri.clone(), local.route.clone())
+        };
+        let fresh = generation(&uri, &route, false).map_err(|error| error.to_string())?;
+        let db = Omnigraph::open_with_storage(&uri, fresh.storage)
+            .await
+            .map_err(|error| format!("the readback's handle failed to open: {error}"))?;
+        let reader = case_session(db, case)?;
+        let readback = readback_acked_rows(&PlainHost, &reader, step, &driven.acked_runs).await?;
+        self.state.lock().unwrap().concurrent = Some(ConcurrentObservation {
+            driver: Driver::ClosedLoop,
+            claim_grade: false,
+            warmup_seconds: run.warmup_seconds,
+            measured_seconds: run.duration_seconds,
+            sweep: self.sweep.clone(),
+            window_us: driven.window_us,
+            drain_us: driven.drain_us,
+            tokio_unstable: cfg!(tokio_unstable),
+            readback: ReadbackObservation {
+                rows: readback.rows,
+                compared: readback.compared,
+            },
+            labels: driven.labels,
+        });
+        Ok(())
+    }
 }
 impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
     type StepGuard = ();
+    fn admit_case(&self, case: &Case) -> Result<(), String> {
+        crate::gqt_case::admit_case(case)
+    }
+    /// The selected measured block loops for its run; any other block is
+    /// run once, as on a host that measures none.
+    fn concurrent_step<'a>(
+        &'a self,
+        session: &'a omnigraph::Session,
+        case: &'a Case,
+        step: &'a ConcurrentStep,
+    ) -> BoxFuture<'a, Result<(), StepFail>> {
+        if step.measured && step.ordinal == self.selected {
+            let label = format!("step {} (concurrent)", step.ordinal);
+            return async move {
+                self.measured_block(session, case, step)
+                    .await
+                    .map_err(|message| StepFail::new(label, message))
+            }
+            .boxed();
+        }
+        run_block_once(self, session, step)
+    }
     fn arm_seams(&self, seams: &[SeamDirective], _: &Step) -> Result<(), String> {
         if seams.is_empty() {
             Ok(())
@@ -620,6 +717,8 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
                 .collect(),
             expected_reads: bound.plan.cache_condition.iterations,
             attribution: bound.plan.definition.protocol.attribution,
+            block: bound.plan.block,
+            sweep: bound.plan.queries.sweep.clone(),
             state: Mutex::new(HostState::new(Some(LocalInstrumentation {
                 root: root.into(),
                 uri: uri.into(),
@@ -649,7 +748,9 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
             executed
         };
         let result = tokio::time::timeout(
-            Duration::from_millis(case.runner.timeout_ms)
+            bound
+                .plan
+                .past_declared_run(Duration::from_millis(case.runner.timeout_ms))
                 .saturating_sub(whole_file_started.elapsed()),
             executed,
         )
@@ -692,6 +793,8 @@ pub(crate) async fn execute_served_rep_signaled<S: MeasurementSignals + Send>(
             .collect(),
         expected_reads: bound.plan.cache_condition.iterations,
         attribution: bound.plan.definition.protocol.attribution,
+        block: None,
+        sweep: BTreeMap::new(),
         state: Mutex::new(HostState::new(None)),
     };
     let result = tokio::time::timeout(
@@ -851,6 +954,8 @@ pub(crate) async fn execute_clone_rep_signaled<S: MeasurementSignals + Send>(
             .collect(),
         expected_reads: bound.plan.cache_condition.iterations,
         attribution: bound.plan.definition.protocol.attribution,
+        block: None,
+        sweep: BTreeMap::new(),
         state: Mutex::new(HostState::new(None)),
     };
     let mut environment = input.environment.clone();
@@ -946,6 +1051,7 @@ fn finish_execution<S: MeasurementSignals + Send>(
         server_receipt_sha256: receipt,
         client_peak_rss_bytes: None,
         base_manifest_sha256: base,
+        concurrent: state.concurrent.take(),
     };
     if let Some(error) = error {
         return Err(if state.settled {
@@ -1033,6 +1139,23 @@ fn validate_evidence(
         .into_iter()
         .map(|s| (s.ordinal, s.kind))
         .collect();
+    match (&sample.concurrent, bound.plan.block, case.measured_block()) {
+        (None, None, _) => {}
+        (None, Some(_), _) if failed => {}
+        (Some(observed), Some(run), Some(step)) => crate::concurrent_host::validate(
+            observed,
+            step,
+            run,
+            &bound.plan.queries.sweep,
+            sample.elapsed_us,
+        )
+        .map_err(failure)?,
+        _ => {
+            return Err(failure(
+                "a block observation belongs to a sample whose measured step is the block, and to no other",
+            ));
+        }
+    }
     if let (Some(logical), Some(control)) =
         (&sample.logical_store_calls, &sample.control_store_calls)
     {
@@ -1282,6 +1405,10 @@ pub(crate) fn sample_byte_upper_bound(plan: &PlannedGqt) -> RunnerResult<usize> 
             following_assertions: u32::MAX,
         },
         merge,
+        concurrent: plan
+            .block
+            .zip(case.measured_block())
+            .map(|(run, step)| crate::concurrent_host::upper_bound(step, run)),
     };
     serde_json::to_vec(&sample)
         .map(|v| v.len())

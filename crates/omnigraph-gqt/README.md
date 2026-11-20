@@ -532,7 +532,9 @@ DST runner only. `--- concurrent` is a free-running block, which takes no
 up to three sessions, six seeded orders above, each pass on a fresh store,
 `timeout_ms` budgeting one pass) and the DST runner once per session with
 the seed's interleaving. A scripted block without its script and a
-free-running block with one are refused.
+free-running block with one are refused. `--- concurrent measured` is the
+free-running block `omnigraph-bench` times (§Measured block below); this
+runner runs it as any free-running block.
 
 ```text
 --- concurrent scripted
@@ -642,6 +644,51 @@ block's rows are the drain, not the interleaving the script named. Store
 requests are the only points an entry can name in this version; seams and
 in-process gates as entries, control statements as sessions and sessions on
 separate handles are later extensions.
+
+### Measured block
+
+`--- concurrent measured` marks the free-running block a measuring host
+times, and a `--- bench` section directly after `--- runner` describes that
+run. The two require each other, and a case holds one measured block.
+
+```text
+--- bench
+warmup_seconds: 5
+duration_seconds: 30
+sweep: { W: [1, 2, 4, 8, 16] }
+
+--- concurrent measured
+writer x${W}: load generate: v1 seed: 42 mode: insert
+  tables:
+    - kind: node
+      name: Chunk
+      rows: 4096000
+      commits: 1000
+      columns:
+        slug: {kind: key, prefix: cw-, width: 7}
+        n: {kind: ordinal, start: 100000, step: 1}
+reader x4: query seeded_row() { match { $c: Chunk } where $c.slug = "seed-0017" return { $c.n } }
+--- expect
+writer: ok
+reader: ok
+```
+
+The section is YAML: `duration_seconds` (1 to 3600), and optionally
+`warmup_seconds` (0 to 3600, 0 when absent), `repetitions` (1 to 10000) and
+`sweep: { <NAME>: [<n>, ...] }`, one name of the form `[A-Z][A-Z0-9_]*`, at
+most 16 characters, with 1 to 16 rising values between 1 and 4096. A `rate:`
+key is refused: it belongs to an open-loop driver, which no host runs.
+`${<NAME>}` on any line outside the section is replaced by one value of the
+sweep before the file is parsed, so `writer x${W}` is a worker count.
+
+This runner and the DST runner read the sweep and nothing else of the
+section: they bind its first value and run the block as any free-running
+block, every worker once per pass, under the bound of 8 workers per label.
+`omnigraph-bench` runs the case once per value of the sweep, each value a
+point of its own, and loops every worker through the warmup and then the
+duration; its README (Measured blocks) says what it records. There a dealt
+recipe must hold the rows its workers take, since worker `w` on its run `s`
+loads row `w + n·s` and a stream that runs out fails the block.
 
 ## Plan expectations
 

@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-reference"
-version = "0.16.0"
+version = "0.16.1"
 edition = "2024"
 description = "A reference interpreter of the GQ core IR: the GQT corpus's differential oracle. Never published."
 license = "MIT"
@@ -10,12 +10,12 @@ publish = false
 [dependencies]
 frostem = { workspace = true, features = ["english"] }
 libm = { workspace = true }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.16.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.16.1" }
 serde_json = { workspace = true }
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.16.0", features = ["test-util"] }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.16.1", features = ["test-util"] }
 proptest = "1"
 
 [lints]

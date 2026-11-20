@@ -198,7 +198,7 @@ pub struct Worker {
 /// the `--- expect` section after the block names for it. A session line
 /// with a worker count `x<n>` is `n` sessions, `<label>.0` to
 /// `<label>.<n-1>`, all under the declared label `group`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionOp {
     /// The session's own name: the declared label, or `<label>.<worker>`
     /// under a worker count.
@@ -398,6 +398,9 @@ pub struct ConcurrentStep {
     pub ordinal: usize,
     pub sessions: Vec<SessionOp>,
     pub order: Vec<Entry>,
+    /// `--- concurrent measured`: the free-running block a measuring host
+    /// loops for the `--- bench` section's duration.
+    pub measured: bool,
 }
 
 impl ConcurrentStep {
@@ -515,6 +518,22 @@ pub fn parse_block(
     body: &[(usize, &str)],
     scripted: bool,
 ) -> Result<(Vec<SessionLine>, Vec<Entry>), String> {
+    parse_block_under(body, scripted, "--- concurrent")
+}
+
+/// A `--- concurrent measured` block: free-running, and refused under its
+/// own header when it carries an `order:` line.
+pub fn parse_measured_block(
+    body: &[(usize, &str)],
+) -> Result<(Vec<SessionLine>, Vec<Entry>), String> {
+    parse_block_under(body, false, "--- concurrent measured")
+}
+
+fn parse_block_under(
+    body: &[(usize, &str)],
+    scripted: bool,
+    header: &str,
+) -> Result<(Vec<SessionLine>, Vec<Entry>), String> {
     let mut sessions: Vec<SessionLine> = Vec::new();
     let mut order: Option<(usize, &str)> = None;
     for (idx, raw) in body {
@@ -525,7 +544,7 @@ pub fn parse_block(
         if let Some(rest) = raw.strip_prefix("order:") {
             if !scripted {
                 return Err(format!(
-                    "line {line}: `--- concurrent` is a free-running block and takes no `order:` line; a block with a script is `--- concurrent scripted`"
+                    "line {line}: `{header}` is a free-running block and takes no `order:` line; a block with a script is `--- concurrent scripted`"
                 ));
             }
             if order.is_some() {
