@@ -320,11 +320,13 @@ pub fn show(args: ShowArgs) -> ExitCode {
         Ok(c) => c,
         Err(e) => return failure(e, args.catalog.json),
     };
-    let plan = match catalog.plan(name) {
-        Ok(p) => p,
+    let points = match catalog.points(name) {
+        Ok(points) => points,
         Err(e) => return failure(e, args.catalog.json),
     };
     let scenario = catalog.scenario(name).expect("resolved scenario exists");
+    let repetitions = catalog.repetitions(scenario, &points);
+    let plan = &points.plans[0];
     let resolve = |path: &Path| {
         let resolved = catalog.root.join(path).canonicalize()?;
         if resolved.to_str().is_none() {
@@ -347,19 +349,27 @@ pub fn show(args: ShowArgs) -> ExitCode {
         Ok(path) => path,
         Err(e) => return failure(problem("source_changed", e.to_string()), args.catalog.json),
     };
-    success(
-        &json!({
-            "id":name,"config":catalog.path,"config_version":catalog::CONFIG_VERSION,"fixture":plan.definition.fixture,
-            "resolved_fixture":resolved_fixture,
-            "resolved_workload":resolved_workload,
-            "workload":scenario.workload,"measured_step":plan.definition.workload.measured_step,
-            "environment":plan.definition.environment,"protocol":plan.definition.protocol,
-            "repetitions":scenario.repetitions(&catalog.definition.defaults),
-            "recipe_sha256":plan.recipe_sha256,"planned_sha256":plan.planned_sha256,
-            "needs_indices":plan.needs_indices,"cache_condition":plan.cache_condition,
-        }),
-        args.catalog.json,
-    )
+    let mut shown = json!({
+        "id":name,"config":catalog.path,"config_version":catalog::CONFIG_VERSION,"fixture":plan.definition.fixture,
+        "resolved_fixture":resolved_fixture,
+        "resolved_workload":resolved_workload,
+        "workload":scenario.workload,"measured_step":plan.definition.workload.measured_step,
+        "environment":plan.definition.environment,"protocol":plan.definition.protocol,
+        "repetitions":repetitions,
+        "recipe_sha256":plan.recipe_sha256,"planned_sha256":plan.planned_sha256,
+        "needs_indices":plan.needs_indices,"cache_condition":plan.cache_condition,
+    });
+    if let Some(block) = plan.block {
+        shown["block"] = json!(block);
+    }
+    if !plan.queries.sweep.is_empty() {
+        shown["points"] = points
+            .plans
+            .iter()
+            .map(|point| json!({"sweep":point.queries.sweep,"planned_sha256":point.planned_sha256}))
+            .collect();
+    }
+    success(&shown, args.catalog.json)
 }
 
 pub fn cache(command: CacheCommand) -> ExitCode {
@@ -558,10 +568,13 @@ fn generate(args: &InitArgs) -> Result<PathBuf, Vec<Diagnostic>> {
             id: args.name.clone(),
             fixture: FixtureInput::Path(fixture),
             workload,
-            measured_step: MeasuredStep {
-                ordinal: args.step,
-                text: operation.source,
-            },
+            measured_step: case
+                .measured_block()
+                .is_none_or(|block| block.ordinal != args.step)
+                .then_some(MeasuredStep {
+                    ordinal: args.step,
+                    text: operation.source,
+                }),
             repetitions: None,
             deadline_seconds: None,
             protocol: ProtocolOverrides::default(),
@@ -583,7 +596,7 @@ fn generate(args: &InitArgs) -> Result<PathBuf, Vec<Diagnostic>> {
     Ok(output)
 }
 
-const CONFIG_HELP: &str = "Config version 2\n\nfixtures/ contains starting-state GQT; workloads/ contains operations and checks.\nbenchmarks.yaml defines scenarios once, optional suites of scenario IDs, and an explicit run list.\n\nrun NAME selects one scenario or suite. run --config FILE uses only FILE's run list.\n--catalog DIR|FILE, repeatable, reads several catalogs: a name resolves in the first that declares it, run and report use that one, list prints every catalog, show names the one it read.\nWithout --config or --catalog, explicit paths, filenames with a suffix, and existing local entries use the legacy case loader.\nUse ./NAME to force a case path; use --config to select a catalog name even if a local entry has that name.\nPaths inside YAML are relative to that YAML's directory and must stay inside it.\n--config and --catalog never fall back if a file is missing or invalid.\n\nEach scenario needs id, fixture, workload and measured_step (ordinal plus exact operation text).\nA fixture is a GQT path, or {kind: registered, reference: ..., preparation: ...}.\nDefaults: repetitions=5, deadline_seconds=60; a scenario names what is measured, never where.\nThe run supplies the environment (--server; --store, a fixture store at the clone reset level, with --backend for an s3:// store; the host's local default, APFS/clonefile on macOS or XFS/plain-copy elsewhere, otherwise) and the reset level follows it;\nenvironment and protocol are expanded before identity: per-phase attribution, manual schedule, monotonic timer.\nScenario fields override defaults; run --repetitions overrides only sample quantity.\ndeadline_seconds: null disables the measurement deadline, not the supervisor watchdog.\nProtocol overrides are attribution, schedule, reset and timer; deadline_seconds is a scenario/default field.\n\nCopy benchmarks/custom.example.yaml, or generate a checked config:\n  omnigraph-bench show --workload benchmarks/workloads/tiny_read.gqt\n  omnigraph-bench init --fixture benchmarks/fixtures/tiny_graph.gqt --workload benchmarks/workloads/tiny_read.gqt --step 1 --output custom.yaml\n  omnigraph-bench run --config custom.yaml\n";
+const CONFIG_HELP: &str = "Config version 2\n\nfixtures/ contains starting-state GQT; workloads/ contains operations and checks.\nbenchmarks.yaml defines scenarios once, optional suites of scenario IDs, and an explicit run list.\n\nrun NAME selects one scenario or suite. run --config FILE uses only FILE's run list.\n--catalog DIR|FILE, repeatable, reads several catalogs: a name resolves in the first that declares it, run and report use that one, list prints every catalog, show names the one it read.\nWithout --config or --catalog, explicit paths, filenames with a suffix, and existing local entries use the legacy case loader.\nUse ./NAME to force a case path; use --config to select a catalog name even if a local entry has that name.\nPaths inside YAML are relative to that YAML's directory and must stay inside it.\n--config and --catalog never fall back if a file is missing or invalid.\n\nEach scenario needs id, fixture, workload and measured_step (ordinal plus exact operation text).\nA workload with a `--- concurrent measured` block needs no measured_step: the block is the measured step, and the workload's `--- bench` section gives its warmup, duration, repetitions and one swept name, a point per value.\nrun --warmup-seconds and --duration-seconds replace the section's two values for one run without moving the point.\nA fixture is a GQT path, or {kind: registered, reference: ..., preparation: ...}.\nDefaults: repetitions=5, deadline_seconds=60; a scenario names what is measured, never where.\nThe run supplies the environment (--server; --store, a fixture store at the clone reset level, with --backend for an s3:// store; the host's local default, APFS/clonefile on macOS or XFS/plain-copy elsewhere, otherwise) and the reset level follows it;\nenvironment and protocol are expanded before identity: per-phase attribution, manual schedule, monotonic timer.\nScenario fields override defaults; run --repetitions overrides only sample quantity.\ndeadline_seconds: null disables the measurement deadline, not the supervisor watchdog.\nProtocol overrides are attribution, schedule, reset and timer; deadline_seconds is a scenario/default field.\n\nCopy benchmarks/custom.example.yaml, or generate a checked config:\n  omnigraph-bench show --workload benchmarks/workloads/tiny_read.gqt\n  omnigraph-bench init --fixture benchmarks/fixtures/tiny_graph.gqt --workload benchmarks/workloads/tiny_read.gqt --step 1 --output custom.yaml\n  omnigraph-bench run --config custom.yaml\n";
 const CACHE_HELP: &str = "Cache inspection is read-only and never builds, restores, cleans or quarantines data.\n\n  omnigraph-bench cache status tiny-read --json\n  omnigraph-bench cache status tiny-read --verify --json\n  omnigraph-bench cache list --limit 100 --json\n\nThe default cache is target/gqt-datasets relative to cwd. Use the same --dataset-cache path for run and status.\nKeys bind recipe, engine/builder, backend/reset, cache location, required indexes and registered-source identity.\nHistorical variants may exist while the current scenario has a cache miss.\nSource: available, missing, invalid, unbound. Cache: missing, present, cached, busy, invalid, incomplete, unknown.\npresent checks published evidence; --verify audits full bytes before reporting cached.\nbusy returns immediately for a held lease. Missing or unbound sources give unknown cache status.\nStatus inspects the host's local environment; a served run reads a provisioned graph and uses no dataset cache.\nA status is a snapshot, not a reservation. Cache missing is a successful observation; inability to inspect fails.\nrun builds missing fixtures unless --no-build is supplied. dataset build prepares fixtures explicitly.\nLegacy dataset validate acquires a lease and stages worker files; use cache status for read-only inspection.\n";
 
 pub fn help(args: HelpArgs) -> ExitCode {

@@ -1689,6 +1689,7 @@ impl ProjectionRecord for crate::gqt_record::AnyRunRecordV1 {
         match self {
             Self::Legacy(r) => legacy_point_row(r),
             Self::Gqt(r) => gqt_point_row(r),
+            Self::Concurrent(r) => gqt_point_row(&r.record),
         }
     }
     fn run_row(
@@ -1698,6 +1699,10 @@ impl ProjectionRecord for crate::gqt_record::AnyRunRecordV1 {
         match self {
             Self::Legacy(r) => legacy_run_row(r, receipt),
             Self::Gqt(r) => gqt_run_row(r, receipt),
+            Self::Concurrent(r) => Ok(RunRow {
+                claim_eligible: r.claim_eligible(),
+                ..gqt_run_row(&r.record, receipt)?
+            }),
         }
     }
 }
@@ -4590,6 +4595,43 @@ mod tests {
         assert_eq!(row.terminal_failed_repetition, Some(1));
         assert_eq!(row.terminal_stage.as_deref(), Some("measure"));
         assert_eq!(row.terminal_code.as_deref(), Some("worker_timeout"));
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_record_never_projects_as_claim_eligible() {
+        use crate::gqt_record::{AnyRunRecordV1, ConcurrentRunRecordV1, GqtSutIdentityV1};
+
+        let mut inner = crate::gqt_tests::authority_fixture().await;
+        let GqtSutIdentityV1::Embedded(sut) = &mut inner.sut else {
+            panic!("the fixture is an embedded run");
+        };
+        sut.build.effective_codegen_options_proved = true;
+        assert!(
+            inner.claim_eligible(),
+            "the wrapped run alone is a complete acquisition on a proved build"
+        );
+        let receipt = crate::archive::ArchiveReceiptV1 {
+            archive_format_version: ARCHIVE_FORMAT_VERSION,
+            invocation_id: inner.invocation.invocation_id.clone(),
+            record_sha256: "a".repeat(64),
+            object_relative_path: "objects/sha256/aa/record.json".to_string(),
+            pointer_relative_path: "invocations/01/pointer.json".to_string(),
+            newly_published: true,
+        };
+        let record = AnyRunRecordV1::Concurrent(Box::new(ConcurrentRunRecordV1 {
+            format_version: 1,
+            driver: crate::concurrent_host::Driver::ClosedLoop,
+            claim_grade: false,
+            warmup_seconds: 0,
+            measured_seconds: 1,
+            sweep: Default::default(),
+            tokio_unstable: false,
+            record: inner,
+        }));
+        assert!(
+            !run_row(&record, &receipt).unwrap().claim_eligible,
+            "a closed-loop block is never a claim, whatever its build proves"
+        );
     }
 
     #[test]

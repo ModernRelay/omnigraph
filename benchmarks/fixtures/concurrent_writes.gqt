@@ -1,0 +1,22 @@
+# issue: none
+# notes: Starting state of the concurrent-writes scenario: one keyed Chunk table with 4096 generated rows on main. The readers look one of them up by key while the writers append rows of their own.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Chunk { slug: String @key n: I64 }
+
+--- seed generate: v1 seed: 7
+tables:
+  - kind: node
+    name: Chunk
+    rows: 4096
+    commits: 1
+    batch_rows: 4096
+    columns:
+      slug: {kind: key, prefix: seed-, width: 4}
+      n: {kind: ordinal, start: 0, step: 1}

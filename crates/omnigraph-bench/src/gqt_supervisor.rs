@@ -591,12 +591,15 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
 
     if let Some(deadline) = input.deadline {
         let deadline_us = duration_us(deadline);
-        if settled_elapsed_us > deadline_us {
+        if settled_elapsed_us > duration_us(input.case.plan.past_declared_run(deadline)) {
             return Err(RunnerError::new(
                 "operation_deadline_exceeded",
                 format!(
-                    "repetition {} settled in {}us, beyond the declared {}us deadline",
-                    input.repetition, settled_elapsed_us, deadline_us
+                    "repetition {} settled in {}us, beyond the declared {}us deadline{}",
+                    input.repetition,
+                    settled_elapsed_us,
+                    deadline_us,
+                    past_block(&input)
                 ),
             )
             .with_repetition(input.repetition)
@@ -1286,16 +1289,32 @@ fn auxiliary_deadline(input: &SupervisionInput) -> Duration {
     measurement_watchdog(input).max(AUXILIARY_DEADLINE_FLOOR)
 }
 
+/// The ceiling from Begin to Settled: the declared deadline, or the watchdog
+/// of a scenario without one, past what the measured step takes by declaration.
 fn measurement_watchdog(input: &SupervisionInput) -> Duration {
-    input.deadline.unwrap_or(UNDECLARED_MEASUREMENT_WATCHDOG)
+    input
+        .case
+        .plan
+        .past_declared_run(input.deadline.unwrap_or(UNDECLARED_MEASUREMENT_WATCHDOG))
+}
+
+/// What a ceiling message adds for a measured block; empty for one operation.
+fn past_block(input: &SupervisionInput) -> String {
+    input.case.plan.block.map_or_else(String::new, |run| {
+        format!(
+            " past the measured block's declared {} second run",
+            run.declared().as_secs()
+        )
+    })
 }
 
 fn measurement_timeout_failure(input: &SupervisionInput, action: &str) -> (&'static str, String) {
+    let past = past_block(input);
     match input.deadline {
         Some(deadline) => (
             "operation_deadline_exceeded",
             format!(
-                "repetition {} {action} within the declared {} second deadline; the worker process group was killed and reaped",
+                "repetition {} {action} within the declared {} second deadline{past}; the worker process group was killed and reaped",
                 input.repetition,
                 deadline.as_secs()
             ),
@@ -1303,7 +1322,7 @@ fn measurement_timeout_failure(input: &SupervisionInput, action: &str) -> (&'sta
         None => (
             "worker_measurement_watchdog_exceeded",
             format!(
-                "repetition {} {action} within the independent {} second safety watchdog for an operation with no declared deadline; the worker process group was killed and reaped",
+                "repetition {} {action} within the independent {} second safety watchdog{past} for an operation with no declared deadline; the worker process group was killed and reaped",
                 input.repetition,
                 UNDECLARED_MEASUREMENT_WATCHDOG.as_secs()
             ),
