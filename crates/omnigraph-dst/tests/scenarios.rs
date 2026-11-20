@@ -3645,6 +3645,121 @@ query nearest_docs($q: Vector(2)) {
     )
 }
 
+/// The storage calls of a ranking drawn as a read of its own (the GQ 3
+/// RFC, section 4: the population is the ranking's relation, the cut its
+/// own): a `nearest` correlated on each outer person, its population the
+/// person's documents, scored exactly and cut to the person's two nearest
+/// by the read's own window, all outer rows in one evaluation of the
+/// population.
+fn ranking_read_cost_rows(replay: &str) -> String {
+    const SCHEMA: &str = r#"
+node Person {
+    handle: String @key
+}
+node Doc {
+    slug: String @key
+    embedding: Vector(2) @index
+}
+edge Authored: Person -> Doc
+"#;
+    const QUERIES: &str = r#"
+query nearest_per_author($q: Vector(2)) {
+    match {
+        $p: Person,
+        from nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $q, k: 2) as $s
+    }
+    return { $p.handle, $d.slug }
+}
+"#;
+    const LABELS: [&str; 1] = ["NearestCorrelated"];
+
+    struct RankingReadCost;
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for RankingReadCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            use omnigraph_compiler::query::value::Literal;
+            omnigraph_dst::cost::set_label("_ranking_read_setup");
+            let writer = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        SCHEMA,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            let mut seed = Vec::new();
+            for person in 0..4 {
+                seed.push(format!(
+                    r#"{{"type":"Person","data":{{"handle":"p{person}"}}}}"#
+                ));
+            }
+            for row in 0..16 {
+                seed.push(format!(
+                    r#"{{"type":"Doc","data":{{"slug":"d{row:02}","embedding":[{x:?},{y:?}]}}}}"#,
+                    x = row as f32,
+                    y = (row % 3) as f32
+                ));
+                seed.push(format!(
+                    r#"{{"edge":"Authored","from":"p{}","to":"d{row:02}"}}"#,
+                    row % 4
+                ));
+            }
+            writer
+                .load_jsonl(&seed.join("\n"), LoadMode::Overwrite)
+                .await
+                .unwrap();
+            let reader = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            let mut params = omnigraph_compiler::ir::ParamMap::new();
+            params.insert(
+                "q".to_string(),
+                Literal::List(vec![Literal::Float(3.0), Literal::Float(1.0)]),
+            );
+            omnigraph_dst::cost::set_label(LABELS[0]);
+            let rows = reader
+                .query(
+                    omnigraph::db::ReadTarget::branch("main"),
+                    QUERIES,
+                    "nearest_per_author",
+                    &params,
+                )
+                .await
+                .unwrap()
+                .to_rust_json()
+                .unwrap();
+            omnigraph_dst::cost::set_label("_ranking_read_verify");
+            assert_eq!(
+                rows.as_array().unwrap().len(),
+                8,
+                "two nearest documents for each of four authors: {rows}"
+            );
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-ranking-read-cost-{replay}"),
+        &RankingReadCost,
+        &LABELS,
+    )
+}
+
 /// The storage calls of a schema apply that changes a full-text field's
 /// analyzer on a reopened handle: the redeclaration's detached commit
 /// (`commit_full_text_redeclarations`), which replaces the column's
@@ -5015,6 +5130,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&update_patch_cost_rows("a"));
     table.push_str(&keyed_write_table_size_cost_rows("a"));
     table.push_str(&nearest_cost_rows("a"));
+    table.push_str(&ranking_read_cost_rows("a"));
     table.push_str(&vector_index_recovery_cost_rows("a"));
     table.push_str(&carried_write_cost_rows("a"));
     table.push_str(&writer_claim_cost_rows("a"));
@@ -5037,6 +5153,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&update_patch_cost_rows("b"));
     table2.push_str(&keyed_write_table_size_cost_rows("b"));
     table2.push_str(&nearest_cost_rows("b"));
+    table2.push_str(&ranking_read_cost_rows("b"));
     table2.push_str(&vector_index_recovery_cost_rows("b"));
     table2.push_str(&carried_write_cost_rows("b"));
     table2.push_str(&writer_claim_cost_rows("b"));
