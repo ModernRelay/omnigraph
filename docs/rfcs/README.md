@@ -259,3 +259,4 @@ then dated RFCs by date.
 | [2026-11-09](2026-11-09-writer-epoch-fence.md) | Writer epoch fence on the branch manifest | maintainer | draft | in-progress |
 | [2026-11-10](2026-11-10-writes-carried-over-row-preserving-publications.md) | Writes carried over row-preserving publications | maintainer | draft | in-progress |
 | [2026-11-10](2026-11-10-graph-shallow-clone.md) | Graph shallow clone | maintainer | draft | in-progress |
+| [2026-11-15](2026-11-15-process-query-admission.md) | Process query admission | public | draft | not-started |
