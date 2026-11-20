@@ -2281,6 +2281,17 @@ query q() { match { $p: Person } return { $p.name } }"#,
         intended: None,
     },
     Row {
+        code: "T41",
+        shape: "non boolean and operand",
+        schema: COMMON,
+        // A top-level `and` of `where` splits into conjuncts, each a filter;
+        // under `or` it is one operand whose own operands must be Booleans.
+        source: "query q() { match { $p: Person } where ($p.age > 1 and $p.name) or $p.handle = \"x\" return { $p.handle } }",
+        message: "`and` needs a Bool, got String",
+        fix: None,
+        intended: None,
+    },
+    Row {
         code: "T42",
         shape: "order alias not returned",
         schema: COMMON,

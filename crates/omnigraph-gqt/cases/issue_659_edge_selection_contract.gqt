@@ -1,6 +1,10 @@
 # issue: 659
 # red_on: 7f1233bb
 # notes: Type and hop refusals, finite shared-work exhaustion and an empty wildcard retain explicit diagnostics and output shape.
+# notes: An endpoint whose type an earlier triple inferred has that type in scope (the GQ 3 RFC, section 2: a name's type is its
+# notes: type in the environment, however it was bound), so `$p * $q` after `$p knows $q` matches each member in the direction
+# notes: its end types fix (section 3, "Kept") and returns rows (`inferred_wildcard_endpoint`); an endpoint with no type is
+# notes: still refused (`missing_wildcard_endpoint`).
 
 --- runner
 timeout_ms: 10000
