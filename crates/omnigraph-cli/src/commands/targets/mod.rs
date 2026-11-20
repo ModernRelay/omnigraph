@@ -40,11 +40,16 @@ fn edit(
     targets::replace_file(&path, &after)
 }
 
+/// Creates the profile `name` after a verified sign-in. Without
+/// `organization` the sign-in's own is used when it is the person's only
+/// one; with several, `choice` asks or refuses, so the profile is never
+/// bound to whichever organization the browser session carried.
 pub(crate) async fn onboard(
     input: &InvocationConfig,
     name: &str,
     api: &str,
     organization: Option<&str>,
+    choice: crate::managed::OrganizationChoice<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
@@ -74,9 +79,20 @@ pub(crate) async fn onboard(
     let auth = crate::operator_routing::registration_auth(input, name, &route)?;
     crate::operator_routing::AUTH
         .scope(Some(auth), async {
-            let receipt =
-                crate::managed::register_login(route.clone(), organization, stderr).await?;
-            let organization = receipt["data"]["account_id"]
+            let registration =
+                crate::managed::ProfileRegistration::begin(&route, organization).await?;
+            // Another creator may have published this profile while we waited
+            // for its session. Recheck before reading or replacing that session.
+            let current = crate::operator::load_operator_config_at(&path(input)?)?;
+            if current
+                .schema
+                .as_ref()
+                .is_some_and(|schema| schema.profiles.contains_key(name))
+            {
+                bail!("profile already exists; use login --profile");
+            }
+            let receipt = registration.login(choice, stderr).await?;
+            let organization = receipt.body["data"]["account_id"]
                 .as_str()
                 .ok_or_else(|| eyre!("verified login response has no organization"))?;
             profile["organization_id"] = organization.into();
@@ -86,24 +102,41 @@ pub(crate) async fn onboard(
                 }
                 document.insert("profiles", name, profile)
             }) {
-                let cleanup = crate::managed::discard_registration(route, organization).await;
-                let message = format!(
-                    "profile could not be saved: {error}; session cleanup completed: {}",
-                    cleanup.is_ok()
-                );
-                if let Some(refusal) = error.downcast_ref::<targets::TargetError>() {
-                    return Err(targets::refusal(refusal.code, message));
-                }
-                bail!(message);
+                return Err(registration_save_error(
+                    error,
+                    receipt.created_session,
+                    registration.discard(organization),
+                )
+                .await);
             }
+            drop(registration);
             crate::output::write_json(
-                &serde_json::json!({
-                    "registered": name, "profile": name, "organization_id": organization
-                }),
+                &serde_json::json!({"registered":name,"profile":name,"organization_id":organization}),
                 stdout,
             )
         })
         .await
+}
+
+/// A failed edit can compensate only a session it created, and only before
+/// its profile became visible. Polling the discard future performs revocation.
+pub(crate) async fn registration_save_error(
+    error: color_eyre::Report,
+    created_session: bool,
+    discard: impl std::future::Future<Output = Result<(), crate::managed::Failure>>,
+) -> color_eyre::Report {
+    let message = if !created_session || error.is::<targets::ReplacementSyncFailed>() {
+        format!("profile sign-in preserved: {error}")
+    } else {
+        let cleaned_up = discard.await.is_ok();
+        format!(
+            "profile could not be saved: {error}; local session cleanup completed: {cleaned_up}"
+        )
+    };
+    if let Some(refusal) = error.downcast_ref::<targets::TargetError>() {
+        return targets::refusal(refusal.code, message);
+    }
+    error.wrap_err(message)
 }
 
 pub(crate) fn run_config(

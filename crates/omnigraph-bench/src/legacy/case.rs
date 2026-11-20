@@ -391,6 +391,10 @@ pub struct CacheCondition {
 pub enum ProcessLifecycle {
     FreshPerRepetition,
     LongRunningServer,
+    /// The clone reset level: every step of the program is its own
+    /// `omnigraph` process, so the measured step always opens the graph
+    /// anew and a preparation read warms only the page cache.
+    FreshPerStep,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +463,16 @@ pub enum ResetMode {
     PlainCopy,
     LocalClonefile,
     S3Versioning,
+    /// Each repetition opens an empty graph shallow clone over a frozen
+    /// fixture that nothing writes to; a new point beside the restore levels.
+    Clone,
+}
+
+impl ResetMode {
+    /// The levels that restore the fixture's bytes between repetitions.
+    pub fn restores(self) -> bool {
+        matches!(self, Self::PlainCopy | Self::LocalClonefile)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -990,12 +1004,12 @@ fn validate_backend_protocol(case: &CaseV1, diagnostics: &mut Vec<Diagnostic>) {
             }
             if !matches!(
                 protocol.reset,
-                ResetMode::PlainCopy | ResetMode::LocalClonefile
+                ResetMode::PlainCopy | ResetMode::LocalClonefile | ResetMode::Clone
             ) {
                 diagnostics.push(Diagnostic::error(
                     "invalid_local_reset",
                     "protocol.reset",
-                    "local-fs requires reset: plain-copy or local-clonefile",
+                    "local-fs requires reset: plain-copy, local-clonefile or clone",
                 ));
             }
             if protocol.reset == ResetMode::LocalClonefile && *filesystem != LocalFilesystem::Apfs {
@@ -1039,14 +1053,14 @@ fn validate_backend_protocol(case: &CaseV1, diagnostics: &mut Vec<Diagnostic>) {
                     "AWS S3 requires network_position: same-region or remote; same-host is reserved for local compatible stores",
                 ));
             }
-            if protocol.reset != ResetMode::S3Versioning {
+            if !matches!(protocol.reset, ResetMode::S3Versioning | ResetMode::Clone) {
                 diagnostics.push(Diagnostic::error(
                     "invalid_s3_reset",
                     "protocol.reset",
-                    "S3 requires reset: s3-versioning",
+                    "S3 requires reset: s3-versioning or clone",
                 ));
             }
-            if *versioning != S3Versioning::Enabled {
+            if protocol.reset != ResetMode::Clone && *versioning != S3Versioning::Enabled {
                 diagnostics.push(Diagnostic::error(
                     "s3_versioning_required",
                     "environment.backend.versioning",

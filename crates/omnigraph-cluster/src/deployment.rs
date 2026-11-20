@@ -349,7 +349,10 @@ impl DeploymentId {
 }
 
 pub(crate) fn refusal(code: &str, message: impl Into<String>) -> Diagnostic {
-    let mut message = message.into();
+    Diagnostic::error(code, CLUSTER_STATE_FILE, bounded_message(message.into()))
+}
+
+fn bounded_message(mut message: String) -> String {
     const SUFFIX: &str = " [truncated]";
     if message.len() > MAX_DIAGNOSTIC_BYTES {
         let mut end = MAX_DIAGNOSTIC_BYTES - SUFFIX.len();
@@ -359,7 +362,7 @@ pub(crate) fn refusal(code: &str, message: impl Into<String>) -> Diagnostic {
         message.truncate(end);
         message.push_str(SUFFIX);
     }
-    Diagnostic::error(code, CLUSTER_STATE_FILE, message)
+    message
 }
 
 fn encoded_size(value: &impl Serialize) -> Result<usize, Diagnostic> {
@@ -518,6 +521,9 @@ fn validate_projection(state: &ClusterState) -> Result<(), Diagnostic> {
             ResourceKind::Unknown => unreachable!("address was validated"),
         }
     }
+    // One bundle per scope, never both kinds in one: the rule every reader
+    // selects a bundle by, so a v2 ledger that breaks it is not read at all.
+    crate::policy_binding::PolicyBindings::of(resources)?;
     let mut diagnostics = Vec::new();
     if !validate_state_graph_resource_digests(state, &mut diagnostics) {
         return Err(diagnostics.remove(0));

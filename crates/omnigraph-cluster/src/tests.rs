@@ -2276,22 +2276,12 @@ async fn offline_deployment_captures_schema_queries_and_retains_original_lookup(
         fs::read_to_string(query_payload_path(dir.path(), &query_digest)).unwrap(),
         query
     );
-    assert_eq!(
-        acquire_cluster_admission(root, ClusterAdmissionPurpose::GraphOperation)
-            .await
-            .unwrap_err()
-            .code,
-        "state_lock_held"
-    );
-    assert!(
-        force_unlock_storage_root(root, "wrong-lock-id")
-            .await
-            .is_err()
-    );
-    assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+    // The converged apply released the lock it exposed (#1359).
+    assert!(!lock_id.is_empty());
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
 
-    // Repeating the same full ID with exact input observes while admission is
-    // still held; changed input refuses instead of reusing its receipt.
+    // Repeating the same full ID with exact input observes without taking
+    // admission; changed input refuses instead of reusing its receipt.
     fs::write(dir.path().join("people.pg"), &schema).unwrap();
     fs::write(dir.path().join("people.gq"), &query).unwrap();
     assert!(matches!(
@@ -2318,7 +2308,7 @@ async fn offline_deployment_captures_schema_queries_and_retains_original_lookup(
     let lookup = deployment_status(&canonical_root, Some(&id), &caller)
         .await
         .unwrap();
-    assert_eq!(lookup.lock_id.as_deref(), Some(lock_id.as_str()));
+    assert_eq!(lookup.lock_id, None);
     assert!(
         matches!(lookup.lookup, Some(DeploymentLookup::Complete { result: observed }) if observed.id == id && observed.input_digest == result.input_digest)
     );
@@ -2332,9 +2322,6 @@ async fn offline_deployment_captures_schema_queries_and_retains_original_lookup(
         identity_manifest_version(dir.path()).await,
         before_version + 1
     );
-    force_unlock_storage_root(&canonical_root, &lock_id)
-        .await
-        .unwrap();
     let serving = read_serving_snapshot_from_storage(&canonical_root)
         .await
         .unwrap();
@@ -2440,9 +2427,7 @@ async fn offline_deployment_query_only_preserves_branched_graph_history() {
     let status = deployment_status(root, Some(&result.id), &caller)
         .await
         .unwrap();
-    force_unlock_storage_root(root, status.lock_id.as_deref().unwrap())
-        .await
-        .unwrap();
+    assert_eq!(status.lock_id, None);
 
     // Retention may discard every terminal receipt. The achieved projection
     // still has to detect a graph recreated with identical source bytes and
@@ -4612,7 +4597,7 @@ async fn serving_snapshot_refuses_missing_embedding_provider_metadata() {
 }
 
 #[tokio::test]
-async fn serving_snapshot_refuses_tampered_blob_and_stripped_bindings() {
+async fn serving_snapshot_refuses_tampered_blob_and_broken_bindings() {
     let dir = fixture();
     apply_identity_fixture(dir.path()).await;
     // Tamper with the query blob...
@@ -4631,27 +4616,56 @@ async fn serving_snapshot_refuses_tampered_blob_and_stripped_bindings() {
             .any(|diagnostic| diagnostic.code == "catalog_payload_digest_mismatch"),
         "{err:?}"
     );
-    // ...and strip the policy bindings (pre-5A ledger).
-    let mut state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap())
-            .unwrap();
-    state["applied_revision"]["resources"]["policy.base"]
-        .as_object_mut()
-        .unwrap()
-        .remove("applies_to");
-    fs::write(
-        dir.path().join(CLUSTER_STATE_FILE),
-        serde_json::to_string_pretty(&state).unwrap(),
-    )
-    .unwrap();
-
-    let err = read_serving_snapshot(dir.path()).await.unwrap_err();
-    assert!(
-        err.iter()
-            .any(|diagnostic| diagnostic.code == "invalid_state"
-                && diagnostic.message.contains("policy bindings")),
-        "{err:?}"
-    );
+    // ...and break the policy bindings: a second bundle bound to the graph,
+    // one bundle bound to both kinds of scope (both refused by `cluster
+    // validate` in a config, and by every reader in a ledger), and stripped
+    // bindings (pre-5A ledger).
+    let original = fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let tampered = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut state: serde_json::Value = serde_json::from_str(&original).unwrap();
+        edit(&mut state["applied_revision"]["resources"]);
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+    };
+    let edits: [(&dyn Fn(&mut serde_json::Value), &str, &str); 3] = [
+        (
+            &|resources| {
+                resources["policy.second"] = resources["policy.base"].clone();
+            },
+            "applied_policy_invalid",
+            "both bind `graph.knowledge`",
+        ),
+        (
+            &|resources| {
+                resources["policy.base"]["applies_to"] =
+                    serde_json::json!(["cluster", "graph.knowledge"]);
+            },
+            "applied_policy_invalid",
+            "binds both `cluster` and graph scopes",
+        ),
+        (
+            &|resources| {
+                resources["policy.base"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("applies_to");
+            },
+            "invalid_state",
+            "policy bindings",
+        ),
+    ];
+    for (edit, code, said) in edits {
+        tampered(edit);
+        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.code == code && diagnostic.message.contains(said)),
+            "{said}: {err:?}"
+        );
+    }
     let _ = snapshot; // the pre-tamper read succeeded
 }
 

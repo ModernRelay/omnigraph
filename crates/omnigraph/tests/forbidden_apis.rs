@@ -1000,9 +1000,11 @@ gateway_surfaces! {
     ],
     "omnigraph-core/dataset_index.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "validate_full_text_scan", "validate_full_text_demand", "is_full_text_index",
-        "is_untrained_full_text", "key_column_index_coverage", "has_unindexed_fragments", "user_indices_for_column",
+        "covers_no_fragment", "is_untrained_full_text", "key_column_index_coverage", "has_unindexed_fragments",
+        "user_indices_for_column",
         "has_btree_index_on", "has_fts_index_on", "has_fts_postings_on", "has_vector_index_on",
         "current_fragments", "is_btree_index", "key_column_coverage", "key_column_uncovered_tail",
+        "key_column_covered_fragments",
     ],
     "omnigraph-core/staging.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "is_detached_version",
@@ -1089,6 +1091,10 @@ durable_calls! {
     ("omnigraph-core/instrumentation.rs", ".rename_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/instrumentation.rs", ".delete(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/instrumentation.rs", ".delete_prefix(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
+    ("omnigraph-core/logical_calls.rs", ".put_opts(", 1, WriteProtocol::Composed("logical call counter forwards its caller's put; the counter wraps an object store to count requests by verb and every write it forwards is registered at the caller's site")),
+    ("omnigraph-core/logical_calls.rs", ".put_part(", 1, WriteProtocol::Composed("logical call counter forwards its caller's multipart part")),
+    ("omnigraph-core/logical_calls.rs", ".complete(", 1, WriteProtocol::Composed("logical call counter forwards its caller's multipart completion")),
+    ("omnigraph-core/logical_calls.rs", ".abort(", 1, WriteProtocol::Composed("logical call counter forwards its caller's multipart abort")),
     ("omnigraph-core/lance_access.rs", ".put_opts(", 1, WriteProtocol::Composed("Lance-realm object-store seam forwarding (dst only)")),
     ("omnigraph-core/read_memo.rs", ".put_opts(", 1, WriteProtocol::Composed("statement read-memo forwarding: the memo intercepts immutable-path reads only and passes the caller's put untouched to the wrapped store")),
     ("omnigraph-core/storage.rs", ".write_bytes(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
@@ -1197,6 +1203,9 @@ durable_calls! {
     // fork before the incarnation refusal; read-only access to the handle.
     ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("exec/blob_write.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
+    // A delete cascade plans its edge-table reads from the edge table's index
+    // coverage (`validate::RemovalEdgeReads`); read-only metadata access.
+    ("exec/mutation.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     // Commit-change enumeration: pinned parent/child handles for the ordered
     // merge's typed row comparison. Read-only by construction — the enumerator
     // stages no transaction and publishes nothing.
@@ -1219,7 +1228,7 @@ durable_calls! {
     // rebuilt in memory, so this write can never change a query's result. It
     // runs in a task the run awaits, so a dropped run cannot drop it.
     ("db/omnigraph/optimize.rs", ".write_bytes(", 1, WriteProtocol::PhysicalOnly),
-    ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V9),
+    ("exec/merge.rs", "SnapshotHandle::new(", 3, MERGE_V9),
 }
 
 const DURABLE_PRIMITIVES: &[&str] = &[
@@ -3565,6 +3574,9 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::capture_query_io_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::CountingStorageAdapter",
     "instrumentation.rs: omnigraph_core::instrumentation::ExternalPayloadReadHold",
+    "instrumentation.rs: omnigraph_core::instrumentation::IndexBuildProbes",
+    "instrumentation.rs: omnigraph_core::instrumentation::LogicalCallCounter",
+    "instrumentation.rs: omnigraph_core::instrumentation::LogicalCallCounts",
     "instrumentation.rs: omnigraph_core::instrumentation::MergeTimingReading",
     "instrumentation.rs: omnigraph_core::instrumentation::MergeWriteProbes",
     "instrumentation.rs: omnigraph_core::instrumentation::ProbedStores",
@@ -3581,6 +3593,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::with_csv_slice_bytes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_external_payload_read_held",
     "instrumentation.rs: omnigraph_core::instrumentation::with_external_payload_read_stalled",
+    "instrumentation.rs: omnigraph_core::instrumentation::with_index_build_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_merge_write_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_overwrite_chunk_rows",
     "instrumentation.rs: omnigraph_core::instrumentation::with_query_io_probes",
@@ -3593,6 +3606,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "lib.rs: omnigraph_core::dst_clock",
     "lib.rs: omnigraph_core::dst_gate",
     "lib.rs: omnigraph_core::dst_ids",
+    "lib.rs: omnigraph_core::fts_compat::ANALYZER_GENERATION as FTS_ANALYZER_GENERATION",
     "seams.rs: omnigraph_core::seams::Behavior",
     "seams.rs: omnigraph_core::seams::Counted",
     "seams.rs: omnigraph_core::seams::Decide",

@@ -6,6 +6,8 @@ timeout_ms: 60000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
 
 --- query
 query friends() { match { $p: Person $p knows $q } return { $p.name, $q.name } }

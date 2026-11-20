@@ -15,17 +15,18 @@ Three things keep that cost paid once: one feature set for every loop, a warm
 
 Cargo builds a separate copy of every crate whose features differ, so
 alternating `cargo test -p omnigraph-engine` with the failpoint graph rebuilds
-the engine and everything above it each time. The aliases in
+the engine and everything above it each time. The test aliases in
 `.cargo/config.toml` all build the canonical CI graph from
-[testing.md](testing.md), with `omnigraph-engine/failpoints` and
-`omnigraph-cluster/failpoints`:
+[test ownership](test-ownership.md#commands), with `omnigraph-engine/failpoints` and
+`omnigraph-cluster/failpoints`; `cargo dev-clippy` lints the default-feature
+workspace, CI's first Clippy pass:
 
 ```bash
 cargo dev-build-tests                      # compile every test binary, run nothing
 cargo dev-test                             # the canonical workspace graph
 cargo dev-nextest -E 'package(omnigraph-engine)'           # run a subset, no rebuild
 cargo dev-nextest -E 'binary(=integration) & test(/^branching::/)'
-cargo dev-clippy
+cargo dev-clippy                           # default features; the failpoints pass is in ci.md's local checks
 ```
 
 Narrow a run with a nextest filterset or a libtest name filter, not with `-p`:
@@ -113,5 +114,5 @@ adds `-fuse-ld=mold` when `mold` is on `PATH` (GCC 12.1 or later, or clang)
 and otherwise runs `cc` unchanged. Install it with the system package manager
 (`apt-get install mold`). The linker is not part of a compile fingerprint, so
 installing or removing mold relinks without recompiling. CI's test and lint jobs
-install it; release builds do not, and link exactly as before. macOS uses the
-system linker.
+install it; release builds do not, and link with the default `cc`. macOS uses
+the system linker.

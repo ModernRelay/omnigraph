@@ -989,19 +989,26 @@ pub(crate) fn validate_invocation(invocation: &InvocationIdentityV1) -> RecordRe
 }
 
 pub(crate) fn validate_sut(sut: &SutIdentityV1) -> RecordResult<()> {
+    if sut.source_tree_dirty {
+        return Err(RecordError::new(
+            "dirty_source_tree",
+            "sut.source_tree_dirty",
+            "source-commit provenance is incomplete for a binary built from an uncommitted tree",
+        ));
+    }
+    validate_harness(sut)
+}
+
+/// The harness build that drove a product binary: a release worker with
+/// complete provenance, its `source_tree_dirty` recorded as it was, since the
+/// measured binary is the product's, not this one.
+pub(crate) fn validate_harness(sut: &SutIdentityV1) -> RecordResult<()> {
     validate_text(&sut.package_version, "sut.package_version")?;
     if !valid_lower_hex(&sut.source_commit, &[40, 64]) {
         return Err(RecordError::new(
             "invalid_source_commit",
             "sut.source_commit",
             "source commit must be exactly 40 or 64 lowercase hexadecimal characters",
-        ));
-    }
-    if sut.source_tree_dirty {
-        return Err(RecordError::new(
-            "dirty_source_tree",
-            "sut.source_tree_dirty",
-            "source-commit provenance is incomplete for a binary built from an uncommitted tree",
         ));
     }
     if sut.build.profile != "release"

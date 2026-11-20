@@ -8,6 +8,48 @@ use super::{Completion, UndeliveredFailure, finish, run_from};
 use crate::{client::GraphClient, command_outcome, invocation::MachineErrors};
 
 #[tokio::test]
+async fn profile_edit_refusal_reports_session_cleanup_issue_1169() {
+    for created_session in [false, true] {
+        for machine in [None, Some(MachineErrors::Json)] {
+            let mut discarded = false;
+            let error = crate::commands::targets::registration_save_error(
+                crate::targets::refusal("config_not_editable", "authored YAML cannot be edited"),
+                created_session,
+                async {
+                    discarded = true;
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(discarded, created_session);
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let result =
+                super::complete_onboarding(Err(error), machine.is_some(), &mut stdout, &mut stderr);
+            let completion =
+                finish(result, None, None, machine, false, &mut stdout, &mut stderr).unwrap();
+            assert_eq!(completion.code(), 2);
+            let message = if machine.is_some() {
+                let body: Value = serde_json::from_slice(&stdout).unwrap();
+                assert_eq!(body["code"], "config_not_editable");
+                assert!(stderr.is_empty());
+                body["error"].as_str().unwrap().to_owned()
+            } else {
+                assert!(stdout.is_empty());
+                String::from_utf8(stderr).unwrap()
+            };
+            assert!(message.contains("authored YAML cannot be edited"));
+            let outcome = if created_session {
+                "local session cleanup completed: true"
+            } else {
+                "profile sign-in preserved"
+            };
+            assert!(message.contains(outcome), "{message}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn login_uses_the_default_profile_without_starting_onboarding_issue_1115() {
     let home = tempfile::tempdir().unwrap();
     let path = home.path().join("config.yaml");
@@ -25,6 +67,7 @@ async fn login_uses_the_default_profile_without_starting_onboarding_issue_1115()
             &mut io::empty(),
             false,
             &mut stdout,
+            false,
             &mut stderr,
         )
         .await
@@ -62,6 +105,7 @@ async fn managed_target_add_uses_the_resolved_default_profile_issue_1115() {
             &mut io::empty(),
             false,
             &mut Vec::new(),
+            false,
             &mut Vec::new(),
         )
         .await
@@ -101,6 +145,7 @@ async fn login_never_creates_or_overwrites_a_profile_implicitly() {
                 &mut io::empty(),
                 terminal,
                 &mut Vec::new(),
+                false,
                 &mut stderr,
             )
             .await;
@@ -118,6 +163,67 @@ async fn login_never_creates_or_overwrites_a_profile_implicitly() {
             );
             assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
         }
+    }
+}
+
+#[test]
+fn onboarding_only_reads_an_answer_for_human_terminal_output() {
+    for terminal in [false, true] {
+        for json in [false, true] {
+            let mut input = io::empty();
+            assert_eq!(
+                matches!(
+                    super::onboarding_choice(&mut input, terminal, json),
+                    crate::managed::OrganizationChoice::Ask(_)
+                ),
+                terminal && !json
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn profile_creation_emits_a_managed_refusal_through_the_cli() {
+    let home = tempfile::tempdir().unwrap();
+    for json in [false, true] {
+        let mut arguments = vec![
+            "omnigraph",
+            "login",
+            "--create-profile",
+            "work",
+            "--organization",
+            "bad id",
+        ];
+        if json {
+            arguments.push("--json");
+        }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = super::execute(
+            crate::invocation::parse_from(arguments).unwrap(),
+            crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+            &mut io::empty(),
+            true,
+            &mut stdout,
+            false,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completion.code(), 2);
+        if json {
+            let refusal: Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(refusal["type"], "organization_invalid");
+            assert!(refusal["detail"].is_string());
+        } else {
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains("organization_invalid:")
+            );
+        }
+        assert!(!home.path().join("config.yaml").exists());
     }
 }
 
@@ -183,6 +289,7 @@ async fn argument_refusal_help_and_success_return_without_terminating_the_caller
             &mut io::empty(),
             false,
             &mut out,
+            false,
             &mut Vec::new(),
         )
         .await
@@ -248,6 +355,7 @@ async fn handled_lint_failure_allows_a_following_successful_invocation() {
                 &mut io::empty(),
                 false,
                 stdout,
+                false,
                 &mut stderr,
             )
             .await;
@@ -1197,6 +1305,7 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
         &mut FailedInput,
         false,
         &mut stdout,
+        false,
         &mut stderr,
     )
     .await
@@ -1352,6 +1461,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
         &mut io::empty(),
         false,
         &mut stdout,
+        false,
         &mut stderr,
     )
     .await
@@ -1694,11 +1804,23 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let results = state["deployment_results"].as_array().unwrap();
             assert_eq!(results.len(), 1);
             let id = results[0]["id"].as_str().unwrap();
-            let lock = status.lock_id.as_deref().unwrap();
             let message = format!("{error:#}");
             assert!(message.contains(id), "{message}");
-            assert!(message.contains(lock), "{message}");
+            assert!(message.contains("Admission lock: "), "{message}");
             assert!(!message.contains("\"disposition\""));
+            // The converged apply released its lock (#1359). A later owner that
+            // stops without release leaves the lock the checks below deliver.
+            assert!(status.lock_id.is_none());
+            let later = omnigraph_cluster::acquire_cluster_admission(
+                root,
+                omnigraph_cluster::ClusterAdmissionPurpose::GraphOperation,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let lock = later.lock_id().to_owned();
+            drop(later);
+            let lock = lock.as_str();
             let receipt = omnigraph_cluster::deployment_status(root, Some(id), &caller)
                 .await
                 .unwrap()
@@ -1723,7 +1845,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let lock_bytes = std::fs::read(&lock_path).unwrap();
 
             // Resubmitting the known identity observes the original result even
-            // while admission is retained. It must not run the deployment again.
+            // while another owner's admission is retained. It must not run the deployment again.
             let mut observed = Vec::new();
             let mut custody = Vec::new();
             apply_source(
@@ -1864,6 +1986,286 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
     }
 }
 
+/// Runs one command line against the default operator configuration and
+/// returns its completion with both streams as text.
+async fn run_cli(args: &[&str]) -> (Completion, String, String) {
+    let parsed = crate::invocation::parse_from(args.iter().copied()).unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let completion = super::execute(
+        parsed,
+        crate::operator::InvocationConfig::at(None, None),
+        &mut io::empty(),
+        false,
+        &mut stdout,
+        false,
+        &mut stderr,
+    )
+    .await
+    .unwrap();
+    (
+        completion,
+        String::from_utf8(stdout).unwrap(),
+        String::from_utf8(stderr).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn base_opens_a_graph_shallow_clone_and_leaves_the_base_unchanged() {
+    const PEOPLE: &str = "query people() { match { $p: Person } return { $p.slug } }";
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base.omni").to_str().unwrap().to_owned();
+    let clone = temp.path().join("clone").to_str().unwrap().to_owned();
+    omnigraph::db::Omnigraph::init(&base, "node Person { slug: String @key }")
+        .await
+        .unwrap();
+    let insert = |slug: &str| format!("query add() {{ insert Person {{ slug: \"{slug}\" }} }}");
+    let (seeded, _, _) = run_cli(&[
+        "omnigraph",
+        "mutate",
+        "--target",
+        &base,
+        "-e",
+        &insert("a"),
+        "--json",
+    ])
+    .await;
+    assert_eq!(seeded.code(), 0);
+    let base_listing_before = list_tree(temp.path().join("base.omni"));
+
+    let (written, _, stderr) = run_cli(&[
+        "omnigraph",
+        "mutate",
+        "--target",
+        &clone,
+        "--base",
+        &base,
+        "-e",
+        &insert("b"),
+        "--json",
+    ])
+    .await;
+    assert_eq!(written.code(), 0, "{stderr}");
+    let (read, clone_rows, _) = run_cli(&[
+        "omnigraph",
+        "query",
+        "--target",
+        &clone,
+        "--base",
+        &base,
+        "-e",
+        PEOPLE,
+        "--json",
+    ])
+    .await;
+    assert_eq!(read.code(), 0);
+    let clone_rows: Value = serde_json::from_str(&clone_rows).unwrap();
+    assert_eq!(clone_rows["row_count"], 2, "{clone_rows}");
+
+    let (read, base_rows, _) = run_cli(&[
+        "omnigraph",
+        "query",
+        "--target",
+        &base,
+        "-e",
+        PEOPLE,
+        "--json",
+    ])
+    .await;
+    assert_eq!(read.code(), 0);
+    let base_rows: Value = serde_json::from_str(&base_rows).unwrap();
+    assert_eq!(
+        base_rows["row_count"], 1,
+        "the base answers as before: {base_rows}"
+    );
+    assert_eq!(
+        list_tree(temp.path().join("base.omni")),
+        base_listing_before,
+        "the base records no clone"
+    );
+    assert!(temp.path().join("clone/__clone/created").is_file());
+}
+
+#[tokio::test]
+async fn stats_writes_one_document_with_the_invocation_s_store_calls() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base.omni").to_str().unwrap().to_owned();
+    let clone = temp.path().join("clone").to_str().unwrap().to_owned();
+    let stats = temp.path().join("stats.json");
+    omnigraph::db::Omnigraph::init(&base, "node Person { slug: String @key }")
+        .await
+        .unwrap();
+    let (completion, _, stderr) = run_cli(&[
+        "omnigraph",
+        "query",
+        "--target",
+        &clone,
+        "--base",
+        &base,
+        "--stats",
+        stats.to_str().unwrap(),
+        "-e",
+        "query people() { match { $p: Person } return { $p.slug } }",
+        "--json",
+    ])
+    .await;
+    assert_eq!(completion.code(), 0, "{stderr}");
+    let document: Value = serde_json::from_slice(&std::fs::read(&stats).unwrap()).unwrap();
+    assert_eq!(document["stats_version"], 1);
+    assert_eq!(document["exit_code"], 0);
+    assert!(document["elapsed_ms"].as_f64().unwrap() > 0.0, "{document}");
+    let manifest = &document["storage"]["manifest"];
+    assert!(
+        manifest["get"].as_u64().unwrap() + manifest["list"].as_u64().unwrap() > 0,
+        "the open through the clone's mount is object-store I/O the `__manifest` plane counts: {document}"
+    );
+    for class in [
+        "put", "put_part", "head", "list", "delete", "copy", "rename",
+    ] {
+        assert!(manifest[class].is_u64(), "{class} missing: {document}");
+    }
+    assert!(document["storage"]["table"].is_object(), "{document}");
+}
+
+#[tokio::test]
+async fn stats_that_cannot_be_written_fails_after_the_mutation_committed() {
+    const PEOPLE: &str = "query people() { match { $p: Person } return { $p.slug } }";
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base.omni").to_str().unwrap().to_owned();
+    let blocker = temp.path().join("blocker");
+    std::fs::write(&blocker, b"").unwrap();
+    let stats = blocker.join("stats.json");
+    omnigraph::db::Omnigraph::init(&base, "node Person { slug: String @key }")
+        .await
+        .unwrap();
+    let (completion, _, stderr) = run_cli(&[
+        "omnigraph",
+        "mutate",
+        "--target",
+        &base,
+        "--stats",
+        stats.to_str().unwrap(),
+        "-e",
+        "query add() { insert Person { slug: \"a\" } }",
+        "--json",
+    ])
+    .await;
+    assert_ne!(completion.code(), 0, "{stderr}");
+    assert!(stderr.contains("writing --stats"), "{stderr}");
+    let (read, rows, _) = run_cli(&[
+        "omnigraph",
+        "query",
+        "--target",
+        &base,
+        "-e",
+        PEOPLE,
+        "--json",
+    ])
+    .await;
+    assert_eq!(read.code(), 0);
+    let rows: Value = serde_json::from_str(&rows).unwrap();
+    assert_eq!(
+        rows["row_count"], 1,
+        "the mutation committed before the document failed: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn base_is_refused_where_the_command_has_no_clone_form() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base.omni").to_str().unwrap().to_owned();
+    let clone = temp.path().join("clone").to_str().unwrap().to_owned();
+    omnigraph::db::Omnigraph::init(&base, "node Person { slug: String @key }")
+        .await
+        .unwrap();
+    let (completion, stdout, stderr) =
+        run_cli(&["omnigraph", "optimize", "--target", &clone, "--base", &base]).await;
+    assert_ne!(completion.code(), 0);
+    assert!(
+        format!("{stdout}{stderr}").contains("no clone form"),
+        "{stdout}{stderr}"
+    );
+    assert!(!temp.path().join("clone").exists());
+}
+
+/// `--format arrow` writes the result batches of a query run on direct
+/// storage. A served target, whose server answers JSON, refuses it from the
+/// target's kind alone: before the credential is read (the token's variable
+/// is unset) and before any request.
+#[tokio::test]
+async fn query_format_arrow_refuses_a_served_target_before_credentials_issue_1428() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "version: 1\ntargets:\n  prod:\n    kind: server\n    endpoint: https://data.example\n    default_graph: knowledge\n    auth: {provider: token, source: {env: OMNIGRAPH_ISSUE_1428_UNSET_TOKEN}}\n",
+    )
+    .unwrap();
+    for verb_args in [
+        vec![
+            "-e",
+            "query people() { match { $p: Person } return { $p.slug } }",
+        ],
+        vec!["stored_people"],
+    ] {
+        let parsed = crate::invocation::parse_from(
+            [
+                "omnigraph",
+                "query",
+                "--target",
+                "prod",
+                "--format",
+                "arrow",
+            ]
+            .into_iter()
+            .chain(verb_args.iter().copied()),
+        )
+        .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = super::execute(
+            parsed,
+            crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+            &mut io::empty(),
+            false,
+            &mut stdout,
+            false,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert_eq!(completion.code(), 1, "{verb_args:?}: {stderr}");
+        assert!(stdout.is_empty(), "{verb_args:?}");
+        assert_eq!(
+            stderr,
+            "target_kind_unsupported: `--format arrow` writes the result batches of a query \
+             run on direct storage; target 'prod' is served, and its server answers JSON: use \
+             `--format json` or `--format jsonl`\n",
+            "{verb_args:?}"
+        );
+    }
+}
+
+/// Every file under `root` with its length, so a tree can be compared
+/// before and after an operation that must not write it.
+fn list_tree(root: std::path::PathBuf) -> Vec<(std::path::PathBuf, u64)> {
+    let mut out = Vec::new();
+    let mut pending = vec![root];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(path);
+            } else {
+                out.push((path, entry.metadata().unwrap().len()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 fn direct_test_target(uri: &str, root: bool) -> crate::targets::ResolvedTarget {
     use crate::targets::*;
     ResolvedTarget::new(
@@ -1938,6 +2340,7 @@ async fn target_edits_preserve_the_authored_operator_document_issue_1169() {
             &mut &stdin[..],
             false,
             &mut Vec::new(),
+            false,
             &mut Vec::new(),
         )
         .await
@@ -1991,6 +2394,7 @@ async fn uneditable_target_rename_reports_its_code_without_replacing_yaml_issue_
                 &mut io::empty(),
                 false,
                 &mut Vec::new(),
+                false,
                 &mut stderr,
             )
             .await

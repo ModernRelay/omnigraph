@@ -147,41 +147,15 @@ fn settings_from_snapshot_inner(
         );
     }
 
-    // Bindings -> Cedar slots. The serving pipeline loads one bundle per
-    // graph plus one server-level bundle; stacked bundles per scope are a
-    // later slice — refuse loudly rather than silently merging policy.
-    let mut server_policy: Option<PolicySource> = None;
-    let mut graph_policies: BTreeMap<String, PolicySource> = BTreeMap::new();
-    for policy in &snapshot.policies {
-        for binding in &policy.applies_to {
-            if binding == "cluster" {
-                if server_policy
-                    .replace(PolicySource::Inline(policy.source.clone()))
-                    .is_some()
-                {
-                    bail!(
-                        "multiple policy bundles bind the cluster scope; cluster-mode serving supports one bundle per scope — split or merge bundles (multi-bundle scopes are a later slice)"
-                    );
-                }
-            } else if let Some(graph_id) = binding.strip_prefix("graph.") {
-                if graph_policies
-                    .insert(
-                        graph_id.to_string(),
-                        PolicySource::Inline(policy.source.clone()),
-                    )
-                    .is_some()
-                {
-                    bail!(
-                        "multiple policy bundles bind graph '{graph_id}'; cluster-mode serving supports one bundle per scope — split or merge bundles (multi-bundle scopes are a later slice)"
-                    );
-                }
-            } else {
-                bail!("unrecognized policy binding '{binding}' in the applied revision");
-            }
-        }
-    }
-
-    let catalogue_policy = graph_policies.remove(omnigraph_compiler::CATALOGUE_SCOPE);
+    // Bindings -> Cedar slots: one bundle per graph plus one server-level
+    // bundle, selected by the cluster's one binding rule, which refused any
+    // ledger binding a scope twice before this snapshot was read.
+    let inline =
+        |policy: &omnigraph_cluster::ServingPolicy| PolicySource::Inline(policy.source.clone());
+    let server_policy = snapshot.cluster_policy().map(inline);
+    let catalogue_policy = snapshot
+        .graph_policy(omnigraph_compiler::CATALOGUE_SCOPE)
+        .map(inline);
     let mut graphs = Vec::new();
     let mut skipped_graphs = Vec::new();
     for graph in &snapshot.quarantined_graphs {
@@ -259,7 +233,7 @@ fn settings_from_snapshot_inner(
             startup_failure,
             graph_id: graph.graph_id.clone(),
             uri: graph.root.to_string_lossy().to_string(),
-            policy: graph_policies.get(&graph.graph_id).cloned(),
+            policy: snapshot.graph_policy(&graph.graph_id).map(inline),
             embedding,
             external_blob_policy: graph.external_blob_policy.clone(),
             queries: registry,
@@ -706,9 +680,10 @@ pub(crate) fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
-        BTreeMap, DEFAULT_SHUTDOWN_GRACE, Path, PathBuf, open_multi_graph_state,
-        settings_from_snapshot,
+        DEFAULT_SHUTDOWN_GRACE, Path, PathBuf, open_multi_graph_state, settings_from_snapshot,
     };
     use super::{
         GraphId, GraphKey, GraphStartupConfig, RegistryLookup, ServerConfig, ServerConfigMode,

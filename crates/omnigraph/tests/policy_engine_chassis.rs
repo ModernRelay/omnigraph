@@ -1123,7 +1123,7 @@ async fn maintenance_entry_points_enforce_maintain_on_their_branch_before_effect
         )
         .await
         .expect("maintain on main admits optimize")
-        .tables;
+        .datasets;
     assert!(
         stats
             .iter()

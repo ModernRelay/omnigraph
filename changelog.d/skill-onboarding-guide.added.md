@@ -1,3 +1,4 @@
-- The agent skill has an onboarding guide that takes an agent from nothing installed to a queried local graph; the README's setup prompt points to it. See [the skill][skill-onboarding].
+- The [onboarding guide][skill-onboarding] starts with the user's use case or a cookbook
+  and walks an agent through querying a local graph.
 
-[skill-onboarding]: ../docs/user/cli/index.md#give-an-agent-the-matching-skill
+[skill-onboarding]: ../skills/omnigraph/references/onboarding.md

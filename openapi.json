@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.15.1"
+    "version": "0.16.0"
   },
   "paths": {
     "/.well-known/oauth-protected-resource": {
@@ -17092,6 +17092,16 @@
           "operation_id"
         ],
         "properties": {
+          "datasets": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Only these datasets, each named by its type key (`node:<Type>`,\n`edge:<Type>`), in this order."
+          },
           "max_gate_hold_ms": {
             "type": [
               "integer",
@@ -17104,16 +17114,6 @@
           "operation_id": {
             "type": "string",
             "description": "A canonical ULID the caller chose; a repeated submission with the same\nrequest answers the existing record."
-          },
-          "tables": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "type": "string"
-            },
-            "description": "Only these table keys (`node:<Type>`, `edge:<Type>`), in this order."
           }
         },
         "additionalProperties": false

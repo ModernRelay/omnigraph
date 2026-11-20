@@ -84,7 +84,7 @@ cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --
 
 The embedded and served GQT suites and the DST suite are excluded by name;
 their commands and process environments are listed in
-[`docs/dev/testing.md`](docs/dev/testing.md).
+[`docs/dev/test-ownership.md`](docs/dev/test-ownership.md#commands).
 
 If you touch S3-backed flows, the CI model uses a local RustFS instance for
 integration tests.

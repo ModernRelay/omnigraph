@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
-use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
+use omnigraph::db::{ReadTarget, SnapshotId};
 use omnigraph::settings::{SessionSettings, SettingId, SettingValue, Source};
-use omnigraph::storage::{CapturedStorageBinding, storage_for_binding};
+use omnigraph::storage::CapturedStorageBinding;
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent, Session};
 use omnigraph_api_types::{
     AccessOutput, BlobReadQuery, BlobStatOutput, BlobWriteOutput, BlobWriteQuery,
@@ -25,6 +25,7 @@ use omnigraph_api_types::{
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
 use omnigraph_compiler::query::parser::parse_query;
+use omnigraph_compiler::result::QueryResult;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
@@ -40,7 +41,7 @@ use crate::command_outcome::{EngineWrite as _, EngineWriteError};
 use crate::graph_http::ApiContractError;
 use crate::graph_http::GraphHttpClient;
 use crate::helpers::{
-    PreconditionFailedCli, apply_bearer_token, branch_statement_change_request,
+    ContradictoryReply, PreconditionFailedCli, apply_bearer_token, branch_statement_change_request,
     branch_statement_query_request, missing_credential, precondition_failed_cli,
     query_params_from_json, remote_json_bounded, remote_no_content, remote_response_json_bounded,
     remote_url, resolve_actor_with_config, select_named_query,
@@ -79,9 +80,9 @@ fn validate_merge_receipt(
         {
             Ok(())
         }
-        _ => bail!(
-            "invalid merge response: outcome and commit disagree; effects are unknown; reconcile before retrying"
-        ),
+        _ => Err(ContradictoryReply::report(
+            "invalid merge response: outcome and commit disagree; effects are unknown; reconcile before retrying",
+        )),
     }
 }
 
@@ -94,14 +95,14 @@ fn validate_merge_output(
     dry_run: bool,
 ) -> Result<()> {
     if output.source != source || output.target != target {
-        bail!(
-            "invalid merge response: source or target differs from the request; effects are unknown; reconcile before retrying"
-        );
+        return Err(ContradictoryReply::report(
+            "invalid merge response: source or target differs from the request; effects are unknown; reconcile before retrying",
+        ));
     }
     if output.dry_run != dry_run {
-        bail!(
-            "invalid merge response: the dry-run flag contradicts the request; effects are unknown; reconcile before retrying"
-        );
+        return Err(ContradictoryReply::report(
+            "invalid merge response: the dry-run flag contradicts the request; effects are unknown; reconcile before retrying",
+        ));
     }
     if dry_run {
         // A dry run writes nothing: no commit, no deletion.
@@ -109,9 +110,9 @@ fn validate_merge_output(
             || output.branch_deleted.is_some()
             || output.branch_delete_error_details.is_some()
         {
-            bail!(
-                "invalid merge response: a dry run reported a write; effects are unknown; reconcile before retrying"
-            );
+            return Err(ContradictoryReply::report(
+                "invalid merge response: a dry run reported a write; effects are unknown; reconcile before retrying",
+            ));
         }
         return Ok(());
     }
@@ -126,9 +127,9 @@ fn validate_merge_output(
         .as_ref()
         .is_some_and(|commit| commit.published == as_commit)
     {
-        bail!(
-            "invalid merge response: the commit's publication state contradicts the request; effects are unknown; reconcile before retrying"
-        );
+        return Err(ContradictoryReply::report(
+            "invalid merge response: the commit's publication state contradicts the request; effects are unknown; reconcile before retrying",
+        ));
     }
     match (
         delete_branch,
@@ -137,9 +138,9 @@ fn validate_merge_output(
     ) {
         (false, None, None) | (true, Some(true), None) => Ok(()),
         (true, Some(false), Some(error)) if !error.error.is_empty() => Ok(()),
-        _ => bail!(
-            "invalid merge response: optional deletion result is incomplete or inconsistent; effects are unknown; reconcile before retrying"
-        ),
+        _ => Err(ContradictoryReply::report(
+            "invalid merge response: optional deletion result is incomplete or inconsistent; effects are unknown; reconcile before retrying",
+        )),
     }
 }
 
@@ -203,12 +204,16 @@ pub(crate) fn parse_set_flags(flags: &[String]) -> Result<Vec<(SettingId, Settin
 pub(crate) enum GraphClient {
     /// Local engine at `uri`. Reads (`resolve()`) leave `actor` empty;
     /// writes (`resolve_with_policy()`) attribute the resolved actor.
-    /// Direct-store access carries no Cedar policy (RFC-011: policy lives
-    /// in the cluster/server, not in per-operator addressing).
+    /// A writable open of a cluster graph installs the policy the cluster
+    /// applied to it (RFC-011: direct means no HTTP boundary, not unpoliced);
+    /// a standalone graph has none.
     Embedded {
         uri: String,
         actor: Option<String>,
         binding: Box<CapturedStorageBinding>,
+        /// The base of a graph shallow clone (`--base`): every open of
+        /// `uri` reads through this root and never writes it.
+        base: Option<String>,
     },
     /// Remote HTTP server. The actor is resolved server-side from the
     /// token; the client never sets identity.
@@ -223,6 +228,42 @@ pub(crate) enum GraphClient {
     /// read as `@` types, with no store opened. Serves read queries and
     /// `schema show`; every other verb is refused.
     Catalogue,
+}
+
+/// An ad-hoc read the engine in this process answered, on a direct target's
+/// store or on the catalogue scope, before any rendering.
+pub(crate) struct EngineRead {
+    query_name: String,
+    /// The target the read used; `None` on the catalogue scope, which has
+    /// no branches or snapshots.
+    target: Option<ReadTarget>,
+    pub(crate) result: QueryResult,
+    graph_commit_id: Option<String>,
+}
+
+impl EngineRead {
+    /// The `ReadOutput` a server renders for the same answer.
+    fn into_read_output(self) -> Result<ReadOutput> {
+        let Some(target) = self.target else {
+            let mut output = read_output(
+                self.query_name,
+                &ReadTarget::branch("main"),
+                self.result,
+                None,
+            )?;
+            output.target = omnigraph_api_types::ReadTargetOutput {
+                branch: None,
+                snapshot: None,
+            };
+            return Ok(output);
+        };
+        Ok(read_output(
+            self.query_name,
+            &target,
+            self.result,
+            self.graph_commit_id,
+        )?)
+    }
 }
 
 /// The refusal every verb outside the catalogue scope's reads answers.
@@ -320,6 +361,7 @@ impl GraphClient {
                     uri: binding.uri().to_owned(),
                     actor,
                     binding: Box::new(binding),
+                    base: target.base.clone(),
                 })
             }
             TargetBinding::Server { endpoint, auth, .. } => {
@@ -367,6 +409,7 @@ impl GraphClient {
             uri,
             actor,
             binding: Box::new(binding),
+            base: None,
         }
     }
 
@@ -407,14 +450,15 @@ impl GraphClient {
         matches!(self, GraphClient::Remote { .. })
     }
 
-    /// Writable verbs alone acquire durable cluster admission. Direct-store
-    /// access carries no Cedar policy (RFC-011), the actor rides the `_as` APIs.
+    /// Writable verbs alone acquire durable cluster admission. A cluster
+    /// graph's applied policy is installed on the handle, and the declared
+    /// actor rides the `_as` APIs into it.
     async fn open_write(
-        uri: &str,
         binding: &CapturedStorageBinding,
+        base: Option<&str>,
         stderr: &mut dyn Write,
     ) -> Result<Session> {
-        Self::open_write_session(uri, binding, &[], stderr).await
+        Self::open_write_session(binding, base, &[], stderr).await
     }
 
     /// Read dispatch uses no writable opener or retained writer admission.
@@ -422,9 +466,10 @@ impl GraphClient {
     async fn open_read_session(
         uri: &str,
         binding: &CapturedStorageBinding,
+        base: Option<&str>,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<Session> {
-        Self::open_read_session_with_external_blob_policy(uri, binding, settings, None).await
+        Self::open_read_session_with_external_blob_policy(uri, binding, base, settings, None).await
     }
 
     /// An embedded read session, with `external_blob_policy` installed on
@@ -433,11 +478,12 @@ impl GraphClient {
     async fn open_read_session_with_external_blob_policy(
         _uri: &str,
         binding: &CapturedStorageBinding,
+        base: Option<&str>,
         settings: &[(SettingId, SettingValue)],
         external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
     ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
-        let db = crate::admission::open_read_only_with_binding(binding, None).await?;
+        let db = crate::admission::open_read_only_with_binding(binding, base, None).await?;
         let db = match external_blob_policy {
             Some(policy) => db.with_external_blob_policy(policy)?,
             None => db,
@@ -453,12 +499,12 @@ impl GraphClient {
     /// environment's defaults and the `--set` values, every setting accepted;
     /// the source's own `set` lines apply per call, on top.
     async fn open_write_session(
-        uri: &str,
         binding: &CapturedStorageBinding,
+        base: Option<&str>,
         settings: &[(SettingId, SettingValue)],
         stderr: &mut dyn Write,
     ) -> Result<Session> {
-        Self::open_write_session_with_external_blob_policy(uri, binding, settings, None, stderr)
+        Self::open_write_session_with_external_blob_policy(binding, base, settings, None, stderr)
             .await
     }
 
@@ -466,16 +512,15 @@ impl GraphClient {
     /// its fresh handle when given: the one way a CLI run admits a source
     /// outside the graph (a `load csv "file://…"` statement run directly).
     async fn open_write_session_with_external_blob_policy(
-        uri: &str,
         binding: &CapturedStorageBinding,
+        base: Option<&str>,
         settings: &[(SettingId, SettingValue)],
         external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
         stderr: &mut dyn Write,
     ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
-        crate::admission::ensure_graph_with_binding(binding, stderr).await?;
-        crate::command_outcome::writable_open();
-        let db = Omnigraph::open_with_storage(uri, storage_for_binding(binding)?).await?;
+        let storage = crate::admission::embedded_storage(binding, base);
+        let db = crate::admission::open_writable(binding, storage, stderr).await?;
         let db = match external_blob_policy {
             Some(policy) => db.with_external_blob_policy(policy)?,
             None => db,
@@ -579,8 +624,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let session = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let session = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let mut branches = session.branch_list().await?;
                 branches.sort();
                 Ok(BranchListOutput {
@@ -614,8 +661,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let session = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let session = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let listing = session.branch_list_detailed(&mut |_| true).await?;
                 Ok(branch_list_output(&listing))
             }
@@ -643,8 +692,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let db = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let db = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await?;
                 let internal_schema_version = db.internal_schema_version_at(&snapshot).await?;
                 snapshot_payload(branch, &snapshot, internal_schema_version)
@@ -674,8 +725,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let db = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let db = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 Ok(SchemaOutput {
                     schema_source: db.schema_source().to_string(),
                     system_columns: Some(db.catalog().system_columns.into()),
@@ -782,8 +835,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let db = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let db = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let commits = db
                     .list_commits(branch)
                     .await?
@@ -839,8 +894,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let db = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let db = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let page = db.list_commits_page(branch, page_token, limit).await?;
                 Ok(CommitListOutput {
                     commits: page.commits.iter().map(commit_output).collect(),
@@ -886,8 +943,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let db = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let db = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let commits = db
                     .list_unpublished_commits(branch)
                     .await?
@@ -938,8 +997,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let db = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let db = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let commits = db
                     .list_unattached_commits(branch)
                     .await?
@@ -976,8 +1037,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let session = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let session = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 Ok(commit_output(&session.get_commit(commit_id).await?))
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("get commit")),
@@ -1030,8 +1093,11 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let session = Self::open_read_session(uri, binding, settings).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let session =
+                    Self::open_read_session(uri, binding, base.as_deref(), settings).await?;
                 let scope = change_scope(filter.kinds, filter.types, filter.ops);
                 let page = session
                     .commit_changes_page(commit_id, &scope, page_token, limit, None)
@@ -1105,8 +1171,11 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let session = Self::open_read_session(uri, binding, settings).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let session =
+                    Self::open_read_session(uri, binding, base.as_deref(), settings).await?;
                 let position = if let Some(token) = page_token {
                     omnigraph::changes::ChangeFeedPosition::PageToken(token.to_string())
                 } else if let Some(cursor) = cursor {
@@ -1202,8 +1271,10 @@ impl GraphClient {
                     })?;
                 Ok(record.baseline)
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let db = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let db = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let scope = change_scope(filter.kinds, filter.types, filter.ops);
                 let baseline = db
                     .capture_change_baseline(branch.unwrap_or("main"), &scope, writer)
@@ -1267,13 +1338,15 @@ impl GraphClient {
                 remote_response_json_bounded(response, token.as_deref(), *response_limit).await
             }
             GraphClient::Embedded {
-                uri,
+                uri: _,
                 actor,
                 binding,
+                base,
             } => {
                 refuse_noncanonical_branches([Some(branch), from])?;
                 let data = std::fs::read_to_string(data)?;
-                let session = Self::open_write_session(uri, binding, settings, stderr).await?;
+                let session =
+                    Self::open_write_session(binding, base.as_deref(), settings, stderr).await?;
                 // A missing branch is forked first, which publishes on its
                 // own; the engine marks a later refusal as following it.
                 let receipt = session
@@ -1350,15 +1423,17 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded {
-                uri,
+                uri: _,
                 actor,
                 binding,
+                base,
             } => {
                 let (selected_name, query_params) =
                     select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
                 refuse_noncanonical_branches([branch])?;
-                let session = Self::open_write_session(uri, binding, settings, stderr).await?;
+                let session =
+                    Self::open_write_session(binding, base.as_deref(), settings, stderr).await?;
                 let actor = actor.as_deref();
                 let receipt = session
                     .mutate_as_with_optional_branch_receipt(
@@ -1443,15 +1518,15 @@ impl GraphClient {
                         merge,
                     }) = &output.outcome
                     else {
-                        bail!(
-                            "invalid merge response: missing merge outcome; effects are unknown; reconcile before retrying"
-                        );
+                        return Err(ContradictoryReply::report(
+                            "invalid merge response: missing merge outcome; effects are unknown; reconcile before retrying",
+                        ));
                     };
                     if actual_source != source || actual_target != target || output.branch != target
                     {
-                        bail!(
-                            "invalid merge response: source or target differs from the request; effects are unknown; reconcile before retrying"
-                        );
+                        return Err(ContradictoryReply::report(
+                            "invalid merge response: source or target differs from the request; effects are unknown; reconcile before retrying",
+                        ));
                     }
                     validate_merge_receipt(
                         *merge,
@@ -1464,17 +1539,18 @@ impl GraphClient {
                         .as_ref()
                         .is_some_and(|commit| commit.published == *as_commit)
                     {
-                        bail!(
-                            "invalid merge response: the commit's publication state contradicts the request; effects are unknown; reconcile before retrying"
-                        );
+                        return Err(ContradictoryReply::report(
+                            "invalid merge response: the commit's publication state contradicts the request; effects are unknown; reconcile before retrying",
+                        ));
                     }
                 }
                 Ok(output)
             }
             GraphClient::Embedded {
-                uri,
+                uri: _,
                 actor,
                 binding,
+                base,
             } => {
                 let query_name = write.statement_name().to_string();
                 let (branch, commit, outcome) = match write {
@@ -1508,7 +1584,8 @@ impl GraphClient {
                     } => {
                         let target = into.unwrap_or_else(|| "main".to_string());
                         let mut session =
-                            Self::open_write_session(uri, binding, settings, stderr).await?;
+                            Self::open_write_session(binding, base.as_deref(), settings, stderr)
+                                .await?;
                         Self::apply_prefix(&mut session, query_source)?;
                         let result = session
                             .branch_merge_as_with_options(
@@ -1593,20 +1670,22 @@ impl GraphClient {
                     _ => false,
                 };
                 if !answered {
-                    bail!(
+                    return Err(ContradictoryReply::report(format!(
                         "invalid `{}` response: the outcome does not describe the requested commit; effects are unknown; reconcile before retrying",
                         write.statement_name()
-                    );
+                    )));
                 }
                 Ok(output)
             }
             GraphClient::Embedded {
-                uri,
+                uri: _,
                 actor,
                 binding,
+                base,
             } => {
                 let query_name = write.statement_name().to_string();
-                let mut session = Self::open_write_session(uri, binding, settings, stderr).await?;
+                let mut session =
+                    Self::open_write_session(binding, base.as_deref(), settings, stderr).await?;
                 Self::apply_prefix(&mut session, query_source)?;
                 let target = session
                     .get_commit(write.graph_commit_id())
@@ -1685,15 +1764,16 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded {
-                uri,
+                uri: _,
                 actor,
                 binding,
+                base,
             } => {
                 let query_name = stmt.statement_name().to_string();
                 let request = omnigraph::loader::CsvLoadRequest::from_statement(&stmt);
                 let mut session = Self::open_write_session_with_external_blob_policy(
-                    uri,
                     binding,
+                    base.as_deref(),
                     settings,
                     external_blob_policy,
                     stderr,
@@ -1747,11 +1827,13 @@ impl GraphClient {
                 .await?
             }
             GraphClient::Embedded {
-                uri,
+                uri: _,
                 actor,
                 binding,
+                base,
             } => {
-                let session = Self::open_write_session(uri, binding, &[], stderr).await?;
+                let session =
+                    Self::open_write_session(binding, base.as_deref(), &[], stderr).await?;
                 commit_output(
                     &session
                         .publish_commit_as(commit_id, actor.as_deref())
@@ -1762,9 +1844,9 @@ impl GraphClient {
             GraphClient::Catalogue => return Err(catalogue_scope_refusal("commit publish")),
         };
         if !published.published || published.graph_commit_id != commit_id {
-            bail!(
-                "invalid `commit publish` response: the answer does not describe the requested commit as published; effects are unknown; reconcile before retrying"
-            );
+            return Err(ContradictoryReply::report(
+                "invalid `commit publish` response: the answer does not describe the requested commit as published; effects are unknown; reconcile before retrying",
+            ));
         }
         Ok(published)
     }
@@ -1789,11 +1871,13 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded {
-                uri,
+                uri: _,
                 actor,
                 binding,
+                base,
             } => {
-                let session = Self::open_write_session(uri, binding, &[], stderr).await?;
+                let session =
+                    Self::open_write_session(binding, base.as_deref(), &[], stderr).await?;
                 session
                     .drop_commit_as(commit_id, actor.as_deref())
                     .await
@@ -1873,8 +1957,11 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let session = Self::open_read_session(uri, binding, settings).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let session =
+                    Self::open_read_session(uri, binding, base.as_deref(), settings).await?;
                 Ok(branch_read_output(&session.branch_read(&read).await?)?)
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("branch read statement")),
@@ -1912,8 +1999,11 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let mut session = Self::open_read_session(uri, binding, settings).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let mut session =
+                    Self::open_read_session(uri, binding, base.as_deref(), settings).await?;
                 Self::apply_prefix(&mut session, query_source)?;
                 Ok(show_read_output(&session.show(id))?)
             }
@@ -1965,21 +2055,45 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
+            GraphClient::Embedded { .. } | GraphClient::Catalogue => self
+                .engine_query(target, query_source, query_name, params_json, settings)
+                .await?
+                .into_read_output(),
+        }
+    }
+
+    /// Run an ad-hoc read on the engine in this process, a direct target's or
+    /// the catalogue scope's, and keep its answer as the engine gave it: the
+    /// batches every format renders, under the session's read limits.
+    /// `--format arrow` writes them unrendered. A served target runs the read
+    /// on its server, which answers JSON, so it has no engine answer.
+    pub(crate) async fn engine_query(
+        &self,
+        target: Option<ReadTarget>,
+        query_source: &str,
+        query_name: Option<&str>,
+        params_json: Option<&Value>,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<EngineRead> {
+        match self {
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
                 let (selected_name, query_params) =
                     select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
-                let session = Self::open_read_session(uri, binding, settings).await?;
+                let session =
+                    Self::open_read_session(uri, binding, base.as_deref(), settings).await?;
                 let target = target.unwrap_or_else(|| ReadTarget::branch("main"));
                 let (result, graph_commit_id) = session
                     .query_with_head(target.clone(), query_source, &selected_name, &params)
                     .await?;
-                Ok(read_output(
-                    selected_name,
-                    &target,
+                Ok(EngineRead {
+                    query_name: selected_name,
+                    target: Some(target),
                     result,
                     graph_commit_id,
-                )?)
+                })
             }
             GraphClient::Catalogue => {
                 if target.is_some() {
@@ -1993,13 +2107,15 @@ impl GraphClient {
                 let params = query_params_from_json(&query_params, params_json)?;
                 let scope = Self::catalogue_scope(settings)?;
                 let result = scope.query(query_source, &selected_name, &params).await?;
-                let mut output =
-                    read_output(selected_name, &ReadTarget::branch("main"), result, None)?;
-                output.target = omnigraph_api_types::ReadTargetOutput {
-                    branch: None,
-                    snapshot: None,
-                };
-                Ok(output)
+                Ok(EngineRead {
+                    query_name: selected_name,
+                    target: None,
+                    result,
+                    graph_commit_id: None,
+                })
+            }
+            GraphClient::Remote { .. } => {
+                Err(crate::read_format::arrow_has_no_batches("a served answer"))
             }
         }
     }
@@ -2020,24 +2136,48 @@ impl GraphClient {
                 self.query(Some(target), query_source, None, None, settings)
                     .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
+            GraphClient::Embedded { .. } | GraphClient::Catalogue => self
+                .engine_explain_load(target, query_source, stmt, external_blob_policy, settings)
+                .await?
+                .into_read_output(),
+        }
+    }
+
+    /// `explain load csv …` on a direct target's engine, its plan rows kept
+    /// as the engine gave them; see [`Self::engine_query`].
+    pub(crate) async fn engine_explain_load(
+        &self,
+        target: ReadTarget,
+        query_source: &str,
+        stmt: omnigraph_compiler::query::ast::LoadStmt,
+        external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<EngineRead> {
+        match self {
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
                 let mut session = Self::open_read_session_with_external_blob_policy(
                     uri,
                     binding,
+                    base.as_deref(),
                     settings,
                     external_blob_policy,
                 )
                 .await?;
                 Self::apply_prefix(&mut session, query_source)?;
                 let (result, graph_commit_id) = session.explain_load(target.clone(), &stmt).await?;
-                Ok(read_output(
-                    stmt.statement_name().to_string(),
-                    &target,
+                Ok(EngineRead {
+                    query_name: stmt.statement_name().to_string(),
+                    target: Some(target),
                     result,
                     graph_commit_id,
-                )?)
+                })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("explain load")),
+            GraphClient::Remote { .. } => {
+                Err(crate::read_format::arrow_has_no_batches("a served answer"))
+            }
         }
     }
 
@@ -2184,8 +2324,9 @@ impl GraphClient {
                 uri,
                 actor,
                 binding,
+                base,
             } => {
-                let db = Self::open_write(uri, binding, stderr).await?;
+                let db = Self::open_write(binding, base.as_deref(), stderr).await?;
                 let actor = actor.as_deref();
                 let created = db
                     .branch_create_from_as(start, name, actor)
@@ -2231,8 +2372,9 @@ impl GraphClient {
                 uri,
                 actor,
                 binding,
+                base,
             } => {
-                let db = Self::open_write(uri, binding, stderr).await?;
+                let db = Self::open_write(binding, base.as_deref(), stderr).await?;
                 let actor = actor.as_deref();
                 db.branch_delete_as(name, actor).await.engine_write()?;
                 Ok(BranchDeleteOutput {
@@ -2290,9 +2432,11 @@ impl GraphClient {
                 uri,
                 actor,
                 binding,
+                base,
             } if dry_run => {
                 // A read of both branches, composed as the server's dry run.
-                let session = Self::open_read_session(uri, binding, settings).await?;
+                let session =
+                    Self::open_read_session(uri, binding, base.as_deref(), settings).await?;
                 let result = session.branch_merge_dry_run(source, into).await?;
                 BranchMergeOutput {
                     source: source.to_string(),
@@ -2306,11 +2450,13 @@ impl GraphClient {
                 }
             }
             GraphClient::Embedded {
-                uri,
+                uri: _,
                 actor,
                 binding,
+                base,
             } => {
-                let session = Self::open_write_session(uri, binding, settings, stderr).await?;
+                let session =
+                    Self::open_write_session(binding, base.as_deref(), settings, stderr).await?;
                 let actor = actor.as_deref();
                 let result = session
                     .branch_merge_as_with_options(source, into, actor, as_commit)
@@ -2397,8 +2543,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let session = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let session = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let sides = match sides {
                     DiffSidesArg::Between { from, to } => {
                         omnigraph::changes::GraphDiffSides::Between {
@@ -2454,8 +2602,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let session = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let session = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let base = session.merge_base(source, target).await?;
                 Ok(merge_base_output(source, target, &base))
             }
@@ -2483,8 +2633,9 @@ impl GraphClient {
                 uri,
                 actor,
                 binding,
+                base,
             } => {
-                let db = Self::open_write(uri, binding, stderr).await?;
+                let db = Self::open_write(binding, base.as_deref(), stderr).await?;
                 let result = db
                     .apply_schema_as_with_catalog_check(schema_source, actor.as_deref(), validate)
                     .await
@@ -2540,8 +2691,10 @@ impl GraphClient {
                 writer.flush()?;
                 Ok(())
             }
-            GraphClient::Embedded { uri, binding, .. } => {
-                let db = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let db = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 db.export_jsonl_to_writer(branch, type_names, writer)
                     .await?;
                 writer.flush()?;
@@ -2560,8 +2713,10 @@ impl GraphClient {
         writer: &mut W,
     ) -> Result<()> {
         match self {
-            GraphClient::Embedded { uri, binding, .. } => {
-                let db = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let db = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let read = db
                     .read_blob_at(blob_read_target(query), blob_cell(query))
                     .await
@@ -2664,8 +2819,10 @@ impl GraphClient {
     /// external references are classified without probing their target.
     pub(crate) async fn blob_stat(&self, query: &BlobReadQuery) -> Result<BlobStatOutput> {
         match self {
-            GraphClient::Embedded { uri, binding, .. } => {
-                let db = Self::open_read_session(uri, binding, &[]).await?;
+            GraphClient::Embedded {
+                uri, binding, base, ..
+            } => {
+                let db = Self::open_read_session(uri, binding, base.as_deref(), &[]).await?;
                 let read = db
                     .read_blob_at(blob_read_target(query), blob_cell(query))
                     .await
@@ -2733,11 +2890,13 @@ impl GraphClient {
         let branch = query.branch.as_deref().unwrap_or("main");
         match self {
             GraphClient::Embedded {
-                uri,
+                uri: _,
                 actor,
                 binding,
+                base,
             } => {
-                let session = Self::open_write_session(uri, binding, &[], stderr).await?;
+                let session =
+                    Self::open_write_session(binding, base.as_deref(), &[], stderr).await?;
                 let cell = blob_write_cell(query);
                 let outcome = match bytes {
                     Some(bytes) => {

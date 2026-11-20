@@ -28,7 +28,7 @@ const DIFFERENT_REQUEST: i32 = 4;
 const ANOTHER_ACTIVE: i32 = 75;
 
 pub(crate) struct ServedOptimize {
-    pub(crate) tables: Vec<String>,
+    pub(crate) datasets: Vec<String>,
     pub(crate) max_gate_hold: Option<Duration>,
     pub(crate) no_wait: bool,
     pub(crate) operation: Option<String>,
@@ -41,6 +41,8 @@ pub(crate) struct ServedOptimize {
 enum Refusal {
     /// The id names another request.
     DifferentRequest,
+    /// The credential resolves to another actor than `--as` asserts.
+    ActorMismatch,
     /// Another operation holds the scope's active slot.
     AnotherActive,
     /// Refused before acceptance: nothing ran.
@@ -60,6 +62,9 @@ fn classify(error: &color_eyre::Report) -> Refusal {
             .starts_with("[operation_request_mismatch]") =>
         {
             Refusal::DifferentRequest
+        }
+        412 if remote.output.code == Some(omnigraph_api_types::ErrorCode::ActorMismatch) => {
+            Refusal::ActorMismatch
         }
         429 => Refusal::AnotherActive,
         // A server error that says it took no effect (routes off, admission
@@ -104,11 +109,13 @@ fn classify_lookup(error: &color_eyre::Report) -> LookupAnswer {
 
 fn request_body(request: &ServedOptimize, operation_id: &str) -> Value {
     let mut body = json!({ "operation_id": operation_id });
-    if !request.tables.is_empty() {
-        body["tables"] = json!(request.tables);
+    if !request.datasets.is_empty() {
+        body["datasets"] = json!(request.datasets);
     }
     if let Some(hold) = request.max_gate_hold {
-        body["max_gate_hold_ms"] = json!(hold.as_millis() as u64);
+        // Saturating: a wrapped value would ask the server for a shorter
+        // hold than the caller named; one past its ceiling is refused.
+        body["max_gate_hold_ms"] = json!(u64::try_from(hold.as_millis()).unwrap_or(u64::MAX));
     }
     body
 }
@@ -161,7 +168,10 @@ pub(crate) async fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let deadline = request.timeout.map(|timeout| Instant::now() + timeout);
+    // A timeout the clock cannot add to now never ends the wait.
+    let deadline = request
+        .timeout
+        .and_then(|timeout| Instant::now().checked_add(timeout));
     let (operation_id, mut answer) = match &request.operation {
         Some(id) => match within(deadline, client.operation(id)).await {
             Some(answer) => (id.clone(), answer),
@@ -182,6 +192,10 @@ pub(crate) async fn run(
                     Refusal::DifferentRequest => {
                         writeln!(stderr, "error: {error}")?;
                         return Ok(Completion::exit(DIFFERENT_REQUEST));
+                    }
+                    Refusal::ActorMismatch => {
+                        writeln!(stderr, "error: {error}")?;
+                        return Ok(Completion::exit(crate::EXIT_PRECONDITION_FAILED));
                     }
                     Refusal::AnotherActive => {
                         writeln!(stderr, "error: {error}")?;
@@ -287,16 +301,25 @@ fn write_record(
     let state = operation["state"].as_str().unwrap_or("unknown");
     writeln!(stdout, "optimize {state} — operation {operation_id}")?;
     let outcome = &operation["outcome"];
-    if let Some(tables) = outcome["tables"].as_array() {
+    if let Some(tables) = outcome["datasets"].as_array() {
         for table in tables {
             let subject = graph_type_subject(table["type_key"].as_str().unwrap_or(""));
             let outcome = table["outcome"].as_str().unwrap_or("");
             match outcome {
-                "optimized" => writeln!(
-                    stdout,
-                    "  {subject:<40} frags {} → {} ✓",
-                    table["fragments_removed"], table["fragments_added"]
-                )?,
+                "optimized" => {
+                    writeln!(
+                        stdout,
+                        "  {subject:<40} frags {} → {} ✓",
+                        table["fragments_removed"], table["fragments_added"]
+                    )?;
+                    if table["reason"].as_str() == Some("index_failed") {
+                        let first = table["detail"]
+                            .as_str()
+                            .and_then(|detail| detail.lines().next())
+                            .unwrap_or("unknown error");
+                        writeln!(stdout, "    ↳ index maintenance incomplete: {first}")?;
+                    }
+                }
                 "unchanged" => writeln!(stdout, "  {subject:<40} no-op")?,
                 _ => {
                     let detail = table["detail"].as_str().or(table["reason"].as_str());
@@ -307,6 +330,18 @@ fn write_record(
                 }
             }
         }
+    }
+    // Past the record's cap the tables are counted, not listed: per outcome
+    // code and reason, so an index failure there still shows.
+    if let Some(more) = outcome["more_datasets"].as_object()
+        && !more.is_empty()
+    {
+        let counts = more
+            .iter()
+            .map(|(key, count)| format!("{key} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(stdout, "  not listed: {counts}")?;
     }
     if let Some(commit) = operation["published_commit"].as_str() {
         writeln!(stdout, "graph commit: {commit}")?;
@@ -386,6 +421,18 @@ mod tests {
             Refusal::BeforeAcceptance
         );
         assert_eq!(
+            classify(&remote(
+                412,
+                "actor_mismatch",
+                "the credential is another actor"
+            )),
+            Refusal::ActorMismatch
+        );
+        assert_eq!(
+            classify(&remote(412, "precondition_failed", "graph moved")),
+            Refusal::BeforeAcceptance
+        );
+        assert_eq!(
             classify(&remote(429, "too_many_requests", "active")),
             Refusal::AnotherActive
         );
@@ -426,7 +473,7 @@ mod tests {
     #[test]
     fn the_request_carries_only_what_was_asked() {
         let request = ServedOptimize {
-            tables: vec!["node:Person".to_string()],
+            datasets: vec!["node:Person".to_string()],
             max_gate_hold: Some(Duration::from_secs(30)),
             no_wait: false,
             operation: None,
@@ -437,9 +484,83 @@ mod tests {
             request_body(&request, "01JC0000000000000000000001"),
             json!({
                 "operation_id": "01JC0000000000000000000001",
-                "tables": ["node:Person"],
+                "datasets": ["node:Person"],
                 "max_gate_hold_ms": 30_000,
             })
+        );
+        // A hold past `u64` milliseconds saturates instead of wrapping to a
+        // short one the server would accept.
+        let longest = ServedOptimize {
+            datasets: Vec::new(),
+            max_gate_hold: Some(Duration::from_secs(u64::MAX)),
+            ..request
+        };
+        assert_eq!(
+            request_body(&longest, "01JC0000000000000000000001"),
+            json!({
+                "operation_id": "01JC0000000000000000000001",
+                "max_gate_hold_ms": u64::MAX,
+            })
+        );
+    }
+
+    /// The record lists its tables under `datasets`. An optimized table whose
+    /// index link failed says so under its line, and the tables past the
+    /// record's cap are shown as counts per outcome code and reason.
+    #[test]
+    fn a_record_prints_an_index_failure_and_the_tables_it_does_not_list() {
+        let record = json!({
+            "operation": {
+                "state": "succeeded",
+                "published_commit": "hb1.child",
+                "outcome": {
+                    "datasets": [
+                        {
+                            "type_key": "node:Person",
+                            "outcome": "optimized",
+                            "reason": "index_failed",
+                            "detail": "storage: index build lost\nsecond line",
+                            "fragments_removed": 3,
+                            "fragments_added": 1,
+                        },
+                        {
+                            "type_key": "node:Doc",
+                            "outcome": "optimized",
+                            "fragments_removed": 2,
+                            "fragments_added": 1,
+                        },
+                        {
+                            "type_key": "edge:Knows",
+                            "outcome": "deferred",
+                            "reason": "gate_hold_limit",
+                        },
+                    ],
+                    "more_datasets": { "optimized": 4, "optimized:index_failed": 1 },
+                },
+            },
+        });
+        let mut out = Vec::new();
+        write_record("01JC0000000000000000000001", &record, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("↳ index maintenance incomplete"))
+                .copied()
+                .collect::<Vec<_>>(),
+            ["↳ index maintenance incomplete: storage: index build lost"],
+            "{text}"
+        );
+        assert!(
+            lines.contains(&"not listed: optimized 4, optimized:index_failed 1"),
+            "{text}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.ends_with("deferred (gate_hold_limit)")),
+            "{text}"
         );
     }
 }

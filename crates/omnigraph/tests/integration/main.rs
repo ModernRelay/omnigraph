@@ -40,6 +40,7 @@ mod point_in_time;
 mod proptest_equivalence;
 mod recovery;
 mod recovery_probe;
+mod repro_issue_1442;
 mod repro_issue_563;
 mod repro_issue_703;
 mod repro_issue_723;

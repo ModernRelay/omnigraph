@@ -28,7 +28,25 @@ endpoints; other cloud-direct and catalogue targets are unsupported. Use `./name
 relative filesystem address; a bare name selects a registered target.
 `init --schema graph.pg ./graph.omni` remains a creation convenience and refuses `--target`.
 
-`--as ACTOR` attributes supported direct operations. A served target derives its
+`--base URI` opens a direct graph target as a graph shallow clone of the graph
+at `URI`: a read falls through to the base where the target has no object of its
+own, every write lands in the target, and the base is never written. Both are
+local directories or `s3://` prefixes of one endpoint (an S3 pair reads the
+standard `AWS_*` environment, and the clone's `s3://` prefix is named inline as
+the target, the one inline `s3://` graph the CLI admits); a target that contains
+its base, or lies inside it, is refused. The option applies to `query`, `mutate`, `load`, `branch`,
+`commit`, `changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`;
+maintenance and schema changes keep the one root they are given. A fresh target
+directory or prefix is a new clone; the same target again shows the clone's own
+state. Nothing in the target records its base, so pass the same `--base` on
+every open of that target; a clone root opened without `--base` is refused,
+since its marker says it is a clone and not which base it was cloned from.
+A target that already holds objects but no clone marker, an ordinary graph
+for example, is refused under `--base` before anything is written.
+
+`--as ACTOR` attributes supported direct operations; on a cluster graph the
+applied graph policy judges them by it ([direct writes](../operations/policy.md#actor-identity)).
+A served target derives its
 actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
 exiting 4 on a mismatch ([Assert the actor](../operations/server.md#assert-the-actor));
 a managed target refuses it. `--yes` supplies noninteractive consent for destructive
@@ -77,6 +95,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its resource credential, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server or managed |
 | `studio` | Open Omnigraph Studio on a server target through an `omnigraph-studio://open` link and print it; no request or credential; `--json` adds the `binding` and `home` digests ([Open Studio](studio.md)) | server |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
+| `organization list` | List the organizations you are an active member of, marking the profile's ([your organizations](managed-team.md#find-your-organizations)) | profile |
 | `organization members/invitations` | List members, set service roles, offboard and manage invitations; see [team access](managed-team.md) | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
 | `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
@@ -96,12 +115,18 @@ params; see [Work with branches](index.md#work-with-branches)), or one
 `explain` statement, `query -e 'explain query q() { … }'`, answering the plan
 as rows under the query's own target and params; see [Explain](../queries/explain.md).
 
-Read output supports `table`, `json`, `jsonl`, `csv`, `kv`, and `toon`. With no
+Read output supports `table`, `json`, `jsonl`, `csv`, `kv`, `toon`, and, for
+`query`, `arrow`. With no
 `--format`, no `--json`, and no `defaults.output`, a read prints a table. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
 cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
-`table` and `kv` print strings unquoted. CSV writes an empty string as `""`
-and quotes fields containing a comma, double quote, or line break. `--format json` prints the
+`table` and `kv` print strings unquoted. CSV writes a null as an empty field
+and an empty string as `""`, and quotes fields containing a comma, double
+quote, or line break, so [`load csv`](../mutations/index.md#csv-loading)
+reads a null back as null and the string `null` as that string. `load csv`
+also reads `""` as null, because it has no spelling for an empty string, and
+it skips empty lines, so a null row of a one-column result is not loaded back.
+`--format json` prints the
 envelope pretty and the `rows` array compact. `--format toon` encodes that same
 document as [TOON](https://github.com/toon-format/spec) (specification 4.4,
 comma delimiter, two-space indent). `rows` declares its fields once when every
@@ -110,6 +135,37 @@ non-uniform and TOON repeats every key. Numbers use TOON's canonical spelling,
 so an integral value is `1` where the JSON writer may spell `1.0`. The CLI ends
 the TOON document with a newline. The HTTP API returns JSON. A refusal follows
 [Diagnostics](../queries/diagnostics.md).
+
+`query --format arrow` writes the result's columns and rows to stdout as one
+[Arrow IPC stream](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format),
+which Arrow readers such as pyarrow and Polars read. Each column keeps its
+declared Arrow type, and a null stays a null. The stream holds the result
+alone: the `graph_commit_id`, target and `ranking` of the JSON document are not
+in it. Only a query that this process runs on a direct target, including an
+`explain` statement, has result batches to write. Three cases refuse `arrow`
+before the read runs, and exit 1: a served target, whose server answers JSON
+(refused before its credential is read); a control statement such as
+`branch list` or `show`; and a stdout that is a terminal, so redirect it, for
+example `> result.arrow`. Stdout therefore holds the whole stream, or, when a
+write to it fails, part of one and a nonzero exit. `alias` and
+`defaults.output` do not offer `arrow`. To stream a whole branch, use
+[`export`](#commands), which writes JSONL.
+
+### Invocation statistics
+
+`--stats PATH` writes one JSON document when the invocation ends, a refusal
+before the command dispatches included: `stats_version` (`1`), `elapsed_ms`
+(the invocation from target resolution to its last byte of output), `exit_code`
+(the code the process exits with), `storage` with the logical object-store
+calls the engine issued on the `manifest` and `table` planes of a direct target
+(`get`, `put`, `put_part`, `head`, `list`, `delete`, `copy`, `rename`,
+`multipart_complete`, `multipart_abort`; every direct target counts, a local
+directory included; a served target issues none in this process, so both planes
+read zero there), and `peak_rss_bytes` where the platform reports it. One
+logical call may fan out into several requests below the engine, so these are
+never request or cost counts. The document is the whole invocation, not one
+statement, and a document that cannot be written fails the command after it
+ran, so a write it carried has committed.
 
 ### Machine-readable read and write positions
 

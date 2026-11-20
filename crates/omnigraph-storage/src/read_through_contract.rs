@@ -176,8 +176,10 @@ pub async fn a_durable_store_keeps_its_whiteouts_out_of_sight(fixture: &dyn Fixt
         .unwrap();
     store.delete(&graph("c.txt")).await.unwrap();
     store.delete(&graph("a.txt")).await.unwrap();
+    let mut layer_keys = keys(layer.as_ref(), Some("graph/__clone")).await;
+    layer_keys.sort();
     assert_eq!(
-        keys(layer.as_ref(), Some("graph/__clone")).await,
+        layer_keys,
         vec!["graph/__clone/created", "graph/__clone/deleted/a.txt"],
         "the created object and one whiteout per deleted base object, nothing for a clone-root key"
     );
@@ -216,6 +218,47 @@ pub async fn durable_refuses_a_base_that_holds_an_object_at_the_reserved_name(
     assert!(
         error.contains("the base holds an object named __clone"),
         "{error}"
+    );
+}
+
+/// A layer that holds objects under the mount but no `__clone/created` is
+/// not a clone root: it is refused before any write, so the refusal leaves
+/// it as it was. Objects outside the mount do not count.
+pub async fn durable_refuses_a_layer_that_is_not_a_clone_root(fixture: &dyn Fixture) {
+    let base = fixture.base(&[("a.txt", "base a")]).await;
+    let layer = fixture.clone_root().await;
+    layer
+        .put(
+            &Path::from("elsewhere/x.txt"),
+            PutPayload::from_static(b"x"),
+        )
+        .await
+        .unwrap();
+    drop(durable(&layer, &base).await);
+    assert!(layer.head(&graph("__clone/created")).await.is_ok());
+
+    let layer = fixture.clone_root().await;
+    layer
+        .put(
+            &graph("_versions/1.manifest"),
+            PutPayload::from_static(b"m"),
+        )
+        .await
+        .unwrap();
+    let frozen = FrozenDirectory::over(base).await.unwrap();
+    let error = ReadThroughStore::durable(Arc::clone(&layer), frozen, Path::from(PREFIX))
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("it is not a clone root"), "{error}");
+    assert!(error.contains("graph/_versions/1.manifest"), "{error}");
+    assert!(
+        matches!(
+            layer.head(&graph("__clone/created")).await,
+            Err(Error::NotFound { .. })
+        ),
+        "the refusal writes no marker"
     );
 }
 

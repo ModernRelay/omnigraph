@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use omnigraph::Session;
+use omnigraph::db::ReadTarget;
 use omnigraph::loader::LoadMode;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -157,6 +158,25 @@ fn batch_bound(message: impl Into<String>, fix: impl Into<String>) -> CaseError 
     CaseError::new(CaseErrorCode::BatchBound, message).fix(fix)
 }
 
+/// The bound every recipe that loads shares: at least one nonempty batch;
+/// `fix` names the site's own spelling of an empty fixture.
+pub(crate) fn require_batches(generated: &Generated, fix: &str) -> Result<(), CaseError> {
+    if generated.call_count() == 0 {
+        return Err(batch_bound(
+            "a generated load requires at least one nonempty batch; empty recipes are admitted only as seeds",
+            fix,
+        ));
+    }
+    Ok(())
+}
+
+/// A rule the `--- branches` header breaks.
+fn branches_header(message: impl Into<String>) -> CaseError {
+    CaseError::new(CaseErrorCode::BodyShape, message).fix(
+        "write `--- branches generate: v1 seed: <u64> count: <n> prefix: <name> [from: <branch>]`; the message names the key",
+    )
+}
+
 impl Seed {
     pub(crate) fn parse(header: &str, body: String) -> Result<Self, CaseError> {
         if header == "seed" {
@@ -226,6 +246,145 @@ pub(crate) fn parse_arguments(
         return Err("generated load branch must not be empty".into());
     }
     Ok((seed, mode, branch.to_string()))
+}
+
+/// The most branches a `--- branches` section declares, the loop's cap.
+const MAX_BRANCHES: u64 = 10_000;
+/// The one marker a branches recipe admits: the branch's own name.
+pub const BRANCH_MARKER: &str = "${branch}";
+
+/// The `--- branches generate: v1 seed: <u64> count: <n> prefix: <name>
+/// [from: <branch>]` fixture section: `count` branches named `<prefix><i>`,
+/// `i` decimal from zero, forked from `from` after the seed loads and each
+/// loaded with the recipe, `${branch}` in it bound to the branch's name. State
+/// the case declares, built before step 1: no step, label or report row.
+#[derive(Debug)]
+pub struct Branches {
+    seed: u64,
+    count: u64,
+    prefix: String,
+    from: String,
+    /// The recipe text with `${branch}` unresolved; `None` forks bare branches.
+    recipe: Option<String>,
+}
+
+impl Branches {
+    /// The header and the recipe text; the caller has refused every `${`
+    /// that is not `${branch}` line by line, so the recipe is validated once
+    /// here, with the longest name substituted.
+    pub(crate) fn parse(arguments: &str, body: &str) -> Result<Self, CaseError> {
+        let mut branches = parse_branches_arguments(arguments).map_err(branches_header)?;
+        if !body.trim().is_empty() {
+            let longest = Generated::parse(
+                branches.seed,
+                &body.replace(BRANCH_MARKER, &branches.name(branches.count - 1)),
+            )?;
+            require_batches(
+                &longest,
+                "give a table `rows:` and `commits:` of at least 1, or drop the body to fork bare branches",
+            )?;
+            branches.recipe = Some(body.to_string());
+        }
+        Ok(branches)
+    }
+
+    fn name(&self, index: u64) -> String {
+        format!("{}{index}", self.prefix)
+    }
+
+    /// The branch names in fork order.
+    pub fn names(&self) -> impl Iterator<Item = String> + '_ {
+        (0..self.count).map(|index| self.name(index))
+    }
+
+    /// The branch every declared branch forks from.
+    pub fn from(&self) -> &str {
+        &self.from
+    }
+
+    /// The recipe with `${branch}` bound to `branch`; `None` for a bare fork.
+    pub fn recipe(&self, branch: &str) -> Result<Option<Generated>, String> {
+        self.recipe
+            .as_ref()
+            .map(|text| {
+                Generated::parse(self.seed, &text.replace(BRANCH_MARKER, branch))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
+    }
+
+    /// Forks every branch from `from` and appends its recipe, as a `branch
+    /// create` step and a `load generate` step on the branch would.
+    pub async fn load(&self, session: &Session) -> Result<(), String> {
+        for name in self.names() {
+            session
+                .db()
+                .branch_create_from_as(ReadTarget::branch(&self.from), &name, None)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "branches fixture: branch create {name} from {}: {error}",
+                        self.from
+                    )
+                })?;
+            if let Some(generated) = self.recipe(&name)? {
+                generated
+                    .load(session, &name, LoadMode::Append)
+                    .await
+                    .map_err(|error| format!("branches fixture: load {name}: {error}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The header's keys as a `Branches` with no recipe yet.
+fn parse_branches_arguments(arguments: &str) -> Result<Branches, String> {
+    let tokens = arguments.split_whitespace().collect::<Vec<_>>();
+    if !tokens.len().is_multiple_of(2) {
+        return Err("branches header requires key: value pairs".into());
+    }
+    let mut values = BTreeMap::new();
+    for pair in tokens.chunks_exact(2) {
+        if !matches!(
+            pair[0],
+            "generate:" | "seed:" | "count:" | "prefix:" | "from:"
+        ) || values.insert(pair[0], pair[1]).is_some()
+        {
+            return Err(format!(
+                "unknown or repeated branches argument {:?}",
+                pair[0]
+            ));
+        }
+    }
+    if values.get("generate:") != Some(&"v1") {
+        return Err("declared branches require `generate: v1`".into());
+    }
+    let seed = values
+        .get("seed:")
+        .ok_or("declared branches require an explicit `seed: <u64>`")?
+        .parse::<u64>()
+        .map_err(|_| "generator seed must be an unsigned 64-bit integer")?;
+    let count = values
+        .get("count:")
+        .ok_or("declared branches require `count: <n>`")?
+        .parse::<u64>()
+        .map_err(|_| "branches count must be an unsigned integer")?;
+    if count == 0 || count > MAX_BRANCHES {
+        return Err(format!("branches count must be in 1..={MAX_BRANCHES}"));
+    }
+    let prefix = values
+        .get("prefix:")
+        .ok_or("declared branches require `prefix: <name>`")?
+        .to_string();
+    let from = values.get("from:").copied().unwrap_or("main").to_string();
+    Ok(Branches {
+        seed,
+        count,
+        prefix,
+        from,
+        recipe: None,
+    })
 }
 
 impl GeneratedParams {
@@ -302,6 +461,70 @@ impl GeneratedParams {
 impl Generated {
     pub fn call_count(&self) -> u64 {
         self.tables.iter().map(|table| table.commits).sum()
+    }
+
+    /// The shape a dealt recipe (a `load generate:` session statement) has:
+    /// one node table with a `kind: key` column and no `blob` column, since
+    /// the readback after the block matches the row as a node by that key
+    /// and projects every column through GQ; its row count and that column.
+    pub(crate) fn dealt_shape(&self) -> Result<(u64, String), String> {
+        let [table] = self.tables.as_slice() else {
+            return Err(format!(
+                "a dealt recipe has one table, got {}",
+                self.tables.len()
+            ));
+        };
+        if !matches!(table.kind, RowKind::Node) {
+            return Err(format!(
+                "a dealt recipe's table is a node table; `{}` is an edge table, which the readback after the block cannot match by key",
+                table.name
+            ));
+        }
+        if let Some((name, _)) = table
+            .columns
+            .iter()
+            .find(|(_, column)| matches!(column, Column::Blob { .. }))
+        {
+            return Err(format!(
+                "a dealt recipe's column `{name}` is a blob, which the readback after the block cannot project through GQ"
+            ));
+        }
+        let key = table
+            .columns
+            .iter()
+            .find(|(_, column)| matches!(column, Column::Key { .. }))
+            .map(|(name, _)| name.clone())
+            .ok_or("a dealt recipe's table needs a `kind: key` column, which the readback after the block reads")?;
+        Ok((table.rows, key))
+    }
+
+    /// Row `index` of a dealt recipe's table as one JSONL line.
+    pub(crate) fn dealt_row(&self, index: u64) -> Result<String, String> {
+        let (rows, _) = self.dealt_shape()?;
+        if index >= rows {
+            return Err(format!(
+                "the dealt stream has {rows} rows and row {index} was asked for"
+            ));
+        }
+        let table = &self.tables[0];
+        self.batch(table, &table.distributions()?, index, index + 1)
+    }
+
+    /// Row `index`'s table, key column and key value, for the readback after
+    /// the block.
+    pub(crate) fn dealt_key(&self, index: u64) -> Result<(String, String, Value), String> {
+        let (_, key) = self.dealt_shape()?;
+        let table = &self.tables[0];
+        let column = &table.columns[&key];
+        let ordinal = table.ordinal(index)?;
+        let value = column.value(
+            self.seed,
+            &table.name,
+            &format!("data.{key}"),
+            ordinal,
+            None,
+        )?;
+        Ok((table.name.clone(), key, value))
     }
 
     pub(crate) fn single_batch(&self) -> Result<Option<String>, String> {
