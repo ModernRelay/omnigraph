@@ -79,6 +79,12 @@ graphs:
     schema: knowledge.pg
 ```
 
+A graph ID is 1–64 ASCII letters, digits or hyphens, and not `policies`,
+`healthz`, `openapi` or `graphs`. This is the rule the server enforces when it
+starts, so `cluster validate`, `plan` and `apply` refuse any other ID with
+`invalid_resource_id` before anything is written. An underscore is refused in
+a graph ID; policy bundle, query and embedding provider names may contain one.
+
 Optional fields:
 
 | Field | Meaning |
