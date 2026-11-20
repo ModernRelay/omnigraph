@@ -3533,30 +3533,35 @@ impl TableStore {
                     continue;
                 }
                 if segments.len() <= 1 {
+                    // If the index was already created or folded at the current dataset version,
+                    // its partition count is already the converged layout for this dataset state.
+                    // Flagging it again on unchanged tables causes repeated rebuild loops (e.g.
+                    // when duplicate vectors legitimately stepped down partitions).
+                    if segments
+                        .iter()
+                        .all(|s| s.dataset_version == ds.version().version)
+                    {
+                        continue;
+                    }
                     // Check whether this complete vector index has a degenerate
                     // partition count (e.g. 1 IVF partition over many rows).
-                    let partitions = Self::vector_partition_count(ds, &name, &segments)
-                        .await
-                        .ok();
-                    if let Some(partitions) = partitions {
-                        let non_null_rows = match segments
-                            .first()
-                            .and_then(|seg| seg.fields.first())
-                            .and_then(|id| ds.schema().field_by_id(*id))
-                            .map(|field| field.name.clone())
-                        {
-                            Some(col) => Self::non_null_vector_count(ds, &col).await.unwrap_or(0),
-                            None => {
-                                if total_rows.is_none() {
-                                    total_rows = ds.count_rows(None).await.ok();
-                                }
-                                total_rows.unwrap_or(0)
+                    let partitions = Self::vector_partition_count(ds, &name, &segments).await?;
+                    let non_null_rows = match segments
+                        .first()
+                        .and_then(|seg| seg.fields.first())
+                        .and_then(|id| ds.schema().field_by_id(*id))
+                        .map(|field| field.name.clone())
+                    {
+                        Some(col) => Self::non_null_vector_count(ds, &col).await?,
+                        None => {
+                            if total_rows.is_none() {
+                                total_rows =
+                                    Some(ds.count_rows(None).await.map_err(OmniError::storage)?);
                             }
-                        };
-                        if !Self::is_degenerate_vector_index(partitions, non_null_rows) {
-                            continue;
+                            total_rows.unwrap_or(0)
                         }
-                    } else {
+                    };
+                    if !Self::is_degenerate_vector_index(partitions, non_null_rows) {
                         continue;
                     }
                 }
@@ -3673,10 +3678,7 @@ impl TableStore {
                 // is sized up to the target partition count for the table.
                 // If the table shrank, bound by available training vectors.
                 let partitions = Self::vector_partition_count(ds, &item.name, segments).await?;
-                let non_null_rows = match Self::non_null_vector_count(ds, column).await {
-                    Ok(count) => count,
-                    Err(_) => ds.count_rows(None).await.unwrap_or(0),
-                };
+                let non_null_rows = Self::non_null_vector_count(ds, column).await?;
                 let target = Self::target_vector_partitions(non_null_rows);
                 let mut final_partitions = if non_null_rows == 0 {
                     1
@@ -3684,6 +3686,7 @@ impl TableStore {
                     partitions.min(non_null_rows).max(target)
                 };
                 loop {
+                    let _probe = crate::instrumentation::enter_index_build_probe().await;
                     let params = lance::index::vector::VectorIndexParams::ivf_flat(
                         final_partitions,
                         MetricType::L2,
@@ -6349,12 +6352,10 @@ impl TableStore {
                         .await
                 }
                 IndexBuildSpec::Vector { column } => {
-                    let non_null_rows = match Self::non_null_vector_count(&ds_clone, column).await {
-                        Ok(count) => count,
-                        Err(_) => ds_clone.count_rows(None).await.unwrap_or(0),
-                    };
+                    let non_null_rows = Self::non_null_vector_count(&ds_clone, column).await?;
                     let mut partitions = Self::target_vector_partitions(non_null_rows);
                     loop {
+                        let _probe = crate::instrumentation::enter_index_build_probe().await;
                         let params = lance::index::vector::VectorIndexParams::ivf_flat(
                             partitions,
                             MetricType::L2,
