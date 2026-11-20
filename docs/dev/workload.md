@@ -55,7 +55,14 @@ state directly. The graph sits beside the systems it syncs with and
 claims no authority over their records: a mirrored record is true as of its
 sync and owned by its source, authored knowledge is owned by the graph, and
 the two provenances stay distinguishable, because agents read both together
-and write only the second, or propose changes to the first.
+and write only the second, or propose changes to the first. Values
+a pipeline derives inside the graph are a third provenance, reproducible
+from the commit they read. An agent changes a mirrored record at its source
+and lets the sync bring it back, because writing both places is a dual
+write that can leave them disagreeing [31]. A sync is safe to replay because
+its upserts are keyed, not because it is one commit, and a replay of an
+older batch overwrites a newer value unless the update checks a stored
+source version.
 
 ### Quantities
 
@@ -66,8 +73,10 @@ and write only the second, or propose changes to the first.
 | Mix | Reads outnumber writes by one to two orders of magnitude; most reads are lookups and exploration, largely overlapping across agents, and a real minority, one in ten or more, are analytical reads over whole types; authored commits dominate writes by count, acquisition and sync by rows; deletes are rare everywhere | Analytical reads become the majority; a write on every agent turn brings reads and writes near one to one; updates or deletes become common; result sets pass 10^4 rows |
 | Volume | 10^4 to 10^7 entities per graph, set by the sources; 10 to 100 types; small scalar properties, text bodies, embeddings on a few types, Blobs for documents; agent batches of 10^2 to 10^5 records, whole-source imports and backfills to 10^7 records and 10^4 documents | 10^8 entities or 10^3 types; batches past 10^6; sync as streaming at thousands of events a second |
 | Rate | 10^2 to 10^4 commits a day; two kinds of branch: tens of task branches with hundreds of commits each and one writer, and many more short speculative branches of a few commits, most of them discarded, about ten per database project in one vendor's telemetry, some nested deep [24]; incremental sync every few minutes; an additive schema change about weekly; history retained long and read as often as the present | Commit rate or branch count up an order; several writers on one task branch; conflict retries common; destructive schema changes frequent; history read rarely; branches rarely abandoned |
-| Reaction | Tens of standing consumers per graph (agents, pipelines, downstream systems), each filtered to a few types; a change reaches its consumers within seconds of its commit; reaction chains a few steps deep | Hundreds of consumers; sub-second delivery needed; reaction storms |
-| Targets | No latency is measured yet. As a starting hypothesis for a warm handle in the store's region: a retrieve read answers in about 100 ms at the median and under 1 s at the tail; (one agent-memory system reports search latencies of 0.15 to 0.5 s [30]); a small commit publishes in under 1 s; creating and discarding a branch costs about what a small commit costs; one branch publishes its commits serially, a few a second at most, which the hypothesized rate needs on average at one every several seconds, with bursts on shared state from merges and syncs | Measured figures replace these; shared state needs sustained tens of commits a second |
+| Fan-out | Edges per entity are skewed: most entities have tens, a few hubs have 10^4 to 10^5. A lookup costs what the hubs it touches cost, not the mean degree | Hub degree passes 10^6, or hubs dominate lookups |
+| Maintenance debt | Each small commit adds files, so files per table grow with commits per day until an `optimize` | The slowest reads grow with time since the last `optimize` |
+| Reaction | Tens of standing consumers per graph (agents, pipelines, downstream systems), each filtered to a few types; a change reaches its consumers within seconds of its commit; reaction chains a few steps deep | Hundreds of consumers; sub-second delivery needed; reaction storms; re-reading a baseline at every schema change, which each consumer must do today, costs more than delivery |
+| Targets | No latency is measured yet. As a starting hypothesis for a warm handle in the store's region: a retrieve read answers in about 100 ms at the median and under 1 s at the 99th percentile, measured at the client; a step of several reads waits for its slowest one, so the read target is set for a step of five reads to stay under 1 s at its own 99th percentile; (one agent-memory system reports search latencies of 0.15 to 0.5 s [30]); a small commit publishes in under 1 s; creating and discarding a branch costs about what a small commit costs; one branch publishes its commits serially, a few a second at most, which the hypothesized rate needs on average at one every several seconds, with bursts on shared state from merges and syncs | Measured figures replace these; shared state needs sustained tens of commits a second |
 
 ### What we optimize for
 
@@ -131,12 +140,12 @@ about statements that already exist; the work asks for several of those too
 | A change feed that waits | The feed is polled and filters by kind, type and operation, with no condition over state | A consumer waits for the next matching change, filtered by a condition over the changed state, and learns of a commit soon after it is acknowledged |
 | Task and reason on a commit | A commit records an actor only | The task and the reason, readable wherever the commit is |
 | Work in progress | A branch listing shows head, origin and times, not owner, task or touched entities | Which branches are live, who owns each, for what task, and which entities it has touched, recorded as the work happens |
-| A request identity | Graph writes carry no request identity: a lost answer is resolved by reading history, and only a conditional write is safe to repeat. Recorded operations do carry one | A request sent again after a lost answer applies at most once and returns the first answer |
+| A request identity | Graph writes carry no request identity: a lost answer is resolved by reading history, and only a conditional write or a keyed upsert is safe to repeat, the second at the cost of a commit. Recorded operations do carry one | A request sent again after a lost answer applies at most once and returns the first answer |
 | Exclusive claims | A claim is a conditional write on the whole branch head, so claimants on a busy branch refuse each other and unrelated writers refuse them | When several agents claim one task or entity, exactly one succeeds and the others learn who holds it; an unrelated commit never makes a claim fail |
 | Merge checks | A merge is gated by policy on who may merge, not by a check on what is merged | The target names a check the branch must pass, run by a party other than its author |
 | Declared dependencies | A merge records and checks no read dependency, so a conclusion can merge on evidence that changed on the target | A branch records what its conclusions depend on, and a merge reports a dependency that changed on the target since the fork |
 | Search over the schema | Types and properties carry descriptions, but nothing searches the schema by meaning | Search over the schema's names and descriptions |
-| Valid time | A schema models when a fact held true as ordinary properties, and nothing ranks or filters by them specially | Decide whether valid time stays a schema convention or becomes a construct |
+| Valid time | A schema models when a fact held true as ordinary properties, and nothing ranks or filters by them specially. A mirrored record has three times: when the fact held at the source, when the source recorded it, and when the graph committed it; a backfill bunches commit times, so "what changed last week" by commit time is wrong for synced data | Decide whether valid time stays a schema convention or becomes a construct |
 
 ## What the evidence says
 
@@ -164,7 +173,12 @@ premise is untested, not confirmed.
   bring it near one to one. Most agent-memory systems are schemaless: that
   the shared model is **typed** is this page's bet, argued from
   standardization as the way to make one party's output usable by another
-  [29], not an observation.
+  [29], not an observation. Schema-on-read is the
+  better fit for heterogeneous data and for structure owned by an outside
+  system that changes it at will [31], which is the work of acquire and
+  sync: the bet is that authored knowledge is typed, and that outside data
+  enters as a raw Blob or a loosely typed property and becomes typed by
+  extraction.
 - **Outside the store.** Scheduling and control (which agent runs next, and
   on what) is a separate component in every coordination architecture
   [25]. The contract owes it the facts it decides from, visible in the
@@ -180,19 +194,24 @@ three are categories of the literature; LTAP is one vendor's architecture.
 
 | Category | What it bundles | Where Omnigraph matches | Where it does not |
 |---|---|---|---|
-| OLTP [10] [11] | Work: many short transactions that read or update a few records by key, on current data; transaction throughput is the measure. Contract: atomic, isolated transactions, serializable or weaker; often interactive sessions, though some engines run stored procedures one at a time. Mechanism: row storage, B-tree indexes, a write-ahead log, updates in place under locks or multi-version rows | The footprint: small reads by key and small commits on a critical path, each seeing current data; serial execution per branch, as in the engines that run transactions one at a time [12] | The transaction is one request, not an interactive session. A branch's commits are serialized by a compare-and-swap on object storage, so a commit costs object-store round trips and one branch sustains a few commits a second, the rate Delta Lake reports for the same mechanism [15], not thousands. Write concurrency comes from branches |
-| OLAP [10] [16] | Work: few complex ad hoc queries that scan, join and aggregate much historical data consolidated from many sources, loaded in batches; response time is the measure. Contract: read-mostly; a consistent snapshot of the last load, refreshed periodically; often a multidimensional model. Mechanism: star schemas, bitmap indexes, materialized views, parallel scans; later columnar storage and vectorized execution; in the cloud, compute apart from storage | The mechanism: columnar immutable files, batch loads, compute apart from storage; analytical reads are part of the work | The scale, the model and the lag: analytical reads cover one graph of up to 10^7 entities, not a warehouse consolidating many sources; there is no multidimensional model and no pre-aggregated summary; an analytical read sees the latest commit, the one a lookup sees, not the last load |
+| OLTP [10] [11] [31] | Work: many short, low-latency reads and writes of a few records by key, on current data, from end users. Contract: usually atomic, isolated transactions, serializable or weaker, though the category does not require them; often interactive sessions, though some engines run stored procedures one at a time. Mechanism: row storage and a write-ahead log, with B-trees updated in place or log-structured merge trees | The footprint: small reads by key and small commits on a critical path, each seeing current data; serial execution per branch, as in the engines that run transactions one at a time [12] | The transaction is one request, not an interactive session. A branch's commits are serialized by a compare-and-swap on object storage, so a commit costs object-store round trips and one branch sustains a few commits a second, the rate Delta Lake reports for the same mechanism [15], not thousands. Write concurrency comes from branches |
+| OLAP [10] [16] [31] | Work: few complex ad hoc queries that scan, join and aggregate much historical data consolidated from many sources, loaded in batches; response time is the measure. Contract: read-mostly; a consistent snapshot of the last load, refreshed periodically; often a multidimensional model. Mechanism: star schemas, bitmap indexes, materialized views, parallel scans; later columnar storage and vectorized execution; in the cloud, compute apart from storage | The mechanism: columnar immutable files, batch loads, compute apart from storage; analytical reads are part of the work | The scale, the model and the lag: analytical reads cover one graph of up to 10^7 entities, not a warehouse consolidating many sources; there is no multidimensional model and no pre-aggregated summary; unlike a warehouse fed by periodic loads, there is no second copy for an analytical read to lag behind |
 | HTAP [12] [13] [14] | Work: transactions and analytical queries on the same data at once, analytics on the latest committed data. Contract: transactions plus analytical reads of a fresh, consistent snapshot; the named requirements are freshness and performance isolation. Mechanism, two families: one copy with snapshots, or a row store plus a columnar replica kept consistent by replication | The mixed read work on one system over one copy, every read at a fresh snapshot: the single-copy family, not the replicated one | With no replica there is no replication lag. Isolation of lookups from analytical reads would come from separate stateless reader processes over the same files, not from separate representations, and it is unmeasured. The transactional half is weaker than OLTP as above, so HTAP's hard case, analytics beside a high write rate, is not this work |
 | LTAP [17] | Databricks' term (June 2026), Lake Transactional/Analytical Processing: separate transactional and analytical engines over one durable copy in open table formats on object storage. Postgres writes with full transactions through a replicated log and a page server that transcodes pages to columns; analytical engines read the same files, scaled independently, at a log position plus the tail not yet written out; row pages are a cache. It unifies at the storage layer, not in one engine | The shape: one copy in an open format on object storage, one write path, readers that scale out, no export to a second system | The unit and the engines: one engine and a typed graph commit published by compare-and-swap, with no log and no row tier, against multi-statement Postgres transactions over a replicated log. Its branches are copies for experiments; Omnigraph's merge three-way. Retrieval over structure, vectors and text is a first-class read, which the term does not name |
 
 What none of the four names, and what this work is mostly made of: isolation
-by branch and merge instead of by lock or session; history read as often as
-the present, where those systems keep it for rollback and reproduction;
+by branch and merge instead of by lock or session; the history of the state's versions read as often as
+the present, where a warehouse's history is a table of events and the others keep versions for rollback and reproduction;
 ranked retrieval as the common read; and readers and writers that are
 programs acting on what they just read. Two existing labels sit closer than
 the four and are still only shorthand: data versioning systems, which share
 the branch, commit and merge contract [9], and hybrid serving and analytical
-processing, which names selective latency-bound reads beside analytics. Use
+processing, which names selective latency-bound reads beside analytics. Against composing
+specialized stores through a log [31], Omnigraph bundles graph, vector,
+full-text and history over one copy: one snapshot covers every mode and
+nothing lags between them, at the cost that retrieval is as deep as one
+engine provides. Seen from outside it is itself one component of such a
+dataflow, with syncs in and a feed out. Use
 a category word only as shorthand for the row it points at; a design argues
 from the contract and the work, never from "it is an HTAP system".
 
@@ -202,15 +221,28 @@ The contract uses plain words. These are the precise terms behind them.
 
 - **`E1` on one branch.** One branch is one linearizable object [1]: every
   read and every write on a branch is one atomic operation on the branch
-  head. A read takes effect when it resolves the head, at its start, and so
-  includes every commit acknowledged before it began; a write takes effect at
-  its publication. The reads and commits of one branch are therefore strictly
+  head. A read takes effect at one point inside its interval, when it
+  resolves the head, and so includes every commit acknowledged before it
+  began; a write takes effect at its publication. This needs the store's
+  read-after-write, and does not hold for a process that claimed the branch
+  (`read:2`). The reads and commits of one branch are therefore strictly
   serializable in commit order [2]. A write whose outcome is unknown counts
   as still pending: it is concurrent with everything after it until history
   shows whether it landed. Each such operation touches one branch, so by
   locality [1] operations on different branches are linearizable together. A
   merge, a two-sided diff and a branch create read two branches and are not
-  covered: two branches have no joint view.
+  covered: two branches have no joint view. The transaction is one request:
+  an agent's read and a later write are two transactions unless the write
+  names the head it read (`write:3`). Serial publication per branch is the
+  design the book calls actual serial execution [31], validated across
+  processes by compare-and-swap; it holds while commits on a branch are
+  short and few a second, and a long load or a burst of merges on the shared
+  branch delays every writer of that branch.
+- **History.** History is a partial order: one commit happens before another
+  exactly when it is its ancestor, and two commits are concurrent when
+  neither is. A branch's feed delivers in an order consistent with it. The
+  common ancestor does the work of version vectors and tombstones [31], so a
+  delete on one side is never undone by the other.
 - **`write:3`.** A write with a named head is a compare-and-set on the branch
   head, so the caller's read and write take effect as one transaction in the
   serial order, or not at all.
@@ -226,7 +258,11 @@ The contract uses plain words. These are the precise terms behind them.
   never merged. Write skew, write skew through a predicate read (both
   branches see no matching entity and each inserts one) and the read-only
   anomaly [5] are admitted unless a declared constraint catches them. Not
-  promised: serializability across branches.
+  promised: serializability across branches. The ask for declared
+  dependencies is the read tracking of serializable snapshot isolation, made
+  at merge. This is also the split between integrity at every commit and
+  enforcement across branches deferred to the merge, which is the check
+  before the irreversible step [31].
 - **`merge:1`.** A state-based, keyed three-way merge [8], the contract that
   data versioning systems share [9].
 - **`merge:3`.** Which constraints a merge of two valid branches can break
@@ -325,6 +361,15 @@ On the work itself, read on 2026-11-16:
     "Concurrency Control in Groupware Systems", SIGMOD 1989.
 30. Chhikara et al., "Mem0", 2025: measured memory search latency.
 
-Not grounded in a source read here: the definition of durability; the
+31. Kleppmann, "Designing Data-Intensive Applications", O'Reilly 2017,
+    read in full on 2026-11-20: describing load and tail latency (ch. 1),
+    schema-on-read (ch. 2), OLTP, OLAP and compaction (ch. 3), evolution
+    across program versions (ch. 4), conflict handling (ch. 5), isolation
+    anomalies, serial execution and durability (ch. 7), clocks, leases and
+    fencing (ch. 8), linearizability, ordering and consensus (ch. 9), change
+    capture and effectively-once delivery (ch. 11), the end-to-end argument,
+    timeliness against integrity and auditability (ch. 12).
+
+Not grounded in a source read here: the
 read-to-write ratio, the latency targets and the rate figures in the work,
 which no source measures for a shared model and which remain hypotheses.
