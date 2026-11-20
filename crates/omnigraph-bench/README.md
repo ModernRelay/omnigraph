@@ -5,8 +5,10 @@ release worker. One [`benchmarks.yaml`](../../benchmarks/benchmarks.yaml)
 selects fixtures, workloads and run settings. `run --config FILE` accepts the
 same format for custom experiments; [custom.example.yaml](../../benchmarks/custom.example.yaml)
 is a complete starting point. The measured operation is selected by ordinal
-plus exact header/body echo. GQT remains the language for data,
-operations, and expectations; it has no benchmark timing or cache labels.
+plus exact header/body echo, or is the workload's one
+[measured block](#measured-blocks). GQT remains the language for data,
+operations, and expectations; it has no cache labels, and its one timing
+section, `--- bench`, gives a measured block its run.
 The production parser/executor comes from `omnigraph-gqt-core`, which has no
 build script or normal `test-util` requirement. The GQT binary separately owns
 correctness/DST execution and never supplies these wall-clock measurements.
@@ -406,7 +408,9 @@ contain clean source and release-build evidence, an executable digest,
 process-effective machine and backend evidence, a stamped fixture manifest,
 and logical calls. [Served records](#served-read-only-acquisition) keep the
 declared deployment receipt and observed client evidence separate; unavailable
-server measurements remain absent.
+server measurements remain absent. A run whose measured step is a
+[measured block](#measured-blocks) publishes a `ConcurrentRunRecordV1` around
+the same record.
 
 A dirty or unproved source tree cannot publish a record because the source
 commit would not honestly describe its provenance. The local CLI rechecks that
@@ -535,7 +539,7 @@ observed client is in `client_build_json` and `client_machine_json`.
 ## Local support envelope
 
 The adapter accepts direct-engine, local-filesystem GQT environments without
-DST seams or concurrent actor blocks. The admitted tuples are APFS with
+DST seams or scripted concurrent blocks. The admitted tuples are APFS with
 local-clonefile or qualified XFS with plain-copy, on the declared NVMe SSD
 backend. The platform probe remains authoritative. Cloud stores, unproved embedded backend declarations, and OS page-cache
 eviction claims are refused; the served path uses the explicit deployment
@@ -696,6 +700,75 @@ Machine-readable diagnostic-mode failures keep the suite/case/point identity
 and all completed runs or repetitions. A worker killed at its hard deadline
 contributes structured process-containment evidence, but never a partial
 sample.
+
+## Measured blocks
+
+A scenario whose workload holds a `--- concurrent measured` block measures
+that block; the [catalog guide](../../benchmarks/README.md#measured-concurrent-blocks)
+has the scenarios and the run flags. The block is the selected step. A
+workload whose measured block is another step than the selected one is
+refused, and so is the block under a served target or the `clone` reset
+level. A label of the block declares up to 256 workers; any other
+free-running block of the program keeps the bound of 8 and runs its sessions
+once, in declaration order.
+
+Planning reads the workload once per value of the section's sweep. The swept
+binding is frozen with the source and enters `GqtPointIdentityV1.sweep` and
+the planned hash, so every value is a point of its own. A workload that
+sweeps nothing serializes and hashes as it did, so no existing point id
+moved. The block's warmup and duration are `PlannedGqt.block`, a run setting
+outside both hashes. Repetitions come from `--repetitions`, else the entry,
+else the section, else the defaults. A route that plans one point (a legacy
+case file, its `--dataset` and `--queries` overrides, an explicit pair)
+refuses a workload that sweeps more than one value and names the catalog
+route.
+
+The worker runs the block between the two protocol signals: `Ready` before
+the warmup's first statement and `Settled` once the last worker returned its
+statement in flight, so `elapsed_us` is warmup, window and drain.
+`concurrent_host::drive` spawns one task per worker over a clone of the case
+session, each under the caller's query I/O probes. A phase flag moves from
+warmup to measured to stop. A statement is counted in the phase it started
+in, and its acknowledgement lands in the second of the window it arrived in,
+or in `acked_in_drain` at or past the declared duration. At the flip the host
+discards what its store-call counters saw of the warmup. The two counts
+split a statement at the flip differently: one in flight across it is a
+warmup acknowledgement, the store calls it issues after the flip are the
+window's, and a call in progress at that instant lands on either side. A
+run with no warmup has no such statement: its window opens, and the
+counters start, before the first worker does. A label counts the service
+time of every window statement in buckets: a time under 256 µs has a bucket
+of its own, and above that a bucket is narrower than 1/128 of its times.
+The nearest-rank p50 and p99 are the top of the bucket their statement is
+counted in, so each is less than 1/128 over that statement's own time and
+never over `max`, which is exact. A failed statement stops every worker and
+fails the repetition with no `Settled`. The readback after `Settled` opens a
+fresh handle on the same root.
+
+`GqtRepObservation.concurrent` is the observation: `driver`, `claim_grade`,
+`warmup_seconds`, `measured_seconds`, `sweep`, `window_us`, `drain_us`,
+`tokio_unstable`, `readback` (`rows` found by key, `compared` in full) and
+one row per label (`label`, `kind`, `workers`, `acked`, `warmup_acked`,
+`acked_in_drain`, `acked_per_second_millis`, `per_worker` min and max,
+`service_time_us` p50, p99 and max, `authority_conflicts`,
+`acked_by_second`). The durable record of such a run is
+`ConcurrentRunRecordV1`, the third `AnyRunRecordV1` variant: the run's
+`driver`, `claim_grade`, `warmup_seconds`, `measured_seconds`, `sweep` and
+`tokio_unstable` over an unchanged `GqtRunRecordV1` in `record`. Validation
+parses the echoed block at the record's swept value and refuses a sample
+whose labels, kinds, worker counts, per-second series or rates disagree with
+it, a `claim_grade` of true, a warmup or duration outside the section's
+bounds, and a plain GQT record whose samples carry a block. The projection
+reads the inner record and takes `claim_eligible` from the wrapper, so a
+closed-loop run is never claim-eligible.
+
+`run --archive` publishes the record. A `--store` run is at the `clone`
+reset level and so runs no measured block yet; `report`, which reads a
+store, prints a concurrent record it finds there with its run and, per
+label, every repetition's rate, p50, p99 and conflicts in repetition order.
+It summarizes nothing across repetitions, and its `*_us` columns time whole
+blocks. The supervisor's deadline and the worker's whole-file timeout both
+count past the block's declared warmup and duration.
 
 ## End-to-end query and traversal workloads
 
