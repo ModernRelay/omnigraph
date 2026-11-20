@@ -7,7 +7,7 @@ differs today; the rules that keep the promises are in
 the promises serve in [the work](workload.md)
 **Written for:** agents first. Every session loads this page and checks
 designs against it, so precision comes before ease of reading. People start
-at [In plain words](#in-plain-words)
+at [For human readers](#for-human-readers)
 
 ## Editing this page
 
@@ -47,54 +47,65 @@ from the two and live in the area guides, never here.
   that names it. Check a statement against the code before writing it.
 - **Keep addresses stable.** Other documents cite `E2`, `write:3` or `D5`.
   Add numbers at the end; never reuse or renumber one.
-- **Precision before readability.** A statement is exact and complete even
-  when that makes it harder to read. [In plain words](#in-plain-words) is
-  the only part written for a first reading; keep it in step with the
-  statements, and keep it short.
+- **Precision before readability.** A statement is exact and complete even when
+  that makes it harder to read. [For human readers](#for-human-readers) is
+  the one part written for a first reading, and it is written in ASD-STE100
+  Simplified Technical English (the standard is free at asd-ste100.org):
+  sentences of 25 words or fewer, active voice and simple tenses, `can`,
+  `will` and `must` as the only modal verbs, one word for one meaning, and
+  each term defined at its first use. It says nothing that a statement below
+  does not, and it changes in the same pull request as the statement it
+  summarizes.
 - **Keep it short.** Every agent session loads this page. Evidence, history
   and reasoning about the workload go to [the work](workload.md).
 
-## In plain words
+## For human readers
 
-The whole contract, for a person reading it once. It promises nothing by
-itself: where it and a statement below differ, the statement holds.
+This section is for a person who reads the contract for the first time. It
+is written in ASD-STE100 Simplified Technical English. It adds no promise. If
+this section and a statement in a later section are different, the statement
+is correct.
 
-Omnigraph is one shared graph with a schema, which many agents read and
-change. Every change is a commit, a new version of the whole graph. A branch
-is a line of commits, and history stays until someone removes it on purpose.
+Omnigraph is one graph that many agents read and change. A schema gives the
+types and the rules of the graph. Each change is a commit, which is a new
+version of the full graph. A branch is a line of commits. The history stays
+until a person removes it.
 
-Every operation keeps seven rules:
+Each operation obeys seven rules:
 
-1. It reads one version of the graph, never a mix (`E1`).
-2. It changes everything it meant to, or nothing (`E2`).
-3. It cannot break a rule the schema declares (`E3`).
-4. Its answer is true: success means the change is stored and visible, and a
-   failure says what it left behind (`E4`).
-5. It finishes or refuses. It never hangs, and never passes off part of an
-   answer as the whole (`E5`).
-6. It is checked against who is asking (`E6`).
-7. It changes only what its kind may. Only `cleanup` removes history, and
-   building an index never changes an answer (`E7`).
+1. It reads one version of the graph. It does not read a mixture of versions
+   (`E1`).
+2. It makes all of its changes, or it makes none (`E2`).
+3. It cannot break a rule that the schema gives (`E3`).
+4. Its answer is true. A success tells you that the change is stored and
+   that all later reads see it. A failure tells you which changes stayed
+   (`E4`).
+5. It gives its full answer, or it refuses. It does not give a part of an
+   answer as the full answer (`E5`).
+6. The server makes sure that the caller has permission (`E6`).
+7. It changes only what its kind of operation can change. Only `cleanup`
+   removes history. An index does not change an answer (`E7`).
 
-How strong the promise is depends on how far apart two things are:
+The promise changes with the distance between two operations:
 
-- **Inside one request**, nothing else interferes. A request is the only
-  transaction.
-- **On one branch**, requests behave as if they ran one at a time, and a
-  read sees every change acknowledged before it began. Two requests are tied
-  together only if the second says "apply only if the branch has not moved".
-  Without that, a value read and then written back can overwrite someone
-  else's change.
-- **Across branches**, nothing is shared until a merge. A merge compares the
-  two sides entity by entity. It refuses when both changed the same entity
-  differently or when the result would break the schema, and it resolves
-  nothing by itself. It checks what each side wrote, not what it read.
+- In one request, other operations have no effect on it. A request is the
+  only transaction (a set of changes that is applied fully or not at all).
+- On one branch, the result is the same as if the requests occurred one at a
+  time. A read sees each change that the system acknowledged before the read
+  started. To connect two requests, the second request must name the commit
+  that the first request read. If it does not, a value that you read and
+  then write can replace the change of a different writer.
+- Between branches, nothing is shared until a merge. A merge compares the
+  two branches one entity at a time. The merge refuses if the two branches
+  changed the same entity differently. It also refuses if the result breaks
+  the schema. It does not correct a conflict automatically. It examines what
+  each branch wrote, not what each branch read.
 
-The page also says what one kind of operation promises beyond the seven
-rules, which pairs of operations refuse each other, and what Omnigraph
-assumes of its storage. Two tables keep it honest about today:
-[Gaps](#gaps), where the code does not yet do what a statement says, and
-[Decisions](#decisions), where the target is not yet chosen.
+The sections that follow give the other rules for each kind of operation,
+the pairs of operations that refuse each other, and the conditions that the
+storage must satisfy. Two tables show where the software is today.
+[Gaps](#gaps) lists the statements that the code does not obey at this time.
+[Decisions](#decisions) lists the questions that have no chosen target.
 
 ## How this page is organized
 

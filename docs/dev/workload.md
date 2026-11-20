@@ -6,7 +6,7 @@ that work asks of the shared state, and the evidence for and against it; what
 each operation promises is in [the contract](contract.md)
 **Written for:** agents first. Designs are checked against this page, so
 precision comes before ease of reading. People start at
-[In plain words](#in-plain-words)
+[For human readers](#for-human-readers)
 
 ## Editing this page
 
@@ -38,42 +38,50 @@ and live in the area guides, never here.
   different workload changes this page in the same pull request, with the
   measurement that moved it.
 - **Precision before readability.** A row is exact and complete even when
-  that makes it harder to read. [In plain words](#in-plain-words) is the
-  only part written for a first reading; keep it in step with the tables,
-  and keep it short.
+  that makes it harder to read. [For human readers](#for-human-readers) is
+  the one part written for a first reading, and it is written in ASD-STE100
+  Simplified Technical English (the standard is free at asd-ste100.org):
+  sentences of 25 words or fewer, active voice and simple tenses, `can`,
+  `will` and `must` as the only modal verbs, one word for one meaning, and
+  each term defined at its first use. It says nothing that a row below
+  does not, and it changes in the same pull request as the row it
+  summarizes.
 
-## In plain words
+## For human readers
 
-The whole hypothesis, for a person reading it once. Where it and a table
-below differ, the table holds.
+This section is for a person who reads the hypothesis for the first time. It
+is written in ASD-STE100 Simplified Technical English. If this section and a
+table in a later section are different, the table is correct.
 
-Omnigraph is built for several agents that share one typed model of a
-domain, and that read it, update it and coordinate through it over a long
-time. Nobody has measured this work at scale, so everything here is a guess
-with a stated way to prove it wrong.
+Omnigraph is made for one type of work. In this work, many agents share one
+typed model of a domain. They read the model, change it, and use it to
+coordinate for a long time. No person measured this work at large scale.
+Thus each number on this page is an estimate, and each estimate says what
+can change it.
 
-- **Who.** A few to tens of agents on a graph at once, a few people, and a
-  handful of programs such as syncs and pipelines.
-- **What they do.** Mostly read: find out what the model holds, look things
-  up, search, and count or rank over a whole type. They write small notes,
-  claims and decisions many times a task, and now and then import a whole
-  source or keep one in sync. They work on their own branches, try ideas and
-  throw most of them away, review and merge each other's work, react to
-  changes, and look back at what was known earlier.
-- **How much.** Reads outnumber writes by ten to a hundred times. A graph
-  holds ten thousand to ten million entities and takes a hundred to ten
-  thousand commits a day, with tens of task branches and many short-lived
-  ones.
-- **What we optimize, in order.** Correctness, then simplicity, then cost.
-  On cost: the reads an agent step waits for come first, then small commits
-  and cheap branches, then history and change delivery, then bulk import and
-  sync.
-- **What we give up.** Warehouse-scale scans, and a high write rate on one
-  branch. Writers spread across branches instead.
+These are the parts of the hypothesis:
 
-The rest of the page gives each of these as a table, derives from the
-sentence above what the shared state must do, and sets the hypothesis
-against the evidence and against the usual database categories.
+- Actors: A graph has from a few agents to some tens of agents at the same
+  time. It also has a small number of persons and programs, such as sync
+  pipelines.
+- Activities: Most operations are reads. Agents find what the model
+  contains, get entities, search, and count or rank across a full type.
+  Agents write small records many times in a task. Sometimes they import a
+  full source or keep it in sync. Each agent works on its own branch and
+  discards most of its experiments. Agents examine and merge the work of
+  other agents, react to changes, and read the earlier history.
+- Quantities: There are 10 to 100 reads for each write. A graph contains
+  10,000 to 10,000,000 entities. It receives 100 to 10,000 commits each day.
+- Priorities, in this sequence: correct results, then a simple design, then
+  cost. For cost, the reads that an agent step waits for are first. Small
+  commits and branches are second. History and the delivery of changes are
+  third. Bulk import and sync are last.
+- Not optimized: Scans of warehouse size, and a high write rate on one
+  branch. Writers use different branches.
+
+The sections that follow give each part as a table. They also derive what
+the shared state must do. Then they compare the hypothesis with the evidence
+and with the usual database categories.
 
 ## The hypothesis
 
