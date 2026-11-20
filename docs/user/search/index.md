@@ -168,8 +168,8 @@ all run, inside blocks too, and keep exactly the rows the call's matches
 decide. The exact lexical scan answers every call from the field's rows and
 reads no index, so a row an index has not covered yet answers as an indexed
 one does; its time is linear in the field's text
-([cost](analyzers.md#the-exact-scans-cost)). A full-text call read as a value, in `return`, `order` or a block's
-aggregate, is not lowered (`T86`). `search`, `match_text` and `fuzzy` are not
+([cost](analyzers.md#the-exact-scans-cost)). A full-text call read as a value, in `return`, `order` or an aggregate
+(a block's included), is the same Boolean for each row. `search`, `match_text` and `fuzzy` are not
 functions: each is refused (`T6`) with its `match_terms` fix,
 `match_terms($d.body, terms($q, mode: any))`, and `max_edits: 2` for a `fuzzy`
 without a budget.
@@ -192,8 +192,8 @@ The column `as` names, `$score` here, holds the relevance the ranking used.
 `rrf` gives the fused score as an `F64`. Without an alias the result column
 takes the name `as` gave the score (`as $relevance`, returned as
 `$relevance`, is the column `relevance`); an alias in `return` renames it like
-any column. A lexical predicate, `match_terms(...)`, is a filter and not a
-return item (`T86`). An aggregate reads the score as a
+any column. A lexical predicate, `match_terms(...)`, returned as an item is the row's
+Boolean. An aggregate reads the score as a
 column of every row the ranking keeps: `return { max($score) as best }` is
 the best score among them, and over a `nearest` window, among its targets.
 

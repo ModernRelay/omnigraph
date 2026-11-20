@@ -1,0 +1,101 @@
+# issue: none
+# notes: A `let` inside an `optional` whose pattern binds no node of its own (a triple closing on
+# notes: two outer names) is a column of the optional's matches, null on an outer row with none,
+# notes: whether its value reads a name the optional binds, an outer name or a parameter.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+node Doc {
+    id: String @key
+    title: String
+    body: String @index
+    year: I32
+    tags: [String]
+    embedding: Vector(3)? @index
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Person","data":{"handle":"a","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"b","name":"Bob","age":20}}
+{"type":"Person","data":{"handle":"p1","name":"Cy","age":50}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Doc","data":{"id":"d1","title":"graph basics","body":"graph databases store graphs","year":2020,"tags":["x"],"embedding":[1.0,0.0,0.0]}}
+{"type":"Doc","data":{"id":"d2","title":"vector search","body":"vector search over graph embeddings","year":2021,"tags":["y"],"embedding":[0.9,0.1,0.0]}}
+{"type":"Doc","data":{"id":"d3","title":"cooking","body":"pasta and graph theory of sauces","year":2022,"tags":[],"embedding":[0.0,1.0,0.0]}}
+{"type":"Doc","data":{"id":"d4","title":"rivers","body":"water flows downhill","year":2023,"tags":[],"embedding":[0.0,0.0,1.0]}}
+{"type":"Doc","data":{"id":"d5","title":"graphs again","body":"graph graph graph","year":2024,"tags":[],"embedding":[0.5,0.5,0.0]}}
+{"edge":"Authored","from":"a","to":"d1"}
+{"edge":"Authored","from":"a","to":"d3"}
+{"edge":"Authored","from":"a","to":"d4"}
+{"edge":"Authored","from":"b","to":"d2"}
+{"edge":"Authored","from":"b","to":"d5"}
+{"edge":"Authored","from":"b","to":"d3"}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"b","to":"p1"}
+{"edge":"WorksAt","from":"a","to":"acme"}
+{"edge":"Cites","from":"d1","to":"d2"}
+
+--- query
+query q() { match { $p: Person, $q: Person, optional { $p knows $q, let $x = 1 } } where $p.handle = "a" return { $q.handle, $x } }
+
+--- expect unordered
+{"q.handle":"a"}
+{"q.handle":"b","x":1}
+{"q.handle":"p1"}
+
+--- expect shape
+q.handle: String
+x: I64?
+
+--- query
+query q() { match { $p: Person, $q: Person, optional { $p knows $q, let $x = $q.age, let $y = $p.name } } return { $p.handle, $q.handle, $x, $y } }
+
+--- expect unordered
+{"p.handle":"a","q.handle":"a"}
+{"p.handle":"a","q.handle":"b","x":20,"y":"Ada"}
+{"p.handle":"a","q.handle":"p1"}
+{"p.handle":"b","q.handle":"a"}
+{"p.handle":"b","q.handle":"b"}
+{"p.handle":"b","q.handle":"p1","x":50,"y":"Bob"}
+{"p.handle":"p1","q.handle":"a"}
+{"p.handle":"p1","q.handle":"b"}
+{"p.handle":"p1","q.handle":"p1"}
+
+--- expect shape
+p.handle: String
+q.handle: String
+x: I32?
+y: String?
+
+--- query
+query q($t: String) { match { $p: Person, $q: Person, optional { $p knows $q, let $x = $t } } where $x is null and $p.handle = "a" return { $q.handle } }
+
+--- params
+{"t": "hi"}
+
+--- expect unordered
+{"q.handle":"a"}
+{"q.handle":"p1"}
+
+--- expect shape
+q.handle: String

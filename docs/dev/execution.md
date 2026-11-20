@@ -139,7 +139,11 @@ A query runs against one resolved `ReadTarget`:
    (`F64`), read by the identity column the node adds to its reads. Every
    full-text field has a profile (`english_v1` where its index names none),
    so every `match_terms` is a `Filter` or `Let` operand and every `bm25` a
-   `Score`, both answered by the exact lexical scan (below); nothing derives
+   `Score`, both answered by the exact lexical scan (below): a call read as a
+   value in `return`, `order` or an aggregate (a block's included) is the
+   column of a `PatternStep::Let` the shaper makes up for it after the
+   pattern (`Shaper::lexical_columns`), which the projection, the sort and
+   the aggregate read; nothing derives
    a choice between an exact and a native path. A lexical predicate reads its
    binding's identity, not its field (`optimizer::reads_of_expr`), since the
    scan reads the field from the table. Plan acceptance requires each `Score`

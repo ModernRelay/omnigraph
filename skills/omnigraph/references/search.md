@@ -198,8 +198,8 @@ a fixed name: it is the name the `from`'s `as` writes (`as $relevance`
 returns the column `relevance`), and an alias in `return` renames it like any
 column. A `let` name bound to a ranking carries an unnamed score too, so its
 `from` takes `as`; an inline read that returns a named score takes none
-(`T85`). Full-text predicates are not return
-items (`T86`).
+(`T85`). A full-text predicate read as a return item is the row's
+Boolean (`match_terms(...) as hit`).
 
 A ranking may feed aggregates, but it only selects the rows that are
 aggregated: the `k` window under `nearest`, every text match under
@@ -248,7 +248,7 @@ Boolean operand like any other in a `where`: true where the row is among the
 call's matches, false elsewhere, never null. Write `not match_terms(...)`,
 `match_terms(...) or ...` or `match_terms(...) = false`; the rows are the same
 whether or not the index covers them yet. Read as a value in `return`,
-`order` or a block's aggregate, a call is `T86`.
+`order` or an aggregate, a call is that same Boolean.
 
 ### Analyzers
 

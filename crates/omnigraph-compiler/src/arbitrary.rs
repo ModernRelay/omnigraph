@@ -1370,10 +1370,44 @@ impl ReadGen<'_, '_, '_> {
         } else {
             String::new()
         };
-        elements.push(format!("optional {{ {t}{w} }}"));
+        // A `let` inside the optional, a column of its matches null where
+        // nothing matched, whether or not the optional binds a node.
+        let lv = (depth > 0 && self.c.flag(20)).then(|| self.var("l"));
+        let l = match &lv {
+            Some(v) => format!(", let {v} = {}", self.expr(Class::Int, &inner, depth - 1)),
+            None => String::new(),
+        };
+        elements.push(format!("optional {{ {t}{l}{w} }}"));
         self.nullable_nodes
             .extend(new.iter().map(|v| v.name.clone()));
         scope.extend(new);
+        if let Some(v) = lv {
+            scope.push(Var {
+                name: v,
+                kind: VarKind::Scalar(Sc::I64),
+            });
+        }
+    }
+
+    /// `match_terms($x.t, terms(…))` over a node of the first type in scope
+    /// whose full-text field it reads, or `None`.
+    fn lexical_value(&mut self, scope: &[Var]) -> Option<String> {
+        let t = 0;
+        if !self.schema.nodes[t].props.iter().any(|p| p.name == "t") {
+            return None;
+        }
+        let nodes: Vec<String> = Self::node_vars(scope)
+            .into_iter()
+            .filter(|(name, n)| *n == t && !self.nullable_nodes.contains(name))
+            .map(|(name, _)| name)
+            .collect();
+        if nodes.is_empty() {
+            return None;
+        }
+        let x = self.c.pick(&nodes).clone();
+        let text = self.text_query();
+        let mode = *self.c.pick(&["any", "all"]);
+        Some(format!("match_terms({x}.t, terms({text}, mode: {mode}))"))
     }
 
     /// `from union({ … return { $x as u } }, { … return { $y as u } })`,
@@ -1445,7 +1479,7 @@ impl ReadGen<'_, '_, '_> {
         let name = edge.surface();
         let from_ty = &self.schema.nodes[edge.from].name;
         let to_ty = &self.schema.nodes[edge.to].name;
-        let u = self.var("ue");
+        let u = self.var("edge");
         let (k1, k2) = (self.var("k"), self.var("k"));
         let (b1, a2, b2) = (self.var("n"), self.var("n"), self.var("n"));
         let sources: Vec<String> = Self::node_vars(scope)
@@ -1608,6 +1642,12 @@ impl ReadGen<'_, '_, '_> {
                 // the read stays a plain projection.
                 items.push(format!("{block} as {alias}"));
                 continue;
+            } else if self.options.search
+                && self.c.flag(5)
+                && let Some(call) = self.lexical_value(scope)
+            {
+                // A full-text call read as a value.
+                call
             } else if self.c.flag(15) {
                 // A node or edge reference.
                 // A node reference; an edge returned whole is refused

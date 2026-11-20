@@ -296,18 +296,17 @@ a later release lowers it.
 | Refused |
 |---|
 | An `rrf` whose arms read a name of the enclosing scope |
-| A node an `optional` introduces, or an edge reference, returned whole; a `let` inside an `optional` that binds no node of its own |
-| A full-text call (`match_terms`) read as a value in `return`, `order` or a block's aggregate |
+| A node an `optional` introduces, or an edge reference, returned whole |
 | A `Blob` read from a row in an assignment (a write group whose selection reads a type an earlier group changes is `T91`: every group selects on the write's snapshot) |
 | A read that calls itself (`Fix`) |
 
 ```text
-query q($s: String) { match { $d: Doc } return { $d.title, match_terms($d.body, terms($s, mode: any)) as hit } }
+query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }
 ```
 
 ```text
-error[T86]: type error: T86: `q`: this release does not support a full-text call read as a value in `return` yet
-  --> line 1, column 60
+error[T86]: type error: T86: `q`: this release does not support an edge reference returned whole (the result has no edge object) yet
+  --> line 1, column 80
 ```
 
 `T86` prints a fix only where a form the planner runs has the same rows and

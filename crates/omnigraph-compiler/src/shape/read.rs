@@ -1618,6 +1618,23 @@ impl<'a> Shaper<'a> {
         order_keys
             .iter_mut()
             .for_each(|key| null_tests(&mut key.expr));
+        // A full-text call read as a value (in `return`, `order` or an
+        // aggregate) is a column of the pattern's rows, computed once after
+        // the pattern as a `let` would be: the Boolean the call's matches
+        // decide for each row, which the projection, the sort and the
+        // aggregate then read.
+        let mut lexical: Vec<(String, IRExpr)> = Vec::new();
+        for e in items.values_mut() {
+            self.lexical_columns(e, &mut lexical);
+        }
+        for agg in aggs.values_mut() {
+            if let Some(arg) = &mut agg.arg {
+                self.lexical_columns(arg, &mut lexical);
+            }
+        }
+        for key in &mut order_keys {
+            self.lexical_columns(&mut key.expr, &mut lexical);
+        }
         let order_keys = order_keys.as_slice();
         // Return items.
         let mut return_exprs = Vec::new();
@@ -1659,12 +1676,6 @@ impl<'a> Shaper<'a> {
                     )));
                 }
             };
-            if holds_lexical_call(&item) {
-                return Err(self.refuse_at(
-                    "a full-text call read as a value in `return`",
-                    Construct::ReturnItem(i),
-                ));
-            }
             let alias = self.alias(column, &item);
             return_exprs.push(IRProjection {
                 ty: if item.ty() == ty {
@@ -1751,9 +1762,6 @@ impl<'a> Shaper<'a> {
                     .item(other, &aggs, ranking.as_ref())
                     .map_err(|e| e.at(at.clone()))?,
             };
-            if holds_lexical_call(&expr) {
-                return Err(self.refuse_at("a full-text call read as a value in `order`", at));
-            }
             // The sort reads columns: a computed key reads the first return
             // item that computes it; one no item computes is not lowered yet.
             let computed = matches!(
@@ -1850,6 +1858,9 @@ impl<'a> Shaper<'a> {
                 &HashSet::new(),
                 &mut fresh,
             )?;
+        }
+        for (name, value) in lexical {
+            pipeline.push(PatternStep::Let { name, value });
         }
         // The read's own projection, cut and order, and the expressions of
         // what it returns and orders by, which the shape copies.
@@ -2608,7 +2619,6 @@ impl<'a> Shaper<'a> {
     /// then the optional's own, whose new names enter the scope.
     fn optional(&self, outer: &Term, pattern: &Term, facts: &mut Facts) -> Result<(), ShapeError> {
         self.facts(outer, facts)?;
-        let at = || Construct::Element(&[ElementKind::Optional], None);
         // The names the scope binds before it are the outer columns; a
         // rebinding of one inside is `T68`.
         let mut outer_columns: HashSet<String> = facts.names().into_iter().collect();
@@ -2648,19 +2658,47 @@ impl<'a> Shaper<'a> {
                 .filter_map(|name| inner.types.get(name).map(|ty| (name, ty)))
                 .collect();
             nodes.sort();
-            let Some((marker, type_name)) = nodes.first() else {
-                return Err(self.refuse_at("a `let` inside an `optional` that binds no node", at()));
-            };
-            matched = Some(IRExpr::IsNull {
-                expr: Box::new(IRExpr::Variable(
-                    marker.to_string(),
-                    ExprType::Node {
-                        type_name: type_name.to_string(),
-                    },
-                )),
-                negated: true,
-                ty: scalar(ScalarType::Bool),
-            });
+            // With no node of its own to mark a match, each value is a
+            // column the optional's own steps compute after its elements,
+            // which the optional pads null where nothing matches.
+            match nodes.first() {
+                Some((marker, type_name)) => {
+                    matched = Some(IRExpr::IsNull {
+                        expr: Box::new(IRExpr::Variable(
+                            marker.to_string(),
+                            ExprType::Node {
+                                type_name: type_name.to_string(),
+                            },
+                        )),
+                        negated: true,
+                        ty: scalar(ScalarType::Bool),
+                    });
+                }
+                None => {
+                    let computed: HashSet<String> =
+                        inner.checks.iter().map(|c| c.name.clone()).collect();
+                    for (name, value) in &mut exported {
+                        let own = matches!(value, IRExpr::PropAccess { variable, .. } if computed.contains(variable));
+                        if own {
+                            continue;
+                        }
+                        let n = self.lets_minted.get();
+                        self.lets_minted.set(n + 1);
+                        let binding = self.shaped(format_args!("l{n}_{name}"));
+                        let ty = value.ty().clone();
+                        inner.checks.push(LetCheck {
+                            name: binding.clone(),
+                            value: value.clone(),
+                            marks: inner.marks(),
+                        });
+                        *value = IRExpr::PropAccess {
+                            variable: binding,
+                            property: LET_VALUE.to_string(),
+                            ty,
+                        };
+                    }
+                }
+            }
         }
         let columns: HashSet<String> = inner.checks.iter().map(|c| c.name.clone()).collect();
         facts.optional_names.extend(introduced);
@@ -3977,13 +4015,66 @@ impl<'a> Shaper<'a> {
         if let Some(arg) = &mut agg.arg {
             resolve(arg, &inner_lets);
         }
-        if agg.arg.as_ref().is_some_and(holds_lexical_call) {
-            return Err(self.refuse_at(
-                "a full-text call read as a value in a block's aggregate",
-                Construct::Block,
-            ));
+        // A full-text call the aggregate reads is a column of the block's
+        // rows, computed after its pattern.
+        if let Some(arg) = &mut agg.arg {
+            let mut lexical = Vec::new();
+            self.lexical_columns(arg, &mut lexical);
+            for (name, value) in lexical {
+                inner_facts.checks.push(LetCheck {
+                    name,
+                    value,
+                    marks: inner_facts.marks(),
+                });
+            }
         }
         Ok((inner_facts, agg))
+    }
+
+    /// `expr` with every full-text call read as the column of a `let` made
+    /// up for it, the same call reading the same column: each `(column,
+    /// call)` is pushed onto `lets` once, for the steps to compute.
+    fn lexical_columns(&self, expr: &mut IRExpr, lets: &mut Vec<(String, IRExpr)>) {
+        crate::stack::deep(|| {
+            if expr.lexical_predicate_field().is_some() {
+                let name = match lets.iter().find(|(_, call)| call == expr) {
+                    Some((name, _)) => name.clone(),
+                    None => {
+                        let n = self.lets_minted.get();
+                        self.lets_minted.set(n + 1);
+                        let name = self.shaped(format_args!("l{n}_lexical"));
+                        lets.push((name.clone(), expr.clone()));
+                        name
+                    }
+                };
+                *expr = IRExpr::PropAccess {
+                    variable: name,
+                    property: LET_VALUE.to_string(),
+                    ty: expr.ty().clone(),
+                };
+                return;
+            }
+            match expr {
+                IRExpr::Binary { left, right, .. } => {
+                    self.lexical_columns(left, lets);
+                    self.lexical_columns(right, lets);
+                }
+                IRExpr::Not(inner, _)
+                | IRExpr::Cast { expr: inner, .. }
+                | IRExpr::Neg { expr: inner, .. }
+                | IRExpr::IsNull { expr: inner, .. } => self.lexical_columns(inner, lets),
+                IRExpr::Aggregate { arg, .. } => self.lexical_columns(arg, lets),
+                IRExpr::Call { args, .. } => args
+                    .iter_mut()
+                    .for_each(|arg| self.lexical_columns(arg, lets)),
+                IRExpr::PropAccess { .. }
+                | IRExpr::Nearest { .. }
+                | IRExpr::Variable(..)
+                | IRExpr::Param(..)
+                | IRExpr::Literal(..)
+                | IRExpr::AliasRef(..) => {}
+            }
+        })
     }
 
     /// A block read as a value (`count { p }` in a `let`, a return item or

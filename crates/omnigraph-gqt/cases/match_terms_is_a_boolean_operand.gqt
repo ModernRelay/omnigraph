@@ -6,8 +6,8 @@
 # notes: query term in the document, `mode: any` one of them; repeating or reordering query
 # notes: terms changes nothing, and a null title never matches. The twins `t1` and `t5` are
 # notes: inserted after the index was built, into a fragment no full-text segment covers, and
-# notes: are answered as their indexed originals are. An edit budget other than 0 is T86
-# notes: (the refusal table, `tests/integration/law_refusals.rs`).
+# notes: are answered as their indexed originals are. Read as a value, in `return`, `order` or an
+# notes: aggregate, the call is the same Boolean (`full_text_calls_read_as_values.gqt`).
 
 --- runner
 timeout_ms: 10000

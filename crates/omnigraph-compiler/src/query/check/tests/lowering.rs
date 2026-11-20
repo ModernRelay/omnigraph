@@ -75,28 +75,6 @@ const B_IN_PROGRESS: &[InProgress] = &[
         site: "an edge reference returned whole (the result has no edge object)",
         text: "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }",
     },
-    InProgress {
-        construct: "a full-text call read as a value",
-        site: "a full-text call read as a value in `return`",
-        text: "query q($s: String) { match { $d: Doc } return { $d.title, match_terms($d.body, terms($s, mode: any)) as hit } }",
-    },
-    InProgress {
-        construct: "a full-text call as an order key",
-        site: "a full-text call read as a value in `order`",
-        text: "query q($s: String) { match { $d: Doc } return { $d.title } order { match_terms($d.body, terms($s, mode: any)) } }",
-    },
-    // `ReadShape`: the elements of a pattern.
-    InProgress {
-        construct: "a `let` inside an `optional` that binds no node",
-        site: "a `let` inside an `optional` that binds no node",
-        text: "query q() { match { $p: Person, $q: Person, optional { $p knows $q, let $x = 1 } } where $p.handle = \"a\" and $q.handle = \"b\" return { $p.name, $x } }",
-    },
-    // `ReadShape`: the blocks of a `where`.
-    InProgress {
-        construct: "a full-text call in a block's aggregate",
-        site: "a full-text call read as a value in a block's aggregate",
-        text: "query q($s: String) { match { $p: Person } where sum(if(match_terms($d.body, terms($s, mode: any)), 1, 0)) { $d: Doc, $p authored $d } > 0 return { $p.name } }",
-    },
     // `WriteShape`.
     InProgress {
         construct: "an assignment reading a Blob from a row",
@@ -444,10 +422,25 @@ const CLOSURE: &[Row] = &[
                 "query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 1)) return { $d.title } }",
                 Lowers,
             ),
-            // "a full-text call read as a value"
+            // A full-text call read as a value.
             (
                 "query q($s: String) { match { $d: Doc } return { $d.title, match_terms($d.body, terms($s, mode: any)) as hit } }",
-                Refused("B"),
+                Lowers,
+            ),
+            // A full-text call as an order key.
+            (
+                "query q($s: String) { match { $d: Doc } return { $d.title } order { match_terms($d.body, terms($s, mode: any)) } }",
+                Lowers,
+            ),
+            // A `let` inside an `optional` that binds no node.
+            (
+                "query q() { match { $p: Person, $q: Person, optional { $p knows $q, let $x = 1 } } where $p.handle = \"a\" and $q.handle = \"b\" return { $p.name, $x } }",
+                Lowers,
+            ),
+            // A full-text call in a block's aggregate.
+            (
+                "query q($s: String) { match { $p: Person } where sum(if(match_terms($d.body, terms($s, mode: any)), 1, 0)) { $d: Doc, $p authored $d } > 0 return { $p.name } }",
+                Lowers,
             ),
         ],
     },
@@ -834,12 +827,12 @@ fn every_refusal_of_the_shapers_is_pinned() {
 #[test]
 fn t86_is_at_the_construct() {
     let refused = |text: &str| outcome(text).expect_err("refused");
-    // A block whose aggregate reads a full-text call is refused at the
-    // block.
-    let d = refused(
-        "query q($s: String) { match { $p: Person } where sum(if(match_terms($d.body, terms($s, mode: any)), 1, 0)) { $d: Doc, $p authored $d } > 0 return { $p.name } }",
-    );
-    assert_eq!(d.position.map(|p| p.column), Some(50), "{d}");
+    // An edge reference returned whole is refused at its return item.
+    let text =
+        "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }";
+    let d = refused(text);
+    let item = u32::try_from(text.rfind("$k").unwrap() + 1).unwrap();
+    assert_eq!(d.position.map(|p| p.column), Some(item), "{d}");
 }
 
 /// Every group of a write selects on the write's one snapshot, so a group

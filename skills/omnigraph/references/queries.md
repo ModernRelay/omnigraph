@@ -402,7 +402,7 @@ BM25 needs neither, though a limit is recommended for bounded output.
 Return the score by the name `as` gave it (`as $near` returns the column
 `near`), or alias it; see [`search.md`](search.md#projecting-scores). The lexical
 predicate `match_terms` is a Boolean operand in `where`, under `not` and `or`
-too, and is not a return item (`T86`). A ranked read's JSON carries a `ranking` object; see
+too, and a Boolean value in `return`, `order` or an aggregate. A ranked read's JSON carries a `ranking` object; see
 [`search.md`](search.md#what-a-ranked-read-reports).
 
 ### Hybrid (reciprocal rank fusion)
@@ -771,8 +771,8 @@ Rewrite what it leaves from the fix and this map:
 Moved codes: `T2` (unknown property in a read) and `T11` in a write's `where`
 are `T6`; list equality in braces `T3` is `T7`; an aggregate call in a filter
 (`T7`, `T44`) is `T8`; a block compared with a value of another type (`T40`)
-is `T7`; a bare edge binding returned (`T23`) and a full-text call in
-`return` (`T35`) are `T86`; `T32`/`T33`/`T54` are `T65`; `T58` is `T9`;
+is `T7`; a bare edge binding returned (`T23`) is `T86`, and a full-text call
+in `return` (`T35`) runs as a Boolean; `T32`/`T33`/`T54` are `T65`; `T58` is `T9`;
 `T59` is `T75`; a bare name (`T45`, `T36`) is `Q018`; `lint` parse refusals
 carry their own `Q…` code instead of `Q000`. A read named after a function
 (`lower`, `length`, `round`, …) or an element keyword is `T74`; over grouped rows every order key must be returned

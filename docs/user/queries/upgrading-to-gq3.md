@@ -162,7 +162,7 @@ code. Scripts and agents that match codes need these changes.
 | `T23` | an edge binding returned whole, `return { $k }` | `T86`: return its fields |
 | `T23` | an edge binding inside a block, `optional` or inline read reusing an outer name | `T68` |
 | `T32`, `T33`, `T54` | a ranking under an aggregate, a projected rank, `asc` on a rank key | `T65` |
-| `T35` | a full-text call projected in `return` | `T86` |
+| `T35` | a full-text call projected in `return` | runs: the row's Boolean |
 | `T38` | a full-text predicate under `or` or `not` | accepted |
 | `T58` | an aggregate compared with an ungrouped property in `return` | `T9` |
 | `T59` | `rrf` arms ranking two bindings one traversal connects | `T75` |

@@ -182,7 +182,13 @@ query search_projected($q: String) {
 --- params
 {"q": "needle"}
 
---- expect error: T86: `search_projected`: this release does not support a full-text call read as a value in `return` yet
+--- expect unordered
+{"hit":true,"p.name":"A"}
+{"hit":true,"p.name":"B"}
+
+--- expect shape
+p.name: String
+hit: Bool
 
 --- query
 query alias_projected_again() {

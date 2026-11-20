@@ -249,7 +249,7 @@ score, including through traversals, ranking the binding the ranking names
 whichever binding its population declares first
 ([details](../search/index.md#ranking-a-traversal-reached-binding)). A
 `nearest` window `k` and the `limit` are separate values. `limit` takes an integer literal or parameter, `limit $k`, bound to a non-negative count when the read runs. A ranking written as a call in `order` or `return` is refused (`T65`); a search
-predicate in `return` is not lowered (`T86`).
+predicate in `return` is the row's Boolean.
 
 For aggregate or DISTINCT returns, the ranking selects the input population;
 it does not order the output, and its score is not an order key (`T42`); with
