@@ -296,7 +296,6 @@ a later release lowers it.
 | Refused |
 |---|
 | An `rrf` whose arms read a name of the enclosing scope |
-| A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope; an inline read returning an outer name under another name; a called read's `limit $k` bound to a computed argument |
 | A node an `optional` introduces, or an edge reference, returned whole; a `let` inside an `optional` that binds no node of its own |
 | A full-text call (`match_terms`) read as a value in `return`, `order` or a block's aggregate |
 | A `Blob` read from a row in an assignment (a write group whose selection reads a type an earlier group changes is `T91`: every group selects on the write's snapshot) |

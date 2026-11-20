@@ -91,32 +91,6 @@ const B_IN_PROGRESS: &[InProgress] = &[
         site: "a `let` inside an `optional` that binds no node",
         text: "query q() { match { $p: Person, $q: Person, optional { $p knows $q, let $x = 1 } } where $p.handle = \"a\" and $q.handle = \"b\" return { $p.name, $x } }",
     },
-    InProgress {
-        construct: "a union arm returning an edge",
-        site: "a `union` arm returning an edge",
-        text: "query q() { match { from union({ match { $p: Person, $q: Person, $p $k:knows $q } return { $k } }, { match { $a: Person, $b: Person, $a $e:knows $b } return { $e as k } }) } return { $k.@src } }",
-    },
-    InProgress {
-        construct: "a union arm returning a value that reads the enclosing scope",
-        site: "a `union` arm that returns a value or keeps its own cut and reads the enclosing scope",
-        text: "query q() { match { $c: Company, from union({ match { $p: Person, $p worksAt $c } return { $p, 1 as d } }, { match { $q: Person } return { $q as p, 2 as d } }) } return { $p.name, $d } }",
-    },
-    InProgress {
-        construct: "an inline read returning an outer variable under another name",
-        site: "a `from` returning an outer variable under another name",
-        text: "query q() { match { $p: Person, from { match { $q: Person, $p knows $q } return { $p as r } } } return { $r.name } }",
-    },
-    InProgress {
-        construct: "an inline read with an aggregate returning an outer variable under another name",
-        site: "a `from` returning an outer variable under another name",
-        text: "query q() { match { $p: Person, from { match { $q: Person, $p knows $q } return { $p as r, count($q) as n } } } return { $r.name, $n } }",
-    },
-    InProgress {
-        construct: "a called read's `limit $k` bound to a computed argument",
-        site: "a called read's `limit` over an argument that is not a literal or a parameter",
-        text: "query top($k: I64) { match { $q: Person } return { $q } order { $q.age } limit $k }
-               query q() { match { $p: Person, from top(3 + 1) } return { $p.name, $q.name } }",
-    },
     // `ReadShape`: the blocks of a `where`.
     InProgress {
         construct: "a full-text call in a block's aggregate",
@@ -333,19 +307,35 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { from union({ match { $p: Person } return { $p } order { $p.age } limit 1 }, { match { $q: Person } return { $q as p } }) } return { $p.name } }",
                 Lowers,
             ),
-            // "a union arm returning an edge"
+            // A union arm returning an edge.
             (
                 "query q() { match { from union({ match { $p: Person, $q: Person, $p $k:knows $q } return { $k } }, { match { $a: Person, $b: Person, $a $e:knows $b } return { $e as k } }) } return { $k.@src } }",
-                Refused("B"),
+                Lowers,
             ),
             (
                 "query q() { match { $c: Company, from union({ match { $p: Person, $p worksAt $c } return { $p } }, { match { $q: Person } return { $q as p } }) } return { $p.name } }",
                 Lowers,
             ),
-            // "a union arm returning a value that reads the enclosing scope"
+            // A union arm returning a value that reads the enclosing scope.
             (
                 "query q() { match { $c: Company, from union({ match { $p: Person, $p worksAt $c } return { $p, 1 as d } }, { match { $q: Person } return { $q as p, 2 as d } }) } return { $p.name, $d } }",
-                Refused("B"),
+                Lowers,
+            ),
+            // An inline read returning an outer variable under another name.
+            (
+                "query q() { match { $p: Person, from { match { $q: Person, $p knows $q } return { $p as r } } } return { $r.name } }",
+                Lowers,
+            ),
+            // An inline read with an aggregate returning an outer variable under another name.
+            (
+                "query q() { match { $p: Person, from { match { $q: Person, $p knows $q } return { $p as r, count($q) as n } } } return { $r.name, $n } }",
+                Lowers,
+            ),
+            // A called read's `limit $k` bound to a computed argument.
+            (
+                "query top($k: I64) { match { $q: Person } return { $q } order { $q.age } limit $k }
+               query q() { match { $p: Person, from top(3 + 1) } return { $p.name, $q.name } }",
+                Lowers,
             ),
             (
                 "query q($s: String) { match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.body, $s) as $score } return { $d.title, $score } order { $score desc } limit 3 }",
@@ -793,7 +783,11 @@ fn names_site(message: &str, site: &str) -> bool {
 fn every_refusal_of_the_shapers_is_pinned() {
     let mut sites = refusal_sites(include_str!("../../../shape/read.rs"));
     sites.extend(refusal_sites(include_str!("../../../shape/write.rs")));
-    assert!(sites.len() > 10, "the site reader found {sites:#?}");
+    // The read that calls itself (stage Rec) is refused whatever B lowers.
+    assert!(
+        sites.iter().any(|s| s.contains("`Fix`")),
+        "the site reader found {sites:#?}"
+    );
     let stage = |text: &str| -> (String, &'static str) {
         let d = outcome(text).expect_err(text);
         let stage = refused_stage(&d, text);

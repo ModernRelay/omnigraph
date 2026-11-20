@@ -76,13 +76,23 @@ A query runs against one resolved `ReadTarget`:
    a value or groups, orders or cuts its rows, every arm is an uncorrelated
    `PatternStep::Correlate` returning its columns under the first arm's
    names, its values columns of one `values` binding all arms share, which
-   the union binds beside its references. A union whose node-returning arms
+   the union binds beside its references. A union's reference columns are
+   nodes or edges, an edge column carrying its edge's columns as a node
+   column does. A union whose arms
    read the enclosing scope is the pattern of a correlated
-   `PatternStep::Correlate` returning its references: its `PatternStep::Union`
+   `PatternStep::Correlate` returning its references and its values: its
+   `PatternStep::Union`
    names the `outer_var` each arm starts from, the first arm from the read's
    `OuterReference` and the others from leaves of their own over the same
    slot, which `OuterReferenceExec` reads without emptying, and `UnionExec`
    carries the outer rows' tag both arms hold.
+   An inline read returning an outer name under another name binds that
+   name to the outer reference, which every later read of it, a triple's
+   end and a nested scope's outer names included, reads in its place.
+   A called read's `limit $k` bound to an argument computed in the caller's
+   scope is the read's `InnerRead::limit_expr`, which `CorrelateExec`
+   evaluates on each outer row (once, uncorrelated) as that row's cut,
+   refusing a value that is no count.
    A `from` over an inline read (or a call) with its own aggregate,
    `distinct`, `order` or `limit` (the core's `Correlate` over its `Group`,
    `Order` and `Cut`) is a `PatternStep::Correlate`, placed beside the
@@ -165,9 +175,8 @@ A query runs against one resolved `ReadTarget`:
    since, so a chain of guarded blocks computes each guard once.
    The shaper is the compiler's
    (`omnigraph_compiler::shape`), and the type checker runs it on every
-   declaration it accepts: a term it does not lower (a `union` arm with
-   an edge, or with a value and an outer name, `Fix`, an `rrf` whose arms
-   read the enclosing scope) is refused at
+   declaration it accepts: a term it does not lower (`Fix`, an `rrf` whose
+   arms read the enclosing scope) is refused at
    type check with
    `T86`, at the construct and naming the programme stage that adds it, so
    the planner never refuses a checked read. A term that still arrives

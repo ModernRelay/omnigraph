@@ -2099,6 +2099,7 @@ pub struct InnerReadMirror {
     pub limit: Option<u64>,
     pub limit_param: Option<String>,
     pub window: Option<TargetWindowMirror>,
+    pub limit_expr: Option<ExprMirror>,
 }
 
 /// A `Correlate`'s `nearest` window.
@@ -2123,6 +2124,7 @@ impl From<&InnerRead> for InnerReadMirror {
                 targets: w.targets,
                 targets_param: w.targets_param.clone(),
             }),
+            limit_expr: read.limit_expr.as_ref().map(ExprMirror::from),
         }
     }
 }
@@ -2141,6 +2143,7 @@ impl From<InnerReadMirror> for InnerRead {
                 targets: w.targets,
                 targets_param: w.targets_param,
             }),
+            limit_expr: mirror.limit_expr.map(IRExpr::from),
         }
     }
 }

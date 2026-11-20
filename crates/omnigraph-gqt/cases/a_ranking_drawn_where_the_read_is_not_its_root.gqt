@@ -9,7 +9,7 @@
 # notes: of each target (d3 has two authors), and an outer `where` or `limit` never sizes it.
 
 --- runner
-timeout_ms: 20000
+timeout_ms: 10000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem

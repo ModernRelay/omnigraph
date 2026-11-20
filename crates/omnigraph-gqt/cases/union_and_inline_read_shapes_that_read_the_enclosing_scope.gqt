@@ -1,0 +1,302 @@
+# issue: none
+# notes: The union and inline-read shapes of the GQ 3 RFC (section 3, "Relation expressions",
+# notes: "Scope and correlation"; section 2, `Call`): an inline read returning an outer name
+# notes: under another name binds that name to the outer reference (a later triple from it and
+# notes: a block reading it included); a called read's `limit $k` bound to an argument computed
+# notes: in the caller's scope cuts at that value per outer row, and a value that is no count
+# notes: refuses the read's input; a `union` whose arms return values or keep their own cut
+# notes: while reading an outer name runs per outer row; and a `union` arm may return an edge.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+node Doc {
+    id: String @key
+    title: String
+    body: String @index
+    year: I32
+    tags: [String]
+    embedding: Vector(3)? @index
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Person","data":{"handle":"a","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"b","name":"Bob","age":20}}
+{"type":"Person","data":{"handle":"p1","name":"Cy","age":50}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Doc","data":{"id":"d1","title":"graph basics","body":"graph databases store graphs","year":2020,"tags":["x"],"embedding":[1.0,0.0,0.0]}}
+{"type":"Doc","data":{"id":"d2","title":"vector search","body":"vector search over graph embeddings","year":2021,"tags":["y"],"embedding":[0.9,0.1,0.0]}}
+{"type":"Doc","data":{"id":"d3","title":"cooking","body":"pasta and graph theory of sauces","year":2022,"tags":[],"embedding":[0.0,1.0,0.0]}}
+{"type":"Doc","data":{"id":"d4","title":"rivers","body":"water flows downhill","year":2023,"tags":[],"embedding":[0.0,0.0,1.0]}}
+{"type":"Doc","data":{"id":"d5","title":"graphs again","body":"graph graph graph","year":2024,"tags":[],"embedding":[0.5,0.5,0.0]}}
+{"edge":"Authored","from":"a","to":"d1"}
+{"edge":"Authored","from":"a","to":"d3"}
+{"edge":"Authored","from":"a","to":"d4"}
+{"edge":"Authored","from":"b","to":"d2"}
+{"edge":"Authored","from":"b","to":"d5"}
+{"edge":"Authored","from":"b","to":"d3"}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"b","to":"p1"}
+{"edge":"WorksAt","from":"a","to":"acme"}
+{"edge":"Cites","from":"d1","to":"d2"}
+
+--- query
+query q() { match { $p: Person, from { match { $q: Person, $p knows $q } return { $p as r } } } return { $p.name, $r.name } }
+
+--- expect unordered
+{"p.name":"Ada","r.name":"Ada"}
+{"p.name":"Bob","r.name":"Bob"}
+
+--- expect shape
+p.name: String
+r.name: String
+
+--- query
+query q() { match { $p: Person, from { match { $q: Person, $p knows $q } return { $p as r, count($q) as n } } } return { $r.name, $n } }
+
+--- expect unordered
+{"n":1,"r.name":"Ada"}
+{"n":1,"r.name":"Bob"}
+
+--- expect shape
+r.name: String
+n: I64
+
+--- query
+query q() { match { $p: Person, from { match { $q: Person, $p knows $q } return { $p as r, $q } } , $r authored $d } return { $r.handle, $q.handle, $d.id } }
+
+--- expect unordered
+{"d.id":"d1","q.handle":"b","r.handle":"a"}
+{"d.id":"d2","q.handle":"p1","r.handle":"b"}
+{"d.id":"d3","q.handle":"b","r.handle":"a"}
+{"d.id":"d3","q.handle":"p1","r.handle":"b"}
+{"d.id":"d4","q.handle":"b","r.handle":"a"}
+{"d.id":"d5","q.handle":"p1","r.handle":"b"}
+
+--- expect shape
+r.handle: String
+q.handle: String
+d.id: String
+
+--- query
+query q() { match { $p: Person, from { match { $q: Person, $p knows $q } return { $p as r } } } where exists { $d: Doc, $r authored $d } return { $r.handle } order { $r } }
+
+--- expect ordered
+{"r.handle":"a"}
+{"r.handle":"b"}
+
+--- expect shape
+r.handle: String
+
+--- query
+query q() { match { $p: Person, from { match { $q: Person, $p knows $q } return { $p as r } order { $q.age } limit 1 } } return { $r, $p.handle } }
+
+--- expect unordered
+{"p.handle":"a","r":{"@id":"a","age":36,"handle":"a","name":"Ada"}}
+{"p.handle":"b","r":{"@id":"b","age":20,"handle":"b","name":"Bob"}}
+
+--- expect shape
+r: Person
+p.handle: String
+
+--- query
+query q() { match { $c: Company, from union({ match { $p: Person, $p worksAt $c } return { $p, 1 as d } }, { match { $q: Person } return { $q as p, 2 as d } }) } return { $c.slug, $p.name, $d } }
+
+--- expect unordered
+{"c.slug":"acme","d":1,"p.name":"Ada"}
+{"c.slug":"acme","d":2,"p.name":"Ada"}
+{"c.slug":"acme","d":2,"p.name":"Bob"}
+{"c.slug":"acme","d":2,"p.name":"Cy"}
+
+--- expect shape
+c.slug: String
+p.name: String
+d: I64
+
+--- query
+query q() { match { $p: Person, from union({ match { $q: Person, $p knows $q } return { $q, 1 as d } order { $q.age } limit 1 }, { match { $d2: Doc, $p authored $d2, $a: Person, $a authored $d2 } return { $a as q, cast($d2.year, I64) as d } }) } return { $p.handle, $q.handle, $d } }
+
+--- expect unordered
+{"d":1,"p.handle":"a","q.handle":"b"}
+{"d":1,"p.handle":"b","q.handle":"p1"}
+{"d":2020,"p.handle":"a","q.handle":"a"}
+{"d":2021,"p.handle":"b","q.handle":"b"}
+{"d":2022,"p.handle":"a","q.handle":"a"}
+{"d":2022,"p.handle":"a","q.handle":"b"}
+{"d":2022,"p.handle":"b","q.handle":"a"}
+{"d":2022,"p.handle":"b","q.handle":"b"}
+{"d":2023,"p.handle":"a","q.handle":"a"}
+{"d":2024,"p.handle":"b","q.handle":"b"}
+
+--- expect shape
+p.handle: String
+q.handle: String
+d: I64
+
+--- query
+query q() { match { $p: Person, from union({ match { $q: Person, $p knows $q } return { $q } order { $q.age desc } limit 1 }, { match { $q: Person } where $q.handle = "p1" return { $q } }) } return { $p.handle, $q.handle } }
+
+--- expect unordered
+{"p.handle":"a","q.handle":"b"}
+{"p.handle":"a","q.handle":"p1"}
+{"p.handle":"b","q.handle":"p1"}
+{"p.handle":"b","q.handle":"p1"}
+{"p.handle":"p1","q.handle":"p1"}
+
+--- expect shape
+p.handle: String
+q.handle: String
+
+--- query
+query q() { match { $p: Person, from union({ match { $q: Person, $p knows $q } return { count($q) as n } }, { match { $d: Doc, $p authored $d } return { count($d) as n } }) } return { $p.handle, $n } }
+
+--- expect unordered
+{"n":0,"p.handle":"p1"}
+{"n":0,"p.handle":"p1"}
+{"n":1,"p.handle":"a"}
+{"n":1,"p.handle":"b"}
+{"n":3,"p.handle":"a"}
+{"n":3,"p.handle":"b"}
+
+--- expect shape
+p.handle: String
+n: I64
+
+--- query
+query q() { match { from union({ match { $p: Person, $q: Person, $p $k:knows $q } return { $k } }, { match { $a: Person, $b: Person, $a $e:knows $b } return { $e as k } }) } return { $k.@src, $k.@dst } }
+
+--- expect unordered
+{"k.@dst":"b","k.@src":"a"}
+{"k.@dst":"b","k.@src":"a"}
+{"k.@dst":"p1","k.@src":"b"}
+{"k.@dst":"p1","k.@src":"b"}
+
+--- expect shape
+k.@src: String
+k.@dst: String
+
+--- query
+query q() { match { $c: Person, from union({ match { $q: Person, $c $k:knows $q } return { $k } }, { match { $a: Person, $a $e:knows $c } return { $e as k } }) } return { $c.handle, $k.@src, $k.@dst } }
+
+--- expect unordered
+{"c.handle":"a","k.@dst":"b","k.@src":"a"}
+{"c.handle":"b","k.@dst":"b","k.@src":"a"}
+{"c.handle":"b","k.@dst":"p1","k.@src":"b"}
+{"c.handle":"p1","k.@dst":"p1","k.@src":"b"}
+
+--- expect shape
+c.handle: String
+k.@src: String
+k.@dst: String
+
+--- query
+query q() { match { from union({ match { $p: Person, $q: Person, $p $k:knows $q } return { $k, 1 as w } }, { match { $a: Person, $b: Person, $a $e:knows $b } where $a.handle = "a" return { $e as k, 2 as w } }) } return { $k.@src, $k.@dst, $w } }
+
+--- expect unordered
+{"k.@dst":"b","k.@src":"a","w":1}
+{"k.@dst":"b","k.@src":"a","w":2}
+{"k.@dst":"p1","k.@src":"b","w":1}
+
+--- expect shape
+k.@src: String
+k.@dst: String
+w: I64
+
+--- query
+query q() { match { from union({ match { $k: Knows } return { $k } }, { match { $e: Knows } return { $e as k } }), $s: Person } where $s.handle = $k.@src return { $s.name, $k.@dst } order { $s.name, $k } }
+
+--- expect ordered
+{"k.@dst":"b","s.name":"Ada"}
+{"k.@dst":"b","s.name":"Ada"}
+{"k.@dst":"p1","s.name":"Bob"}
+{"k.@dst":"p1","s.name":"Bob"}
+
+--- expect shape
+s.name: String
+k.@dst: String
+
+--- query
+query top($k: I64) { match { $q: Person } return { $q } order { $q.age } limit $k }
+query q() { match { $p: Person, from top(1 + 1) } return { $p.name, $q.name } }
+
+--- expect unordered
+{"p.name":"Ada","q.name":"Ada"}
+{"p.name":"Ada","q.name":"Bob"}
+{"p.name":"Bob","q.name":"Ada"}
+{"p.name":"Bob","q.name":"Bob"}
+{"p.name":"Cy","q.name":"Ada"}
+{"p.name":"Cy","q.name":"Bob"}
+
+--- expect shape
+p.name: String
+q.name: String
+
+--- query
+query friends($h: String, $k: I64) { match { $a: Person, $a knows $q } where $a.handle = $h return { $q } order { $q.age } limit $k }
+query q() { match { $p: Person, from friends($p.handle, 2 - 1) } return { $p.name, $q.name } }
+
+--- expect unordered
+{"p.name":"Ada","q.name":"Bob"}
+{"p.name":"Bob","q.name":"Cy"}
+
+--- expect shape
+p.name: String
+q.name: String
+
+--- query
+query docs($k: I64) { match { $d: Doc } return { $d } order { $d.year desc } limit $k }
+query q() { match { $p: Person, from docs(cast(coalesce($p.age, 0) / 18, I64)) } return { $p.handle, $d.id } }
+
+--- expect unordered
+{"d.id":"d4","p.handle":"a"}
+{"d.id":"d4","p.handle":"p1"}
+{"d.id":"d5","p.handle":"a"}
+{"d.id":"d5","p.handle":"b"}
+{"d.id":"d5","p.handle":"p1"}
+
+--- expect shape
+p.handle: String
+d.id: String
+
+--- query
+query docs($k: I64) { match { $d: Doc } return { $d } order { $d.year desc } limit $k }
+query q() { match { $p: Person, from docs(cast(coalesce($p.age, 0) - 30, I64)) } return { $p.handle, $d.id } }
+
+--- expect error: which is no count
+--- query
+query top($k: I64) { match { $q: Person } return { $q } order { $q.age } limit $k }
+query q($n: I64) { match { $p: Person, from top($n * 2) } return { $p.name, $q.name } }
+
+--- params
+{"n": 1}
+
+--- expect unordered
+{"p.name":"Ada","q.name":"Ada"}
+{"p.name":"Ada","q.name":"Bob"}
+{"p.name":"Bob","q.name":"Ada"}
+{"p.name":"Bob","q.name":"Bob"}
+{"p.name":"Cy","q.name":"Ada"}
+{"p.name":"Cy","q.name":"Bob"}
+
+--- expect shape
+p.name: String
+q.name: String

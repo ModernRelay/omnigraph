@@ -1372,6 +1372,7 @@ impl Lower for Walk<'_, '_> {
                 )),
                 None => None,
             },
+            limit_expr: read.limit_expr.clone(),
             references,
             scores,
             params: Arc::clone(self.lowering.params()),

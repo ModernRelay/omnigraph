@@ -75,6 +75,10 @@ pub(crate) struct CorrelateRead {
     /// window `k`, the rows of the first `k` distinct identities of each
     /// partition in the read's order kept, every row of each.
     pub(crate) window: Option<(String, usize)>,
+    /// A called read's `limit` bound to an argument computed in the
+    /// caller's scope: evaluated on each outer row (once, uncorrelated), the
+    /// cut of that row's partition.
+    pub(crate) limit_expr: Option<IRExpr>,
     /// The reference columns that leave: each binding's columns.
     pub(crate) references: Vec<String>,
     /// The score columns a ranking read appended to a reference's columns
@@ -249,7 +253,20 @@ impl ExecutionPlan for CorrelateExec {
                         &reservation,
                     )
                     .await?;
-                    let result = evaluate(&rows, None, None, &read, &ctx, &reservation).await?;
+                    let limits = match &read.limit_expr {
+                        Some(expr) => Some(limits(&unit_row(), expr, &read.params)?),
+                        None => None,
+                    };
+                    let result = evaluate(
+                        &rows,
+                        None,
+                        None,
+                        limits.as_deref(),
+                        &read,
+                        &ctx,
+                        &reservation,
+                    )
+                    .await?;
                     return assemble(&result, None, None, &schema).map_err(external);
                 };
                 let wide = drain_one(
@@ -272,10 +289,15 @@ impl ExecutionPlan for CorrelateExec {
                 .await;
                 drop(filled);
                 let rows = rows?;
+                let limits = match &read.limit_expr {
+                    Some(expr) => Some(limits(&wide, expr, &read.params)?),
+                    None => None,
+                };
                 let result = evaluate(
                     &rows,
                     Some(&tag_column),
                     Some(wide.num_rows()),
+                    limits.as_deref(),
                     &read,
                     &ctx,
                     &reservation,
@@ -293,6 +315,7 @@ async fn evaluate(
     rows: &RecordBatch,
     tag: Option<&str>,
     outer_rows: Option<usize>,
+    limits: Option<&[usize]>,
     read: &CorrelateRead,
     ctx: &Arc<TaskContext>,
     reservation: &Arc<WorkMemory>,
@@ -315,10 +338,11 @@ async fn evaluate(
     }
     let rows = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
     reservation.hold(&rows)?;
-    if read.order_by.is_empty() && read.limit.is_none() && read.window.is_none() {
+    if read.order_by.is_empty() && read.limit.is_none() && read.window.is_none() && limits.is_none()
+    {
         return Ok(rows);
     }
-    let kept = ordered_cut(&rows, tag, read).map_err(external)?;
+    let kept = ordered_cut(&rows, tag, limits, read).map_err(external)?;
     reservation.take(&rows, &kept)
 }
 
@@ -462,7 +486,12 @@ fn empty_input_value(data_type: &DataType, n: usize) -> DfResult<ArrayRef> {
 /// The indices of the rows the read keeps, in its order: sorted by the tag
 /// (correlated), the `order` keys and the tie rule, then the first `limit`
 /// rows of each tag.
-fn ordered_cut(rows: &RecordBatch, tag: Option<&str>, read: &CorrelateRead) -> Result<UInt32Array> {
+fn ordered_cut(
+    rows: &RecordBatch,
+    tag: Option<&str>,
+    limits: Option<&[usize]>,
+    read: &CorrelateRead,
+) -> Result<UInt32Array> {
     let mut keys = Vec::new();
     if let Some(tag) = tag {
         keys.push(SortColumn {
@@ -496,7 +525,7 @@ fn ordered_cut(rows: &RecordBatch, tag: Option<&str>, read: &CorrelateRead) -> R
     } else {
         lexsort_to_indices(&keys, None).map_err(OmniError::arrow_internal)?
     };
-    if read.limit.is_none() && read.window.is_none() {
+    if read.limit.is_none() && read.window.is_none() && limits.is_none() {
         return Ok(sorted);
     }
     let tags = match tag {
@@ -553,12 +582,57 @@ fn ordered_cut(rows: &RecordBatch, tag: Option<&str>, read: &CorrelateRead) -> R
                 continue;
             }
         }
-        if read.limit.is_none_or(|limit| taken < limit) {
+        let limit = match limits {
+            Some(limits) => limits.get(partition as usize).copied(),
+            None => read.limit,
+        };
+        if limit.is_none_or(|limit| taken < limit) {
             kept.push(row);
             taken += 1;
         }
     }
     Ok(UInt32Array::from(kept))
+}
+
+/// One row with no column: what a constant computed over no outer row is
+/// evaluated on.
+fn unit_row() -> RecordBatch {
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::empty()),
+        Vec::new(),
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(1)),
+    )
+    .expect("a one-row batch with no column")
+}
+
+/// The computed cut of each row of `rows`: a count in `0..`, else the
+/// read's input is refused, as a `limit $k` bound to no count is.
+fn limits(rows: &RecordBatch, expr: &IRExpr, params: &ParamMap) -> DfResult<Vec<usize>> {
+    let values = evaluate_expr(rows, expr, params).map_err(external)?;
+    let values = arrow_cast::cast(&values, &DataType::Int64)?;
+    let values = values
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            external(OmniError::manifest_internal(
+                "a computed limit is not an integer",
+            ))
+        })?;
+    (0..values.len())
+        .map(|row| {
+            if values.is_null(row) {
+                return Err(external(OmniError::manifest(
+                    "a called read's `limit` is bound to null, which is no count",
+                )));
+            }
+            usize::try_from(values.value(row)).map_err(|_| {
+                external(OmniError::manifest(format!(
+                    "a called read's `limit` is bound to {}, which is no count",
+                    values.value(row)
+                )))
+            })
+        })
+        .collect()
 }
 
 fn column(rows: &RecordBatch, name: &str) -> Result<ArrayRef> {

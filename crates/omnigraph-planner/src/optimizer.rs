@@ -777,7 +777,7 @@ fn resolve_pipeline(
                 let inner_root = resolve_pipeline(plan, inner, source, next_binding, seed)?;
                 let tiebreak = correlate_tiebreak(plan, inner_root, read, source)?;
                 let mut reads = Vec::new();
-                for expr in read.exprs() {
+                for expr in read.exprs().chain(read.limit_expr.iter()) {
                     reads_of_expr(expr, &mut reads);
                 }
                 let schema = schema_of(plan, inner_root)?;

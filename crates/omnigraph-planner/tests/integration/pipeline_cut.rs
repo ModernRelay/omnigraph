@@ -101,6 +101,7 @@ fn multi_input_samples(plan: &mut PhysicalPlan) -> Vec<PhysicalNode> {
                 limit: Some(1),
                 limit_param: None,
                 window: None,
+                limit_expr: None,
             }),
             tiebreak: Vec::new(),
         },

@@ -387,6 +387,12 @@ pub struct InnerRead {
     /// identities, every row of each (fan-out carries the score and adds no
     /// vote), per outer row when the read is correlated.
     pub window: Option<TargetWindow>,
+    /// A called read's `limit $k` bound to an argument computed in the
+    /// caller's scope (the GQ 3 RFC, section 2, `Call`: an argument is
+    /// evaluated in the caller's scope and bound to the parameter): the cut
+    /// is that value, evaluated on each outer row (once, uncorrelated), and
+    /// a value that is no count in `0..` refuses the read's input.
+    pub limit_expr: Option<IRExpr>,
 }
 
 /// A [`InnerRead`]'s `nearest` window: the ranked node column and the window
@@ -1075,6 +1081,9 @@ impl Facts {
                 if let Some(score) = &mut correlate.score {
                     f(&mut score.query);
                 }
+                if let Some(limit) = &mut correlate.read.limit_expr {
+                    f(limit);
+                }
             }
         })
     }
@@ -1085,6 +1094,48 @@ impl Facts {
         crate::stack::deep(|| {
             if lets.is_empty() {
                 return;
+            }
+            // A name bound to a reference (an outer variable an inline read
+            // returns under another name) is that reference wherever it is
+            // read: a triple's end and a nested scope's outer names too.
+            let aliases: HashMap<String, String> = lets
+                .iter()
+                .filter_map(|(name, value)| match value {
+                    IRExpr::Variable(target, _) if is_reference(value) && target != name => {
+                        Some((name.clone(), target.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !aliases.is_empty() {
+                let alias = |name: &mut String| {
+                    if let Some(target) = aliases.get(name.as_str()) {
+                        *name = target.clone();
+                    }
+                };
+                for t in &mut self.traversals {
+                    alias(&mut t.src);
+                    alias(&mut t.dst);
+                }
+                let outer = |set: &mut HashSet<String>| {
+                    *set = std::mem::take(set)
+                        .into_iter()
+                        .map(|mut name| {
+                            alias(&mut name);
+                            name
+                        })
+                        .collect();
+                };
+                for conjunct in &mut self.conjuncts {
+                    match conjunct {
+                        ConjunctFact::Block { block, .. } => outer(&mut block.outer),
+                        ConjunctFact::Filter { values, .. } => {
+                            values.iter_mut().for_each(|c| outer(&mut c.outer))
+                        }
+                    }
+                }
+                self.unions.iter_mut().for_each(|u| outer(&mut u.outer));
+                self.correlates.iter_mut().for_each(|c| outer(&mut c.outer));
             }
             self.checks
                 .iter_mut()
@@ -1120,6 +1171,9 @@ impl Facts {
                 if let Some(score) = &mut correlate.score {
                     resolve(&mut score.query, lets);
                 }
+                if let Some(limit) = &mut correlate.read.limit_expr {
+                    resolve(limit, lets);
+                }
             }
         })
     }
@@ -1152,7 +1206,8 @@ struct TraversalFact {
 #[derive(Debug, Clone)]
 struct UnionFact {
     arms: Vec<Facts>,
-    bindings: Vec<(String, String)>,
+    /// Each reference column and its type: a node or an edge.
+    bindings: Vec<(String, ExprType)>,
     /// The `values` binding every arm's value columns belong to, when the
     /// arms return values.
     values: Option<String>,
@@ -1238,6 +1293,9 @@ impl CorrelateFact {
             if let Some(window) = &mut self.read.window {
                 rename(&mut window.binding);
             }
+            if let Some(limit) = &mut self.read.limit_expr {
+                rename_expr(limit, &rename);
+            }
             if let Some(score) = &mut self.score {
                 rename(&mut score.binding);
                 rename_expr(&mut score.query, &rename);
@@ -1257,6 +1315,14 @@ struct BlockFact {
     left: BlockAggregateExpr,
     op: CompOp,
     right: IRExpr,
+}
+
+/// The node types of the node columns among `columns`.
+fn node_types(columns: &[(String, ExprType)]) -> impl Iterator<Item = (String, String)> + '_ {
+    columns.iter().filter_map(|(name, ty)| match ty {
+        ExprType::Node { type_name } => Some((name.clone(), type_name.clone())),
+        _ => None,
+    })
 }
 
 /// Whether `term` is a ranking: `nearest`, `distance`, `bm25` or `rrf`.
@@ -2657,7 +2723,6 @@ impl<'a> Shaper<'a> {
     /// of the same name (the arms match by name, columns in the first arm's
     /// order) and every other name it binds renamed apart.
     fn union(&self, term: &Term, facts: &mut Facts) -> Result<(), ShapeError> {
-        let at = || Construct::Element(FROM, None);
         let mut arms = Vec::new();
         let mut pending = vec![term];
         while let Some(term) = pending.pop() {
@@ -2677,22 +2742,12 @@ impl<'a> Shaper<'a> {
         for arm in &arms {
             parts.push(read_parts(arm).ok_or_else(|| self.unlowered_node(arm))?);
         }
-        if parts.iter().any(|(_, items, _)| {
-            items
-                .iter()
-                .any(|(_, e)| matches!(e.ty(), ExprType::Edge { .. }))
-        }) {
-            return Err(self.refuse_at("a `union` arm returning an edge", at()));
-        }
         if parts.iter().any(|(input, items, _)| {
-            groups_or_cuts(input)
-                || items
-                    .iter()
-                    .any(|(_, e)| !matches!(e.ty(), ExprType::Node { .. }))
+            groups_or_cuts(input) || items.iter().any(|(_, e)| !is_reference(e))
         }) {
             return self.union_of_reads(&parts, facts);
         }
-        let mut columns: Vec<(String, String)> = Vec::new();
+        let mut columns: Vec<(String, ExprType)> = Vec::new();
         let mut shaped = Vec::new();
         let mut outer: HashSet<String> = HashSet::new();
         for (index, &(input, items, bindings)) in parts.iter().enumerate() {
@@ -2714,14 +2769,14 @@ impl<'a> Shaper<'a> {
             for (column, expr) in items.iter() {
                 let mut expr = expr.clone();
                 resolve(&mut expr, &inner_lets);
-                let IRExpr::Variable(variable, ExprType::Node { type_name }) = &expr else {
+                let (IRExpr::Variable(variable, ty), true) = (&expr, is_reference(&expr)) else {
                     return Err(ShapeError::Internal(
-                        "a union arm's column is not a node after the value arms were drawn"
+                        "a union arm's column is not a reference after the value arms were drawn"
                             .to_string(),
                     ));
                 };
                 if index == 0 {
-                    columns.push((column.clone(), type_name.clone()));
+                    columns.push((column.clone(), ty.clone()));
                 }
                 let Some((name, declared)) = columns.iter().find(|(name, _)| name == column) else {
                     return Err(ShapeError::Internal(format!(
@@ -2729,9 +2784,9 @@ impl<'a> Shaper<'a> {
                         index + 1
                     )));
                 };
-                if declared != type_name {
+                if declared != ty {
                     return Err(ShapeError::Internal(format!(
-                        "union column `{name}` is node {declared} and node {type_name}, which the type checker refuses (T73)"
+                        "union column `{name}` is {declared:?} and {ty:?}, which the type checker refuses (T73)"
                     )));
                 }
                 exposed.insert(variable.clone());
@@ -2759,9 +2814,7 @@ impl<'a> Shaper<'a> {
             shaped.push(inner);
             outer.extend(arm_outer);
         }
-        facts
-            .types
-            .extend(columns.iter().map(|(name, ty)| (name.clone(), ty.clone())));
+        facts.types.extend(node_types(&columns));
         let reads_outer = !outer.is_empty();
         let union = UnionFact {
             arms: shaped,
@@ -2780,9 +2833,7 @@ impl<'a> Shaper<'a> {
             ..Facts::default()
         };
         inner.unions.push(union);
-        inner
-            .types
-            .extend(columns.iter().map(|(name, ty)| (name.clone(), ty.clone())));
+        inner.types.extend(node_types(&columns));
         let values = self.shaped(format_args!("r{}", facts.inlined));
         facts.inlined += 1;
         let read = InnerRead {
@@ -2790,10 +2841,8 @@ impl<'a> Shaper<'a> {
             group: None,
             columns: columns
                 .iter()
-                .map(|(name, type_name)| {
-                    let ty = ExprType::Node {
-                        type_name: type_name.clone(),
-                    };
+                .map(|(name, ty)| {
+                    let ty = ty.clone();
                     IRProjection {
                         expr: IRExpr::Variable(name.clone(), ty.clone()),
                         alias: None,
@@ -2806,6 +2855,7 @@ impl<'a> Shaper<'a> {
             limit: None,
             limit_param: None,
             window: None,
+            limit_expr: None,
         };
         facts.correlates.push(CorrelateFact {
             inner,
@@ -2831,23 +2881,22 @@ impl<'a> Shaper<'a> {
         parts: &[(&Term, &[Item], &[Item])],
         facts: &mut Facts,
     ) -> Result<(), ShapeError> {
-        let at = || Construct::Element(FROM, None);
         let values = self.shaped(format_args!("r{}", facts.inlined));
         facts.inlined += 1;
         let Some((_, first, _)) = parts.first() else {
             return Err(ShapeError::Internal("a union has no arm".to_string()));
         };
         let names: Vec<String> = first.iter().map(|(column, _)| column.clone()).collect();
-        let mut nodes: Vec<(String, String)> = Vec::new();
+        let mut nodes: Vec<(String, ExprType)> = Vec::new();
         let mut value_types: Vec<(String, ExprType)> = Vec::new();
         let mut shaped = Vec::new();
+        let mut outer: HashSet<String> = HashSet::new();
         for (index, (input, items, bindings)) in parts.iter().enumerate() {
-            let reads_outer = bindings.iter().any(|(_, arg)| !arg.columns_empty());
-            if reads_outer || !env_columns(input).is_empty() {
-                return Err(self.refuse_at(
-                    "a `union` arm that returns a value or keeps its own cut and reads the enclosing scope",
-                    at(),
-                ));
+            outer.extend(env_columns(input));
+            for (_, arg) in bindings.iter() {
+                let mut read = Vec::new();
+                arg.columns(&mut read);
+                outer.extend(read);
             }
             if items.len() != names.len() {
                 return Err(ShapeError::Internal(
@@ -2879,27 +2928,22 @@ impl<'a> Shaper<'a> {
             };
             for (position, column) in correlate.read.columns.iter().enumerate() {
                 match (&column.expr, column.ty.clone()) {
-                    (IRExpr::Variable(_, _), ExprType::Node { type_name }) => {
+                    (IRExpr::Variable(_, _), ty) if is_reference(&column.expr) => {
                         match nodes.iter().find(|(name, _)| *name == column.column) {
-                            Some((_, declared)) if *declared != type_name => {
+                            Some((_, declared)) if *declared != ty => {
                                 return Err(ShapeError::Internal(format!(
-                                    "union column `{}` is node {declared} and node {type_name}, which the type checker refuses (T73)",
+                                    "union column `{}` is {declared:?} and {ty:?}, which the type checker refuses (T73)",
                                     column.column
                                 )));
                             }
                             Some(_) => {}
-                            None if index == 0 => nodes.push((column.column.clone(), type_name)),
+                            None if index == 0 => nodes.push((column.column.clone(), ty)),
                             None => {
                                 return Err(ShapeError::Internal(format!(
-                                    "union column {position} is a node only in a later arm"
+                                    "union column {position} is a reference only in a later arm"
                                 )));
                             }
                         }
-                    }
-                    (IRExpr::Variable(_, _), _) => {
-                        return Err(ShapeError::Internal(
-                            "a union arm returning an edge reached the value arms, which `union` refuses first".into(),
-                        ));
                     }
                     (_, ty) => match value_types
                         .iter_mut()
@@ -2919,24 +2963,87 @@ impl<'a> Shaper<'a> {
             inner.lets.clear();
             shaped.push(inner);
         }
+        facts.types.extend(node_types(&nodes));
+        let union = UnionFact {
+            arms: shaped,
+            bindings: nodes.clone(),
+            values: (!value_types.is_empty()).then_some(values.clone()),
+            outer: outer.clone(),
+        };
+        if outer.is_empty() {
+            for (name, ty) in &value_types {
+                facts.lets.insert(
+                    name.clone(),
+                    IRExpr::PropAccess {
+                        variable: values.clone(),
+                        property: name.clone(),
+                        ty: ty.clone(),
+                    },
+                );
+            }
+            facts.unions.push(union);
+            return Ok(());
+        }
+        // Arms reading the enclosing scope run per outer row: the union is
+        // the pattern of a correlated read returning its references and its
+        // values, as a union of references alone is.
+        let mut inner = Facts {
+            inlined: facts.inlined,
+            ..Facts::default()
+        };
+        inner.unions.push(union);
+        inner.types.extend(node_types(&nodes));
+        let read_values = self.shaped(format_args!("r{}", facts.inlined));
+        facts.inlined += 1;
+        let mut columns: Vec<IRProjection> = nodes
+            .iter()
+            .map(|(name, ty)| {
+                let ty = ty.clone();
+                IRProjection {
+                    expr: IRExpr::Variable(name.clone(), ty.clone()),
+                    alias: None,
+                    column: name.clone(),
+                    ty,
+                }
+            })
+            .collect();
         for (name, ty) in &value_types {
+            columns.push(IRProjection {
+                expr: IRExpr::PropAccess {
+                    variable: values.clone(),
+                    property: name.clone(),
+                    ty: ty.clone(),
+                },
+                alias: None,
+                column: name.clone(),
+                ty: ty.clone(),
+            });
             facts.lets.insert(
                 name.clone(),
                 IRExpr::PropAccess {
-                    variable: values.clone(),
+                    variable: read_values.clone(),
                     property: name.clone(),
                     ty: ty.clone(),
                 },
             );
         }
-        facts
-            .types
-            .extend(nodes.iter().map(|(name, ty)| (name.clone(), ty.clone())));
-        facts.unions.push(UnionFact {
-            arms: shaped,
-            bindings: nodes,
-            values: (!value_types.is_empty()).then_some(values),
-            outer: HashSet::new(),
+        facts.correlates.push(CorrelateFact {
+            inner,
+            outer,
+            read: InnerRead {
+                values: read_values,
+                group: None,
+                columns,
+                order_by: Vec::new(),
+                limit: None,
+                limit_param: None,
+                window: None,
+                limit_expr: None,
+            },
+            optionals_before: facts.optionals.len(),
+            fails: false,
+            score: None,
+            steps: None,
         });
         Ok(())
     }
@@ -2985,17 +3092,18 @@ impl<'a> Shaper<'a> {
             .collect();
         let mut renames: HashMap<String, String> = HashMap::new();
         let mut values: Vec<(String, IRExpr)> = Vec::new();
+        let mut aliases: Vec<(String, IRExpr)> = Vec::new();
         for (column, expr) in &items {
             match expr {
                 IRExpr::Variable(variable, ExprType::Node { .. } | ExprType::Edge { .. }) => {
                     if variable != column {
+                        // An outer variable under another name is that
+                        // variable: the same identity, the same row.
                         if outer.contains(variable) {
-                            return Err(self.refuse_at(
-                                "a `from` returning an outer variable under another name",
-                                Construct::Element(FROM, None),
-                            ));
+                            aliases.push((column.clone(), expr.clone()));
+                        } else {
+                            renames.insert(variable.clone(), column.clone());
                         }
-                        renames.insert(variable.clone(), column.clone());
                     }
                 }
                 _ => values.push((column.clone(), expr.clone())),
@@ -3031,6 +3139,7 @@ impl<'a> Shaper<'a> {
         // any outer `where`: a value that can fail is evaluated there, by
         // the check its `Project` states among the inner facts.
         facts.append(inner)?;
+        facts.lets.extend(aliases);
         for (column, mut value) in values {
             rename_expr(&mut value, &rename);
             bind_params(&mut value, bindings);
@@ -3137,6 +3246,7 @@ impl<'a> Shaper<'a> {
             term = input;
         }
         // A called read's `limit $k` reads the argument bound to `$k`.
+        let mut limit_expr = None;
         if let Some(name) = limit_param.take() {
             match bindings.iter().find(|(param, _)| *param == name) {
                 None => limit_param = Some(name),
@@ -3146,12 +3256,7 @@ impl<'a> Shaper<'a> {
                         ShapeError::Internal(format!("`limit ${name}` is bound to {n}"))
                     })?)
                 }
-                Some(_) => {
-                    return Err(self.refuse_at(
-                        "a called read's `limit` over an argument that is not a literal or a parameter",
-                        at(),
-                    ));
-                }
+                Some((_, computed)) => limit_expr = Some(computed.clone()),
             }
         }
         let mut order_keys: Vec<IROrdering> = Vec::new();
@@ -3292,13 +3397,13 @@ impl<'a> Shaper<'a> {
             if let IRExpr::Variable(variable, _) = &expr
                 && is_reference(&expr)
             {
+                // An outer variable under another name is that variable,
+                // which the enclosing rows already carry: the name reads it.
+                if variable != column && outer.contains(variable) {
+                    facts.lets.insert(column.clone(), expr.clone());
+                    continue;
+                }
                 if variable != column {
-                    if outer.contains(variable) {
-                        return Err(self.refuse_at(
-                            "a `from` returning an outer variable under another name",
-                            at(),
-                        ));
-                    }
                     renames.insert(variable.clone(), column.clone());
                 }
                 if let ExprType::Node { type_name } = expr.ty() {
@@ -3375,6 +3480,7 @@ impl<'a> Shaper<'a> {
             limit,
             limit_param,
             window: None,
+            limit_expr,
         };
         for e in read.exprs_mut() {
             rename_expr(e, &rename);
@@ -3576,6 +3682,7 @@ impl<'a> Shaper<'a> {
                 limit: None,
                 limit_param: None,
                 window,
+                limit_expr: None,
             },
             optionals_before: facts.optionals.len(),
             fails: false,
@@ -3673,6 +3780,7 @@ impl<'a> Shaper<'a> {
                 limit: None,
                 limit_param: None,
                 window: None,
+                limit_expr: None,
             },
             optionals_before: facts.optionals.len(),
             fails: false,
@@ -3982,6 +4090,7 @@ impl<'a> Shaper<'a> {
             limit: None,
             limit_param: None,
             window: None,
+            limit_expr: None,
         };
         facts.lets.insert(column.to_string(), value);
         Ok(CorrelateFact {
@@ -5171,7 +5280,16 @@ fn resolve(expr: &mut IRExpr, lets: &HashMap<String, IRExpr>) {
                 resolve(right, lets);
             }
             IRExpr::Call { args, .. } => args.iter_mut().for_each(|a| resolve(a, lets)),
-            IRExpr::Literal(_, _) | IRExpr::Param(_, _) | IRExpr::PropAccess { .. } => {}
+            // A name bound to a reference (an inline read returning an outer
+            // variable under another name) reads that reference's fields.
+            IRExpr::PropAccess { variable, .. } => {
+                if let Some(IRExpr::Variable(target, _)) = lets.get(variable.as_str())
+                    && is_reference(&lets[variable.as_str()])
+                {
+                    *variable = target.clone();
+                }
+            }
+            IRExpr::Literal(_, _) | IRExpr::Param(_, _) => {}
         }
     })
 }

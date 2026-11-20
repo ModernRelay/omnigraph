@@ -130,9 +130,8 @@ own (per outer row), except an `rrf` whose arms read an outer name (`T86`).
 joins the bag of its arms' rows, columns matched by name in the first arm's
 order (`return { $q as p }` in a later one; a missing or extra name is
 `T73`); an arm may return values and
-group, order or cut its own rows, and may read an outer name (the union then
-runs per outer row); one returning an edge, or a value while reading an outer
-name, is `T86`. `from name(args)` runs a read
+group, order or cut its own rows, return edges, and read an outer name (the
+union then runs per outer row). `from name(args)` runs a read
 declared in the same source as an inline read, each parameter bound to its
 argument in the caller's scope (`from colleagues($p.handle)` reads the
 caller's `$p`, never one the called read binds); its returned columns enter

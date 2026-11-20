@@ -1244,6 +1244,8 @@ impl ReadGen<'_, '_, '_> {
             6 if self.options.search && self.options.nesting && self.c.flag(50) => {
                 self.later_ranking(scope, elements)
             }
+            7 if self.options.nesting && self.c.flag(30) => self.edge_union_from(scope, elements),
+            8 if self.options.nesting && self.c.flag(30) => self.alias_from(scope, elements),
             _ => {
                 if let Some((text, new)) = self.traversal(scope, choice == 5, false, false) {
                     elements.push(text);
@@ -1404,14 +1406,107 @@ impl ReadGen<'_, '_, '_> {
             String::new()
         };
         let un = &u[1..];
+        // Each arm may return a value beside its node, and the correlated
+        // first arm may keep its own cut.
+        let value = self.c.flag(30).then(|| self.var("v"));
+        let (v1, v2) = match &value {
+            Some(v) => (format!(", 1 as {}", &v[1..]), format!(", 2 as {}", &v[1..])),
+            None => (String::new(), String::new()),
+        };
+        let cut = if self.c.flag(20) {
+            format!(" order {{ {x1}.k }} limit {}", 1 + self.c.below(2))
+        } else {
+            String::new()
+        };
         elements.push(format!(
-            "from union({{ match {{ {t1} }}{w1} return {{ {x1} as {un} }} }}, {{ match {{ {x2}: {} }}{w2} return {{ {x2} as {un} }} }})",
+            "from union({{ match {{ {t1} }}{w1} return {{ {x1} as {un}{v1} }}{cut} }}, {{ match {{ {x2}: {} }}{w2} return {{ {x2} as {un}{v2} }} }})",
             self.schema.nodes[ty].name
         ));
         scope.push(Var {
             name: u,
             kind: VarKind::Node(ty),
         });
+        if let Some(v) = value {
+            scope.push(Var {
+                name: v,
+                kind: VarKind::Scalar(Sc::I64),
+            });
+        }
+    }
+
+    /// `from union(…)` of two arms each returning an edge of one type, the
+    /// first correlated on a node in scope when one is its source.
+    fn edge_union_from(&mut self, scope: &mut Vec<Var>, elements: &mut Vec<String>) {
+        if self.schema.edges.is_empty() {
+            return;
+        }
+        let e = self.c.below(self.schema.edges.len());
+        let edge = self.schema.edges[e].clone();
+        let name = edge.surface();
+        let from_ty = &self.schema.nodes[edge.from].name;
+        let to_ty = &self.schema.nodes[edge.to].name;
+        let u = self.var("ue");
+        let (k1, k2) = (self.var("k"), self.var("k"));
+        let (b1, a2, b2) = (self.var("n"), self.var("n"), self.var("n"));
+        let sources: Vec<String> = Self::node_vars(scope)
+            .into_iter()
+            .filter(|(_, t)| *t == edge.from)
+            .map(|(n, _)| n)
+            .collect();
+        let first = match sources.first() {
+            Some(a) if self.c.flag(50) => format!("{b1}: {to_ty}, {a} {k1}:{name} {b1}"),
+            _ => {
+                let a1 = self.var("n");
+                format!("{a1}: {from_ty}, {b1}: {to_ty}, {a1} {k1}:{name} {b1}")
+            }
+        };
+        let un = &u[1..];
+        elements.push(format!(
+            "from union({{ match {{ {first} }} return {{ {k1} as {un} }} }}, {{ match {{ {a2}: {from_ty}, {b2}: {to_ty}, {a2} {k2}:{name} {b2} }} return {{ {k2} as {un} }} }})"
+        ));
+        scope.push(Var {
+            name: u,
+            kind: VarKind::Edge(e),
+        });
+    }
+
+    /// `from { match { … $o … } return { $o as a } }`: an inline read
+    /// returning a node in scope under another name, with a count or not.
+    fn alias_from(&mut self, scope: &mut Vec<Var>, elements: &mut Vec<String>) {
+        let Some((t, new)) = self.traversal(scope, false, true, true) else {
+            return;
+        };
+        let nodes = Self::node_vars(scope);
+        let Some((o, ty)) = nodes
+            .iter()
+            .find(|(name, _)| t.contains(&format!("{name} ")))
+            .cloned()
+        else {
+            return;
+        };
+        let a = self.var("a");
+        let count = match new.first() {
+            Some(n) if self.c.flag(50) => Some((n.name.clone(), self.var("c"))),
+            _ => None,
+        };
+        let extra = match &count {
+            Some((n, c)) => format!(", count({n}) as {}", &c[1..]),
+            None => String::new(),
+        };
+        elements.push(format!(
+            "from {{ match {{ {t} }} return {{ {o} as {}{extra} }} }}",
+            &a[1..]
+        ));
+        scope.push(Var {
+            name: a,
+            kind: VarKind::Node(ty),
+        });
+        if let Some((_, c)) = count {
+            scope.push(Var {
+                name: c,
+                kind: VarKind::Scalar(Sc::I64),
+            });
+        }
     }
 
     /// A block over a fresh traversal from a node in scope: `count`,
