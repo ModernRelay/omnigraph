@@ -1,0 +1,1 @@
+- Branch merges against a managed target now use the 300-second write timeout instead of timing out at 30 seconds with unknown effects.

@@ -373,6 +373,30 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     expected_commit: Option<&str>,
     response_limit: Option<usize>,
 ) -> Result<T> {
+    remote_json_bounded_with_timeout(
+        client,
+        method,
+        url,
+        body,
+        bearer_token,
+        expected_commit,
+        response_limit,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn remote_json_bounded_with_timeout<T: DeserializeOwned>(
+    client: &crate::graph_http::GraphHttpClient,
+    method: Method,
+    url: String,
+    body: Option<Value>,
+    bearer_token: Option<&str>,
+    expected_commit: Option<&str>,
+    response_limit: Option<usize>,
+    timeout: Option<std::time::Duration>,
+) -> Result<T> {
     let request = apply_bearer_token(client.request(method, url)?, bearer_token);
     let request = if let Some(commit_id) = expected_commit {
         request.header(
@@ -384,6 +408,11 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     };
     let request = if let Some(body) = body {
         request.json(&body)
+    } else {
+        request
+    };
+    let request = if let Some(timeout) = timeout {
+        request.timeout(timeout)
     } else {
         request
     };

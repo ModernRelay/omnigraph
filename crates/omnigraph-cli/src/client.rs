@@ -43,16 +43,22 @@ use crate::graph_http::GraphHttpClient;
 use crate::helpers::{
     ContradictoryReply, PreconditionFailedCli, apply_bearer_token, branch_statement_change_request,
     branch_statement_query_request, missing_credential, precondition_failed_cli,
-    query_params_from_json, remote_json_bounded, remote_no_content, remote_response_json_bounded,
-    remote_url, resolve_actor_with_config, select_named_query,
+    query_params_from_json, remote_json_bounded, remote_json_bounded_with_timeout,
+    remote_no_content, remote_response_json_bounded, remote_url, resolve_actor_with_config,
+    select_named_query,
 };
 use crate::operator::InvocationConfig;
 use crate::targets::{ResolvedTarget, TargetBinding};
 
 const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
-// Managed load transport has its own longer bounded receipt wait.
+// Managed load and branch merge transport have their own longer bounded receipt wait.
 // Managed queries and mutations share a thirty-second total request deadline.
 const MANAGED_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const MANAGED_MERGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn merge_request_timeout(managed: bool) -> Option<std::time::Duration> {
+    managed.then_some(MANAGED_MERGE_TIMEOUT)
+}
 
 /// A success response must describe the merge that was submitted. A receipt
 /// cannot be recovered by reading a mutable HEAD after receiving bad evidence.
@@ -1495,7 +1501,10 @@ impl GraphClient {
             } => {
                 let mut request = branch_statement_change_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
-                let output: ChangeOutput = remote_json_bounded(
+                let timeout = merge_request_timeout(
+                    response_limit.is_some() && matches!(write, BranchWrite::Merge { .. }),
+                );
+                let output: ChangeOutput = remote_json_bounded_with_timeout(
                     http,
                     Method::POST,
                     remote_url(base_url, &["mutate"], &[])?,
@@ -1503,6 +1512,7 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
+                    timeout,
                 )
                 .await?;
                 if let BranchWrite::Merge {
@@ -2410,7 +2420,7 @@ impl GraphClient {
                 response_limit,
                 ..
             } => {
-                remote_json_bounded(
+                remote_json_bounded_with_timeout(
                     http,
                     Method::POST,
                     remote_url(base_url, &["branches", "merge"], &[])?,
@@ -2425,6 +2435,7 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
+                    merge_request_timeout(response_limit.is_some()),
                 )
                 .await?
             }
@@ -3971,11 +3982,14 @@ mod tests {
                     "affected_edges": 0, "actor_id": "principal:alice", "commit": commit
                 });
                 if form == "branch" {
-                    reply["query_name"] = json!("branch merge");
+                    reply["branch"] = json!("review");
+                    reply["query_name"] = json!("branch create");
                     reply["affected_nodes"] = json!(0);
                     reply["outcome"] = json!({
-                        "kind": "merged", "source": "review", "target": "main",
-                        "merge": "fast_forward"
+                        "kind": "created",
+                        "from": "main",
+                        "name": "review",
+                        "from_commit_id": "head-before"
                     });
                 }
                 let server = IntentApiFixture::graph_with_response_delay(
@@ -4001,11 +4015,10 @@ mod tests {
                         "branch" => (
                             client
                                 .branch_write_statement(
-                                    "branch merge review into main",
-                                    BranchWrite::Merge {
-                                        source: "review".into(),
-                                        into: Some("main".into()),
-                                        as_commit: false,
+                                    "branch create review from main",
+                                    BranchWrite::Create {
+                                        name: "review".into(),
+                                        from: Some(BranchCreateFrom::Branch("main".into())),
                                     },
                                     &[],
                                     &mut std::io::sink(),
@@ -4480,6 +4493,127 @@ mod tests {
             );
             assert_eq!(request.body().unwrap().as_bytes(), Some(b"{}\n".as_slice()));
         }
+    }
+
+    #[test]
+    fn managed_merge_request_has_its_own_deadline() {
+        assert_eq!(
+            merge_request_timeout(true),
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(merge_request_timeout(false), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "nightly: waits out the real 30 s managed deadline for a merge"]
+    async fn managed_branch_merge_outlives_the_thirty_second_deadline_issue_1457() {
+        // The server publishes the merge and answers at 30.25 s, well inside
+        // the 300 s a managed load or merge is given. On main the CLI gives up at 30 s
+        // and the published merge is reported with unknown effects.
+        let commit = json!({
+            "graph_commit_id": "head-after", "graph_branch": "main",
+            "graph_manifest_version": 7, "parent_commit_id": "head-before",
+            "merged_parent_commit_id": "head-source",
+            "actor_id": "principal:alice", "created_at": 12345,
+            "published": true, "kind": "published", "root_commit_id": null
+        });
+        let server_route = IntentApiFixture::graph_with_response_delay(
+            vec![IntentReply::json(
+                200,
+                json!({
+                    "source": "review", "target": "main", "outcome": "merged",
+                    "commit": commit, "actor_id": "principal:alice"
+                }),
+            )],
+            std::time::Duration::from_millis(30_250),
+        );
+        let server_mutate = IntentApiFixture::graph_with_response_delay(
+            vec![IntentReply::json(
+                200,
+                json!({
+                    "branch": "main", "query_name": "branch merge", "affected_nodes": 0,
+                    "affected_edges": 0, "actor_id": "principal:alice", "commit": commit,
+                    "outcome": {
+                        "kind": "merged", "source": "review", "target": "main",
+                        "merge": "fast_forward"
+                    }
+                }),
+            )],
+            std::time::Duration::from_millis(30_250),
+        );
+        crate::operator_routing::test_transport_scope(
+            &[&server_route.origin, &server_mutate.origin],
+            async {
+                let client_route = GraphClient::managed(
+                    &server_route.origin,
+                    "knowledge",
+                    crate::credential_sources::test_credential(
+                        &server_route.origin,
+                        "data-credential",
+                    ),
+                )
+                .unwrap();
+                let client_mutate = GraphClient::managed(
+                    &server_mutate.origin,
+                    "knowledge",
+                    crate::credential_sources::test_credential(
+                        &server_mutate.origin,
+                        "data-credential",
+                    ),
+                )
+                .unwrap();
+
+                let mut sink_route = std::io::sink();
+                let mut sink_mutate = std::io::sink();
+                let started = std::time::Instant::now();
+                let (res_route, res_mutate) = tokio::join!(
+                    client_route.branch_merge(
+                        "review",
+                        "main",
+                        false,
+                        false,
+                        false,
+                        &[],
+                        &mut sink_route,
+                    ),
+                    client_mutate.branch_write_statement(
+                        "branch merge review into main",
+                        BranchWrite::Merge {
+                            source: "review".into(),
+                            into: Some("main".into()),
+                            as_commit: false,
+                        },
+                        &[],
+                        &mut sink_mutate,
+                    ),
+                );
+                let elapsed = started.elapsed();
+                assert!(elapsed >= std::time::Duration::from_millis(30_000));
+
+                let out_route = res_route.unwrap_or_else(|error| {
+                    panic!(
+                        "branch merge answered at 30.25 s was cut off after {elapsed:?}: {error}"
+                    )
+                });
+                assert_eq!(serde_json::to_value(out_route.commit).unwrap(), commit);
+
+                let out_mutate = res_mutate.unwrap_or_else(|error| {
+                    panic!(
+                        "branch write statement merge answered at 30.25 s was cut off after {elapsed:?}: {error}"
+                    )
+                });
+                assert_eq!(serde_json::to_value(out_mutate.commit).unwrap(), commit);
+
+                let req_route = server_route.workflow_requests();
+                assert_eq!(req_route.len(), 1, "a merge must not be retried");
+                assert_eq!(req_route[0].path, "/graphs/knowledge/branches/merge");
+
+                let req_mutate = server_mutate.workflow_requests();
+                assert_eq!(req_mutate.len(), 1, "a merge must not be retried");
+                assert_eq!(req_mutate[0].path, "/graphs/knowledge/mutate");
+            },
+        )
+        .await;
     }
 
     fn content_range_headers(value: &'static str) -> reqwest::header::HeaderMap {
