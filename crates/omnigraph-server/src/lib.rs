@@ -47,7 +47,7 @@ pub use registry::{
 
 use crate::queries::{QueryRegistry, check, format_check_breakages};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;

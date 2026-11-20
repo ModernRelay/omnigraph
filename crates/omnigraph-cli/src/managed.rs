@@ -19,7 +19,7 @@ mod deployment;
 mod lifecycle;
 mod members;
 mod organization;
-pub(crate) use auth::VerifiedIdentity;
+pub(crate) use auth::{OrganizationChoice, ProfileRegistration, VerifiedIdentity};
 
 pub(crate) fn import_custody(
     source: &Path,
@@ -48,14 +48,31 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 type Result<T> = std::result::Result<T, Failure>;
 
 #[derive(Debug)]
-struct Failure {
+pub(crate) struct Failure {
     body: Value,
     exit: i32,
     /// Trusted transport evidence, kept separate from an endpoint's error body.
     response_status: Option<StatusCode>,
 }
 
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.body.fmt(f)
+    }
+}
+
+impl std::error::Error for Failure {}
+
 impl Failure {
+    pub(crate) fn emit(
+        self,
+        json: bool,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> color_eyre::Result<i32> {
+        Output::from_result(Err(self), json, 0).emit(stdout, stderr)
+    }
+
     fn new(kind: &str, detail: &str, exit: i32) -> Self {
         Self {
             body: json!({"type":kind,"title":kind.replace('_', " "),"detail":detail}),
@@ -406,26 +423,6 @@ pub(crate) fn credential_status(binding: &Binding) -> Value {
 pub(crate) async fn credential_lock() -> color_eyre::Result<auth::LockGuard> {
     auth::cache_lock("static-credential-edit")
         .await
-        .map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))
-}
-
-pub(crate) async fn register_login(
-    api: String,
-    organization: Option<&str>,
-    stderr: &mut dyn Write,
-) -> color_eyre::Result<Value> {
-    auth::login(api, organization, stderr)
-        .await
-        .map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))
-}
-
-pub(crate) async fn discard_registration(
-    api: String,
-    organization: &str,
-) -> color_eyre::Result<()> {
-    auth::logout(api, Some(organization))
-        .await
-        .map(|_| ())
         .map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))
 }
 

@@ -21,14 +21,72 @@ struct Selection {
 
 enum Invocation {
     Replay(PathBuf),
+    Check {
+        paths: Vec<PathBuf>,
+        json: bool,
+        corpus: bool,
+    },
+    Explain(String),
+    Grammar,
+    Version,
     Case(Box<Selection>),
 }
 
-const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--store <URI> [--base <URI>] | --server <URL> --graph <ID> [--token <TOKEN>]] [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--trace] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json>";
+const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--store <URI> [--base <URI>] | --server <URL> --graph <ID> [--token <TOKEN>]] [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--trace] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json> | --check [--json] [--corpus] <case.gqt|dir>... | --explain <code> | --grammar | --version";
 
 fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let mut args = args.iter().peekable();
     let first = args.peek().ok_or(USAGE)?;
+    if *first == "--grammar" || *first == "--version" {
+        let flag = args.next().unwrap();
+        if args.next().is_some() {
+            return Err(format!("{} takes no arguments", flag.to_string_lossy()));
+        }
+        return Ok(if flag == "--grammar" {
+            Invocation::Grammar
+        } else {
+            Invocation::Version
+        });
+    }
+    if *first == "--explain" {
+        args.next();
+        let code = args
+            .next()
+            .and_then(|code| code.to_str())
+            .ok_or("--explain requires an error code")?;
+        if args.next().is_some() {
+            return Err("--explain accepts one error code".into());
+        }
+        return Ok(Invocation::Explain(code.to_string()));
+    }
+    if *first == "--check" {
+        args.next();
+        let mut paths = Vec::new();
+        let mut json = false;
+        let mut corpus = false;
+        for arg in args {
+            if arg == "--json" {
+                json = true;
+            } else if arg == "--corpus" {
+                corpus = true;
+            } else if arg.to_string_lossy().starts_with("--") {
+                return Err(format!(
+                    "--check takes case paths, `--json` and `--corpus` only, not `{}`",
+                    arg.to_string_lossy()
+                ));
+            } else {
+                paths.push(PathBuf::from(arg));
+            }
+        }
+        if paths.is_empty() {
+            return Err("--check requires a case or directory path".into());
+        }
+        return Ok(Invocation::Check {
+            paths,
+            json,
+            corpus,
+        });
+    }
     if *first == "--replay" {
         args.next();
         let path = args
@@ -248,7 +306,37 @@ fn run() -> Result<(), String> {
         ))
     })?;
     match invocation {
+        Invocation::Grammar => {
+            print!("{}", omnigraph_gqt_core::grammar_text());
+            Ok(())
+        }
+        Invocation::Version => {
+            println!(
+                "omnigraph-gqt {} (gqt format {})",
+                env!("CARGO_PKG_VERSION"),
+                omnigraph_gqt_core::GQT_FORMAT_VERSION
+            );
+            Ok(())
+        }
+        Invocation::Explain(code) => {
+            print!("{}", omnigraph_gqt::explain(&code)?);
+            Ok(())
+        }
         Invocation::Replay(path) => omnigraph_gqt::replay_report(&path, &executable),
+        Invocation::Check {
+            paths,
+            json,
+            corpus,
+        } => {
+            let named: Vec<_> = paths
+                .into_iter()
+                .map(|path| {
+                    let listed = case_files(std::slice::from_ref(&path));
+                    (path, listed)
+                })
+                .collect();
+            omnigraph_gqt::check_cases(&named, json, corpus)
+        }
         Invocation::Case(selection) => {
             let bless = omnigraph_gqt::bless_from_env().map_err(refusal)?;
             let files = case_files(&selection.paths)

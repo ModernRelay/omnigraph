@@ -516,7 +516,7 @@ pub(super) fn empty_ledger() -> ClusterState {
 
 /// Initialize only an empty root; all graph effects then use the same v2
 /// deployment protocol as updates. Existing v1 state is never executed.
-async fn bootstrap_ledger(
+pub(super) async fn bootstrap_ledger(
     store: &ClusterStore,
     bundle: &DeploymentBundle,
     caller: &DeploymentCaller,
@@ -570,10 +570,8 @@ async fn bootstrap_ledger(
         .await
         .map_err(|error| retained_error(error, guard.lock_id()))?;
     // Only awaited control writes happened. No graph/native operation started.
-    store
-        .release_settled(guard.lock_id())
-        .await
-        .map_err(|error| retained_error(error, guard.lock_id()))
+    // A failed release states its own outcome; the lock may already be free.
+    store.release_settled(guard.lock_id()).await
 }
 
 async fn replace(
@@ -1677,6 +1675,9 @@ async fn apply_direct_bundle(
             return Ok(found);
         }
     }
+    // Every control and graph write of this deployment runs in one storage
+    // scope, so a converged result can prove them settled before release.
+    let store = store.with_io_scope(omnigraph_storage::StorageIoScope::new())?;
     let admission = admission::acquire_with_store(&store, ClusterAdmissionPurpose::Deployment)
         .await?
         .ok_or_else(|| refusal("state_missing", "cluster ledger is missing"))?;
@@ -1701,7 +1702,33 @@ async fn apply_direct_bundle(
             }
         };
     }
-    result
+    // A writable deployment can hand the root to a successor only after
+    // convergence on a backend with tracked I/O. Azure retains admission.
+    match result {
+        Ok(DeploymentLookup::Complete { result })
+            if result.converged && admission.io_scope().is_some() =>
+        {
+            release_converged_deployment(admission, &result.id).await?;
+            Ok(DeploymentLookup::Complete { result })
+        }
+        other => other,
+    }
+}
+
+pub(super) async fn release_converged_deployment(
+    admission: ClusterAdmission,
+    deployment_id: &str,
+) -> Result<(), Diagnostic> {
+    admission
+        .release_after_settlement()
+        .await
+        .map_err(|mut error| {
+            error.message = bounded_message(format!(
+                "deployment {deployment_id} converged; {}",
+                error.message
+            ));
+            error
+        })
 }
 
 /// Execute under the existing sole writer. The server supplies its paused live
@@ -1959,8 +1986,7 @@ pub(super) async fn execute_captured_deployment_in_store(
         cas = replace(store, &mut state, &cas).await?;
     }
     let result = finish(store, &mut state, &cas, bundle).await?;
-    // Exact publication is not a proof that all accepted native/control I/O
-    // has stopped. Retain admission until explicit operator quiescence/unlock.
+    // Admission still belongs to the caller, who owns storage settlement.
     Ok(DeploymentLookup::Complete { result })
 }
 
@@ -2324,11 +2350,64 @@ fn authorize_graph_deletion(
         let actor = caller.actor().ok_or_else(|| {
             refusal(
                 "policy_denied",
-                "graph deletion requires an actor when policy is installed",
+                format!(
+                    "deleting graph '{graph}' runs under its applied policy and needs an actor; \
+                     pass --as with an actor that policy permits read and schema_apply"
+                ),
             )
         })?;
         policy.check_graph(actor, graph, PolicyAction::Read)?;
         policy.check_graph(actor, graph, PolicyAction::SchemaApply)?;
+    }
+    Ok(())
+}
+
+/// Who may recover each graph of an outstanding deployment: the one decision
+/// recovery makes, before admission so a refusal takes no lock and changes
+/// nothing, and again under admission against the re-read policy. A deletion
+/// needs what forward deletion needs. Settling a started schema change acts as
+/// the caller: an identity needs `read` and `schema_apply`, and a storage owner
+/// on a graph with an applied policy needs an actor that policy permits
+/// `schema_apply` on `main`, the check the engine makes when it settles. Other
+/// work runs no graph action as the caller. The engine keeps its own gate.
+/// The check under admission can refuse only if the outstanding record changed
+/// after the first check (a changed policy is refused first, as
+/// `deployment_base_changed`). That refusal keeps the lock, as every recovery
+/// exit after admission does.
+fn authorize_recovery(
+    policy: &AppliedPolicies,
+    caller: &DeploymentCaller,
+    pending: &OutstandingDeployment,
+) -> Result<(), Diagnostic> {
+    for (graph, entry) in &pending.graphs {
+        if entry.delete.is_some() {
+            authorize_graph_deletion(policy, caller, graph)?;
+            continue;
+        }
+        if !matches!(entry.state, GraphDeploymentState::Started) || entry.create.is_some() {
+            continue;
+        }
+        match caller {
+            DeploymentCaller::AuthenticatedIdentity(identity) => {
+                policy.check_graph(identity.actor(), graph, PolicyAction::Read)?;
+                policy.check_graph(identity.actor(), graph, PolicyAction::SchemaApply)?;
+            }
+            DeploymentCaller::StorageOwner { actor } => {
+                if policy.graph(graph).is_none() {
+                    continue;
+                }
+                let actor = actor.as_deref().ok_or_else(|| {
+                    refusal(
+                        "policy_denied",
+                        format!(
+                            "recovering graph '{graph}' runs under its applied policy and needs \
+                             an actor; pass --as with an actor that policy permits schema_apply"
+                        ),
+                    )
+                })?;
+                policy.check_graph(actor, graph, PolicyAction::SchemaApply)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2892,7 +2971,7 @@ async fn reconcile_deployment_in_store(
 ) -> Result<DeploymentLookup, Diagnostic> {
     let (before, _) = read_existing(&store).await?;
     require_v2(&before)?;
-    lookup_policies(&store, &before, caller, Some(id)).await?;
+    let preflight_policy = lookup_policies(&store, &before, caller, Some(id)).await?;
     let existing = lookup(&before, id)?;
     if !matches!(existing, DeploymentLookup::Outstanding { .. }) {
         return Ok(existing);
@@ -2902,6 +2981,9 @@ async fn reconcile_deployment_in_store(
             "writers_stopped_required",
             "recovery requires --writers-stopped and settled prior graph/control I/O",
         ));
+    }
+    if let Some(pending) = before.outstanding.as_ref() {
+        authorize_recovery(&preflight_policy, caller, pending)?;
     }
     let admission = admission::acquire_with_store(
         &store,
@@ -2931,13 +3013,13 @@ async fn reconcile_deployment_in_store(
             "outstanding achieved authority changed",
         ));
     }
+    authorize_recovery(&policy, caller, &pending)?;
     let bundle = store.read_deployment_bundle(&pending.input_digest).await?;
     validate_bundle(&bundle, admission.canonical_root())?;
     validate_pending_input(&state, &pending, &bundle)?;
     install_catalog_payloads(&store, &state, &bundle).await?;
     for (graph, entry) in pending.graphs {
         let result = if let Some(delete) = &entry.delete {
-            authorize_graph_deletion(&policy, caller, &graph)?;
             if matches!(entry.state, GraphDeploymentState::Settled { .. }) {
                 continue;
             }
@@ -3078,10 +3160,6 @@ async fn reconcile_deployment_in_store(
                             "query-only work cannot carry started graph effects",
                         )
                     })?;
-                    if let DeploymentCaller::AuthenticatedIdentity(identity) = caller {
-                        policy.check_graph(identity.actor(), &graph, PolicyAction::Read)?;
-                        policy.check_graph(identity.actor(), &graph, PolicyAction::SchemaApply)?;
-                    }
                     admission
                         .validate_graph_uri(&store.graph_root(&graph))
                         .await?;

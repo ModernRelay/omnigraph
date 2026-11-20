@@ -589,6 +589,35 @@ async fn clean_release_and_concurrent_reacquisition_keep_delayed_writes_harmless
     adapter.assert_no_forbidden_calls().await;
 }
 
+/// The first direct apply on a fresh root bootstraps the ledger and releases
+/// that lock before the deployment. When the release acknowledgement is lost
+/// after the backend committed it, the lock is free, so the diagnostic must not
+/// say it is held: it names the admission to compare with `cluster status`.
+#[tokio::test]
+async fn lost_bootstrap_release_acknowledgement_is_reported_unconfirmed_issue_1359() {
+    let (_directory, bundle, store, adapter) = fixture();
+    adapter.arm(Point::Release, Fault::LostResponse);
+    let error =
+        crate::deployment::execution::bootstrap_ledger(&store, &bundle, &super::tests::owner())
+            .await
+            .unwrap_err();
+    assert!(adapter.fault.lock().unwrap().is_none());
+    let lock: serde_json::Value =
+        serde_json::from_str(&adapter.read(CLUSTER_LOCK_FILE).await).unwrap();
+    assert!(lock["release_id"].is_string(), "{lock}");
+    let lock_id = lock["lock_id"].as_str().unwrap();
+    assert!(!error.message.contains("remains held"), "{error:?}");
+    assert!(error.message.contains(lock_id), "{error:?}");
+    assert!(error.message.contains("cluster status --json"), "{error:?}");
+    assert!(
+        error.message.contains("lost after backend commit"),
+        "{error:?}"
+    );
+    assert_eq!(error.code, "cluster_admission_release_failed");
+    assert_eq!(error.path, CLUSTER_LOCK_FILE);
+    adapter.assert_no_forbidden_calls().await;
+}
+
 #[tokio::test]
 async fn lost_release_acknowledgement_never_replays_over_the_successor() {
     use crate::admission::{ClusterAdmissionPurpose, acquire_with_store};
@@ -604,7 +633,22 @@ async fn lost_release_acknowledgement_never_replays_over_the_successor() {
         adapter.arm(Point::Release, fault);
         match fault {
             Fault::LostResponse => {
-                assert!(owner.release_after_settlement().await.is_err());
+                let error = crate::deployment::execution::release_converged_deployment(
+                    owner,
+                    &receipt.deployment_id,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.code, "cluster_admission_release_failed");
+                assert!(error.message.contains(&receipt.deployment_id), "{error:?}");
+                assert!(error.message.contains(&old_id), "{error:?}");
+                assert!(
+                    error.message.contains("lost after backend commit"),
+                    "{error:?}"
+                );
+                assert!(error.message.contains("cluster status"), "{error:?}");
+                assert!(!error.message.contains("remains held"), "{error:?}");
+                assert_eq!(error.path, CLUSTER_LOCK_FILE);
             }
             Fault::CancelAfterCommit => {
                 let release = owner.release_after_settlement();

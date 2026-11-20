@@ -759,7 +759,7 @@ async fn graph_diff_across_a_compaction_reads_data_flat_in_table_extent() {
                 .await
                 .unwrap();
             let person = stats
-                .tables
+                .datasets
                 .iter()
                 .find(|stat| stat.type_key == "node:Person")
                 .expect("optimize reports the Person table");

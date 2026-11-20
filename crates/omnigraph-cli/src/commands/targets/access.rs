@@ -180,9 +180,10 @@ fn served_graph(snapshot: &omnigraph_cluster::ServingSnapshot, graph: &str) -> R
     Ok(())
 }
 
-/// Once the cluster serves `graph`, its applied `graph.{id}` bundle decides
-/// for `actor`, and a graph without one allows every action, with or without
-/// an actor, since no policy is installed to refuse one.
+/// Once the cluster serves `graph`, the bundle the cluster's binding rule
+/// selects for it, the one a direct write installs, decides for `actor`, and a
+/// graph without one allows every action, with or without an actor, since no
+/// policy is installed to refuse one.
 fn snapshot_access(
     snapshot: &omnigraph_cluster::ServingSnapshot,
     graph: &str,
@@ -190,30 +191,10 @@ fn snapshot_access(
     args: &AccessArgs,
 ) -> Result<AccessOutput> {
     served_graph(snapshot, graph)?;
-    let binding = format!("graph.{graph}");
-    let bundles: Vec<_> = snapshot
-        .policies
-        .iter()
-        .filter(|policy| policy.applies_to.iter().any(|scope| scope == &binding))
-        .collect();
-    let engine = match bundles.as_slice() {
-        [] => None,
-        [bundle] => Some(omnigraph_policy::PolicyEngine::load_graph_from_source(
-            &bundle.source,
-            graph,
-        )?),
-        // A server refuses to start from such a ledger, so nothing serves
-        // the graph until one bundle binds it.
-        many => {
-            return Err(CodedRefusal::report(
-                ErrorCode::GraphUnavailable,
-                format!(
-                    "graph `{graph}` is not served: {} policy bundles bind it, and the cluster binds one per graph",
-                    many.len()
-                ),
-            ));
-        }
-    };
+    let engine = snapshot
+        .graph_policy(graph)
+        .map(|bundle| omnigraph_policy::PolicyEngine::load_graph_from_source(&bundle.source, graph))
+        .transpose()?;
     AccessOutput::evaluate(
         actor.clone(),
         graph.to_string(),
@@ -346,7 +327,7 @@ mod tests {
 
     #[test]
     fn access_reads_policy_only_for_a_graph_the_cluster_serves() {
-        let mut snapshot = omnigraph_cluster::ServingSnapshot {
+        let snapshot = omnigraph_cluster::ServingSnapshot {
             graphs: vec![omnigraph_cluster::ServingGraph {
                 graph_id: "knowledge".into(),
                 root: std::path::PathBuf::new(),
@@ -389,24 +370,5 @@ mod tests {
             assert_eq!(refused, code, "{graph}");
             assert!(message.contains(says), "{graph}: {message}");
         }
-        // Two bundles bound to one graph are a ledger no server starts from,
-        // so the graph is unavailable rather than its policy guessed.
-        snapshot.policies = ["first", "second"]
-            .into_iter()
-            .map(|name| omnigraph_cluster::ServingPolicy {
-                name: name.into(),
-                source: String::new(),
-                applies_to: vec!["graph.knowledge".into()],
-            })
-            .collect();
-        let args = AccessArgs {
-            branch: None,
-            target_branch: None,
-            json: true,
-        };
-        let (refused, message) =
-            refusal(snapshot_access(&snapshot, "knowledge", None, &args).unwrap_err());
-        assert_eq!(refused, ErrorCode::GraphUnavailable);
-        assert!(message.contains("2 policy bundles"), "{message}");
     }
 }

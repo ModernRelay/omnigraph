@@ -168,6 +168,16 @@ async fn execute_request(
             )
             .await
         }
+        crate::gqt_protocol::RepetitionInputV2::Clone { input } => {
+            crate::gqt_runner::execute_clone_rep_signaled(
+                request.repetition,
+                &validated,
+                input,
+                &request.worker_scratch_root,
+                signals,
+            )
+            .await
+        }
     }
 }
 

@@ -201,6 +201,32 @@ pub(crate) fn admits_inline_s3_root(command: &Command) -> bool {
     )
 }
 
+/// The commands that open a direct graph as a shallow clone under `--base`:
+/// the reads and writes the embedded client serves. Maintenance, schema
+/// changes and deployment keep the one root they are given, since what a
+/// `cleanup`, an `optimize` or an upgrade leaves in a clone root is not
+/// defined. Under an `s3://` base these commands name the clone's `s3://`
+/// prefix inline (`scope::resolve`), the pair `open_clone` puts on one
+/// endpoint, where a registered direct target admits `file://` only.
+pub(crate) fn admits_base(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Query(_)
+            | Command::Mutate(_)
+            | Command::Load(_)
+            | Command::Branch { .. }
+            | Command::Commit { .. }
+            | Command::Changes { .. }
+            | Command::Diff(_)
+            | Command::Snapshot(_)
+            | Command::Export(_)
+            | Command::Blob { .. }
+            | Command::Schema {
+                command: SchemaCommand::Show { .. }
+            }
+    )
+}
+
 /// Whether the operation addresses one graph of `target`, so `--graph` or the
 /// target's `default_graph` must select it before any I/O.
 pub(crate) fn selects_graph(command: &Command, target: &ResolvedTarget) -> bool {
@@ -301,6 +327,9 @@ fn accepts_actor(command: &Command) -> bool {
         | Command::Index { .. }
         | Command::RebuildFullTextIndexes(_)
         | Command::Mcp(_) => true,
+        // A cluster graph's applied policy judges maintenance by this actor
+        // (`maintain`, `reclaim`); a served optimize asserts it.
+        Command::Optimize(_) | Command::Cleanup(_) => true,
         // The actor a direct target's policy decides for.
         Command::Access(_) => true,
         Command::Branch { command } => match command {
@@ -362,8 +391,6 @@ fn accepts_actor(command: &Command) -> bool {
         | Command::Organization { .. }
         | Command::Init(_)
         | Command::Upgrade(_)
-        | Command::Optimize(_)
-        | Command::Cleanup(_)
         | Command::Lint(_)
         | Command::Alias(_)
         | Command::Embed(_)
@@ -468,6 +495,22 @@ pub(crate) fn validate_target(
             }
             _ => {}
         }
+    }
+    // `--format arrow` writes the result batches of a query the engine in
+    // this process runs; a server runs the query itself and answers JSON.
+    if let Command::Query(args) = &cli.command
+        && args.format == Some(crate::read_format::ReadOutputFormat::Arrow)
+        && matches!(target.binding, Server { .. } | Managed(_))
+    {
+        return Err(crate::targets::refusal(
+            "target_kind_unsupported",
+            format!(
+                "`--format arrow` writes the result batches of a query run on direct storage; \
+                 target '{}' is served, and its server answers JSON: use `--format json` or \
+                 `--format jsonl`",
+                target.label()
+            ),
+        ));
     }
     let invocation = match &cli.command {
         Command::Query(args) => Some((
@@ -809,8 +852,8 @@ mod tests {
             (&["diff", "--from", "a", "--to", "b"], false),
             (&["changes", "poll"], false),
             (&["changes", "baseline", "--out", "out"], false),
-            (&["optimize"], false),
-            (&["cleanup"], false),
+            (&["optimize"], true),
+            (&["cleanup"], true),
             (&["mcp"], true),
             (&["mcp", "--write"], true),
             // Studio's actor is its credential's; the link asserts none.
