@@ -36,7 +36,8 @@ Unicode word segmentation: `"don't"` is the two tokens `don` and `t`.
 Lance's index builder applies. Its stop list therefore holds each of NLTK's 198
 English stop words and that word's Snowball English stem, so a stop word the
 stemmer changes is removed too: `only` and `very` (stems `onli`, `veri`) match
-nothing, and a query of only stop words has no searchable term. A word whose
+nothing. A query of only stop words analyzes to no term and matches no
+document, under either mode and every edit budget. A word whose
 stem is a stop word drops as well: `"human beings"` analyzes to `human`.
 Folding after stemming keeps `"résumés"` (`résumé`) apart from `"resumes"`
 (`resum`).
@@ -145,10 +146,12 @@ the resource, the limit and the actual value. Every analyzed term and term
 comparison counts against the read's
 [`read_work_limit`](../queries/settings.md), and what the scan holds counts
 against `query_memory_bytes`. A budget outside 0 to 2 is `T71`, from a literal
-when the query is checked and from a parameter when the read runs. A query
-with no analyzed term is `T20`: an empty or punctuation-only literal at type
-checking, and any text the profile reduces to nothing, stop words included,
-when the read runs.
+when the query is checked and from a parameter when the read runs. An empty
+or punctuation-only literal is `T20` at type checking. Any other text the
+profile reduces to no term, such as a parameter holding only stop words,
+matches nothing and is never refused: `match_terms` is false under both modes
+and every edit budget, `bm25` keeps no row, and an `rrf` arm of such a `bm25`
+adds nothing to the fusion. The field is not read for it.
 
 An `rrf` arm over `bm25` is that same exact score over the arm's population,
 ranked by it from the highest ([Hybrid ranking](index.md#hybrid-ranking)).

@@ -4341,6 +4341,9 @@ impl Ctx<'_> {
         {
             Some(p) => p,
             None => {
+                if let Some(refusal) = self.catalog.absent_at_commit(&type_name, &property) {
+                    return Err(err(if name == "bm25" { T27 } else { T15 }, refusal));
+                }
                 return Err(err(
                     if name == "bm25" { T27 } else { T15 },
                     format!(
@@ -5650,6 +5653,9 @@ impl Ctx<'_> {
                     return Err(err(T6, format!("type `{type_name}` not found")));
                 };
                 let Some(p) = props.get(prop) else {
+                    if let Some(refusal) = self.catalog.absent_at_commit(type_name, prop) {
+                        return Err(err(T6, refusal));
+                    }
                     let hint = match prop {
                         "id" => format!("; the system identity is `${var}.@id`"),
                         _ => String::new(),
@@ -5674,6 +5680,13 @@ impl Ctx<'_> {
                 let Some(mut p) =
                     crate::traversal::common_edge_property(self.catalog, &names, prop)
                 else {
+                    if let Some(refusal) = names.iter().find_map(|name| {
+                        self.catalog
+                            .lookup_edge_by_name(name)
+                            .and_then(|edge| self.catalog.absent_at_commit(&edge.name, prop))
+                    }) {
+                        return Err(err(T6, refusal));
+                    }
                     let what = if type_name.is_empty() {
                         format!(
                             "`${var}` selects no edge: an empty wildcard has no inferable property `{prop}`"

@@ -4,7 +4,7 @@
 # notes: `Doc.english`, declared with the profile: the same rows for every query, with no index read.
 # notes: The profile stems before it removes stop words, and its stop list holds each of NLTK's 198
 # notes: English stop words and its stem, so a query of `only` or `very` (stems `onli`, `veri`) has
-# notes: no searchable term (`T20`, at run time for a parameter), while "human beings" analyzes to
+# notes: no searchable term and matches nothing, never refused at run time, while "human beings" analyzes to
 # notes: `human` (`being` stems to the stop word `be`). There is no token-length filter, so the
 # notes: 45-letter word matches. The edit relation holds on every full-text field: `grph` is one
 # notes: edit from `graph`. `bm25` is `bm25_v1`'s `F64` over the field corpus, and every term is
@@ -39,7 +39,10 @@ query hits($q: String) {
 --- params
 {"q": "only very"}
 
---- expect error: T20
+--- expect unordered
+
+--- expect shape
+d.slug: String
 
 --- query
 query hits($q: String) {

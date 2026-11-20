@@ -41,7 +41,7 @@ use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::ir::IRExpr;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
-use omnigraph_compiler::query::codes::{E1, E3, T20, T71};
+use omnigraph_compiler::query::codes::{E1, E3, T71};
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
 use omnigraph_compiler::schema::analysis::AnalyzerProfile;
 
@@ -79,7 +79,10 @@ pub(crate) struct LexicalQuery {
 impl LexicalQuery {
     /// `text` analyzed with `analyzer`, every term (`all`) or any one
     /// required, within `max_edits`. A budget outside `0..=2` is `T71`, a
-    /// text with no searchable term `T20`, both type errors.
+    /// type error. A text that analyzes to no term, a query of only stop
+    /// words, is a query that matches nothing ([`Self::matches_nothing`]),
+    /// never a refusal: the text is usually a parameter its author never
+    /// sees.
     pub(crate) fn analyze(
         analyzer: &mut Analyzer,
         text: &str,
@@ -111,14 +114,6 @@ impl LexicalQuery {
                 Ok(())
             },
         )?;
-        if terms.is_empty() {
-            return Err(type_error(
-                T20,
-                format!(
-                    "the lexical query `{text}` has no searchable terms under its field's analyzer"
-                ),
-            ));
-        }
         let chars = terms.iter().map(|term| term.chars().collect()).collect();
         Ok(Self {
             terms,
@@ -131,6 +126,12 @@ impl LexicalQuery {
     #[cfg(test)]
     pub(crate) fn terms(&self) -> &[String] {
         &self.terms
+    }
+
+    /// The text analyzed to no term: no document matches it, under either
+    /// mode and any edit budget, so no field is read for it.
+    pub(crate) fn matches_nothing(&self) -> bool {
+        self.terms.is_empty()
     }
 }
 
@@ -213,7 +214,13 @@ struct Hits {
 }
 
 impl Hits {
+    /// Whether the value matches: every query term (`all`) or one has an
+    /// alternative. A query of no term matches nothing, though every one of
+    /// its terms vacuously has one.
     fn matched(&self, all: bool) -> bool {
+        if self.by_term.is_empty() {
+            return false;
+        }
         if all {
             self.by_term.iter().all(|hits| !hits.is_empty())
         } else {
@@ -483,8 +490,11 @@ pub(crate) async fn members(
     query: &LexicalQuery,
     memory: &WorkMemory,
 ) -> Result<HashSet<String>> {
-    let mut scan = FieldScan::new(field_analyzer(catalog, type_name, property)?, query, memory)?;
     let mut ids = HashSet::new();
+    if query.matches_nothing() {
+        return Ok(ids);
+    }
+    let mut scan = FieldScan::new(field_analyzer(catalog, type_name, property)?, query, memory)?;
     scan_field(
         snapshot,
         catalog,
@@ -589,6 +599,9 @@ impl Bm25Scorer {
         values: &StringArray,
         memory: &WorkMemory,
     ) -> Result<Vec<Option<f64>>> {
+        if self.query.matches_nothing() {
+            return Ok(vec![None; values.len()]);
+        }
         let mut scan = FieldScan::new(Analyzer::of(self.profile)?, &self.query, memory)?;
         let mut out = Vec::with_capacity(values.len());
         for row in 0..values.len() {
@@ -631,11 +644,21 @@ pub(crate) async fn bm25(
             "the exact lexical scan reads `{type_name}.{property}`, whose index declares no analyzer"
         ))
     })?;
-    let mut scan = FieldScan::new(Analyzer::of(profile)?, &query, memory)?;
     let mut corpus = Corpus {
         holding: vec![0; query.terms.len()],
         ..Corpus::default()
     };
+    // No document matches a query of no term, so its statistics score
+    // nothing and the corpus is not read.
+    if query.matches_nothing() {
+        return Ok(Bm25Scorer {
+            profile,
+            query,
+            corpus,
+            idf: Vec::new(),
+        });
+    }
+    let mut scan = FieldScan::new(Analyzer::of(profile)?, &query, memory)?;
     scan_field(
         snapshot,
         catalog,
@@ -795,15 +818,21 @@ mod tests {
 
     /// `english_v1` removes each stop word and its stem: `only` and `very`
     /// stem to `onli` and `veri`, which the list holds, so a query of them
-    /// has no searchable term; a word whose stem is a stop word drops too,
-    /// so "human beings" analyzes to `human`.
+    /// has no searchable term and matches nothing; a word whose stem is a
+    /// stop word drops too, so "human beings" analyzes to `human`.
     #[test]
     fn english_v1_removes_stop_words_and_their_stems() {
         let mut english = Analyzer::of(AnalyzerProfile::EnglishV1).unwrap();
         for text in ["only", "very", "only very because", "why during any"] {
-            let error = LexicalQuery::analyze(&mut english, text, false, 0).unwrap_err();
-            assert!(error.to_string().contains("T20"), "{text}: {error}");
+            for (all, edits) in [(false, 0), (true, 0), (false, 2), (true, 1)] {
+                let query = LexicalQuery::analyze(&mut english, text, all, edits).unwrap();
+                assert!(query.matches_nothing(), "{text}");
+            }
         }
+        // Every term vacuously has an alternative under `all`; a query of
+        // none still matches nothing.
+        let none = Hits { by_term: vec![] };
+        assert!(!none.matched(true) && !none.matched(false));
         let query = LexicalQuery::analyze(&mut english, "human beings", false, 0).unwrap();
         assert_eq!(query.terms(), ["human"]);
         // The standard profiles remove no stop word.
@@ -830,9 +859,6 @@ mod tests {
         assert!(error.to_string().contains("T71"), "{error}");
         let error = LexicalQuery::analyze(&mut analyzer, "beta", false, -1).unwrap_err();
         assert!(error.to_string().contains("T71"), "{error}");
-        let mut english = Analyzer::of(AnalyzerProfile::EnglishV1).unwrap();
-        let error = LexicalQuery::analyze(&mut english, "the and of", false, 0).unwrap_err();
-        assert!(error.to_string().contains("T20"), "{error}");
         let long = "a".repeat(QUERY_MAX_BYTES + 1);
         match LexicalQuery::analyze(&mut analyzer, &long, false, 0).unwrap_err() {
             OmniError::ResourceLimitExceeded {

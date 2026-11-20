@@ -20,10 +20,11 @@
 //! The converse for `T82`: a selection it admits, one member along the
 //! written order and one against it, returns rows on some generated graph.
 //!
-//! `T20`, a lexical query with no searchable terms, is a type error by its
-//! rule (section 4, "Empty text") and claims nothing about rows: under
-//! `mode: all` such a query would hold on every document, vacuously, so it
-//! is not one of these.
+//! `T20`, a literal lexical query with no searchable character, is a type
+//! error by its rule (section 4, "Empty text") and is not one of these: the
+//! same text bound at run time, or a text of only stop words, matches no
+//! document under either mode, a property of the lexical relation that its
+//! own cases pin, not a refusal's claim.
 //!
 //! A counterexample is a wrongful refusal. `T3`'s reason is misspelling, not
 //! emptiness: a literal no row can hold is refused wherever it is compared,

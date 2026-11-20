@@ -1026,6 +1026,16 @@ impl Omnigraph {
         Arc::clone(&self.schema_view.load().catalog)
     }
 
+    /// The catalog a read query on `target` type-checks against: the
+    /// accepted one on a branch, and at an explicit commit the current
+    /// schema as that commit holds it ([`Catalog::at_commit`]), whose
+    /// [`Catalog::historical`] names the commit.
+    pub async fn query_catalog(&self, target: impl Into<ReadTarget>) -> Result<Arc<Catalog>> {
+        self.capture_query_view(target)
+            .await
+            .map(|(_, catalog)| catalog)
+    }
+
     /// Returns an `Arc<String>` snapshot of the schema source.
     pub fn schema_source(&self) -> Arc<String> {
         Arc::clone(&self.schema_view.load().source)
@@ -2799,7 +2809,80 @@ impl Omnigraph {
         );
         let catalog = self.catalog_for_image_vintage(&snapshot, catalog).await?;
         snapshot.bind_catalog_aliases(&catalog, &live)?;
+        let commit = snapshot
+            .graph_head(branch.as_deref())
+            .map_or_else(|| format!("manifest version {version}"), str::to_string);
+        let catalog = self
+            .bind_historical_schema(&mut snapshot, catalog, &commit)
+            .await?;
         Ok((snapshot, catalog))
+    }
+
+    /// [`Self::capture_read_view`] for a read query: on an explicit
+    /// historical target, the view is bound to the schema accepted at that
+    /// commit ([`Self::bind_historical_schema`]).
+    pub(crate) async fn capture_query_view(
+        &self,
+        target: impl Into<ReadTarget>,
+    ) -> Result<(ResolvedTarget, Arc<Catalog>)> {
+        let target = target.into();
+        let historical = matches!(&target, ReadTarget::Snapshot(_));
+        let (mut resolved, catalog) = self.capture_read_view(target).await?;
+        if !historical {
+            return Ok((resolved, catalog));
+        }
+        let commit = resolved
+            .graph_commit_id
+            .clone()
+            .unwrap_or_else(|| resolved.snapshot_id.as_str().to_string());
+        let catalog = self
+            .bind_historical_schema(&mut resolved.snapshot, catalog, &commit)
+            .await?;
+        Ok((resolved, catalog))
+    }
+
+    /// The one place that decides the shape of a read query at an earlier
+    /// commit (RFC GQ 3, A2): a snapshot is its data and the schema accepted
+    /// at it. `catalog` is the current catalog, already bound to `snapshot`'s
+    /// tables by type identity; the read sees each property the commit holds
+    /// under its current name, through its stable identity, and no other.
+    ///
+    /// The catalog returned is the current one restricted to the property
+    /// identities the commit's recorded schema declares
+    /// ([`Catalog::at_commit`]), so the type checker refuses a property the
+    /// commit does not hold, naming `commit`, and a whole node expands to
+    /// the properties it holds; the shape is fixed before planning and the
+    /// bound plan records it. A commit whose schema was not recorded (a
+    /// version written before the contract lived in `__manifest`, or a
+    /// commit converted with none) is planned against the current schema,
+    /// as it was before. Either way every table opens under the property
+    /// view of the catalog returned, so a property renamed since reads under
+    /// its current name and a dropped property's column, even one sharing a
+    /// current name, is unreachable.
+    async fn bind_historical_schema(
+        &self,
+        snapshot: &mut Snapshot,
+        catalog: Arc<Catalog>,
+        commit: &str,
+    ) -> Result<Arc<Catalog>> {
+        let current = catalog.bound_schema_ir().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "a historical read needs an identity-bound catalog".to_string(),
+            )
+        })?;
+        let recorded = snapshot
+            .schema_contract()
+            .filter(|_| snapshot.records_schema());
+        let catalog = match recorded {
+            Some(identity) if identity != SchemaContractIdentity::from_ir(current)? => {
+                let row = snapshot.read_schema_contract(self.uri()).await?;
+                let (at, _) = validate_schema_contract_row(&row)?;
+                Arc::new(catalog.at_commit(&at, commit)?)
+            }
+            _ => catalog,
+        };
+        snapshot.set_property_views(property_views(&catalog));
+        Ok(catalog)
     }
 
     /// The catalog a pinned image plans against: the accepted one, or its
@@ -5508,6 +5591,36 @@ fn changed_kind_under_gate(commit_id: &str) -> OmniError {
     OmniError::manifest_internal(format!(
         "commit '{commit_id}' resolved to a different kind under the branch gate"
     ))
+}
+
+/// Per table key, each property `catalog` declares, stable property id to
+/// name: the names a historical read opens its tables under.
+fn property_views(catalog: &Catalog) -> crate::db::snapshot::PropertyViews {
+    let schemas = catalog
+        .node_types
+        .iter()
+        .map(|(name, node)| (format!("node:{name}"), &node.arrow_schema))
+        .chain(
+            catalog
+                .edge_types
+                .iter()
+                .map(|(name, edge)| (format!("edge:{name}"), &edge.arrow_schema)),
+        );
+    schemas
+        .map(|(table_key, schema)| {
+            let view = schema
+                .fields()
+                .iter()
+                .filter_map(|field| {
+                    field
+                        .metadata()
+                        .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+                        .map(|id| (id.clone(), field.name().clone()))
+                })
+                .collect();
+            (table_key, view)
+        })
+        .collect()
 }
 
 fn validate_bound_catalog_against_snapshot(catalog: &Catalog, snapshot: &Snapshot) -> Result<()> {

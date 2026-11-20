@@ -677,6 +677,13 @@ impl Snapshot {
         self.schema_contract.as_ref()
     }
 
+    /// Whether the schema accepted at this snapshot can be read: it carries
+    /// a contract head, and a commit record names the content behind it.
+    pub fn records_schema(&self) -> bool {
+        self.schema_contract.is_some()
+            && !matches!(self.contract_source, ContractSource::Archive(None))
+    }
+
     /// Whether both snapshots captured the same immutable manifest image.
     pub fn same_manifest_image(&self, other: &Self) -> bool {
         self.root_uri == other.root_uri
