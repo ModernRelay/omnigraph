@@ -259,7 +259,7 @@ struct Probe {
 enum Side {
     Pending,
     Hashed(Box<Built>),
-    Lookup(Lookup),
+    Lookup(Box<Lookup>),
     /// The build held no row: nothing joins, the probe stops.
     Empty,
 }
@@ -283,10 +283,10 @@ impl Probe {
             Err(error) if self.fallback.is_some() && OmniError::is_query_memory_failure(&error) => {
                 self.fallbacks.add(1);
                 Switch::IdLookup.record(&self.switch);
-                Side::Lookup(Lookup {
-                    spec: Arc::clone(&self.lookup),
-                    declared: Arc::clone(&self.declared),
-                })
+                Side::Lookup(Box::new(Lookup::new(
+                    Arc::clone(&self.lookup),
+                    Arc::clone(&self.declared),
+                )))
             }
             Err(error) => return Err(error),
         };
@@ -368,19 +368,33 @@ impl Streamed for Probe {
             if let Side::Pending = self.side {
                 self.drain_build(&batch, memory).await?;
             }
+            if let Side::Lookup(lookup) = &mut self.side {
+                lookup.push(batch, memory, sender).await?;
+                return Ok(Flow::Continue);
+            }
             match &self.side {
                 Side::Hashed(built) => {
                     self.hashed(built, batch, memory, sender).await?;
                     Ok(Flow::Continue)
                 }
-                Side::Lookup(lookup) => {
-                    lookup.resolve(batch, memory, sender).await?;
-                    Ok(Flow::Continue)
-                }
+                Side::Lookup(_) => unreachable!("handled above"),
                 Side::Empty => Ok(Flow::Stop),
                 Side::Pending => Err(DataFusionError::Internal(
                     "hash join probed before its build was tried".into(),
                 )),
+            }
+        })
+    }
+
+    fn finish<'a>(
+        &'a mut self,
+        memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, DfResult<()>> {
+        Box::pin(async move {
+            match &mut self.side {
+                Side::Lookup(lookup) => lookup.flush(memory, sender).await,
+                _ => Ok(()),
             }
         })
     }

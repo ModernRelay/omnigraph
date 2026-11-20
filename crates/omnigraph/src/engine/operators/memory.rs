@@ -673,6 +673,13 @@ impl WorkMemory {
         )
     }
 
+    /// The bytes the query's pool has free now: its limit less every charge
+    /// it holds.
+    pub(in crate::engine) fn free_bytes(&self) -> u64 {
+        let reserved = u64::try_from(self.resources.pool.reserved()).unwrap_or(u64::MAX);
+        self.resources.limit.saturating_sub(reserved)
+    }
+
     /// Target bytes per producer batch, leaving room for queued batches and consumers.
     pub(in crate::engine) fn batch_bytes(&self) -> usize {
         (self.resources.limit / 32).clamp(1, 1024 * 1024) as usize
