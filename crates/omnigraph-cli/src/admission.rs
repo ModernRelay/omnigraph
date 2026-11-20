@@ -9,6 +9,8 @@ use omnigraph::storage::{CapturedStorageBinding, storage_for_binding};
 use omnigraph_cluster::{ClusterAdmission, ClusterAdmissionPurpose};
 use tokio::sync::Mutex;
 
+use crate::command_outcome::EngineWrite;
+
 type Owners = Arc<Mutex<BTreeMap<String, ClusterAdmission>>>;
 
 tokio::task_local! {
@@ -87,7 +89,13 @@ pub(crate) async fn open_writable(
         None => None,
     };
     crate::command_outcome::writable_open();
-    let db = omnigraph::db::Omnigraph::open_with_storage(binding.uri(), storage.await?).await?;
+    let storage = storage.await?;
+    // The open's own error says what the open did: a typed refusal, such as
+    // a root that holds no graph, precedes every write the open makes, while
+    // an untyped storage failure stays one whose effects are unknown.
+    let db = omnigraph::db::Omnigraph::open_with_storage(binding.uri(), storage)
+        .await
+        .engine_write()?;
     Ok(match policy {
         Some(policy) => db.with_policy(policy),
         None => db,

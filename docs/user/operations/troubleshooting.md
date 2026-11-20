@@ -109,7 +109,9 @@ a streamed page, already reached stdout. Stdout then keeps the bytes already wri
 unfinished object, as for `diff`, `branch diff`, `commit changes` and
 `changes poll` with `--json` when they follow every page, and the failure
 document is on stderr. Human mode prints the `disposition` line on
-stderr. A target refusal on these commands exits 1 with `action: fix`. HTTP
+stderr. A target refusal on these commands exits 1 with `action: fix`; a
+target that holds no graph is one, refused as `not_found` with `effects: none`
+before the command writes anything. HTTP
 failures also retain `http_status` and, when present, the original
 `retry_after` string.
 
