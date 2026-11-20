@@ -225,9 +225,10 @@ either end, is `T90`: it would drop every row where the name is null and turn
 the outer join into an inner one. The fix moves the triple inside the
 optional; drop the optional instead where only its matches were meant. A
 later optional, a block, an inline read and a `where` read the name and keep
-the row. Returning a node the optional introduces whole, `return { $c }`, is not lowered
-(`T86`). It prints no fix: returning the node's properties instead runs, but
-with other result columns.
+the row. A node the optional introduces, returned whole (`return { $c }`), is
+its node object where the optional matched and a null object where it matched
+nothing: JSON leaves the column out of that row, as it leaves out every null
+cell, and the result column is nullable (`c: Company?`).
 
 A read's plan budget bounds the work of compiling and planning it: every
 node of its plan built, every expression typed, each scope's copy of the

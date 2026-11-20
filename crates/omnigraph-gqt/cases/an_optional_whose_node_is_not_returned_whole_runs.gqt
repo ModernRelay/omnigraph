@@ -1,6 +1,6 @@
 # issue: none
-# notes: An `optional` runs when its node is not returned whole. Its node returned whole, a read that calls itself and an edge
-# notes: reference returned whole are refused with `T86`, which the refusal table (`tests/integration/law_refusals.rs`) pins.
+# notes: An `optional` runs when its node is not returned whole; returned whole, its node is a null object where the `optional`
+# notes: matched nothing (`an_optional_node_returned_whole_is_a_null_object.gqt`).
 
 --- runner
 timeout_ms: 10000

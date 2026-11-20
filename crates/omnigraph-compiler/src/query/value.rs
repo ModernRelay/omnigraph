@@ -178,8 +178,8 @@ impl AggFunc {
                     list: true,
                     nullable: _,
                 }
-                | ExprType::Node { type_name: _ }
-                | ExprType::Edge { type_name: _ }
+                | ExprType::Node { .. }
+                | ExprType::Edge { .. }
                 | ExprType::ExactInteger { .. },
             ) => None,
         }

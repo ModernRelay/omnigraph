@@ -438,19 +438,23 @@ pub enum ExprType {
         list: bool,
         nullable: bool,
     },
+    /// A node reference; `nullable` where an `optional` introduced it, so
+    /// a row it kept without a match holds no node.
     Node {
         type_name: String,
-    },
-    /// An edge reference column of the core IR; `type_name` may hold the
-    /// alternatives of an edge selector, joined by `|`.
-    Edge {
-        type_name: String,
-    },
-    /// Internal exact comparison carrier, never a declared parameter or result.
-    ExactInteger {
-        list: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         nullable: bool,
     },
+    /// An edge reference column of the core IR; `type_name` may hold the
+    /// alternatives of an edge selector, joined by `|`; `nullable` as a
+    /// node's.
+    Edge {
+        type_name: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        nullable: bool,
+    },
+    /// Internal exact comparison carrier, never a declared parameter or result.
+    ExactInteger { list: bool, nullable: bool },
 }
 
 impl ExprType {
@@ -464,8 +468,26 @@ impl ExprType {
 
     pub fn nullable(&self) -> bool {
         match self {
-            Self::Value { nullable, .. } | Self::ExactInteger { nullable, .. } => *nullable,
-            Self::Node { .. } | Self::Edge { .. } => false,
+            Self::Value { nullable, .. }
+            | Self::ExactInteger { nullable, .. }
+            | Self::Node { nullable, .. }
+            | Self::Edge { nullable, .. } => *nullable,
+        }
+    }
+
+    /// A node reference of `type_name` that is never null.
+    pub fn node(type_name: impl Into<String>) -> Self {
+        Self::Node {
+            type_name: type_name.into(),
+            nullable: false,
+        }
+    }
+
+    /// An edge reference of `type_name` that is never null.
+    pub fn edge(type_name: impl Into<String>) -> Self {
+        Self::Edge {
+            type_name: type_name.into(),
+            nullable: false,
         }
     }
 
@@ -494,8 +516,22 @@ impl ExprType {
             (Self::ExactInteger { list: left, .. }, Self::ExactInteger { list: right, .. }) => {
                 left == right
             }
-            (Self::Node { type_name: left }, Self::Node { type_name: right })
-            | (Self::Edge { type_name: left }, Self::Edge { type_name: right }) => left == right,
+            (
+                Self::Node {
+                    type_name: left, ..
+                },
+                Self::Node {
+                    type_name: right, ..
+                },
+            )
+            | (
+                Self::Edge {
+                    type_name: left, ..
+                },
+                Self::Edge {
+                    type_name: right, ..
+                },
+            ) => left == right,
             _ => false,
         }
     }
@@ -518,8 +554,14 @@ impl ExprType {
                 enum_values: None,
             }
             .display_name(),
-            Self::Node { type_name } => type_name.clone(),
-            Self::Edge { type_name } => format!("edge {type_name}"),
+            Self::Node {
+                type_name,
+                nullable,
+            } => format!("{type_name}{}", if *nullable { "?" } else { "" }),
+            Self::Edge {
+                type_name,
+                nullable,
+            } => format!("edge {type_name}{}", if *nullable { "?" } else { "" }),
             Self::ExactInteger { list, nullable } => format!(
                 "{}{}",
                 if *list {
@@ -548,7 +590,7 @@ impl ExprType {
                 }
                 .to_arrow(),
             ),
-            Self::Node { type_name: _ } | Self::Edge { type_name: _ } => None,
+            Self::Node { .. } | Self::Edge { .. } => None,
             Self::ExactInteger { list, .. } => Some(if *list {
                 DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
                     "item",

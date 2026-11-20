@@ -84,7 +84,8 @@ introduces null; an inner scope like a block, so it binds a name new to it,
 `optional { $c: Company, $p worksAt $c }` (`T84`), and reads an outer one
 unbound (`T68`); those names, and its `let`s, are nullable after it, null on
 a row with no match, a triple outside it reading one is `T90`, whose fix
-moves the triple inside, and returning one of its nodes whole is `T86`), `let`
+moves the triple inside, and one of its nodes returned whole is a null object
+on such a row, left out of the JSON row), `let`
 and `from`, separated by
 commas (a trailing comma is allowed; a newline is not
 a separator). `where`, after the braces, holds one Boolean expression that sees

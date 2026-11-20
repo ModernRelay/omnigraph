@@ -1124,11 +1124,13 @@ mod render_tests {
                 "p".into(),
                 ExprType::Node {
                     type_name: "Other".into(),
+                    nullable: false,
                 },
             )),
             signature: AggSignature {
                 arg: ExprType::Node {
                     type_name: "Person".into(),
+                    nullable: false,
                 },
                 result: ExprType::from_prop(&PropType::scalar(crate::types::ScalarType::I64, true)),
             },
@@ -1268,11 +1270,13 @@ mod render_tests {
                 "f".to_string(),
                 ExprType::Node {
                     type_name: "Friend".into(),
+                    nullable: false,
                 },
             )),
             signature: AggSignature {
                 arg: ExprType::Node {
                     type_name: "Friend".into(),
+                    nullable: false,
                 },
                 result: ExprType::from_prop(&PropType::scalar(crate::types::ScalarType::I64, true)),
             },
@@ -1655,9 +1659,13 @@ fn validate_leaf_type(ty: &ExprType) -> Result<()> {
         } if *list || *dim == 0 || *dim > i32::MAX as u32 => Err(CompilerError::Plan(
             "invalid vector type on expression leaf".into(),
         )),
-        ExprType::Node { type_name } | ExprType::Edge { type_name } if type_name.is_empty() => Err(
-            CompilerError::Plan("reference leaf has an empty type name".into()),
-        ),
+        ExprType::Node { type_name, .. } | ExprType::Edge { type_name, .. }
+            if type_name.is_empty() =>
+        {
+            Err(CompilerError::Plan(
+                "reference leaf has an empty type name".into(),
+            ))
+        }
         _ => Ok(()),
     }
 }
@@ -2761,6 +2769,7 @@ mod block_type_tests {
         assert!(forged.check_types().is_err());
         let node = ExprType::Node {
             type_name: "Person".into(),
+            nullable: false,
         };
         let forged = BlockAggregateExpr::Aggregate {
             func: AggFunc::Count,

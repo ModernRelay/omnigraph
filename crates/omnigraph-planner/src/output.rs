@@ -24,7 +24,7 @@ pub(crate) fn node_object_types(
     let names: BTreeSet<&str> = returns
         .iter()
         .filter_map(|projection| match &projection.ty {
-            ExprType::Node { type_name } => Some(type_name.as_str()),
+            ExprType::Node { type_name, .. } => Some(type_name.as_str()),
             ExprType::Value { .. } | ExprType::Edge { .. } | ExprType::ExactInteger { .. } => None,
         })
         .collect();
@@ -81,12 +81,14 @@ pub(crate) fn return_schema(
             ExprType::Edge { .. } => {
                 return Err(PlanError::Internal("an edge reference is not a public result type".into()));
             }
-            ExprType::Node { type_name } => {
+            // A node an `optional` introduces is a null object on a row the
+            // `optional` kept without a match.
+            ExprType::Node { type_name, nullable } => {
                 let fields = objects.get(type_name.as_str()).ok_or_else(|| {
                     PlanError::Internal(format!("missing node object declaration `{type_name}`"))
                 })?;
                 used.insert(type_name.as_str());
-                (DataType::Struct((*fields).clone()), false)
+                (DataType::Struct((*fields).clone()), *nullable)
             }
         };
         Ok(Field::new(&projection.column, data_type, nullable))

@@ -296,7 +296,7 @@ a later release lowers it.
 | Refused |
 |---|
 | An `rrf` whose arms read a name of the enclosing scope |
-| A node an `optional` introduces, or an edge reference, returned whole |
+| An edge reference returned whole |
 | A `Blob` read from a row in an assignment (a write group whose selection reads a type an earlier group changes is `T91`: every group selects on the write's snapshot) |
 | A read that calls itself (`Fix`) |
 
@@ -310,8 +310,8 @@ error[T86]: type error: T86: `q`: this release does not support an edge referenc
 ```
 
 `T86` prints a fix only where a form the planner runs has the same rows and
-result columns, and none above has one: returning an `optional` node's
-properties instead of the node, for example, changes the result columns.
+result columns, and none above has one: returning an edge's fields instead of
+the edge, for example, changes the result columns.
 `P006` is not a refusal: see [Planner codes](#planner-codes).
 
 ## Planner codes

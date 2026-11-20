@@ -66,11 +66,6 @@ const B_IN_PROGRESS: &[InProgress] = &[
     },
     // `ReadShape`: return items and order keys.
     InProgress {
-        construct: "a node an optional introduces returned whole",
-        site: "a node an `optional` introduces returned whole (a nullable node object)",
-        text: "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c } }",
-    },
-    InProgress {
         construct: "an edge reference returned whole",
         site: "an edge reference returned whole (the result has no edge object)",
         text: "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }",
@@ -171,10 +166,11 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $k.@id, $k.@src, $k.@dst } order { $k } }",
                 Lowers,
             ),
-            // "a node an optional introduces returned whole"
+            // A node an `optional` introduces returned whole: a nullable
+            // node object.
             (
                 "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c } }",
-                Refused("B"),
+                Lowers,
             ),
             (
                 "query q() { match { $p: Person, optional { $f: Person, $p knows $f, $c: Company, $f worksAt $c } } where $c.name = \"Acme\" return { $p.name, $f.name } }",

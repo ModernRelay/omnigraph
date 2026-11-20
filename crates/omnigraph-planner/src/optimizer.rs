@@ -1641,7 +1641,7 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
                 (AggFunc::Count, IRExpr::Variable(variable, ty)) => {
                     // An edge over several types is identified by its type and
                     // its id together.
-                    if matches!(ty, ExprType::Edge { type_name } if type_name.contains('|')) {
+                    if matches!(ty, ExprType::Edge { type_name, .. } if type_name.contains('|')) {
                         out.push(ColumnRef::property(variable, EDGE_TYPE_MEMBER));
                     }
                     out.push(ColumnRef::property(variable, IDENTITY_MEMBER));

@@ -2812,15 +2812,6 @@ query people_2() { match { $p: Person } return { $p.handle } }"#,
         code: "T86",
         shape: "unlowered read does not run",
         schema: COMMON,
-        source: "query whole($h: String) { match { $p: Person, optional { $q: Person, $p knows $q } } where $p.handle = $h return { $p.name, $q } }",
-        message: "`whole`: this release does not support a node an `optional` introduces returned whole (a nullable node object) yet",
-        fix: None,
-        intended: None,
-    },
-    Row {
-        code: "T86",
-        shape: "unlowered read does not run (2)",
-        schema: COMMON,
         source: r#"query reachable($from: String) {
     match {
         from union(
@@ -2835,7 +2826,7 @@ query people_2() { match { $p: Person } return { $p.handle } }"#,
     },
     Row {
         code: "T86",
-        shape: "unlowered read does not run (3)",
+        shape: "unlowered read does not run (2)",
         schema: COMMON,
         source: "query edge_whole() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }",
         message: "`edge_whole`: this release does not support an edge reference returned whole (the result has no edge object) yet",

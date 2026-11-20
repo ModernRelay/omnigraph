@@ -211,10 +211,11 @@ fn independent_type_refusals_in_a_block_are_all_reported() {
 /// type refusals of its declaration that it does not depend on.
 #[test]
 fn the_lowering_refusal_and_the_product_rule_stand_beside_other_type_refusals() {
-    let src = r#"query q($h: String) { match { $p: Person, optional { $q: Person, $p knows $q } } where $p.hndle = $h return { $p.name, $q } }"#;
+    let src = r#"query q($h: String) { match { $p: Person, $p knows $q } where $p.hndle = $h return { $p.name, collect($q) as qs } }"#;
     assert_eq!(
         codes_at(src),
-        [("T6", "$p.hndle = $h"), ("T86", "$q")].map(|(c, t)| (c.to_string(), t.to_string())),
+        [("T6", "$p.hndle = $h"), ("T86", "collect($q)")]
+            .map(|(c, t)| (c.to_string(), t.to_string())),
     );
     // A `from` whose `as` alone is refused draws its relation, so a term
     // it holds that this release does not lower is refused too.

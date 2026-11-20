@@ -1901,12 +1901,14 @@ mod result_contract {
                         "p".into(),
                         omnigraph_compiler::types::ExprType::Node {
                             type_name: "Person".into(),
+                            nullable: false,
                         },
                     ),
                     alias: Some("person".into()),
                     column: "person".into(),
                     ty: ExprType::Node {
                         type_name: "Person".into(),
+                        nullable: false,
                     },
                 },
             ],
@@ -2091,6 +2093,7 @@ mod result_contract {
                 "p".into(),
                 ExprType::Node {
                     type_name: "Person".into(),
+                    nullable: false,
                 },
             )
         };
@@ -2114,6 +2117,7 @@ mod result_contract {
                 signature: AggSignature {
                     arg: ExprType::Node {
                         type_name: "Person".into(),
+                        nullable: false,
                     },
                     result: ty(ScalarType::I64, true),
                 },
@@ -2316,8 +2320,12 @@ mod shape_section {
     #[test]
     fn a_node_type_name_spells_a_bare_node_projection() {
         let parsed = lines("p: Person");
-        assert!(matches!(&parsed[0].shape_type, ShapeType::Node(name) if name == "Person"));
-        assert!(shape_refusal("p: Person?").contains("never null"));
+        assert!(
+            matches!(&parsed[0].shape_type, ShapeType::Node { type_name, nullable: false } if type_name == "Person")
+        );
+        assert!(
+            matches!(&lines("p: Person?")[0].shape_type, ShapeType::Node { type_name, nullable: true } if type_name == "Person")
+        );
         let (field, column) = person_struct();
         let executed = result(vec![field], vec![column]);
         assert_eq!(mismatch(&lines("p: Person"), &executed), None);
@@ -2334,6 +2342,36 @@ mod shape_section {
         assert_eq!(
             bless_shape_lines(&executed, &age_catalog()).unwrap(),
             vec!["p: Person".to_string()]
+        );
+        // A null object, which an `optional` leaves, needs `?`, and bless
+        // writes it.
+        let (field, column) = person_struct();
+        let DataType::Struct(fields) = field.data_type().clone() else {
+            unreachable!()
+        };
+        let absent = StructArray::new(
+            fields.clone(),
+            column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap()
+                .columns()
+                .to_vec(),
+            Some(vec![false].into()),
+        );
+        let executed = result(
+            vec![Field::new("p", DataType::Struct(fields), true)],
+            vec![Arc::new(absent)],
+        );
+        assert!(
+            mismatch(&lines("p: Person"), &executed)
+                .unwrap()
+                .contains("null object")
+        );
+        assert_eq!(mismatch(&lines("p: Person?"), &executed), None);
+        assert_eq!(
+            bless_shape_lines(&executed, &age_catalog()).unwrap(),
+            vec!["p: Person?".to_string()]
         );
     }
 
@@ -2402,7 +2440,14 @@ mod shape_section {
             .iter()
             .map(|l| match &l.shape_type {
                 ShapeType::Scalar(t) => format!("{}: {}", l.name, t.display_name()),
-                ShapeType::Node(n) => format!("{}: {n}", l.name),
+                ShapeType::Node {
+                    type_name,
+                    nullable,
+                } => format!(
+                    "{}: {type_name}{}",
+                    l.name,
+                    if *nullable { "?" } else { "" }
+                ),
             })
             .collect();
         assert_eq!(

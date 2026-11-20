@@ -39,6 +39,7 @@ fn entity_reference_keeps_a_later_nearest_vector_column_demanded_by_name() {
             "c".to_string(),
             omnigraph_compiler::ExprType::Node {
                 type_name: "T".into(),
+                nullable: false,
             },
         )],
         vec![
@@ -73,11 +74,13 @@ fn metadata_count_rewrite_converges() {
                 "c".to_string(),
                 omnigraph_compiler::ExprType::Node {
                     type_name: "T".into(),
+                    nullable: false,
                 },
             )),
             signature: AggSignature {
                 arg: ExprType::Node {
                     type_name: "T".into(),
+                    nullable: false,
                 },
                 result: ExprType::from_prop(&PropType::scalar(ScalarType::I64, true)),
             },

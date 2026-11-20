@@ -11,11 +11,12 @@ use omnigraph_compiler::{PropType, QueryResult, ScalarType};
 use crate::BodySpan;
 
 /// A shape line's type: a `.pg` property type, or a node type name for a
-/// bare node projection (`p: Person`), whose column is the node object.
+/// bare node projection (`p: Person`), whose column is the node object, with
+/// `?` where an `optional` introduced the node (`c: Company?`).
 #[derive(Debug, Clone)]
 pub(crate) enum ShapeType {
     Scalar(PropType),
-    Node(String),
+    Node { type_name: String, nullable: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -79,12 +80,15 @@ pub(crate) fn parse_shape_body(body: &[(usize, &str)]) -> Result<Vec<ShapeLine>,
                 }
                 ShapeType::Scalar(prop_type)
             }
-            None if is_type_name(type_text) => ShapeType::Node(type_text.to_string()),
+            None if is_type_name(type_text) => ShapeType::Node {
+                type_name: type_text.to_string(),
+                nullable: false,
+            },
             None if type_text.ends_with('?') && is_type_name(&type_text[..type_text.len() - 1]) => {
-                return Err(format!(
-                    "line {line_no}: `{type_text}` is refused; a node object is never null, write `{}`",
-                    &type_text[..type_text.len() - 1]
-                ));
+                ShapeType::Node {
+                    type_name: type_text[..type_text.len() - 1].to_string(),
+                    nullable: true,
+                }
             }
             None => return Err(format!("line {line_no}: unknown type `{type_text}`")),
         };
@@ -101,7 +105,14 @@ pub(crate) fn parse_shape_body(body: &[(usize, &str)]) -> Result<Vec<ShapeLine>,
 pub(crate) fn spell_shape_line(line: &ShapeLine) -> String {
     match &line.shape_type {
         ShapeType::Scalar(prop_type) => format!("{}: {}", line.name, prop_type.display_name()),
-        ShapeType::Node(type_name) => format!("{}: {type_name}", line.name),
+        ShapeType::Node {
+            type_name,
+            nullable,
+        } => format!(
+            "{}: {type_name}{}",
+            line.name,
+            if *nullable { "?" } else { "" }
+        ),
     }
 }
 
@@ -194,7 +205,10 @@ pub(crate) fn shape_mismatch(
         }
         let prop_type = match &want.shape_type {
             ShapeType::Scalar(prop_type) => prop_type,
-            ShapeType::Node(type_name) => {
+            ShapeType::Node {
+                type_name,
+                nullable,
+            } => {
                 let names = match node_object_names(catalog, type_name) {
                     Ok(names) => names,
                     Err(why) => {
@@ -211,6 +225,15 @@ pub(crate) fn shape_mismatch(
                         names.join(", "),
                         spell_arrow(got.data_type())
                     ));
+                }
+                if !nullable {
+                    let nulls = null_cells(result, i);
+                    if nulls > 0 {
+                        return Some(format!(
+                            "result shape mismatch at column {i} `{}`: written without `?`, the executor returned {nulls} null object(s)",
+                            want.name
+                        ));
+                    }
                 }
                 continue;
             }
@@ -293,7 +316,8 @@ pub(crate) fn bless_shape_lines(
                     field.name()
                 ));
             };
-            lines.push(format!("{}: {type_name}", field.name()));
+            let nullable = if null_cells(result, i) > 0 { "?" } else { "" };
+            lines.push(format!("{}: {type_name}{nullable}", field.name()));
             continue;
         }
         let Some(mut prop_type) = PropType::from_arrow(field.data_type()) else {

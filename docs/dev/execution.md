@@ -67,7 +67,12 @@ A query runs against one resolved `ReadTarget`:
    the `OptionalJoin` pads null on a row with no match; one whose value is a
    column the optional does not compute (an outer column, a parameter, a
    constant) is a column after it, `if(<a node it binds> is not null, value,
-   null)`, so it is null on a row with no match whatever it reads. A `from union(…)` whose arms read no outer name is a
+   null)`, so it is null on a row with no match whatever it reads. A node
+   it introduces, returned whole, is a nullable node type
+   (`ExprType::Node`'s `nullable`, the type checker's own column type) whose
+   object the projection marks null where its identity is null; the plan's
+   result columns, the executed schema and the compiler's inferred schema
+   agree on the flag. A `from union(…)` whose arms read no outer name is a
    `PatternStep::Union` placed first, each arm its own pipeline from nothing
    with its unreturned names renamed apart, and the logical and physical
    `Union` (a new node kind: no existing one emits the rows of two

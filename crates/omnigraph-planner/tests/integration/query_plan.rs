@@ -144,6 +144,7 @@ fn projection(expr: IRExpr, pipeline: &[PatternStep]) -> IRProjection {
                 .expect("fixture return variable is bound");
             ExprType::Node {
                 type_name: name.clone(),
+                nullable: false,
             }
         }
         IRExpr::PropAccess { property, .. } => property_type(property),

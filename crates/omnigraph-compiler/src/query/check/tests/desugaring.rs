@@ -362,6 +362,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
                                         Literal::Null,
                                         ExprType::Node {
                                             type_name: "Company".into(),
+                                            nullable: false,
                                         },
                                     ),
                                 ),

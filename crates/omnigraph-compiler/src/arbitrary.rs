@@ -677,8 +677,8 @@ struct ReadGen<'s, 'c, 'd> {
     fresh: usize,
     /// Declared parameters: `(name, declaration, value)`.
     params: Vec<(String, String, Option<Literal>)>,
-    /// Nodes an `optional` introduces, which a read does not return whole
-    /// yet (`T86`).
+    /// Nodes an `optional` introduces: null on a row it kept without a
+    /// match, so no later triple starts from one (`T90`).
     nullable_nodes: Vec<String>,
     /// Draw no term that can fail (arithmetic, unary minus, a numeric row,
     /// a `cast` to a number or from a String, `left`, `right`,
@@ -1653,14 +1653,12 @@ impl ReadGen<'_, '_, '_> {
                 // A full-text call read as a value.
                 call
             } else if self.c.flag(15) {
-                // A node or edge reference.
-                // A node reference; an edge returned whole is refused
-                // (`T86`).
+                // A node reference, a null object where an `optional`
+                // introduced it and matched nothing; an edge returned whole
+                // is refused (`T86`).
                 let refs: Vec<&Var> = scope
                     .iter()
-                    .filter(|v| {
-                        matches!(v.kind, VarKind::Node(_)) && !self.nullable_nodes.contains(&v.name)
-                    })
+                    .filter(|v| matches!(v.kind, VarKind::Node(_)))
                     .collect();
                 if refs.is_empty() {
                     self.any_expr(scope, 1)

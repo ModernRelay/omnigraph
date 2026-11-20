@@ -1320,7 +1320,7 @@ struct BlockFact {
 /// The node types of the node columns among `columns`.
 fn node_types(columns: &[(String, ExprType)]) -> impl Iterator<Item = (String, String)> + '_ {
     columns.iter().filter_map(|(name, ty)| match ty {
-        ExprType::Node { type_name } => Some((name.clone(), type_name.clone())),
+        ExprType::Node { type_name, .. } => Some((name.clone(), type_name.clone())),
         _ => None,
     })
 }
@@ -1648,16 +1648,6 @@ impl<'a> Shaper<'a> {
                     "result column `{column}` is not a column of the extended rows, which the type checker's final projection always reads"
                 )));
             };
-            // A node object has no null in this release's result types, and
-            // an `optional`'s name is null on a row it kept without a match.
-            if let Some(IRExpr::Variable(variable, ExprType::Node { .. })) = items.get(hidden)
-                && optional_names.contains(variable)
-            {
-                return Err(self.refuse_at(
-                    "a node an `optional` introduces returned whole (a nullable node object)",
-                    Construct::ReturnItem(i),
-                ));
-            }
             // The public result has a node object and no edge object: an
             // edge reference is read through its fields (`$k.@id`, `$k.@src`,
             // `$k.@dst`, `$k.@type`, its properties).
@@ -2670,9 +2660,7 @@ impl<'a> Shaper<'a> {
                     matched = Some(IRExpr::IsNull {
                         expr: Box::new(IRExpr::Variable(
                             marker.to_string(),
-                            ExprType::Node {
-                                type_name: type_name.to_string(),
-                            },
+                            ExprType::node(type_name.to_string()),
                         )),
                         negated: true,
                         ty: scalar(ScalarType::Bool),
@@ -3448,7 +3436,7 @@ impl<'a> Shaper<'a> {
                 if variable != column {
                     renames.insert(variable.clone(), column.clone());
                 }
-                if let ExprType::Node { type_name } = expr.ty() {
+                if let ExprType::Node { type_name, .. } = expr.ty() {
                     facts.types.insert(column.clone(), type_name.clone());
                 }
             }
@@ -3642,7 +3630,7 @@ impl<'a> Shaper<'a> {
                     ShapeError::Internal(format!("the population's column `{column}` has no value"))
                 })?
             };
-            if let ExprType::Node { type_name } = expr.ty() {
+            if let ExprType::Node { type_name, .. } = expr.ty() {
                 facts.types.insert(column.clone(), type_name.clone());
             }
             columns.push(IRProjection {
@@ -3670,9 +3658,7 @@ impl<'a> Shaper<'a> {
             (None, [k]) => {
                 let id = self.catalog.system_columns.id;
                 let mut order_by = vec![IROrdering::new(score.clone(), false)];
-                let target = ExprType::Node {
-                    type_name: type_name.clone(),
-                };
+                let target = ExprType::node(type_name.clone());
                 order_by.extend(
                     reference_identity(&ranking.column, &target, id)
                         .unwrap_or_default()
@@ -3781,9 +3767,7 @@ impl<'a> Shaper<'a> {
         };
         let values = self.shaped(format_args!("r{}", facts.inlined));
         facts.inlined += 1;
-        let target = ExprType::Node {
-            type_name: target_type.clone(),
-        };
+        let target = ExprType::node(target_type.clone());
         facts.types.insert(ranking.column.clone(), target_type);
         let score = IRExpr::PropAccess {
             variable: ranking.column.clone(),
@@ -4873,7 +4857,7 @@ fn reference_identity(variable: &str, ty: &ExprType, id: &str) -> Option<Vec<IRE
     };
     match ty {
         ExprType::Node { .. } => Some(vec![property(id)]),
-        ExprType::Edge { type_name } if type_name.contains('|') => {
+        ExprType::Edge { type_name, .. } if type_name.contains('|') => {
             Some(vec![property(EDGE_TYPE_COLUMN), property(id)])
         }
         ExprType::Edge { .. } => Some(vec![property(id)]),

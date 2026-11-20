@@ -171,7 +171,7 @@ pub fn validate_aggregate_specs(plan: &PhysicalPlan) -> Result<(), PlanError> {
                             ..
                         } => {
                             matches!((arg.as_ref(), &signature.arg),
-                                (IRExpr::Variable(binding, _), ExprType::Node { type_name })
+                                (IRExpr::Variable(binding, _), ExprType::Node { type_name, .. })
                                 if spec.binding.as_ref() == Some(binding) && spec.table.type_key.strip_prefix("node:") == Some(type_name.as_str()))
                         }
                         _ => false,

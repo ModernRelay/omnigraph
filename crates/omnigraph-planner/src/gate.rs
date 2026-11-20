@@ -1021,12 +1021,14 @@ mod tests {
                     "d".into(),
                     omnigraph_compiler::ExprType::Node {
                         type_name: "Doc".into(),
+                        nullable: false,
                     },
                 ),
                 alias: None,
                 column: "d".into(),
                 ty: omnigraph_compiler::ExprType::Node {
                     type_name: "Doc".into(),
+                    nullable: false,
                 },
             }],
             distinct: false,

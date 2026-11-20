@@ -899,7 +899,7 @@ pub(super) fn validate_plan_values(
                         )));
                     }
                 }
-                IRExpr::Variable(variable, ExprType::Node { type_name }) => {
+                IRExpr::Variable(variable, ExprType::Node { type_name, .. }) => {
                     if bindings.get(variable.as_str()).copied() != Some(type_name.as_str()) {
                         return Err(OmniError::manifest_internal(format!(
                             "node leaf {variable} type {type_name} disagrees with its binding owner"

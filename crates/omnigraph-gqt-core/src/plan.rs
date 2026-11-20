@@ -757,12 +757,17 @@ fn expression_type(text: &str) -> Option<String> {
         return Some(text.to_string());
     }
     // An edge reference, as `count($k)` reads it: `edge` and its selector's
-    // types.
-    if let Some(types) = text.strip_prefix("edge ") {
+    // types, `?` where an `optional` introduced it.
+    if let Some(types) = base.strip_prefix("edge ") {
         return types
             .split('|')
             .all(crate::shape::is_type_name)
             .then(|| text.to_string());
+    }
+    // A node reference an `optional` introduced.
+    if base != text && crate::shape::is_type_name(base) && crate::shape::parse_type(base).is_none()
+    {
+        return Some(text.to_string());
     }
     aggregate_type(text)
 }
@@ -858,7 +863,9 @@ pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Re
             for column in columns {
                 let parsed = crate::shape::parse_shape_body(&[(0, column)])?;
                 for field in parsed {
-                    if let crate::shape::ShapeType::Node(name) = field.shape_type
+                    if let crate::shape::ShapeType::Node {
+                        type_name: name, ..
+                    } = field.shape_type
                         && catalog.query_node_type(&name).is_none()
                     {
                         return Err(format!("expect plan: unknown node type `{name}`"));

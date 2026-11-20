@@ -112,16 +112,25 @@ impl Ty {
         out
     }
 
-    /// The expression type of a value of this type: a reference's
-    /// nullability is the column's, so the reference type carries none.
+    /// The expression type of a value of this type, its nullability
+    /// included: a reference an `optional` introduces is nullable outside
+    /// it.
     pub fn expr_type(&self) -> ExprType {
         match self {
             Self::Value(p) => ExprType::from_prop(p),
-            Self::Node { type_name, .. } => ExprType::Node {
+            Self::Node {
+                type_name,
+                nullable,
+            } => ExprType::Node {
                 type_name: type_name.clone(),
+                nullable: *nullable,
             },
-            Self::Edge { type_name, .. } => ExprType::Edge {
+            Self::Edge {
+                type_name,
+                nullable,
+            } => ExprType::Edge {
                 type_name: type_name.clone(),
+                nullable: *nullable,
             },
         }
     }

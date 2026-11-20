@@ -7508,23 +7508,18 @@ fn column_types(t: &Term) -> HashMap<String, ExprType> {
                 ..
             } => {
                 let mut own = Vec::new();
-                own.push((
-                    dst.clone(),
-                    ExprType::Node {
-                        type_name: dst_type.clone(),
-                    },
-                ));
+                own.push((dst.clone(), ExprType::node(dst_type.clone())));
                 if let Some(e) = edge_var {
                     own.push((
                         e.clone(),
-                        ExprType::Edge {
-                            type_name: edges
+                        ExprType::edge(
+                            edges
                                 .members()
                                 .iter()
                                 .map(|m| m.edge_type.as_str())
                                 .collect::<Vec<_>>()
                                 .join("|"),
-                        },
+                        ),
                     ));
                 }
                 over(column_types(input), listed(own))

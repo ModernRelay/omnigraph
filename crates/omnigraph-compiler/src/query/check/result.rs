@@ -37,12 +37,15 @@ pub fn projection_field(catalog: &Catalog, name: &str, ty: &ExprType) -> Result<
                 "internal exact integer cannot be a result column".into(),
             ));
         }
-        ExprType::Edge { type_name } => {
+        ExprType::Edge { type_name, .. } => {
             return Err(CompilerError::Plan(format!(
                 "edge reference `{type_name}` cannot be a result column"
             )));
         }
-        ExprType::Node { type_name } => {
+        ExprType::Node {
+            type_name,
+            nullable,
+        } => {
             let node_type = catalog.query_node_type(type_name).ok_or_else(|| {
                 CompilerError::typed(T51, format!("type `{}` not found in catalog", type_name))
             })?;
@@ -52,7 +55,7 @@ pub fn projection_field(catalog: &Catalog, name: &str, ty: &ExprType) -> Result<
                     Field::new(member, field.data_type().clone(), field.is_nullable())
                 })
                 .collect();
-            (DataType::Struct(fields.into()), false)
+            (DataType::Struct(fields.into()), *nullable)
         }
     };
     Ok(Field::new(name, data_type, nullable))
