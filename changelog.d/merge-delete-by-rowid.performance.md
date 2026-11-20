@@ -1,0 +1,1 @@
+- A branch merge that deletes rows now removes them by the row ids its walk already read, so its delete no longer scans the `id` column of fragments the `id` index does not cover.

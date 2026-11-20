@@ -1,0 +1,1 @@
+- A traversal reads each step's edges one batch at a time, so a read from a node with many edges no longer exceeds `query_memory_bytes` once the edge tables are indexed.

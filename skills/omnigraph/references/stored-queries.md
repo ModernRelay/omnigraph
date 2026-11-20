@@ -79,8 +79,9 @@ are omitted from JSON rows, and DateTime strings are UTC without a trailing
 - **`invoke_query`** is a per-graph Cedar action gating the whole stored-query invocation surface. Grant it like any other action (see [`server-policy.md`](server-policy.md)).
 - **Stored mutations are double-gated:** the caller needs `invoke_query` to reach the query **and** `change` for the write. An actor with `invoke_query` but not `change` gets `403` on a stored mutation.
 - **Deny == unknown:** for a caller *lacking* `invoke_query`, a denial and an unknown query name return the **same 404** (identical body) — the catalog can't be probed. A caller who *holds* `invoke_query` may still get a `403` from the inner gate for a query it can't `read`/`change`, so existence is visible to grant-holders by design.
-- **Default-deny mode** (bearer tokens, no policy bundle) permits only `read`,
-  so every `/graphs/{graph_id}/queries/{query_name}` call returns `404` until an
+- **Default-deny mode** (bearer tokens, no policy bundle) permits nothing
+  (`read` only under the server's `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`), so
+  every `/graphs/{graph_id}/queries/{query_name}` call returns `404` until an
   `invoke_query` rule is configured.
 
 ## MCP exposure

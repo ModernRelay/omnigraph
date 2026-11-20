@@ -238,7 +238,7 @@ last: String
 }
 
 #[test]
-fn test_reject_body_unique_containing_blob_property() {
+fn test_reject_body_unique_containing_blob_list_or_vector_property_issue_1305() {
     for (case, input, property) in [
         (
             "node-single",
@@ -291,10 +291,77 @@ payload: Blob?
             "{case}"
         );
     }
+
+    // Issue 1305: the body form must refuse list and vector members as the
+    // property-level shorthand does; the write path cannot enforce them.
+    for (case, input, refusal) in [
+        (
+            "node-list",
+            r#"
+node U {
+slug: String @key
+tags: [String]?
+@unique(tags)
+}
+"#,
+            "list property U.tags",
+        ),
+        (
+            "node-list-composite",
+            r#"
+node U {
+slug: String @key
+counts: [I64]?
+@unique(slug, counts)
+}
+"#,
+            "list property U.counts",
+        ),
+        (
+            "node-vector",
+            r#"
+node U {
+slug: String @key
+embedding: Vector(2)?
+@unique(embedding)
+}
+"#,
+            "vector property U.embedding",
+        ),
+        (
+            "edge-list-composite",
+            r#"
+node U { slug: String @key }
+edge Tags: U -> U {
+tags: [String]?
+@unique(@src, tags)
+}
+"#,
+            "list property Tags.tags",
+        ),
+        (
+            "edge-vector",
+            r#"
+node U { slug: String @key }
+edge Near: U -> U {
+embedding: Vector(2)
+@unique(embedding)
+}
+"#,
+            "vector property Near.embedding",
+        ),
+    ] {
+        let error = parse_schema_diagnostic(input).expect_err(case);
+        assert_eq!(
+            error.to_string(),
+            format!("parse error: @unique is not supported on {refusal}"),
+            "{case}"
+        );
+    }
 }
 
 #[test]
-fn test_persisted_contract_parser_allows_only_historical_body_blob_unique() {
+fn test_persisted_contract_parser_allows_only_historical_body_unique_issue_1305() {
     let historical_node = r#"
 node Document {
 payload: Blob?
@@ -308,7 +375,28 @@ payload: Blob?
 @unique(src, payload)
 }
 "#;
-    for historical in [historical_node, historical_edge] {
+    // Issue 1305: body-level `@unique` on a list or vector was admitted until
+    // admission refused it; graphs that already hold one must still open.
+    let historical_list = r#"
+node U {
+slug: String @key
+tags: [String]?
+@unique(tags)
+}
+"#;
+    let historical_vector = r#"
+node U { slug: String @key }
+edge Near: U -> U {
+embedding: Vector(2)?
+@unique(@src, embedding)
+}
+"#;
+    for historical in [
+        historical_node,
+        historical_edge,
+        historical_list,
+        historical_vector,
+    ] {
         assert!(parse_schema(historical).is_err());
         assert!(parse_persisted_schema_contract(historical).is_ok());
     }

@@ -1241,12 +1241,25 @@ fn validate_type_constraints(
                             type_name, col
                         ))
                     })?;
-                    if matches!(prop.prop_type.scalar, ScalarType::Blob)
-                        && mode == ConstraintValidationMode::Admission
-                    {
+                    // The write path enforces uniqueness on scalar values only.
+                    // Earlier releases admitted these members in the body form, so
+                    // a persisted contract keeps them and its graph still opens.
+                    if mode != ConstraintValidationMode::Admission {
+                        continue;
+                    }
+                    let refused = if prop.prop_type.list {
+                        Some("list")
+                    } else if matches!(prop.prop_type.scalar, ScalarType::Vector(_)) {
+                        Some("vector")
+                    } else if matches!(prop.prop_type.scalar, ScalarType::Blob) {
+                        Some("blob")
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = refused {
                         return Err(CompilerError::Parse(format!(
-                            "@unique is not supported on blob property {}.{}",
-                            type_name, col
+                            "@unique is not supported on {} property {}.{}",
+                            kind, type_name, col
                         )));
                     }
                 }

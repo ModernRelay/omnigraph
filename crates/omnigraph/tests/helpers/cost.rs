@@ -291,11 +291,9 @@ pub struct IoCounts {
     /// rows paired by stable row id, or the exact ordered merge.
     pub change_intervals_row_identity: u64,
     pub change_intervals_exact_merge: u64,
-    /// Incremental vs full merge-authority projection refreshes and the exact
-    /// number of physical manifest rows hydrated to classify DV additions.
+    /// Incremental vs full merge-authority projection refreshes.
     pub projection_incremental_refreshes: u64,
     pub projection_full_refreshes: u64,
-    pub projection_identity_rows: u64,
 }
 
 impl IoCounts {
@@ -591,7 +589,6 @@ struct OpProbes {
     change_intervals_exact_merge: Arc<AtomicU64>,
     projection_incremental_refreshes: Arc<AtomicU64>,
     projection_full_refreshes: Arc<AtomicU64>,
-    projection_identity_rows: Arc<AtomicU64>,
 }
 
 impl OpProbes {
@@ -622,7 +619,6 @@ impl OpProbes {
             change_intervals_exact_merge: Arc::new(AtomicU64::new(0)),
             projection_incremental_refreshes: Arc::new(AtomicU64::new(0)),
             projection_full_refreshes: Arc::new(AtomicU64::new(0)),
-            projection_identity_rows: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
@@ -642,7 +638,6 @@ impl OpProbes {
             change_intervals_exact_merge: Arc::clone(&h.change_intervals_exact_merge),
             projection_incremental_refreshes: Arc::clone(&h.projection_incremental_refreshes),
             projection_full_refreshes: Arc::clone(&h.projection_full_refreshes),
-            projection_identity_rows: Arc::clone(&h.projection_identity_rows),
             // graph_build_count / graph_edges_built unused by this harness.
             ..Default::default()
         };
@@ -697,7 +692,6 @@ impl OpProbes {
                 .projection_incremental_refreshes
                 .load(Ordering::Relaxed),
             projection_full_refreshes: self.projection_full_refreshes.load(Ordering::Relaxed),
-            projection_identity_rows: self.projection_identity_rows.load(Ordering::Relaxed),
         }
     }
 }
@@ -835,4 +829,49 @@ pub async fn s3_graph(name: &str) -> Option<omnigraph::Session> {
         .await
         .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 seed load failed");
     Some(db)
+}
+
+/// The store-agnostic body of the writer epoch cost gate, over two graphs of
+/// one history: an insert on a bound branch its process holds issues the
+/// requests of an insert on a branch nobody claimed, less the head probes it
+/// skips. Byte counts are left out, since a claimed branch's `__manifest`
+/// holds one more row.
+pub async fn assert_branch_claim_adds_no_request_to_a_write(
+    unclaimed: &omnigraph::Session,
+    held: &omnigraph::Session,
+) {
+    let requests = |io: &IoCounts| {
+        [
+            io.data_reads,
+            io.data_writes,
+            io.data_open_count,
+            io.manifest_reads,
+            io.manifest_writes,
+            io.manifest_scan_count,
+            io.internal_open_count,
+        ]
+    };
+    let mut writes = Vec::new();
+    for (db, claims) in [(unclaimed, false), (held, true)] {
+        if claims {
+            assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+        }
+        measure_insert(db, "claim_cost_warm").await;
+        writes.push(measure_insert(db, "claim_cost_measured").await);
+    }
+    let (plain, owned) = (&writes[0], &writes[1]);
+    eprintln!("write requests: unclaimed {plain:?}, held {owned:?}");
+    assert_eq!(
+        requests(owned),
+        requests(plain),
+        "a write on a held branch issues the requests of a write on an unclaimed one"
+    );
+    assert!(
+        plain.version_probes > 0,
+        "an unclaimed branch is probed: {plain:?}"
+    );
+    assert_eq!(
+        owned.version_probes, 0,
+        "a held bound branch is not probed: {owned:?}"
+    );
 }

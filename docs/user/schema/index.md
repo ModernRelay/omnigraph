@@ -105,8 +105,19 @@ and a stored floating-point bound as a decimal with the recorded value.
 Complete outstanding deployments containing affected schema source before
 upgrading the binary; deployment source validation uses the admission rules.
 
-`Blob`, list, and vector properties cannot be keys. Blob properties also cannot
-be unique or indexed.
+`Blob`, list, and vector properties cannot be keys or unique, in the
+property-level or the body form. Blob properties also cannot be indexed.
+
+Earlier releases admitted a body-level `@unique` on a list or vector property.
+A graph that already declares one still opens, but a write that gives the
+property a value is refused, and reapplying that source is refused at
+admission. In a cluster, every `cluster apply` of a deployment that contains
+such a graph is refused, even one that changes only another graph, query or
+policy, until the constraint is removed. To remove the constraint in place, drop every property it names in
+one schema change, then add the properties back without it; dropping a
+property discards its stored values. A constraint that also names another
+property or `@src`/`@dst` cannot be removed in place: rebuild the graph
+without it.
 
 Current automatic property indexes are created for single-property node declarations:
 orderable scalars and enums receive a scalar index, free-text Strings receive a
@@ -136,6 +147,13 @@ edges.
 Schema apply refuses a new edge type with a non-zero minimum whose source node
 type already exists (`OG-MF-107`): its existing nodes have none of the new
 edges. Declare such an edge with its source type, or without a minimum.
+
+Schema apply widens an existing edge type's range in place: lowering `min`, or
+raising or removing `max`, as in `@card(1..1)` to `@card(0..1)`, rewrites no
+data, because every stored count inside the old range is also inside the new
+one. The new range holds from the next write. Raising `min` or lowering `max`
+is refused, because the stored counts would need a check that apply does not
+make.
 
 Earlier Omnigraph versions did not count inserted source nodes, so a graph they
 wrote can hold nodes below the minimum. Each is counted the next time a write
@@ -243,7 +261,7 @@ same accepted source again leaves the graph unchanged.
 
 Changes such as adding a required property to existing entities (add it nullable,
 then promote it), changing a property
-type (except enum widening and making a property required), changing edge endpoints or cardinality, adding an
+type (except enum widening and making a property required), changing edge endpoints, raising an edge's `@card` minimum or lowering its maximum, adding an
 edge type with a non-zero `@card` minimum from an existing node type, changing a
 node's implemented interfaces, adding a constraint other than `@index` and a node's `@unique`,
 removing a constraint from a property that stays, and adding, removing or

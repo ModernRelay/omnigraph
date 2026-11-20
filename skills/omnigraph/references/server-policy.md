@@ -23,8 +23,10 @@ There is no single-graph server mode. On local and S3 roots a clean shutdown
 releases the server's cluster lock, and on S3 a restarted server takes over a
 crashed predecessor's lock through its lease. A local server that exited
 uncertainly, any Azure server, and every direct CLI writer on the cluster
-root (`cluster apply`, `load`, maintenance; a standalone graph takes no
-cluster lock) keep the lock: once that owner's writes have settled,
+root (`load`, maintenance, a `cluster apply` that fails or does not
+converge, and any `cluster apply` on Azure; a standalone graph takes no
+cluster lock) keep the lock: once that
+owner's writes have settled,
 clear it with `cluster force-unlock <LOCK_ID>` before the next start (see
 [cluster mode](cluster.md)).
 
@@ -106,8 +108,11 @@ omnigraph query get_person --target production --graph knowledge
 A server with no credential source (static tokens or signed-token trust) and no
 policy refuses to start unless explicitly
 given `--unauthenticated` (or `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only on a
-trusted development network. Tokens without a policy allow only `read`; other
-actions remain denied.
+trusted development network. A graph without a policy denies every action to
+every token, reads included, because tokens are not scoped to graphs; apply a
+policy to each graph. `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` in the server's
+environment lets every static token `read` every graph without a policy, as
+before.
 
 Managed signed data credentials are a separate token source, enabled with
 `--data-token-trust <file>`. The trust file binds keys to the exact deployment;
@@ -157,7 +162,10 @@ Graph-scoped actions are:
 | `change` | Mutations, loads, `load csv` (and its `explain` source probe), and Blob put/clear |
 | `schema_apply` | Schema changes: `cluster apply --target` needs it on each existing graph whose schema changes |
 | `branch_create`, `branch_delete`, `branch_merge` | Corresponding branch operation |
+| `branch_claim` | Claim of a branch's writer epoch; no CLI command or HTTP route claims in this release, only a program embedding the engine |
 | `commit_publish`, `commit_drop` | Publish or drop an unpublished commit; drop an unattached commit |
+| `maintain` | Optimize, index builds and the full-text rebuild; `change` admits none of them |
+| `reclaim` | Cleanup, which permanently removes unretained history |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved; no current public operation |
 
@@ -203,12 +211,12 @@ rules:
       actions: [invoke_query]
 ```
 
-`branch_scope` is valid only with `read`, `export`, and `change`;
+`branch_scope` is valid only with `read`, `export`, `change`, and `maintain`;
 `target_branch_scope` only with `branch_create`, `branch_delete`,
-`branch_merge`, `schema_apply`, `commit_publish`, and `commit_drop`. Any other pairing, or both scopes on one
+`branch_merge`, `branch_claim`, `schema_apply`, `commit_publish`, and `commit_drop`. Any other pairing, or both scopes on one
 rule, is refused. Values are `any`, `protected`, or `unprotected`, where
 protected branches are the bundle's top-level `protected_branches: [main, …]`
-list. `invoke_query`, `graph_list` and `config_manage` take no branch scope.
+list. `invoke_query`, `reclaim`, `graph_list` and `config_manage` take no branch scope.
 
 ```bash
 omnigraph policy validate --target ./company-data --graph knowledge
@@ -223,9 +231,11 @@ can update existing bundles and their bindings; the server drains affected
 requests before activating the new permissions. Current applied permissions
 authorize the deployment, so a newly granted administrator cannot authorize
 that grant.
-`--graph <id>` must match exactly one applied
-bundle; with both a graph bundle and a `cluster` bundle applied (as in the
-example above), the command refuses with "matches 2 policy bundles".
+Each action is answered by the bundle the server asks for it: a graph action
+by the bundle bound to `--graph <id>`, `graph_list` and `config_manage` by the
+bundle bound to `cluster`. `validate` checks both, each as its own kind, and
+`test` runs each case against its action's bundle. There is no fallback
+between the two: an action whose scope has no applied bundle is refused.
 
 ## Direct access is a separate trust boundary
 
@@ -233,11 +243,14 @@ Served requests always use the server's policy engine. Embedded engine hosts
 can also install a policy engine, and every mutating engine entry point then
 enforces it.
 
-The standalone CLI opening a direct `--target` does **not** load the
-cluster server's Cedar bundle. Its `--as` value records actor attribution but
-does not recreate server authorization. Protect raw graph storage with object
-store IAM/ACLs and restrict who can run direct maintenance. Served writes reject
-client-supplied actor identity because only the token may select it.
+A direct CLI write or maintenance command on a cluster graph (a root
+target with `--graph`, or the graph's own store) installs the policy the
+cluster applied to that graph, the one `omnigraph access` reports. It refuses
+an actor the policy does not admit, or no `--as`, with `forbidden` before any
+effect, as the server would. A standalone graph has no policy. The direct actor
+is self-declared, so this is not authentication: protect raw graph storage with
+object store IAM/ACLs. Served writes reject client-supplied actor identity
+because only the token may select it.
 
 Canonical contracts: [server operations](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/server.md)
 and [authorization](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/policy.md).

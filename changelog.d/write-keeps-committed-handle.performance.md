@@ -1,0 +1,1 @@
+- A write keeps the table versions it committed open for the next write or read on the same process, and a mutation checks the branch head's freshness beside its uploads, not under the write gates.

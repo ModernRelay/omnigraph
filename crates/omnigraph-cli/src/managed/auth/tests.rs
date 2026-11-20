@@ -735,8 +735,20 @@ async fn cached_login_does_not_restart_provider_authorization() {
         )
         .await
         .unwrap();
-        assert_eq!(output["data"]["principal_id"], "principal_one");
-        assert_eq!(output["data"]["refresh_expires_at"], deadline);
+        assert_eq!(output.body["data"]["principal_id"], "principal_one");
+        assert_eq!(output.body["data"]["refresh_expires_at"], deadline);
+        let before = store.0.borrow().clone();
+        let failure = crate::commands::targets::registration_save_error(
+            color_eyre::eyre::eyre!("config edit refused"),
+            output.created_session,
+            async {
+                renewal::logout(&store, &api.origin, Some("org_test")).await?;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(failure.to_string().contains("sign-in preserved"));
+        assert_eq!(*store.0.borrow(), before);
         assert!(provider.requests.lock().unwrap().is_empty());
         api.assert_complete();
     })
@@ -746,7 +758,10 @@ async fn cached_login_does_not_restart_provider_authorization() {
 #[tokio::test]
 #[ignore = "nightly: real 5 s device-flow poll intervals, 20 s in all"]
 async fn device_login_polls_the_provider_and_never_the_old_broker() {
-    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+    let api = IntentApiFixture::new(vec![
+        memberships(&[("org_test", Some("Test"))]),
+        metadata(120, "principal_one"),
+    ]);
     crate::operator_routing::test_transport_scope(&[&api.origin], async {
     let transport = MockTransport::with(vec![
         (
@@ -768,9 +783,12 @@ async fn device_login_polls_the_provider_and_never_the_old_broker() {
     )
     .await
     .unwrap();
-    assert_eq!(output["data"]["principal_id"], "principal_one");
+    assert_eq!(output.body["data"]["principal_id"], "principal_one");
+    assert!(output.created_session);
     assert_eq!(transport.requests.lock().unwrap().len(), 4);
-    assert_eq!(api.requests()[0].path, "/v1/auth/session");
+    // No organization was named: the sign-in's own is the person's only one.
+    assert_eq!(api.requests()[0].path, "/v1/organizations");
+    assert_eq!(api.requests()[1].path, "/v1/auth/session");
     api.assert_complete();
 }).await;
 }
@@ -863,8 +881,9 @@ async fn failed_login_custody_attempts_to_revoke_the_new_provider_session() {
         }
     }
     let api = IntentApiFixture::new(vec![
+        memberships(&[("org_test", Some("Test"))]),
         metadata(120, "principal_one"),
-        IntentReply::json(200, json!({"data":{"logged_out":true},"meta":{}})),
+        logged_out(),
     ]);
     crate::operator_routing::test_transport_scope(&[&api.origin], async {
     let transport = MockTransport::with(vec![
@@ -885,8 +904,8 @@ async fn failed_login_custody_attempts_to_revoke_the_new_provider_session() {
     .await
     .unwrap_err();
     assert_eq!(error.body["type"], "keychain_unavailable");
-    assert_eq!(api.requests()[1].path, "/v1/auth/logout");
-    assert!(api.requests()[1].headers["authorization"].starts_with("Bearer ey"));
+    assert_eq!(api.requests()[2].path, "/v1/auth/logout");
+    assert!(api.requests()[2].headers["authorization"].starts_with("Bearer ey"));
     api.assert_complete();
 }).await;
 }
@@ -1018,6 +1037,384 @@ async fn device_login_refuses_another_organization_before_saving_credentials() {
 }).await;
 }
 
+/// `GET /v1/organizations`: the person's active memberships, with the names
+/// the provider holds.
+fn memberships(organizations: &[(&str, Option<&str>)]) -> IntentReply {
+    IntentReply::json(
+        200,
+        json!({"data":{"organizations":organizations.iter().map(|(id, name)| json!({"organization_id":id,"name":name})).collect::<Vec<_>>()},"meta":{}}),
+    )
+}
+
+fn logged_out() -> IntentReply {
+    IntentReply::json(200, json!({"data":{"logged_out":true},"meta":{}}))
+}
+
+/// A login that names no organization keeps the sign-in's own only when it
+/// is the person's only one. With several it asks at a terminal, by number
+/// or ID, and exchanges the same session for the one chosen; with no one to
+/// ask, or no answer, it refuses with the organizations listed and revokes
+/// the sign-in it will not keep.
+#[tokio::test]
+async fn login_without_an_organization_never_takes_one_of_several_unasked() {
+    type Listed = &'static [(&'static str, Option<&'static str>)];
+    const ONE: Listed = &[("org_test", Some("Test Org"))];
+    const OTHER_ONLY: Listed = &[("org_other", None)];
+    const SEVERAL: Listed = &[("org_other", None), ("org_test", Some("Test Org"))];
+    // What is typed (`None`: no terminal), and the organization it settles on.
+    let cases: [(Listed, Option<&str>, Option<&str>); 10] = [
+        (&[], None, None),
+        (ONE, None, Some("org_test")),
+        (OTHER_ONLY, None, Some("org_other")),
+        (OTHER_ONLY, Some(""), Some("org_other")),
+        (SEVERAL, None, None),
+        (SEVERAL, Some("1\n"), Some("org_other")),
+        (SEVERAL, Some("org_test\n"), Some("org_test")),
+        (SEVERAL, Some("9\n\n  2 \n"), Some("org_test")),
+        (SEVERAL, Some("nine\n0\norg_none\n"), None),
+        (SEVERAL, Some(""), None),
+    ];
+    for (listed, typed, settled) in cases {
+        let exchanged = settled == Some("org_other");
+        let mut replies = vec![memberships(listed)];
+        replies.push(match settled {
+            Some(organization) => metadata_for(120, "principal_one", organization),
+            None => logged_out(),
+        });
+        let api = IntentApiFixture::new(replies);
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            let store = MemoryStore::default();
+            let selected = device_tokens(Some("org_other"), "fresh_session", "selected-refresh");
+            let transport = MockTransport::with(if exchanged {
+                vec![(200, selected.clone())]
+            } else {
+                vec![]
+            });
+            let mut typed_input = typed.map(str::as_bytes);
+            let choice = match &mut typed_input {
+                Some(input) => OrganizationChoice::Ask(input),
+                None => OrganizationChoice::Refuse,
+            };
+            let mut stderr = Vec::new();
+            let fresh = device_tokens(Some("org_test"), "fresh_session", "fresh-refresh");
+            let result = accept_device(
+                &store,
+                &api.origin,
+                config(),
+                &transport.provider(),
+                serde_json::from_value(fresh.clone()).unwrap(),
+                None,
+                choice,
+                &mut stderr,
+            )
+            .await;
+            let stderr = String::from_utf8(stderr).unwrap();
+            let requests = api.requests();
+            assert_eq!(requests[0].path, "/v1/organizations", "{typed:?}");
+            assert_eq!(
+                requests[0].headers["authorization"],
+                format!("Bearer {}", fresh["access_token"].as_str().unwrap())
+            );
+            match settled {
+                Some(organization) => {
+                    let body = result.unwrap();
+                    assert_eq!(body["data"]["account_id"], organization, "{typed:?}");
+                    assert!(
+                        renewal::load_selected(&store, &api.origin, Some(organization))
+                            .unwrap()
+                            .is_some()
+                    );
+                    assert_eq!(requests[1].path, "/v1/auth/session");
+                    // Another organization is the same session exchanged, not
+                    // a second sign-in.
+                    let provider = transport.requests.lock().unwrap();
+                    assert_eq!(provider.len(), usize::from(exchanged), "{typed:?}");
+                    if exchanged {
+                        let exchange: Value =
+                            serde_json::from_slice(provider[0].body.as_ref().unwrap()).unwrap();
+                        assert_eq!(exchange["refresh_token"], "fresh-refresh");
+                        assert_eq!(exchange["organization_id"], "org_other");
+                    }
+                }
+                None => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.body["type"], "organization_required", "{typed:?}");
+                    let detail = error.body["detail"].as_str().unwrap();
+                    if listed.is_empty() {
+                        assert!(
+                            detail.contains("no active organization membership"),
+                            "{detail}"
+                        );
+                    } else {
+                        for expected in ["--organization", "org_other", "org_test (Test Org)"] {
+                            assert!(detail.contains(expected), "{typed:?}: {detail}");
+                        }
+                        assert_eq!(
+                            error.body["organizations"],
+                            json!([
+                                {"organization_id": "org_other", "name": null},
+                                {"organization_id": "org_test", "name": "Test Org"}
+                            ])
+                        );
+                    }
+                    assert!(!error.body.to_string().contains("fresh-refresh"));
+                    assert!(store.0.borrow().is_empty(), "{typed:?}");
+                    assert!(transport.requests.lock().unwrap().is_empty());
+                    // The sign-in that is not kept is revoked with its own bearer.
+                    assert_eq!(requests[1].path, "/v1/auth/logout");
+                    assert_eq!(
+                        requests[1].headers["authorization"],
+                        requests[0].headers["authorization"]
+                    );
+                    if typed.is_none() && listed.len() > 1 {
+                        let expected = error.body.clone();
+                        let (mut out, mut err) = (Vec::new(), Vec::new());
+                        let exit = crate::app::complete_onboarding(
+                            Err(error.into()),
+                            true,
+                            &mut out,
+                            &mut err,
+                        )
+                        .unwrap();
+                        assert_eq!(exit.code(), 2);
+                        assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), expected);
+                        assert!(err.is_empty());
+                    }
+                }
+            }
+            assert_eq!(requests.len(), 2, "{typed:?}");
+            // Only a person at a terminal with several organizations is asked.
+            let asked = typed.is_some() && listed.len() > 1;
+            assert_eq!(
+                stderr.contains("You are an active member of several organizations"),
+                asked,
+                "{typed:?}: {stderr}"
+            );
+            if asked {
+                assert!(stderr.contains("  1. org_other\n"), "{stderr}");
+                assert!(
+                    stderr.contains("  2. org_test (Test Org)  · the one this sign-in opened\n"),
+                    "{stderr}"
+                );
+                assert!(!stderr.contains("fresh-refresh") && !stderr.contains(".signature"));
+            }
+            api.assert_complete();
+        })
+        .await;
+    }
+}
+
+/// A refusal says which check failed and whose fault it is. A fresh sign-in
+/// the provider issued for another issuer or client than the API publishes
+/// is `provider_response_invalid`, and signing in again cannot fix it; a
+/// saved session that no longer reads is `credential_invalid`. Each detail
+/// is a fixed text naming its check, and none carries token material.
+#[tokio::test]
+async fn a_refused_credential_names_the_check_that_failed() {
+    // What is wrong, and the refusal's code and a word of its detail.
+    for (defect, code, word) in [
+        ("issuer", "provider_response_invalid", "issuer"),
+        ("client", "provider_response_invalid", "another client"),
+        ("lifetime", "provider_response_invalid", "lifetime"),
+        ("user", "provider_response_invalid", "another user"),
+        ("saved_format", "credential_invalid", "format"),
+        ("saved_missing", "credential_invalid", "does not hold"),
+        ("saved_index", "credential_invalid", "index"),
+    ] {
+        let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            let store = MemoryStore::default();
+            cache_original_session(&store, &api.origin).await;
+            let saved_key = store
+                .0
+                .borrow()
+                .keys()
+                .find(|key| key.starts_with("credential:"))
+                .unwrap()
+                .clone();
+            let mut fresh = device_tokens(Some("org_test"), "fresh_session", "fresh-refresh");
+            match defect {
+                "issuer" => rewrite_claim(&mut fresh, "iss", json!("https://other.example")),
+                "client" => rewrite_claim(&mut fresh, "client_id", json!("client_other")),
+                "lifetime" => rewrite_claim(&mut fresh, "exp", json!(0)),
+                "user" => fresh["user"]["id"] = json!("user_other"),
+                "saved_format" => {
+                    store.0.borrow_mut().insert(saved_key, "{}".into());
+                }
+                "saved_missing" => {
+                    store.0.borrow_mut().remove(&saved_key);
+                }
+                "saved_index" => {
+                    store
+                        .0
+                        .borrow_mut()
+                        .insert(api.origin.clone(), r#"{"version":9,"sessions":{}}"#.into());
+                }
+                _ => unreachable!(),
+            }
+            let before = store.0.borrow().clone();
+            let transport = MockTransport::with(vec![]);
+            let error = accept_device(
+                &store,
+                &api.origin,
+                config(),
+                &transport.provider(),
+                serde_json::from_value(fresh).unwrap(),
+                Some("org_test"),
+                OrganizationChoice::Refuse,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.body["type"], code, "{defect}: {}", error.body);
+            let detail = error.body["detail"].as_str().unwrap();
+            assert!(detail.contains(word), "{defect}: {detail}");
+            assert!(
+                !error.body.to_string().contains("fresh-refresh"),
+                "{defect}"
+            );
+            assert!(!error.body.to_string().contains(".signature"), "{defect}");
+            assert_eq!(*store.0.borrow(), before, "{defect}");
+            assert!(transport.requests.lock().unwrap().is_empty(), "{defect}");
+            // Only the cached session's own verification reached the API.
+            assert_eq!(api.requests().len(), 1, "{defect}");
+        })
+        .await;
+    }
+}
+
+/// A sign-in that selected no organization, for a login that names none,
+/// refuses with what to pass: the API cannot be asked whose organizations
+/// there are without one, and nothing is saved or exchanged.
+#[tokio::test]
+async fn login_without_any_organization_says_to_name_one() {
+    let api = IntentApiFixture::new(vec![]);
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        let store = MemoryStore::default();
+        let transport = MockTransport::with(vec![]);
+        let error = accept_device(
+            &store,
+            &api.origin,
+            config(),
+            &transport.provider(),
+            serde_json::from_value(device_tokens(None, "fresh_session", "fresh-refresh")).unwrap(),
+            None,
+            OrganizationChoice::Ask(&mut "1\n".as_bytes()),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.body["type"], "organization_required");
+        assert!(
+            error.body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("--organization ORG_ID"),
+            "{}",
+            error.body
+        );
+        assert!(store.0.borrow().is_empty());
+        assert!(transport.requests.lock().unwrap().is_empty());
+        assert!(api.requests().is_empty());
+    })
+    .await;
+}
+
+/// An API that cannot list the person's organizations cannot make the
+/// sign-in's own the default, and one that fails keeps its own refusal.
+#[tokio::test]
+async fn login_without_an_organization_needs_the_api_to_list_them() {
+    for (status, kind, expected) in [
+        (404, "not_found", "organization_required"),
+        (
+            503,
+            "identity_provider_unavailable",
+            "identity_provider_unavailable",
+        ),
+    ] {
+        let api = IntentApiFixture::new(vec![
+            IntentReply::json(status, json!({"type":kind,"title":kind,"status":status})),
+            logged_out(),
+        ]);
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            let store = MemoryStore::default();
+            let transport = MockTransport::with(vec![]);
+            let error = accept_device(
+                &store,
+                &api.origin,
+                config(),
+                &transport.provider(),
+                serde_json::from_value(device_tokens(
+                    Some("org_test"),
+                    "fresh_session",
+                    "fresh-refresh",
+                ))
+                .unwrap(),
+                None,
+                OrganizationChoice::Refuse,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.body["type"], expected, "{status}");
+            assert!(store.0.borrow().is_empty());
+            assert!(transport.requests.lock().unwrap().is_empty());
+            let requests = api.requests();
+            assert_eq!(requests[0].path, "/v1/organizations");
+            assert_eq!(requests[1].path, "/v1/auth/logout");
+            api.assert_complete();
+        })
+        .await;
+    }
+}
+
+/// Tokens received before the prompt can expire while the user chooses.
+/// Refresh before verification if expired or within the verification margin.
+#[tokio::test]
+async fn a_fresh_token_about_to_expire_is_renewed_for_its_own_organization() {
+    for (seconds, renewed) in [(120, false), (20, true), (-10, true)] {
+        let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            let store = MemoryStore::default();
+            let mut fresh = tokens(seconds, "user_one");
+            fresh["refresh_token"] = json!("fresh-refresh");
+            rewrite_claim(&mut fresh, "sid", json!("fresh_session"));
+            let next = device_tokens(Some("org_test"), "fresh_session", "selected-refresh");
+            let transport = MockTransport::with(if renewed {
+                vec![(200, next.clone())]
+            } else {
+                vec![]
+            });
+            let tokens = serde_json::from_value(fresh.clone()).unwrap();
+            let received_at = OffsetDateTime::now_utc() - time::Duration::seconds(30);
+            let initial = renewal::device_claims(&config(), &tokens, received_at).unwrap();
+            let body = finish_device(
+                &store,
+                &api.origin,
+                config(),
+                &transport.provider(),
+                tokens,
+                initial,
+                "org_test",
+            )
+            .await
+            .unwrap();
+            assert_eq!(body["data"]["account_id"], "org_test");
+            assert_eq!(
+                transport.requests.lock().unwrap().len(),
+                usize::from(renewed)
+            );
+            let verified = if renewed { &next } else { &fresh };
+            assert_eq!(
+                api.requests()[0].headers["authorization"],
+                format!("Bearer {}", verified["access_token"].as_str().unwrap())
+            );
+            api.assert_complete();
+        })
+        .await;
+    }
+}
+
 fn rewrite_claim(tokens: &mut Value, field: &str, value: Value) {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     let parts: Vec<_> = tokens["access_token"]
@@ -1090,6 +1487,8 @@ async fn fresh_login_replaces_a_different_human_only_after_exact_confirmation() 
                         &transport.provider(),
                         serde_json::from_value(supplied).unwrap(),
                         Some("org_test"),
+                        OrganizationChoice::Refuse,
+                        &mut Vec::new(),
                     ),
                 )
                 .await;
@@ -1159,6 +1558,8 @@ async fn check_fresh_device_selection(wait_for_consent: bool) {
             serde_json::from_value(device_tokens(initial_org, "fresh_session", "fresh-refresh"))
                 .unwrap(),
             Some("org_other"),
+            OrganizationChoice::Refuse,
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -1223,6 +1624,8 @@ async fn fresh_device_selection_network_timeout_preserves_cached_custody_without
                 serde_json::from_value(device_tokens(None, "fresh_session", "fresh-refresh"))
                     .unwrap(),
                 Some("org_other"),
+                OrganizationChoice::Refuse,
+                &mut Vec::new(),
             ),
         )
         .await
@@ -1239,18 +1642,21 @@ async fn fresh_device_selection_network_timeout_preserves_cached_custody_without
 
 #[tokio::test]
 async fn fresh_device_selection_refuses_substitutions_without_changing_cached_custody() {
-    for change in [
-        "organization",
-        "user",
-        "subject",
-        "session",
-        "issuer",
-        "client",
-        "expiry",
-        "response_organization",
-        "provider_denial",
-        "uncertain_exchange",
-        "target_denial",
+    // Each substitution, and the refusal that names its kind: a response
+    // that does not fit the sign-in configuration is the provider's fault,
+    // never a saved credential's.
+    for (change, refusal) in [
+        ("organization", "organization_mismatch"),
+        ("user", "session_identity_mismatch"),
+        ("subject", "session_identity_mismatch"),
+        ("session", "session_identity_mismatch"),
+        ("issuer", "provider_response_invalid"),
+        ("client", "provider_response_invalid"),
+        ("expiry", "provider_response_invalid"),
+        ("response_organization", "session_identity_mismatch"),
+        ("provider_denial", "login_required"),
+        ("uncertain_exchange", "identity_provider_unavailable"),
+        ("target_denial", "unauthenticated"),
     ] {
         let mut responses = vec![metadata(120, "principal_one")];
         if change == "target_denial" {
@@ -1300,9 +1706,12 @@ async fn fresh_device_selection_refuses_substitutions_without_changing_cached_cu
                 ))
                 .unwrap(),
                 Some("org_other"),
+                OrganizationChoice::Refuse,
+                &mut Vec::new(),
             )
             .await
             .unwrap_err();
+            assert_eq!(error.body["type"], refusal, "{change}");
             assert!(
                 !error.body.to_string().contains("fresh-refresh"),
                 "{change}"
@@ -1329,9 +1738,75 @@ async fn fresh_device_selection_refuses_substitutions_without_changing_cached_cu
 }
 
 #[tokio::test]
+async fn queued_profile_registration_refuses_before_using_the_winners_session() {
+    let home = tempfile::tempdir().unwrap();
+    let input = crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None);
+    let api = IntentApiFixture::new(vec![]);
+    let race = crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        let owner =
+            crate::operator_routing::registration_auth(&input, "work", &api.origin).unwrap();
+        let first = crate::operator_routing::AUTH
+            .scope(Some(owner), coordination::lock(&api.origin))
+            .await
+            .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let second = crate::commands::targets::onboard(
+            &input,
+            "work",
+            &api.origin,
+            Some("org_test"),
+            OrganizationChoice::Refuse,
+            &mut stdout,
+            &mut stderr,
+        );
+        tokio::pin!(second);
+        assert!(
+            futures::poll!(&mut second).is_pending(),
+            "the second login must wait for the first"
+        );
+
+        let config = input.config_path().unwrap();
+        let winner = json!({
+            "version": 1,
+            "profiles": {"work": {
+                "api": api.origin,
+                "organization_id": "org_test",
+                "auth": {"provider":"omnigraph"}
+            }}
+        })
+        .to_string();
+        std::fs::write(&config, &winner).unwrap();
+        drop(first);
+        let refusal = second.await.unwrap_err();
+        assert!(
+            refusal.to_string().contains("profile already exists"),
+            "{refusal}"
+        );
+        assert_eq!(std::fs::read_to_string(config).unwrap(), winner);
+        api.assert_complete();
+    });
+    coordination::TEST_LOCK_DIRECTORY
+        .scope(home.path().join("locks"), race)
+        .await;
+}
+
+#[tokio::test]
 async fn fresh_device_cannot_select_or_revoke_an_existing_cached_session() {
-    for malformed in [false, true] {
-        let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+    // A second profile can claim the same session while the user is choosing.
+    struct InstallAtPrompt<'a>(&'a MemoryStore, HashMap<String, String>);
+    impl Read for InstallAtPrompt<'_> {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            self.0.0.replace(std::mem::take(&mut self.1));
+            Ok(0)
+        }
+    }
+    for (malformed, prompt) in [(false, false), (true, false), (false, true)] {
+        let mut replies = vec![metadata(120, "principal_one")];
+        if prompt {
+            replies.push(memberships(&[("org_other", None), ("org_test", None)]));
+        }
+        let api = IntentApiFixture::new(replies);
         crate::operator_routing::test_transport_scope(&[&api.origin], async {
             let store = MemoryStore::default();
             cache_original_session(&store, &api.origin).await;
@@ -1347,6 +1822,13 @@ async fn fresh_device_cannot_select_or_revoke_an_existing_cached_session() {
             }
             let before = store.0.borrow().clone();
             let transport = MockTransport::with(vec![]);
+            let mut answer = InstallAtPrompt(&store, before.clone()).chain("1\n".as_bytes());
+            let (organization, choice) = if prompt {
+                store.0.borrow_mut().clear();
+                (None, OrganizationChoice::Ask(&mut answer))
+            } else {
+                (Some("org_other"), OrganizationChoice::Refuse)
+            };
             let error = accept_device(
                 &store,
                 &api.origin,
@@ -1358,7 +1840,9 @@ async fn fresh_device_cannot_select_or_revoke_an_existing_cached_session() {
                     "fresh-refresh",
                 ))
                 .unwrap(),
-                Some("org_other"),
+                organization,
+                choice,
+                &mut Vec::new(),
             )
             .await
             .unwrap_err();
@@ -1372,7 +1856,7 @@ async fn fresh_device_cannot_select_or_revoke_an_existing_cached_session() {
             );
             assert_eq!(*store.0.borrow(), before);
             assert!(transport.requests.lock().unwrap().is_empty());
-            assert_eq!(api.requests().len(), 1);
+            assert_eq!(api.requests().len(), if prompt { 2 } else { 1 });
             api.assert_complete();
         })
         .await;
@@ -1411,6 +1895,8 @@ async fn selected_device_custody_failure_revokes_only_the_new_verified_session()
             &transport.provider(),
             serde_json::from_value(device_tokens(None, "fresh_session", "fresh-refresh")).unwrap(),
             Some("org_other"),
+            OrganizationChoice::Refuse,
+            &mut Vec::new(),
         )
         .await
         .unwrap_err();

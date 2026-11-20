@@ -563,3 +563,136 @@ async fn assert_merge_manifest_cost_is_flat_in_history(inactive_target: bool) {
         "merge data-table opens (delta-scoped validation, no per-merge catalog scan)",
     );
 }
+
+/// Issue #1295: a branch merge stages each delete chunk by the target-side
+/// `_rowid` the merge walk already read. Lance turns `_rowid IN (...)` into a
+/// take, so the delete reads no data column; `id IN (...)` searched the `id`
+/// BTREE and scanned the `id` column of every fragment it did not cover
+/// (measured in `lance_surface_guards::delete_chunk_reads_by_filter_form_issue_1295`).
+/// The merge's Delete transaction records the filter it ran. Both
+/// classifiers (the full walk and lineage) and `verify`, which compares their
+/// `(id, _rowid)` pairs, are covered.
+///
+/// All 64 rows start in one fragment. The source and the target each update
+/// rows next to the ones the source deletes, so the merge's update link
+/// rewrites rows of the fragment its delete link then takes from. The delete
+/// is correct only if each `_rowid` the target-side read returned still names
+/// the same live row after that rewrite (stable row ids).
+#[test]
+fn merge_delete_selects_rows_by_rowid_issue_1295() {
+    on_big_stack(|| async {
+        for lineage in ["off", "on", "verify"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = with_setting(&local_graph(&dir).await, "merge_lineage", lineage);
+            let rows = (0..64)
+                .map(|i| {
+                    format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"dv-{i}\",\"age\":20}}}}\n")
+                })
+                .collect::<String>();
+            db.load("main", &rows, omnigraph::loader::LoadMode::Append)
+                .await
+                .unwrap();
+            db.branch_create("feature").await.unwrap();
+            for name in ["dv-0", "dv-63"] {
+                db.mutate(
+                    "feature",
+                    MUTATION_QUERIES,
+                    "remove_person",
+                    &mixed_params(&[("$name", name)], &[]),
+                )
+                .await
+                .unwrap();
+            }
+            for name in ["dv-1", "dv-62"] {
+                db.mutate(
+                    "feature",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", name)], &[("$age", 21)]),
+                )
+                .await
+                .unwrap();
+            }
+            // The target also changes Person, so the merge replays the
+            // source's deletes onto it; an unchanged target table takes the
+            // source's table version by pointer and replays nothing.
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "dv-2")], &[("$age", 22)]),
+            )
+            .await
+            .unwrap();
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "target-only")], &[("$age", 42)]),
+            )
+            .await
+            .unwrap();
+            let before =
+                crate::helpers::open_pinned_dataset_for_test(db.db(), "main", "node:Person")
+                    .await
+                    .count_rows(None)
+                    .await
+                    .unwrap();
+
+            let probes = MergeWriteProbes::default();
+            let result =
+                with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
+                    .await
+                    .unwrap();
+            assert_eq!(result.outcome, MergeOutcome::Merged);
+            let (walks, lineages) = (
+                probes.completed_full_walk_classification_calls(),
+                probes.completed_lineage_classification_calls(),
+            );
+            assert_eq!(
+                (walks, lineages),
+                match lineage {
+                    "on" => (0, 1),
+                    "verify" => (1, 1),
+                    _ => (1, 0),
+                },
+                "merge_lineage = {lineage}"
+            );
+
+            let person =
+                crate::helpers::open_pinned_dataset_for_test(db.db(), "main", "node:Person").await;
+            let transaction = person.read_transaction().await.unwrap().unwrap();
+            let lance::dataset::transaction::Operation::Delete { predicate, .. } =
+                &transaction.operation
+            else {
+                panic!(
+                    "merge_lineage = {lineage}: the merge's last Person transaction is not its \
+                     delete: {:?}",
+                    transaction.operation
+                );
+            };
+            assert!(
+                predicate.starts_with("_rowid IN (") && !predicate.contains("dv-"),
+                "merge_lineage = {lineage}: the merge delete must take its rows by `_rowid`, \
+                 not search the `id` column; Lance recorded the filter `{predicate}`"
+            );
+            assert_eq!(person.count_rows(None).await.unwrap(), before - 2);
+            for (filter, expected) in [
+                ("name = 'dv-0'", 0),
+                ("name = 'dv-63'", 0),
+                ("name = 'dv-1' AND age = 21", 1),
+                ("name = 'dv-62' AND age = 21", 1),
+                ("name = 'dv-2' AND age = 22", 1),
+                ("name = 'dv-3' AND age = 20", 1),
+                ("name = 'target-only' AND age = 42", 1),
+                ("name IN ('dv-1', 'dv-2', 'dv-62')", 3),
+            ] {
+                assert_eq!(
+                    person.count_rows(Some(filter.to_string())).await.unwrap(),
+                    expected,
+                    "merge_lineage = {lineage}: rows where {filter}"
+                );
+            }
+        }
+    });
+}

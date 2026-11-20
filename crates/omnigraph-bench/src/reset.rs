@@ -186,7 +186,21 @@ pub fn verify_metadata_shape(
     expected: &MetadataDigest,
     limits: TraversalLimits,
 ) -> io::Result<MetadataDigest> {
-    let observed = digest_metadata_tree(root, limits)?;
+    verify_metadata_shape_skipping(root, expected, limits, None)
+}
+
+/// [`verify_metadata_shape`] with the top-level entry named `skip` left out
+/// of the observed shape: a clone root's reserved directory, which
+/// read-through storage writes when it is first built over the root, is the
+/// one entry the witness of an empty root does not hold.
+pub fn verify_metadata_shape_skipping(
+    root: &Path,
+    expected: &MetadataDigest,
+    limits: TraversalLimits,
+    skip: Option<&str>,
+) -> io::Result<MetadataDigest> {
+    let entries = inventory_skipping(root, limits, skip)?;
+    let observed = digest_metadata_inventory(root, &entries, limits)?;
     require_metadata(
         "fixture tree shape",
         expected,
@@ -706,6 +720,16 @@ fn stable_absolute_path(label: &str, path: &Path) -> io::Result<PathBuf> {
 }
 
 fn inventory(root: &Path, limits: TraversalLimits) -> io::Result<Vec<TreeEntry>> {
+    inventory_skipping(root, limits, None)
+}
+
+/// [`inventory`] without the top-level entry named `skip` and everything
+/// below it.
+fn inventory_skipping(
+    root: &Path,
+    limits: TraversalLimits,
+    skip: Option<&str>,
+) -> io::Result<Vec<TreeEntry>> {
     let root_metadata = fs::symlink_metadata(root).map_err(|error| {
         contextual(error, format!("inspecting fixture root {}", root.display()))
     })?;
@@ -740,6 +764,9 @@ fn inventory(root: &Path, limits: TraversalLimits) -> io::Result<Vec<TreeEntry>>
                     "fixture path is not valid UTF-8: {:?}",
                     child.path()
                 )));
+            }
+            if depth == 0 && skip.is_some_and(|skip| name.to_str() == Some(skip)) {
+                continue;
             }
 
             let child_depth = depth

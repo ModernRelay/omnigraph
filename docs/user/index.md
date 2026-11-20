@@ -34,6 +34,7 @@ deployment.
 - [Operator profiles, targets and credentials](cli/targets.md)
 - [Open Studio on a server target](cli/studio.md)
 - [Managed data credentials and queries](cli/managed-data.md)
+- [Sign in to a managed profile](cli/login.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [Managed organization members and invitations](cli/managed-team.md)
 - [HTTP server](operations/server.md)
@@ -49,6 +50,7 @@ deployment.
 - [Server logs and traces](operations/observability.md)
 - [Authorization and actors](operations/policy.md)
 - [Maintenance](operations/maintenance.md)
+- [Recorded operations](operations/recorded-operations.md): optimize through the serving owner, looked up by id
 - [S3 cluster roots](operations/s3-cluster-roots.md): deployment, recovery and maintenance with the server stopped
 - [Upgrade from 0.13 to 0.14](operations/upgrade-0.14.md): checklist, YAML and CLI replacements
 - [Storage-format upgrades](operations/upgrade.md)

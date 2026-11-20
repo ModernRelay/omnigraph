@@ -328,3 +328,42 @@ fn branch_start_at_a_commit_probes_once_per_pinned_object() {
         })
     });
 }
+
+/// A writer epoch claim is one `__manifest` publish that touches no data
+/// table, and the owner's repeat of it writes nothing.
+#[test]
+fn branch_claim_is_one_publish_and_the_owners_repeat_writes_nothing() {
+    on_big_stack(|| {
+        cost_harness(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db = local_graph(&dir).await;
+            let (insert, publish) = measure(db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "one-publish")], &[("$age", 30)]),
+            ))
+            .await;
+            insert.unwrap();
+            let (epoch, claim) = measure(db.claim_branch_writer("main")).await;
+            assert_eq!(epoch.unwrap(), 1);
+            let (again, repeat) = measure(db.claim_branch_writer("main")).await;
+            assert_eq!(again.unwrap(), 1);
+            eprintln!("claim {claim:?}\nrepeat {repeat:?}");
+            assert_eq!(
+                claim.manifest_writes, publish.manifest_writes,
+                "a claim puts what one publish puts"
+            );
+            assert_eq!(
+                (claim.data_reads, claim.data_writes, claim.data_open_count),
+                (0, 0, 0),
+                "a claim touches no data table"
+            );
+            assert_eq!(
+                (repeat.manifest_writes, repeat.data_writes),
+                (0, 0),
+                "the owner's claim writes nothing"
+            );
+        })
+    });
+}

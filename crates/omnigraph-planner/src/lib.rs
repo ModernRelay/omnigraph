@@ -94,7 +94,7 @@ pub use route::RouteOverride;
 pub use source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
     FragmentCoverage, FragmentStat, FullTextCoverage, IndexFact, IndexKind, IndexSplitFuture,
-    MemorySource, NodeTypeSpec, PlanSource, SideId,
+    MemorySource, NodeTypeSpec, PlanSource, SideId, btree_covers_column,
 };
 pub use validate::{
     AcceptInput, AcceptedBoundPlan, AcceptedPlan, Evidence, KeyIds, ReplayEnvelope, ReplayQuery,

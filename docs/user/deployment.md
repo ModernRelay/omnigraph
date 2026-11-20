@@ -5,7 +5,7 @@ storage, or Azure Blob Storage. The server always boots from one cluster root
 and exposes its ready applied graphs under `/graphs/{graph_id}/…`; use
 `--require-all-graphs` when any blocked graph must fail startup.
 
-Servers use the v0.14 HTTP contract and open graph storage formats v14 to v16. The
+Servers use the v0.14 HTTP contract and open graph storage formats v14 to v17. The
 cluster ledger has a separate version: explicitly converting it to v2 preserves
 graph data and history. Start with [Operating a cluster](clusters/index.md) to
 create and apply a deployment bundle.
@@ -238,7 +238,8 @@ export AWS_S3_FORCE_PATH_STYLE=true
 ```
 
 Set `AWS_ALLOW_HTTP=true` only for a trusted local development endpoint. Do not
-put credentials in `cluster.yaml` or graph URIs.
+put credentials in `cluster.yaml` or graph URIs. The store's requirements and
+encryption at rest are in [Storage](concepts/storage.md#s3-configuration).
 
 The same storage root must be visible to servers and out-of-band cluster or
 maintenance jobs. Submit schema/query changes and graph additions to the running
@@ -290,16 +291,16 @@ cluster, supported servers and direct CLI writers acquire the same exclusive
 cluster admission before writable graph work and recheck the applied inventory.
 CLI queries, exports, schema inspection/planning, lint and stored-query
 validation check the applied identity without acquiring or changing that lock;
-they refuse outstanding deployments or schema drift. Native maintenance,
-including `repair` preview, uses writer admission. An outstanding deployment
+they refuse outstanding deployments or schema drift. Native maintenance
+uses writer admission. An outstanding deployment
 admits only reconciliation of its exact original ID.
 Keep older binaries, raw storage tools and embedded writers outside this
 cooperating boundary stopped; the lock cannot fence their native storage I/O.
 
-Admission remains held after an ordinary direct write command succeeds or a
-deployment completes. A clean server shutdown follows the bounded release
-described above; ending work without that proof retains admission. A completed read-only
-preflight refusal during new deployment, conversion or admission construction
+Ordinary direct writes retain admission. A converged local or S3 direct `cluster apply` closes its storage scope
+and waits for accepted writes to settle before releasing admission. A clean server shutdown bounds that wait by its deadline.
+For an unconfirmed release, see [direct apply recovery](clusters/index.md#bootstrap-a-cluster). Writable Azure operations retain admission.
+A completed read-only preflight refusal during new deployment, conversion or admission construction
 releases its admission. Recovery of accepted work, cancellation and uncertain
 effects retain it. A finished response, zero active HTTP
 requests, lock age or a stopped PID alone does not prove that previously
@@ -327,7 +328,7 @@ Configure tokens from environment or a mounted secret file:
 
 - `OMNIGRAPH_SERVER_BEARER_TOKEN`
 - `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON`
-- `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE`
+- `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` (mode 600, or `defaultMode: 0400` for a Kubernetes secret volume; a file other accounts can write is refused)
 - `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` in the AWS-enabled build
 
 Policy bundles come from the applied cluster. See

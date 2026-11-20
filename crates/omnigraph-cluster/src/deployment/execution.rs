@@ -516,7 +516,7 @@ pub(super) fn empty_ledger() -> ClusterState {
 
 /// Initialize only an empty root; all graph effects then use the same v2
 /// deployment protocol as updates. Existing v1 state is never executed.
-async fn bootstrap_ledger(
+pub(super) async fn bootstrap_ledger(
     store: &ClusterStore,
     bundle: &DeploymentBundle,
     caller: &DeploymentCaller,
@@ -570,10 +570,8 @@ async fn bootstrap_ledger(
         .await
         .map_err(|error| retained_error(error, guard.lock_id()))?;
     // Only awaited control writes happened. No graph/native operation started.
-    store
-        .release_settled(guard.lock_id())
-        .await
-        .map_err(|error| retained_error(error, guard.lock_id()))
+    // A failed release states its own outcome; the lock may already be free.
+    store.release_settled(guard.lock_id()).await
 }
 
 async fn replace(
@@ -1677,6 +1675,9 @@ async fn apply_direct_bundle(
             return Ok(found);
         }
     }
+    // Every control and graph write of this deployment runs in one storage
+    // scope, so a converged result can prove them settled before release.
+    let store = store.with_io_scope(omnigraph_storage::StorageIoScope::new())?;
     let admission = admission::acquire_with_store(&store, ClusterAdmissionPurpose::Deployment)
         .await?
         .ok_or_else(|| refusal("state_missing", "cluster ledger is missing"))?;
@@ -1701,7 +1702,33 @@ async fn apply_direct_bundle(
             }
         };
     }
-    result
+    // A writable deployment can hand the root to a successor only after
+    // convergence on a backend with tracked I/O. Azure retains admission.
+    match result {
+        Ok(DeploymentLookup::Complete { result })
+            if result.converged && admission.io_scope().is_some() =>
+        {
+            release_converged_deployment(admission, &result.id).await?;
+            Ok(DeploymentLookup::Complete { result })
+        }
+        other => other,
+    }
+}
+
+pub(super) async fn release_converged_deployment(
+    admission: ClusterAdmission,
+    deployment_id: &str,
+) -> Result<(), Diagnostic> {
+    admission
+        .release_after_settlement()
+        .await
+        .map_err(|mut error| {
+            error.message = bounded_message(format!(
+                "deployment {deployment_id} converged; {}",
+                error.message
+            ));
+            error
+        })
 }
 
 /// Execute under the existing sole writer. The server supplies its paused live
@@ -1959,8 +1986,7 @@ pub(super) async fn execute_captured_deployment_in_store(
         cas = replace(store, &mut state, &cas).await?;
     }
     let result = finish(store, &mut state, &cas, bundle).await?;
-    // Exact publication is not a proof that all accepted native/control I/O
-    // has stopped. Retain admission until explicit operator quiescence/unlock.
+    // Admission still belongs to the caller, who owns storage settlement.
     Ok(DeploymentLookup::Complete { result })
 }
 
@@ -2138,7 +2164,13 @@ async fn prepare_graphs(
         let prior = store
             .read_payload(&kind, &resource.digest)
             .await
-            .map_err(|error| refusal("resource_payload_read_error", error))?;
+            .map_err(|error| {
+                refusal(
+                    "resource_payload_read_error",
+                    format!("could not read the catalog payload of {address}: {error}"),
+                )
+                .with_storage_failure(&error)
+            })?;
         let invalid = prior
             .as_ref()
             .is_some_and(|source| sha256_hex(source.as_bytes()) != resource.digest)
@@ -2318,11 +2350,64 @@ fn authorize_graph_deletion(
         let actor = caller.actor().ok_or_else(|| {
             refusal(
                 "policy_denied",
-                "graph deletion requires an actor when policy is installed",
+                format!(
+                    "deleting graph '{graph}' runs under its applied policy and needs an actor; \
+                     pass --as with an actor that policy permits read and schema_apply"
+                ),
             )
         })?;
         policy.check_graph(actor, graph, PolicyAction::Read)?;
         policy.check_graph(actor, graph, PolicyAction::SchemaApply)?;
+    }
+    Ok(())
+}
+
+/// Who may recover each graph of an outstanding deployment: the one decision
+/// recovery makes, before admission so a refusal takes no lock and changes
+/// nothing, and again under admission against the re-read policy. A deletion
+/// needs what forward deletion needs. Settling a started schema change acts as
+/// the caller: an identity needs `read` and `schema_apply`, and a storage owner
+/// on a graph with an applied policy needs an actor that policy permits
+/// `schema_apply` on `main`, the check the engine makes when it settles. Other
+/// work runs no graph action as the caller. The engine keeps its own gate.
+/// The check under admission can refuse only if the outstanding record changed
+/// after the first check (a changed policy is refused first, as
+/// `deployment_base_changed`). That refusal keeps the lock, as every recovery
+/// exit after admission does.
+fn authorize_recovery(
+    policy: &AppliedPolicies,
+    caller: &DeploymentCaller,
+    pending: &OutstandingDeployment,
+) -> Result<(), Diagnostic> {
+    for (graph, entry) in &pending.graphs {
+        if entry.delete.is_some() {
+            authorize_graph_deletion(policy, caller, graph)?;
+            continue;
+        }
+        if !matches!(entry.state, GraphDeploymentState::Started) || entry.create.is_some() {
+            continue;
+        }
+        match caller {
+            DeploymentCaller::AuthenticatedIdentity(identity) => {
+                policy.check_graph(identity.actor(), graph, PolicyAction::Read)?;
+                policy.check_graph(identity.actor(), graph, PolicyAction::SchemaApply)?;
+            }
+            DeploymentCaller::StorageOwner { actor } => {
+                if policy.graph(graph).is_none() {
+                    continue;
+                }
+                let actor = actor.as_deref().ok_or_else(|| {
+                    refusal(
+                        "policy_denied",
+                        format!(
+                            "recovering graph '{graph}' runs under its applied policy and needs \
+                             an actor; pass --as with an actor that policy permits schema_apply"
+                        ),
+                    )
+                })?;
+                policy.check_graph(actor, graph, PolicyAction::SchemaApply)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2343,11 +2428,175 @@ async fn complete_graph_deletion(
         &BTreeMap::from([(graph.to_owned(), delete.contract.clone())]),
         &delete.root,
     )?;
+    // Nothing can settle the graph's recorded operations once its history is
+    // gone, so the deletion settles them itself: by the history rule while
+    // the root still answers, and as `graph_deleted` once its absence is
+    // verified. A resume that finds the root already absent takes the second
+    // step alone.
+    settle_graph_operations(
+        store,
+        admission,
+        graph,
+        &delete.contract.schema_identity_domain,
+        true,
+    )
+    .await
+    .map_err(|error| retained_error(error, admission.lock_id()))?;
     store
         .delete_managed_graph_root(graph, &delete.root)
         .await
-        .map_err(|error| retained_error(error, admission.lock_id()))
+        .map_err(|error| retained_error(error, admission.lock_id()))?;
+    settle_graph_operations(
+        store,
+        admission,
+        graph,
+        &delete.contract.schema_identity_domain,
+        false,
+    )
+    .await
+    .map_err(|error| retained_error(error, admission.lock_id()))
 }
+
+/// The recorded operations of the graph lifetime being deleted. With the
+/// root readable, every non-terminal record of the lifetime leaves the active
+/// slot and its publication is judged by the settlement branch's history, the
+/// walk run to its end; once the root is verifiably absent, every record still
+/// non-terminal becomes `unsettled` with reason `graph_deleted`. One
+/// conditional write under the record's gate when anything changed. A record
+/// the server already refuses (unreadable, or naming another ledger) is
+/// logged and left alone: it gates admission, never the deletion.
+async fn settle_graph_operations(
+    store: &ClusterStore,
+    admission: &ClusterAdmission,
+    graph: &str,
+    schema_identity_domain: &str,
+    root_readable: bool,
+) -> Result<(), Diagnostic> {
+    // The history walks read only, from the record as it stands with the
+    // lifetime's active records released; the gate is taken afterwards and
+    // each answer applied only where the record's cursor is still the one the
+    // walk started from, so no writer waits for a walk.
+    let record = match admission.peek_operations().await {
+        Ok(Some((record, _))) => record,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            tracing::warn!(graph, error = %error.message, "graph deletion leaves an unreadable operation record alone");
+            return Ok(());
+        }
+    };
+    if record
+        .non_terminal_of(graph, schema_identity_domain)
+        .is_empty()
+        && (root_readable || !record.kind_state.optimize.contains_key(graph))
+    {
+        return Ok(());
+    }
+    let mut resolutions = Vec::new();
+    if root_readable {
+        let mut released = record.clone();
+        released.orphan_lifetime(graph, schema_identity_domain);
+        let uri = store.graph_root(graph);
+        let opened = match store.graph_storage(&uri) {
+            Ok(storage) => Omnigraph::open_read_only_with_storage(&uri, storage)
+                .await
+                .ok(),
+            Err(_) => None,
+        };
+        if let Some(db) = opened {
+            for operation in released.non_terminal_of(graph, schema_identity_domain) {
+                let (Some(nonce), Some(input_version)) =
+                    (&operation.nonce, operation.input_manifest_version)
+                else {
+                    continue;
+                };
+                let started_at = operation.resolution.clone();
+                let mut cursor = started_at
+                    .as_ref()
+                    .and_then(|progress| progress.cursor.clone());
+                let resolution = loop {
+                    match db
+                        .resolve_publication(
+                            Some(&operation.settlement_branch),
+                            nonce,
+                            operation.input_commit.as_deref(),
+                            input_version,
+                            cursor.as_deref(),
+                            DELETION_RESOLUTION_WALK_LIMIT,
+                        )
+                        .await
+                    {
+                        Ok(omnigraph::db::PublicationLookup::Walking { next, .. }) => {
+                            cursor = Some(next);
+                        }
+                        Ok(omnigraph::db::PublicationLookup::Committed { commit_id }) => {
+                            break crate::Resolution::Committed {
+                                published_commit: commit_id,
+                            };
+                        }
+                        Ok(omnigraph::db::PublicationLookup::NotCommitted) => {
+                            break crate::Resolution::NotCommitted;
+                        }
+                        Ok(omnigraph::db::PublicationLookup::HeadUnchanged) => {
+                            break crate::Resolution::InDoubt {
+                                reason: "the graph head is still the input head at its deletion"
+                                    .to_string(),
+                            };
+                        }
+                        Ok(omnigraph::db::PublicationLookup::Unproven { reason }) => {
+                            break crate::Resolution::InDoubt { reason };
+                        }
+                        Ok(other) => {
+                            break crate::Resolution::InDoubt {
+                                reason: format!("{other:?}"),
+                            };
+                        }
+                        Err(error) => {
+                            break crate::Resolution::InDoubt {
+                                reason: format!(
+                                    "reading the history of {}: {error}",
+                                    operation.settlement_branch
+                                ),
+                            };
+                        }
+                    }
+                };
+                resolutions.push((operation.operation_id.clone(), started_at, resolution));
+            }
+        }
+    }
+    let lock = admission.lock_operations().await;
+    let outcome =
+        admission
+            .update_operations(&lock, |record| {
+                let mut changed = false;
+                if root_readable {
+                    changed |= record.orphan_lifetime(graph, schema_identity_domain);
+                    for (operation_id, started_at, resolution) in resolutions {
+                        if record.unresolved.iter().any(|op| {
+                            op.operation_id == operation_id && op.resolution == started_at
+                        }) {
+                            changed |= record.settle(&operation_id, resolution);
+                        }
+                    }
+                } else {
+                    changed |= record.settle_graph_deleted(graph, schema_identity_domain);
+                }
+                Ok((changed, ()))
+            })
+            .await;
+    match outcome {
+        Ok(_) => Ok(()),
+        Err(error) if error.code == "operation_record_foreign" => {
+            tracing::warn!(graph, error = %error.message, "graph deletion leaves a foreign operation record alone");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Commits one page of a deletion's resolution walk reads; the walk runs to
+/// its end, so the page size bounds memory, not the walk.
+const DELETION_RESOLUTION_WALK_LIMIT: usize = 256;
 
 async fn install_catalog_payloads(
     store: &ClusterStore,
@@ -2722,7 +2971,7 @@ async fn reconcile_deployment_in_store(
 ) -> Result<DeploymentLookup, Diagnostic> {
     let (before, _) = read_existing(&store).await?;
     require_v2(&before)?;
-    lookup_policies(&store, &before, caller, Some(id)).await?;
+    let preflight_policy = lookup_policies(&store, &before, caller, Some(id)).await?;
     let existing = lookup(&before, id)?;
     if !matches!(existing, DeploymentLookup::Outstanding { .. }) {
         return Ok(existing);
@@ -2732,6 +2981,9 @@ async fn reconcile_deployment_in_store(
             "writers_stopped_required",
             "recovery requires --writers-stopped and settled prior graph/control I/O",
         ));
+    }
+    if let Some(pending) = before.outstanding.as_ref() {
+        authorize_recovery(&preflight_policy, caller, pending)?;
     }
     let admission = admission::acquire_with_store(
         &store,
@@ -2761,13 +3013,13 @@ async fn reconcile_deployment_in_store(
             "outstanding achieved authority changed",
         ));
     }
+    authorize_recovery(&policy, caller, &pending)?;
     let bundle = store.read_deployment_bundle(&pending.input_digest).await?;
     validate_bundle(&bundle, admission.canonical_root())?;
     validate_pending_input(&state, &pending, &bundle)?;
     install_catalog_payloads(&store, &state, &bundle).await?;
     for (graph, entry) in pending.graphs {
         let result = if let Some(delete) = &entry.delete {
-            authorize_graph_deletion(&policy, caller, &graph)?;
             if matches!(entry.state, GraphDeploymentState::Settled { .. }) {
                 continue;
             }
@@ -2908,10 +3160,6 @@ async fn reconcile_deployment_in_store(
                             "query-only work cannot carry started graph effects",
                         )
                     })?;
-                    if let DeploymentCaller::AuthenticatedIdentity(identity) = caller {
-                        policy.check_graph(identity.actor(), &graph, PolicyAction::Read)?;
-                        policy.check_graph(identity.actor(), &graph, PolicyAction::SchemaApply)?;
-                    }
                     admission
                         .validate_graph_uri(&store.graph_root(&graph))
                         .await?;

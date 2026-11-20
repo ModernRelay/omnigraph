@@ -1,1 +1,1 @@
-- macOS stable and edge binaries use Developer ID signatures and Apple notarization. A fixed CLI identity lets Keychain recognize updates; older ad hoc builds may need one authorization.
+- macOS release binaries are Developer ID signed; Apple notarization can finish after publication. A fixed CLI identity lets Keychain recognize updates; older ad hoc builds may need one authorization.

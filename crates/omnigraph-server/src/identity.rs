@@ -198,6 +198,9 @@ impl ResolvedActor {
 pub struct AuthenticatedActor {
     actor: ResolvedActor,
     data_token: Option<VerifiedDataToken>,
+    /// A static credential the server lets `read` a graph with no applied
+    /// policy (`OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY`); never a signed one.
+    policy_less_reads: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +229,7 @@ impl AuthenticatedActor {
             data_token: Some(VerifiedDataToken::Oidc {
                 client_id: Arc::from(claims.client_id),
             }),
+            policy_less_reads: false,
         }
     }
 
@@ -241,7 +245,21 @@ impl AuthenticatedActor {
         Self {
             actor: ResolvedActor::cluster_static(actor_id),
             data_token: None,
+            policy_less_reads: false,
         }
+    }
+
+    /// Let this static credential `read` a graph with no applied policy, as
+    /// the server's `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY` opt-in says. A
+    /// signed credential never gets it.
+    pub(crate) fn with_policy_less_reads(mut self, allow: bool) -> Self {
+        self.policy_less_reads = allow && self.data_token.is_none();
+        self
+    }
+
+    /// Whether this credential may `read` a graph with no applied policy.
+    pub(crate) fn reads_without_policy(&self) -> bool {
+        self.policy_less_reads
     }
 
     pub(crate) fn signed_identity(claims: crate::data_tokens::IdentityTokenClaims) -> Self {
@@ -253,6 +271,7 @@ impl AuthenticatedActor {
                 source: AuthSource::SignedData,
             },
             data_token: Some(VerifiedDataToken::Identity(Arc::new(claims))),
+            policy_less_reads: false,
         }
     }
 

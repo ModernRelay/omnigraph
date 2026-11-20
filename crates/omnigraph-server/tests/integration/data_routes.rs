@@ -3269,6 +3269,29 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
             Some((1, 11)),
             "{path}"
         );
+
+        // A source nested past the bound is refused before the grammar
+        // recurses over it; parsed, it would exhaust the worker's stack and
+        // abort the server for every caller.
+        let deep = format!(
+            "query q() {{ match {{ $p: Person {}$p.age > 1{} }} return {{ $p.name }} }}",
+            "(".repeat(100_000),
+            ")".repeat(100_000)
+        );
+        let chain = format!(
+            "query q() {{ match {{ $p: Person {} }} return {{ $p.name }} }}",
+            vec!["$p.age > 1"; 50_000].join(" or ")
+        );
+        for source in [deep, chain] {
+            let body = json!({field: source, "branch": "main"});
+            let (status, out) = json_response(&app, send(path, token, body, expected_head)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
+            let error: ErrorOutput = serde_json::from_value(out).unwrap();
+            let diagnostic = error
+                .diagnostic
+                .expect("a refused query carries its diagnostic");
+            assert_eq!(diagnostic.code, "Q006", "{path}");
+        }
     }
 }
 
@@ -3897,6 +3920,77 @@ fn assert_settings_refusal(status: StatusCode, body: &Value, error: &str) {
 
 /// A refusal whose sentence the settings definition owns: the 400 and the
 /// claim, never the whole message, which the definition's own tests pin.
+/// A served request may lower a resource budget, or raise it back to the
+/// built-in default, but not past the server's ceiling: the larger of the two.
+/// The operator raises the ceiling through the environment.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_budgets_stop_at_the_server_ceiling() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let read = |source: String, settings: Value| {
+        json_post("/query", &json!({"query": source, "settings": settings}))
+    };
+    for (setting, above) in [
+        ("traversal_work_limit", "9223372036854775807"),
+        ("query_memory_bytes", "1099511627776"),
+        ("write_max_bytes", "1099511627776"),
+        ("load_source_max_bytes", "1099511627776"),
+    ] {
+        let (status, body) = json_response(
+            &app,
+            read(
+                format!("set {setting} = {above}; show {setting};"),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_settings_refusal_needle(status, &body, "ceiling");
+        let (status, body) = json_response(
+            &app,
+            read(
+                format!("show {setting};"),
+                json!({setting: above.parse::<u64>().unwrap()}),
+            ),
+        )
+        .await;
+        assert_settings_refusal_needle(status, &body, "ceiling");
+        let (status, body) = json_response(
+            &app,
+            read(format!("set {setting} = 1024; show {setting};"), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{setting} lowered: {body}");
+    }
+
+    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
+        (variable == "OMNIGRAPH_TRAVERSAL_WORK_LIMIT").then(|| "5000000".to_string())
+    })
+    .unwrap();
+    let (_temp, raised) =
+        app_for_loaded_graph_with_process_defaults(ProcessDefaults { settings, sources }).await;
+    let (status, body) = json_response(
+        &raised,
+        read(
+            "set traversal_work_limit = 5000000; show traversal_work_limit;".to_string(),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "up to an operator-raised value: {body}"
+    );
+    let (status, body) = json_response(
+        &raised,
+        read(
+            "set traversal_work_limit = 5000001; show traversal_work_limit;".to_string(),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_settings_refusal_needle(status, &body, "OMNIGRAPH_TRAVERSAL_WORK_LIMIT");
+}
+
 fn assert_settings_refusal_needle(status: StatusCode, body: &Value, needle: &str) {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["code"], "bad_request", "{body}");
@@ -6819,10 +6913,10 @@ async fn removed_id_memory_refusals_keep_graph_and_admission_usable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() {
-    // Strict read-modify-write attempts are never automatically reprepared.
-    // Exactly one concurrent UPDATE commits; once it changes branch authority,
-    // every waiter reports a typed 409 before any of its Lance effects begin.
+async fn change_concurrent_updates_same_key_all_commit_by_rerunning_issue_1331() {
+    // A strict update overtaken before its effects reruns on the new head
+    // under the writer gates, as every write does, so concurrent updates of
+    // one row all commit, one after another, and none returns a 409.
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let state = AppState::open(graph.to_string_lossy().to_string())
@@ -6864,70 +6958,30 @@ async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() 
     for h in handles {
         results.push(h.await.unwrap());
     }
-    let statuses: Vec<StatusCode> = results.iter().map(|(s, _)| *s).collect();
-
-    let ok_count = statuses.iter().filter(|s| **s == StatusCode::OK).count();
-    let conflict_count = statuses
-        .iter()
-        .filter(|s| **s == StatusCode::CONFLICT)
-        .count();
-    let other: Vec<_> = statuses
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| **s != StatusCode::OK && **s != StatusCode::CONFLICT)
-        .collect();
-
-    let other_bodies: Vec<(usize, StatusCode, String)> = other
-        .iter()
-        .map(|(i, s)| {
-            let body_str = String::from_utf8_lossy(&results[*i].1).to_string();
-            (*i, **s, body_str)
-        })
-        .collect();
-    assert!(
-        other.is_empty(),
-        "expected only 200 or 409 statuses, got non-200/409 entries: {:?}",
-        other_bodies
-    );
-    assert_eq!(
-        ok_count + conflict_count,
-        N,
-        "all responses must be 200 or 409 to satisfy the RYW invariant; statuses: {:?}",
-        statuses
-    );
-    assert_eq!(
-        ok_count,
-        1,
-        "expected exactly one update to commit and N-1 to receive typed 409 conflicts \
-         before effects. Got {} OK + {} 409 + {} other. Statuses: {:?}",
-        ok_count,
-        conflict_count,
-        statuses.len() - ok_count - conflict_count,
-        statuses,
-    );
-
     for (status, bytes) in &results {
-        if *status != StatusCode::CONFLICT {
-            continue;
-        }
-        let error: ErrorOutput = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
-        let conflict = error
-            .read_set_conflict
-            .expect("strict OCC loser must include structured read-set authority");
-        assert!(
-            matches!(
-                conflict.member.as_str(),
-                "graph_head:main" | "published_dataset_version:node:Person"
-            ),
-            "a strict loser is refused by the branch head, or by the table pin when it \
-             revalidates between the winner's detached table commit and its publish; got {}",
-            conflict.member
+        assert_eq!(
+            *status,
+            StatusCode::OK,
+            "every overtaken update reruns and commits: {}",
+            String::from_utf8_lossy(bytes)
         );
-        assert_ne!(conflict.actual, conflict.expected);
-        assert!(error.published_dataset_version_conflict.is_none());
-        assert!(error.recovery_required.is_none());
     }
+    let (status, rows) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": FIND_PERSON_GQ, "params": {"name": "Alice"}, "branch": "main"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    let alice_age = rows["rows"][0]["p.age"]
+        .as_i64()
+        .expect("Alice is still there");
+    assert!(
+        (100..100 + N as i64).contains(&alice_age),
+        "Alice holds one of the updates' ages, got {alice_age}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

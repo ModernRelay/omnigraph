@@ -90,13 +90,6 @@ pub(crate) fn remote_url(base: &str, segments: &[&str], query: &[(&str, &str)]) 
     Ok(url.to_string())
 }
 
-#[cfg(test)]
-pub(crate) fn normalize_bearer_token(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 /// The Cedar resource id for a graph selection: the explicit graph name when one
 /// is given, else the normalized URI (the anonymous fallback). Used by the
 /// `policy` tooling to address a graph's bundle.
@@ -320,6 +313,34 @@ impl std::fmt::Display for CodedRefusal {
 }
 
 impl std::error::Error for CodedRefusal {}
+
+/// A reply that contradicts the request it answers, such as a merge receipt
+/// for another branch or a dry-run answer that says the server did not run a
+/// dry run. It is evidence that the server, or something in between, may
+/// have done something other than what was asked, so the command's effects
+/// are unknown whatever its kind: a command that sends a read through a
+/// route that can write is a read only when the reply confirms it.
+#[derive(Debug)]
+pub(crate) struct ContradictoryReply {
+    pub(crate) message: String,
+}
+
+impl ContradictoryReply {
+    pub(crate) fn report(message: impl Into<String>) -> color_eyre::Report {
+        Self {
+            message: message.into(),
+        }
+        .into()
+    }
+}
+
+impl std::fmt::Display for ContradictoryReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ContradictoryReply {}
 
 /// Build the typed CAS-lost error for the embedded transport, mirroring the
 /// structured body a server would have returned so `--json` output is

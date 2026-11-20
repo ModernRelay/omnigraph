@@ -57,8 +57,9 @@ query jobs_naming_no_operator() {
 A served read of `og_catalog` is authorized like a graph read: the policy
 bound to `graph.og_catalog` in `cluster.yaml` decides, with the resource
 `og_catalog` and no branch; without a bound policy the ordinary no-policy
-rules apply (static tokens may read, signed data credentials need a
-permit). See [Authorization and actors](../operations/policy.md).
+rules apply: every credential is refused, unless the server sets
+`OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`, which lets static tokens read.
+See [Authorization and actors](../operations/policy.md).
 
 ## What is refused
 
@@ -93,8 +94,8 @@ value `show` reports before any `set`, `scope` whether any caller
 descriptive text of each setting stays in [Session settings](settings.md).
 
 **`@Engine`**: the one row describing the binary: `version` is its release
-version, `current_internal_schema_version` the storage format it writes,
-`min_supported_internal_schema_version` the oldest stored format it still
+version, `current_internal_schema_version` the storage format of a graph it
+creates, `min_supported_internal_schema_version` the oldest stored format it still
 serves. A graph's own stored stamp is in `omnigraph snapshot`, not here.
 
 **`@LogicalKind`**: one row per logical plan node kind with its routing

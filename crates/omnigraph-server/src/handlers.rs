@@ -679,10 +679,12 @@ pub(crate) fn authorize(
         //   Per-graph operations are open by operator opt-in (they
         //   accepted "trust the network" for graph data).
         // * **DefaultDeny mode**: tokens configured but no policy. The
-        //   request went through bearer auth, so `actor` is Some. Only
-        //   per-graph `Read` is permitted; other per-graph actions
-        //   return 403. Closes the "configured auth but forgot the
-        //   policy file" trap from MR-723.
+        //   request went through bearer auth, so `actor` is Some. Every
+        //   per-graph action returns 403: bearer tokens are not scoped to
+        //   graphs, so a permit here would reach every graph without a
+        //   policy. The operator opt-in
+        //   `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY` lets a static token
+        //   `read`, the behaviour before this rule.
         // * Either of the above with a **server-scoped** action
         //   (`graph_list`, `config_manage`).
         //
@@ -705,11 +707,13 @@ pub(crate) fn authorize(
                     .to_string(),
             ));
         }
-        if actor.is_some() && request.action != PolicyAction::Read {
+        if let Some(actor) = actor {
+            if request.action == PolicyAction::Read && actor.reads_without_policy() {
+                return Ok(Authz::Allowed);
+            }
             return Ok(Authz::Denied(
-                "server runs in default-deny mode (bearer tokens configured but no \
-                 applied policy bundle). Only `read` actions are permitted. Other \
-                 actions require an applied graph policy."
+                "server runs in default-deny mode: this graph has no applied policy, so \
+                 every action is denied; apply a graph policy that permits it"
                     .to_string(),
             ));
         }
@@ -1670,7 +1674,7 @@ pub(crate) async fn run_mutate(
     expected_head: Option<&str>,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let file = classify(query)?;
-    refuse_process_settings(&file.settings)?;
+    refuse_process_settings(&file.settings, session.baseline())?;
     refuse_empty_file(&file)?;
     let queries = match file.body {
         FileBody::Queries(queries) => queries,
@@ -1882,7 +1886,7 @@ pub(crate) async fn run_query(
     snapshot: Option<String>,
 ) -> std::result::Result<ReadDispatch, ApiError> {
     let file = classify(query)?;
-    refuse_process_settings(&file.settings)?;
+    refuse_process_settings(&file.settings, session.baseline())?;
     refuse_empty_file(&file)?;
     let queries = match file.body {
         FileBody::Queries(queries) => queries,

@@ -706,6 +706,19 @@ fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
         assert!(error.contains("reserved"), "unexpected error: {error}");
         assert!(error.contains(name), "unexpected error: {error}");
     }
+    // The engine drops exactly the names `is_system_column` matches from
+    // change images, export and push comparison. The match must stay exact,
+    // so a property a persisted contract may still declare is never hidden.
+    for name in [
+        "_row",
+        "_rowdy",
+        "_row_custom",
+        "_row_created_at",
+        "id",
+        "rowid",
+    ] {
+        assert!(!is_system_column(name), "Lance now reserves {name}");
+    }
 }
 
 /// Guard: a rename-only `Operation::Project` (the RFC 0040 system-column
@@ -2492,33 +2505,6 @@ async fn _compile_compact_files_signature() -> lance::Result<()> {
     Ok(())
 }
 
-// --- Guard 7b: transaction history exposes repair's classification surface -
-//
-// `db/omnigraph/repair.rs` reads Lance transactions between manifest and HEAD
-// and treats only `ReserveFragments` + `Rewrite` as safe maintenance drift.
-// Compile-only.
-
-#[allow(
-    dead_code,
-    unreachable_code,
-    unused_variables,
-    unused_mut,
-    clippy::diverging_sub_expression
-)]
-async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()> {
-    let ds: Dataset = unimplemented!();
-    let tx = ds.read_transaction_by_version(1u64).await?;
-    if let Some(tx) = tx {
-        let operation = tx.operation;
-        let _name: &str = operation.name();
-        match operation {
-            Operation::Rewrite { .. } | Operation::ReserveFragments { .. } => {}
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 // --- Guard 8: DeleteBuilder::execute_uncommitted returns
 //     UncommittedDelete { transaction, affected_rows, num_deleted_rows } ---
 //
@@ -3966,10 +3952,13 @@ async fn filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table
 
 // --- Guard 11: scalar-index coverage surface (physical_rows + index details) ---
 //
-// `table_store.rs::key_column_index_coverage` mirrors Lance's `create_filter_plan`
-// C6 fallback: it reads `fragment.physical_rows` (the field whose absence on ANY
-// fragment disables the scalar index for the whole scan) and sniffs the BTREE via
-// `load_indices()` → `index.fields` / `index.index_details.type_url`. This is the
+// `dataset_index::key_column_index_coverage` and the planner's index facts
+// (`engine/plan_source/indexes.rs`) mirror Lance's `create_filter_plan` C6
+// fallback: they read `fragment.physical_rows` (the field whose absence on ANY
+// fragment disables the scalar index for the whole scan), group `load_indices()`
+// segments by `index.name` and `index.keyed_field()`, classify a BTREE by the
+// plugin its details resolve to, and union the segments' `fragment_bitmap`s as
+// Lance's `scalar_index_info` does (`dataset_index::SegmentCoverage`). This is the
 // one real Lance-internal coupling on the indexed-traversal read path. If any of
 // these surfaces renames or changes type, the coverage check (and the cost-based
 // traversal chooser that consumes it) silently misclassifies. Compile-only.
@@ -3991,16 +3980,24 @@ async fn _compile_scalar_index_coverage_surface() -> lance::Result<()> {
         // index `fragment_bitmap`.
         let _id: u64 = frag.id;
     }
-    // The index sniff: BTREE presence is detected by single-field index whose
-    // details type_url ends with "BTreeIndexDetails". The fragment coverage check
-    // reads `fragment_bitmap` (Option<RoaringBitmap>) and calls `.contains(u32)`.
+    // The index sniff: segments group by name and keyed field; a BTREE is the
+    // segment whose details resolve to the "BTree" plugin (the `has_*_index_on`
+    // helpers still read the details type_url). The coverage union iterates each
+    // segment's `fragment_bitmap` (Option<RoaringBitmap>) as u32 fragment ids.
     let indices = ds.load_indices().await?;
     for index in indices.iter() {
         let _fields: &Vec<i32> = &index.fields;
+        let _name: &str = index.name.as_str();
+        let _keyed: Option<i32> = index.keyed_field();
         if let Some(details) = index.index_details.as_ref() {
             let _type_url: &str = details.type_url.as_str();
+            let _plugin: Option<String> = lance::index::scalar::IndexDetails(details.clone())
+                .get_plugin()
+                .ok()
+                .map(|plugin| plugin.name().to_string());
         }
         let _covered: Option<bool> = index.fragment_bitmap.as_ref().map(|b| b.contains(0u32));
+        let _ids: Option<Vec<u32>> = index.fragment_bitmap.as_ref().map(|b| b.iter().collect());
     }
     Ok(())
 }
@@ -7551,6 +7548,209 @@ async fn rfc_0067_create_index_keeps_every_fragment_of_its_read_version() {
     assert_eq!(rfc0067_ids(&rebuilt).await, parent_ids, "rows unchanged");
 }
 
+/// The Lance rules a write carried over a row-preserving publication relies
+/// on (RFC 2026-11-10-writes-carried-over-row-preserving-publications,
+/// `table_store::rebase_staged_write`): `TransactionRebase` carries an append
+/// staged on a version over a compaction `Rewrite` of that version unchanged,
+/// and the append committed detached on the compacted version keeps the
+/// compaction, every row and unique row ids; a delete staged on the same
+/// version whose fragment the rewrite replaced is a retryable conflict. Red
+/// when Lance changes either rule: the carry then needs a design review.
+#[tokio::test]
+async fn transaction_rebase_carries_an_append_over_a_rewrite_and_refuses_an_overlapping_delete() {
+    use lance::dataset::DeleteBuilder;
+    use lance::io::commit::conflict_resolver::TransactionRebase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let v1 = rfc0067_create(uri).await;
+    let v2 = rfc0067_append(v1, &["b1"]).await;
+    let base = rfc0067_append(v2, &["c1"]).await;
+    assert_eq!(base.get_fragments().len(), 3, "three fragments to compact");
+
+    let append = rfc0067_staged_append(&base, &["d1"]).await;
+    let delete = DeleteBuilder::new(Arc::new(base.clone()), "id = 'a1'")
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+    let mut compacted = base.clone();
+    compact_files(&mut compacted, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(compacted.get_fragments().len(), 1, "the rewrite compacted");
+    let rewrite = compacted.read_transaction().await.unwrap().unwrap();
+    assert!(
+        matches!(rewrite.operation, Operation::Rewrite { .. }),
+        "compaction commits a Rewrite: {:?}",
+        rewrite.operation
+    );
+    assert_eq!(rewrite.read_version, base.version().version);
+    let rewrite_version = compacted.version().version;
+
+    let mut rebase = TransactionRebase::try_new(&base, append, None)
+        .await
+        .unwrap();
+    rebase.check_txn(&rewrite, rewrite_version).unwrap();
+    let mut carried = rebase.finish(&compacted).await.unwrap();
+    carried.read_version = rewrite_version;
+    let committed = CommitBuilder::new(Arc::new(compacted.clone()))
+        .with_detached(true)
+        .with_skip_auto_cleanup(true)
+        .execute(carried)
+        .await
+        .unwrap();
+    let committed = rfc0067_pinned(uri, committed.version().version).await;
+    assert_eq!(
+        committed
+            .read_transaction()
+            .await
+            .unwrap()
+            .unwrap()
+            .read_version,
+        rewrite_version,
+        "the carried append reads the compacted version"
+    );
+    assert_eq!(
+        committed.get_fragments().len(),
+        2,
+        "the compacted fragment and the append's own: the compaction stays"
+    );
+    assert_eq!(
+        rfc0067_ids(&committed).await,
+        vec!["a1", "a2", "b1", "c1", "d1"],
+        "every row, once"
+    );
+    let mut scanner = committed.scan();
+    scanner.with_row_id().project(&["id"]).unwrap();
+    let row_ids: Vec<u64> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("_rowid")
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(
+        row_ids.iter().collect::<HashSet<_>>().len(),
+        row_ids.len(),
+        "the appended row takes a fresh stable row id"
+    );
+
+    let mut rebase =
+        TransactionRebase::try_new(&base, delete.transaction, delete.affected_rows.as_ref())
+            .await
+            .unwrap();
+    let refused = rebase.check_txn(&rewrite, rewrite_version).unwrap_err();
+    assert!(
+        matches!(refused, lance::Error::RetryableCommitConflict { .. }),
+        "a delete of a rewritten fragment is a retryable conflict: {refused}"
+    );
+}
+
+/// The same carry for the operations the engine stages most: a keyed
+/// `merge_insert` (`Operation::Update`) and a load overwrite. Over a
+/// compaction `Rewrite` of the version they were staged on, `TransactionRebase`
+/// carries the insert of a new key and the overwrite, and refuses the upsert
+/// of a row whose fragment the rewrite replaced as a retryable conflict; the
+/// engine then prepares that write again under the writer gates. Red when
+/// Lance changes any of the three rules.
+#[tokio::test]
+async fn transaction_rebase_carries_keyed_inserts_and_overwrites_over_a_rewrite_and_refuses_an_overlapping_upsert()
+ {
+    use lance::io::commit::conflict_resolver::TransactionRebase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let v1 = rfc0067_create(uri).await;
+    let v2 = rfc0067_append(v1, &["b1"]).await;
+    let base = rfc0067_append(v2, &["c1"]).await;
+    let base_arc = Arc::new(base.clone());
+
+    let new_key = stage_pk_merge(
+        Arc::clone(&base_arc),
+        rfc0067_batch(&["e1"]),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    let upsert = stage_pk_merge(
+        Arc::clone(&base_arc),
+        rfc0067_batch(&["b1"]),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    assert!(
+        matches!(upsert.transaction.operation, Operation::Update { .. }),
+        "a keyed write stages an Update: {:?}",
+        upsert.transaction.operation
+    );
+    let overwrite = InsertBuilder::new(Arc::clone(&base_arc))
+        .with_params(&WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![rfc0067_batch(&["z1"])])
+        .await
+        .unwrap();
+
+    let mut compacted = base.clone();
+    compact_files(&mut compacted, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        compacted.get_fragments().len(),
+        1,
+        "every fragment rewritten"
+    );
+    let rewrite = compacted.read_transaction().await.unwrap().unwrap();
+    assert!(matches!(rewrite.operation, Operation::Rewrite { .. }));
+    let rewrite_version = compacted.version().version;
+
+    let mut rebase =
+        TransactionRebase::try_new(&base, new_key.transaction, new_key.affected_rows.as_ref())
+            .await
+            .unwrap();
+    rebase
+        .check_txn(&rewrite, rewrite_version)
+        .expect("the insert of a new key carries over the rewrite");
+    rebase.finish(&compacted).await.unwrap();
+
+    let mut rebase = TransactionRebase::try_new(&base, overwrite, None)
+        .await
+        .unwrap();
+    rebase
+        .check_txn(&rewrite, rewrite_version)
+        .expect("an overwrite carries over the rewrite");
+    rebase.finish(&compacted).await.unwrap();
+
+    let mut rebase =
+        TransactionRebase::try_new(&base, upsert.transaction, upsert.affected_rows.as_ref())
+            .await
+            .unwrap();
+    let refused = rebase.check_txn(&rewrite, rewrite_version).unwrap_err();
+    assert!(
+        matches!(refused, lance::Error::RetryableCommitConflict { .. }),
+        "an upsert of a rewritten row is a retryable conflict: {refused}"
+    );
+}
+
 /// RFC 0067 §Promotion: replaying the transaction recorded in a detached
 /// manifest linearly at its base lands an identical twin: same uuid, same
 /// fragment ids, same rows, and the linear row stamps the change feed and
@@ -9069,8 +9269,12 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
         );
     }
 
-    let stats = db.optimize().await.unwrap();
+    let stats = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     let person = stats
+        .datasets
         .iter()
         .find(|stat| stat.type_key == "node:Person")
         .expect("optimize reports the Person table");
@@ -9090,4 +9294,544 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
         surviving,
         "compaction carries every live row's id and stamp into the rewritten fragments"
     );
+}
+
+/// Issue #1295: a branch merge stages each delete chunk as `_rowid IN (...)`
+/// (`exec/merge.rs`, `DeleteIdChunk::delete_expr`), relying on Lance's
+/// `TakeOperation::try_from_expr` turning it into a take inside `DeleteJob`:
+/// one row read, no data column, no index. The `id IN (...)` form it replaced
+/// searches the `id` BTREE and scans the `id` column of every fragment the
+/// index does not cover. Measured with Lance's own `analyze_plan` on the scan
+/// `DeleteJob::execute_impl` builds (an object-store `IOTracker` does not see
+/// the scan scheduler's data reads). Paired with
+/// `merge_cost::merge_delete_selects_rows_by_rowid_issue_1295`.
+#[tokio::test]
+async fn delete_chunk_reads_by_filter_form_issue_1295() {
+    use datafusion::prelude::{col, lit};
+    use lance::dataset::DeleteBuilder;
+
+    const ROWS: usize = 2000;
+    fn batch(prefix: &str) -> (Arc<Schema>, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let ids = (0..ROWS)
+            .map(|i| format!("{prefix}-{i}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(Int32Array::from((0..ROWS as i32).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+    let params = |mode| WriteParams {
+        mode,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    for uncovered in [4usize, 16] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("t.lance");
+        let uri = uri.to_str().unwrap();
+        let (schema, first) = batch("covered");
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)], schema),
+            uri,
+            Some(params(WriteMode::Create)),
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        for f in 0..uncovered {
+            let (schema, rows) = batch(&format!("tail{f}"));
+            ds.append(
+                RecordBatchIterator::new(vec![Ok(rows)], schema),
+                Some(params(WriteMode::Append)),
+            )
+            .await
+            .unwrap();
+        }
+        for target in ["covered-5", "tail0-5"] {
+            let row_id = ds
+                .scan()
+                .with_row_id()
+                .project(&["id"])
+                .unwrap()
+                .filter(&format!("id = '{target}'"))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .column_by_name(lance_core::ROW_ID)
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(0);
+            for (form, filter) in [
+                ("id IN", col("id").in_list(vec![lit(target)], false)),
+                (
+                    "_rowid IN",
+                    col(lance_core::ROW_ID).in_list(vec![lit(row_id)], false),
+                ),
+            ] {
+                let cold = DatasetBuilder::from_uri(uri)
+                    .with_session(Arc::new(Session::default()))
+                    .load()
+                    .await
+                    .unwrap();
+                // The scan `DeleteJob::execute_impl` runs, measured by Lance.
+                let mut scan = cold.scan();
+                scan.with_row_id()
+                    .project(&[lance_core::ROW_ID])
+                    .unwrap()
+                    .filter_expr(filter.clone());
+                let analyzed = scan.analyze_plan().await.unwrap();
+                let deleted = DeleteBuilder::from_expr(Arc::new(cold), filter)
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+                assert_eq!(deleted.num_deleted_rows, 1, "{form}");
+                let read = analyzed
+                    .lines()
+                    .find(|line| line.trim_start().starts_with("LanceRead:"))
+                    .unwrap_or_else(|| panic!("no LanceRead node: {analyzed}"));
+                eprintln!(
+                    "DELETE   uncovered_fragments={uncovered} target={target:<9} form={form:<9} {read}"
+                );
+                if form == "_rowid IN" {
+                    for metric in [
+                        "full_filter=--,",
+                        "rows_scanned=1,",
+                        "bytes_read=0,",
+                        "iops=0,",
+                    ] {
+                        assert!(
+                            read.contains(metric),
+                            "Lance no longer takes `_rowid IN` without reading data \
+                         ({metric} missing); branch-merge deletes rely on it: {analyzed}"
+                        );
+                    }
+                } else {
+                    let fragments_scanned = read
+                        .split("fragments_scanned=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(',').next())
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or_else(|| panic!("no fragments_scanned metric: {analyzed}"));
+                    assert!(
+                        fragments_scanned >= uncovered,
+                        "an `id IN` delete scanned {fragments_scanned} fragments with {uncovered} \
+                     uncovered by the index: {analyzed}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Issue #1264: the column patch an `update` stages. A `RewriteColumns`
+/// merge-insert of `(id, score)` over a table with a Blob and a vector column
+/// attaches one data file per touched fragment and never touches the Blob or
+/// vector bytes; it lists the join key in `fields_modified`, so as Lance
+/// stages it the touched fragments leave the `id` index. With the key removed
+/// from `fields_modified`, which the engine does because the patch rewrites
+/// the key byte for byte and moves no row, the index keeps them and still
+/// finds every row. Only the patched rows are restamped, with the read
+/// version plus one, and every row keeps its stable row id. Goes red if
+/// Lance stops listing the key (drop `keep_key_index_coverage`) or stops
+/// restamping or keeping row ids (revisit the change-feed's row-identity
+/// route for column patches).
+#[tokio::test]
+async fn column_patch_keeps_blob_files_row_ids_and_key_index_coverage_issue_1264() {
+    use arrow_array::types::{Int32Type, UInt64Type};
+    use lance::dataset::MergeInsertWriteMode;
+    use lance::dataset::transaction::UpdateMode;
+
+    const DIM: i32 = 4;
+    const ROWS: usize = 8;
+
+    async fn commit_detached(ds: &Dataset, transaction: Transaction) -> Dataset {
+        CommitBuilder::new(Arc::new(ds.clone()))
+            .with_detached(true)
+            .with_skip_auto_cleanup(true)
+            .execute(transaction)
+            .await
+            .unwrap()
+    }
+
+    async fn id_coverage(ds: &Dataset) -> Vec<u32> {
+        let indices = ds.load_indices().await.unwrap();
+        let index = indices
+            .iter()
+            .find(|index| index.name == "id_idx")
+            .expect("the id index");
+        index
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// `(id, score, row id, stamp)` per row, and the Blob bytes.
+    async fn rows(ds: &Dataset) -> Vec<(String, Option<i32>, u64, u64, Vec<u8>)> {
+        let mut scanner = ds.scan();
+        scanner.with_row_id();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner
+            .project(&["id", "score", "content", ROW_LAST_UPDATED_AT_VERSION])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let stamps = batch
+            .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let contents = batch.column_by_name("content").unwrap().as_binary::<i64>();
+        let mut rows = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row).to_string(),
+                    scores.is_valid(row).then(|| scores.value(row)),
+                    row_ids.value(row),
+                    stamps.value(row),
+                    contents.value(row).to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    async fn lookup(ds: &Dataset, id: &str) -> Vec<(String, Option<i32>)> {
+        let mut scanner = ds.scan();
+        scanner.filter(&format!("id = '{id}'")).unwrap();
+        let batch = scanner
+            .project(&["id", "score"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        (0..batch.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row).to_string(),
+                    scores.is_valid(row).then(|| scores.value(row)),
+                )
+            })
+            .collect()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("patch.lance");
+    let uri = uri.to_str().unwrap();
+    let mut pk = HashMap::new();
+    pk.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(pk),
+        Field::new("score", DataType::Int32, true),
+        lance::blob::blob_field("content", true),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+            true,
+        ),
+    ]));
+    let ids = (0..ROWS).map(|row| format!("k{row}")).collect::<Vec<_>>();
+    let mut content = BlobArrayBuilder::new(ROWS);
+    for row in 0..ROWS {
+        content.push_bytes(vec![row as u8; 64 * 1024]).unwrap();
+    }
+    let emb = arrow_array::FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM,
+        Arc::new(Float32Array::from(
+            (0..ROWS * DIM as usize)
+                .map(|value| value as f32)
+                .collect::<Vec<_>>(),
+        )),
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(ids.clone())),
+            Arc::new(Int32Array::from(vec![None::<i32>; ROWS])),
+            content.finish().unwrap(),
+            Arc::new(emb),
+        ],
+    )
+    .unwrap();
+    let mut base = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    base.create_index(
+        &["id"],
+        IndexType::Scalar,
+        Some("id_idx".to_string()),
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(base.get_fragments().len(), 1);
+    let fragment = base.get_fragments()[0].metadata().clone();
+    assert_eq!(id_coverage(&base).await, vec![fragment.id as u32]);
+    let id_field = base.schema().field("id").unwrap().id as u32;
+    let score_field = base.schema().field("score").unwrap().id as u32;
+    let before = rows(&base).await;
+
+    // Stage the patch of two rows, as the engine's KnownPresentColumnPatch does.
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("score", DataType::Int32, true),
+    ]));
+    let source = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["k2", "k5"])),
+            Arc::new(Int32Array::from(vec![Some(20), Some(50)])),
+        ],
+    )
+    .unwrap();
+    let mut builder =
+        MergeInsertBuilder::try_new(Arc::new(base.clone()), vec!["id".into()]).unwrap();
+    builder.when_matched(WhenMatched::UpdateAll);
+    builder.when_not_matched(WhenNotMatched::DoNothing);
+    builder.write_mode(MergeInsertWriteMode::RewriteColumns);
+    builder.conflict_retries(0);
+    let staged = builder
+        .try_build()
+        .unwrap()
+        .execute_uncommitted(lance_datafusion::utils::reader_to_stream(Box::new(
+            RecordBatchIterator::new(vec![Ok(source)], source_schema),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(staged.stats.num_updated_rows, 2);
+    assert_eq!(staged.stats.num_inserted_rows, 0);
+    let Operation::Update {
+        removed_fragment_ids,
+        updated_fragments,
+        new_fragments,
+        fields_modified,
+        update_mode,
+        inserted_rows_filter,
+        updated_fragment_offsets,
+        ..
+    } = &staged.transaction.operation
+    else {
+        panic!("a column patch stages an Update");
+    };
+    assert!(removed_fragment_ids.is_empty() && new_fragments.is_empty());
+    assert_eq!(update_mode, &Some(UpdateMode::RewriteColumns));
+    assert!(inserted_rows_filter.is_none());
+    assert!(updated_fragment_offsets.is_some());
+    assert_eq!(updated_fragments.len(), 1);
+    let patched = &updated_fragments[0];
+    assert_eq!(patched.id, fragment.id);
+    assert_eq!(
+        patched.files.len(),
+        fragment.files.len() + 1,
+        "the patch attaches one data file"
+    );
+    for (old, new) in fragment.files.iter().zip(&patched.files) {
+        assert_eq!(old.path, new.path, "the existing data files are kept");
+    }
+    let mut patch_fields = patched.files.last().unwrap().fields.to_vec();
+    patch_fields.sort();
+    assert_eq!(
+        patch_fields,
+        vec![id_field as i32, score_field as i32],
+        "the patch file holds the key and the patched column, never the Blob or vector"
+    );
+    let mut modified = fields_modified.clone();
+    modified.sort();
+    assert_eq!(
+        modified,
+        vec![id_field, score_field],
+        "Lance lists the rewritten key in fields_modified"
+    );
+
+    // As staged, the touched fragment leaves the id index.
+    let as_staged = commit_detached(&base, staged.transaction.clone()).await;
+    assert!(
+        id_coverage(&as_staged).await.is_empty(),
+        "a listed key withdraws the touched fragment from the key's index"
+    );
+
+    // Without the key in fields_modified, the index keeps the fragment.
+    let mut transaction = staged.transaction.clone();
+    if let Operation::Update {
+        fields_modified, ..
+    } = &mut transaction.operation
+    {
+        fields_modified.retain(|field| *field != id_field);
+    }
+    let kept = commit_detached(&base, transaction).await;
+    assert_eq!(id_coverage(&kept).await, vec![fragment.id as u32]);
+    let after = rows(&kept).await;
+    for (old, new) in before.iter().zip(&after) {
+        assert_eq!(old.0, new.0);
+        assert_eq!(old.2, new.2, "{}: the row keeps its stable row id", old.0);
+        assert_eq!(old.4, new.4, "{}: the Blob bytes are unchanged", old.0);
+        if old.0 == "k2" || old.0 == "k5" {
+            assert_eq!(
+                new.3,
+                base.version().version + 1,
+                "{}: a patched row is stamped with the read version plus one",
+                old.0
+            );
+        } else {
+            assert_eq!(old.1, new.1);
+            assert_eq!(old.3, new.3, "{}: an unpatched row keeps its stamp", old.0);
+        }
+    }
+    assert_eq!(after[2].1, Some(20));
+    assert_eq!(after[5].1, Some(50));
+    for id in &ids {
+        let expected = match id.as_str() {
+            "k2" => Some(20),
+            "k5" => Some(50),
+            _ => None,
+        };
+        assert_eq!(
+            lookup(&kept, id).await,
+            vec![(id.clone(), expected)],
+            "{id}: the kept index finds the row once, with its patched value"
+        );
+    }
+}
+
+// --- Guard: an untrainable vector column is `Error::Unprocessable` ---------
+//
+// `TableStore::stage_index_fold` rebuilds a lagging vector index
+// whole and skips, as pending index work, exactly the column Lance cannot
+// train: it matches the typed `lance::Error::Unprocessable` of the uncommitted
+// build and treats every other failure as an error, so a storage fault during
+// a rebuild is never reported as a column that "cannot train". Lance 13 raises
+// `Unprocessable` only from vector training (`train_kmeans` and the PQ
+// trainers), when the finite, non-null vectors are fewer than the centroids to
+// train; a column whose vectors are all null or all non-finite has none. A
+// column with at least one such vector builds, even with fewer vectors than
+// partitions. When this goes red the variant or the training rule moved:
+// re-derive the fold's skip from the new one before changing the test.
+#[tokio::test]
+async fn vector_index_build_without_trainable_vectors_is_unprocessable_lance_13() {
+    use arrow_array::{BooleanArray, FixedSizeListArray, Float32Array};
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    const DIMENSION: usize = 4;
+    const ROWS: usize = 8;
+
+    /// A nullable vector column whose first `valid` rows are non-null and
+    /// hold `value` in every component.
+    async fn vector_dataset(uri: &str, valid: usize, value: f32) -> Dataset {
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(item.clone(), DIMENSION as i32),
+                true,
+            ),
+        ]));
+        let validity = BooleanArray::from((0..ROWS).map(|row| row < valid).collect::<Vec<_>>());
+        let vectors = FixedSizeListArray::new(
+            item,
+            DIMENSION as i32,
+            Arc::new(Float32Array::from(vec![value; ROWS * DIMENSION])),
+            Some(validity.values().clone().into()),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    for (name, valid, value, partitions, trainable) in [
+        ("every vector null", 0, 1.0, 1, false),
+        ("every vector non-finite", ROWS, f32::NAN, 1, false),
+        ("one vector", 1, 1.0, 1, true),
+        ("fewer vectors than partitions", 3, 1.0, 4, true),
+    ] {
+        let uri = format!(
+            "{}/{}.lance",
+            dir.path().to_str().unwrap(),
+            name.replace(' ', "_")
+        );
+        let mut ds = vector_dataset(&uri, valid, value).await;
+        let params = VectorIndexParams::ivf_flat(partitions, MetricType::L2);
+        let built = ds
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("vector_idx".to_string())
+            .replace(true)
+            .execute_uncommitted()
+            .await;
+        match built {
+            Ok(_) => assert!(trainable, "{name}: Lance built an index it cannot train"),
+            Err(error) => {
+                assert!(!trainable, "{name}: {error}");
+                assert!(
+                    matches!(error, lance::Error::Unprocessable { .. }),
+                    "{name}: an untrainable column must surface as Unprocessable: {error:?}"
+                );
+            }
+        }
+    }
 }

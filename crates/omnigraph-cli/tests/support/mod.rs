@@ -38,18 +38,20 @@ pub fn bootstrap_cluster_fixture(config: &Path, root: &str) {
     unlock_storage_fixture(root);
 }
 
-/// Only call after the fixture's writer has stopped: completed direct owners
-/// retain admission and serving restarts need an explicit exact-ID handoff.
+/// Only call after the fixture's writer has stopped: completed direct writers
+/// other than a converged apply retain admission, and serving restarts need an
+/// explicit exact-ID handoff.
 pub fn unlock_storage_fixture(root: &str) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
         let status = omnigraph_cluster::deployment_status(root, None, &caller)
             .await
             .unwrap();
-        let lock = status.lock_id.expect("fixture owner retains exact lock");
-        omnigraph_cluster::force_unlock_storage_root(root, &lock)
-            .await
-            .unwrap();
+        if let Some(lock) = status.lock_id {
+            omnigraph_cluster::force_unlock_storage_root(root, &lock)
+                .await
+                .unwrap();
+        }
     });
 }
 
@@ -809,21 +811,88 @@ pub fn converged_loaded_cluster(graph_id: &str, policy_yaml: Option<&str>) -> Cl
 
     apply_cluster_fixture(&dir);
 
+    // `POLICY_YAML` lets no actor change the protected `main`.
     let served_root = dir.join("graphs").join(format!("{graph_id}.omni"));
-    output_success(
-        cli()
-            .arg("load")
-            .arg("--data")
-            .arg(fixture("test.jsonl"))
-            .arg("--mode")
-            .arg("overwrite")
-            .arg("--target")
-            .arg(&served_root),
+    seed_as_storage_owner(
+        &served_root,
+        &fs::read_to_string(fixture("test.jsonl")).unwrap(),
     );
 
-    unlock_cluster_fixture(&dir);
     ClusterFixture { _temp: temp, dir }
 }
+
+/// Overwrite `graph`'s `main` with the JSONL `data` as a storage owner's
+/// embedded host that installs no policy. A direct CLI load of a cluster graph
+/// is judged by the graph's applied policy, which may admit no actor to `main`.
+pub fn seed_as_storage_owner(graph: &Path, data: &str) {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = Omnigraph::open(&graph.to_string_lossy()).await.unwrap();
+        session_over(db)
+            .load_jsonl(data, omnigraph::loader::LoadMode::Overwrite)
+            .await
+            .unwrap();
+    });
+}
+
+/// Build a converged cluster with one graph `graph_id` and the policy layout
+/// `docs/user/operations/policy.md` documents: `graph_policy`, when given, is
+/// bound to the graph and `cluster_policy`, when given, to the `cluster`
+/// scope. The graph holds no data; the policy commands read only the ledger.
+pub fn converged_policy_cluster(
+    graph_id: &str,
+    graph_policy: Option<&str>,
+    cluster_policy: Option<&str>,
+) -> ClusterFixture {
+    let temp = tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
+    fs::copy(fixture("test.pg"), dir.join("graph.pg")).unwrap();
+
+    let mut policies = String::new();
+    if let Some(source) = graph_policy {
+        fs::write(dir.join("graph.policy.yaml"), source).unwrap();
+        policies.push_str(&format!(
+            "  graph-access:\n    file: ./graph.policy.yaml\n    applies_to: [{graph_id}]\n"
+        ));
+    }
+    if let Some(source) = cluster_policy {
+        fs::write(dir.join("server.policy.yaml"), source).unwrap();
+        policies.push_str(
+            "  server-access:\n    file: ./server.policy.yaml\n    applies_to: [cluster]\n",
+        );
+    }
+    let policy_block = if policies.is_empty() {
+        String::new()
+    } else {
+        format!("policies:\n{policies}")
+    };
+    fs::write(
+        dir.join("cluster.yaml"),
+        format!(
+            "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  {graph_id}:\n    schema: ./graph.pg\n{policy_block}"
+        ),
+    )
+    .unwrap();
+
+    apply_cluster_fixture(&dir);
+    ClusterFixture { _temp: temp, dir }
+}
+
+/// A `cluster`-scope bundle in the documented shape: configuration and
+/// inventory rules, each in its own rule.
+pub const CLUSTER_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  owners: [act-andrew]
+rules:
+  - id: owners-manage-config
+    allow:
+      actors: { group: owners }
+      actions: [config_manage]
+  - id: owners-list-graphs
+    allow:
+      actors: { group: owners }
+      actions: [graph_list]
+"#;
 
 // ---- helpers moved from the monolithic tests/cli.rs ----
 #[allow(unused_imports)]
@@ -963,7 +1032,16 @@ rules:
   - id: cluster-operators-change
     allow:
       actors: { group: cluster_operators }
-      actions: [change, schema_apply]
+      actions: [change, schema_apply, maintain]
+  - id: cluster-operators-branch
+    allow:
+      actors: { group: cluster_operators }
+      actions: [branch_create]
+      target_branch_scope: any
+  - id: cluster-operators-reclaim
+    allow:
+      actors: { group: cluster_operators }
+      actions: [reclaim]
 "#,
     )
     .unwrap();
@@ -1597,9 +1675,12 @@ policies:
     let served_root = cluster_dir
         .join("graphs")
         .join(format!("{PARITY_GRAPH_ID}.omni"));
+    // A direct write to the cluster graph is judged by its applied policy,
+    // which admits `act-parity`.
     output_success(
         fixture_cli()
             .arg("load")
+            .args(["--as", "act-parity"])
             .arg("--data")
             .arg(fixture("test.jsonl"))
             .arg("--mode")

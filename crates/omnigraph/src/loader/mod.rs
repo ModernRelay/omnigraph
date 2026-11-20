@@ -735,13 +735,10 @@ async fn load_jsonl_data(
     write_budget: WriteBudget,
     query_memory_bytes: u64,
 ) -> Result<LoadReceipt> {
-    const MAX_PRE_EFFECT_REPREPARES: usize = 32;
-
     // Every public load entry point already owns a stable `&str` payload
     // (`load_file_as` reads its file once). Replay that slice directly on a
     // pre-effect retry; copying it into a second raw byte buffer would double
     // peak input memory before the parser's per-type materialization.
-    let retryable = matches!(mode, LoadMode::Append | LoadMode::Merge);
     let memory = crate::engine::LoadMemory::new(query_memory_bytes)?;
     let csv_input;
     let input = match input_shape {
@@ -757,9 +754,11 @@ async fn load_jsonl_data(
             LoadAttemptInput::Csv(request, &csv_input, handle)
         }
     };
-    for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
+    let mut reprepares = crate::db::reprepare::PreEffectReprepares::begin(db, branch, "load");
+    loop {
         let replay = BufReader::new(Cursor::new(data.as_bytes()));
-        match load_jsonl_reader_once(
+        let first_attempt = reprepares.is_first();
+        let result = crate::db::write_queue::preparing(load_jsonl_reader_once(
             db,
             branch,
             replay,
@@ -768,29 +767,19 @@ async fn load_jsonl_data(
             input,
             stage_write_concurrency,
             history_release_bytes,
-            attempt == 0,
+            first_attempt,
             write_budget,
             &memory,
-        )
-        .await
-        {
-            Err(err)
-                if retryable
-                    && err.is_read_set_changed()
-                    && attempt < MAX_PRE_EFFECT_REPREPARES =>
-            {
-                tracing::debug!(
-                    attempt = attempt + 1,
-                    branch = branch.unwrap_or("main"),
-                    "prepared load authority changed before effects; repreparing"
-                );
-                crate::instrumentation::record_mutation_reprepare();
-                db.refresh_coordinator_only().await?;
+            reprepares.attempt(),
+        ))
+        .await;
+        match result {
+            Err(err) if reprepares.may_prepare_again(&err) => {
+                reprepares.prepare_again().await?;
             }
             result => return result,
         }
     }
-    unreachable!("bounded load retry loop always returns")
 }
 
 /// Retain CSV append/merge input against the shared keyed-write ceiling.
@@ -817,6 +806,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     first_attempt: bool,
     write_budget: WriteBudget,
     memory: &crate::engine::LoadMemory,
+    attempt: &mut crate::db::reprepare::WriteAttempt,
 ) -> Result<LoadReceipt> {
     // Capture the manifest/schema authority before interpreting any input. The
     // catalog rides the WriteTxn and was built from the exact accepted IR named
@@ -829,8 +819,17 @@ async fn load_jsonl_reader_once<R: BufRead>(
             error.without_pre_effect_evidence()
         }
     })?;
+    // An overwrite replaces the rows it finds; an append or a merge only
+    // adds or upserts by key (`WriteAttempt::admit`).
+    attempt.admit(&txn, matches!(mode, LoadMode::Overwrite))?;
     let catalog = Arc::clone(&txn.catalog);
     let snapshot = txn.base.clone();
+    let mut planning = snapshot.clone();
+    planning.set_read_caches(crate::db::manifest::SnapshotReadCaches {
+        session: db.read_caches().session.clone(),
+        handles: db.read_caches().handles.clone(),
+        table_wrapper: None,
+    });
 
     // Phase 1: Parse all lines, spool into per-type collections
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
@@ -856,7 +855,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         executed.source_bytes = source.bytes.size();
         let decision = plan_load(
             &catalog,
-            &snapshot,
+            &planning,
             request,
             source.bytes.size(),
             memory.limit(),
@@ -879,6 +878,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 stage_write_concurrency,
                 memory,
                 executed,
+                attempt,
             ))
             .await;
         }
@@ -1246,6 +1246,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 PendingMode::StrictInsert => DeltaClass::Insert,
                 PendingMode::Upsert => DeltaClass::Upsert,
                 PendingMode::Overwrite => DeltaClass::Replace,
+                // A load never stages a column patch; an update's patch of
+                // present rows is an upsert to the judge.
+                PendingMode::ColumnPatch => DeltaClass::Upsert,
             },
             rows: pending.batches.iter().map(|b| b.num_rows() as u64).sum(),
             deleted_ids: Vec::new(),
@@ -1268,25 +1271,17 @@ async fn load_jsonl_reader_once<R: BufRead>(
             (vec![judged], Vec::new())
         }
         None if tables.is_empty() => (Vec::new(), Vec::new()),
-        None => {
-            let mut planning = snapshot.clone();
-            planning.set_read_caches(crate::db::manifest::SnapshotReadCaches {
-                session: db.read_caches().session.clone(),
-                handles: db.read_caches().handles.clone(),
-                table_wrapper: None,
-            });
-            crate::validate::plan::plan_write(
-                &planning,
-                &catalog,
-                WriteKind::Load,
-                CommittedSide::Base,
-                tables,
-                write_budget.bytes(),
-            )
-            .await?
-            .into_iter()
-            .unzip()
-        }
+        None => crate::validate::plan::plan_write(
+            &planning,
+            &catalog,
+            WriteKind::Load,
+            CommittedSide::Base,
+            tables,
+            write_budget.bytes(),
+        )
+        .await?
+        .into_iter()
+        .unzip(),
     };
     let loaded_rows: usize = result
         .nodes_loaded
@@ -1354,8 +1349,16 @@ async fn load_jsonl_reader_once<R: BufRead>(
         .stage_all_with_concurrency(db, branch, stage_write_concurrency)
         .await
         .map_err(OmniError::unpublished)?;
-    let commit =
-        publish_staged_load(db, staged, &txn, branch, actor_id, history_release_bytes).await?;
+    let commit = publish_staged_load(
+        db,
+        staged,
+        &txn,
+        branch,
+        actor_id,
+        history_release_bytes,
+        attempt,
+    )
+    .await?;
 
     Ok(LoadReceipt {
         result,
@@ -1384,6 +1387,7 @@ async fn load_csv_overwrite_plan(
     stage_write_concurrency: usize,
     memory: &crate::engine::LoadMemory,
     mut executed: LoadExecuted,
+    attempt: &mut crate::db::reprepare::WriteAttempt,
 ) -> Result<LoadReceipt> {
     let catalog = Arc::clone(&txn.catalog);
     let table_key = request.target.table_key();
@@ -1464,8 +1468,16 @@ async fn load_csv_overwrite_plan(
                 "load csv overwrite into {table_key}: the plan ran without staging a write"
             ))
         })?;
-    let commit =
-        publish_staged_load(db, staged, &txn, branch, actor_id, history_release_bytes).await?;
+    let commit = publish_staged_load(
+        db,
+        staged,
+        &txn,
+        branch,
+        actor_id,
+        history_release_bytes,
+        attempt,
+    )
+    .await?;
     executed.rows = rows;
     let loaded = usize::try_from(rows)
         .map_err(|_| OmniError::manifest("load csv: row count exceeds usize".to_string()))?;
@@ -1494,6 +1506,7 @@ async fn publish_staged_load(
     branch: Option<&str>,
     actor_id: Option<&str>,
     history_release_bytes: HistoryReleaseBytes,
+    attempt: &mut crate::db::reprepare::WriteAttempt,
 ) -> Result<crate::db::GraphCommit> {
     fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
     let lineage_intent = db
@@ -1505,10 +1518,14 @@ async fn publish_staged_load(
         expected_versions,
         detached: _,
         gates: _held_gates,
+        carried_txn,
     } = staged
-        .commit_all(db, branch, txn)
+        .commit_all(db, branch, txn, None, attempt)
         .await
         .map_err(OmniError::unpublished)?;
+    // A load carried over row-preserving publications publishes on the head
+    // it was re-anchored on.
+    let txn = carried_txn.as_ref().unwrap_or(txn);
     fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER).map_err(OmniError::unpublished)?;
     // The publisher alone decides between a definite loss and an outcome it
     // could not read back.
@@ -2202,18 +2219,24 @@ fn estimate_json_arrow_bytes(value: &JsonValue) -> Result<u64> {
         JsonValue::Number(_) => Ok(4),
         JsonValue::String(value) => u64::try_from(value.len())
             .map_err(|_| OmniError::manifest_internal("JSON string bytes exceed u64")),
-        JsonValue::Array(values) => {
-            let offsets = u64::try_from(values.len())
-                .map_err(|_| OmniError::manifest_internal("JSON array length exceeds u64"))?
-                .checked_add(1)
-                .and_then(|count| count.checked_mul(4))
-                .ok_or_else(|| OmniError::manifest_internal("JSON array offset bytes overflow"))?;
-            values.iter().try_fold(offsets, |bytes, value| {
-                bytes
-                    .checked_add(estimate_json_arrow_bytes(value)?)
-                    .ok_or_else(|| OmniError::manifest_internal("JSON array bytes overflow"))
-            })
-        }
+        // A list cell's item values, plus the four-byte offset each String
+        // item has in its child Utf8 array. Numeric items have no offset, and
+        // a vector (FixedSizeList) has no offsets at all; the list's own row
+        // offset is left out, as a top-level String's is. Charging an offset
+        // per element doubled a Float32 vector's estimate, so a load was
+        // refused at about half of `write_max_bytes`.
+        JsonValue::Array(values) => values.iter().try_fold(0_u64, |bytes, value| {
+            let item = estimate_json_arrow_bytes(value)?;
+            let item = if value.is_string() {
+                item.checked_add(4)
+                    .ok_or_else(|| OmniError::manifest_internal("JSON array bytes overflow"))?
+            } else {
+                item
+            };
+            bytes
+                .checked_add(item)
+                .ok_or_else(|| OmniError::manifest_internal("JSON array bytes overflow"))
+        }),
         // Property names are schema, not per-row Arrow payload. Count values
         // only so the early lower bound does not reject an otherwise-valid
         // wide schema; exact field buffers are charged after batch building.
@@ -2843,15 +2866,7 @@ fn validate_strict_input_fields(
 }
 
 fn is_reserved_physical_input_field(field: &str) -> bool {
-    matches!(
-        field,
-        "_tombstone"
-            | "_rowid"
-            | "_rowaddr"
-            | "_rowoffset"
-            | "_row_created_at_version"
-            | "_row_last_updated_at_version"
-    )
+    field == "_tombstone" || lance_core::is_system_column(field)
 }
 
 fn validate_optional_row_id(
@@ -2894,17 +2909,6 @@ fn validate_required_row_string<'a>(
             "input entity of type '{type_name}' requires explicit field '{field}'"
         ))),
     }
-}
-
-// Single-row test shim over `preflight_strict_row_arrow_bytes_with_limit`,
-// kept next to the strict-row staged-write preflight helpers.
-#[cfg(test)]
-#[allow(dead_code)]
-fn preflight_strict_row_arrow_bytes(
-    schema: &arrow_schema::Schema,
-    object: &serde_json::Map<String, JsonValue>,
-) -> Result<()> {
-    preflight_strict_row_arrow_bytes_with_limit(schema, object, KEYED_WRITE_MAX_BYTES)
 }
 
 #[cfg(test)]
@@ -3000,8 +3004,14 @@ fn projected_strict_column_bytes(data_type: &DataType, value: &JsonValue) -> Res
                     "strict-row vector has invalid dimension {dimension}"
                 ))
             })?;
+            // The child values at full width, present or null, and one
+            // validity bit per child slot: a null vector appends `dimension`
+            // null children. A whole byte per slot overstated a Float32
+            // vector by a quarter.
             let child_width = projected_strict_fixed_width(child.data_type())?;
-            ARRAY_BUFFER_OVERHEAD.saturating_add(dimension.saturating_mul(child_width + 1))
+            ARRAY_BUFFER_OVERHEAD
+                .saturating_add(dimension.saturating_mul(child_width))
+                .saturating_add(dimension.div_ceil(8))
         }
         other => {
             return Err(OmniError::manifest(format!(

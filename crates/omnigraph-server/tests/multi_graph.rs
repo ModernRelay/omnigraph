@@ -653,7 +653,9 @@ rules:
     ready.sort();
     assert_eq!(ready, vec!["good"]);
     assert_eq!(state.routing().registry.len(), 2);
-    let app = build_app(state);
+    // The graphs carry no policy; the token reads `good` through the
+    // operator opt-in.
+    let app = build_app(state.with_reads_without_policy(true));
 
     let (status, body) = json_response(
         &app,

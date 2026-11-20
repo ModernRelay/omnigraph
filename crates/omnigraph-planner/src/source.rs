@@ -139,6 +139,16 @@ impl IndexFact {
     }
 }
 
+/// Whether `column` has an index and every index keyed on it is a usable
+/// BTREE that covers every current fragment: a `column IN (...)` filter is
+/// then served by the index alone. The engine's run-time probe
+/// (`omnigraph_core::dataset_index::key_column_coverage`) applies this rule
+/// to the same metadata.
+pub fn btree_covers_column(facts: &[IndexFact], column: &str) -> bool {
+    let mut candidates = facts.iter().filter(|fact| fact.column == column).peekable();
+    candidates.peek().is_some() && candidates.all(|fact| fact.fully_covers_btree(column))
+}
+
 /// The proof the engine's candidate path captured for one interval: the
 /// child version is the parent's immediate successor under one
 /// row-set-preserving transaction, and these are the fragments it touched.

@@ -1,0 +1,1 @@
+- An MCP `tools/call`, even `health`, no longer aborts `omnigraph-server` with a stack overflow that took every graph down.

@@ -23,12 +23,17 @@
 //!   to unreferenced version history — callers should gate this behind an
 //!   explicit confirm flag at the CLI layer.
 
+use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream::StreamExt;
+use futures::future::BoxFuture;
+use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use lance::dataset::optimize::{CompactionMetrics, CompactionOptions};
+use tokio::time::Instant;
 
 use super::*;
+use crate::error::CompletionEvidence;
 use crate::seams::{decide_seam, fail};
 
 /// How many datasets to optimize/cleanup concurrently. Each has separate
@@ -57,85 +62,717 @@ pub struct CleanupPolicyOptions {
     pub older_than: Option<Duration>,
 }
 
-/// Why `optimize` did not compact a dataset. Typed so callers branch on the
-/// reason rather than sniffing a string.
+/// What one optimize run did to one table. A run reports exactly one outcome
+/// for every table it considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum SkipReason {
-    /// The Lance dataset HEAD is ahead of the version recorded in
-    /// `__manifest`, and no pending pin explains that movement. `optimize`
-    /// cannot infer whether the drift is benign maintenance or an external
-    /// semantic write, so it leaves the dataset untouched and points operators at
-    /// explicit `repair`.
-    DriftNeedsRepair,
+pub enum TableOptimizeOutcome {
+    /// A rewrite or index link was staged and is in the run's publication.
+    /// [`DatasetOptimizeStats::index_failure`] is set when an index link
+    /// failed after an earlier link of the table committed.
+    Optimized,
+    /// Planning found nothing to do.
+    Unchanged,
+    /// Not started: nothing was written for the table.
+    Deferred(DeferReason),
+    /// A failure of this table's own planning or staging, with definite
+    /// evidence: its staging is unreachable and the other tables still
+    /// publish. [`DatasetOptimizeStats::failure`] holds the error.
+    Failed,
 }
 
-impl SkipReason {
-    /// Stable machine-readable token for serialized output (e.g. CLI `--json`).
-    /// Once emitted this is part of the output contract — keep it stable.
+impl TableOptimizeOutcome {
+    /// Stable machine-readable token for serialized output. Once emitted this
+    /// is part of the output contract — keep it stable.
     pub fn as_str(&self) -> &'static str {
         match self {
-            SkipReason::DriftNeedsRepair => "drift_needs_repair",
+            TableOptimizeOutcome::Optimized => "optimized",
+            TableOptimizeOutcome::Unchanged => "unchanged",
+            TableOptimizeOutcome::Deferred(_) => "deferred",
+            TableOptimizeOutcome::Failed => "failed",
         }
     }
 }
 
-impl std::fmt::Display for SkipReason {
-    /// Human-readable reason for CLI and log output.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let msg = match self {
-            SkipReason::DriftNeedsRepair => {
-                "published dataset/Lance HEAD drift — run omnigraph repair"
-            }
-        };
-        f.write_str(msg)
+/// Why a run did not start a table. Typed so callers branch on the reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeferReason {
+    /// The run had held main's writer gates for `max_gate_hold` when the
+    /// table's turn came. This table and every later one wait for a later
+    /// run, which [`OptimizeReport::resume_at`] starts at.
+    GateHoldLimit,
+    /// The run was cancelled before this table's work could land.
+    Cancelled,
+    /// The table's plan passed a per-table ceiling, measured before its first
+    /// write; nothing was written for it, and later tables still run.
+    ResourceLimit(ResourceExceeded),
+    /// The table's source bytes would pass the run's remaining byte budget.
+    /// This table and every later one wait for a later run, which
+    /// [`OptimizeReport::resume_at`] starts at.
+    ByteBudget,
+}
+
+/// What a per-table ceiling measures, all from the table's plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResourceMeasure {
+    /// The fragments the compaction plan rewrites.
+    SourceFragments,
+    /// Their rows.
+    SourceRows,
+    /// The bytes of their data, overlay and deletion files.
+    SourceBytes,
+    /// Their managed Blob payload, from descriptors; external references
+    /// count nothing.
+    BlobBytes,
+    /// The table's rows, when the run would rebuild or build an index over it.
+    IndexRows,
+}
+
+impl ResourceMeasure {
+    /// Stable machine-readable token for serialized output. Once emitted this
+    /// is part of the output contract — keep it stable.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResourceMeasure::SourceFragments => "source_fragments",
+            ResourceMeasure::SourceRows => "source_rows",
+            ResourceMeasure::SourceBytes => "source_bytes",
+            ResourceMeasure::BlobBytes => "blob_bytes",
+            ResourceMeasure::IndexRows => "index_rows",
+        }
     }
 }
 
-/// Per-dataset outcome of `optimize_all_datasets`. This is a returned result type,
+/// A table's plan against one ceiling. `measured` is `None` when the plan
+/// records no size to count (a fragment without a row count, a Blob field
+/// the descriptors cannot size); otherwise counting stopped once it passed
+/// the ceiling, so it is a lower bound. A size that could not be read from
+/// storage is the table's failure, not a deferral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceExceeded {
+    pub measure: ResourceMeasure,
+    pub measured: Option<u64>,
+    pub ceiling: u64,
+}
+
+impl DeferReason {
+    /// Stable machine-readable token for serialized output. Once emitted this
+    /// is part of the output contract — keep it stable.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeferReason::GateHoldLimit => "gate_hold_limit",
+            DeferReason::Cancelled => "cancelled",
+            DeferReason::ResourceLimit(_) => "resource_limit",
+            DeferReason::ByteBudget => "byte_budget",
+        }
+    }
+}
+
+impl std::fmt::Display for DeferReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DeferReason::GateHoldLimit => "the run reached its writer-gate hold limit",
+            DeferReason::Cancelled => "the run was cancelled",
+            DeferReason::ResourceLimit(ResourceExceeded {
+                measure,
+                measured: Some(measured),
+                ceiling,
+            }) => {
+                return write!(
+                    f,
+                    "{} of at least {measured} pass the table ceiling of {ceiling}",
+                    measure.as_str()
+                );
+            }
+            DeferReason::ResourceLimit(ResourceExceeded {
+                measure,
+                measured: None,
+                ..
+            }) => {
+                return write!(f, "{} could not be measured", measure.as_str());
+            }
+            DeferReason::ByteBudget => "the run's byte budget is spent",
+        })
+    }
+}
+
+/// Per-table outcome of `optimize_all_datasets`. This is a returned result type,
 /// not built by callers, so it is `#[non_exhaustive]`: future fields stay
 /// non-breaking and downstream code reads fields rather than constructing it.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DatasetOptimizeStats {
-    /// Qualified graph type key, or `__manifest` for the system dataset.
+    /// Qualified graph type key.
     pub type_key: String,
+    /// What the run did to this table.
+    pub outcome: TableOptimizeOutcome,
     /// Number of source fragments that were rewritten by Lance.
     pub fragments_removed: usize,
     /// Number of new, larger fragments Lance produced.
     pub fragments_added: usize,
-    /// Whether this dataset advanced to a new Lance version that this run
-    /// published through the graph manifest. This may result from compaction,
-    /// index maintenance or materialization, or stale `auto_cleanup` removal.
-    pub committed: bool,
-    /// `Some(reason)` if this dataset was deliberately not compacted. When set,
-    /// `fragments_removed == 0`, `fragments_added == 0`, and `!committed`.
-    pub skipped: Option<SkipReason>,
-    /// Published dataset version observed by optimize for drift skips. `None` for
-    /// normal compaction/no-op outcomes.
-    pub published_dataset_version: Option<u64>,
-    /// Lance HEAD version observed by optimize for drift skips. `None` for
-    /// normal compaction/no-op outcomes.
-    pub lance_head_version: Option<u64>,
     /// Index work deferred this run, with the reason and remedy: a vector
     /// property without trainable vectors, or full-text coverage requiring an
     /// explicit rebuild. Deferred work alone does not stage or publish.
     pub pending_indexes: Vec<super::PendingIndex>,
+    /// Time from the start of the table's planning to the end of its staging;
+    /// zero for a table the run did not start.
+    pub duration: Duration,
+    /// The error of a [`TableOptimizeOutcome::Failed`] table, carrying its
+    /// completion evidence (`BeforeEffect` or `Unpublished`).
+    pub failure: Option<Arc<OmniError>>,
+    /// The plan's source bytes, when a byte ceiling or the run's byte budget
+    /// measured them; what the table spent of the budget.
+    pub source_bytes: Option<u64>,
+    /// An index maintenance or coverage-reporting error after a link of this
+    /// table committed. All completed links are in the run's publication.
+    /// The next run plans any remaining work and checks coverage again.
+    pub index_failure: Option<Arc<OmniError>>,
 }
 
 impl DatasetOptimizeStats {
-    /// Stat for a dataset that Lance actually compacted.
-    fn compacted(type_key: String, metrics: &CompactionMetrics, committed: bool) -> Self {
+    fn planned(type_key: String, metrics: &CompactionMetrics, committed: bool) -> Self {
         Self {
             type_key,
+            outcome: if committed {
+                TableOptimizeOutcome::Optimized
+            } else {
+                TableOptimizeOutcome::Unchanged
+            },
             fragments_removed: metrics.fragments_removed,
             fragments_added: metrics.fragments_added,
-            committed,
-            skipped: None,
-            published_dataset_version: None,
-            lance_head_version: None,
             pending_indexes: Vec::new(),
+            duration: Duration::ZERO,
+            failure: None,
+            source_bytes: None,
+            index_failure: None,
         }
+    }
+
+    fn deferred(type_key: String, reason: DeferReason) -> Self {
+        Self {
+            type_key,
+            outcome: TableOptimizeOutcome::Deferred(reason),
+            fragments_removed: 0,
+            fragments_added: 0,
+            pending_indexes: Vec::new(),
+            duration: Duration::ZERO,
+            failure: None,
+            source_bytes: None,
+            index_failure: None,
+        }
+    }
+
+    fn failed(type_key: String, failure: Arc<OmniError>, duration: Duration) -> Self {
+        Self {
+            type_key,
+            outcome: TableOptimizeOutcome::Failed,
+            fragments_removed: 0,
+            fragments_added: 0,
+            pending_indexes: Vec::new(),
+            duration,
+            failure: Some(failure),
+            source_bytes: None,
+            index_failure: None,
+        }
+    }
+
+    /// Whether this table advanced to a new Lance version that this run
+    /// published through the graph manifest: compaction, index maintenance or
+    /// materialization.
+    pub fn committed(&self) -> bool {
+        self.outcome == TableOptimizeOutcome::Optimized
+    }
+
+    /// The stable token that qualifies [`Self::outcome`] in serialized
+    /// output: why a deferred table was not started, or `index_failed` on an
+    /// optimized table with an index maintenance or coverage error after a
+    /// link committed ([`Self::index_failure`] holds the error). `None` for
+    /// every other table. Once emitted a token is part of the output
+    /// contract; keep it stable.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self.outcome {
+            TableOptimizeOutcome::Deferred(reason) => Some(reason.as_str()),
+            TableOptimizeOutcome::Optimized if self.index_failure.is_some() => Some("index_failed"),
+            _ => None,
+        }
+    }
+}
+
+/// The configuration clear that follows a run's publication under the writer
+/// gates: stale `lance.auto_cleanup.*` keys on `__manifest` are removed with
+/// one config-only commit. It never fails the run; the next run clears keys
+/// that are still present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConfigurationClear {
+    /// The keys were removed.
+    Cleared,
+    /// No key was present.
+    NothingToClear,
+    /// The keys are still present.
+    Failed(String),
+    /// Whether the removal committed has no definite answer.
+    Unknown(String),
+    /// The run was cancelled before its publication, so the clear did not run.
+    NotRun,
+}
+
+impl ConfigurationClear {
+    /// Stable machine-readable token for serialized output. Once emitted this
+    /// is part of the output contract — keep it stable.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConfigurationClear::Cleared => "cleared",
+            ConfigurationClear::NothingToClear => "nothing_to_clear",
+            ConfigurationClear::Failed(_) => "failed",
+            ConfigurationClear::Unknown(_) => "unknown",
+            ConfigurationClear::NotRun => "not_run",
+        }
+    }
+}
+
+/// The adjacency artifact refresh, after the writer gates are released. The
+/// artifact is derived state: a stale or missing one is rejected on load and
+/// rebuilt in memory, so no outcome here changes an answer or fails the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ArtifactRefresh {
+    /// A new artifact was written.
+    Refreshed,
+    /// No edge table advanced and an artifact exists.
+    Unchanged,
+    /// Deliberately not built.
+    Skipped(ArtifactSkip),
+    /// The build or the write failed; traversals keep building in memory.
+    Failed(String),
+}
+
+impl ArtifactRefresh {
+    /// Stable machine-readable token for serialized output. Once emitted this
+    /// is part of the output contract — keep it stable.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ArtifactRefresh::Refreshed => "refreshed",
+            ArtifactRefresh::Unchanged => "unchanged",
+            ArtifactRefresh::Skipped(_) => "skipped",
+            ArtifactRefresh::Failed(_) => "failed",
+        }
+    }
+}
+
+/// Why a run did not build the adjacency artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ArtifactSkip {
+    /// The catalog declares no edge type.
+    NoEdgeTypes,
+    /// A declared edge type has no table yet, so the artifact has no complete
+    /// identity to stamp.
+    IncompleteEdgeTables,
+    /// The run was cancelled: the refresh stopped before its write, or
+    /// never started.
+    Cancelled,
+    /// The artifact would pass `OptimizeLimits::artifact_bytes`: its lower
+    /// bound did before the scan, or the counting build's running bound did
+    /// during it. `counted` is that bound; nothing was written.
+    SizeLimit { counted: u64, limit: u64 },
+}
+
+impl ArtifactSkip {
+    /// Stable machine-readable token for serialized output. Once emitted this
+    /// is part of the output contract — keep it stable.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ArtifactSkip::NoEdgeTypes => "no_edge_types",
+            ArtifactSkip::IncompleteEdgeTables => "incomplete_edge_tables",
+            ArtifactSkip::Cancelled => "cancelled",
+            ArtifactSkip::SizeLimit { .. } => "size_limit",
+        }
+    }
+}
+
+/// What one optimize run did. A returned result type, so `#[non_exhaustive]`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct OptimizeReport {
+    /// main's graph head as the run captured it under the writer gates: the
+    /// parent of the commit the run publishes.
+    pub input_commit: Option<String>,
+    /// The `__manifest` version of that head.
+    pub input_manifest_version: u64,
+    /// The graph commit the run published; `None` when it staged no table.
+    pub graph_commit_id: Option<String>,
+    /// One entry per table the run considered, in the order it visited them.
+    pub datasets: Vec<DatasetOptimizeStats>,
+    /// The first table a full-catalog run deferred because of a run-wide
+    /// bound. A full-catalog run that passes it as `start_at` visits it
+    /// first. `None` when the run stopped on no bound, and for a `datasets`
+    /// request, which neither reads nor moves the resume position.
+    pub resume_at: Option<String>,
+    /// How long the run held main's writer gates, from acquisition to release.
+    pub gate_hold: Duration,
+    /// The configuration clear, under the gates after the publication.
+    pub configuration_clear: ConfigurationClear,
+    /// The adjacency artifact refresh, after the gates are released.
+    pub artifact: ArtifactRefresh,
+    /// Whether a cancellation stopped the run.
+    pub cancellation: RunCancellation,
+}
+
+/// What a run's cancellation handle did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RunCancellation {
+    /// No cancellation was requested.
+    NotRequested,
+    /// The run stopped at a boundary before its publication and published
+    /// nothing: every table it had not finished, and every staged one, is
+    /// `deferred(cancelled)`.
+    Cancelled,
+    /// The cancellation arrived after the run passed its last check before
+    /// the publication, so the run finished. The artifact refresh stopped
+    /// before its write, or, if the write had already started, completed.
+    ArrivedLate,
+}
+
+impl RunCancellation {
+    /// Stable machine-readable token for serialized output. Once emitted this
+    /// is part of the output contract — keep it stable.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunCancellation::NotRequested => "not_requested",
+            RunCancellation::Cancelled => "cancelled",
+            RunCancellation::ArrivedLate => "arrived_late",
+        }
+    }
+}
+
+/// A request to stop a run at its next safe boundary: before a table's plan,
+/// before its rewrite, and before the publication. A table in progress is
+/// dropped where it stands; its detached effects stay unreachable. Clones
+/// share one request.
+#[derive(Debug, Clone, Default)]
+pub struct OptimizeCancellation(Arc<CancellationState>);
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    requested: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl OptimizeCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0
+            .requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// How many tables a run plans ahead of the ones it rewrites, and how many it
+/// rewrites at once. Planning only reads. `rewrite` is also the width of the
+/// run's one budget of heavy steps across those tables (compaction tasks and
+/// index builds; `MaintenanceBudget`), so a lone table may run that many of
+/// its compaction tasks at once and the run never runs more steps at once
+/// than `rewrite` (#1384); a full-text or vector build takes the whole
+/// budget, and at most `INDEX_BUILD_CONCURRENCY` BTREEs build at once (#1385).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptimizeConcurrency {
+    pub planning: usize,
+    pub rewrite: usize,
+}
+
+impl OptimizeConcurrency {
+    pub fn new(planning: usize, rewrite: usize) -> Self {
+        Self { planning, rewrite }
+    }
+
+    /// The direct path's setting: both from `OMNIGRAPH_MAINTENANCE_CONCURRENCY`
+    /// (default 8).
+    pub fn from_env() -> Self {
+        let concurrency = maint_concurrency();
+        Self::new(concurrency, concurrency)
+    }
+}
+
+/// Bounds on one run. An absent limit does not bound it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OptimizeLimits {
+    /// Stop starting tables once the run has held main's writer gates this
+    /// long. The first table always starts, so every run makes progress; the
+    /// wait of a writer that queued for the gates is at most this, plus the
+    /// tables already started, the publication and the configuration clear.
+    /// Those tables share the run's budget, so their full-text and vector
+    /// builds run one at a time.
+    pub max_gate_hold: Option<Duration>,
+    /// Ceilings on one table's plan, checked before its first write.
+    pub table: TableCeilings,
+    /// Total source bytes across the tables the run starts. It is also the
+    /// table byte ceiling when that is unset, and refuses a larger one, so a
+    /// first table within its ceilings always fits.
+    pub run_source_bytes: Option<u64>,
+    /// The largest adjacency artifact the run writes, in bytes of the whole
+    /// object. Over it, the artifact is `skipped(size_limit)` and a load
+    /// rebuilds the adjacency in memory.
+    pub artifact_bytes: Option<u64>,
+}
+
+impl OptimizeLimits {
+    pub fn with_max_gate_hold(mut self, hold: Duration) -> Self {
+        self.max_gate_hold = Some(hold);
+        self
+    }
+
+    pub fn with_table_ceilings(mut self, ceilings: TableCeilings) -> Self {
+        self.table = ceilings;
+        self
+    }
+
+    pub fn with_run_source_bytes(mut self, budget: u64) -> Self {
+        self.run_source_bytes = Some(budget);
+        self
+    }
+
+    pub fn with_artifact_bytes(mut self, limit: u64) -> Self {
+        self.artifact_bytes = Some(limit);
+        self
+    }
+
+    /// The table byte ceiling in force: the explicit one, else the budget.
+    fn table_source_bytes(&self) -> Option<u64> {
+        self.table.source_bytes.or(self.run_source_bytes)
+    }
+}
+
+/// Ceilings on one table's plan; an absent one is not measured. A table over
+/// any of them is `deferred(resource_limit)` and nothing is written for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TableCeilings {
+    pub source_fragments: Option<u64>,
+    pub source_rows: Option<u64>,
+    pub source_bytes: Option<u64>,
+    pub blob_bytes: Option<u64>,
+    pub index_rows: Option<u64>,
+}
+
+impl TableCeilings {
+    pub fn with_source_fragments(mut self, ceiling: u64) -> Self {
+        self.source_fragments = Some(ceiling);
+        self
+    }
+
+    pub fn with_source_rows(mut self, ceiling: u64) -> Self {
+        self.source_rows = Some(ceiling);
+        self
+    }
+
+    pub fn with_source_bytes(mut self, ceiling: u64) -> Self {
+        self.source_bytes = Some(ceiling);
+        self
+    }
+
+    pub fn with_blob_bytes(mut self, ceiling: u64) -> Self {
+        self.blob_bytes = Some(ceiling);
+        self
+    }
+
+    pub fn with_index_rows(mut self, ceiling: u64) -> Self {
+        self.index_rows = Some(ceiling);
+        self
+    }
+}
+
+/// What a run's before-publish hook receives.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct OptimizePublication {
+    /// The nonce of the commit's lineage intent. History stores the commit
+    /// under an id chosen per publish attempt (`hb1.{block}.{slot}.{nonce}`);
+    /// `omnigraph_core::graph_commit_id::commit_id_answers` matches such an id
+    /// to this nonce.
+    pub nonce: String,
+    /// The graph head every publish attempt reads: the commit's parent.
+    pub input_commit: Option<String>,
+    /// The `__manifest` version of that head.
+    pub input_manifest_version: u64,
+    /// One outcome for every table the run considered, as the report lists them.
+    pub datasets: Vec<DatasetOptimizeStats>,
+}
+
+/// Called once, after the run's tables are staged and prepared and before the
+/// publisher's first attempt; a run that stages no table never calls it. An
+/// error publishes nothing and fails the run with `Unpublished` evidence.
+#[derive(Clone)]
+pub struct OptimizeBeforePublish(
+    Arc<dyn Fn(OptimizePublication) -> BoxFuture<'static, Result<()>> + Send + Sync>,
+);
+
+impl OptimizeBeforePublish {
+    pub fn new<F, Fut>(hook: F) -> Self
+    where
+        F: Fn(OptimizePublication) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        Self(Arc::new(move |publication| Box::pin(hook(publication))))
+    }
+}
+
+impl std::fmt::Debug for OptimizeBeforePublish {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OptimizeBeforePublish(..)")
+    }
+}
+
+/// Where a run's write authority is captured when main moved between the
+/// capture before the gates and the gates themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthorityCapture {
+    /// The direct path: the capture before the gates is the attempt's
+    /// authority, and a head that moved while the run waited refuses the run
+    /// before any effect. Outside a serving process no gate fences the writer
+    /// that moved it, so the refusal is the evidence of that writer.
+    #[default]
+    BeforeGates,
+    /// The served path: writers in the same process move main while the run
+    /// waits for its gates, and no writer can move it while they are held, so
+    /// a moved head is captured again under the gates and that capture is the
+    /// attempt's one authority, never a mix of the two.
+    UnderGates,
+}
+
+/// What one optimize run is asked to do. The default is the direct run as it
+/// has always been: every table on main, no bound, and both concurrencies from
+/// `OMNIGRAPH_MAINTENANCE_CONCURRENCY`.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct OptimizeRequest {
+    /// Only these table keys (`node:<Type>`, `edge:<Type>`), in this order.
+    /// A key that names no declared type is refused before any effect.
+    pub datasets: Option<Vec<String>>,
+    /// For a full-catalog run: start at this table key, or at the first key
+    /// after it when no table has it, and wrap around, so the run visits every
+    /// table at most once.
+    pub start_at: Option<String>,
+    pub limits: OptimizeLimits,
+    /// `None` reads [`OptimizeConcurrency::from_env`].
+    pub concurrency: Option<OptimizeConcurrency>,
+    pub before_publish: Option<OptimizeBeforePublish>,
+    pub cancellation: Option<OptimizeCancellation>,
+    pub authority: AuthorityCapture,
+}
+
+impl OptimizeRequest {
+    pub fn with_authority(mut self, authority: AuthorityCapture) -> Self {
+        self.authority = authority;
+        self
+    }
+
+    pub fn with_datasets<I, S>(mut self, table_keys: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.datasets = Some(table_keys.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_start_at(mut self, table_key: impl Into<String>) -> Self {
+        self.start_at = Some(table_key.into());
+        self
+    }
+
+    pub fn with_limits(mut self, limits: OptimizeLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn with_concurrency(mut self, concurrency: OptimizeConcurrency) -> Self {
+        self.concurrency = Some(concurrency);
+        self
+    }
+
+    pub fn with_before_publish(mut self, hook: OptimizeBeforePublish) -> Self {
+        self.before_publish = Some(hook);
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: OptimizeCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// The tables this request visits, in order, out of the catalog's sorted
+    /// keys. Refuses a malformed request before any effect.
+    fn visit_order(&self, table_keys: &[String]) -> Result<Vec<String>> {
+        if let Some(concurrency) = self.concurrency
+            && (concurrency.planning == 0 || concurrency.rewrite == 0)
+        {
+            return Err(OmniError::manifest(
+                "optimize concurrency must be at least 1 for planning and rewriting",
+            ));
+        }
+        if let (Some(table), Some(budget)) =
+            (self.limits.table.source_bytes, self.limits.run_source_bytes)
+            && table > budget
+        {
+            return Err(OmniError::manifest(format!(
+                "optimize table byte ceiling {table} exceeds the run byte budget {budget}"
+            )));
+        }
+        let Some(tables) = &self.datasets else {
+            let start = self
+                .start_at
+                .as_ref()
+                .map_or(0, |start| table_keys.partition_point(|key| key < start));
+            let mut order = table_keys[start..].to_vec();
+            order.extend_from_slice(&table_keys[..start]);
+            return Ok(order);
+        };
+        if self.start_at.is_some() {
+            return Err(OmniError::manifest(
+                "optimize takes a start position only for a full-catalog run, not with a table list",
+            ));
+        }
+        if tables.is_empty() {
+            return Err(OmniError::manifest("optimize table list is empty"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for table in tables {
+            if table_keys.binary_search(table).is_err() {
+                return Err(OmniError::manifest(format!(
+                    "optimize table '{table}' names no node or edge type"
+                )));
+            }
+            if !seen.insert(table.as_str()) {
+                return Err(OmniError::manifest(format!(
+                    "optimize table '{table}' is listed twice"
+                )));
+            }
+        }
+        Ok(tables.clone())
     }
 }
 
@@ -177,10 +814,20 @@ struct PreparedOptimizeTable {
     initial_snapshot: crate::storage_layer::SnapshotHandle,
     witness: crate::table_store::StagingWitness,
     last_linear_version: Option<u64>,
+    /// The compaction plan made for `initial_snapshot`, measured against the
+    /// ceilings and executed as it is: staging does not plan again.
+    plan: lance::dataset::optimize::CompactionPlan,
+    /// Declared indexes already known to be pending if a later link fails
+    /// before the table can plan its index build again.
+    pending_indexes: Vec<super::PendingIndex>,
+    /// The plan's source bytes, measured when a byte ceiling or the run's
+    /// byte budget is set.
+    source_bytes: Option<u64>,
 }
 
 enum OptimizePreparation {
-    Work(PreparedOptimizeTable),
+    /// Boxed: the prepared table carries its compaction plan.
+    Work(Box<PreparedOptimizeTable>),
     Stat(DatasetOptimizeStats),
 }
 
@@ -208,49 +855,158 @@ decide_seam! {
     pub static OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES = ("optimize.post_authority_capture_pre_gates", Unreachable, [Fail]);
 }
 
-/// Run Lance maintenance across every node + edge dataset on `main` under one
-/// graph visibility envelope. Physical dataset work remains bounded-parallel,
-/// but every productive dataset stages detached and the batch publishes once
-/// with an exact pin CAS, so one public Optimize produces at most one graph
-/// commit. The publisher owns main's `__manifest` fragment layout; maintenance
-/// only removes obsolete automatic-cleanup configuration from that dataset.
-pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimizeStats>> {
-    let _export_exclusion = db.reserve_export_destructive_control()?;
-    db.ensure_schema_state_valid().await?;
+/// Run Lance maintenance across the node + edge datasets on `main` that
+/// `request` selects, under one graph visibility envelope. Tables are visited
+/// in order: up to `concurrency.planning` are planned ahead of the ones being
+/// rewritten, rewrites start in visit order, and every productive dataset
+/// stages detached. The batch publishes once with an exact pin CAS, so one
+/// public Optimize produces at most one graph commit. Once the run has held
+/// the writer gates for `max_gate_hold`, it starts no further table and
+/// reports the rest deferred. The publisher owns main's `__manifest` fragment
+/// layout; maintenance only removes obsolete automatic-cleanup configuration
+/// from that dataset, under the gates, and refreshes the adjacency artifact
+/// after releasing them.
+pub async fn optimize_all_datasets(
+    db: &Omnigraph,
+    actor: Option<&str>,
+    request: OptimizeRequest,
+) -> Result<OptimizeReport> {
+    // A policy denial keeps its typed shape, as at every `_as` door. Nothing
+    // durable happens before the first table's staging, so every other
+    // refusal up to there carries `BeforeEffect`.
+    db.enforce(
+        omnigraph_policy::PolicyAction::Maintain,
+        &omnigraph_policy::ResourceScope::Branch("main".to_string()),
+        actor,
+    )?;
+    let concurrency = request
+        .concurrency
+        .unwrap_or_else(OptimizeConcurrency::from_env);
+    let _export_exclusion = db
+        .reserve_export_destructive_control()
+        .map_err(OmniError::before_effect)?;
+    db.ensure_schema_state_valid()
+        .await
+        .map_err(OmniError::before_effect)?;
 
     // Capture complete graph authority before entering any writer gate, then
     // revalidate it after schema -> main -> table acquisition. A concurrent
-    // graph or schema publish therefore refuses this attempt before any
-    // physical maintenance effect.
-    let authority_txn = db.open_write_txn(None).await?;
-    fail(&OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES)?;
+    // graph or schema publish refuses this attempt before any physical
+    // maintenance effect, or, when the request captures under the gates, is
+    // read again there (`AuthorityCapture`).
+    let authority_txn = db
+        .open_write_txn(None)
+        .await
+        .map_err(OmniError::before_effect)?;
+    fail(&OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES).map_err(OmniError::before_effect)?;
 
     // Canonical writer order: schema -> branch -> sorted tables. Planning reads
     // catalog index intent, so it must use an operation-local accepted catalog
     // under the same schema gate as schema apply and the exact RFC-022 writers.
-    let schema_permit = db.write_queue().acquire_schema_shared().await;
-    db.refresh_coordinator_only().await?;
-    let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
+    let schema_permit = db.write_queue().acquire_schema_shared().await?;
+    db.refresh_coordinator_only()
+        .await
+        .map_err(OmniError::before_effect)?;
+    let catalog = db
+        .load_accepted_catalog_with_schema_gate_held()
+        .await
+        .map_err(OmniError::before_effect)?;
+    let table_keys = all_table_keys(&catalog);
+    let visit_order = request
+        .visit_order(&table_keys)
+        .map_err(OmniError::before_effect)?;
+    let full_catalog = request.datasets.is_none();
+
+    // A run cancelled before it holds main's gates (while it waits for the
+    // gates behind writers) stops there, holding
+    // only the shared schema permit that writers also share: it must not
+    // queue for main's gates, nor hold them, only to report every table
+    // cancelled.
+    let cancelled_before_gates = || OptimizeReport {
+        input_commit: authority_txn.authority.graph_head.clone(),
+        input_manifest_version: authority_txn.base.graph_manifest_version(),
+        graph_commit_id: None,
+        datasets: visit_order
+            .iter()
+            .filter(|table_key| authority_txn.base.dataset(table_key).is_some())
+            .map(|table_key| {
+                DatasetOptimizeStats::deferred(table_key.clone(), DeferReason::Cancelled)
+            })
+            .collect(),
+        resume_at: None,
+        gate_hold: Duration::ZERO,
+        configuration_clear: ConfigurationClear::NotRun,
+        artifact: ArtifactRefresh::Skipped(ArtifactSkip::Cancelled),
+        cancellation: RunCancellation::Cancelled,
+    };
+    if request
+        .cancellation
+        .as_ref()
+        .is_some_and(OptimizeCancellation::is_cancelled)
+    {
+        drop(schema_permit);
+        return Ok(cancelled_before_gates());
+    }
 
     // Optimize's one visibility point advances main's graph head, so its
     // authority is branch-wide even though physical effects are table-local.
-    let _main_branch_guard = db.write_queue().acquire_branch(None).await;
-
-    let table_keys = all_table_keys(&catalog);
     let queue_keys = table_keys
         .iter()
         .map(|table_key| (table_key.clone(), None))
         .collect::<Vec<_>>();
-    let table_guards = db.write_queue().acquire_many(&queue_keys).await;
+    let gates = async {
+        let main_branch_guard = db.write_queue().acquire_branch(None).await?;
+        let table_guards = db.write_queue().acquire_many(&queue_keys).await?;
+        Ok::<_, OmniError>((main_branch_guard, table_guards))
+    };
+    // A gate wait dropped before it holds leaves the queue as it was.
+    let (main_branch_guard, table_guards) = match request.cancellation.as_ref() {
+        Some(cancellation) => tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                drop(schema_permit);
+                return Ok(cancelled_before_gates());
+            }
+            gates = gates => gates?,
+        },
+        None => gates.await?,
+    };
+    let gates_acquired = Instant::now();
 
-    let snapshot = db.revalidate_write_txn(&authority_txn).await?;
+    // Under the gates no writer in this process can move main, so a capture
+    // taken here is coherent on its own (invariant 3): the served path takes
+    // it when the one before the gates has moved, and the direct path keeps
+    // the refusal.
+    let (authority_txn, snapshot) = match db.revalidate_write_txn(&authority_txn).await {
+        Ok(snapshot) => (authority_txn, snapshot),
+        Err(error)
+            if request.authority == AuthorityCapture::UnderGates && error.is_read_set_changed() =>
+        {
+            tracing::info!(
+                target: "omnigraph::optimize",
+                error = %error,
+                "main moved before optimize held its gates; capturing its authority under them"
+            );
+            let recaptured = db
+                .open_write_txn(None)
+                .await
+                .map_err(OmniError::before_effect)?;
+            let snapshot = db
+                .revalidate_write_txn(&recaptured)
+                .await
+                .map_err(OmniError::before_effect)?;
+            (recaptured, snapshot)
+        }
+        Err(error) => return Err(error.before_effect()),
+    };
+    let input_commit = authority_txn.authority.graph_head.clone();
+    let input_manifest_version = authority_txn.base.graph_manifest_version();
 
-    // Whether this run advanced any edge table — consumed by the graph-index
-    // artifact gate at the tail (a no-work optimize skips the rebuild+PUT).
-    let mut edge_tables_committed = false;
-
-    let witness = authority_txn.authority.staging_witness()?;
-    let table_tasks = table_keys
+    let witness = authority_txn
+        .authority
+        .staging_witness()
+        .map_err(OmniError::before_effect)?;
+    let table_tasks = visit_order
         .into_iter()
         .filter_map(|table_key| {
             let entry = snapshot.dataset(&table_key)?;
@@ -265,103 +1021,394 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
         })
         .collect::<Vec<_>>();
 
-    let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
+    // A hold the clock cannot add to now is past any deadline the run could
+    // reach, so it bounds nothing; `Instant + Duration` would panic here,
+    // with the gates held.
+    let deadline = request
+        .limits
+        .max_gate_hold
+        .and_then(|hold| gates_acquired.checked_add(hold));
+    let cancellation = request.cancellation.as_ref();
+    let cancel_requested = || cancellation.is_some_and(OptimizeCancellation::is_cancelled);
+    let visited = run_table_pipeline(
+        db,
+        &catalog,
+        table_tasks,
+        concurrency,
+        deadline,
+        request.limits,
+        cancellation,
+    )
+    .await?;
+    // The last cancellation point: once past it, the run publishes.
+    let cancelled = visited.cancelled || cancel_requested();
 
-    let preparations: Vec<Result<OptimizePreparation>> = futures::stream::iter(table_tasks)
-        .map(|task| {
-            let catalog = std::sync::Arc::clone(&catalog);
-            async move { prepare_optimize_table(db, catalog.as_ref(), task).await }
-        })
-        .buffer_unordered(concurrency)
-        .collect()
+    let mut updates = Vec::new();
+    let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
+    let mut tables = Vec::with_capacity(visited.tables.len());
+    for (mut stat, effect) in visited.tables {
+        if cancelled && effect.is_some() {
+            let duration = stat.duration;
+            stat = DatasetOptimizeStats::deferred(stat.type_key, DeferReason::Cancelled);
+            stat.duration = duration;
+        } else if let Some(effect) = effect {
+            expected_versions.insert(
+                effect.update.identity,
+                crate::db::manifest::TableVersionExpectation {
+                    table_key: effect.update.type_key.clone(),
+                    table_version: effect.expected_version,
+                    native_ref: crate::db::manifest::NativeRefPin::Exact(None),
+                },
+            );
+            updates.push(effect.update);
+        }
+        tables.push(stat);
+    }
+    let edge_tables_committed = updates
+        .iter()
+        .any(|update| update.type_key.starts_with("edge:"));
+    let mut graph_commit_id = None;
+    if !updates.is_empty() {
+        fail(&OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT).map_err(OmniError::unpublished)?;
+        let lineage = db
+            .new_lineage_intent_for_branch(None, actor, HistoryReleaseBytes::PRODUCTION)
+            .await
+            .map_err(OmniError::unpublished)?;
+        let before_publish = request.before_publish.as_ref().map(|hook| {
+            let hook = hook.0.clone();
+            let tables = tables.clone();
+            move |intent: super::table_ops::PublicationIntent| {
+                hook(OptimizePublication {
+                    nonce: intent.nonce,
+                    input_commit: intent.input_commit,
+                    input_manifest_version: intent.input_manifest_version,
+                    datasets: tables.clone(),
+                })
+            }
+        });
+        let commit = super::table_ops::commit_updates_on_branch_with_expected(
+            db,
+            None,
+            &updates,
+            &expected_versions,
+            actor,
+            &authority_txn,
+            lineage,
+            super::table_ops::Publication::Publish,
+            before_publish
+                .as_ref()
+                .map(|hook| hook as super::table_ops::BeforePublishHook<'_>),
+        )
         .await;
-
-    let mut prepared = Vec::new();
-    let mut stats = Vec::new();
-    for preparation in preparations {
-        match preparation? {
-            OptimizePreparation::Work(work) => prepared.push(work),
-            OptimizePreparation::Stat(stat) => stats.push(stat),
-        }
+        graph_commit_id = Some(commit?.graph_commit_id);
+        db.runtime_cache.invalidate_all().await;
     }
-    prepared.sort_by(|left, right| left.table_key.cmp(&right.table_key));
 
-    if !prepared.is_empty() {
-        let effect_concurrency = maint_concurrency().min(prepared.len()).max(1);
-        let effect_results: Vec<Result<OptimizeEffectOutcome>> = futures::stream::iter(prepared)
-            .map(|work| {
-                let catalog = std::sync::Arc::clone(&catalog);
-                async move { apply_optimize_table_effects(db, catalog.as_ref(), work).await }
-            })
-            .buffer_unordered(effect_concurrency)
-            .collect()
-            .await;
-        let mut outcomes = Vec::new();
-        for result in effect_results {
-            outcomes.push(result?);
-        }
-        fail(&OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
-        let mut updates = Vec::new();
-        let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
-        for outcome in &mut outcomes {
-            if let Some(effect) = outcome.effect.take() {
-                expected_versions.insert(
-                    effect.update.identity,
-                    crate::db::manifest::TableVersionExpectation {
-                        table_key: effect.update.type_key.clone(),
-                        table_version: effect.expected_version,
-                        native_ref: crate::db::manifest::NativeRefPin::Exact(None),
-                    },
-                );
-                updates.push(effect.update);
-            }
-        }
-        let any_committed = !updates.is_empty();
-        let edge_committed = updates
-            .iter()
-            .any(|update| update.type_key.starts_with("edge:"));
-        if any_committed {
-            let lineage = db
-                .new_lineage_intent_for_branch(None, None, HistoryReleaseBytes::PRODUCTION)
-                .await?;
-            super::table_ops::commit_updates_on_branch_with_expected(
-                db,
-                None,
-                &updates,
-                &expected_versions,
-                None,
-                &authority_txn,
-                lineage,
-                super::table_ops::Publication::Publish,
-            )
-            .await?;
-        }
-        edge_tables_committed = edge_committed;
-        stats.extend(outcomes.into_iter().map(|outcome| outcome.stat));
-        if any_committed {
-            db.runtime_cache.invalidate_all().await;
-            if edge_committed {
-                db.invalidate_graph_index().await;
-            }
-        }
-    }
-    stats.sort_by(|left, right| left.type_key.cmp(&right.type_key));
-
+    // The graph commit is durable from here: nothing below fails the run. A
+    // cancelled run published nothing and leaves the configuration as is.
+    let configuration_clear = if cancelled {
+        ConfigurationClear::NotRun
+    } else {
+        clear_manifest_auto_cleanup(db).await
+    };
+    let gate_hold = gates_acquired.elapsed();
     drop(table_guards);
+    drop(main_branch_guard);
     drop(schema_permit);
 
-    let mut all = stats.into_iter().map(Ok).collect::<Vec<Result<_>>>();
-    all.push(clear_manifest_auto_cleanup(db).await);
+    let artifact = if cancelled {
+        ArtifactRefresh::Skipped(ArtifactSkip::Cancelled)
+    } else {
+        // A cancellation that arrives from here on is the refresh's own to
+        // see: it stops the refresh before its write.
+        match persist_graph_index_artifact(
+            db,
+            &catalog,
+            edge_tables_committed,
+            request.limits.artifact_bytes,
+            cancellation,
+        )
+        .await
+        {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                tracing::warn!(
+                    target: "omnigraph::optimize",
+                    error = %error,
+                    "graph index artifact persist failed; traversals keep building in memory"
+                );
+                ArtifactRefresh::Failed(error.to_string())
+            }
+        }
+    };
 
-    if let Err(error) = persist_graph_index_artifact(db, &catalog, edge_tables_committed).await {
-        tracing::warn!(
-            target: "omnigraph::optimize",
-            error = %error,
-            "graph index artifact persist failed; traversals keep building in memory"
-        );
+    let cancellation = match (cancelled, cancel_requested()) {
+        (true, _) => RunCancellation::Cancelled,
+        (false, true) => RunCancellation::ArrivedLate,
+        (false, false) => RunCancellation::NotRequested,
+    };
+    Ok(OptimizeReport {
+        input_commit,
+        input_manifest_version,
+        graph_commit_id,
+        datasets: tables,
+        // A cancelled run moved nothing, so the next run starts where this one did.
+        resume_at: visited.resume_at.filter(|_| full_catalog && !cancelled),
+        gate_hold,
+        configuration_clear,
+        artifact,
+        cancellation,
+    })
+}
+
+/// The tables a run visited, in visit order, each with its staged effect if
+/// it has one, the first table the gate hold deferred, and whether a
+/// cancellation stopped the pipeline.
+struct VisitedTables {
+    tables: Vec<(DatasetOptimizeStats, Option<OptimizeTableEffect>)>,
+    resume_at: Option<String>,
+    cancelled: bool,
+}
+
+/// Why the pipeline stopped starting tables.
+#[derive(Clone, Copy)]
+enum PipelineStop {
+    /// A run-wide bound (the gate hold or the byte budget) stopped the run at
+    /// this table's turn; rewrites already started finish.
+    Bound(usize, DeferReason),
+    /// A cancellation: every table in progress is dropped where it stands.
+    Cancelled,
+}
+
+type PlannedTable = (usize, Instant, Result<OptimizePreparation>);
+
+/// Plan and stage `tasks` in order under the held gates. Plans run up to
+/// `concurrency.planning` tables ahead; a table's rewrite starts only after
+/// every earlier table's has, with at most `concurrency.rewrite` at once.
+/// When a table's turn comes after `deadline`, that table and every later
+/// one are deferred and their plans, which only read, are dropped; the first
+/// table always starts. A cancellation, checked before every plan and every
+/// rewrite and awaited meanwhile, drops every table in progress. A table's
+/// planning failure is `BeforeEffect` and its staging failure `Unpublished`:
+/// either fails only that table. A failure whose evidence stays uncertain
+/// fails the run.
+async fn run_table_pipeline(
+    db: &Omnigraph,
+    catalog: &std::sync::Arc<omnigraph_compiler::catalog::Catalog>,
+    tasks: Vec<OptimizeTableTask>,
+    concurrency: OptimizeConcurrency,
+    deadline: Option<Instant>,
+    limits: OptimizeLimits,
+    cancellation: Option<&OptimizeCancellation>,
+) -> Result<VisitedTables> {
+    let keys = tasks
+        .iter()
+        .map(|task| task.table_key.clone())
+        .collect::<Vec<_>>();
+    let mut visited: Vec<Option<(DatasetOptimizeStats, Option<OptimizeTableEffect>)>> =
+        (0..keys.len()).map(|_| None).collect();
+    let plan = |index: usize, task: OptimizeTableTask| {
+        let catalog = std::sync::Arc::clone(catalog);
+        async move {
+            let started = Instant::now();
+            let result = prepare_optimize_table(db, catalog.as_ref(), task, &limits).await;
+            (index, started, result)
+        }
+    };
+    // #1384, #1385: the tables being rewritten share one budget of the
+    // rewrite concurrency for their heavy steps (compaction tasks and index
+    // builds), so a run never has more steps in flight than tables it may
+    // rewrite, a lone large table uses the idle slots, and at most
+    // `INDEX_BUILD_CONCURRENCY` BTREEs build together.
+    let budget = crate::table_store::MaintenanceBudget::new(concurrency.rewrite);
+    let budget = &budget;
+    let stage = |index: usize, started: Instant, work: PreparedOptimizeTable| {
+        let catalog = std::sync::Arc::clone(catalog);
+        async move {
+            let result = apply_optimize_table_effects(db, catalog.as_ref(), work, budget).await;
+            (index, started, result)
+        }
+    };
+
+    let mut unplanned = tasks.into_iter().enumerate().peekable();
+    let mut planning = FuturesOrdered::new();
+    let mut ready: VecDeque<PlannedTable> = VecDeque::new();
+    let mut staging = FuturesUnordered::new();
+    let mut turns = 0usize;
+    let mut spent = 0_u64;
+    let mut stop = None;
+    let cancel_requested = || cancellation.is_some_and(OptimizeCancellation::is_cancelled);
+
+    loop {
+        if stop.is_none() {
+            while planning.len() + ready.len() < concurrency.planning {
+                if cancel_requested() {
+                    stop = Some(PipelineStop::Cancelled);
+                    break;
+                }
+                let Some((index, task)) = unplanned.next() else {
+                    break;
+                };
+                planning.push_back(plan(index, task));
+            }
+            while stop.is_none() && staging.len() < concurrency.rewrite {
+                let Some((index, started, result)) = ready.pop_front() else {
+                    break;
+                };
+                if cancel_requested() {
+                    stop = Some(PipelineStop::Cancelled);
+                    break;
+                }
+                if turns > 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    stop = Some(PipelineStop::Bound(index, DeferReason::GateHoldLimit));
+                    break;
+                }
+                // A table's bytes never pass the budget alone, so the first
+                // table with work always fits.
+                if let (Some(budget), Ok(OptimizePreparation::Work(work))) =
+                    (limits.run_source_bytes, &result)
+                    && spent.saturating_add(work.source_bytes.unwrap_or(0)) > budget
+                {
+                    stop = Some(PipelineStop::Bound(index, DeferReason::ByteBudget));
+                    break;
+                }
+                turns += 1;
+                match result {
+                    Ok(OptimizePreparation::Stat(mut stat)) => {
+                        stat.duration = started.elapsed();
+                        visited[index] = Some((stat, None));
+                    }
+                    Ok(OptimizePreparation::Work(work)) => {
+                        spent = spent.saturating_add(work.source_bytes.unwrap_or(0));
+                        staging.push(stage(index, started, *work));
+                    }
+                    // Planning only reads.
+                    Err(error) => {
+                        let failure = table_failure(&keys[index], error.before_effect())?;
+                        visited[index] = Some((
+                            DatasetOptimizeStats::failed(
+                                keys[index].clone(),
+                                failure,
+                                started.elapsed(),
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
+            match stop {
+                Some(PipelineStop::Bound(..)) => {
+                    planning.clear();
+                    ready.clear();
+                }
+                Some(PipelineStop::Cancelled) => {
+                    planning.clear();
+                    ready.clear();
+                    staging.clear();
+                }
+                None => {}
+            }
+        }
+        // The fill above runs before the turns drain `ready`, so turns that
+        // stage nothing (a no-op plan, a deferral, a planning failure) can
+        // empty the pipeline while tables are still unplanned: go round
+        // again to plan them. Only a stop or a visited catalog ends the loop.
+        if planning.is_empty() && ready.is_empty() && staging.is_empty() {
+            if stop.is_none() && unplanned.peek().is_some() {
+                continue;
+            }
+            break;
+        }
+        // The deadline stops only a table whose turn has not come.
+        let timer = deadline.filter(|_| turns > 0 && turns < keys.len() && stop.is_none());
+        let awaiting_cancel =
+            cancellation.filter(|_| !matches!(stop, Some(PipelineStop::Cancelled)));
+        tokio::select! {
+            biased;
+            Some((index, started, result)) = staging.next(), if !staging.is_empty() => {
+                visited[index] = Some(match result {
+                    Ok(mut outcome) => {
+                        outcome.stat.duration = started.elapsed();
+                        (outcome.stat, outcome.effect)
+                    }
+                    // Staging writes only detached links no manifest names.
+                    Err(error) => {
+                        let error = error.with_completion_evidence(CompletionEvidence::Unpublished);
+                        let failure = table_failure(&keys[index], error)?;
+                        (
+                            DatasetOptimizeStats::failed(keys[index].clone(), failure, started.elapsed()),
+                            None,
+                        )
+                    }
+                });
+            }
+            Some(planned) = planning.next(), if !planning.is_empty() && stop.is_none() => {
+                ready.push_back(planned);
+            }
+            () = tokio::time::sleep_until(timer.unwrap_or_else(Instant::now)), if timer.is_some() => {
+                stop = Some(PipelineStop::Bound(turns, DeferReason::GateHoldLimit));
+                planning.clear();
+                ready.clear();
+            }
+            () = async {
+                if let Some(cancellation) = awaiting_cancel {
+                    cancellation.cancelled().await;
+                }
+            }, if awaiting_cancel.is_some() => {
+                stop = Some(PipelineStop::Cancelled);
+                planning.clear();
+                ready.clear();
+                staging.clear();
+            }
+        }
     }
 
-    all.into_iter().collect()
+    let (resume_at, unvisited) = match stop {
+        Some(PipelineStop::Bound(index, reason)) => (Some(keys[index].clone()), reason),
+        Some(PipelineStop::Cancelled) => (None, DeferReason::Cancelled),
+        // With no stop the loop ends only once every table was visited, so
+        // an unvisited table here is a broken exit, not a bound: fail the
+        // run rather than report a deferral no bound caused.
+        None => {
+            if let Some(index) = visited.iter().position(Option::is_none) {
+                return Err(OmniError::manifest_internal(format!(
+                    "optimize pipeline returned with {} unvisited and no stop",
+                    keys[index]
+                ))
+                .with_completion_evidence(CompletionEvidence::Unpublished));
+            }
+            (None, DeferReason::GateHoldLimit)
+        }
+    };
+    let tables = visited
+        .into_iter()
+        .zip(keys)
+        .map(|(entry, key)| {
+            entry.unwrap_or_else(|| (DatasetOptimizeStats::deferred(key, unvisited), None))
+        })
+        .collect();
+    Ok(VisitedTables {
+        tables,
+        resume_at,
+        cancelled: matches!(stop, Some(PipelineStop::Cancelled)),
+    })
+}
+
+/// Keep a table's failure with its table when its evidence is definite; any
+/// other failure, an uncertain one above all, fails the run.
+fn table_failure(table_key: &str, error: OmniError) -> Result<Arc<OmniError>> {
+    match error.completion_evidence() {
+        Some(CompletionEvidence::BeforeEffect | CompletionEvidence::Unpublished) => {
+            tracing::warn!(
+                target: "omnigraph::optimize",
+                table = table_key,
+                error = %error,
+                "optimize left a table unchanged after its own failure"
+            );
+            Ok(Arc::new(error))
+        }
+        _ => Err(error),
+    }
 }
 
 /// Build the full-catalog graph index from a fresh main snapshot and write it
@@ -379,14 +1426,79 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
 /// with no edge writes is likewise rewritten only by the next edge-committing
 /// optimize — the gate cannot cheaply see inside the object (a bounded read
 /// of the whole body is the only primitive; a ranged header read is the
-/// planned follow-up).
+/// planned follow-up). The caller holds no writer gate: the build reads one
+/// fresh snapshot, and the artifact's stamps name the table versions it read.
 async fn persist_graph_index_artifact(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     edge_tables_committed: bool,
-) -> Result<()> {
+    limit: Option<u64>,
+    cancellation: Option<&OptimizeCancellation>,
+) -> Result<ArtifactRefresh> {
+    // Everything before the write reads only, so a cancellation (a shutdown,
+    // a deployment) abandons it at its next await: the scan awaits once per
+    // batch, but the adjacency build and the serialization run without one,
+    // and a cancellation during them is seen only by the check before the
+    // write.
+    let prepare = prepare_graph_index_artifact(db, catalog, edge_tables_committed, limit);
+    let prepared = match cancellation {
+        Some(cancellation) => tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                return Ok(ArtifactRefresh::Skipped(ArtifactSkip::Cancelled));
+            }
+            prepared = prepare => prepared?,
+        },
+        None => prepare.await?,
+    };
+    let (uri, body) = match prepared {
+        Ok(write) => write,
+        Err(outcome) => return Ok(outcome),
+    };
+    // No write is issued once a cancellation is pending: the artifact is
+    // derived, and the next run rebuilds it.
+    if cancellation.is_some_and(OptimizeCancellation::is_cancelled) {
+        return Ok(ArtifactRefresh::Skipped(ArtifactSkip::Cancelled));
+    }
+    // The artifact key is mutable, so a write dropped mid-request would leave
+    // its outcome unknown: once issued, the write runs to its end even when
+    // this run is dropped.
+    let adapter = db.storage_adapter_handle();
+    let write_uri = uri.clone();
+    tokio::spawn(async move { adapter.write_bytes(&write_uri, &body).await })
+        .await
+        .map_err(|error| {
+            OmniError::manifest_internal(format!("graph index artifact write task: {error}"))
+        })??;
+    // A fresh artifact may serve scope keys whose earlier load attempt
+    // failed; those negative verdicts are stamp-keyed, and when this
+    // optimize advanced no table version the stamps (hence keys) are
+    // unchanged — drop them so the new object gets loaded.
+    db.runtime_cache.note_artifact_replaced().await;
+    tracing::debug!(
+        target: "omnigraph::optimize",
+        uri = %uri,
+        "graph index artifact persisted"
+    );
+    Ok(ArtifactRefresh::Refreshed)
+}
+
+decide_seam! {
+    /// The artifact refresh is about to read the edge tables, after the run
+    /// released its writer gates: a cancellation from here on abandons it.
+    pub static OPTIMIZE_ARTIFACT_SCAN = ("optimize.artifact_scan", Unreachable, [Fail]);
+}
+
+/// The artifact's object, or the outcome that ends the refresh without a
+/// write. Reads only.
+async fn prepare_graph_index_artifact(
+    db: &Omnigraph,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    edge_tables_committed: bool,
+    limit: Option<u64>,
+) -> Result<std::result::Result<(String, Vec<u8>), ArtifactRefresh>> {
     if catalog.edge_types.is_empty() {
-        return Ok(());
+        return Ok(Err(ArtifactRefresh::Skipped(ArtifactSkip::NoEdgeTypes)));
     }
     let uri = crate::graph_index::persist::artifact_uri(db.root_uri());
     if !edge_tables_committed && db.storage_adapter().exists(&uri).await? {
@@ -394,13 +1506,14 @@ async fn persist_graph_index_artifact(
             target: "omnigraph::optimize",
             "graph index artifact refresh skipped: no edge table advanced and an artifact exists"
         );
-        return Ok(());
+        return Ok(Err(ArtifactRefresh::Unchanged));
     }
     let edge_types: std::collections::HashMap<String, (String, String)> = catalog
         .edge_types
         .iter()
         .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
         .collect();
+    fail(&OPTIMIZE_ARTIFACT_SCAN)?;
     let snapshot = db.snapshot_for_branch(None).await?;
     // `save` refuses a partially-materialized store (no complete identity to
     // stamp); check that BEFORE paying the full-catalog edge scan.
@@ -412,27 +1525,65 @@ async fn persist_graph_index_artifact(
             target: "omnigraph::optimize",
             "graph index artifact skipped: not every declared edge table is materialized yet"
         );
-        return Ok(());
+        return Ok(Err(ArtifactRefresh::Skipped(
+            ArtifactSkip::IncompleteEdgeTables,
+        )));
     }
-    let index =
-        crate::graph_index::GraphIndex::build(&snapshot, &edge_types, db.catalog().system_columns)
-            .await?;
-    let written =
-        crate::graph_index::persist::save(&snapshot, db.storage_adapter(), &edge_types, &index)
-            .await?;
-    if let Some(uri) = written {
-        // A fresh artifact may serve scope keys whose earlier load attempt
-        // failed; those negative verdicts are stamp-keyed, and when this
-        // optimize advanced no table version the stamps (hence keys) are
-        // unchanged — drop them so the new object gets loaded.
-        db.runtime_cache.note_artifact_replaced().await;
-        tracing::debug!(
-            target: "omnigraph::optimize",
-            uri = %uri,
-            "graph index artifact persisted"
-        );
+    let mut count = None;
+    if let Some(limit) = limit {
+        let Some((shortest, widest)) =
+            crate::graph_index::persist::fixed_bytes(&snapshot, &edge_types)?
+        else {
+            return Ok(Err(ArtifactRefresh::Skipped(
+                ArtifactSkip::IncompleteEdgeTables,
+            )));
+        };
+        // A lower bound: every edge is two `u32` targets, and the live row
+        // count is the number of rows the scan returns.
+        let mut lower = shortest;
+        for edge in edge_types.keys() {
+            let rows = snapshot
+                .open_lance_dataset(&format!("edge:{edge}"))
+                .await?
+                .count_rows(None)
+                .await
+                .map_err(OmniError::storage)?;
+            lower = lower.saturating_add((rows as u64).saturating_mul(8));
+        }
+        if lower > limit {
+            return Ok(Err(ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit {
+                counted: lower,
+                limit,
+            })));
+        }
+        count = Some(crate::graph_index::persist::ArtifactCount::new(
+            widest,
+            limit,
+            &edge_types,
+        ));
     }
-    Ok(())
+    let build = crate::graph_index::GraphIndex::build_counted(
+        &snapshot,
+        &edge_types,
+        db.catalog().system_columns,
+        count.as_mut(),
+    );
+    let Some(index) = build.await? else {
+        let counted = count.as_ref().map_or(0, |count| count.counted());
+        return Ok(Err(ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit {
+            counted,
+            limit: limit.unwrap_or(0),
+        })));
+    };
+    let Some((uri, body)) =
+        crate::graph_index::persist::artifact_body(&snapshot, &edge_types, &index)?
+    else {
+        return Ok(Err(ArtifactRefresh::Skipped(
+            ArtifactSkip::IncompleteEdgeTables,
+        )));
+    };
+    drop(index);
+    Ok(Ok((uri, body)))
 }
 
 /// Pure planning: classify drift/no-work/productive state without advancing
@@ -441,19 +1592,18 @@ async fn prepare_optimize_table(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     task: OptimizeTableTask,
+    limits: &OptimizeLimits,
 ) -> Result<OptimizePreparation> {
     let snapshot = db
         .open_pinned_for_write(&task.full_path, &task.entry)
         .await?;
 
-    // The same plan `stage_compaction` executes: a fragment still holding a
-    // dropped property's values is compaction work even when Lance's planner
-    // would leave the table alone.
+    // The plan `stage_compaction` executes, made once: a fragment still
+    // holding a dropped property's values is compaction work even when
+    // Lance's planner would leave the table alone.
     let options = CompactionOptions::default();
-    let will_compact = TableStore::plan_table_compaction(snapshot.dataset(), &options)
-        .await?
-        .num_tasks()
-        > 0;
+    let plan = TableStore::plan_table_compaction(snapshot.dataset(), &options).await?;
+    let will_compact = plan.num_tasks() > 0;
     let needs_reindex = TableStore::has_foldable_unindexed_fragments(snapshot.dataset()).await?;
     let index_work = super::table_ops::index_work_status_on_dataset_for_catalog(
         db,
@@ -464,7 +1614,7 @@ async fn prepare_optimize_table(
     .await?;
     if !will_compact && !needs_reindex && !index_work.needs_commit {
         let mut stat =
-            DatasetOptimizeStats::compacted(task.table_key, &CompactionMetrics::default(), false);
+            DatasetOptimizeStats::planned(task.table_key, &CompactionMetrics::default(), false);
         stat.pending_indexes = index_work.pending;
         super::table_ops::append_deferred_full_text_indexes(
             &snapshot,
@@ -477,7 +1627,29 @@ async fn prepare_optimize_table(
         return Ok(OptimizePreparation::Stat(stat));
     }
 
-    Ok(OptimizePreparation::Work(PreparedOptimizeTable {
+    let source = plan
+        .tasks
+        .iter()
+        .flat_map(|task| task.fragments.iter().cloned())
+        .collect::<Vec<_>>();
+    // The lag measured here is complete: a stable-row-id rewrite carries every
+    // row-id-domain index's coverage to the new fragments (Lance 13's
+    // `manifest_build.rs`; only zone-map, Bloom and FM indexes report row
+    // addresses, and the engine builds none, and only a data overlay newer
+    // than an index drops a fragment from it, and no engine writer creates
+    // one), so compaction alone causes no fold after it.
+    let will_index = needs_reindex || index_work.needs_commit;
+    let source_bytes = match measure_plan(snapshot.dataset(), &source, will_index, limits).await? {
+        Ok(source_bytes) => source_bytes,
+        Err(exceeded) => {
+            return Ok(OptimizePreparation::Stat(DatasetOptimizeStats::deferred(
+                task.table_key,
+                DeferReason::ResourceLimit(exceeded),
+            )));
+        }
+    };
+
+    Ok(OptimizePreparation::Work(Box::new(PreparedOptimizeTable {
         identity: task.identity,
         table_key: task.table_key,
         full_path: task.full_path,
@@ -485,7 +1657,148 @@ async fn prepare_optimize_table(
         initial_snapshot: snapshot,
         witness: task.witness,
         last_linear_version: task.entry.version_metadata.last_linear_version(),
-    }))
+        plan,
+        pending_indexes: index_work.pending,
+        source_bytes,
+    })))
+}
+
+/// Measure a table's plan against its ceilings, in order, and stop at the
+/// first one it passes; the fragment count comes first, so it bounds the size
+/// requests. Only a set ceiling is measured. On success, the source bytes when
+/// a byte ceiling or the run's byte budget needs them. A storage read that
+/// fails while measuring is returned as the error it is, so the table is
+/// reported failed with its cause; a deferral names only a ceiling the plan
+/// passed or a size the plan does not record.
+async fn measure_plan(
+    ds: &lance::Dataset,
+    source: &[lance_table::format::Fragment],
+    index_work: bool,
+    limits: &OptimizeLimits,
+) -> Result<std::result::Result<Option<u64>, ResourceExceeded>> {
+    let ceilings = &limits.table;
+    let over = |measure, measured, ceiling| {
+        Ok(Err(ResourceExceeded {
+            measure,
+            measured,
+            ceiling,
+        }))
+    };
+    if let Some(ceiling) = ceilings.source_fragments
+        && source.len() as u64 > ceiling
+    {
+        return over(
+            ResourceMeasure::SourceFragments,
+            Some(source.len() as u64),
+            ceiling,
+        );
+    }
+    if let Some(ceiling) = ceilings.source_rows {
+        let mut rows = 0_u64;
+        for fragment in source {
+            let Some(physical) = fragment.physical_rows else {
+                return over(ResourceMeasure::SourceRows, None, ceiling);
+            };
+            rows = rows.saturating_add(physical as u64);
+            if rows > ceiling {
+                return over(ResourceMeasure::SourceRows, Some(rows), ceiling);
+            }
+        }
+    }
+    let mut source_bytes = None;
+    if let Some(ceiling) = limits.table_source_bytes() {
+        let bytes = source_file_bytes(ds, source, ceiling).await?;
+        if bytes > ceiling {
+            return over(ResourceMeasure::SourceBytes, Some(bytes), ceiling);
+        }
+        source_bytes = Some(bytes);
+    }
+    if let Some(ceiling) = ceilings.blob_bytes
+        && !source.is_empty()
+    {
+        match TableStore::managed_blob_bytes(ds, source.to_vec(), ceiling).await? {
+            Some(bytes) if bytes > ceiling => {
+                return over(ResourceMeasure::BlobBytes, Some(bytes), ceiling);
+            }
+            Some(_) => {}
+            None => return over(ResourceMeasure::BlobBytes, None, ceiling),
+        }
+    }
+    if let Some(ceiling) = ceilings.index_rows
+        && index_work
+    {
+        let rows = ds.count_rows(None).await.map_err(|error| {
+            OmniError::storage_context("optimize: count the rows an index would cover", error)
+        })? as u64;
+        if rows > ceiling {
+            return over(ResourceMeasure::IndexRows, Some(rows), ceiling);
+        }
+    }
+    Ok(Ok(source_bytes))
+}
+
+/// The bytes of `source`'s data, overlay and deletion files: a data file's
+/// recorded size, or a HEAD of the file when none is recorded, and a HEAD of
+/// each deletion file, which records no size in Lance 13. Each file resolves
+/// through the collector's base rule. The recorded sizes are summed first,
+/// since they cost no request; the HEADs then run side by side, as many as
+/// the table's object store allows (`io_parallelism`), and are counted in
+/// file order. Counting stops once it passes `ceiling`, so a total above it
+/// is a lower bound. A size that cannot be read is an error.
+async fn source_file_bytes(
+    ds: &lance::Dataset,
+    source: &[lance_table::format::Fragment],
+    ceiling: u64,
+) -> Result<u64> {
+    let mut total = 0_u64;
+    for file in source
+        .iter()
+        .flat_map(|fragment| fragment.referenced_lance_files())
+    {
+        if let Some(size) = file.file_size_bytes.get() {
+            total = total.saturating_add(size.get());
+        }
+    }
+    if total > ceiling {
+        return Ok(total);
+    }
+    // Resolved to owned stores and paths before the requests run, so the
+    // concurrent requests borrow nothing from the plan.
+    let mut unsized_files = Vec::new();
+    for fragment in source {
+        for file in fragment.referenced_lance_files() {
+            if file.file_size_bytes.get().is_none() {
+                unsized_files.push(super::collector::data_file_location(ds, file).await?);
+            }
+        }
+        if let Some(deletion) = &fragment.deletion_file {
+            unsized_files
+                .push(super::collector::deletion_file_location(ds, fragment.id, deletion).await?);
+        }
+    }
+    if unsized_files.is_empty() {
+        return Ok(total);
+    }
+    let parallelism = ds
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?
+        .io_parallelism()
+        .max(1);
+    let mut sizes = futures::stream::iter(unsized_files)
+        .map(|(store, path)| async move {
+            store.size(&path).await.map_err(|error| {
+                OmniError::storage_context(format!("optimize: size of {path}"), error)
+            })
+        })
+        .buffered(parallelism);
+    while let Some(size) = sizes.next().await {
+        total = total.saturating_add(size?);
+        if total > ceiling {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 decide_seam! {
@@ -498,30 +1811,60 @@ decide_seam! {
     pub static OPTIMIZE_BEFORE_COMPACT = ("optimize.before_compact", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// At the start of each of one table's index links, the fold and the
+    /// index build, after the links before it, if any, committed detached
+    /// (RFC 0067). A failure here is that index link's: a table with a
+    /// committed link still publishes it.
+    pub static OPTIMIZE_BEFORE_INDEX_LINK = ("optimize.before_index_link", Unreachable, [Fail]);
+}
+
+/// A link one table committed detached: the snapshot at it and the staging
+/// identity the manifest pin names.
+type CommittedLink = (
+    crate::storage_layer::SnapshotHandle,
+    crate::table_store::StagedTransactionIdentity,
+);
+
 /// Stage one productive table's maintenance detached from its pin, as a
-/// chain of at most three links: the compaction rewrite, then a whole rebuild
-/// of every foldable index whose coverage lags the rewritten layout (Lance 11
-/// folds only through a linear commit, so `stage_index_fold` rebuilds instead
-/// of merging), then any declared-but-unbuilt index. The rewrite comes first
-/// so an index is rebuilt once, over the settled layout.
+/// chain of at most three links: the compaction rewrite, from the plan the
+/// table was measured with, then a whole rebuild of every foldable index
+/// whose coverage lags the rewritten layout (Lance 13 folds only through a
+/// linear commit, so `stage_index_fold` rebuilds instead of merging), then
+/// any declared-but-unbuilt index. The rewrite comes first so an index is
+/// rebuilt once, over the settled layout. Compaction tasks and index builders
+/// take their permits from the same run budget.
+///
+/// The links are independent derived state, so an index link does not decide
+/// the fate of the links before it: when the fold or the index build fails
+/// after an earlier link of the table committed, the committed links are
+/// still the table's effect and are published, and the table reports the
+/// failure (`DatasetOptimizeStats::index_failure`). A table whose index
+/// cannot be built is still compacted, and the next run plans the remaining
+/// index work again. With no link committed before it, an index link's
+/// failure is the table's.
 async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
+    budget: &crate::table_store::MaintenanceBudget,
 ) -> Result<OptimizeEffectOutcome> {
     let table_key = work.table_key;
     let full_path = work.full_path;
     let base = work.initial_snapshot;
     let witness = work.witness;
+    let source_bytes = work.source_bytes;
     let declared_full_text = super::table_ops::declared_full_text_columns(catalog, &table_key);
     fail(&OPTIMIZE_BEFORE_COMPACT)?;
-    let options = CompactionOptions::default();
-    let mut chain = Vec::new();
+    // Links committed for the table: each moves its published version by one.
+    let mut links = 0_u64;
     let mut tip = base.clone();
     let mut tip_identity = None;
     let mut metrics = CompactionMetrics::default();
-    if let Some((staged, compaction_metrics)) =
-        db.storage().stage_compaction(&base, &options).await?
+    if let Some((staged, compaction_metrics)) = db
+        .storage()
+        .stage_compaction(&base, work.plan, budget)
+        .await?
     {
         let (rewrite, identity) = db
             .storage()
@@ -530,29 +1873,50 @@ async fn apply_optimize_table_effects(
         metrics = compaction_metrics;
         tip = rewrite;
         tip_identity = Some(identity);
+        links += 1;
         fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
     }
-    // Fold every index whose coverage lags (appended fragments, or a vector
-    // index that keeps row addresses and dropped the compacted fragments)
-    // as a detached rebuild chained on the rewrite.
-    let (fold, skipped_folds) = db.storage().stage_index_fold(&tip).await?;
-    if let Some(staged) = fold {
-        if tip_identity.is_some() {
-            chain.push(tip.clone());
+    // Fold every index whose coverage lags (appended fragments) as a detached
+    // rebuild chained on the rewrite, then build the declared indexes the
+    // table lacks. The rewrite itself leaves none lagging: Lance 13 carries a
+    // row-id-domain index's coverage to the new fragments, the engine builds
+    // no address-domain index, and no engine writer creates the data overlays
+    // that would also drop coverage.
+    let mut pending_indexes = work.pending_indexes;
+    let mut skipped_folds = Vec::new();
+    let fold = stage_fold_link(
+        db,
+        &tip,
+        &witness,
+        &declared_full_text,
+        budget,
+        &mut skipped_folds,
+    )
+    .await;
+    let build = match fold {
+        Ok(folded) => {
+            if let Some((folded, identity)) = folded {
+                tip = folded;
+                tip_identity = Some(identity);
+                links += 1;
+                fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
+            }
+            stage_build_link(
+                db,
+                catalog,
+                &table_key,
+                &tip,
+                &mut pending_indexes,
+                &witness,
+                &declared_full_text,
+                budget,
+            )
+            .await
         }
-        let (folded, identity) = db
-            .storage()
-            .commit_staged_detached(tip, staged, &witness, &declared_full_text)
-            .await?;
-        tip = folded;
-        tip_identity = Some(identity);
-        fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
-    }
-    let mut index_work =
-        super::table_ops::plan_index_work_on_dataset_for_catalog(db, catalog, &table_key, &tip)
-            .await?;
+        Err(error) => Err(error),
+    };
     for (column, reason) in skipped_folds {
-        index_work.pending.push(super::PendingIndex {
+        pending_indexes.push(super::PendingIndex {
             type_key: table_key.clone(),
             property: column,
             reason: format!(
@@ -560,53 +1924,47 @@ async fn apply_optimize_table_effects(
             ),
         });
     }
-    if !index_work.specs.is_empty() {
-        let staged = db
-            .storage()
-            .stage_create_indices(&tip, &index_work.specs)
+    let index_result = match build {
+        Ok(built) => {
+            if let Some((built, identity)) = built {
+                tip = built;
+                tip_identity = Some(identity);
+                links += 1;
+                fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
+            }
+            // Keep the completed link when only this status read fails.
+            super::table_ops::append_deferred_full_text_indexes(
+                &tip,
+                &table_key,
+                "main",
+                &[],
+                &mut pending_indexes,
+            )
             .await
-            .map_err(|error| {
-                error.with_context(format!(
-                    "stage index batch on {table_key} ({:?})",
-                    index_work.specs
-                ))
-            })?;
-        if tip_identity.is_some() {
-            chain.push(tip.clone());
+            .map_err(|error| error.with_context("read full-text index coverage"))
         }
-        let (indexed, identity) = db
-            .storage()
-            .commit_staged_detached(tip, staged, &witness, &declared_full_text)
-            .await?;
-        tip = indexed;
-        tip_identity = Some(identity);
-        fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
-    }
+        Err(error) => Err(error),
+    };
+    let index_failure = match index_result {
+        Ok(()) => None,
+        Err(error) => Some(index_maintenance_failure(
+            error,
+            tip_identity.is_some(),
+            &table_key,
+        )?),
+    };
     let Some(identity) = tip_identity else {
-        let mut stat = DatasetOptimizeStats::compacted(table_key, &metrics, false);
-        stat.pending_indexes = index_work.pending;
-        super::table_ops::append_deferred_full_text_indexes(
-            &tip,
-            &stat.type_key,
-            "main",
-            &[],
-            &mut stat.pending_indexes,
-        )
-        .await?;
+        let mut stat = DatasetOptimizeStats::planned(table_key, &metrics, false);
+        stat.source_bytes = source_bytes;
+        stat.pending_indexes = pending_indexes;
         return Ok(OptimizeEffectOutcome { stat, effect: None });
     };
-    let mut stat = DatasetOptimizeStats::compacted(table_key.clone(), &metrics, true);
-    stat.pending_indexes = index_work.pending;
-    super::table_ops::append_deferred_full_text_indexes(
-        &tip,
-        &stat.type_key,
-        "main",
-        &[],
-        &mut stat.pending_indexes,
-    )
-    .await?;
+    let mut stat = DatasetOptimizeStats::planned(table_key.clone(), &metrics, true);
+    stat.source_bytes = source_bytes;
+    stat.pending_indexes = pending_indexes;
+    stat.index_failure = index_failure;
     let state = db.storage().table_state(&full_path, &tip).await?;
-    let published_dataset_version = work.expected_version + 1 + chain.len() as u64;
+    let published_dataset_version = work.expected_version + links;
     let version_metadata = state
         .version_metadata
         .with_staged(state.version, identity.uuid.clone())
@@ -626,6 +1984,100 @@ async fn apply_optimize_table_effects(
             expected_version: work.expected_version,
         }),
     })
+}
+
+/// What an index maintenance or coverage error means for its table. After a
+/// link of the table committed, a failure with definite evidence stays with the
+/// table as its index failure and the committed links publish; an uncertain
+/// one fails the run, as any staging failure does. With no link committed,
+/// the failure is the table's.
+fn index_maintenance_failure(
+    error: OmniError,
+    committed: bool,
+    table_key: &str,
+) -> Result<Arc<OmniError>> {
+    if !committed {
+        return Err(error);
+    }
+    let error = error.with_completion_evidence(CompletionEvidence::Unpublished);
+    if !matches!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::BeforeEffect | CompletionEvidence::Unpublished)
+    ) {
+        return Err(error);
+    }
+    tracing::warn!(
+        target: "omnigraph::optimize",
+        table = table_key,
+        error = %error,
+        "optimize retains the table's committed links after an index maintenance error"
+    );
+    Ok(Arc::new(error))
+}
+
+/// One table's fold link at `tip`: stage a whole rebuild of every foldable
+/// index whose coverage lags under the shared run budget, and commit
+/// it detached. Record the vector columns that could not train before the
+/// commit, so its failure keeps those reasons. Returns `None` when no index
+/// lagged or none could be rebuilt.
+async fn stage_fold_link(
+    db: &Omnigraph,
+    tip: &crate::storage_layer::SnapshotHandle,
+    witness: &crate::table_store::StagingWitness,
+    declared_full_text: &[String],
+    budget: &crate::table_store::MaintenanceBudget,
+    skipped_folds: &mut Vec<(String, String)>,
+) -> Result<Option<CommittedLink>> {
+    fail(&OPTIMIZE_BEFORE_INDEX_LINK)?;
+    let (fold, skipped) = db.storage().stage_index_fold(tip, budget).await?;
+    *skipped_folds = skipped;
+    let Some(staged) = fold else {
+        return Ok(None);
+    };
+    db.storage()
+        .commit_staged_detached(tip.clone(), staged, witness, declared_full_text)
+        .await
+        .map(Some)
+}
+
+/// One table's index-build link at `tip`: plan the declared indexes the
+/// table lacks, build them under the shared run budget, stage them as one
+/// `CreateIndex`, and commit it detached. Refresh the declared pending indexes
+/// as soon as the plan is known, so a build failure keeps them. Returns
+/// `None` when no declared index was missing.
+#[allow(clippy::too_many_arguments)]
+async fn stage_build_link(
+    db: &Omnigraph,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    table_key: &str,
+    tip: &crate::storage_layer::SnapshotHandle,
+    pending_indexes: &mut Vec<super::PendingIndex>,
+    witness: &crate::table_store::StagingWitness,
+    declared_full_text: &[String],
+    budget: &crate::table_store::MaintenanceBudget,
+) -> Result<Option<CommittedLink>> {
+    fail(&OPTIMIZE_BEFORE_INDEX_LINK)?;
+    let index_work =
+        super::table_ops::plan_index_work_on_dataset_for_catalog(db, catalog, table_key, tip)
+            .await?;
+    *pending_indexes = index_work.pending;
+    if index_work.specs.is_empty() {
+        return Ok(None);
+    }
+    let staged = db
+        .storage()
+        .stage_create_indices(tip, &index_work.specs, budget)
+        .await
+        .map_err(|error| {
+            error.with_context(format!(
+                "stage index batch on {table_key} ({:?})",
+                index_work.specs
+            ))
+        })?;
+    db.storage()
+        .commit_staged_detached(tip.clone(), staged, witness, declared_full_text)
+        .await
+        .map(Some)
 }
 
 const INTERNAL_CONFIG_RETRY_BUDGET: u32 = 5;
@@ -660,35 +2112,72 @@ async fn clear_stale_auto_cleanup_config(
     Ok(true)
 }
 
-/// Remove stored automatic GC configuration without changing manifest fragments.
-async fn clear_manifest_auto_cleanup(db: &Omnigraph) -> Result<DatasetOptimizeStats> {
+decide_seam! {
+    /// After the run's publication, before the configuration clear reads
+    /// `__manifest`. A failure here must leave the published run reported,
+    /// with the clear `failed`.
+    pub static OPTIMIZE_CONFIGURATION_CLEAR = ("optimize.configuration_clear", Unreachable, [Fail]);
+}
+
+/// Remove stored automatic GC configuration without changing manifest
+/// fragments, and report what happened. A failed removal reads `__manifest`
+/// again: keys still present are `Failed`, keys gone are `Cleared`, and a
+/// read that fails too is `Unknown`. Nothing here fails the run.
+async fn clear_manifest_auto_cleanup(db: &Omnigraph) -> ConfigurationClear {
     let uri = crate::db::manifest::manifest_uri(db.root_uri());
+    let mut last_error = None;
     for attempt in 0..INTERNAL_CONFIG_RETRY_BUDGET {
-        let handle = db.storage().open_dataset_head(&uri, None).await?;
-        let mut ds = handle.into_dataset();
+        if let Err(error) = fail(&OPTIMIZE_CONFIGURATION_CLEAR) {
+            return ConfigurationClear::Failed(error.to_string());
+        }
+        let mut ds = match db.storage().open_dataset_head(&uri, None).await {
+            Ok(handle) => handle.into_dataset(),
+            Err(error) => return ConfigurationClear::Failed(error.to_string()),
+        };
         match clear_stale_auto_cleanup_config(&mut ds).await {
-            Ok(cleared) => {
-                if cleared {
-                    db.refresh_coordinator_only().await?;
+            Ok(false) => return ConfigurationClear::NothingToClear,
+            Ok(true) => {
+                if let Err(error) = db.refresh_coordinator_only().await {
+                    tracing::warn!(
+                        target: "omnigraph::optimize",
+                        error = %error,
+                        "coordinator refresh after the configuration clear failed"
+                    );
                 }
-                return Ok(DatasetOptimizeStats::compacted(
-                    "__manifest".to_string(),
-                    &CompactionMetrics::default(),
-                    false,
-                ));
+                return ConfigurationClear::Cleared;
             }
             Err(error)
                 if attempt + 1 < INTERNAL_CONFIG_RETRY_BUDGET
                     && is_retryable_lance_conflict(&error) =>
             {
+                last_error = Some(error);
                 continue;
             }
-            Err(error) => return Err(OmniError::storage(error)),
+            Err(error) => {
+                last_error = Some(error);
+                break;
+            }
         }
     }
-    Err(OmniError::manifest_conflict(format!(
-        "manifest auto-cleanup configuration removal exhausted {INTERNAL_CONFIG_RETRY_BUDGET} retries"
-    )))
+    let message = last_error.map_or_else(
+        || format!("removal exhausted {INTERNAL_CONFIG_RETRY_BUDGET} retries"),
+        |error| error.to_string(),
+    );
+    match db.storage().open_dataset_head(&uri, None).await {
+        Ok(handle) => {
+            let present = handle
+                .dataset()
+                .config()
+                .keys()
+                .any(|key| key.starts_with("lance.auto_cleanup."));
+            if present {
+                ConfigurationClear::Failed(message)
+            } else {
+                ConfigurationClear::Cleared
+            }
+        }
+        Err(error) => ConfigurationClear::Unknown(format!("{message}; read-back failed: {error}")),
+    }
 }
 
 decide_seam! {
@@ -717,7 +2206,13 @@ decide_seam! {
 pub async fn cleanup_all_datasets(
     db: &Omnigraph,
     options: CleanupPolicyOptions,
+    actor: Option<&str>,
 ) -> Result<Vec<DatasetCleanupStats>> {
+    db.enforce(
+        omnigraph_policy::PolicyAction::Reclaim,
+        &omnigraph_policy::ResourceScope::Graph,
+        actor,
+    )?;
     if options.keep_versions.is_none() && options.older_than.is_none() {
         return Err(OmniError::manifest(
             "cleanup requires at least one of keep_versions or older_than",
@@ -733,7 +2228,7 @@ pub async fn cleanup_all_datasets(
     // envelope before deleting any version history.
     let authority_txn = db.open_write_txn(None).await?;
 
-    let _cleanup_schema_permit = db.write_queue().acquire_schema_shared().await;
+    let _cleanup_schema_permit = db.write_queue().acquire_schema_shared().await?;
     db.refresh_coordinator_only().await?;
     let cleanup_catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
@@ -748,9 +2243,9 @@ pub async fn cleanup_all_datasets(
         .collect();
 
     let graph_branches = cleanup_graph_branches(db).await?;
-    let _cleanup_branch_guards = db.write_queue().acquire_branches(&graph_branches).await;
+    let _cleanup_branch_guards = db.write_queue().acquire_branches(&graph_branches).await?;
     let gc_queue_keys = db.table_queue_keys_for_branches(&graph_branches, &cleanup_catalog);
-    let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await;
+    let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await?;
 
     db.revalidate_write_txn(&authority_txn).await?;
 
@@ -908,12 +2403,12 @@ pub struct BranchReconcileStats {
 /// Collect unreferenced table forks under cleanup's complete writer gates.
 #[cfg(all(test, feature = "failpoints"))]
 pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconcileStats> {
-    let _schema = db.write_queue().acquire_schema_shared().await;
+    let _schema = db.write_queue().acquire_schema_shared().await?;
     let catalog = db.catalog();
     let graph_branches = cleanup_graph_branches(db).await?;
-    let _branches = db.write_queue().acquire_branches(&graph_branches).await;
+    let _branches = db.write_queue().acquire_branches(&graph_branches).await?;
     let table_keys = db.table_queue_keys_for_branches(&graph_branches, &catalog);
-    let _tables = db.write_queue().acquire_many(&table_keys).await;
+    let _tables = db.write_queue().acquire_many(&table_keys).await?;
     reconcile_orphaned_branches_under_control_gates(db, None).await
 }
 
@@ -1531,6 +3026,89 @@ mod tests {
         )
     }
 
+    /// #1384: optimize takes every heavy step of the tables it stages, each
+    /// compaction task, index fold and index build, through its run's one
+    /// budget of `concurrency.rewrite` steps. Two tables each have one
+    /// compaction task, an identity BTREE to fold and a vector index to build.
+    /// The first two steps rendezvous so serialized work times out. A build
+    /// outside the shared budget is missing from the step count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn optimize_takes_every_tables_heavy_steps_through_one_budget_issue_1384() {
+        use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let schema = "node Person {\n name: String @key\n embedding: Vector(2)? @index\n}\n\
+                      node Company {\n name: String @key\n embedding: Vector(2)? @index\n}";
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(Omnigraph::init(uri, schema).await.unwrap()),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        // Index the first fragment. The next two have the same uncovered
+        // layout, so they compact together. Their vectors can then be indexed.
+        db.load_jsonl(
+            r#"{"type":"Person","data":{"name":"seed"}}
+{"type":"Company","data":{"name":"seed"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+        let pending = db.ensure_indices_as(None).await.unwrap();
+        assert_eq!(pending.len(), 2, "both vector indexes await data");
+        for name in ["a", "b"] {
+            for type_name in ["Person", "Company"] {
+                db.load_jsonl(
+                    &format!("{{\"type\":\"{type_name}\",\"data\":{{\"name\":\"{name}\",\"embedding\":[1.0,2.0]}}}}"),
+                    LoadMode::Merge,
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let probes = OptimizeStepProbes::rendezvous(2);
+        let report = tokio::time::timeout(
+            Duration::from_secs(30),
+            with_optimize_step_probes(
+                probes.clone(),
+                optimize_all_datasets(
+                    &db,
+                    None,
+                    OptimizeRequest::default().with_concurrency(OptimizeConcurrency::new(2, 2)),
+                ),
+            ),
+        )
+        .await
+        .expect("the two tables' steps never ran side by side")
+        .unwrap();
+        assert_eq!(report.datasets.len(), 2, "{report:?}");
+        let snapshot = db
+            .snapshot_of(crate::db::ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        for stat in &report.datasets {
+            assert!(stat.committed(), "{stat:?}");
+            assert!(stat.fragments_removed > 1, "one compaction task: {stat:?}");
+            assert!(stat.index_failure.is_none(), "{stat:?}");
+            let table = snapshot.open_dataset(&stat.type_key).await.unwrap();
+            assert_eq!(
+                table.index_coverage("__id").await.unwrap(),
+                crate::IndexCoverage::Indexed
+            );
+            assert!(table.has_vector_index("embedding").await.unwrap());
+        }
+        assert_eq!(
+            probes.entered(),
+            6,
+            "one compaction task, one fold and one index build per table, each within the budget"
+        );
+        assert_eq!(
+            probes.peak_in_flight(),
+            2,
+            "the run never has more steps in flight than its rewrite concurrency"
+        );
+    }
+
     #[tokio::test]
     async fn reconcile_caches_live_branch_snapshot_resolution_failure() {
         let _scenario = crate::seams::FailScenario::setup();
@@ -1649,10 +3227,13 @@ mod tests {
         let bytes = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
         store.delete(&path).await.unwrap();
         let rows = db
-            .cleanup(CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: None,
-            })
+            .cleanup_as(
+                CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert!(
@@ -1666,10 +3247,13 @@ mod tests {
         );
         store.inner.put(&path, bytes.into()).await.unwrap();
         let rows = db
-            .cleanup(CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: None,
-            })
+            .cleanup_as(
+                CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");

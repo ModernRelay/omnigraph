@@ -22,6 +22,7 @@ codes! {
     Q003 = "a settings statement is refused";
     Q004 = "a branch, commit, show or explain statement is misplaced or malformed";
     Q005 = "a declaration body is refused";
+    Q006 = "the source nests deeper than the compiler accepts";
 
     // Typechecker.
     T1 = "unknown node type";

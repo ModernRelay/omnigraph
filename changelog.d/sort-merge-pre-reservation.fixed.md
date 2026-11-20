@@ -1,0 +1,1 @@
+- A sort that spills no longer fails at one memory budget while running at smaller and larger ones: its merge pre-reserves a sixteenth of `query_memory_bytes`, not a third.

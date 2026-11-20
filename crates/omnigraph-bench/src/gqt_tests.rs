@@ -1,6 +1,7 @@
 //! The public catalog and the measured adapter share these owning-layer tests.
 use crate::gqt_case::*;
-use crate::gqt_runner::{execute_gqt_rep_signaled, validate_sample};
+use crate::gqt_evidence::{LocalRoute, LocalRouteKind};
+use crate::gqt_runner::{GqtRepObservation, execute_gqt_rep_signaled, validate_sample};
 use crate::runner::{MeasurementSignals, RunnerResult};
 use omnigraph::db::{GraphCommit, GraphCommitKind, Omnigraph};
 use omnigraph_gqt_core::StepKind;
@@ -68,18 +69,25 @@ macro_rules! scenario_tests {
 fn catalog() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks")
 }
+/// The recorded identities were taken on APFS with the clonefile reset.
 fn recorded_catalog() -> crate::catalog::Catalog {
     let mut catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
-    catalog.definition.defaults.environment =
-        Some(GqtEnvironment::embedded(crate::case::Backend::LocalFs {
-            filesystem: crate::case::LocalFilesystem::Apfs,
-            storage_class: crate::case::LocalStorageClass::NvmeSsd,
-        }));
     catalog.definition.defaults.protocol.reset = Some(crate::case::ResetMode::LocalClonefile);
     catalog
 }
+fn apfs_backend() -> crate::case::Backend {
+    crate::case::Backend::LocalFs {
+        filesystem: crate::case::LocalFilesystem::Apfs,
+        storage_class: crate::case::LocalStorageClass::NvmeSsd,
+    }
+}
+fn recorded_environment() -> GqtEnvironment {
+    GqtEnvironment::embedded(apfs_backend())
+}
 fn plan(name: &str) -> PlannedGqt {
-    recorded_catalog().plan(name).unwrap()
+    recorded_catalog()
+        .plan_in(name, &recorded_environment())
+        .unwrap()
 }
 #[derive(Debug, Default)]
 struct Signals {
@@ -141,8 +149,16 @@ async fn run_sample_with_logical(
         .bind(&logical.logical_content_sha256, &logical.algorithm)
         .unwrap();
     let mut signals = Signals::default();
-    let sample =
-        execute_gqt_rep_signaled(1, &root, &physical, &metadata, &bound, &mut signals).await?;
+    let sample = execute_gqt_rep_signaled(
+        1,
+        &root,
+        &LocalRoute::Direct,
+        &physical,
+        &metadata,
+        &bound,
+        &mut signals,
+    )
+    .await?;
     validate_sample(
         &sample,
         &bound,
@@ -193,7 +209,7 @@ async fn retained_unattached_chain(root: &Path) -> (Vec<GraphCommit>, Vec<GraphC
     (chain, published)
 }
 #[test]
-fn original_pairs_and_groups_preserve_pre_migration_identity() {
+fn original_pairs_and_suites_preserve_pre_migration_identity() {
     let catalog = recorded_catalog();
     let baseline: serde_json::Value =
         serde_json::from_str(include_str!("../tests/fixtures/gqt-catalog-identity.json")).unwrap();
@@ -206,7 +222,9 @@ fn original_pairs_and_groups_preserve_pre_migration_identity() {
             .iter()
             .find(|scenario| scenario.id == *id)
             .unwrap_or_else(|| panic!("original scenario {id} is missing"));
-        let plan = catalog.plan(&scenario.id).unwrap();
+        let plan = catalog
+            .plan_in(&scenario.id, &recorded_environment())
+            .unwrap();
         plan.revalidate().unwrap();
         assert_eq!(
             old["planned_sha256"], plan.planned_sha256,
@@ -241,25 +259,25 @@ fn original_pairs_and_groups_preserve_pre_migration_identity() {
         );
         assert_eq!(
             old["repetitions"],
-            scenario.expand(&catalog.definition.defaults).1
+            scenario.repetitions(&catalog.definition.defaults)
         );
     }
-    let groups: std::collections::BTreeMap<String, Vec<(String, u32)>> =
-        serde_json::from_str(include_str!("../tests/fixtures/gqt-catalog-groups.json")).unwrap();
-    assert_eq!(groups.len(), 8);
+    let suites: std::collections::BTreeMap<String, Vec<(String, u32)>> =
+        serde_json::from_str(include_str!("../tests/fixtures/gqt-catalog-suites.json")).unwrap();
+    assert_eq!(suites.len(), 8);
     let selection = |name: Option<&str>| {
         catalog
-            .resolve(name, None)
+            .resolve_in(name, None, &recorded_environment())
             .unwrap()
             .runs
             .into_iter()
             .map(|run| (run.case.id().to_owned(), run.repetitions))
             .collect::<Vec<_>>()
     };
-    for (group, expected) in &groups {
-        assert_eq!(selection(Some(group)), *expected, "group {group}");
+    for (suite, expected) in &suites {
+        assert_eq!(selection(Some(suite)), *expected, "suite {suite}");
     }
-    assert_eq!(selection(None), groups["local-fast"]);
+    assert_eq!(selection(None), suites["local-fast"]);
     assert_eq!(
         selection(Some("search")),
         vec![
@@ -379,14 +397,14 @@ fn query_shape_catalog_selects_complete_queries_with_bounded_plans() {
     use crate::case::{EnginePreparation, PageCacheCondition, ProcessLifecycle};
 
     let catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
-    for (group, expected) in [
+    for (suite, expected) in [
         ("query-shapes", QUERY_SHAPES.to_vec()),
         (
             "traversal",
             TRAVERSAL_SHAPES.iter().map(|(id, _)| *id).collect(),
         ),
     ] {
-        let selected = catalog.resolve(Some(group), None).unwrap();
+        let selected = catalog.resolve(Some(suite), None).unwrap();
         assert_eq!(
             selected
                 .runs
@@ -394,7 +412,7 @@ fn query_shape_catalog_selects_complete_queries_with_bounded_plans() {
                 .map(|run| (run.case.id(), run.repetitions))
                 .collect::<Vec<_>>(),
             expected.into_iter().map(|id| (id, 1)).collect::<Vec<_>>(),
-            "{group}"
+            "{suite}"
         );
     }
     for (name, warm) in query_shape_cases() {
@@ -515,6 +533,125 @@ fn query_shape_scenario_tests_cover_every_catalog_scenario() {
     );
 }
 
+/// A planned case with its reset and backend replaced, its identity recomputed.
+fn with_reset(
+    p: &PlannedGqt,
+    backend: crate::case::Backend,
+    reset: crate::case::ResetMode,
+) -> PlannedGqt {
+    let mut changed = p.clone();
+    changed.definition.environment = GqtEnvironment::embedded(backend);
+    changed.definition.protocol.reset = reset;
+    changed.cache_condition = crate::gqt_case::admit_point_queries(
+        &changed.queries.parse().unwrap(),
+        &changed.definition.workload.measured_step,
+        changed.definition.environment.target,
+        reset,
+    )
+    .unwrap();
+    changed.case_digest = crate::model::typed_sha256(&changed.definition).unwrap();
+    changed.planned_sha256 = changed.planned_hash().unwrap();
+    changed
+}
+fn s3_backend() -> crate::case::Backend {
+    crate::case::Backend::S3 {
+        implementation: crate::case::S3Implementation::Rustfs,
+        implementation_version: "1.0.0-beta.12".into(),
+        region: "us-east-1".into(),
+        storage_class: "STANDARD".into(),
+        versioning: crate::case::S3Versioning::Disabled,
+        image_digest: Some(format!("sha256:{}", "e".repeat(64))),
+    }
+}
+fn point_id(p: &PlannedGqt) -> String {
+    p.bind(
+        &"a".repeat(64),
+        crate::dataset_identity::DATASET_LOGICAL_ALGORITHM,
+    )
+    .unwrap()
+    .point_id
+}
+
+#[test]
+fn clone_is_a_reset_level_of_its_own_on_local_and_s3_stores() {
+    use crate::case::{Backend, LocalFilesystem, LocalStorageClass, ResetMode};
+    let apfs = Backend::LocalFs {
+        filesystem: LocalFilesystem::Apfs,
+        storage_class: LocalStorageClass::NvmeSsd,
+    };
+    let xfs = Backend::LocalFs {
+        filesystem: LocalFilesystem::Xfs,
+        storage_class: LocalStorageClass::NvmeSsd,
+    };
+    let p = plan("tiny-read");
+    assert_eq!(p.definition.protocol.reset, ResetMode::LocalClonefile);
+    let admitted = [
+        with_reset(&p, apfs.clone(), ResetMode::Clone),
+        with_reset(&p, xfs.clone(), ResetMode::Clone),
+        with_reset(&p, s3_backend(), ResetMode::Clone),
+    ];
+    for changed in &admitted {
+        changed.revalidate().unwrap();
+        changed.dataset_build_plan().unwrap().revalidate().unwrap();
+        assert_ne!(
+            point_id(changed),
+            point_id(&p),
+            "clone is a new point beside the restore level"
+        );
+    }
+    assert_ne!(
+        point_id(&admitted[0]),
+        point_id(&admitted[2]),
+        "the store's backend stays in the point"
+    );
+    for (backend, reset) in [
+        (apfs.clone(), ResetMode::PlainCopy),
+        (xfs, ResetMode::LocalClonefile),
+        (s3_backend(), ResetMode::S3Versioning),
+        (s3_backend(), ResetMode::LocalClonefile),
+        (apfs, ResetMode::None),
+    ] {
+        let refused = with_reset(&p, backend.clone(), reset);
+        assert!(
+            refused.revalidate().is_err(),
+            "{backend:?} under {reset:?} is not an admitted embedded pair"
+        );
+    }
+    let mut served = with_reset(&p, s3_backend(), ResetMode::Clone);
+    served.definition.environment.target = Target::Server;
+    served.definition.environment.network_position = crate::case::NetworkPosition::SameHost;
+    served.case_digest = crate::model::typed_sha256(&served.definition).unwrap();
+    served.planned_sha256 = served.planned_hash().unwrap();
+    assert!(
+        served.revalidate().is_err(),
+        "a served case keeps reset: none"
+    );
+}
+
+#[test]
+fn an_s3_environment_derives_the_clone_reset() {
+    let catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
+    assert_eq!(catalog.definition.defaults.protocol.reset, None);
+    assert_eq!(catalog.definition.scenarios.len(), 79);
+    let plan = catalog
+        .plan_in("tiny-read", &GqtEnvironment::embedded(s3_backend()))
+        .unwrap();
+    assert_eq!(
+        plan.definition.protocol.reset,
+        crate::case::ResetMode::Clone
+    );
+    assert_eq!(plan.definition.environment.backend, s3_backend());
+    let local = catalog.plan("tiny-read").unwrap();
+    assert_eq!(
+        local.definition.environment,
+        crate::catalog::local_environment()
+    );
+    assert_ne!(
+        local.definition.protocol.reset,
+        crate::case::ResetMode::Clone
+    );
+}
+
 #[test]
 fn content_identity_excludes_authored_locations_and_selectors() {
     let p = plan("tiny-read");
@@ -600,6 +737,21 @@ fn selected_echo_loop_write_prefix_and_implicit_suffix_refuse() {
     let c = omnigraph_gqt_core::parse_case("dst_only", &dst).unwrap();
     assert!(admit_queries(&c, &p.definition.workload.measured_step).is_err());
 }
+/// A workload file runs on the bench's store, so the pin's claim of `main`
+/// would stay there.
+#[test]
+fn writer_pin_is_refused_on_a_workload_file() {
+    let p = plan("tiny-read");
+    let held = p
+        .queries
+        .text
+        .replacen("# issue: none\n", "# issue: none\n# writer: held\n", 1);
+    let c = omnigraph_gqt_core::parse_case("held_workload", &held).unwrap();
+    let refused = admit_queries(&c, &p.definition.workload.measured_step)
+        .err()
+        .unwrap_or_default();
+    assert!(refused.contains("`# writer: held` cannot"), "{refused}");
+}
 #[tokio::test]
 async fn selected_read_restart_mutation_branch_and_single_load_use_engine_receipts() {
     for name in [
@@ -627,6 +779,154 @@ async fn selected_read_restart_mutation_branch_and_single_load_use_engine_receip
         assert!(sample.merge.is_none());
     }
 }
+/// `repetitions` of `plan` on `kind` as the run loop prepares them: a
+/// restored route gets a verified copy of the frozen template, read-through
+/// an empty `active`. The template's bytes are checked after each one.
+async fn run_on_route(
+    plan: &PlannedGqt,
+    kind: LocalRouteKind,
+    repetitions: u32,
+) -> Vec<GqtRepObservation> {
+    let limits = crate::reset::TraversalLimits::default();
+    let directory = tempfile::tempdir().unwrap();
+    let entry = directory.path().canonicalize().unwrap();
+    let active = entry.join("active");
+    let scratch = entry.join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let (logical, _) = crate::dataset_worker::build_dataset(
+        &plan.dataset_build_plan().unwrap(),
+        active.to_str().unwrap(),
+        &scratch,
+        None,
+    )
+    .await
+    .unwrap();
+    let template =
+        crate::reset::freeze_plain_copy_template(&active, &entry.join("root"), limits).unwrap();
+    std::fs::remove_dir_all(&active).unwrap();
+    let physical = template.physical_digest().clone();
+    let route = kind.over(template.template_root());
+    let bound = plan
+        .bind(&logical.logical_content_sha256, &logical.algorithm)
+        .unwrap();
+    let mut samples = Vec::new();
+    for repetition in 1..=repetitions {
+        let metadata = match kind {
+            LocalRouteKind::ReadThrough => {
+                std::fs::create_dir(&active).unwrap();
+                crate::reset::digest_metadata_tree(&active, limits).unwrap()
+            }
+            LocalRouteKind::Direct | LocalRouteKind::ObjectStore => {
+                template.restore_active().unwrap().metadata_digest().clone()
+            }
+        };
+        let context = format!("{} on {} #{repetition}", plan.definition.id, kind.name());
+        let sample = execute_gqt_rep_signaled(
+            repetition,
+            &active,
+            &route,
+            &physical,
+            &metadata,
+            &bound,
+            &mut Signals::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
+        validate_sample(
+            &sample,
+            &bound,
+            repetition,
+            &crate::gqt_protocol::PreparationProofV2::Embedded {
+                physical_digest: physical.clone(),
+                metadata_digest: metadata,
+            },
+            sample.elapsed_us,
+            false,
+        )
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
+        assert_eq!(sample.outcome, "expectations-passed", "{context}");
+        assert!(sample.verification.selected_assertion_passed, "{context}");
+        crate::reset::verify_physical_tree(template.template_root(), &physical, limits)
+            .unwrap_or_else(|error| panic!("{context}: the template's bytes changed: {error}"));
+        std::fs::remove_dir_all(&active).unwrap();
+        samples.push(sample);
+    }
+    samples
+}
+
+/// A scenario answers alike on the three routes to a local root, and the
+/// read-through route asks storage for what the object-store route asks,
+/// repetition after repetition over one template.
+async fn routes_agree(name: &str) {
+    let p = plan(name);
+    let direct = run_on_route(&p, LocalRouteKind::Direct, 1).await;
+    let object_store = run_on_route(&p, LocalRouteKind::ObjectStore, 1).await;
+    let read_through = run_on_route(&p, LocalRouteKind::ReadThrough, 2).await;
+    for (route, sample) in [
+        ("direct", &direct[0]),
+        ("object-store", &object_store[0]),
+        ("read-through", &read_through[0]),
+        ("read-through, second repetition", &read_through[1]),
+    ] {
+        eprintln!(
+            "{name} on {route}: {} us, lance {:?}, control {:?}",
+            sample.elapsed_us, sample.logical_store_calls, sample.control_store_calls
+        );
+        assert_eq!(
+            sample.verification, direct[0].verification,
+            "{name} on {route}"
+        );
+    }
+    assert_eq!(
+        direct[0].control_store_calls, object_store[0].control_store_calls,
+        "{name}: control calls, direct against object-store"
+    );
+    for sample in &read_through {
+        assert_eq!(
+            sample.control_store_calls, object_store[0].control_store_calls,
+            "{name}: control calls, read-through against object-store"
+        );
+        assert_eq!(
+            sample.logical_store_calls, object_store[0].logical_store_calls,
+            "{name}: Lance calls, read-through against object-store"
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_reads_and_reopens() {
+    for name in ["tiny-read", "tiny-restart", "tiny-post-reopen"] {
+        routes_agree(name).await;
+    }
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_published_writes() {
+    for name in ["tiny-mutate", "tiny-branch", "tiny-load"] {
+        routes_agree(name).await;
+    }
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_a_merge() {
+    routes_agree("e2e-merge-all-changed").await;
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_a_branch_delete() {
+    routes_agree("e2e-branch-delete").await;
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_a_write_over_a_long_history() {
+    routes_agree("very-long-history-32-write").await;
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_writes_to_several_branches() {
+    routes_agree("identity-lifecycle").await;
+}
+
 async fn bounded_scenario(name: &str) -> crate::dataset_identity::DatasetLogicalV1 {
     let p = plan(name);
     let (sample, _, logical) = run_sample_with_logical(&p)
@@ -775,7 +1075,7 @@ fn request_budget_and_projection_budget_are_admitted_before_io() {
     assert!(serde_json::to_vec(&b).unwrap().len() < 512 * 1024);
 }
 
-async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
+pub(crate) async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
     use crate::gqt_record::{GqtMeasurementsV1, GqtRunIdentityV1, GqtRunRecordV1};
     use crate::record::{
         AcquisitionStatusV1, AcquisitionV1, EvidenceStrengthV1, WallClockSummaryV1,
@@ -805,6 +1105,7 @@ async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
     let mut sample = execute_gqt_rep_signaled(
         1,
         &active,
+        &LocalRoute::Direct,
         &physical,
         &template_metadata,
         &bound,
@@ -846,6 +1147,7 @@ async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
             },
         }),
         dataset_cache_hit: Some(true),
+        base: None,
         acquisition: AcquisitionV1 {
             status: AcquisitionStatusV1::Complete,
             requested_repetitions: 1,
@@ -1007,6 +1309,23 @@ fn raw_dataset_plan_needs_no_measured_operation_and_unions_query_indexes() {
     assert!(indexed.needs_indices);
     assert_eq!(indexed.recipe_sha256, measured.recipe_sha256);
     assert_eq!(indexed, measured.dataset_build_plan().unwrap());
+
+    let scratch = tempfile::tempdir().unwrap();
+    let held = scratch.path().join("held.gqt");
+    let text = std::fs::read_to_string(&dataset).unwrap();
+    std::fs::write(
+        &held,
+        text.replacen("# issue: none\n", "# issue: none\n# writer: held\n", 1),
+    )
+    .unwrap();
+    let refused = dataset_file(
+        &held,
+        None,
+        measured.definition.environment.backend.clone(),
+        measured.definition.protocol.reset,
+    )
+    .unwrap_err();
+    assert!(refused.contains("`# writer: held` cannot"), "{refused}");
 }
 #[test]
 fn acquisition_receipts_fit_before_dataset_io() {
@@ -1070,6 +1389,9 @@ async fn completed_gqt_prefix_has_one_owner_and_failed_repetition_is_retained() 
         fixture: record.fixture,
         dataset_cache_hit: Some(true),
         server_receipt: None,
+        base: None,
+        product: None,
+        observed_backend: None,
         samples: vec![sample.clone()],
         wall_clock: crate::runner::WallClockSummary {
             observed_repetitions: 1,
@@ -1256,6 +1578,9 @@ async fn gqt_record_build_rejects_receipts_outside_the_frozen_program() {
         fixture: record.fixture.clone(),
         dataset_cache_hit: record.dataset_cache_hit,
         server_receipt: None,
+        base: None,
+        product: None,
+        observed_backend: None,
         samples: record.measurements.raw_samples.clone(),
         wall_clock: WallClockSummary {
             observed_repetitions: 1,
@@ -1276,4 +1601,34 @@ async fn gqt_record_build_rejects_receipts_outside_the_frozen_program() {
         error.to_string().contains("unknown receipt ordinal"),
         "{error}"
     );
+}
+
+/// The names a `--store` child inherits: the credential sources object_store
+/// renews (container endpoint, web identity, the region) must stay in the
+/// list, or a run longer than one session dies at the expiry with no error here.
+#[test]
+fn child_environment_passes_every_renewing_credential_source() {
+    let names = crate::gqt_runner::CHILD_ENVIRONMENT;
+    for name in [
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_ROLE_SESSION_NAME",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+    ] {
+        assert!(names.contains(&name), "{name} is not passed to the child");
+    }
+    for name in [
+        "GITHUB_TOKEN",
+        "ACTIONS_RUNTIME_TOKEN",
+        "OMNIGRAPH_BENCH_PRODUCT",
+    ] {
+        assert!(
+            !names.contains(&name),
+            "{name} reaches the measured process"
+        );
+    }
 }

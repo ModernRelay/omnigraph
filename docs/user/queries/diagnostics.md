@@ -114,6 +114,7 @@ do not mean there is no possible fix.
 | `Q003` | A settings statement is refused: unknown setting, value outside its row, or a process setting in a request. |
 | `Q004` | A branch, show or explain statement is misplaced or malformed. |
 | `Q005` | A declaration body is refused; `expected` names the construct. |
+| `Q006` | The source nests too deeply, checked before the grammar runs: more than 64 levels of brackets and adjacent `not`s, or an expression deeper than 256 levels when each `and`/`or` of a chain also counts one. Write a long `or` chain over one property as `$p.name in [...]`. |
 
 Type codes are listed where the construct they guard is described, in
 [Query language](index.md).

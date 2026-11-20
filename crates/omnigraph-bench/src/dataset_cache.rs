@@ -23,7 +23,6 @@ pub enum SourceAvailability {
     Missing,
     Invalid,
     Unbound,
-    NotApplicable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -83,17 +82,6 @@ impl CacheInspection {
         }
     }
 
-    /// The answer for a served scenario, which reads a provisioned graph and no cache entry.
-    pub fn served_not_applicable(path: &Path, message: impl Into<String>) -> Self {
-        let mut result = Self::new(path, None);
-        result.source = Some(SourceAvailability::NotApplicable);
-        result.diagnostic = Some(RunnerError::new(
-            "served_scenario_has_no_dataset_cache",
-            message,
-        ));
-        result
-    }
-
     fn fail(mut self, state: CacheState, code: &str, message: impl Into<String>) -> Self {
         self.cache = state;
         self.diagnostic = Some(RunnerError::new(code, message));
@@ -143,14 +131,32 @@ impl DatasetLease {
                 limits,
             )
             .and_then(|t| t.restore_active()),
-            ResetMode::None | ResetMode::S3Versioning => {
-                return Err(error("unsupported dataset reset"));
+            ResetMode::None | ResetMode::S3Versioning | ResetMode::Clone => {
+                return Err(error(
+                    "the dataset lease restores a restore level only; the clone level reads the template through an empty active root",
+                ));
             }
         }
         .map_err(|e| error(e.to_string()))?;
         prepared
             .verify_unchanged()
             .map_err(|e| error(e.to_string()))
+    }
+    /// An empty active root beside the verified template: the layer a
+    /// repetition reads the template through, in place of a restored copy.
+    pub fn empty_active(&self) -> RunnerResult<MetadataDigest> {
+        self.verify()?;
+        self.remove_active()?;
+        std::fs::create_dir(&self.active).map_err(|e| error(e.to_string()))?;
+        reset::digest_metadata_tree(&self.active, TraversalLimits::default())
+            .map_err(|e| error(e.to_string()))
+    }
+    /// Read every byte of the template and require the digest it was frozen
+    /// with: the proof that repetitions which opened it in place left it alone.
+    pub fn verify_template_bytes(&self) -> RunnerResult<()> {
+        reset::verify_physical_tree(&self.template, self.physical(), TraversalLimits::default())
+            .map(|_| ())
+            .map_err(|e| error(format!("template bytes changed: {e}")))
     }
     pub fn verify(&self) -> RunnerResult<()> {
         self.validate_ownership()?;
@@ -672,7 +678,7 @@ fn validate_descriptor(root: &Path, manifest: &DatasetManifestV1) -> RunnerResul
     Ok(())
 }
 
-fn registered_physical(
+pub(crate) fn registered_physical(
     plan: &DatasetBuildPlan,
     binding: Option<&str>,
 ) -> RunnerResult<Option<RegisteredPhysicalTreeV1>> {

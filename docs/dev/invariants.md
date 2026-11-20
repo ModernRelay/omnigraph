@@ -30,7 +30,8 @@ five more changes like this one?**
    names, every pin is a detached version that opens, and the pin is the
    table's version for its whole life. A graph table's linear HEAD stays at
    its creation version, recorded per registration as
-   `omnigraph.last_linear_version`; `repair` reads it for drift. Added-type
+   `omnigraph.last_linear_version`; the collector reads it to list foreign
+   versions. Added-type
    admission may also inspect an unregistered deterministic path, but accepts
    only its qualified original empty version 1, never an advanced HEAD.
    Per-table publication is never graph publication.
@@ -69,7 +70,8 @@ five more changes like this one?**
    lists still exists after the run; and progress, that a table version no
    retained `__manifest` version names is gone after a run that retains
    nothing else. Foreign movement fails closed: a linear commit above a
-   table's last linear version is reported by `repair` and never adopted.
+   table's last linear version is reported by the collector (`cleanup`'s
+   `foreign_versions`), never deleted and never adopted.
    See [recovery.md](recovery.md).
 
 6. **Stable identity survives renames, not lifetimes.** Accepted SchemaIR owns
@@ -129,8 +131,9 @@ five more changes like this one?**
 13. **Evidence matches the boundary.** Test the layer whose contract changed.
     Irreversible storage, protocol, or substrate decisions require an RFC plus
     compatibility, refusal, crash, and rebuild evidence. Cost claims require a
-    checked-in instrument. Extend the existing owner in
-    [testing.md](testing.md) before adding a parallel fixture.
+    checked-in instrument. Extend the existing owner
+    ([testing.md](testing.md), [test ownership](test-ownership.md)) before
+    adding a parallel fixture.
 
 ## Deny-list
 
@@ -178,7 +181,8 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
   One outstanding durable authority owns completion/recovery. Generic drain
   does not prove native-I/O settlement. Clean server release additionally closes
   its explicit storage scope, drains accepted backend mutations and refuses
-  sticky uncertainty; S3 release/reacquisition uses the same lock key by CAS.
+  sticky uncertainty; a converged direct apply releases by the same proof.
+  S3 release/reacquisition uses the same lock key by CAS.
   Excluding raw and older writers remains an operator obligation.
 - Azure writes require the admission wrapper and remain a qualification preview
   pending the adversarial live-Azure matrix. The narrower managed-identity
@@ -188,6 +192,18 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
   together; the removed file-installation protocol supplies no distributed
   lock. Branch creation/deletion and cleanup retain their existing
   single-writer-process control boundary.
+- The writer epoch fences publications that move a branch's head, on a branch
+  some process claimed ([writes](writes.md#writer-epoch)). Only the embedded
+  engine claims: no command or route does, so a claimed branch refuses the
+  server and the CLI. Ref metadata and ref deletes, the collector's
+  deletes, `optimize`'s configuration commit and the stamp-only route of
+  `omnigraph upgrade` are not fenced. The process that holds
+  its handle's bound branch reads it, and opens and revalidates its writes on
+  it, with no head probe ([writes](writes.md#writer-epoch) lists the sites and
+  the captures that still probe), so the reads of an owner another process
+  replaced, or whose branch another process deleted, are stale until its next
+  publish on the branch. One mutation-capable writer process per cluster
+  remains the supported topology.
 - Physical index reconciliation is explicit; there is no background scheduler
   whose queue is a second authority.
 
@@ -196,13 +212,15 @@ code, tests, guide, and—when irreversible—RFC.
 
 ## Review checklist
 
+- Which statements of [the contract](contract.md#citing) does it keep, close,
+  decide or change?
 - Does one snapshot or authority token cover the whole operation?
 - Is graph visibility still one manifest publication?
 - Is every pre-publication durable effect unreachable until the manifest names
   it, and are the table pins and accepted contract complete in that publication?
-- Does it read linear HEAD outside `repair` or qualified original-version
-  admission for an unregistered added-type path, or rebuild a row without carrying
-  `omnigraph.last_linear_version` forward?
+- Does it read linear HEAD outside the collector's foreign-version listing or
+  qualified original-version admission for an unregistered added-type path, or
+  rebuild a row without carrying `omnigraph.last_linear_version` forward?
 - Does the collector's mark set still cover every retained pin, and does its
   sweep still reach every unretained published version?
 - Are names kept separate from stable identity?

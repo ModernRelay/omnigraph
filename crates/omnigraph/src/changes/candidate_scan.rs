@@ -32,10 +32,10 @@
 //! **durable per-transaction provenance proof** — the `omnigraph.no_by_source_delete`
 //! marker every general keyed MergeInsert update stamps, or the RFC-023
 //! `insert_absence` certificate that proven strict inserts carry instead. The
-//! op shape alone is not enough: `repair --force --confirm` can
-//! adopt an external Lance merge whose delete-capable by-source arm persists as
-//! `Update { RewriteRows }`, and its child-only candidate scan has no delete
-//! pass. The source-walk guard (`no_delete_capable_merge_arm_in_engine_source`)
+//! op shape alone is not enough: an external Lance merge whose delete-capable
+//! by-source arm persists as `Update { RewriteRows }` (earlier releases could
+//! adopt one into a table's history) has a child-only candidate scan with no
+//! delete pass. The source-walk guard (`no_delete_capable_merge_arm_in_engine_source`)
 //! proves only that *current engine code* builds no such arm; the marker
 //! authenticates the *persisted* transaction. An unproven `Update` falls back.
 //! See [`transaction_is_row_set_preserving`].
@@ -103,6 +103,21 @@ pub(crate) fn operation_is_row_set_preserving(operation: &Operation) -> bool {
     }
 }
 
+/// An in-place column patch (`Update { RewriteColumns }`, as an `update`
+/// stages for issue #1264): data files attached to existing fragments, no
+/// fragment added or removed.
+fn is_column_patch(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Update {
+            removed_fragment_ids,
+            new_fragments,
+            update_mode: Some(UpdateMode::RewriteColumns),
+            ..
+        } if removed_fragment_ids.is_empty() && new_fragments.is_empty()
+    )
+}
+
 /// Whether one transaction is safe to derive by the touched-fragment candidate
 /// path.
 ///
@@ -113,9 +128,9 @@ pub(crate) fn operation_is_row_set_preserving(operation: &Operation) -> bool {
 /// `insert_absence` certificate (a pure insert deletes nothing). `Append` is
 /// unconditionally additive and needs no marker.
 ///
-/// The shape check alone is NOT sufficient: `repair --force --confirm` can adopt
-/// an external Lance merge whose delete-capable by-source arm persists as
-/// `Operation::Update { RewriteRows }`. Such a transaction carries neither proof,
+/// The shape check alone is NOT sufficient: an external Lance merge whose
+/// delete-capable by-source arm persists as `Operation::Update { RewriteRows }`,
+/// which earlier releases could adopt into a table's history, carries neither proof,
 /// so it falls back to the exact ordered merge — whose delete pass reports the
 /// removed rows the child-only candidate scan would miss.
 pub(crate) fn transaction_is_row_set_preserving(transaction: &Transaction) -> bool {
@@ -246,6 +261,18 @@ pub(crate) async fn interval_candidate_plan(
             to_dataset,
             proof.stamp_window(),
         ));
+    }
+    if is_column_patch(&transaction.operation) {
+        // A column patch moves no row: it attaches data files to the fragments
+        // holding the rows it updated and restamps exactly those rows, so the
+        // candidate suffix above is empty. The transaction names the opened
+        // `from` as its parent, which is the lineage row identity needs: pair
+        // the touched fragments' rows by `_rowid` and read those whose stamp
+        // moved.
+        if !pair_rows_by_identity {
+            return Ok(None);
+        }
+        return row_identity_plan(from_dataset, to_dataset).await;
     }
     if proof != IntervalProof::Commit {
         return Ok(None);
@@ -1001,7 +1028,7 @@ mod tests {
             &[(INSERT_ABSENCE_PROPERTY, INSERT_ABSENCE_V1)],
         )));
         // ... but NOT without a durable proof. An external Lance merge with a
-        // delete-capable by-source arm, adopted via `repair --force`, persists
+        // delete-capable by-source arm, adopted by an earlier release, persists
         // this exact `Update{RewriteRows}` shape and carries no marker — this is
         // the data-loss regression the fix closes (the op-shape classifier alone
         // returns true here).

@@ -1,0 +1,1 @@
+- Reading a branch's commits one after another (`commit show`, `commit changes`, a diff or read pinned to a commit id) reads that branch alone after the first, not every live branch.

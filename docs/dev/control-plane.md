@@ -47,7 +47,7 @@ credential custody. Preserve it across removal, logout and upgrade. Retiring the
 old grammar does not authorize discarding unresolved work or replaying it under
 a new identity. `config recover-operations --source DIR --profile NAME`
 preserves matching legacy folder evidence without accepting old configuration
-or submitting remote operations; `managed/lifecycle/pending` owns that copy/retire
+or submitting remote operations; `managed::lifecycle::pending` (in `omnigraph-cli`) owns that copy/retire
 protocol.
 
 The CLI's managed HTTP adapter obtains current access before each new request,
@@ -83,9 +83,11 @@ scope, response validation and refusal tests.
 |---|---|
 | `__cluster/state.json` | Applied ledger; v2 also owns outstanding deployment authority and bounded results |
 | `__cluster/resources/` | Content-addressed queries, policies and immutable deployment bundles |
-| `__cluster/recoveries/` | Legacy evidence read only during explicit conversion checks |
+| `__cluster/recoveries/` | Legacy evidence, never executed or swept: serving quarantines a graph a sidecar names, plan/status/observe warn, an identity-authorized plan refuses, and ledger conversion requires it resolved |
 | `__cluster/approvals/` | Preserved legacy audit artifacts; no operational approval writer |
 | `__cluster/lock.json` | Persisted control lock; v2 lifetime cluster admission |
+| `__cluster/lease/<lock_id>/` | Heartbeats and the takeover claim of a leased S3 serving lock |
+| `__cluster/operations.json` | The operation record: each admission scope's active operation, unresolved publications, bounded terminal results, the eviction mark and each kind's state per graph |
 | `graphs/<id>.omni/` | Derived graph roots managed through apply |
 
 All stored control objects use the shared storage adapter. Filesystem replacement and object-store PUT/CAS details stay below that boundary; higher layers deal in versioned reads, conditional writes, and normalized roots.
@@ -94,6 +96,44 @@ The engine has no ordinary graph recovery sidecar: schema, table pins and
 lineage publish together in `__manifest`. Ledger v2 stores prepared schema and
 graph-birth and graph-deletion authority in one outstanding record. Legacy control evidence is
 preserved for explicit conversion checks, never executed by a fallback sweep.
+
+## Operation record
+
+`__cluster/operations.json` (`omnigraph_cluster::OperationRecord`) is
+separate from `state.json`, whose `deny_unknown_fields` ledger older binaries
+must keep reading. It names the cluster's ledger id; a record naming another
+ledger is refused with `operation_record_foreign` and never merged. Only the
+lock holder writes it, and in that process every read a write follows and
+every write hold the admission's record gate (`ClusterAdmission::lock_operations`,
+`update_operations`: read, apply, one conditional put), the server's routes,
+the runs' state changes and the graph deletion's settlement alike; the
+server's live-run set changes under the same gate, so a lookup never meets a
+run that ended while its record was still active. Each write is a conditional put against the version read: at
+acceptance, when the run starts, in the optimize run's before-publish hook
+(`publishing`, with the intent nonce, the input head and the per-table
+outcomes), and at the end. The record is generic over `kind`: the header
+keys its active operations by admission scope and each kind's state by graph
+and kind, and each record names its settlement branch; `optimize` is the
+first kind. A write with no definite answer (`OperationWrite::InDoubt`) stops
+the run's writes; the server's next admission or lookup reads the record
+back and re-applies a run's final change, kept per operation id until a write applies it or the record settled the run another way, to the record as it then stands. A write the store or the process's storage scope refuses is a definite `Refused` outcome (503, nothing accepted), distinct from one with no answer (`InDoubt`, 500 `outcome_unknown`): a scope keeps refusing a key whose earlier request is unsettled until the server is replaced. An `accepted` or `running` operation no live run holds becomes
+`interrupted`, and a `publishing` one joins at most four unresolved
+operations, settled by `Omnigraph::resolve_publication` once the settlement
+branch's graph head moves: one page of the branch's first-parent chain per
+attempt (`OMNIGRAPH_OPERATION_RESOLUTION_WALK_LIMIT`), the page's unvisited
+parent kept as the record's cursor, until the input head's child answers the
+nonce or proves the run did not commit. A lost terminal write is re-issued
+first. Terminal records are bounded by the deployment receipts' values; the
+newest evicted id's ULID time is the eviction mark, and an id at or before it
+is refused; an id dated more than `MAX_OPERATION_ID_LEAD_MS` ahead of the
+server's clock is refused too, since once evicted it would set the mark for
+everyone. A retained id answers before either check. A graph deletion settles the lifetime's non-terminal records in
+`complete_graph_deletion`: by the history rule while the root answers, and as
+`unsettled` (`graph_deleted`) once its absence is verified. The server side
+is `crates/omnigraph-server/src/recorded_operations.rs`: one admission gate
+per scope, taken by the handler and held by the owned operation that writes
+the acceptance as its first step, and cancellation on shutdown and before a
+deployment's drain of the graph.
 
 ## Deployment ledger
 
@@ -118,7 +158,7 @@ revision. Retained roots, trust and storage format stay fixed. Removing a graph
 from desired configuration deletes its exact managed root, including all branches,
 retained history and managed Blob bytes. It does not follow external Blob
 references or delete peer roots. Adoption, missing-root recreation and catalog
-repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.14.
+repair refuse. Normal engine open requires v14 to v17; server HTTP requires v0.14.
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
@@ -162,8 +202,7 @@ graph. A replacement lifetime refuses, while an unreadable partial root remains
 bound to its original intent.
 Completion requires verified root absence before a `Deleted` outcome removes
 the graph's applied resources and contract. A lost completion acknowledgement is
-reconciled by original ID. No deletion queue, side record or retained-owner pool
-is introduced, and matching source text never authorizes a replacement root.
+reconciled by original ID. There is no deletion queue, side record or retained-owner pool, and matching source text never authorizes a replacement root.
 
 A graph-birth token binds canonical root, exact source/IR contract and genesis
 identity. Reconciliation accepts only that birth, not matching text. Under
@@ -210,12 +249,16 @@ Read-only CLI consumers instead validate canonical membership, captured ledger
 CAS and accepted schema through `graph_read.rs`, without taking writer admission.
 This is an observation, not a reclamation lease or a fence against later changes.
 Dropping a guard or returning from writable work, including success, retains its
-persisted lock. Completed read-only preflight refusals during new deployment,
+persisted lock unless the owner releases it explicitly as described here. Completed read-only preflight refusals during new deployment,
 conversion, admission construction or read-only server settings validation
 explicitly release the exact lock. Recovery
 of an accepted invocation retains admission even when its current preparation
 refuses. Other explicit release requires qualified terminal graph and control
-I/O; generic server drain does not establish that proof. Clean serving release
+I/O; generic server drain does not establish that proof. A direct deployment
+(`apply_direct_bundle`) runs its control and graph writes in one explicit
+storage scope and, when the deployment completes converged, releases through
+the same scope settlement as clean serving release; Azure, a non-converged or
+outstanding result, and an uncertain scope retain admission. Clean serving release
 adds an explicit storage scope covering native and Lance writes, described below.
 Other operator transfer requires stopped prior processes and accepted-I/O quiescence,
 then exact-ID unlock with all admissions and other unlocks excluded until it
@@ -418,7 +461,7 @@ I/O settlement. Azure writers also acquire the external admission lease through
 
 A directory lets the server resolve the storage root from `cluster.yaml`; a URI reads the applied deployment artifact directly. There is no single-graph positional boot, `--target`, or independent graph add/remove API; inventory additions and destructive removals use deployment.
 
-Serving captures ledger/resource digests, graph identity, expected contracts and validated policies before binding the listener. The captured registry initially contains loading or preflight-blocked entries, with the same captured policy later installed on the engine. One process-owned startup batch opens at most four graphs concurrently, checks accepted contracts, projects external-Blob policy, and validates stored queries. Each completed graph becomes ready or blocked through the process/registry admission boundary; shutdown prevents late activation and drains entered opens. Default startup admits healthy graphs individually. `--require-all-graphs` installs successful handles atomically only when every graph succeeds; any failure stops startup. A nonempty inventory with zero healthy graphs fails after the batch finishes. No attempt timeout, startup retry, reopen or native-settlement proof is introduced.
+Serving captures ledger/resource digests, graph identity, expected contracts and validated policies before binding the listener. The captured registry initially contains loading or preflight-blocked entries, with the same captured policy later installed on the engine. One process-owned startup batch opens at most four graphs concurrently, checks accepted contracts, projects external-Blob policy, and validates stored queries. Each completed graph becomes ready or blocked through the process/registry admission boundary; shutdown prevents late activation and drains entered opens. Default startup admits healthy graphs individually. `--require-all-graphs` installs successful handles atomically only when every graph succeeds; any failure stops startup. A nonempty inventory with zero healthy graphs fails after the batch finishes. There is no attempt timeout, startup retry, reopen or native-settlement proof.
 
 `POST /cluster/deployments` submits a bounded immutable bundle and original ID
 to the running owner. The bearer actor needs applied cluster `ConfigManage` and
@@ -485,7 +528,7 @@ Protected graph and registry HTTP calls require the v0.14 contract header after
 authentication and before graph resolution. CLI discovery and response validation
 are specified by [wire compatibility](versioning.md#wire-compatibility); the
 managed control-plane API and standard MCP/OAuth protocols are separate surfaces.
-This admission check changes no ledger or serving-reload behavior.
+
 
 Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
 
@@ -502,9 +545,9 @@ reachability is outside the serving request path. The profile boundary and
 applied-policy ownership are described in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
 
-`GET /graphs/discovery` accepts only the verified identity profile and returns
-IDs and display names for the loading, ready and blocked graph inventory captured
-at boot. It neither scans storage nor discloses availability, paths, policy,
+`GET /graphs/discovery` accepts only the verified identity profile and returns IDs and display names for every graph in the current
+serving registry (loading, ready, transitioning or blocked), as last installed
+by boot or a deployment activation. It neither scans storage nor discloses availability, paths, policy,
 schema, or query definitions. It needs no policy membership. The separate
 `GET /graphs` uses the same registry with a `graph_list` gate and returns one
 list containing runtime availability, sanitized failure and action. Neither inventory synthesizes graph
@@ -664,6 +707,7 @@ server. Public actor construction cannot grant signed-token permissions.
 on `AuthenticatedActor` exposes only verified claims.
 
 Policy embedders must handle `PolicyAction::ConfigManage`,
+`PolicyAction::Maintain`, `PolicyAction::Reclaim`,
 `PolicyResourceKind::Cluster`, and `PolicyEngineKind::Cluster`. These public
 enums are exhaustive, so an external exhaustive match must add the relevant
 arm when upgrading. Preserving existing constructors and direct storage-holder
@@ -708,8 +752,9 @@ or token expiry. The exact format and limits are in
 The server mounts `/mcp` whenever it has a bearer credential source: static
 tokens, signed data tokens or OIDC. OIDC additionally enables
 `/.well-known/oauth-protected-resource` and the metadata path advertised in the
-authentication challenge. Ad-hoc reads and write tools require their separate
-boot opt-ins; every invocation uses the same handlers and policy as HTTP.
+authentication challenge. `/mcp` lists every tool; the only MCP boot setting is the
+allowed-host list (`--mcp-allowed-host`). Every invocation uses the same
+handlers and policy as HTTP.
 A registered resource or listed tool is never a permission grant.
 
 `omnigraph-mcp` owns the SDK integration, tool/resource catalog, settings,

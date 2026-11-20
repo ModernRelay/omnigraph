@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::diagnostic::{CaseError, CaseErrorCode};
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
@@ -68,7 +70,7 @@ impl Environment {
         };
         if needs_dst {
             return Err(
-                "unsupported_environment: --store cannot execute seams or concurrent blocks on the direct engine; select or declare omnigraph-engine-dst (--target omnigraph-engine-dst)".into(),
+                "unsupported_environment: --store cannot execute seams or scripted concurrent blocks on the direct engine; select or declare omnigraph-engine-dst (--target omnigraph-engine-dst)".into(),
             );
         }
         if !["file://", "s3://", "az://"]
@@ -162,7 +164,7 @@ impl Environment {
                 }
             }
             _ => Err(format!(
-                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams or concurrent blocks and omnigraph-engine-dst/in-memory-object-store",
+                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams or scripted concurrent blocks and omnigraph-engine-dst/in-memory-object-store",
                 self
             )),
         }
@@ -274,6 +276,27 @@ pub fn parse_runner(body: &str) -> Result<RunnerConfig, String> {
         }
     }
     Ok(config)
+}
+
+/// The `timeout_ms` the required corpus admits.
+pub const CORPUS_TIMEOUT_MS: u64 = 10_000;
+
+/// The admission the required corpus adds to the parser's rules for a case
+/// its fast tier runs, decided in one place for the run and for `--check`.
+pub fn corpus_admission(runner: &RunnerConfig) -> Result<(), CaseError> {
+    if runner.timeout_ms <= CORPUS_TIMEOUT_MS {
+        return Ok(());
+    }
+    Err(CaseError::new(
+        CaseErrorCode::CorpusTimeout,
+        format!(
+            "the required corpus admits timeout_ms at most {CORPUS_TIMEOUT_MS}; this case declares {}",
+            runner.timeout_ms
+        ),
+    )
+    .fix(format!(
+        "set `timeout_ms: {CORPUS_TIMEOUT_MS}` or lower, or move the case under `cases_slow/`"
+    )))
 }
 
 pub fn parse_seam(body: &str) -> Result<SeamDirective, String> {

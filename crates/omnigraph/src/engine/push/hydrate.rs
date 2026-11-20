@@ -30,6 +30,7 @@ use super::error::{ExecError, Result};
 use super::roles::{Operator, OperatorResult};
 use crate::ordered_cursor::{
     HYDRATION_CHUNK_HARD_BYTES, HYDRATION_CHUNK_SEED_ROWS, HYDRATION_CHUNK_TARGET_BYTES, row_id_at,
+    row_id_ref,
 };
 use crate::storage_layer::KEYED_WRITE_MAX_ROWS;
 
@@ -246,8 +247,8 @@ impl ChunkHydrator {
             let &(batch_index, row) = by_address
                 .get(address)
                 .ok_or_else(|| self.internal("is missing a requested row"))?;
-            if row_id_at(&batches[batch_index], row, self.id_col)?
-                != row_id_at(keys, start + offset, self.id_col)?
+            if row_id_ref(&batches[batch_index], row, self.id_col)?
+                != row_id_ref(keys, start + offset, self.id_col)?
             {
                 return Err(self.internal("returned a row out of key order"));
             }
@@ -449,16 +450,4 @@ fn take_in_order(chunk: &HydratedChunk) -> Result<RecordBatch> {
         .map(|(batch, row)| (offsets[*batch] + row) as u32)
         .collect();
     Ok(take_record_batch(&all, &indices)?)
-}
-
-/// The hydrated schema a side declares: its columns plus the address pair.
-pub fn hydrated_columns(schema: &Schema) -> Schema {
-    let mut fields: Vec<Field> = schema
-        .fields()
-        .iter()
-        .map(|field| field.as_ref().clone())
-        .collect();
-    fields.push(Field::new(lance_core::ROW_ID, DataType::UInt64, true));
-    fields.push(Field::new(lance_core::ROW_ADDR, DataType::UInt64, true));
-    Schema::new(fields)
 }

@@ -437,6 +437,16 @@ pub async fn app_for_graph_with_auth_tokens_only(
     schema: &str,
     tokens: &[(&str, &str)],
 ) -> (tempfile::TempDir, Router) {
+    app_for_graph_with_auth_tokens_only_reading(schema, tokens, false).await
+}
+
+/// [`app_for_graph_with_auth_tokens_only`], with the server's
+/// `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY` opt-in set as `allow_reads` says.
+pub async fn app_for_graph_with_auth_tokens_only_reading(
+    schema: &str,
+    tokens: &[(&str, &str)],
+    allow_reads: bool,
+) -> (tempfile::TempDir, Router) {
     let temp = init_graph_with_schema(schema).await;
     let graph = graph_path(temp.path());
     let state = AppState::open_with_bearer_tokens_and_policy(
@@ -448,7 +458,8 @@ pub async fn app_for_graph_with_auth_tokens_only(
         None,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .with_reads_without_policy(allow_reads);
     (temp, build_app(state))
 }
 

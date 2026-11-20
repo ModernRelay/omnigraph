@@ -37,9 +37,29 @@ impl ClusterAdmissionPurpose {
 #[derive(Debug, Clone)]
 pub struct ClusterAdmission(Option<Arc<AdmissionOwner>>);
 
+/// The held operation-record gate ([`ClusterAdmission::lock_operations`]).
+pub struct OperationsLock {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    _held: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// What [`ClusterAdmission::update_operations`] leaves: the record as
+/// written (or as read, when nothing changed), its version, the outstanding
+/// deployment's id, and the change's own value.
+pub struct OperationsUpdate<T> {
+    pub record: crate::OperationRecord,
+    pub version: Option<String>,
+    pub outstanding_deployment: Option<String>,
+    pub value: T,
+}
+
 #[derive(Debug)]
 struct AdmissionOwner {
     changed: Arc<tokio::sync::Notify>,
+    /// The in-process gate over the operation record: every read that a write
+    /// follows, and every write, holds it, so the record's conditional put
+    /// never races another writer in this process.
+    operations: Arc<tokio::sync::Mutex<()>>,
     store: ClusterStore,
     guard: StateLockGuard,
     canonical_root: String,
@@ -67,6 +87,7 @@ impl ClusterAdmission {
         };
         Self(Some(Arc::new(AdmissionOwner {
             changed: Arc::new(tokio::sync::Notify::new()),
+            operations: Arc::default(),
             canonical_root: store
                 .canonical_root()
                 .expect("bootstrap has a validated S3 root"),
@@ -158,6 +179,161 @@ impl ClusterAdmission {
         Ok(())
     }
 
+    /// The cluster ledger id and the outstanding deployment's id, for the
+    /// admission of a recorded operation. Reading them needs no configuration
+    /// grant: they decide whether an operation may start, and say nothing
+    /// about the deployment beyond its id.
+    pub async fn operations_context(&self) -> Result<(String, Option<String>), Diagnostic> {
+        let snapshot = self
+            .owner()
+            .store
+            .read_state(&mut self.owner().store.observations())
+            .await?;
+        let state = snapshot.state.ok_or_else(|| {
+            Diagnostic::error(
+                "state_missing",
+                CLUSTER_STATE_FILE,
+                "a served cluster has a ledger",
+            )
+        })?;
+        let ledger_id = state.ledger_id.clone().ok_or_else(|| {
+            Diagnostic::error(
+                "ledger_upgrade_required",
+                CLUSTER_STATE_FILE,
+                "a recorded operation requires a v2 ledger",
+            )
+        })?;
+        Ok((
+            ledger_id,
+            state
+                .outstanding
+                .as_ref()
+                .map(|outstanding| outstanding.id.clone()),
+        ))
+    }
+
+    /// Take the operation record's in-process gate. A caller holds it from the
+    /// read it bases a write on through that write; the deletion's settlement
+    /// and every server route write under it, so there is one writer at a time
+    /// in this process and the conditional put's precondition is the version
+    /// the holder read.
+    pub async fn lock_operations(&self) -> OperationsLock {
+        let gate = Arc::clone(&self.owner().operations);
+        OperationsLock {
+            _held: Arc::clone(&gate).lock_owned().await,
+            gate,
+        }
+    }
+
+    /// The operation record as it stands, for a read no write follows: the
+    /// history walk that settles a publication starts from it, and its result
+    /// is applied under the gate only where the record still matches.
+    pub async fn peek_operations(
+        &self,
+    ) -> Result<Option<(crate::OperationRecord, String)>, Diagnostic> {
+        self.owner().store.read_operations().await
+    }
+
+    /// The operation record and its version token, under the gate.
+    pub async fn read_operations(
+        &self,
+        lock: &OperationsLock,
+    ) -> Result<Option<(crate::OperationRecord, String)>, Diagnostic> {
+        debug_assert!(
+            Arc::ptr_eq(&lock.gate, &self.owner().operations),
+            "an operation-record gate is read under the admission that gave it"
+        );
+        self.owner().store.read_operations().await
+    }
+
+    /// One conditional put of the operation record, under the gate. Only this
+    /// admission's exact lock holder writes it, so the cluster lock is checked
+    /// first.
+    pub async fn write_operations(
+        &self,
+        lock: &OperationsLock,
+        record: &crate::OperationRecord,
+        expected_version: Option<&str>,
+    ) -> Result<crate::OperationWrite, Diagnostic> {
+        debug_assert!(
+            Arc::ptr_eq(&lock.gate, &self.owner().operations),
+            "an operation-record gate is written under the admission that gave it"
+        );
+        self.validate_current_lock().await?;
+        self.owner()
+            .store
+            .write_operations(record, expected_version)
+            .await
+    }
+
+    /// Read the record (a new one with this cluster's ledger id when the root
+    /// has none), apply `change`, and put it once when the change reports it
+    /// moved something. A record naming another ledger is refused
+    /// (`operation_record_foreign`) and never merged. A put the store refuses
+    /// as a conflict is unexpected under the gate and reported as such; one
+    /// with no definite answer is `operation_record_outcome_unknown`.
+    pub async fn update_operations<T>(
+        &self,
+        lock: &OperationsLock,
+        change: impl FnOnce(&mut crate::OperationRecord) -> Result<(bool, T), Diagnostic>,
+    ) -> Result<OperationsUpdate<T>, Diagnostic> {
+        let (ledger_id, outstanding_deployment) = self.operations_context().await?;
+        let (mut record, version) = match self.read_operations(lock).await? {
+            Some((record, version)) => (record, Some(version)),
+            None => (crate::OperationRecord::new(ledger_id.clone()), None),
+        };
+        if record.ledger_id != ledger_id {
+            return Err(Diagnostic::error(
+                "operation_record_foreign",
+                crate::CLUSTER_OPERATIONS_FILE,
+                format!(
+                    "the operation record names ledger {} but this cluster's ledger is {ledger_id}; move the record aside",
+                    record.ledger_id
+                ),
+            ));
+        }
+        let (changed, value) = change(&mut record)?;
+        let version = if changed {
+            match self
+                .write_operations(lock, &record, version.as_deref())
+                .await?
+            {
+                crate::OperationWrite::Written { version } => Some(version),
+                crate::OperationWrite::Conflict => {
+                    return Err(Diagnostic::error(
+                        "operation_record_changed",
+                        crate::CLUSTER_OPERATIONS_FILE,
+                        "the operation record changed under this process's gate; another writer holds the root",
+                    ));
+                }
+                crate::OperationWrite::Refused { error } => {
+                    return Err(Diagnostic::error(
+                        "operation_record_refused",
+                        crate::CLUSTER_OPERATIONS_FILE,
+                        format!(
+                            "the operation record write was refused and applied nothing: {error}"
+                        ),
+                    ));
+                }
+                crate::OperationWrite::InDoubt { error } => {
+                    return Err(Diagnostic::error(
+                        "operation_record_outcome_unknown",
+                        crate::CLUSTER_OPERATIONS_FILE,
+                        format!("the operation record write has no definite answer: {error}"),
+                    ));
+                }
+            }
+        } else {
+            version
+        };
+        Ok(OperationsUpdate {
+            record,
+            version,
+            outstanding_deployment,
+            value,
+        })
+    }
+
     /// A recovery/deployment owner cannot be reinterpreted as a serving owner.
     pub fn validate_serving(&self) -> Result<(), Diagnostic> {
         if self.owner().purpose != ClusterAdmissionPurpose::Serve {
@@ -211,10 +387,15 @@ impl ClusterAdmission {
         }
     }
 
-    /// Explicitly release a uniquely owned admission after the caller has
-    /// proved all graph/native effects and accepted control I/O settled.
+    /// Explicitly release a uniquely owned admission.
     ///
-    /// This method does not establish that proof. Error, cancellation, an
+    /// With a tracked storage scope this method proves storage settlement
+    /// itself: it closes the scope, waits until every accepted request has
+    /// finished and refuses `cluster_admission_io_uncertain` while any is
+    /// uncertain. The caller must still prove the logical outcome, that its
+    /// work ended in a state the next owner may take over (a converged
+    /// deployment, a drained server), and, without a tracked scope, that its
+    /// graph/native effects and control I/O settled. Error, cancellation, an
     /// outstanding clone, or abandonment never authorizes release. On S3 the
     /// held version becomes a unique released marker by CAS; the key remains
     /// present so a delayed release or original bootstrap create cannot
@@ -250,6 +431,27 @@ impl ClusterAdmission {
     /// canonical graph layout; graph symlinks escaping that layout are refused.
     pub async fn validate_graph_uri(&self, graph_uri: &str) -> Result<(), Diagnostic> {
         self.admitted_graph_id(graph_uri).map(|_| ())
+    }
+
+    /// The policy the applied revision binds to the admitted graph at
+    /// `graph_uri`, or `None` when it binds none. A storage owner's handle
+    /// installs it as a server's does, so a direct writer is refused what a
+    /// served one is. It is read from the state under this admission's lock,
+    /// which a deployment needs to change it, so it holds for the admission's
+    /// life. Only the bundles bound to the graph are read; one that does not
+    /// load refuses.
+    pub async fn graph_policy(
+        &self,
+        graph_uri: &str,
+    ) -> Result<Option<Arc<omnigraph_policy::PolicyEngine>>, Diagnostic> {
+        let graph = self.admitted_graph_id(graph_uri)?;
+        let store = self.store();
+        let state = store
+            .read_state(&mut store.observations())
+            .await?
+            .state
+            .ok_or_else(missing_state)?;
+        crate::authorization::AppliedPolicies::load_graph(&store, &state, &graph).await
     }
 
     fn admitted_graph_id(&self, graph_uri: &str) -> Result<String, Diagnostic> {
@@ -469,6 +671,7 @@ pub(crate) async fn acquire_with_store(
     };
     Ok(Some(ClusterAdmission(Some(Arc::new(AdmissionOwner {
         changed: Arc::new(tokio::sync::Notify::new()),
+        operations: Arc::default(),
         store: store.clone(),
         guard,
         canonical_root,
@@ -667,6 +870,38 @@ mod tests {
         // prevent its capture; graph-open errors belong to per-graph startup.
         assert!(!graph.join("__manifest").exists());
         next.release_after_settlement().await.unwrap();
+    }
+
+    /// A converged direct apply (#1359) relies on the release itself to refuse
+    /// uncertain storage: unlike the server, it checks nothing before the call.
+    #[tokio::test]
+    async fn uncertain_scope_keeps_the_lock_through_a_settled_release_issue_1359() {
+        let dir = state_fixture(2, false);
+        let root = dir.path().to_str().unwrap();
+        let store = crate::store::ClusterStore::for_storage_root(root)
+            .unwrap()
+            .with_io_scope(omnigraph_storage::StorageIoScope::new())
+            .unwrap();
+        let owner = acquire_with_store(&store, ClusterAdmissionPurpose::Deployment)
+            .await
+            .unwrap()
+            .unwrap();
+        let lock_id = owner.lock_id().to_owned();
+        let graph = dir.path().join("graphs/knowledge.omni");
+        let adapter = owner
+            .store()
+            .graph_storage(graph.to_str().unwrap())
+            .unwrap();
+        // A write to a mutable key, abandoned in flight: the payload is large
+        // enough that the local write cannot finish within its first poll.
+        let payload = "x".repeat(64 << 20);
+        let target = graph.join("_refs/probe.json");
+        let write = adapter.write_text(target.to_str().unwrap(), &payload);
+        let _ = tokio::time::timeout(std::time::Duration::ZERO, write).await;
+        let error = owner.release_after_settlement().await.unwrap_err();
+        assert_eq!(error.code, "cluster_admission_io_uncertain");
+        let lock = std::fs::read_to_string(dir.path().join("__cluster/lock.json")).unwrap();
+        assert!(lock.contains(&lock_id), "{lock}");
     }
 
     #[tokio::test]

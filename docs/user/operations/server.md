@@ -91,8 +91,12 @@ Choose one static token source:
 |---|---|
 | `OMNIGRAPH_SERVER_BEARER_TOKEN` | One bearer token; actor is `default` |
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON` | Actor-to-token object, e.g. `{"act-alice":"secret-a"}` |
-| `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` | Path to that JSON object |
+| `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` | Path to that JSON object. On Unix a file other accounts can write is refused at startup, and one they can read logs a warning; use `chmod 600`, or `defaultMode: 0400` on a Kubernetes secret volume |
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` | Secrets Manager mapping; requires an AWS-enabled build: the container images, the release archives from v0.14.0 and every edge build, or a source build with `cargo build -p omnigraph-server --features aws` |
+
+Every source refuses a blank actor, a duplicate token value and an actor name
+starting with `principal:`, which is reserved for signed and OIDC identities
+(`principal:<id>`), so a static token cannot match their policy rules.
 
 Send `Authorization: Bearer secret-a` (the scheme is case-insensitive). The token selects the
 actor for authorization and commit attribution; clients cannot claim another actor. See
@@ -101,9 +105,13 @@ the server refused the token sent; a valid OIDC token it does not admit gets 403
 
 A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
-on a trusted development network. Static tokens without a policy allow only the
-`read` action. Stored-query invocation, export, graph listing, writes, and other
-actions remain denied.
+on a trusted development network. A graph without an applied policy refuses
+every action to every token, reads included: bearer tokens are not scoped to
+graphs, so a permit there would reach every graph that lacks a policy. Apply a
+[graph policy](policy.md) to each graph a token should reach. Setting
+`OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` in the server's environment restores
+the earlier behaviour, in which every static token may `read` every graph
+without a policy; the server logs a warning at startup when it is set.
 
 ### Assert the actor
 

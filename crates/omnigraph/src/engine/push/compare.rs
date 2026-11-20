@@ -15,7 +15,7 @@ use super::chunk::{Chunk, prefixed, side_batch, with_column};
 use super::context::{EngineHooks, ExecContext, SideRow, side_name};
 use super::error::Result;
 use super::roles::{Operator, OperatorResult};
-use crate::changes::model::is_reserved_storage_system_column;
+use lance_core::is_system_column;
 
 use crate::changes::row_compare::column_name_at_vintage;
 
@@ -102,7 +102,7 @@ pub async fn rows_differ(
         let Some(name) = field.name().strip_prefix(&prefix) else {
             continue;
         };
-        if is_reserved_storage_system_column(name) {
+        if is_system_column(name) {
             continue;
         }
         if is_blob(field) {

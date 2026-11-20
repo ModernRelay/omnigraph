@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-server"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2024"
 description = "HTTP server for the Omnigraph graph database."
 license = "MIT"
@@ -19,12 +19,12 @@ default = []
 aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
 
 [dependencies]
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.15.0" }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.0" }
-omnigraph-policy = { path = "../omnigraph-policy", version = "0.15.0" }
-omnigraph-api-types = { path = "../omnigraph-api-types", version = "0.15.0" }
-omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.15.0" }
-omnigraph-mcp = { path = "../omnigraph-mcp", version = "0.15.0" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.15.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1" }
+omnigraph-policy = { path = "../omnigraph-policy", version = "0.15.1" }
+omnigraph-api-types = { path = "../omnigraph-api-types", version = "0.15.1" }
+omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.15.1" }
+omnigraph-mcp = { path = "../omnigraph-mcp", version = "0.15.1" }
 axum = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
@@ -34,7 +34,6 @@ tokio = { workspace = true }
 yaml_serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["json"] }
-tower-http = { workspace = true }
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots", "internal-logs"] }
@@ -52,7 +51,6 @@ libc = "0.2"
 subtle = { workspace = true }
 async-trait = { workspace = true }
 arc-swap = { workspace = true }
-dashmap = "6"
 regex = { workspace = true }
 thiserror = { workspace = true }
 aws-config = { version = "1", optional = true, default-features = false, features = ["rustls", "rt-tokio", "credentials-process", "sso"] }
@@ -63,13 +61,12 @@ opentelemetry_sdk = { version = "0.31", default-features = false, features = ["t
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic-messages", "trace"] }
 prost = "0.14"
 omnigraph = { package = "omnigraph-engine", path = "../omnigraph", features = ["failpoints"] }
-omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.15.0", features = ["test-util", "failpoints"] }
+omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.15.1", features = ["test-util", "failpoints"] }
 tempfile = { workspace = true }
 tower = { workspace = true }
 serial_test = "3"
 rsa = "0.9"
 lance = { workspace = true }
-lance-index = { workspace = true }
 object_store = { workspace = true }
 reqwest = { workspace = true }
 

@@ -36,8 +36,8 @@ use lance::dataset::write::merge_insert::{
     MergeStats, SourceDedupeBehavior, UncommittedMergeInsert,
 };
 use lance::dataset::{
-    DeleteBuilder, InsertBuilder, MergeInsertBuilder, ReadBlobsStream, WhenMatched, WhenNotMatched,
-    WriteMode, WriteParams,
+    DeleteBuilder, InsertBuilder, MergeInsertBuilder, MergeInsertWriteMode, ReadBlobsStream,
+    WhenMatched, WhenNotMatched, WriteMode, WriteParams,
 };
 use lance::datatypes::Schema as LanceSchema;
 use lance::index::DatasetIndexExt;
@@ -105,6 +105,10 @@ pub(crate) const INSERT_ABSENCE_PROPERTY: &str = "omnigraph.insert_absence";
 pub(crate) const INSERT_ABSENCE_V1: &str = "v1";
 
 const EXTERNAL_BLOB_PROBE_CONCURRENCY: usize = 8;
+/// The IVF partition count the engine builds a declared vector index with.
+/// A fold keeps an index's own count, except for an index that holds no
+/// rows (`TableStore::vector_partition_count`).
+const ENGINE_VECTOR_PARTITIONS: usize = 1;
 const EXTERNAL_BLOB_REFERENCE_RESOURCE: &str = "external Blob reference cells";
 const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata bytes";
 
@@ -139,6 +143,17 @@ pub(crate) const ORDERED_SCAN_MAX_INPUT_BATCH_BYTES: u64 = ORDERED_SCAN_MEMORY_B
 /// Soft scanner hints of the streamed id scans behind delete and Overwrite removal.
 pub(crate) const ID_SCAN_BATCH_ROWS: usize = 1024;
 pub(crate) const ID_SCAN_BATCH_BYTES: u64 = 1024 * 1024;
+
+/// The most data-file bytes, as the manifest records them, that the fragments
+/// an id BTREE leaves uncovered may hold for an all-present upsert to take
+/// Lance's indexed merge route instead of the id join. That route scans those
+/// fragments for every source column, so this bounds what the switch can read
+/// beyond the BTREE whatever the row width. One MiB is the id column alone of
+/// tens of thousands of rows, so above that table size the switch reads less
+/// than the join even at the bound, and below it the switch reads at most this
+/// much more. A narrow one-row tail, the state a write leaves between index
+/// builds, is a few KiB.
+pub(crate) const KNOWN_PRESENT_TAIL_MAX_BYTES: u64 = 1024 * 1024;
 
 /// The byte cap of one batch entering a `SortExec` under a pool of `memory_limit` bytes.
 pub(crate) fn sort_input_batch_bytes(memory_limit: u64) -> usize {
@@ -183,13 +198,41 @@ pub(crate) fn cap_sort_inputs_and_merge_partitions(
     })
 }
 
-/// DataFusion's sort spill reservation under a pool of `memory_limit` bytes.
+/// DataFusion's sort spill reservation under a pool of `memory_limit` bytes:
+/// what a sort's merge holds from the sort's first input batch on, and the
+/// headroom DataFusion frees for the in-memory sort at every spill. A
+/// sixteenth of the pool, at least a third of it up to 512 KiB, at most
+/// DataFusion's own default of 10 MiB: a third (at most 40 MiB) sat idle
+/// beside the batches' half and left the graph work producing the sort's
+/// input a sixth (#1361), and under 1.5 MiB a sixteenth is less headroom
+/// than a spill's in-memory sort needs beside a second spilling consumer.
 pub(crate) fn sort_spill_reservation_bytes(memory_limit: u64) -> usize {
-    (memory_limit / 3).min(40 * 1024 * 1024) as usize
+    (memory_limit / 16)
+        .max((memory_limit / 3).min(512 * 1024))
+        .min(10 * 1024 * 1024) as usize
 }
+
+/// The codec of every spill file the engine writes, in a query's session and
+/// in an ordered scan's. A spill file counts against its scratch quota by its
+/// compressed size, and a run whose spills outgrow the quota is refused, so
+/// the codec is chosen for size: zstd. Spilled pairs repeat a row's values
+/// across a fan-out further apart than LZ4's 64 KiB window, which zstd's
+/// window still reaches, and on unique rows zstd's files are about half
+/// LZ4's for roughly one and a half times its CPU time.
+pub(crate) const SPILL_COMPRESSION: datafusion::common::config::SpillCompression =
+    datafusion::common::config::SpillCompression::Zstd;
 
 /// The built read and its scanner-normalized filter.
 pub(crate) type PlannedScan = (Arc<dyn ExecutionPlan>, Option<Expr>);
+
+/// Lance batches a pipelined read decodes ahead, which no memory pool sees.
+pub(crate) const PIPELINED_READAHEAD: usize = 2;
+
+/// Bytes Lance may hold fetched and not yet decoded for one pipelined read,
+/// which no memory pool sees either. Lance's default is 32 MiB per I/O thread
+/// (2 GiB on a cloud store), read ahead of a consumer that may stop after its
+/// first batch; two 32 MiB pages keep its throughput.
+pub(crate) const PIPELINED_IO_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Configuration surface for a scan after projection, filtering, and ordering
 /// have been selected by [`TableStore::scan_stream_with`].
@@ -320,6 +363,15 @@ impl ScanTuning<'_> {
     pub(crate) fn io_buffer_size(&mut self, bytes: u64) -> &mut Self {
         self.scanner.io_buffer_size(bytes);
         self
+    }
+
+    /// Bound what Lance decodes ([`PIPELINED_READAHEAD`]) and fetches
+    /// ([`PIPELINED_IO_BUFFER_BYTES`]) ahead of a consumer that takes one
+    /// batch at a time: an engine read's scan, and branch merge validation's
+    /// sweep of its delta. `fragment_readahead` keeps Lance's default.
+    pub(crate) fn pipelined(&mut self) -> &mut Self {
+        self.batch_readahead(PIPELINED_READAHEAD);
+        self.io_buffer_size(PIPELINED_IO_BUFFER_BYTES)
     }
 
     pub(crate) fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
@@ -497,7 +549,7 @@ pub(crate) fn has_insert_absence_certificate(transaction: &Transaction) -> bool 
 /// instead, which consumers accept as the same no-delete proof. It is
 /// read-advisory: a missing marker only forces a fall-back, never a
 /// correctness change. A persisted `Update` from an external Lance merge
-/// (e.g. adopted via `repair --force`) carries no marker and cannot be pruned.
+/// carries no marker and cannot be pruned.
 pub(crate) const NO_BY_SOURCE_DELETE_PROPERTY: &str = "omnigraph.no_by_source_delete";
 pub(crate) const NO_BY_SOURCE_DELETE_V1: &str = "v1";
 
@@ -746,6 +798,155 @@ pub(crate) fn is_index_only_commit(transaction: &Transaction, expected_read_vers
         && matches!(&transaction.operation, Operation::CreateIndex { .. })
 }
 
+/// Most links [`row_preserving_chain`] follows before it gives up. One
+/// optimize run chains at most a rewrite, an index fold and an index build
+/// per table, each possibly followed by a full-text declaration; the bound
+/// leaves room for several runs between a write's capture and its gates and
+/// keeps the walk's requests bounded. Past it the write starts over, as it
+/// did before the chain was read.
+pub(crate) const ROW_PRESERVING_CHAIN_MAX_LINKS: usize = 32;
+
+/// The commits between a write's captured pin of a table and the table's
+/// current pin, when every one of them leaves the table's rows as they were.
+///
+/// A link qualifies when its operation is a `Rewrite` or a `CreateIndex`.
+/// Lance's transaction specification defines a rewrite as reorganizing data
+/// without changing it (compaction, deletion materialization, dropped-column
+/// erasure all commit one), and a `CreateIndex` applies with every fragment of
+/// the version it read unchanged (`is_index_only_commit`). Those are the
+/// operations optimize and index reconciliation publish; who published a link
+/// is not consulted, only what its transaction records.
+#[derive(Debug, Clone)]
+pub(crate) struct RowPreservingChain {
+    /// `(version, transaction)` of every link, lowest first: the first link
+    /// read the captured pin, the last is the current pin.
+    links: Vec<(u64, Transaction)>,
+}
+
+/// Walk `current`'s chain of commits by `read_version` links down to
+/// `captured_version` and return it when every link preserves rows
+/// ([`RowPreservingChain`]). `None` when a link is any other operation,
+/// records no transaction, is no longer in storage, or the walk reaches
+/// neither the captured version nor a stop within
+/// [`ROW_PRESERVING_CHAIN_MAX_LINKS`]: the write must then treat the table as
+/// changed.
+///
+/// A link below `current` is named by no `__manifest` version, so `cleanup`
+/// deletes it, and a run can do so between a write's capture and its gates.
+/// A link that is not found, at its checkout or when its transaction is read
+/// (Lance 13 reads it from the manifest's inline section, else from the
+/// transaction file the sweep deletes first), is therefore an unreadable
+/// chain, not a storage fault. `current` is the table's pin, which the
+/// collector keeps whole, so a failure to read its own transaction stays an
+/// error.
+pub(crate) async fn row_preserving_chain(
+    current: &Dataset,
+    captured_version: u64,
+) -> Result<Option<RowPreservingChain>> {
+    let collected = |error: &OmniError| {
+        error
+            .storage_failure()
+            .is_some_and(|failure| failure.kind == crate::error::StorageFailureKind::NotFound)
+    };
+    let mut links = Vec::new();
+    let mut dataset = current.clone();
+    for _ in 0..ROW_PRESERVING_CHAIN_MAX_LINKS {
+        let transaction = match dataset.read_transaction().await.map_err(OmniError::storage) {
+            Ok(Some(transaction)) => transaction,
+            Ok(None) => return Ok(None),
+            Err(error) if !links.is_empty() && collected(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !matches!(
+            transaction.operation,
+            Operation::Rewrite { .. } | Operation::CreateIndex { .. }
+        ) {
+            return Ok(None);
+        }
+        let read_version = transaction.read_version;
+        links.push((dataset.version().version, transaction));
+        if read_version == captured_version {
+            links.reverse();
+            return Ok(Some(RowPreservingChain { links }));
+        }
+        if read_version == 0 {
+            return Ok(None);
+        }
+        dataset = match dataset
+            .checkout_version(read_version)
+            .await
+            .map_err(OmniError::storage)
+        {
+            Ok(link) => link,
+            Err(error) if collected(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+    }
+    Ok(None)
+}
+
+/// Carry a staged write prepared on `base` over the row-preserving `chain`
+/// to `current`, the chain's last version, with Lance's own conflict
+/// resolver (`TransactionRebase`, the pass `commit_transaction` runs for a
+/// linear commit): every link is checked as a concurrent transaction, the
+/// resolver finishes against `current`, and the transaction then records
+/// `current` as the version it read, so the detached commit links to the
+/// table's current pin like any other write. Nothing is written for the
+/// operations the chain can hold, so a refusal leaves no effect.
+///
+/// The inner `Ok` is the write, now reading `current`, to commit detached
+/// there; the inner `Err` is Lance's message when its conflict rules refuse
+/// to carry the write over a link (an update or delete of a fragment a
+/// rewrite replaced, for one).
+pub(crate) async fn rebase_staged_write(
+    base: &Dataset,
+    staged: StagedWrite,
+    current: &Dataset,
+    chain: &RowPreservingChain,
+) -> Result<std::result::Result<StagedWrite, String>> {
+    let StagedWrite {
+        transaction,
+        commit_metadata,
+        new_fragments,
+        removed_fragment_ids,
+        deleted_rows,
+    } = staged;
+    let mut rebase = lance::io::commit::conflict_resolver::TransactionRebase::try_new(
+        base,
+        transaction,
+        commit_metadata.affected_rows.as_ref(),
+    )
+    .await
+    .map_err(OmniError::storage)?;
+    for (version, link) in &chain.links {
+        if let Err(error) = rebase.check_txn(link, *version) {
+            return match error {
+                lance::Error::RetryableCommitConflict { .. }
+                | lance::Error::IncompatibleTransaction { .. }
+                | lance::Error::CommitConflict { .. } => Ok(Err(error.to_string())),
+                other => Err(OmniError::storage(other)),
+            };
+        }
+    }
+    let mut transaction = match rebase.finish(current).await {
+        Ok(transaction) => transaction,
+        Err(
+            error @ (lance::Error::RetryableCommitConflict { .. }
+            | lance::Error::IncompatibleTransaction { .. }
+            | lance::Error::CommitConflict { .. }),
+        ) => return Ok(Err(error.to_string())),
+        Err(error) => return Err(OmniError::storage(error)),
+    };
+    transaction.read_version = current.version().version;
+    Ok(Ok(StagedWrite {
+        transaction,
+        commit_metadata,
+        new_fragments,
+        removed_fragment_ids,
+        deleted_rows,
+    }))
+}
+
 /// Verify one persisted link of the insertion-absence proof chain and return
 /// its exact physical row contribution. This is intentionally stricter than a
 /// property lookup: the caller must also supply the expected parent version,
@@ -879,6 +1080,95 @@ struct IndexLag {
     name: String,
     fields: Vec<i32>,
     vector: bool,
+}
+
+/// How many BTREE index builds may run at once in one maintenance pass
+/// (#1385). Each BTREE training that spills gets its own Lance memory pool of
+/// 150 MiB per partition, one partition per core (`LANCE_MEM_POOL_SIZE`
+/// overrides it), so the bound caps how many such pools exist at once;
+/// full-text and vector builds have no such bound yet (#1296) and run alone.
+pub const INDEX_BUILD_CONCURRENCY: usize = 4;
+
+/// The heavy steps one maintenance pass may execute at once, shared by every
+/// table it stages (#1384, #1385). The pass that owns it (an `ensure_indices`
+/// or full-text rebuild pass, one `optimize` run) makes one and passes it to
+/// every step, so the bound holds across its tables. Each step takes its
+/// permits through [`Self::run`] (a compaction task: one permit) or
+/// [`Self::permit_for`] (one index build), never while it holds others, so
+/// permits cannot deadlock. A BTREE build takes enough permits that at most
+/// [`INDEX_BUILD_CONCURRENCY`] run at once; a full-text or vector build takes
+/// all of them, so it never overlaps another step. Permits are granted in
+/// request order, so a waiting full-text build is not starved by later steps.
+/// The pass never has more steps in flight than its width.
+#[derive(Debug, Clone)]
+pub struct MaintenanceBudget {
+    permits: Arc<tokio::sync::Semaphore>,
+    width: u32,
+}
+
+/// The permits one index build holds while it runs.
+pub(crate) struct BuildPermit<'a> {
+    _permit: tokio::sync::SemaphorePermit<'a>,
+    _probe: Option<crate::instrumentation::StageWriteProbeGuard>,
+}
+
+impl MaintenanceBudget {
+    /// A budget of `width` concurrent steps; `1` runs them one after another.
+    pub fn new(width: usize) -> Self {
+        let width = width.clamp(
+            1,
+            tokio::sync::Semaphore::MAX_PERMITS.min(u32::MAX as usize),
+        );
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(width)),
+            width: width as u32,
+        }
+    }
+
+    /// The number of steps that may be in flight.
+    pub fn width(&self) -> usize {
+        self.width as usize
+    }
+
+    /// Run one compaction task holding one permit.
+    pub async fn run<T>(&self, step: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| OmniError::manifest_internal("maintenance budget closed"))?;
+        let _probe = crate::instrumentation::enter_optimize_step_probe().await;
+        step.await
+    }
+
+    /// The permits one build of `kind` holds while it runs: a share of the
+    /// width for a BTREE, so at most `INDEX_BUILD_CONCURRENCY` run at once
+    /// (exactly that many only when the width is a multiple of it), and the
+    /// whole width for any other kind, so a kind without a memory
+    /// bound never overlaps another step. Every build acquires through here.
+    pub(crate) async fn permit_for(&self, kind: IndexType) -> Result<BuildPermit<'_>> {
+        let permits = if kind == IndexType::BTree {
+            self.width.div_ceil(INDEX_BUILD_CONCURRENCY as u32)
+        } else {
+            self.width
+        };
+        let permit = self
+            .permits
+            .acquire_many(permits)
+            .await
+            .map_err(|_| OmniError::manifest_internal("maintenance budget closed"))?;
+        Ok(BuildPermit {
+            _permit: permit,
+            _probe: crate::instrumentation::enter_optimize_step_probe().await,
+        })
+    }
+}
+
+impl Default for MaintenanceBudget {
+    /// An index pass's budget: `INDEX_BUILD_CONCURRENCY` BTREE builds at once.
+    fn default() -> Self {
+        Self::new(INDEX_BUILD_CONCURRENCY)
+    }
 }
 
 /// A staged index fold: the `CreateIndex` to commit detached, if any index
@@ -1057,6 +1347,10 @@ pub struct StagedWrite {
     /// adds without removing anything); populated from
     /// `Operation::Update.removed_fragment_ids` for keyed writes.
     removed_fragment_ids: Vec<u64>,
+    /// Rows `stage_delete` removes, as Lance's delete scan counted them while
+    /// staging. `None` for every other effect, including `stage_delete_rows`,
+    /// whose rows the caller supplies and Lance does not count.
+    deleted_rows: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1183,6 +1477,7 @@ impl StagedWrite {
             commit_metadata: StagedCommitMetadata::default(),
             new_fragments,
             removed_fragment_ids,
+            deleted_rows: None,
         }
     }
 
@@ -1197,7 +1492,19 @@ impl StagedWrite {
             commit_metadata,
             new_fragments,
             removed_fragment_ids,
+            deleted_rows: None,
         }
+    }
+
+    fn with_deleted_rows(mut self, deleted_rows: u64) -> Self {
+        self.deleted_rows = Some(deleted_rows);
+        self
+    }
+
+    /// Rows a `stage_delete` removes, as Lance's delete scan counted them;
+    /// `None` for any other effect, including `stage_delete_rows`.
+    pub(crate) fn deleted_rows(&self) -> Option<u64> {
+        self.deleted_rows
     }
 
     pub fn new_fragments(&self) -> &[Fragment] {
@@ -2898,7 +3205,8 @@ impl TableStore {
         // counter. Per-operation ownership makes the envelope and its cleanup
         // exact without maintaining another long-lived runtime view.
         let mut session_config = SessionConfig::new()
-            .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes(memory_limit));
+            .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes(memory_limit))
+            .with_spill_compression(SPILL_COMPRESSION);
         if let Some(target_partitions) = options.target_partition {
             session_config = session_config.with_target_partitions(target_partitions);
         }
@@ -3052,10 +3360,27 @@ impl TableStore {
         Ok(!Self::foldable_index_lag(ds).await?.is_empty())
     }
 
-    /// The partition count Lance reports for a vector index. A fold keeps
-    /// it, so a statistics read that fails or names no positive count is an
-    /// error, not a silent rebuild with one partition.
-    async fn vector_partition_count(ds: &Dataset, name: &str) -> Result<usize> {
+    /// The partition count a fold keeps for a vector index: the count Lance
+    /// reports for the index's segments. For an index that holds rows, a
+    /// statistics read that fails or names no positive count is an error,
+    /// not a silent rebuild with one partition. An index none of whose
+    /// `segments` covers a fragment holds no rows, and Lance reports no
+    /// statistics for it (an empty object per segment): a column patch of
+    /// the indexed column withdraws every fragment it touches. Its former
+    /// shape is not in its metadata, so it is rebuilt as a new declared
+    /// vector index is built, with [`ENGINE_VECTOR_PARTITIONS`].
+    async fn vector_partition_count(
+        ds: &Dataset,
+        name: &str,
+        segments: &[&IndexMetadata],
+    ) -> Result<usize> {
+        if !segments.is_empty()
+            && segments
+                .iter()
+                .all(|segment| crate::dataset_index::covers_no_fragment(segment))
+        {
+            return Ok(ENGINE_VECTOR_PARTITIONS);
+        }
         fn first_num_partitions(value: &serde_json::Value) -> Option<u64> {
             match value {
                 serde_json::Value::Object(map) => map
@@ -3087,27 +3412,18 @@ impl TableStore {
         for index in indices.iter().filter(|index| Self::can_fold_index(index)) {
             by_name.entry(index.name.clone()).or_default().push(index);
         }
+        let current = crate::dataset_index::current_fragments(ds);
         let mut lag = Vec::new();
         for (name, segments) in by_name {
+            let coverage =
+                crate::dataset_index::SegmentCoverage::of(segments.iter().copied(), &current);
             // As on the public coverage surface, unknown coverage is not
             // evidence of work. Such legacy inventory needs explicit handling.
-            if segments
-                .iter()
-                .any(|segment| segment.fragment_bitmap.is_none())
-            {
+            if !coverage.known {
                 continue;
             }
-            let mut covered = std::collections::HashSet::<u32>::new();
-            for segment in &segments {
-                if let Some(bitmap) = segment.fragment_bitmap.as_ref() {
-                    covered.extend(bitmap.iter());
-                }
-            }
             let vector = Self::index_is_vector(segments[0]);
-            let complete = ds
-                .fragments()
-                .iter()
-                .all(|fragment| covered.contains(&(fragment.id as u32)));
+            let complete = coverage.covers_every(&current);
             // A scalar index whose segments together cover every fragment
             // is current. A vector index split into segments (Lance's own
             // fold left deltas, or a partial rebuild) is collapsed into one.
@@ -3124,14 +3440,20 @@ impl TableStore {
     }
 
     /// RFC 0067: stage one `CreateIndex` that folds every lagging foldable
-    /// index, ready to commit detached. Lance's own fold (`optimize_indices`)
-    /// merges the delta and previous segments through a crate-private path
-    /// and commits linearly; this rebuilds each lagging index whole under its
+    /// index, ready to commit detached. Lance 13's own fold
+    /// (`optimize_indices`) merges the delta and previous segments through a
+    /// crate-private module (`index::append`) and commits linearly
+    /// (`apply_commit`); this rebuilds each lagging index whole under its
     /// name with the public builder, which leaves the same single segment
-    /// Lance's merge would. A vector index the builder cannot train (a column
-    /// with no non-null rows) is skipped and reported by column.
-    pub async fn stage_index_fold(&self, ds: &Dataset) -> Result<StagedIndexFold> {
-        let (batch, _, skipped) = Self::index_fold_batch(ds).await?;
+    /// Lance's merge would. A vector training refusal (Lance's `Unprocessable`)
+    /// is reported by column; any other build failure is an error. The builds
+    /// count against `limit`, which the maintenance pass owns.
+    pub async fn stage_index_fold(
+        &self,
+        ds: &Dataset,
+        limit: &MaintenanceBudget,
+    ) -> Result<StagedIndexFold> {
+        let (batch, _, skipped) = Self::index_fold_batch(ds, limit).await?;
         Ok(StagedIndexFold {
             staged: batch.stage(ds.manifest.version),
             skipped,
@@ -3144,15 +3466,18 @@ impl TableStore {
     /// [`Self::stage_index_fold`] builds it): one detached commit leaves every
     /// buildable declared index present and covering every current fragment.
     /// Full-text coverage is not folded (`can_fold_index`).
+    /// The builds count against `limit`, which a caller staging several
+    /// tables shares across them.
     pub async fn stage_index_reconciliation(
         &self,
         ds: &Dataset,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<StagedIndexReconciliation> {
-        let (mut batch, refreshed, skipped) = Self::index_fold_batch(ds).await?;
+        let (mut batch, refreshed, skipped) = Self::index_fold_batch(ds, limit).await?;
         let mut vector_builds = 0;
         if !specs.is_empty() {
-            let (created, builds) = Self::create_index_batch(ds, specs).await?;
+            let (created, builds) = Self::create_index_batch(ds, specs, limit).await?;
             batch.extend(created)?;
             vector_builds = builds;
         }
@@ -3171,8 +3496,11 @@ impl TableStore {
 
     /// The fold batch: every lagging foldable index rebuilt whole under its
     /// name, the columns rebuilt, and the vector columns that could not train.
+    /// The rebuilds run under `limit`, BTREEs together and vectors alone, and
+    /// join the batch in lag order.
     async fn index_fold_batch(
         ds: &Dataset,
+        limit: &MaintenanceBudget,
     ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
         let lag = Self::foldable_index_lag(ds).await?;
         if lag.is_empty() {
@@ -3180,60 +3508,86 @@ impl TableStore {
         }
         let existing = ds.load_indices().await.map_err(OmniError::storage)?;
         let read_version = ds.manifest.version;
-        let mut new_indices = Vec::new();
-        let mut removed_indices = Vec::new();
-        let mut refreshed = Vec::new();
-        let mut skipped = Vec::new();
-        for item in lag {
-            let Some(column) = item
-                .fields
-                .first()
-                .and_then(|id| ds.schema().field_by_id(*id))
-                .map(|field| field.name.clone())
-            else {
-                continue;
-            };
+        let items: Vec<_> = lag
+            .into_iter()
+            .filter_map(|item| {
+                let column = item
+                    .fields
+                    .first()
+                    .and_then(|id| ds.schema().field_by_id(*id))
+                    .map(|field| field.name.clone())?;
+                let segments = existing
+                    .iter()
+                    .filter(|index| index.name == item.name)
+                    .collect::<Vec<_>>();
+                Some((item, column, segments))
+            })
+            .collect();
+        // Only Lance's typed vector training refusal is a pending column.
+        // Return any other failure through the stream so observing it in lag
+        // order drops outstanding builds before the batch can be staged.
+        let builds = items.iter().map(|(item, column, segments)| async move {
             let mut ds_clone = ds.clone();
             let columns = [column.as_str()];
+            let kind = if item.vector {
+                IndexType::Vector
+            } else {
+                IndexType::BTree
+            };
+            let _permit = limit.permit_for(kind).await?;
             let built = if item.vector {
-                // Keep the index's partition count: the engine builds one
-                // partition, but a partitioned index (Lance's split, or an
-                // explicit build) keeps its shape across folds.
-                let partitions = Self::vector_partition_count(ds, &item.name).await?;
+                // Keep the index's partition count across folds.
+                let partitions = Self::vector_partition_count(ds, &item.name, segments).await?;
                 let params =
                     lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
                 ds_clone
-                    .create_index_builder(&columns, IndexType::Vector, &params)
+                    .create_index_builder(&columns, kind, &params)
                     .name(item.name.clone())
                     .replace(true)
                     .execute_uncommitted()
                     .await
             } else {
                 let params = ScalarIndexParams::default();
+                let _probe = crate::instrumentation::enter_index_build_probe().await;
                 ds_clone
-                    .create_index_builder(&columns, IndexType::BTree, &params)
+                    .create_index_builder(&columns, kind, &params)
                     .name(item.name.clone())
                     .replace(true)
                     .execute_uncommitted()
                     .await
             };
+            match built {
+                Ok(index) => Ok(Ok(index)),
+                Err(error @ lance::Error::Unprocessable { .. }) if item.vector => {
+                    Ok(Err(error.to_string()))
+                }
+                Err(error) => Err(OmniError::storage_context(
+                    format!("stage_index_fold: fold index '{}' on '{column}'", item.name),
+                    error,
+                )),
+            }
+        });
+        let built: Vec<_> = futures::stream::iter(builds.collect::<Vec<_>>())
+            .buffered(limit.width())
+            .try_collect()
+            .await?;
+
+        let mut new_indices = Vec::new();
+        let mut removed_indices = Vec::new();
+        let mut refreshed = Vec::new();
+        let mut skipped = Vec::new();
+        for ((item, column, segments), built) in items.into_iter().zip(built) {
             let new_idx = match built {
                 Ok(index) => index,
-                Err(error) if item.vector => {
+                Err(reason) => {
                     tracing::warn!(
                         index = item.name.as_str(),
                         column = column.as_str(),
-                        error = %error,
+                        error = %reason,
                         "vector index fold skipped: the column cannot train an index"
                     );
-                    skipped.push((column, error.to_string()));
+                    skipped.push((column, reason));
                     continue;
-                }
-                Err(error) => {
-                    return Err(OmniError::storage_context(
-                        format!("stage_index_fold: fold index '{}' on '{column}'", item.name),
-                        error,
-                    ));
                 }
             };
             if new_idx.dataset_version != read_version {
@@ -3242,12 +3596,7 @@ impl TableStore {
                     new_idx.name, new_idx.dataset_version, read_version
                 )));
             }
-            removed_indices.extend(
-                existing
-                    .iter()
-                    .filter(|index| index.name == item.name)
-                    .cloned(),
-            );
+            removed_indices.extend(segments.into_iter().cloned());
             if item.vector {
                 crate::instrumentation::record_stage_vector_index();
             }
@@ -3382,12 +3731,15 @@ impl TableStore {
             }
         };
 
-        Ok(Some(StagedWrite::with_commit_metadata(
-            uncommitted.transaction,
-            StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
-            new_fragments,
-            removed_fragment_ids,
-        )))
+        Ok(Some(
+            StagedWrite::with_commit_metadata(
+                uncommitted.transaction,
+                StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
+                new_fragments,
+                removed_fragment_ids,
+            )
+            .with_deleted_rows(uncommitted.num_deleted_rows),
+        ))
     }
 
     /// Stage the delete of exactly the rows at `row_addrs`, captured by the
@@ -3586,7 +3938,7 @@ impl TableStore {
         ds: Dataset,
         type_key: &str,
         batch: RecordBatch,
-        semantics: KeyedWriteSemantics,
+        mut semantics: KeyedWriteSemantics,
         system_columns: SystemColumns,
         write_budget: WriteBudget,
     ) -> Result<StagedWrite> {
@@ -3632,6 +3984,62 @@ impl TableStore {
                     write_budget,
                 )
                 .await;
+        }
+        // Lance's insert-capable merge route joins the source against every
+        // id of the table. An upsert whose rows are all new or all present
+        // needs neither that join nor its inserted-key filter: the exact-id
+        // probe a strict insert runs decides which, through the id BTREE.
+        // All new, it stages through the absence-proven insert writer and
+        // reads no more than the probe. All present, it may stage as a
+        // known-present update, whose indexed merge reads the BTREE's pages
+        // and then scans each fragment the BTREE leaves uncovered for every
+        // source column (Lance 13 `merge_insert.rs`, the indexed route's
+        // unindexed union), where the join reads only the id column of every
+        // fragment. So it switches only while both costs of that tail are
+        // bounded: the BTREE covers more fragments than it leaves (requests),
+        // and the tail's recorded data files hold at most
+        // `KNOWN_PRESENT_TAIL_MAX_BYTES` (bytes, whatever the row width). An
+        // unrecorded file size keeps the join. A mixed batch keeps the join,
+        // and so does a table without the BTREE, where the probe itself would
+        // read every id. Lance plans the probe's IN list once per uncovered
+        // fragment, so the probe runs only while those copies hold no more
+        // ids than one keyed batch (#1225).
+        let tail = match semantics {
+            KeyedWriteSemantics::Upsert => {
+                crate::dataset_index::key_column_uncovered_tail(&ds, system_columns.id)
+                    .await?
+                    .filter(|tail| {
+                        tail.fragments.saturating_mul(source_ids.len()) <= KEYED_WRITE_MAX_ROWS
+                    })
+            }
+            _ => None,
+        };
+        if let Some(tail) = tail {
+            let present = Self::existing_id_count(&ds, &source_ids, system_columns).await?;
+            if present == 0 {
+                return self
+                    .stage_absence_proven_strict_insert(
+                        ds,
+                        type_key,
+                        batch,
+                        source_ids,
+                        id_field_id,
+                        &expected_schema_preorder_ids,
+                        "stage_keyed_write",
+                        system_columns,
+                        write_budget,
+                    )
+                    .await;
+            }
+            let covered = ds.fragments().len().saturating_sub(tail.fragments);
+            if present == source_ids.len()
+                && tail.fragments < covered
+                && tail
+                    .data_file_bytes
+                    .is_some_and(|bytes| bytes <= KNOWN_PRESENT_TAIL_MAX_BYTES)
+            {
+                semantics = KeyedWriteSemantics::KnownPresentUpdate;
+            }
         }
 
         // MergeInsertBuilder does not expose WriteParams and therefore cannot
@@ -4011,26 +4419,11 @@ impl TableStore {
         source_ids: &[String],
         system_columns: SystemColumns,
     ) -> Result<Option<String>> {
-        use datafusion::prelude::{col, lit};
-
         exact_id_primary_key_field_id(ds, system_columns, "first_existing_id")?;
         if source_ids.is_empty() {
             return Ok(None);
         }
-        let filter = col(system_columns.id)
-            .in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
-        let mut target_ids = Self::scan_stream_with(
-            ds,
-            Some(&[system_columns.id]),
-            None,
-            None,
-            false,
-            |scanner| {
-                scanner.filter_expr(filter);
-                Ok(())
-            },
-        )
-        .await?;
+        let mut target_ids = Self::exact_id_scan(ds, source_ids, system_columns).await?;
         while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
             let ids =
                 string_id_column(&batch, system_columns, "stage_keyed_write strict preflight")?;
@@ -4041,6 +4434,56 @@ impl TableStore {
             }
         }
         Ok(None)
+    }
+
+    /// The id column of the pinned table's rows whose id is a member of
+    /// `source_ids`: the one structured, scalar-index-eligible exact-id
+    /// predicate both id probes run, which Lance serves from a covering
+    /// BTREE and by a filtered scan of the fragments it leaves uncovered.
+    async fn exact_id_scan(
+        ds: &Dataset,
+        source_ids: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<DatasetRecordBatchStream> {
+        use datafusion::prelude::{col, lit};
+
+        let filter = col(system_columns.id)
+            .in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
+        Self::scan_stream_with(
+            ds,
+            Some(&[system_columns.id]),
+            None,
+            None,
+            false,
+            |scanner| {
+                scanner.filter_expr(filter);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// How many members of `source_ids` the pinned table holds, through the
+    /// same exact-id predicate as [`Self::first_existing_id`].
+    async fn existing_id_count(
+        ds: &Dataset,
+        source_ids: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<usize> {
+        if source_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut target_ids = Self::exact_id_scan(ds, source_ids, system_columns).await?;
+        let mut present = HashSet::new();
+        while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
+            let ids = string_id_column(&batch, system_columns, "stage_keyed_write upsert probe")?;
+            for row in 0..ids.len() {
+                if ids.is_valid(row) {
+                    present.insert(ids.value(row).to_string());
+                }
+            }
+        }
+        Ok(present.len())
     }
 
     async fn stage_keyed_write_from_stream(
@@ -4058,7 +4501,8 @@ impl TableStore {
         // `stage_absence_proven_strict_insert`.
         let when_not_matched = match semantics {
             KeyedWriteSemantics::Upsert => WhenNotMatched::InsertAll,
-            KeyedWriteSemantics::KnownPresentUpdate => WhenNotMatched::DoNothing,
+            KeyedWriteSemantics::KnownPresentUpdate
+            | KeyedWriteSemantics::KnownPresentColumnPatch => WhenNotMatched::DoNothing,
             KeyedWriteSemantics::StrictInsert => {
                 return Err(OmniError::manifest_internal(format!(
                     "{context}: strict insert must stage through the absence-proven insert writer"
@@ -4070,12 +4514,23 @@ impl TableStore {
                 .map_err(OmniError::lance_internal)?;
         builder.when_matched(WhenMatched::UpdateAll);
         builder.when_not_matched(when_not_matched);
-        if semantics != KeyedWriteSemantics::KnownPresentUpdate {
+        let update_only = matches!(
+            semantics,
+            KeyedWriteSemantics::KnownPresentUpdate | KeyedWriteSemantics::KnownPresentColumnPatch
+        );
+        if !update_only {
             // Lance's scalar-index v1 route omits the inserted-row key filter.
             // Every insertion-capable path therefore forces v2 and validates
             // the exact-id filter below. Update-only staging may use v1 because
             // DoNothing closes the insertion action and affected_rows owns OCC.
             builder.use_index(false);
+        }
+        if semantics == KeyedWriteSemantics::KnownPresentColumnPatch {
+            // Patch `id` and the source's columns into the fragments holding
+            // the matched rows; the columns the source omits are neither read
+            // nor written. Lance refuses the mode, rather than falling back,
+            // when the source covers every column or carries a Blob.
+            builder.write_mode(MergeInsertWriteMode::RewriteColumns);
         }
         builder.conflict_retries(0);
         builder.source_dedupe_behavior(SourceDedupeBehavior::Fail);
@@ -4086,6 +4541,14 @@ impl TableStore {
             .await
             .map_err(OmniError::lance_stream)?;
 
+        if semantics == KeyedWriteSemantics::KnownPresentColumnPatch {
+            let mut uncommitted = uncommitted;
+            validate_known_present_column_patch(&uncommitted, merged_rows, context)?;
+            keep_key_index_coverage(&mut uncommitted.transaction, id_field_id, context)?;
+            let stats = uncommitted.stats.clone();
+            crate::instrumentation::record_stage_known_present_update(merged_rows);
+            return Ok((staged_column_patch_result(uncommitted, context)?, stats));
+        }
         if semantics == KeyedWriteSemantics::KnownPresentUpdate {
             validate_known_present_update(&uncommitted, id_field_id, merged_rows, context)?;
         } else {
@@ -4651,22 +5114,34 @@ impl TableStore {
         Ok(plan)
     }
 
-    /// RFC 0067: plan ([`Self::plan_table_compaction`]) and execute Lance
-    /// compaction against a pinned base and stage the result as one `Rewrite`
-    /// transaction. The new fragments take ids above the base's high-water
-    /// mark, so the commit needs no `ReserveFragments` (whose replay would
-    /// not conflict with its twin). A stable-row-id rewrite carries every
-    /// index's coverage over to the new fragments when Lance applies it.
-    /// `None` when the plan has no task. Every task of a Blob table is sized
-    /// before any executes, so a sizing refusal leaves no rewritten file
-    /// behind.
+    /// RFC 0067: execute `plan` ([`Self::plan_table_compaction`]'s for `ds`)
+    /// against a pinned base and stage the result as one `Rewrite`
+    /// transaction. The caller plans once and hands that plan here, so the
+    /// plan a run measured against its ceilings is the one it executes; a
+    /// plan of another version is refused. The new fragments take ids above
+    /// the base's high-water mark, so the commit needs no `ReserveFragments`
+    /// (whose replay would not conflict with its twin). A stable-row-id
+    /// rewrite carries every index's coverage over to the new fragments when
+    /// Lance applies it. `None` when the plan has no task. Every task of a
+    /// Blob table is sized before any executes, so a sizing refusal leaves no
+    /// rewritten file behind. The tasks run side by side, each holding one
+    /// permit of `limit` ([`MaintenanceBudget`]), the run's budget of heavy
+    /// steps.
     pub async fn stage_compaction(
         &self,
         ds: &Dataset,
-        options: &CompactionOptions,
+        plan: CompactionPlan,
+        limit: &MaintenanceBudget,
     ) -> Result<Option<StagedCompaction>> {
-        let plan = Self::plan_table_compaction(ds, options).await?;
-        Self::stage_compaction_plan(ds, plan).await
+        if plan.read_version != ds.manifest.version {
+            return Err(OmniError::manifest_internal(format!(
+                "compaction of {} was planned at version {} and cannot be staged against version {}",
+                ds.uri(),
+                plan.read_version,
+                ds.manifest.version
+            )));
+        }
+        Self::stage_compaction_plan(ds, plan, limit).await
     }
 
     /// #721: rewrite exactly the fragments `fragment_ids` names, one
@@ -4706,7 +5181,7 @@ impl TableStore {
             read_version: ds.manifest.version,
             options: CompactionOptions::default(),
         };
-        Self::stage_compaction_plan(ds, plan).await
+        Self::stage_compaction_plan(ds, plan, &MaintenanceBudget::new(1)).await
     }
 
     /// Execute a compaction plan against `ds` and stage its result as one
@@ -4714,6 +5189,7 @@ impl TableStore {
     async fn stage_compaction_plan(
         ds: &Dataset,
         plan: CompactionPlan,
+        limit: &MaintenanceBudget,
     ) -> Result<Option<StagedCompaction>> {
         if plan.num_tasks() == 0 {
             return Ok(None);
@@ -4734,13 +5210,29 @@ impl TableStore {
                 task.options.batch_size = Some(rows);
             }
         }
-        let mut results = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            if let (true, Some(rows)) = (has_blob_columns, task.options.batch_size) {
-                crate::instrumentation::record_compaction_blob_batch(rows);
-            }
-            results.push(task.execute(ds).await.map_err(OmniError::storage)?);
-        }
+        // Unordered, as Lance's `compact_files` runs them, so a slow task
+        // does not keep finished slots empty; sorting by task index puts the
+        // results, and the fragment ids assigned from them below, back in
+        // task order however the tasks interleave.
+        let width = if has_blob_columns { 1 } else { limit.width() };
+        let mut results = futures::stream::iter(tasks.into_iter().enumerate())
+            .map(|(index, task)| {
+                limit.run(async move {
+                    if let (true, Some(rows)) = (has_blob_columns, task.options.batch_size) {
+                        crate::instrumentation::record_compaction_blob_batch(rows);
+                    }
+                    let result = task.execute(ds).await.map_err(OmniError::storage)?;
+                    Ok((index, result))
+                })
+            })
+            .buffer_unordered(width)
+            .try_collect::<Vec<_>>()
+            .await?;
+        results.sort_unstable_by_key(|(index, _)| *index);
+        let results = results
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<Vec<_>>();
         if results.iter().any(|result| result.row_addrs.is_some()) {
             return Err(OmniError::manifest_internal(format!(
                 "compaction of {} produced an address-style rewrite; graph tables use stable row ids",
@@ -4785,6 +5277,41 @@ impl TableStore {
     /// nothing); after an early stop, a lower bound that already derives one-row batches.
     /// `None` when a nested or non-Blob-v2 Blob field cannot be sized.
     async fn max_row_blob_bytes(ds: &Dataset, fragments: Vec<Fragment>) -> Result<Option<u64>> {
+        let mut max = 0_u64;
+        let sized = Self::visit_row_blob_bytes(ds, fragments, |rows| {
+            max = rows.iter().copied().fold(max, u64::max);
+            compaction_blob_batch_rows(max) != 1
+        })
+        .await?;
+        Ok(sized.then_some(max))
+    }
+
+    /// Managed Blob bytes in `fragments`, from descriptors (externals count nothing and
+    /// are never fetched); the count stops once it passes `ceiling`, so a value above
+    /// `ceiling` is a lower bound. `None` when a nested or non-Blob-v2 Blob field cannot
+    /// be sized.
+    pub(crate) async fn managed_blob_bytes(
+        ds: &Dataset,
+        fragments: Vec<Fragment>,
+        ceiling: u64,
+    ) -> Result<Option<u64>> {
+        let mut total = 0_u64;
+        let sized = Self::visit_row_blob_bytes(ds, fragments, |rows| {
+            total = rows.iter().fold(total, |sum, row| sum.saturating_add(*row));
+            total <= ceiling
+        })
+        .await?;
+        Ok(sized.then_some(total))
+    }
+
+    /// Scan the Blob descriptors of `fragments` and hand each batch's per-row managed
+    /// bytes to `visit`, which returns false to stop. Returns false, scanning nothing,
+    /// when a nested or non-Blob-v2 Blob field cannot be sized.
+    async fn visit_row_blob_bytes(
+        ds: &Dataset,
+        fragments: Vec<Fragment>,
+        mut visit: impl FnMut(&[u64]) -> bool,
+    ) -> Result<bool> {
         if nested_blob_field(ds.schema()).is_some()
             || ds
                 .schema()
@@ -4792,7 +5319,7 @@ impl TableStore {
                 .iter()
                 .any(|field| field.is_blob() && !field.is_blob_v2())
         {
-            return Ok(None);
+            return Ok(false);
         }
         let blob_columns = ds
             .schema()
@@ -4801,13 +5328,15 @@ impl TableStore {
             .filter(|field| field.is_blob())
             .map(|field| field.name.as_str())
             .collect::<Vec<_>>();
+        if blob_columns.is_empty() {
+            return Ok(true);
+        }
         let mut stream =
             Self::scan_stream_with(ds, Some(&blob_columns), None, None, false, |scanner| {
                 scanner.with_fragments(fragments);
                 Ok(())
             })
             .await?;
-        let mut max = 0_u64;
         while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
             let mut row_bytes = vec![0_u64; batch.num_rows()];
             for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
@@ -4828,12 +5357,11 @@ impl TableStore {
                     }
                 }
             }
-            max = row_bytes.into_iter().fold(max, u64::max);
-            if compaction_blob_batch_rows(max) == 1 {
+            if !visit(&row_bytes) {
                 break;
             }
         }
-        Ok(Some(max))
+        Ok(true)
     }
 
     /// Stage creation of a new dataset without publishing its first manifest.
@@ -5560,17 +6088,21 @@ impl TableStore {
     /// This intentionally covers OmniGraph's current one-segment full-table
     /// vector shape. Lance's generic multi-segment commit helper remains an
     /// inline-commit API and is not used here.
+    ///
+    /// The builds count against `limit`, which the maintenance pass owns and
+    /// shares across the tables it stages.
     pub async fn stage_create_indices(
         &self,
         ds: &Dataset,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<StagedWrite> {
         if specs.is_empty() {
             return Err(OmniError::manifest_internal(
                 "stage_create_indices requires at least one index specification",
             ));
         }
-        let (batch, vector_builds) = Self::create_index_batch(ds, specs).await?;
+        let (batch, vector_builds) = Self::create_index_batch(ds, specs, limit).await?;
         let staged = batch.stage(ds.manifest.version).ok_or_else(|| {
             OmniError::manifest_internal(
                 "stage_create_indices built no index for its specifications",
@@ -5591,31 +6123,32 @@ impl TableStore {
     async fn create_index_batch(
         ds: &Dataset,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<(IndexBatch, usize)> {
         let read_version = ds.manifest.version;
         let existing_indices = ds
             .load_indices()
             .await
             .map_err(|error| OmniError::storage_context("stage_create_indices", error))?;
-        let mut new_indices = Vec::with_capacity(specs.len());
-        let mut new_names = std::collections::HashSet::with_capacity(specs.len());
-        let mut vector_builds = 0usize;
-        let mut full_text_fields = HashSet::new();
-
         for spec in specs {
-            let (column, index_type) = match spec {
-                IndexBuildSpec::BTree { column, .. } => (column, "BTREE"),
-                IndexBuildSpec::FullText { column } => (column, "FTS"),
-                IndexBuildSpec::Vector { column } => (column, "Vector"),
-            };
+            let (column, index_type) = spec.column_and_kind();
             if column.is_empty() {
                 return Err(OmniError::manifest_internal(format!(
                     "stage_create_indices received an empty {index_type} column name"
                 )));
             }
+        }
 
+        // #1385: independent BTREE builds overlap under `limit`; a full-text
+        // or vector build runs alone. Each builds from the same snapshot and
+        // the results join the batch in specification order, so the batch is
+        // the one a serial loop builds. Observing a build error in that order
+        // drops outstanding builds. Files they wrote remain unreferenced.
+        let builds = specs.iter().map(|spec| async move {
+            let (column, index_type) = spec.column_and_kind();
             let mut ds_clone = ds.clone();
-            let mut new_idx = match spec {
+            let _permit = limit.permit_for(spec.index_type()).await?;
+            let built = match spec {
                 IndexBuildSpec::BTree { column, name } => {
                     let params = ScalarIndexParams::default();
                     let columns = [column.as_str()];
@@ -5623,10 +6156,13 @@ impl TableStore {
                         ds_clone.create_index_builder(&columns, IndexType::BTree, &params);
                     // Same-snapshot builders cannot see each other's new
                     // default names; companions need explicit distinct names
-                    // even with Lance 11's sequential collision avoidance.
+                    // even with Lance 13's sequential collision avoidance,
+                    // which suffixes a default name only against the
+                    // committed indexes (`index/create.rs`).
                     if let Some(name) = name {
                         builder = builder.name(name.clone());
                     }
+                    let _probe = crate::instrumentation::enter_index_build_probe().await;
                     builder.replace(true).execute_uncommitted().await
                 }
                 IndexBuildSpec::FullText { column } => {
@@ -5638,25 +6174,37 @@ impl TableStore {
                         .await
                 }
                 IndexBuildSpec::Vector { column } => {
-                    let params =
-                        lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
-                    let new_idx = ds_clone
+                    let params = lance::index::vector::VectorIndexParams::ivf_flat(
+                        ENGINE_VECTOR_PARTITIONS,
+                        MetricType::L2,
+                    );
+                    ds_clone
                         .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
                         .replace(true)
                         .execute_uncommitted()
-                        .await;
-                    if new_idx.is_ok() {
-                        vector_builds += 1;
-                    }
-                    new_idx
+                        .await
                 }
-            }
-            .map_err(|error| {
+            };
+            built.map_err(|error| {
                 OmniError::storage_context(
                     format!("stage_create_indices: build {index_type} index on '{column}'"),
                     error,
                 )
-            })?;
+            })
+        });
+        let built: Vec<_> = futures::stream::iter(builds.collect::<Vec<_>>())
+            .buffered(limit.width())
+            .try_collect()
+            .await?;
+
+        let mut new_indices = Vec::with_capacity(specs.len());
+        let mut new_names = std::collections::HashSet::with_capacity(specs.len());
+        let mut vector_builds = 0usize;
+        let mut full_text_fields = HashSet::new();
+        for (spec, mut new_idx) in specs.iter().zip(built) {
+            if matches!(spec, IndexBuildSpec::Vector { .. }) {
+                vector_builds += 1;
+            }
 
             if new_idx.dataset_version != read_version {
                 return Err(OmniError::manifest_internal(format!(
@@ -5842,7 +6390,7 @@ impl TableStore {
                 .await?
         };
         let mut account = PendingScanAccount::new(budget)?;
-        account.add_batches(&pending)?;
+        let pending = account.retain_all(pending)?;
 
         let scan_rows = account.next_scan_rows();
         let scan_bytes = account.next_scan_bytes();
@@ -5876,8 +6424,7 @@ impl TableStore {
             if batch.num_rows() == 0 {
                 continue;
             }
-            account.add_batch(&batch)?;
-            committed.push(batch);
+            committed.push(account.retain(batch)?);
         }
 
         committed.extend(pending);
@@ -6013,7 +6560,7 @@ impl TableStore {
                 .collect::<Result<Vec<_>>>()?,
         };
         let mut account = PendingScanAccount::new(budget)?;
-        account.add_batches(&pending)?;
+        let pending = account.retain_all(pending)?;
         let carried_without_blobs: Option<SchemaRef> =
             (!carried.fields.iter().any(|field| field.is_blob()))
                 .then(|| Arc::new((&carried).into()));
@@ -6056,20 +6603,22 @@ impl TableStore {
                 continue;
             }
             account.ensure_additional_rows(batch.num_rows())?;
+            if let Some(schema) = &carried_without_blobs {
+                let carried_rows = predicate_rows_as(schema, &batch)?;
+                committed.push(account.retain(carried_rows)?);
+                continue;
+            }
+
             // This predicate scan contains every logical non-blob column and
             // `_rowid`, but no blob descriptors/payloads. Charge the logical
             // columns now so an already-overwide match fails before
-            // `take_rows` performs the second full-row read.
+            // `take_rows` performs the second full-row read. A scanner batch
+            // can share buffers with rows it does not contain, so measure a
+            // copy of the matched rows, as `PendingScanAccount::retain` does.
+            let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
             let non_blob_bytes = non_blob_column_bytes(committed_ds, &batch)?;
             account.remaining_bytes_after(non_blob_bytes)?;
             let payload_budget = account.write_budget.bytes() - account.payload_bytes;
-
-            if let Some(schema) = &carried_without_blobs {
-                let carried_rows = predicate_rows_as(schema, &batch)?;
-                account.add_batch(&carried_rows)?;
-                committed.push(carried_rows);
-                continue;
-            }
 
             let row_ids = batch
                 .column_by_name("_rowid")
@@ -6125,12 +6674,434 @@ impl TableStore {
                 Err(error) => return Err(error),
                 Ok(materialized) => materialized,
             };
-            account.add_batch(&materialized)?;
-            committed.push(materialized);
+            committed.push(account.retain(materialized)?);
         }
 
         committed.extend(pending);
         Ok(committed)
+    }
+
+    /// Select the rows an `update` matches and decide how its write lands
+    /// (issue #1264): as a column patch, Lance's `RewriteColumns`, which writes
+    /// `id` and the assigned columns into a data file beside each touched
+    /// fragment and never reads or writes the `request.omitted` columns; or as
+    /// whole rows, the keyed upsert every other write uses.
+    ///
+    /// One filtered scan reads the carried columns (every column but the
+    /// omitted ones) with `_rowid` and `_rowaddr`; on a table whose omitted
+    /// columns are all vectors it reads those too, so a row rewrite reads
+    /// what it always did (a patch then drops them unwritten). That fixes
+    /// [`UpdateWriteCost::patch_bytes`] and a lower bound of
+    /// [`UpdateWriteCost::rows_bytes`] (the carried columns and the vectors at
+    /// full width); a patch that beats the bound is chosen without reading any
+    /// omitted column. Otherwise the matched rows' omitted columns are taken by
+    /// `_rowid` (vectors and Blob descriptors, never a payload), which a row
+    /// rewrite needs anyway: their managed Blob lengths complete the estimate,
+    /// and a stored external reference selects the patch whatever the
+    /// estimate, because only the patch keeps it without reading or refusing
+    /// it. (On a vector-only table the bound is the whole estimate.)
+    ///
+    /// A patch returns the carried columns, schema order, for validation; the
+    /// patch source is cut from them at staging. Rows rebuild the taken Blobs,
+    /// as [`Self::scan_with_pending_materialized_blobs`] does, and return the
+    /// dataset's full logical schema. The caller holds no pending row of the
+    /// table, so this scan has no merge-shadow side.
+    pub async fn scan_update_matches(
+        &self,
+        ds: &Dataset,
+        request: &UpdateMatchRequest,
+        filter: Expr,
+        budget: PendingScanBudget,
+    ) -> Result<UpdateMatches> {
+        let schema = ds.schema();
+        if request.omitted.is_empty() {
+            return Err(OmniError::manifest_internal(
+                "scan_update_matches: a column patch must omit at least one column",
+            ));
+        }
+        let mut vector_row_bytes = 0_u64;
+        let mut omitted_blobs = Vec::new();
+        for name in &request.omitted {
+            let field = schema.field(name).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "scan_update_matches: omitted column '{name}' is not in the table"
+                ))
+            })?;
+            let width = if field.is_blob() {
+                field.is_blob_v2().then_some(0)
+            } else {
+                fixed_width_row_bytes(&field.data_type())
+            };
+            let Some(width) = width else {
+                // A legacy Blob or a vector of non-primitive items: no patch
+                // is estimated, so the update rewrites whole rows as before.
+                let batches = self
+                    .scan_with_pending_materialized_blobs(
+                        ds,
+                        &[],
+                        None,
+                        Some(filter),
+                        Some(&request.id_column),
+                        &[],
+                        budget,
+                    )
+                    .await?;
+                return Ok(UpdateMatches {
+                    mode: UpdateWriteMode::Rows,
+                    cost: UpdateWriteCost::default(),
+                    batches,
+                });
+            };
+            if field.is_blob() {
+                omitted_blobs.push(name.as_str());
+            }
+            vector_row_bytes = vector_row_bytes
+                .checked_add(width)
+                .ok_or_else(|| OmniError::manifest_internal("vector row bytes overflow"))?;
+        }
+        let mut assigned_field_ids: Vec<(HashSet<i32>, u64)> = Vec::new();
+        for (name, row_bytes) in &request.assigned {
+            let field = schema.field(name).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "scan_update_matches: assigned column '{name}' is not in the table"
+                ))
+            })?;
+            if field.is_blob() || request.omitted.contains(name) || *name == request.id_column {
+                return Err(OmniError::manifest_internal(format!(
+                    "scan_update_matches: '{name}' cannot be a column patch's assigned column"
+                )));
+            }
+            let mut ids = HashSet::new();
+            let mut pending = vec![field];
+            while let Some(field) = pending.pop() {
+                ids.insert(field.id);
+                pending.extend(field.children.iter());
+            }
+            assigned_field_ids.push((ids, *row_bytes));
+        }
+        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+        let indexed_assigned_row_bytes = assigned_field_ids
+            .iter()
+            .filter(|(ids, _)| {
+                indices
+                    .iter()
+                    .filter(|index| !is_system_index(index))
+                    .any(|index| index.fields.iter().any(|id| ids.contains(id)))
+            })
+            .map(|(_, row_bytes)| *row_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let assigned_row_bytes = request
+            .assigned
+            .iter()
+            .map(|(_, row_bytes)| *row_bytes)
+            .fold(0_u64, u64::saturating_add);
+
+        let carried_names = schema
+            .fields
+            .iter()
+            .filter(|field| !request.omitted.contains(&field.name))
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        if !carried_names.contains(&request.id_column.as_str()) {
+            return Err(OmniError::manifest_internal(
+                "scan_update_matches: the id column must be carried",
+            ));
+        }
+        let carried: SchemaRef = Arc::new(
+            (&schema
+                .project(&carried_names)
+                .map_err(OmniError::lance_internal)?)
+                .into(),
+        );
+        let omitted_names = request
+            .omitted
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let omitted_schema = schema
+            .project(&omitted_names)
+            .map_err(OmniError::lance_internal)?;
+
+        // With no omitted Blob, the omitted columns are vectors and a row
+        // rewrite needs nothing else: the scan projects them, so a rewrite
+        // reads exactly what it always did and a patch drops them unwritten.
+        // A separate take of them would open another reader, which on Lance
+        // 13 reads the column's metadata again.
+        let scan_vectors = omitted_blobs.is_empty();
+        let projection = if scan_vectors {
+            schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect()
+        } else {
+            carried_names.clone()
+        };
+        let full: SchemaRef = Arc::new(schema.into());
+        let mut account = PendingScanAccount::new(budget)?;
+        let scan_rows = account.next_scan_rows();
+        let scan_bytes = account.next_scan_bytes();
+        let mut matched =
+            Self::scan_stream_with(ds, Some(&projection), None, None, true, |scanner| {
+                scanner.filter_expr(filter);
+                scanner.with_row_address();
+                scanner.batch_size(scan_rows);
+                scanner.batch_size_bytes(scan_bytes);
+                Ok(())
+            })
+            .await?;
+
+        let mut cost = UpdateWriteCost {
+            indexed_assigned_row_bytes,
+            rows_disallowed: !request.rows_allowed,
+            ..UpdateWriteCost::default()
+        };
+        let mut fragments = HashSet::new();
+        let mut scanned: Vec<(RecordBatch, Vec<u64>)> = Vec::new();
+        let mut scanned_whole: Vec<RecordBatch> = Vec::new();
+        let mut carried_bytes = 0_u64;
+        while let Some(batch) = matched.try_next().await.map_err(OmniError::storage)? {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            account.ensure_additional_rows(batch.num_rows())?;
+            // A filtered scan returns the matched rows as a slice of a batch
+            // decoded from their fragment, which pins that batch's buffers.
+            // Copied into their own buffers before they are charged or kept,
+            // the rows hold, and are charged, only their own bytes, whatever
+            // else their fragment stores or the scan's batch size was.
+            let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
+            // Admission charges the carried columns alone, what a patch
+            // retains, whichever mode the update then takes.
+            let rows = predicate_rows_as(&carried, &batch)?;
+            carried_bytes = carried_bytes
+                .checked_add(rows.get_array_memory_size() as u64)
+                .ok_or_else(|| OmniError::manifest_internal("pending scan byte count overflow"))?;
+            account.remaining_bytes_after(carried_bytes)?;
+            let addresses = batch
+                .column_by_name("_rowaddr")
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("expected _rowaddr in an update's match scan")
+                })?;
+            fragments.extend(addresses.values().iter().map(|address| address >> 32));
+            let ids = rows
+                .column_by_name(&request.id_column)
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "expected a Utf8 id column in an update's match scan",
+                    )
+                })?;
+            // The offsets bound this batch's values: a slice shares its
+            // parent's whole values buffer.
+            let offsets = ids.value_offsets();
+            let id_values = offsets[offsets.len() - 1] - offsets[0];
+            cost.id_bytes = cost
+                .id_bytes
+                .saturating_add(u64::try_from(id_values).unwrap_or(0))
+                .saturating_add(4 * ids.len() as u64);
+            cost.carried_bytes = cost.carried_bytes.saturating_add(value_bytes(&rows));
+            cost.matched_rows = cost.matched_rows.saturating_add(rows.num_rows() as u64);
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("expected _rowid in an update's match scan")
+                })?
+                .values()
+                .to_vec();
+            if scan_vectors {
+                scanned_whole.push(predicate_rows_as(&full, &batch)?);
+            }
+            scanned.push((rows, row_ids));
+        }
+        cost.vector_bytes = vector_row_bytes.saturating_mul(cost.matched_rows);
+        cost.assigned_bytes = assigned_row_bytes.saturating_mul(cost.matched_rows);
+        cost.touched_rows = ds
+            .manifest
+            .fragments
+            .iter()
+            .filter(|fragment| fragments.contains(&fragment.id))
+            .try_fold(0_u64, |rows, fragment| {
+                fragment
+                    .physical_rows
+                    .map(|physical| rows.saturating_add(physical as u64))
+            })
+            .unwrap_or(u64::MAX);
+
+        // The Blob lengths only add to a row rewrite's bytes: a patch that
+        // beats the bound without them beats it with them.
+        let patch = |scanned: Vec<(RecordBatch, Vec<u64>)>,
+                     account: &mut PendingScanAccount,
+                     cost: UpdateWriteCost|
+         -> Result<UpdateMatches> {
+            let mut batches = Vec::with_capacity(scanned.len());
+            for (rows, _) in scanned {
+                batches.push(account.retain(rows)?);
+            }
+            Ok(UpdateMatches {
+                mode: UpdateWriteMode::ColumnPatch,
+                cost,
+                batches,
+            })
+        };
+        if cost.matched_rows == 0 || cost.mode() == UpdateWriteMode::ColumnPatch {
+            return patch(scanned, &mut account, cost);
+        }
+        if scan_vectors {
+            // A row rewrite that does not fit the write budget takes the
+            // patch, which always fits when the carried columns do, so the
+            // budget constrains the choice and never decides admission.
+            let mut trial = account.clone();
+            let mut batches = Vec::with_capacity(scanned_whole.len());
+            for whole in scanned_whole {
+                match trial.retain(whole) {
+                    Ok(whole) => batches.push(whole),
+                    Err(OmniError::ResourceLimitExceeded { .. }) => {
+                        cost.rows_over_budget = true;
+                        return patch(scanned, &mut account, cost);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(UpdateMatches {
+                mode: UpdateWriteMode::Rows,
+                cost,
+                batches,
+            });
+        }
+
+        // Take the matched rows' omitted columns: vectors and Blob
+        // descriptors, no payload.
+        let mut taken = Vec::with_capacity(scanned.len());
+        for (_, row_ids) in &scanned {
+            let omitted = ds
+                .take_rows(row_ids, omitted_schema.clone())
+                .await
+                .map_err(OmniError::storage)?;
+            for name in &omitted_blobs {
+                let descriptions = omitted
+                    .column_by_name(name)
+                    .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+                    .ok_or_else(|| {
+                        OmniError::blob_integrity(format!(
+                            "expected Blob descriptions for '{name}' in an update's matched rows"
+                        ))
+                    })?;
+                let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
+                for row in 0..omitted.num_rows() {
+                    match decoder.classify(row)? {
+                        BlobDescriptor::Null => {}
+                        BlobDescriptor::Managed { length } => {
+                            cost.managed_blob_bytes =
+                                cost.managed_blob_bytes.saturating_add(length);
+                        }
+                        BlobDescriptor::External { .. } => cost.external_blob = true,
+                    }
+                }
+            }
+            taken.push(omitted);
+        }
+        if cost.mode() == UpdateWriteMode::ColumnPatch {
+            return patch(scanned, &mut account, cost);
+        }
+
+        // Rows: rebuild the taken Blobs and join them to the carried columns.
+        // A row rewrite that does not fit the write budget takes the patch,
+        // which fits whenever the carried columns do (they were charged
+        // above), so the budget constrains the choice and never decides the
+        // outcome. Payload lengths are known from the descriptors, so an
+        // overrun is found before any payload is read; the rows are charged
+        // to a trial account, kept only when every batch fits.
+        let payload_fits = account
+            .payload_bytes
+            .checked_add(cost.managed_blob_bytes)
+            .is_some_and(|payload| payload <= account.write_budget.bytes());
+        if !payload_fits {
+            cost.rows_over_budget = true;
+            return patch(scanned, &mut account, cost);
+        }
+        let mut trial = account.clone();
+        let mut batches = Vec::with_capacity(scanned.len());
+        for ((rows, row_ids), omitted) in scanned.iter().zip(taken) {
+            let whole = match self
+                .rows_with_omitted(
+                    ds,
+                    &full,
+                    &omitted_schema,
+                    !omitted_blobs.is_empty(),
+                    rows,
+                    omitted,
+                    row_ids,
+                    &trial,
+                )
+                .await
+                .and_then(|whole| trial.retain(whole))
+            {
+                Ok(whole) => whole,
+                Err(OmniError::ResourceLimitExceeded { .. }) => {
+                    cost.rows_over_budget = true;
+                    return patch(scanned, &mut account, cost);
+                }
+                Err(error) => return Err(error),
+            };
+            batches.push(whole);
+        }
+        Ok(UpdateMatches {
+            mode: UpdateWriteMode::Rows,
+            cost,
+            batches,
+        })
+    }
+
+    /// One batch of an update's matched rows, whole: the carried `rows` joined
+    /// to their `omitted` columns, whose Blobs are rebuilt as logical values
+    /// within what remains of `account`'s payload budget.
+    #[allow(clippy::too_many_arguments)]
+    async fn rows_with_omitted(
+        &self,
+        ds: &Dataset,
+        full: &SchemaRef,
+        omitted_schema: &LanceSchema,
+        has_blobs: bool,
+        rows: &RecordBatch,
+        omitted: RecordBatch,
+        row_ids: &[u64],
+        account: &PendingScanAccount,
+    ) -> Result<RecordBatch> {
+        account.remaining_bytes_after(rows.get_array_memory_size() as u64)?;
+        let omitted = if has_blobs {
+            let payload_budget = account.write_budget.bytes() - account.payload_bytes;
+            self.materialize_blob_batch_with_row_ids(
+                ds,
+                omitted_schema,
+                omitted,
+                row_ids,
+                Some(payload_budget),
+                None,
+                None,
+            )
+            .await?
+        } else {
+            omitted
+        };
+        let columns = full
+            .fields()
+            .iter()
+            .map(|field| {
+                rows.column_by_name(field.name())
+                    .or_else(|| omitted.column_by_name(field.name()))
+                    .cloned()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "an update's matched rows lack column '{}'",
+                            field.name()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        RecordBatch::try_new(full.clone(), columns).map_err(OmniError::arrow_internal)
     }
 
     /// `count_rows` variant that respects staged writes. Used for
@@ -6462,14 +7433,157 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
     Ok(())
 }
 
+/// What [`TableStore::scan_update_matches`] needs from the update.
+#[derive(Debug, Clone)]
+pub struct UpdateMatchRequest {
+    /// The graph's system id column, the patch's join key.
+    pub id_column: String,
+    /// The assigned columns, none a Blob, each with the bytes one row's
+    /// value occupies in the patch source.
+    pub assigned: Vec<(String, u64)>,
+    /// Unassigned Blob and fixed-width vector columns: a column patch neither
+    /// reads nor writes them.
+    pub omitted: Vec<String>,
+    /// Whether the update may rewrite whole rows. A mutation that writes
+    /// another table shares one write budget with it, and a row rewrite
+    /// charges carried payload a patch does not, so there the update patches
+    /// and its charge does not depend on the mode. The caller sets it only for
+    /// a mutation of one statement (`ir.ops.len() == 1`), so every update in
+    /// a mutation of several statements patches whatever [`UpdateWriteCost`]
+    /// estimates: the estimate chooses the mode for single-statement
+    /// mutations alone, and tuning it changes nothing for the others.
+    pub rows_allowed: bool,
+}
+
+/// How an update's matched rows reach Lance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateWriteMode {
+    /// `id` and the assigned columns, patched into the touched fragments
+    /// (`MergeInsertWriteMode::RewriteColumns`).
+    ColumnPatch,
+    /// Whole rows, moved to a new fragment (`RewriteRows`).
+    Rows,
+}
+
+/// The facts an update's write mode is chosen from, in bytes. A column patch
+/// writes a column file covering every row of each touched fragment, so its
+/// size is the touched rows times the source row (`id` plus the assigned
+/// values) and barely falls as fewer rows match; a row rewrite reads and
+/// writes each matched row whole, its carried columns, vectors and managed
+/// Blob payloads. Both read about what they write, and both write one object
+/// per touched fragment (a patch file or a deletion vector), so the object
+/// count does not separate them.
+///
+/// The choice is a physical plan decision and never decides the outcome:
+/// admission charges the carried columns, which both modes hold, and a row
+/// rewrite that would exceed the write budget takes the patch
+/// (`rows_over_budget`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpdateWriteCost {
+    pub matched_rows: u64,
+    /// Physical rows of the fragments holding a matched row.
+    pub touched_rows: u64,
+    /// The matched rows' ids, values plus offsets.
+    pub id_bytes: u64,
+    /// The matched rows' assigned values in the patch source.
+    pub assigned_bytes: u64,
+    /// The matched rows' carried (non-omitted) columns as stored.
+    pub carried_bytes: u64,
+    /// The matched rows' omitted vectors, at full width.
+    pub vector_bytes: u64,
+    /// The matched rows' managed Blob payloads in omitted columns.
+    pub managed_blob_bytes: u64,
+    /// Bytes one row's values occupy in the assigned columns an index covers.
+    /// A patch withdraws every touched fragment from such an index until the
+    /// next reconciliation, so reads of the column scan those fragments: one
+    /// read of the column over them is added to the patch's cost.
+    pub indexed_assigned_row_bytes: u64,
+    /// An omitted Blob column of a matched row holds an external reference.
+    pub external_blob: bool,
+    /// The mutation writes another table, so the update patches.
+    pub rows_disallowed: bool,
+    /// The row rewrite would exceed the write budget, so the update patches.
+    pub rows_over_budget: bool,
+}
+
+impl UpdateWriteCost {
+    /// The bytes a column patch costs: the source row times the touched rows,
+    /// plus a read of each indexed assigned column over the touched rows.
+    pub fn patch_bytes(&self) -> u128 {
+        if self.matched_rows == 0 {
+            return 0;
+        }
+        let source = u128::from(self.id_bytes) + u128::from(self.assigned_bytes);
+        source * u128::from(self.touched_rows) / u128::from(self.matched_rows)
+            + u128::from(self.indexed_assigned_row_bytes) * u128::from(self.touched_rows)
+    }
+
+    /// The bytes a row rewrite writes: every matched row whole.
+    pub fn rows_bytes(&self) -> u128 {
+        u128::from(self.carried_bytes)
+            + u128::from(self.vector_bytes)
+            + u128::from(self.managed_blob_bytes)
+    }
+
+    /// A stored external reference takes the patch, which keeps it unread;
+    /// so does a mutation that writes another table, or a row rewrite over
+    /// the write budget. Otherwise the smaller cost wins.
+    pub fn mode(&self) -> UpdateWriteMode {
+        if self.external_blob
+            || self.rows_disallowed
+            || self.rows_over_budget
+            || self.patch_bytes() < self.rows_bytes()
+        {
+            UpdateWriteMode::ColumnPatch
+        } else {
+            UpdateWriteMode::Rows
+        }
+    }
+}
+
+/// An update's matched rows in the shape its write mode stages: the carried
+/// columns for a patch, the full logical rows otherwise.
+#[derive(Debug)]
+pub struct UpdateMatches {
+    pub mode: UpdateWriteMode,
+    pub cost: UpdateWriteCost,
+    pub batches: Vec<RecordBatch>,
+}
+
+/// Bytes per row of a fixed-width vector column (`FixedSizeList` of a
+/// primitive), `None` for any other type.
+fn fixed_width_row_bytes(data_type: &arrow_schema::DataType) -> Option<u64> {
+    match data_type {
+        arrow_schema::DataType::FixedSizeList(item, length) => {
+            let width = item.data_type().primitive_width()?;
+            u64::try_from(*length)
+                .ok()?
+                .checked_mul(u64::try_from(width).ok()?)
+        }
+        _ => None,
+    }
+}
+
+/// Bytes the values of `batch` occupy, slices counted at their length.
+fn value_bytes(batch: &RecordBatch) -> u64 {
+    batch
+        .columns()
+        .iter()
+        .map(|column| column.to_data().get_slice_memory_size().unwrap_or(0) as u64)
+        .fold(0_u64, u64::saturating_add)
+}
+
 /// Incremental resource accounting for a pending-aware update scan.
 ///
 /// The retained `Vec<RecordBatch>` never grows past this account: pending
 /// results are charged first, and each committed scanner emission is charged
-/// only after pending-key shadowing. `initial_rows` represents this table's
+/// only after pending-key shadowing. Every kept batch goes through
+/// [`Self::retain`], so neither the charge nor the memory held depends on the
+/// rows stored beside a match. `initial_rows` represents this table's
 /// retained batches, while `initial_bytes` represents every table retained by
 /// `MutationStaging`, so a chained cross-table update receives only the
 /// remaining graph-operation byte budget.
+#[derive(Clone)]
 struct PendingScanAccount {
     table_key: String,
     rows: u64,
@@ -6498,17 +7612,33 @@ impl PendingScanAccount {
         &self.table_key
     }
 
-    fn add_batches(&mut self, batches: &[RecordBatch]) -> Result<()> {
-        for batch in batches {
-            self.add_batch(batch)?;
-        }
-        Ok(())
+    /// [`Self::retain`] each batch in order.
+    fn retain_all(&mut self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+        batches
+            .into_iter()
+            .map(|batch| self.retain(batch))
+            .collect()
     }
 
-    fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+    /// The one way a pending-aware scan keeps a batch, and the only method
+    /// that charges one: copy its rows into buffers of their own, then charge
+    /// the copy, and return the copy to keep.
+    ///
+    /// A Lance scanner batch can share buffers with rows it does not contain,
+    /// so charging (or keeping) it as emitted could count rows stored beside
+    /// a match. Copying first makes both the charge and the memory held
+    /// depend only on the kept rows, never on storage layout (issue #1303).
+    /// There is deliberately no separate batch charge method. Only `new` and
+    /// `retain` call `add_usage`, by convention rather than by the compiler,
+    /// so a new retention point should keep its batches through `retain`, and
+    /// must not charge an uncopied batch through `add_usage`. The copy is
+    /// made before the charge: its size is bounded by the input batch, not by
+    /// the budget, so an over-budget copy is made and then refused.
+    fn retain(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+        let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
         let rows = u64::try_from(batch.num_rows())
             .map_err(|_| OmniError::manifest_internal("pending scan row count exceeds u64"))?;
-        let usage = write_batch_bytes(batch)?;
+        let usage = write_batch_bytes(&batch)?;
         let payload_bytes = self
             .payload_bytes
             .checked_add(usage.payload)
@@ -6517,7 +7647,7 @@ impl PendingScanAccount {
             .check(MATERIALIZED_BLOB_PAYLOAD_BYTES, payload_bytes)?;
         self.add_usage(rows, usage.rows)?;
         self.payload_bytes = payload_bytes;
-        Ok(())
+        Ok(batch)
     }
 
     fn add_usage(&mut self, rows: u64, bytes: u64) -> Result<()> {
@@ -7146,10 +8276,12 @@ fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &
     Ok(())
 }
 
-/// Managed Blob bytes one compaction scanner batch may materialize: Lance 11
-/// rewrites a Blob table through a scanner that reads every managed payload of
-/// a batch, so `stage_compaction` sizes each task's batches against this, per
-/// row (a row sums its Blob columns; one over the budget is a one-row batch).
+/// Managed Blob bytes one compaction scanner batch may materialize: Lance 13
+/// never binary-copies a table with a Blob column
+/// (`can_use_binary_copy_current`) and rewrites it through a scanner whose
+/// every batch has its managed payloads read (`transform_blob_v2_batch`), so
+/// `stage_compaction` sizes each task's batches against this, per row (a row
+/// sums its Blob columns; one over the budget is a one-row batch).
 const COMPACTION_BLOB_BATCH_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 /// Most rows a Blob table's compaction batch may hold: Lance's own fallback
 /// default. `stage_compaction` always sets the derived size on a Blob table,
@@ -7328,6 +8460,131 @@ fn validate_known_present_update(
         }
     }
     Ok(())
+}
+
+/// The shape a known-present column patch must stage: every source id
+/// matched once and updated in place, nothing inserted or deleted, and one
+/// `Update { RewriteColumns }` that only attaches data files to existing
+/// fragments (no new or removed fragment, no inserted-row filter) and lists
+/// the offsets it patched, which `build_manifest` restamps.
+fn validate_known_present_column_patch(
+    uncommitted: &UncommittedMergeInsert,
+    expected_rows: u64,
+    context: &'static str,
+) -> Result<()> {
+    let stats = &uncommitted.stats;
+    if stats.num_inserted_rows != 0
+        || stats.num_updated_rows != expected_rows
+        || stats.num_deleted_rows != 0
+        || stats.num_skipped_duplicates != 0
+    {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("{context}:known_present_ids"),
+            Some(format!(
+                "updated={expected_rows}, inserted=0, deleted=0, skipped=0"
+            )),
+            Some(format!(
+                "updated={}, inserted={}, deleted={}, skipped={}",
+                stats.num_updated_rows,
+                stats.num_inserted_rows,
+                stats.num_deleted_rows,
+                stats.num_skipped_duplicates
+            )),
+        ));
+    }
+    match &uncommitted.transaction.operation {
+        Operation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+            update_mode,
+            inserted_rows_filter,
+            updated_fragment_offsets,
+            ..
+        } if removed_fragment_ids.is_empty()
+            && new_fragments.is_empty()
+            && !updated_fragments.is_empty()
+            && update_mode == &Some(UpdateMode::RewriteColumns)
+            && inserted_rows_filter.is_none()
+            && updated_fragment_offsets.is_some() =>
+        {
+            Ok(())
+        }
+        _ => Err(OmniError::manifest_internal(format!(
+            "{context}: known-present column patch did not stage an in-place RewriteColumns Update"
+        ))),
+    }
+}
+
+/// Keep the `id` index's coverage of the fragments a column patch touched.
+///
+/// Lance writes every source column into the patch, the join key included,
+/// and lists it in `fields_modified`, which withdraws each touched fragment
+/// from every index over the key (lance 13.0.0 `select_write_sink`: the patch
+/// "would reproduce the key column byte for byte"). The values are byte for
+/// byte the ones the index holds, since the join matched them exactly, and a
+/// patch moves no row, so each row keeps its stable row id: the index entries
+/// stay exact. Removing the key from `fields_modified` keeps the coverage;
+/// the patch's other columns stay listed, so an index over them is withdrawn
+/// as Lance decides. `lance_surface_guards.rs` pins both halves.
+fn keep_key_index_coverage(
+    transaction: &mut Transaction,
+    id_field_id: i32,
+    context: &'static str,
+) -> Result<()> {
+    let Operation::Update {
+        fields_modified, ..
+    } = &mut transaction.operation
+    else {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: a column patch is not an Update"
+        )));
+    };
+    let key = u32::try_from(id_field_id).map_err(|_| {
+        OmniError::manifest_internal(format!("{context}: negative id field id {id_field_id}"))
+    })?;
+    if !fields_modified.contains(&key) {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: the column patch does not list the id field {key} it wrote"
+        )));
+    }
+    fields_modified.retain(|field| *field != key);
+    if fields_modified.is_empty() {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: the column patch modified no column besides the id"
+        )));
+    }
+    Ok(())
+}
+
+/// The staged packet of a column patch: the patched fragments replace their
+/// committed selves in a read-your-writes view (`committed - removed + new`),
+/// so they are both the removed and the new fragments. It removes no row, so
+/// it carries the same no-by-source-delete marker as every keyed update.
+fn staged_column_patch_result(
+    mut uncommitted: UncommittedMergeInsert,
+    context: &'static str,
+) -> Result<StagedWrite> {
+    let Operation::Update {
+        updated_fragments, ..
+    } = &uncommitted.transaction.operation
+    else {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: a column patch is not an Update"
+        )));
+    };
+    let new_fragments = updated_fragments.clone();
+    let removed_fragment_ids = updated_fragments
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect();
+    stamp_no_by_source_delete(&mut uncommitted.transaction);
+    Ok(StagedWrite::with_commit_metadata(
+        uncommitted.transaction,
+        StagedCommitMetadata::affected_rows(None),
+        new_fragments,
+        removed_fragment_ids,
+    ))
 }
 
 fn merge_stats_prove_pure_insert(stats: &MergeStats, expected_rows: u64) -> bool {
@@ -7727,7 +8984,7 @@ fn next_proven_insert_batch(
         {
             batch.clone()
         } else {
-            copy_proven_insert_batch_range(batch, offset, rows)?
+            copy_batch_range(batch, offset, rows)?
         };
         let usage = write_batch_bytes(&candidate)?;
         let bytes = usage.rows.max(usage.payload);
@@ -7805,6 +9062,11 @@ fn largest_proven_insert_prefix(
     Ok((low, batch_slice_memory_size(batch, offset, low)?))
 }
 
+/// The bytes `rows` rows of `batch` from `offset` span in their buffers
+/// (`ArrayData::get_slice_memory_size`): every slot's offset range, a null's
+/// included. A Lance scan can return a null whose offsets span a neighbouring
+/// row's bytes in a shared decode buffer, so this counts what a `concat` of
+/// the rows would copy, not what they hold ([`column_logical_bytes`]).
 pub(crate) fn batch_slice_memory_size(
     batch: &RecordBatch,
     offset: usize,
@@ -7839,18 +9101,104 @@ fn finish_proven_insert_batch(
     Ok(batch)
 }
 
-fn copy_proven_insert_batch_range(
+/// The bytes `column`'s rows hold: every non-null value's bytes plus the
+/// column's offsets or views and its validity, which is what a
+/// [`copy_batch_range`] of the rows holds and what a fact built from them
+/// can copy. A null counts no value bytes, whatever range its offsets span
+/// ([`batch_slice_memory_size`] counts that range, and so does the
+/// allocation). A view array keeps a value of at most 12 bytes inside its
+/// 16-byte view, so only longer values add bytes; it is measured here but not
+/// compacted by [`copy_batch_range`], which keeps its data buffers, so a copy
+/// of a view array is no smaller than the slice it copies. A fixed-width or
+/// nested column counts its slice, or its whole allocation where that is
+/// unavailable.
+pub(crate) fn column_logical_bytes(column: &dyn Array) -> usize {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+
+    fn sum(lengths: impl Iterator<Item = usize>) -> usize {
+        lengths.fold(0, usize::saturating_add)
+    }
+    // A view of at most this many bytes stores the value inline.
+    const VIEW_INLINE_BYTES: usize = 12;
+    let outlined = |length: usize| {
+        if length > VIEW_INLINE_BYTES {
+            length
+        } else {
+            0
+        }
+    };
+    let rows = column.len();
+    let validity = column.nulls().map_or(0, |_| rows.div_ceil(8));
+    let (values, framing) = match column.data_type() {
+        DataType::Utf8 => (
+            sum(column.as_string::<i32>().iter().flatten().map(str::len)),
+            rows.saturating_add(1).saturating_mul(4),
+        ),
+        DataType::LargeUtf8 => (
+            sum(column.as_string::<i64>().iter().flatten().map(str::len)),
+            rows.saturating_add(1).saturating_mul(8),
+        ),
+        DataType::Utf8View => (
+            sum(column
+                .as_string_view()
+                .iter()
+                .flatten()
+                .map(|value| outlined(value.len()))),
+            rows.saturating_mul(16),
+        ),
+        DataType::Binary => (
+            sum(column.as_binary::<i32>().iter().flatten().map(<[u8]>::len)),
+            rows.saturating_add(1).saturating_mul(4),
+        ),
+        DataType::LargeBinary => (
+            sum(column.as_binary::<i64>().iter().flatten().map(<[u8]>::len)),
+            rows.saturating_add(1).saturating_mul(8),
+        ),
+        DataType::BinaryView => (
+            sum(column
+                .as_binary_view()
+                .iter()
+                .flatten()
+                .map(|value| outlined(value.len()))),
+            rows.saturating_mul(16),
+        ),
+        _ => {
+            return column
+                .to_data()
+                .get_slice_memory_size()
+                .unwrap_or_else(|_| column.get_array_memory_size());
+        }
+    };
+    values.saturating_add(framing).saturating_add(validity)
+}
+
+/// The bytes `batch`'s rows hold, column by column ([`column_logical_bytes`]).
+pub(crate) fn batch_logical_bytes(batch: &RecordBatch) -> u64 {
+    batch.columns().iter().fold(0_u64, |total, column| {
+        total.saturating_add(
+            u64::try_from(column_logical_bytes(column.as_ref())).unwrap_or(u64::MAX),
+        )
+    })
+}
+
+/// `rows` rows of `batch` from `offset`, copied into buffers of their own: an
+/// Arrow slice keeps every buffer of its parent alive, a copy only its rows.
+/// `take` copies a variable-width column's valid values alone, so a null
+/// whose offsets span a neighbour's bytes is not copied with them; a view
+/// array keeps its data buffers.
+pub(crate) fn copy_batch_range(
     batch: &RecordBatch,
     offset: usize,
     rows: usize,
 ) -> Result<RecordBatch> {
     let end = offset
         .checked_add(rows)
-        .ok_or_else(|| OmniError::manifest_internal("proven insert delta range overflow"))?;
+        .ok_or_else(|| OmniError::manifest_internal("batch copy range overflow"))?;
     let offset = u64::try_from(offset)
-        .map_err(|_| OmniError::manifest_internal("proven insert delta offset exceeds u64"))?;
+        .map_err(|_| OmniError::manifest_internal("batch copy offset exceeds u64"))?;
     let end = u64::try_from(end)
-        .map_err(|_| OmniError::manifest_internal("proven insert delta end exceeds u64"))?;
+        .map_err(|_| OmniError::manifest_internal("batch copy end exceeds u64"))?;
     let indices = UInt64Array::from_iter_values(offset..end);
     arrow_select::take::take_record_batch(batch, &indices).map_err(OmniError::arrow_internal)
 }
@@ -7905,7 +9253,7 @@ fn staged_keyed_merge_result(
     // insert), none of which use a by-source-delete arm. Stamp the durable
     // no-by-source-delete marker before the transaction is committed, so the CDC
     // candidate-pruning classifier can trust this persisted `Update` removed no
-    // rows (an external merge adopted via `repair --force` carries no marker).
+    // rows (an external Lance merge carries no marker).
     stamp_no_by_source_delete(&mut uncommitted.transaction);
     Ok(StagedWrite::with_commit_metadata(
         uncommitted.transaction,
@@ -7919,6 +9267,145 @@ fn staged_keyed_merge_result(
 mod tests {
     use super::*;
     use arrow_array::{StringArray, UInt8Array, UInt32Array};
+
+    /// A row's logical bytes count its non-null values: a null whose offsets
+    /// span a neighbour's bytes in a shared buffer counts none of them, as no
+    /// copy or fact holds them (#1427); a view counts a value inline in it
+    /// once; a fixed-width column counts its slice.
+    #[test]
+    fn column_logical_bytes_count_values_not_their_buffers_issue_1427() {
+        use arrow_array::{BinaryViewArray, Int64Array, StringViewArray};
+        use datafusion::arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
+
+        let spanning_null = StringArray::new(
+            OffsetBuffer::new(vec![0_i32, 5, 10].into()),
+            Buffer::from("aaaaabbbbb".as_bytes()),
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        assert_eq!(
+            spanning_null.to_data().get_slice_memory_size().unwrap(),
+            10 + 2 * 4 + 1,
+            "the slice size counts the null's bytes"
+        );
+        assert_eq!(column_logical_bytes(&spanning_null), 5 + 3 * 4 + 1);
+        let copied = copy_batch_range(
+            &RecordBatch::try_from_iter([("s", Arc::new(spanning_null) as ArrayRef)]).unwrap(),
+            0,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            copied.column(0).to_data().get_slice_memory_size().unwrap(),
+            5 + 2 * 4 + 1,
+            "a copy holds the valid value's bytes alone"
+        );
+        assert_eq!(
+            column_logical_bytes(&StringArray::from(vec!["abc", "de"])),
+            5 + 3 * 4
+        );
+        assert_eq!(
+            column_logical_bytes(&Int64Array::from(vec![1, 2, 3])),
+            3 * 8
+        );
+        let long = "x".repeat(13);
+        assert_eq!(
+            column_logical_bytes(&StringViewArray::from(vec!["inline", long.as_str()])),
+            2 * 16 + 13,
+            "a view holds a value of at most 12 bytes inline"
+        );
+        assert_eq!(
+            column_logical_bytes(&BinaryViewArray::from(vec![
+                b"twelve bytes".as_slice(),
+                long.as_bytes()
+            ])),
+            2 * 16 + 13
+        );
+    }
+
+    /// Issue #1264: the write mode an update takes from its byte estimate.
+    #[test]
+    fn update_write_mode_follows_bytes_external_references_and_indexes() {
+        // One row of a 512-row fragment, a 32-byte vector: a patch writes the
+        // whole fragment's key and value, a rewrite the one row.
+        let point = UpdateWriteCost {
+            matched_rows: 1,
+            touched_rows: 512,
+            id_bytes: 30,
+            assigned_bytes: 4,
+            carried_bytes: 60,
+            vector_bytes: 32,
+            ..UpdateWriteCost::default()
+        };
+        assert_eq!(point.patch_bytes(), 512 * 34);
+        assert_eq!(point.rows_bytes(), 92);
+        assert_eq!(point.mode(), UpdateWriteMode::Rows);
+        // The same row holding a 1 MiB Blob.
+        let blob = UpdateWriteCost {
+            managed_blob_bytes: 1 << 20,
+            ..point
+        };
+        assert_eq!(blob.mode(), UpdateWriteMode::ColumnPatch);
+        // Every row of the fragment, even with no Blob.
+        let all = UpdateWriteCost {
+            matched_rows: 512,
+            id_bytes: 512 * 30,
+            assigned_bytes: 512 * 4,
+            carried_bytes: 512 * 60,
+            vector_bytes: 512 * 32,
+            ..point
+        };
+        assert_eq!(all.mode(), UpdateWriteMode::ColumnPatch);
+        // An index on the assigned column adds a read of it over the touched
+        // rows to the patch: still cheaper than rewriting a 1 MiB Blob, not
+        // than rewriting a narrow row that the patch already loses to.
+        let indexed = UpdateWriteCost {
+            indexed_assigned_row_bytes: 4,
+            ..blob
+        };
+        assert_eq!(indexed.patch_bytes(), 512 * 34 + 512 * 4);
+        assert_eq!(indexed.mode(), UpdateWriteMode::ColumnPatch);
+        let indexed_all = UpdateWriteCost {
+            matched_rows: 512,
+            id_bytes: 512 * 30,
+            assigned_bytes: 512 * 4,
+            carried_bytes: 512 * 40,
+            indexed_assigned_row_bytes: 30,
+            ..point
+        };
+        assert_eq!(indexed_all.mode(), UpdateWriteMode::Rows);
+        // A stored external reference, a mutation writing another table, and
+        // a row rewrite over the write budget take the patch whatever the
+        // estimate.
+        for cost in [point, indexed_all] {
+            for forced in [
+                UpdateWriteCost {
+                    external_blob: true,
+                    ..cost
+                },
+                UpdateWriteCost {
+                    rows_disallowed: true,
+                    ..cost
+                },
+                UpdateWriteCost {
+                    rows_over_budget: true,
+                    ..cost
+                },
+            ] {
+                assert_eq!(forced.mode(), UpdateWriteMode::ColumnPatch);
+            }
+        }
+        // Equal bytes keep the row rewrite; no match writes nothing.
+        let tie = UpdateWriteCost {
+            matched_rows: 1,
+            touched_rows: 2,
+            id_bytes: 5,
+            assigned_bytes: 5,
+            carried_bytes: 20,
+            ..UpdateWriteCost::default()
+        };
+        assert_eq!(tie.mode(), UpdateWriteMode::Rows);
+        assert_eq!(UpdateWriteCost::default().patch_bytes(), 0);
+    }
     use arrow_schema::{DataType, Field, Schema};
     use lance::blob::BlobArrayBuilder;
 
@@ -7957,17 +9444,37 @@ mod tests {
         )
         .await
         .unwrap();
+        let indices = ds.load_indices().await.unwrap();
+        let segments = indices.iter().collect::<Vec<_>>();
         assert_eq!(
-            TableStore::vector_partition_count(&ds, "embedding_idx")
+            TableStore::vector_partition_count(&ds, "embedding_idx", &segments)
                 .await
                 .unwrap(),
             2
         );
         assert!(
-            TableStore::vector_partition_count(&ds, "missing_idx")
+            TableStore::vector_partition_count(&ds, "missing_idx", &[])
                 .await
                 .is_err(),
             "a failed statistics read must not fold the index with one partition"
+        );
+        // A segment that covers no fragment holds no rows and has no
+        // statistics; an index of only such segments is rebuilt as the
+        // engine builds a new one.
+        let mut emptied = indices[0].clone();
+        emptied.fragment_bitmap.as_mut().unwrap().clear();
+        assert_eq!(
+            TableStore::vector_partition_count(&ds, "embedding_idx", &[&emptied])
+                .await
+                .unwrap(),
+            ENGINE_VECTOR_PARTITIONS
+        );
+        assert_eq!(
+            TableStore::vector_partition_count(&ds, "embedding_idx", &[&emptied, &indices[0]])
+                .await
+                .unwrap(),
+            2,
+            "a segment that covers rows keeps the index's count"
         );
     }
 

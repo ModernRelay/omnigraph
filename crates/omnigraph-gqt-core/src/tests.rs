@@ -131,6 +131,7 @@ async fn generated_params_supply_a_step_and_are_refused_outside_their_contract()
     assert!(
         GeneratedParams::parse("generate: v1 seed: 0", &format!("params:\n{wide}"))
             .unwrap_err()
+            .message
             .contains("zipf tables exceed 8000000 entries")
     );
 
@@ -315,8 +316,23 @@ async fn generated_load_observes_typed_errors_for_single_and_multiple_calls() {
     }
 }
 
+/// The first refusal's message, without its code and line.
 fn refusal(stem: &str, text: &str) -> String {
-    parse_case(stem, text).expect_err("expected the case to be refused")
+    parse_case(stem, text)
+        .expect_err("expected the case to be refused")
+        .first()
+        .message
+        .clone()
+}
+
+/// The first refusal as `line N: message`, for the tests that pin the line.
+fn refusal_at(stem: &str, text: &str) -> String {
+    let errors = parse_case(stem, text).expect_err("expected the case to be refused");
+    let first = errors.first();
+    match first.line {
+        Some(line) => format!("line {line}: {}", first.message),
+        None => first.message.clone(),
+    }
 }
 
 #[test]
@@ -337,7 +353,7 @@ fn a_fault_section_is_refused() {
 }
 
 const DST_RUNNER: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person {\n    name: String @key\n}\n";
-const BLOCK: &str = "--- concurrent\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 put __manifest/, r1, w1\n";
+const BLOCK: &str = "--- concurrent scripted\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 put __manifest/, r1, w1\n";
 const BLOCK_EXPECT: &str = "--- expect\nw1: ok\nr1: ok\n";
 
 #[test]
@@ -351,52 +367,106 @@ fn a_concurrent_block_parses_with_its_bare_expect() {
     };
     assert_eq!(step.ordinal, 1);
     assert_eq!(step.sessions.len(), 2);
-    assert_eq!(step.sessions[0].kind, SessionKind::Mutation);
-    assert_eq!(step.sessions[1].kind, SessionKind::Query);
+    assert!(matches!(step.sessions[0].kind, SessionKind::Mutation));
+    assert!(matches!(step.sessions[1].kind, SessionKind::Query));
     assert_eq!(step.sessions[0].name, "add");
     assert_eq!(step.order.len(), 3);
     assert_eq!(case.source_lines.get(&1), Some(&15));
 }
 
+const ENGINE_RUNNER: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Person {\n    name: String @key\n}\n";
+
 #[test]
-fn a_concurrent_block_refuses_what_it_cannot_run() {
-    let refused = |block: &str, expect: &str| {
-        refusal("block", &format!("{HDR}{DST_RUNNER}{SEED}{block}{expect}"))
+fn a_block_without_a_script_is_free_running_on_every_host() {
+    let block = "--- concurrent\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{block}{BLOCK_EXPECT}");
+    let case = parse_case("free", &text).unwrap();
+    assert!(!case.needs_dst());
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
     };
-    assert!(refused(BLOCK, "--- expect ok\n").contains("`--- expect` is bare"));
+    assert!(step.is_free_running());
+    assert!(step.order.is_empty());
+    assert_eq!(step.sessions.len(), 2);
+    assert_eq!(step.sessions[0].group, "w1");
+    assert_eq!(step.sessions[0].label, "w1");
+    assert_eq!(case.plain_passes(), 2);
+    assert!(PlainHost.admit_case(&case).is_ok());
+}
+
+#[test]
+fn a_worker_count_declares_one_session_per_worker_under_one_label() {
+    let block = "--- concurrent\nwriter x3 on w${worker}: query put() { insert Person { name: \"bob\" } }\nreader: query all() { match { $p: Person } return { $p.name } }\n";
+    let expect = "--- expect\nwriter: error: conflict\nreader: ok\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{block}{expect}");
+    let case = parse_case("workers", &text).unwrap();
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
+    };
+    let labels: Vec<&str> = step.sessions.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels, ["writer.0", "writer.1", "writer.2", "reader"]);
+    let branches: Vec<&str> = step.sessions.iter().map(|s| s.branch.as_str()).collect();
+    assert_eq!(branches, ["w0", "w1", "w2", "main"]);
+    assert!(step.sessions.iter().take(3).all(|s| s.group == "writer"
+        && s.expect
+            == SessionExpect::Error {
+                needle: "conflict".into()
+            }));
+    assert_eq!(step.sessions[3].expect, SessionExpect::Ok);
+    let nine = parse_case(
+        "nine",
+        &format!(
+            "{HDR}{ENGINE_RUNNER}{SEED}--- concurrent\nwriter x9: query put() {{ insert Person {{ name: \"bob\" }} }}\n--- expect\nwriter: ok\n"
+        ),
+    )
+    .unwrap();
+    assert_eq!(nine.plain_passes(), concurrent::PLAIN_PASSES);
+    let over = admit_workers(&nine).unwrap_err();
     assert!(
-        refused(BLOCK, "--- expect\n# note\nw1: ok\nr1: ok\n")
-            .contains("`#` lines are refused inside the expect section")
+        over.contains("at most 8 workers under one label; step 1 declares 9"),
+        "{over}"
     );
-    assert!(
-        refused(BLOCK, "--- params\n{}\n--- expect\nw1: ok\nr1: ok\n").contains("takes no params")
+    assert!(PlainHost.admit_case(&nine).is_err());
+}
+
+#[test]
+fn a_recipe_or_a_merge_is_a_session_statement() {
+    let recipe = "--- concurrent\nwriter x3: load generate: v1 seed: 42 mode: append\n  tables:\n    - kind: node\n      name: Person\n      rows: 4\n      commits: 1\n      columns:\n        name: {kind: key, prefix: cw-, width: 3}\nreader: query all() { match { $p: Person } return { $p.name } }\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{recipe}--- expect\nwriter: ok\nreader: ok\n");
+    let case = parse_case("recipe", &text).unwrap();
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
+    };
+    assert_eq!(step.sessions.len(), 4);
+    let SessionKind::Load(recipe) = &step.sessions[0].kind else {
+        panic!("expected a dealt recipe");
+    };
+    assert_eq!(step.sessions[2].label, "writer.2");
+    assert_eq!(step.sessions[2].worker, Worker { index: 2, count: 3 });
+    let SessionKind::Load(shared) = &step.sessions[1].kind else {
+        panic!("expected the same dealt recipe");
+    };
+    assert!(Arc::ptr_eq(recipe, shared));
+    assert!(matches!(step.sessions[3].kind, SessionKind::Query));
+
+    let merge = "--- concurrent\nmerger x2: branch merge w${worker} into main\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{merge}--- expect\nmerger: ok\n");
+    let case = parse_case("merge", &text).unwrap();
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
+    };
+    let SessionKind::Merge(merge) = &step.sessions[1].kind else {
+        panic!("expected a merge session");
+    };
+    assert_eq!(
+        *merge,
+        MergeOp {
+            source: "w1".into(),
+            into: Some("main".into()),
+            as_commit: false
+        }
     );
-    assert!(
-        refused(
-            "--- concurrent\nw1: query add($n: String) { insert Person { name: $n } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1, r1\n",
-            BLOCK_EXPECT
-        )
-        .contains("declares parameters")
-    );
-    assert!(
-        refused(
-            "--- concurrent\nw1: branch create feature\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1, r1\n",
-            BLOCK_EXPECT
-        )
-        .contains("must be a query or mutation declaration")
-    );
-    let in_loop = refused(
-        &format!("--- loop $x 1 2\n{BLOCK}"),
-        &format!("{BLOCK_EXPECT}--- endloop\n"),
-    );
-    assert!(in_loop.contains("inside a loop"), "{in_loop}");
-    assert!(
-        refused(
-            "--- concurrent extra\nw1: query a() {}\norder: w1\n",
-            BLOCK_EXPECT
-        )
-        .contains("takes no arguments")
-    );
+    assert_eq!(step.sessions[1].name, "branch merge");
 }
 
 #[test]
@@ -828,7 +898,7 @@ fn refuses_substitution_marker_in_a_statement_body() {
         "{HDR}{SCHEMA}{SEED}--- foreach $i a b\n--- mutate\nbranch create \"${{i}}\"\n{EXPECT_OK}--- endloop\n"
     );
     assert_eq!(
-        refusal("x", &text),
+        refusal_at("x", &text),
         "line 16: `${` may appear only inside a params or expect body"
     );
 }
@@ -948,7 +1018,7 @@ fn bind_commit_refusals() {
         ),
         (
             format!("{PROPOSE}--- bind commit $c\nbody\n"),
-            "line 20: `--- bind` carries no body",
+            "`--- bind` carries no body",
         ),
         (
             format!("--- mutate\ncommit publish \"${{c}}\"\n{EXPECT_OK}"),
@@ -988,7 +1058,7 @@ fn bind_commit_refusals() {
         ),
         (
             format!("--- foreach $i a b\n{PROPOSE}{BIND}--- endloop\n"),
-            "invalid_case: `--- bind` inside a loop is refused; a binding is one id for the case",
+            "`--- bind` inside a loop is refused; a binding is one id for the case",
         ),
         (
             BIND.to_string(),
@@ -1007,7 +1077,7 @@ fn bind_fence_admits_only_a_whole_quoted_commit_operand() {
         "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\nbranch create \"${{c}}\"\n{EXPECT_OK}"
     );
     assert_eq!(
-        refusal("x", &text),
+        refusal_at("x", &text),
         "line 21: `${` may appear only inside a params or expect body"
     );
 }
@@ -1066,7 +1136,7 @@ fn unattached_base_operand_resolves_its_binding() {
     );
     let elsewhere = CHILD.replace("name: \"carol\"", "name: \"${r}\"");
     assert_eq!(
-        refusal("x", &format!("{HDR}{SCHEMA}{SEED}{ROOT}{elsewhere}")),
+        refusal_at("x", &format!("{HDR}{SCHEMA}{SEED}{ROOT}{elsewhere}")),
         "line 21: `${` may appear only inside a params or expect body"
     );
     let unbound_param =
@@ -1213,10 +1283,7 @@ fn same_as_v1_is_refused_off_a_query_rows_expect() {
         format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{SAME}"),
     ] {
         let refused = refusal("x", &text);
-        assert!(
-            refused.starts_with("invalid_case: ") && refused.contains("refused on a mutate step"),
-            "{refused}"
-        );
+        assert!(refused.contains("refused on a mutate step"), "{refused}");
     }
     let rows = "--- expect unordered\n{\"p.name\": \"alice\"}\n";
     for (text, needle) in [
@@ -2145,7 +2212,7 @@ mod shape_section {
     fn a_rows_expect_without_a_shape_section_is_refused() {
         let text =
             format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"alice\"}}\n");
-        let reason = refusal("x", &text);
+        let reason = refusal_at("x", &text);
         assert!(
             reason.contains("line 19: the rows expect needs an `--- expect shape` section"),
             "{reason}"
@@ -2597,6 +2664,89 @@ fn traversal_header_forces_index_builds() {
 }
 
 #[test]
+fn writer_header_takes_held_once_and_only_on_the_cases_own_store() {
+    let plain = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let plain = parse_case("x", &plain).unwrap();
+    assert!(!plain.writer_held);
+    admit_served(&plain).unwrap();
+
+    let text = format!("{HDR}# writer: held\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let case = parse_case("x", &text).unwrap();
+    assert!(case.writer_held);
+    assert!(!case.needs_indices);
+    case.admit_store(None).unwrap();
+    let refused = admit_served(&case).unwrap_err();
+    assert!(refused.contains("the `# writer:` pin"), "{refused}");
+
+    let runner = SCHEMA.split("--- schema").next().unwrap();
+    let on_a_store = |header: &str| {
+        let text = format!("{HDR}{header}{runner}{QUERY}{EXPECT}");
+        parse_case("x", &text)
+            .unwrap()
+            .admit_store(Some("file:///tmp/graph"))
+    };
+    on_a_store("").unwrap();
+    let refused = on_a_store("# writer: held\n").unwrap_err();
+    assert!(
+        refused.contains("`# writer: held` cannot run on --store"),
+        "{refused}"
+    );
+
+    let text = format!("{HDR}# writer: Held\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let reason = refusal("x", &text);
+    assert!(reason.contains("`# writer:` takes `held`"), "{reason}");
+    let twice = format!("{HDR}# writer: held\n# writer: held\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let reason = refusal("x", &twice);
+    assert!(reason.contains("duplicate `# writer:` header"), "{reason}");
+}
+
+/// The `# writer: held` pin makes the case's process the writer of `main`:
+/// the runner's claim is one `__manifest` version that moves no head, and a
+/// claim after the case answers that epoch and writes nothing.
+#[tokio::test]
+async fn writer_header_claims_main_in_one_version_that_moves_no_head() {
+    for held in [false, true] {
+        let pin = if held { "# writer: held\n" } else { "" };
+        let text = format!("{HDR}{pin}{SCHEMA}{SEED}{QUERY}{EXPECT}");
+        let case = parse_case("x", &text).unwrap();
+        let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let (seeded, head) = main_version_and_head(session.db()).await;
+
+        let session = execute_steps(
+            &case,
+            Path::new("unused.gqt"),
+            false,
+            session,
+            &uri,
+            None,
+            &PlainHost,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            main_version_and_head(session.db()).await,
+            (seeded + u64::from(held), head.clone()),
+            "held={held}"
+        );
+        assert_eq!(session.db().claim_branch_writer("main").await.unwrap(), 1);
+        assert_eq!(
+            main_version_and_head(session.db()).await,
+            (seeded + 1, head),
+            "held={held}: one claim version stands above the seed, whoever claimed first"
+        );
+    }
+}
+
+async fn main_version_and_head(db: &omnigraph::db::Omnigraph) -> (u64, omnigraph::db::SnapshotId) {
+    (
+        db.graph_manifest_version_of(ReadTarget::branch("main"))
+            .await
+            .unwrap(),
+        db.resolve_snapshot("main").await.unwrap(),
+    )
+}
+
+#[test]
 fn pin_violation_names_the_path_that_ran() {
     assert_eq!(pin_violation("indexed", 3, 0, true), None);
     assert_eq!(pin_violation("csr", 0, 2, true), None);
@@ -2854,7 +3004,7 @@ fn refuses_a_process_setting_anywhere_in_a_case_body() {
     let text = format!(
         "{HDR}{SCHEMA}{SEED}--- mutate\nset merge_lineage = off;\nset merge_lineage = on; set rrf_plan = force_prefilter;\n--- expect ok\n"
     );
-    let reason = refusal("x", &text);
+    let reason = refusal_at("x", &text);
     assert!(reason.contains(needle), "{reason}");
     assert!(
         reason.starts_with("line 16: "),
@@ -3098,7 +3248,7 @@ async fn open_case_store(
         .await
         .map_err(|e| format!("init failed: {e}"))?;
     let session = case_session(db, case, engine)?;
-    seed_case(&session, &fixture.seed, case.needs_indices).await?;
+    seed_case(&session, fixture, case.needs_indices).await?;
     Ok((session, uri, dir))
 }
 
@@ -3405,4 +3555,208 @@ fn a_plan_section_follows_a_load_or_mutate_steps_expect_only() {
     assert_eq!(step.plan.as_ref().map(|plan| plan.lines.len()), Some(2));
     let before_the_expect = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{PLAN}{EXPECT_OK}");
     assert!(parse_case("load_plan", &before_the_expect).is_err());
+}
+
+/// The negative corpus, `tests/invalid/<code>_<name>.gqt`: one case per
+/// rule, broken on purpose at a known line, and the (code, line) pairs
+/// `--check` must report for it, written here from the rule, not recorded.
+#[test]
+fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
+    use CaseErrorCode::*;
+    const INVALID: &[(&str, &[(CaseErrorCode, usize)])] = &[
+        (
+            "batch_bound_branches_recipe_loads_nothing",
+            &[(BatchBound, 14)],
+        ),
+        ("batch_bound_commits_above_rows", &[(BatchBound, 12)]),
+        ("batch_bound_commits_with_zero_rows", &[(BatchBound, 12)]),
+        (
+            "batch_bound_one_commit_over_the_batch_cap",
+            &[(BatchBound, 12)],
+        ),
+        ("bind_shape_bind_before_any_write", &[(BindShape, 14)]),
+        (
+            "body_shape_branches_count_above_the_cap",
+            &[(BodyShape, 14)],
+        ),
+        ("body_shape_recipe_rows_above_the_limit", &[(BodyShape, 12)]),
+        ("body_shape_restart_with_an_argument", &[(BodyShape, 20)]),
+        (
+            "body_shape_row_above_the_batch_byte_bound",
+            &[(BodyShape, 12)],
+        ),
+        ("corpus_timeout_budget_above_the_cap", &[(CorpusTimeout, 3)]),
+        (
+            "corpus_timeout_quoted_key_above_the_cap",
+            &[(CorpusTimeout, 3)],
+        ),
+        ("duplicate_header_issue_twice", &[(DuplicateHeader, 2)]),
+        (
+            "expect_mode_for_step_ok_on_a_query",
+            &[(ExpectModeForStep, 16)],
+        ),
+        (
+            "expect_mode_missing_bare_expect",
+            &[(ExpectModeMissing, 16)],
+        ),
+        (
+            "expect_without_step_expect_before_any_step",
+            &[(ExpectWithoutStep, 14)],
+        ),
+        ("file_name_issue_case_misnamed", &[(FileName, 1)]),
+        ("header_shape_issue_without_value", &[(HeaderShape, 1)]),
+        ("loop_header_loop_without_bounds", &[(LoopHeader, 14)]),
+        ("loop_structure_loop_never_closed", &[(LoopStructure, 14)]),
+        (
+            "missing_expect_before_endloop_leaves_the_next_loop_clean",
+            &[(MissingExpect, 19)],
+        ),
+        ("missing_expect_query_after_query", &[(MissingExpect, 16)]),
+        ("missing_issue_issue_as_a_word", &[(MissingIssue, 1)]),
+        ("missing_issue_no_header", &[(MissingIssue, 1)]),
+        (
+            "missing_red_on_issue_case_without_red_on",
+            &[(MissingRedOn, 1), (FileName, 1)],
+        ),
+        ("missing_runner_schema_first", &[(MissingRunner, 2)]),
+        ("missing_shape_rows_without_shape", &[(MissingShape, 16)]),
+        (
+            "params_placement_params_before_any_step",
+            &[(ParamsPlacement, 14)],
+        ),
+        (
+            "query_parse_bound_operand_beside_a_syntax_error",
+            &[(QueryParse, 19)],
+        ),
+        (
+            "query_parse_schema_beside_a_seed_comment",
+            &[(QueryParse, 7), (BodyShape, 13)],
+        ),
+        ("query_parse_unclosed_brace", &[(QueryParse, 14)]),
+        ("runner_config_timeout_as_a_word", &[(RunnerConfig, 2)]),
+        ("section_order_branches_after_a_step", &[(SectionOrder, 19)]),
+        (
+            "section_order_schema_after_a_step",
+            &[(SectionOrder, 12), (SectionOrder, 17)],
+        ),
+        ("section_order_seam_before_an_expect", &[(SectionOrder, 16)]),
+        ("step_kind_mutation_under_query", &[(StepKind, 14)]),
+        (
+            "substitution_placement_branches_header_names_the_marker",
+            &[(SubstitutionPlacement, 14)],
+        ),
+        (
+            "substitution_placement_branches_recipe_names_the_loop",
+            &[(SubstitutionPlacement, 21)],
+        ),
+        (
+            "substitution_placement_in_a_step_body",
+            &[(SubstitutionPlacement, 16)],
+        ),
+        (
+            "substitution_placement_outside_a_loop",
+            &[(SubstitutionPlacement, 16)],
+        ),
+        ("unbound_name_snapshot_never_bound", &[(UnboundName, 14)]),
+        ("unknown_expect_mode_sorted", &[(UnknownExpectMode, 16)]),
+        (
+            "unknown_header_key_note_for_notes",
+            &[(UnknownHeaderKey, 2)],
+        ),
+        ("unknown_section_misspelled_mutate", &[(UnknownSection, 14)]),
+    ];
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/invalid");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "gqt"))
+        .map(|path| path.file_stem().unwrap().to_str().unwrap().to_string())
+        .collect();
+    on_disk.sort();
+    let listed: Vec<&str> = INVALID.iter().map(|(stem, _)| *stem).collect();
+    assert_eq!(
+        on_disk, listed,
+        "the directory and the table name the same cases"
+    );
+    let mut covered = HashSet::new();
+    for (stem, expected) in INVALID {
+        let text = std::fs::read_to_string(dir.join(format!("{stem}.gqt"))).unwrap();
+        let errors = check_text(stem, &text, true);
+        let reported: Vec<(CaseErrorCode, usize)> = errors
+            .iter()
+            .map(|error| (error.code, error.line.unwrap_or(0)))
+            .collect();
+        assert_eq!(&reported, expected, "{stem}:\n{}", render(&errors));
+        assert!(
+            stem.starts_with(&format!("{}_", expected[0].0.name())),
+            "{stem}: the file name starts with the code of its first error"
+        );
+        for error in &errors {
+            assert!(
+                error.fix.is_some(),
+                "{stem}: `{}` names no fix",
+                error.message
+            );
+        }
+        covered.extend(expected.iter().map(|(code, _)| *code));
+    }
+    let uncovered: Vec<&str> = CaseErrorCode::ALL
+        .iter()
+        .filter(|code| !matches!(code, Other | LineEndings))
+        .filter(|code| !covered.contains(code))
+        .map(|code| code.name())
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "codes with no invalid case: {uncovered:?}"
+    );
+
+    fn render(errors: &[CaseError]) -> String {
+        errors
+            .iter()
+            .map(|error| format!("  {}\n", error.to_json()))
+            .collect()
+    }
+}
+
+/// `tests/grammar/v<N>.txt` is the format's surface at version N, the text
+/// `--grammar` prints. A change to a table or a rule shows here as a diff;
+/// an incompatible one is a new version and a new file.
+#[test]
+fn the_grammar_file_is_the_surface_of_the_current_format_version() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("tests/grammar/v{GQT_FORMAT_VERSION}.txt"));
+    let pinned = std::fs::read_to_string(&path).unwrap_or_default();
+    let derived = grammar_text();
+    assert!(
+        pinned == derived,
+        "{} differs from the derived grammar; the derived text is:\n{derived}",
+        path.display()
+    );
+}
+
+/// The near-miss tables name what the dispatch accepts: every word in them
+/// is parsed under its own rules, never as unknown.
+#[test]
+fn every_near_miss_word_is_a_dispatched_spelling() {
+    for kind in SECTION_KINDS {
+        let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- {kind}\n");
+        let errors = check_text("words", &text, false);
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.message.starts_with("unknown section")),
+            "`--- {kind}` is a section kind: {errors:?}"
+        );
+    }
+    for word in EXPECT_MODE_WORDS {
+        let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect {word}\n");
+        let errors = check_text("words", &text, false);
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.message.starts_with("unknown expect mode")),
+            "`--- expect {word}` is a mode: {errors:?}"
+        );
+    }
 }

@@ -43,13 +43,29 @@ Write mode determines ownership:
   ingress is disabled, and exportable when it names its whole object (see
   below).
 
-An `update` never reads the old value of a Blob it assigns. It carries every
-other Blob cell of a matched row: it reads the cell and rewrites it as managed
-bytes. Carrying a stored external reference therefore needs the graph's
-external Blob policy to admit the reference's source. Otherwise the update
-fails with a 400 that names the type, id, and property; assign that property in
-the same update, to a new value or to null, to replace or clear the reference
-without reading it.
+An `update` never reads the old value of a Blob it assigns. When it assigns no
+Blob and is the only statement of its mutation that writes the type, it can
+write just the assigned properties into the rows' existing storage: the row's
+Blob and vector values are neither read nor rewritten, and a stored external
+reference stays as it is. It does so whenever a matched row holds a stored
+external reference, and otherwise when it writes fewer bytes than rewriting
+the matched rows whole. That is the usual case when the rows hold large Blobs
+or vectors. A one-row update in a large table of small rows rewrites the row.
+Such an update is never refused for the Blobs it does not assign: when
+rewriting the rows would exceed `write_max_bytes`, or when the mutation also
+writes another type, it writes just the assigned properties. Whether it is
+admitted never depends on an index, and only the matched rows count toward
+`write_max_bytes`, not the other rows stored beside them.
+
+An update that rewrites whole rows carries every Blob cell of a matched row it
+does not assign: it reads the cell and rewrites it as managed bytes, and those
+bytes count toward `write_max_bytes`. Carrying a stored external reference
+therefore needs the graph's external Blob policy to admit the reference's
+source. Otherwise the update fails with a 400 that names the type, id, and
+property. Assign that property in the same update, to a new value or to null,
+to replace or clear the reference without reading it. An update rewrites whole
+rows when it assigns a Blob, or when another statement of the same mutation
+writes the type.
 
 Only a graph written outside OmniGraph can hold a stored reference to a byte
 range of an object. Export writes an external reference as a bare URI, which
@@ -104,7 +120,7 @@ lands while the write is in flight makes it start again from the new head and
 check again, so a stale ETag fails instead of overwriting the newer value; a
 write without a precondition replaces whatever is current. A schema apply or a
 delete and recreate of the branch landing in that window refuses the write
-with a conflict instead.
+instead, over HTTP a `409` `read_set_conflict`.
 
 The returned ETag is the one a read at the returned commit reports. When a call
 fails after its commit became durable, for example because its acknowledgement

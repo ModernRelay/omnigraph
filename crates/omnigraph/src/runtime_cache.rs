@@ -40,12 +40,12 @@ struct GraphIndexTableState {
     /// per-lineage counter, so two branches share it with different pins.
     staged_version: Option<u64>,
     table_branch: Option<String>,
-    /// Lance manifest incarnation token for this edge table version. Preserves the
-    /// incarnation distinction the dropped synthetic snapshot id used to carry: a
-    /// branch deleted and recreated at the same version number gets a new e_tag, so
-    /// the cache rebuilds instead of serving stale topology. `None` only on stores
-    /// without e_tags (local FS); there a same-branch manifest refresh clears the
-    /// cache as the fallback (the read-path gap in docs/dev/invariants.md).
+    /// Lance manifest incarnation token for this edge table version, where the
+    /// store gives one (S3 and Linux local files do). A branch deleted and
+    /// recreated at the same version number gets a new e_tag. The key does not
+    /// depend on it: the recreated branch's new random `staged_version` already
+    /// splits the key on every store, e_tag or not
+    /// (`same_counter_different_pin_splits_both_keys_without_etag`).
     e_tag: Option<String>,
     /// The edge's `(from_type, to_type)` endpoint names at build time. `GraphIndex`
     /// keys its `TypeIndex`es by these, and `execute_expand_csr` looks them up by
@@ -113,6 +113,31 @@ impl RuntimeCache {
         cache.entries.invalidate_all();
         cache.shelf = None;
         cache.artifact_negative.invalidate_all();
+    }
+
+    /// A write changed the edge tables `table_keys` (`edge:<Name>`): drop the
+    /// scoped indexes and failed-load verdicts that cover any of them, and keep
+    /// the rest. Every key embeds each covered table's stamp (identity,
+    /// version, pin, e_tag), so an index over untouched tables stays exact
+    /// after the write, and a written table's next read misses on its new
+    /// stamp anyway. The shelf stays: `shelf_serve` verifies each requested
+    /// table's current stamp, so it stops serving a written table and keeps
+    /// serving untouched ones. A branch create or delete clears nothing (it
+    /// changes no key); a refresh, schema apply and optimize still clear
+    /// everything through `invalidate_all`.
+    pub async fn invalidate_edge_tables<'a>(&self, table_keys: impl IntoIterator<Item = &'a str>) {
+        let written: std::collections::HashSet<&str> = table_keys.into_iter().collect();
+        if written.is_empty() {
+            return;
+        }
+        let untouched = |key: &GraphIndexCacheKey| {
+            !key.edge_tables
+                .iter()
+                .any(|table| written.contains(table.table_key.as_str()))
+        };
+        let mut cache = self.graph_indices.lock().await;
+        cache.entries.retain(untouched);
+        cache.artifact_negative.retain(untouched);
     }
 
     /// Build (or fetch) the CSR/CSC graph index scoped to exactly `edge_types` —
@@ -472,7 +497,7 @@ mod tests {
     }
 
     /// Two branches write the same lineage counter to different detached pins
-    /// on one physical table; without e_tags (Windows local files) the pin is
+    /// on one physical table; for a store that reports no e_tag the pin is
     /// the only thing that tells the two datasets apart, in both caches.
     #[test]
     fn same_counter_different_pin_splits_both_keys_without_etag() {
@@ -621,13 +646,11 @@ mod tests {
         assert_eq!(map.len(), 0);
     }
 
-    /// Issue 859: every commit of a table is a new handle key, so steady
-    /// writes to one long-lived branch filled the cache with superseded
-    /// versions of the hot table, each holding a decoded manifest that lists
-    /// every fragment. A publication now evicts the pin it replaced, so each
-    /// table holds one version per graph branch in use.
+    /// Issue 859: a publication demotes the pin it replaced, so the superseded
+    /// versions of a steadily written table stay held while the budget has
+    /// room and are the first out, behind every live pin.
     #[tokio::test]
-    async fn steady_writes_hold_one_version_per_table_and_branch_issue_859() {
+    async fn steady_writes_demote_superseded_versions_behind_the_live_pins_issue_859() {
         const SCHEMA: &str = r#"
 node Chunk { slug: String @key  n: I64 @index }
 "#;
@@ -658,6 +681,7 @@ query since($n: I64) { match { $c: Chunk  $c.n >= $n } return { $c.slug } }
                 ),
             ])
         };
+        let handles = &graph.read_caches().handles;
         session
             .mutate("main", QUERIES, "put", &params(0))
             .await
@@ -667,6 +691,11 @@ query since($n: I64) { match { $c: Chunk  $c.n >= $n } return { $c.slug } }
             .query("main", QUERIES, "since", &params(0))
             .await
             .unwrap();
+        let main_pin = handles
+            .held_keys()
+            .await
+            .pop()
+            .expect("main's read holds its pin");
         for n in 1..=COMMITS {
             session
                 .mutate("session", QUERIES, "put", &params(n))
@@ -678,26 +707,121 @@ query since($n: I64) { match { $c: Chunk  $c.n >= $n } return { $c.slug } }
                 .unwrap();
             assert_eq!(rows.num_rows(), 1);
         }
+        let session_pin = handles.held_keys().await.pop().unwrap();
         session
             .query("main", QUERIES, "since", &params(0))
             .await
             .unwrap();
 
+        let held: Vec<TableHandleKey> = handles
+            .held_keys()
+            .await
+            .into_iter()
+            .filter(|key| key.table_path == main_pin.table_path)
+            .collect();
+        // Every session version, main's pin, and the version-1 base main's
+        // first write staged on: a branch create drops only the created
+        // branch's own refs, so that handle outlives it.
+        assert_eq!(
+            held.len(),
+            COMMITS as usize + 2,
+            "under the budget every version stays held: {held:?}"
+        );
+        assert_eq!(
+            &held[held.len() - 2..],
+            [session_pin, main_pin],
+            "the two live pins are the last out; every superseded version precedes them"
+        );
+    }
+
+    /// Issue 859: a fork's write demotes the pin it replaced instead of dropping
+    /// it, so main's live pin stays warm and the fork's superseded pin is held
+    /// ahead of every live one in eviction order.
+    #[tokio::test]
+    async fn fork_writes_keep_the_bound_branch_pin_and_demote_their_own_issue_859() {
+        const SCHEMA: &str = r#"
+node Chunk { slug: String @key  n: I64 @index }
+"#;
+        const QUERIES: &str = r#"
+query put($slug: String, $n: I64) { insert Chunk { slug: $slug, n: $n } }
+query since($n: I64) { match { $c: Chunk  $c.n >= $n } return { $c.slug } }
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let graph = Arc::new(
+            crate::db::Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+                .await
+                .unwrap(),
+        );
+        let session = crate::Session::from_defaults(
+            Arc::clone(&graph),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        let params = |n: i64| {
+            std::collections::HashMap::from([
+                (
+                    "slug".to_string(),
+                    omnigraph_compiler::query::ast::Literal::String(format!("c{n}")),
+                ),
+                (
+                    "n".to_string(),
+                    omnigraph_compiler::query::ast::Literal::Integer(i128::from(n)),
+                ),
+            ])
+        };
         let handles = &graph.read_caches().handles;
-        let mut per_table = std::collections::BTreeMap::<String, usize>::new();
-        for key in handles.held_keys().await {
-            *per_table.entry(key.table_path).or_default() += 1;
+        session
+            .mutate("main", QUERIES, "put", &params(0))
+            .await
+            .unwrap();
+        graph.branch_create("fork").await.unwrap();
+        session
+            .query("main", QUERIES, "since", &params(0))
+            .await
+            .unwrap();
+        let main_pins = handles.held_keys().await;
+        assert!(!main_pins.is_empty(), "main's read holds its pins");
+
+        session
+            .mutate("fork", QUERIES, "put", &params(1))
+            .await
+            .unwrap();
+        session
+            .query("fork", QUERIES, "since", &params(0))
+            .await
+            .unwrap();
+        let fork_first_pins: Vec<TableHandleKey> = handles
+            .held_keys()
+            .await
+            .into_iter()
+            .filter(|key| !main_pins.contains(key))
+            .collect();
+        assert!(
+            !fork_first_pins.is_empty(),
+            "the fork's read holds its own pins"
+        );
+
+        session
+            .mutate("fork", QUERIES, "put", &params(2))
+            .await
+            .unwrap();
+        session
+            .query("fork", QUERIES, "since", &params(0))
+            .await
+            .unwrap();
+        let held = handles.held_keys().await;
+        let position = |pin: &TableHandleKey| {
+            held.iter()
+                .position(|key| key == pin)
+                .unwrap_or_else(|| panic!("{pin:?} is no longer held; held: {held:?}"))
+        };
+        let first_live = main_pins.iter().map(position).min().unwrap();
+        for pin in &fork_first_pins {
+            assert!(
+                position(pin) < first_live,
+                "the fork's superseded pin {pin:?} is not ahead of main's live pins in \
+                 eviction order; held: {held:?}"
+            );
         }
-        let occupancy = handles.occupancy().await;
-        assert!(
-            per_table.values().all(|held| *held <= 2),
-            "after {COMMITS} commits each table holds at most main's and the \
-             branch's version: {per_table:?} ({occupancy:?})"
-        );
-        assert!(
-            occupancy.fragments <= 2 * (COMMITS as usize + 1),
-            "held manifests list no superseded history: {occupancy:?}"
-        );
     }
 
     /// PR #544 review finding 3 regression: two different edge scopes served
@@ -727,7 +851,9 @@ edge Likes: Person -> Person {}
         db.load_jsonl(DATA, crate::loader::LoadMode::Overwrite)
             .await
             .unwrap();
-        db.optimize().await.unwrap();
+        db.optimize_as(None, crate::db::OptimizeRequest::default())
+            .await
+            .unwrap();
         // Fresh handle: cold in-memory caches, the artifact stays on the store.
         let db = crate::db::Omnigraph::open(dir.path().to_str().unwrap())
             .await

@@ -63,7 +63,12 @@ lance-file = "=13.0.0"
 lance-index = "=13.0.0"
 lance-linalg = "=13.0.0"
 lance-namespace = "=13.0.0"
-lance-namespace-impls = "=13.0.0"
+# default-features = false: the crate's defaults (`dir-aws, dir-azure, dir-gcp,
+# dir-oss, dir-huggingface`) only forward to `lance/<cloud>` and `lance-io/<cloud>`
+# and gate nothing in its own source; the defaults widened Lance to five cloud
+# features in every build that includes a dev-dependency on it, so those builds
+# compiled a second Lance/DataFusion world beside the two-feature one above.
+lance-namespace-impls = { version = "=13.0.0", default-features = false }
 lance-table = "=13.0.0"
 # Persistent FTS certificates identify this analyzer generation. A change needs
 # the RFC 0043 compatibility audit, not just a transitive lockfile refresh.
@@ -88,7 +93,6 @@ yaml_serde = "0.10.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
 color-eyre = "0.6"
 tempfile = "3"
 ahash = "0.8"

@@ -73,13 +73,13 @@ Fresh apply creates the ledger and declared graphs in the selected root, capture
 source bytes before execution and prints the original `Deployment-ID` with exact
 outcomes. Use `load` or `mutate` for rows.
 
-Direct apply retains its admission lock after completion. Establish that the
-owner and its accepted I/O have settled, then follow
-[ownership transfer](../deployment.md#writer-topology) using the exact printed
-lock ID before starting the server:
+A writable direct apply on local storage or S3 releases admission after convergence and write settlement.
+If release is unconfirmed, compare the diagnostic's admission ID with the current `lock_id`
+from `cluster status --json` on the same root. Only a matching ID belongs to that apply. Reading the receipt again leaves the lock unchanged.
+A writable apply retains admission on Azure, on failure to converge, or with unsettled writes.
+For a retained lock, follow [ownership transfer](../deployment.md#writer-topology) before starting the server.
 
 ```bash
-omnigraph --target file:///srv/company-brain cluster force-unlock '<LOCK_ID>'
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-alice":"secret"}' \
   omnigraph-server --cluster file:///srv/company-brain --bind 0.0.0.0:8080
 ```
@@ -274,6 +274,13 @@ omnigraph --target file:///srv/company-brain \
   cluster apply --deployment-id '<DEPLOYMENT_ID>' --writers-stopped --json
 ```
 
+Recovery on a graph with an applied policy runs as an actor that the policy
+must permit: settling a started schema change needs `schema_apply`, and a graph
+deletion needs `read` and `schema_apply`. Add `--as <ACTOR>` with such an
+actor. When the policy refuses the caller, including a recovery with no `--as`,
+reconciliation refuses with `policy_denied` before it takes the lock and
+changes nothing.
+
 An S3 root works the same way inline, for example
 `--target s3://bucket/company-brain`; see
 [S3 cluster roots](../operations/s3-cluster-roots.md).
@@ -331,8 +338,9 @@ settings on the server.
 
 ## Operational boundaries
 
-- One mutation-capable process owns a cluster. Online deployment runs inside it;
-  direct maintenance requires an ownership handoff.
+- One mutation-capable process owns a cluster. Online deployment runs inside it,
+  and so can `optimize`, as a [recorded operation](../operations/recorded-operations.md);
+  other direct maintenance requires an ownership handoff.
 - Object-storage clusters may boot directly from `s3://bucket/prefix` or
   `az://container/prefix`; source files are not needed for serving or recovery.
 - Azure remains a qualification preview. Its running server retains the

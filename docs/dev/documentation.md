@@ -1,6 +1,6 @@
 # Documentation guide
 
-Documentation is part of OmniGraph's public contract. Keep each fact in one
+Documentation is part of Omnigraph's public contract. Keep each fact in one
 place, at the narrowest audience that needs it.
 
 ## Content ownership
@@ -65,7 +65,7 @@ but keep day-to-day instructions in user or developer docs.
 
 ## Documentation tools
 
-Use Python 3.10 or newer. From the repository root, create and activate a local
+Use Python 3.11 or newer. From the repository root, create and activate a local
 environment before running the documentation checker or release-note commands:
 
 ```bash
@@ -142,18 +142,27 @@ A `## Highlights` section holds three to five `### ` highlights for a minor or
 major release, and up to five for a patch release, each at most 150 words.
 The heading names the change and what it gives users in a few words, with a
 measured number when there is one (`CSV import: 630 million rows in under
-five minutes`, not `CSV loads go through the planner`). The body is in
-database terms: it opens with the mechanism (projection pushdown,
-copy-on-write branches, compare-and-swap publication), names the benchmark
-behind any number and the machine and storage it ran on, and lists its pull
-requests:
+five minutes`, not `CSV loads go through the planner`). The body opens with
+what changes for the reader: what was slow, refused, wrong or impossible
+before, who noticed, and what they can do now. Then it names the mechanism in
+database terms (projection pushdown, copy-on-write branches, compare-and-swap
+publication), names the benchmark behind any number and the machine and
+storage it ran on, says when a number was not measured on a cloud store, and
+lists its pull requests:
 
 ```markdown
 ### Counting no longer loads every embedding
 
-Projection pushdown: a `Vector` or `Blob` column is read only when the query
-names it, so a `count` over embedding-heavy types reads no vectors. #760, #795
+A `count` over a type with embeddings used to read every vector, so it slowed
+down as the vectors grew. It now reads none. Projection pushdown: a `Vector`
+or `Blob` column is read only when the query names it. #760, #795
 ```
+
+A note follows the same order in fewer words: say what the reader notices
+(`a read no longer waits for a write to commit`), not only what the code does
+(`branch state installs by pointer swap`). When the notes of a release are
+still hard to act on after it is tagged, add its
+[overview](#release-overviews) rather than editing the snapshot.
 
 The release-prep pull request may leave `## Highlights` empty for someone else
 to write: the preview shows them as still to be written and CI passes, but the
@@ -230,15 +239,12 @@ and an explicit date:
 python3 scripts/release_notes.py snapshot --target HEAD --date 2026-10-01
 ```
 
-Replace the example date with the intended release date. A release that still
-carries a hand-written document names it with `legacy` in `release.json`, a
-durable, already-landed ancestor containing that exact document, and passes
-`--replace-legacy` for its first snapshot. `--replace` regenerates an existing
+Replace the example date with the intended release date. `--replace` regenerates an existing
 generated snapshot before its tag exists. Nothing moves, deletes or stages
 fragments. Preview accepts `--base REF`, `--version vX.Y.Z` and
-`--initial-release` for comparison runs. A snapshot must agree with the version,
-base and legacy source in `release.json`, including `base: null` for an initial
-release. Configuration itself remains part of the recorded inputs.
+`--initial-release` for comparison runs. A snapshot must agree with the version
+and base in `release.json`, including `base: null` for an initial release.
+`legacy` stays `null`. Configuration itself remains part of the recorded inputs.
 
 The snapshot records the selected target SHA, base SHA and note digests. The
 target SHA documents where generation ran; squash merging may remove that
@@ -279,20 +285,24 @@ keep `"format": 2`.
 Advance the workspace package version too: edge builds are refused while it is
 not above the latest stable release ([release workflows](ci.md#release-workflows)).
 
-v0.12.0 through v0.14.0 are format 1, and each snapshot records its format, so
-their snapshots keep that shape. v0.14.0's GitHub release body was replaced
-by hand after publication with a format-2 page; its snapshot is unchanged. v0.12.0's hand-written document was converted
-into two notes, `changelog.d/a-release-highlights.added.md` and
-`changelog.d/a-compatibility-and-behavior-changes.changed.md`. The v0.15.0
-cycle is the first in format 2; a format-2 GitHub release body is the snapshot
-without its heading, status line and provenance comment. The length caps and
+Each snapshot records its format. The snapshots of v0.12.0 through v0.14.0 are
+format 1 and keep that shape; every later cycle is format 2. A format-2 GitHub
+release body is the snapshot without its heading, status line and provenance
+comment. The length caps and
 the release file apply only to a format-2 cycle. Generated snapshots require
 exact verification, and existing published documents and URLs stay unchanged.
+
+### Release overviews
 
 A release may also have a curated `docs/releases/vX.Y.Z-overview.md`, linked
 from the generated release index. Reconcile superseded fragments against the
 code at the release tag and explain the final shipped behavior and upgrade
-actions. Link the complete immutable `vX.Y.Z.md` snapshot from the overview;
+actions. Write it for a reader deciding whether and how to upgrade: for each
+upgrade action, who is affected, what changes for them and why, and what to do;
+for each other change, what was slow, refused or wrong before and what works
+now. Keep the release page's sections, order and pull request links, so a
+reader finds each change where earlier releases put it. Link the complete
+immutable `vX.Y.Z.md` snapshot from the overview;
 do not edit the published snapshot or source notes to resolve contradictions.
 The overview is a maintained guide to that release, not a replacement for its
 recorded history. After adding it, regenerate the index with

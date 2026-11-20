@@ -7,6 +7,7 @@ use crate::settings::{SessionSettings, SessionSettingsError, SettingId, SettingV
 
 use super::ast::*;
 use super::codes::{Q001, Q002, Q003, Q004, Q005};
+use super::depth::check_query_nesting;
 use super::diagnostic::{Applicability, Position, QueryDiagnostic, Suggestion, TextEdit};
 
 #[derive(Parser)]
@@ -85,6 +86,7 @@ fn skip_trivia(mut input: &str) -> &str {
 
 /// Parse `input` into its file body, refusing with a positioned diagnostic.
 pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, QueryDiagnostic> {
+    check_query_nesting(input)?;
     let pairs = QueryParser::parse(Rule::query_file, input)
         .map_err(|error| pest_error_to_diagnostic(input, error))?;
 

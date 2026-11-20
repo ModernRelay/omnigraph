@@ -51,6 +51,12 @@ pub(crate) enum PendingMode {
     StrictInsert,
     Upsert,
     Overwrite,
+    /// An `update` that patches columns of present rows (issue #1264): its
+    /// batch carries every column except the unassigned Blob and vector
+    /// columns, for validation, and stages only `id` plus the table's
+    /// [`PendingTable::patch_columns`]. It is the only write to its table in
+    /// the mutation, so it never mixes with another mode.
+    ColumnPatch,
 }
 
 /// Per-table accumulator. Each insert/update op pushes a `RecordBatch` into
@@ -61,6 +67,9 @@ pub(crate) struct PendingTable {
     pub(crate) schema: SchemaRef,
     pub(crate) mode: PendingMode,
     pub(crate) batches: Vec<RecordBatch>,
+    /// [`PendingMode::ColumnPatch`]: `id` and the assigned columns, schema
+    /// order, the columns Lance writes.
+    pub(crate) patch_columns: Vec<String>,
 }
 
 impl PendingTable {
@@ -69,6 +78,7 @@ impl PendingTable {
             schema,
             mode,
             batches: Vec::new(),
+            patch_columns: Vec::new(),
         }
     }
 
@@ -273,6 +283,11 @@ impl MutationStaging {
                     )));
                 }
             }
+            if existing.mode == PendingMode::ColumnPatch || mode == PendingMode::ColumnPatch {
+                return Err(OmniError::manifest_internal(format!(
+                    "table '{table_key}' cannot stage a column patch beside another write"
+                )));
+            }
             if !schemas_compatible(&existing.schema, &batch.schema()) {
                 return Err(OmniError::manifest(format!(
                     "table '{}' accumulated mutation batches with mismatched schemas: \
@@ -297,7 +312,10 @@ impl MutationStaging {
             .ok_or_else(|| {
                 OmniError::manifest_internal("pending Blob payload byte count overflow")
             })?;
-        let pending_bytes = if matches!(mode, PendingMode::StrictInsert | PendingMode::Upsert) {
+        let pending_bytes = if matches!(
+            mode,
+            PendingMode::StrictInsert | PendingMode::Upsert | PendingMode::ColumnPatch
+        ) {
             let existing_rows = self
                 .pending
                 .get(table_key)
@@ -344,6 +362,31 @@ impl MutationStaging {
         entry.batches.push(batch);
         self.pending_bytes = pending_bytes;
         self.pending_payload_bytes = pending_payload_bytes;
+        Ok(())
+    }
+
+    /// Stage an `update`'s column patch: `batch` holds every carried column
+    /// of the matched rows (validation reads them), `patch_columns` the `id`
+    /// and assigned columns Lance writes. The table must have nothing pending.
+    pub(crate) fn append_column_patch(
+        &mut self,
+        table_key: &str,
+        batch: RecordBatch,
+        patch_columns: Vec<String>,
+    ) -> Result<()> {
+        let schema = batch.schema();
+        if let Some(missing) = patch_columns
+            .iter()
+            .find(|name| schema.column_with_name(name).is_none())
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "column patch of '{table_key}' names '{missing}', which its batch lacks"
+            )));
+        }
+        self.append_batch(table_key, schema, PendingMode::ColumnPatch, batch)?;
+        if let Some(entry) = self.pending.get_mut(table_key) {
+            entry.patch_columns = patch_columns;
+        }
         Ok(())
     }
 
@@ -397,19 +440,6 @@ impl MutationStaging {
         Ok(())
     }
 
-    /// Delete predicates already recorded for `table_key` by earlier delete
-    /// statements in this query. Read before recording the current statement's
-    /// predicate so its `affected_*` count can exclude rows a prior statement
-    /// already scheduled for deletion (deletes stage, so the committed snapshot
-    /// is unchanged across statements — without this, overlapping predicates
-    /// would double-count). `&[]` if none.
-    pub(crate) fn recorded_delete_predicates(&self, table_key: &str) -> &[Expr] {
-        self.delete_predicates
-            .get(table_key)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
     /// Read-your-writes accessor: the accumulated pending batches for
     /// `table_key`, or `&[]` if none.
     pub(crate) fn pending_batches(&self, table_key: &str) -> &[RecordBatch] {
@@ -450,13 +480,6 @@ impl MutationStaging {
     /// the query made no observable writes.
     pub(crate) fn is_empty(&self) -> bool {
         self.pending.is_empty() && self.delete_predicates.is_empty()
-    }
-
-    /// Total count of pending rows across all tables. Used by tests and
-    /// (eventually) memory-budget enforcement.
-    #[allow(dead_code)]
-    pub(crate) fn pending_row_count(&self) -> usize {
-        self.pending.values().map(|p| p.total_rows()).sum()
     }
 
     /// End-of-query: for each pending table, concat batches and stage
@@ -865,7 +888,10 @@ fn prepare_pending_table(
         )));
     }
 
-    if matches!(table.mode, PendingMode::StrictInsert | PendingMode::Upsert) {
+    if matches!(
+        table.mode,
+        PendingMode::StrictInsert | PendingMode::Upsert | PendingMode::ColumnPatch
+    ) {
         let (rows, bytes) =
             table
                 .batches
@@ -910,6 +936,26 @@ fn prepare_pending_table(
         PendingMode::Overwrite => PreparedPendingTable::Overwrite {
             batches: table.batches,
         },
+        PendingMode::ColumnPatch => {
+            let carried = dedupe_merge_batches_by_id(&table.schema, table.batches, system_columns)?;
+            let indices = table
+                .patch_columns
+                .iter()
+                .map(|name| {
+                    carried.schema().index_of(name).map_err(|_| {
+                        OmniError::manifest_internal(format!(
+                            "column patch of '{table_key}' lacks its column '{name}'"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            PreparedPendingTable::Keyed {
+                semantics: KeyedWriteSemantics::KnownPresentColumnPatch,
+                batch: carried
+                    .project(&indices)
+                    .map_err(OmniError::arrow_internal)?,
+            }
+        }
     })
 }
 
@@ -1082,6 +1128,11 @@ pub(crate) struct CommittedMutation {
     /// set across manifest publish (see `commit_all`) so no same-process
     /// writer interleaves after revalidation.
     pub(crate) gates: crate::db::write_queue::HeldWriteGates,
+    /// The attempt re-anchored on the current head when revalidation carried
+    /// it over publications that changed no row; the publisher must expect
+    /// that head, not the captured one. `None` when the captured authority
+    /// was current.
+    pub(crate) carried_txn: Option<crate::db::WriteTxn>,
 }
 
 decide_seam! {
@@ -1111,17 +1162,22 @@ impl StagedMutation {
     /// a table this attempt does not write. Under the ordered gates we compare
     /// the complete immutable token. A safe insert/Append/Merge caller discards
     /// and fully reprepares; strict Update/Delete/Overwrite returns
-    /// `ReadSetChanged`. Both outcomes occur before any detached commit, so
-    /// staged transaction files remain unreferenced and reclaimable.
+    /// `ReadSetChanged`, unless every publication in between changed no row
+    /// and only Lance refused the carry (`attempt` records it, and the write
+    /// prepares again). Both outcomes occur before any detached commit, so
+    /// staged transaction files remain unreferenced and reclaimable. An
+    /// attempt that prepared under its writer gates brings them in `attempt`.
     pub(crate) async fn commit_all(
         self,
         db: &crate::db::Omnigraph,
         branch: Option<&str>,
         txn: &crate::db::WriteTxn,
+        early: Option<crate::db::EarlyRevalidation>,
+        attempt: &mut crate::db::reprepare::WriteAttempt,
     ) -> Result<CommittedMutation> {
         let StagedMutation {
-            staged,
-            expected_versions,
+            mut staged,
+            mut expected_versions,
         } = self;
 
         // Per-(table_key, branch) queues for every touched table. Sorted by
@@ -1139,27 +1195,50 @@ impl StagedMutation {
         // exclusive side excludes every writer, RFC
         // 2026-09-18-shared-schema-gate), branch gate, then sorted
         // per-table gates. Hold the full set through manifest publish.
-        let schema = db.write_queue().acquire_schema_shared().await;
-        let branch_guard = db.write_queue().acquire_branch(branch).await;
-        let table_guards = db.write_queue().acquire_many(&queue_keys).await;
-        let gates = crate::db::write_queue::HeldWriteGates::new(schema, branch_guard, table_guards);
+        let branch_gates = match attempt.admitted_gates()? {
+            Some(held) if held.branch_key() == branch => held,
+            Some(held) => {
+                return Err(OmniError::manifest_internal(format!(
+                    "a write on branch '{}' prepared under the gates of branch '{}'",
+                    branch.unwrap_or("main"),
+                    held.branch_key().unwrap_or("main"),
+                )));
+            }
+            None => db.write_queue().acquire_branch_write_gates(branch).await?,
+        };
+        let table_guards = db.write_queue().acquire_many(&queue_keys).await?;
+        let gates = branch_gates.with_tables(table_guards);
 
         // Re-capture manifest pins under the queue (PR 2 / MR-686).
         //
         // expected_versions was captured when the mutation first opened
-        // each table for mutation (the query's read-time pin). For
-        // Any writer may advance the branch while we stage reclaimable files
-        // outside the gate. RFC-022 does not patch those prepared table pins or
-        // transparently rebase a validated transaction: every mismatch rejects
-        // the complete attempt before effects. Mutation inserts and load
-        // append/merge may then reprepare at their outer bounded retry loop;
-        // strict read-modify-write operations return the typed conflict.
-        let snapshot = db.revalidate_write_txn(txn).await?;
+        // each table for mutation (the query's read-time pin). Any writer may
+        // advance the branch while we stage reclaimable files outside the
+        // gate. A mismatch rejects the complete attempt before effects, unless
+        // every publication since the capture changed no row (optimize
+        // compaction, index builds): the captured authority is then still
+        // logically current, and the attempt is re-anchored on the current
+        // head. Each staged table whose pin such a publication moved is carried
+        // over that pin's chain by Lance's own conflict resolver, so its
+        // detached commit reads the table's current pin; a table the write
+        // only read keeps its moved pin. Otherwise mutation inserts and load
+        // append/merge reprepare at their outer bounded retry loop, and strict
+        // read-modify-write operations return the typed conflict.
+        let (snapshot, carried_txn, mut carried) = match db
+            .revalidate_write_txn_carrying(txn, early)
+            .await?
+        {
+            crate::db::WriteRevalidation::Current(snapshot) => (*snapshot, None, HashMap::new()),
+            crate::db::WriteRevalidation::RowPreserving { txn, tables } => {
+                (txn.base.clone(), Some(txn), tables)
+            }
+        };
+        let txn = carried_txn.as_deref().unwrap_or(txn);
         let pins = txn
             .unattached_base
             .as_ref()
             .map_or(&snapshot, |_| &txn.base);
-        for entry in &staged {
+        for entry in &mut staged {
             let current = pins
                 .dataset(&entry.table_key)
                 .map(|e| e.published_dataset_version)
@@ -1169,19 +1248,57 @@ impl StagedMutation {
                         entry.table_key,
                     ))
                 })?;
-
-            // RFC-022-enrolled mutation/load attempts never patch a prepared
-            // table expectation to a newer manifest pin. The complete branch
-            // token was just revalidated; any remaining table mismatch is a
-            // stale/internally-inconsistent read set and must restart the
-            // whole validation attempt before effects.
-            if entry.expected_version != current {
-                return Err(OmniError::manifest_read_set_changed(
-                    format!("published_dataset_version:{}", entry.table_key),
-                    Some(entry.expected_version.to_string()),
-                    Some(current.to_string()),
-                ));
+            if entry.expected_version == current {
+                continue;
             }
+            let refused = OmniError::manifest_read_set_changed(
+                format!("published_dataset_version:{}", entry.table_key),
+                Some(entry.expected_version.to_string()),
+                Some(current.to_string()),
+            );
+            // Without a row-preserving chain, a moved pin is a stale read set:
+            // restart the whole validation attempt before effects.
+            let Some(table) = carried.remove(&entry.table_key) else {
+                return Err(refused);
+            };
+            let Some(staged_write) = entry.staged_write.take() else {
+                return Err(refused);
+            };
+            match db
+                .storage()
+                .rebase_staged_write(&entry.dataset, staged_write, &table.current, &table.chain)
+                .await?
+            {
+                Ok(rebased) => {
+                    entry.staged_write = Some(rebased);
+                    entry.dataset = table.current;
+                    entry.expected_version = current;
+                    entry.path.entry = table.entry;
+                    if let Some(expected) = expected_versions.get_mut(&entry.path.identity) {
+                        expected.table_version = current;
+                    }
+                }
+                Err(reason) => {
+                    tracing::debug!(
+                        table = %entry.table_key,
+                        %reason,
+                        "Lance's conflict rules refuse to carry the staged write over the table's \
+                         row-preserving commits"
+                    );
+                    return Err(refused);
+                }
+            }
+        }
+        // A touched table without a staged effect (a delete that matched no
+        // row) stages nothing to carry; its rows are unchanged, so it expects
+        // its current pin.
+        if carried_txn.is_some() {
+            for expected in expected_versions.values_mut() {
+                if let Some(entry) = pins.dataset(&expected.table_key) {
+                    expected.table_version = entry.published_dataset_version;
+                }
+            }
+            crate::instrumentation::record_write_carried_over_row_preserving();
         }
         // An empty load/mutation has no independently durable table effect.
         // It may still publish its fixed lineage intent.
@@ -1191,6 +1308,7 @@ impl StagedMutation {
                 expected_versions,
                 detached: Vec::new(),
                 gates,
+                carried_txn: carried_txn.map(|txn| *txn),
             });
         }
 
@@ -1239,6 +1357,17 @@ impl StagedMutation {
                 .with_table_fork_owner(table_fork_owner)
                 .with_staged(state.version, identity.uuid.clone())
                 .with_last_linear_version(path.entry.version_metadata.last_linear_version());
+            db.read_caches()
+                .handles
+                .insert(
+                    &path.entry.dataset_path,
+                    path.table_branch.as_deref(),
+                    target,
+                    Some(state.version),
+                    version_metadata.e_tag(),
+                    detached.dataset().clone(),
+                )
+                .await;
             let update = DatasetUpdate {
                 identity: path.identity,
                 type_key: table_key.clone(),
@@ -1264,6 +1393,7 @@ impl StagedMutation {
             expected_versions,
             detached: detached_tables,
             gates,
+            carried_txn: carried_txn.map(|txn| *txn),
         })
     }
 }

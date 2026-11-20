@@ -396,15 +396,28 @@ async fn released(probes: &QueryMemoryProbes) {
     .expect("every traversal worker and reservation must be released");
 }
 
+/// `len` printable characters that LZ4 and zstd barely shrink (splitmix64
+/// over `seed` and the position), so spilled bytes stay near their
+/// uncompressed size whatever the session's spill codec.
+fn noise(seed: usize, len: usize) -> String {
+    (0..len)
+        .map(|position| {
+            let mut z = ((seed as u64) << 32 | position as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            char::from(b'!' + (z % 90) as u8)
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn selected_bound_sort_spills_and_refuses_its_scratch_quota_issue_659() {
     const MIB: u64 = 1024 * 1024;
     let mut seed = people();
     for member in ["Knows", "Likes"] {
         for index in 0..64 {
-            let payload = (0..1024)
-                .map(|position| char::from(b'!' + ((position * 37 + index * 17) % 90) as u8))
-                .collect::<String>();
+            let payload = noise(index * 2 + usize::from(member == "Likes"), 1024);
             let (src, dst) = if member == "Knows" {
                 ("a", "b")
             } else {
@@ -418,14 +431,6 @@ async fn selected_bound_sort_spills_and_refuses_its_scratch_quota_issue_659() {
     let result = with_query_memory_probes(sufficient.clone(), async {
         let ctx =
             QueryContext::with_scratch_limit(4 * MIB, NonZeroU64::new(20_000), 64 * MIB).unwrap();
-        assert!(matches!(
-            ctx.task_ctx()
-                .session_config()
-                .options()
-                .execution
-                .spill_compression,
-            datafusion::common::config::SpillCompression::Uncompressed
-        ));
         execute_selected(sources(&[128]), &env, selected_step(true, 1), &ctx).await
     })
     .await
@@ -552,4 +557,52 @@ async fn bound_pairs_size_a_list_property_by_its_own_elements_issue_1251() {
         chunks.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
         [EDGES]
     );
+}
+
+/// A bound frontier holds nodes, whose ids are never null, so a null
+/// source id is an integrity fault: the pairs refuse it instead of dropping
+/// the row, and emit nothing.
+#[tokio::test]
+async fn bound_pairs_refuse_a_null_source_id() {
+    let (_dir, env) = graph_environment_for(
+        "node Person { name: String @key }\nedge Knows: Person -> Person",
+        people(),
+    )
+    .await;
+    let ctx = QueryContext::new(64 * 1024 * 1024).unwrap();
+    let memory = Arc::new(WorkMemory::new(ctx.task_ctx(), "bound pair nulls").unwrap());
+    let member = EdgeMember {
+        edge_type: "Knows".into(),
+        direction: Direction::Out,
+    };
+    let schema =
+        bound_edge_pair_schema(&env.catalog, std::slice::from_ref(&member), false).unwrap();
+    let wide = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "p.__id",
+            DataType::Utf8,
+            true,
+        )])),
+        vec![Arc::new(StringArray::from(vec![Some("a"), None]))],
+    )
+    .unwrap();
+    let mut emitted = 0;
+    let error = produce_bound_edge_pairs(
+        &wide,
+        &env.snapshot,
+        &env.catalog,
+        "p",
+        &member,
+        None,
+        &schema,
+        &memory,
+        |_batch, _lease| {
+            emitted += 1;
+            std::future::ready(Ok(()))
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("null 'p.__id'"), "{error}");
+    assert_eq!(emitted, 0);
 }

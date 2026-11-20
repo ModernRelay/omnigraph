@@ -891,7 +891,7 @@ async fn static_token_app(settings: omnigraph_server::McpSettings) -> (tempfile:
 /// answers source, and a write is refused by the server's default deny with nothing
 /// written.
 #[tokio::test]
-async fn mcp_default_deny_lists_read_and_refuses_mutate_without_a_policy() {
+async fn mcp_default_deny_refuses_read_and_mutate_without_a_policy() {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let state = AppState::open_with_bearer_tokens_and_policy(
@@ -912,6 +912,8 @@ async fn mcp_default_deny_lists_read_and_refuses_mutate_without_a_policy() {
     assert!(names.iter().any(|name| name == "query"), "{names:?}");
     assert!(names.iter().any(|name| name == "mutate"), "{names:?}");
 
+    // Tokens are not scoped to graphs, so a graph without a policy refuses
+    // `read` as it refuses every other action.
     let read = call(
         &app,
         "secret",
@@ -919,13 +921,8 @@ async fn mcp_default_deny_lists_read_and_refuses_mutate_without_a_policy() {
         json!({"graph":"default","query":"query q() { match { $p: Person } return { $p.name } }"}),
     )
     .await;
-    assert_eq!(read["result"]["isError"], false, "{read}");
-    assert!(
-        read["result"]["structuredContent"]["row_count"]
-            .as_u64()
-            .is_some_and(|rows| rows > 0),
-        "{read}"
-    );
+    assert_eq!(read["result"]["isError"], true, "{read}");
+    assert_eq!(read["result"]["structuredContent"]["status"], 403, "{read}");
 
     let before = manifest_dataset_version(&graph).await;
     let refused = call(
@@ -1018,6 +1015,59 @@ async fn static_token_server_serves_mcp_without_oauth_discovery() {
     assert_eq!(graphs["result"]["structuredContent"]["error"], native);
     let schema = call(&app, "secret", "schema", json!({"graph":"default"})).await;
     assert_eq!(schema["result"]["isError"], false, "{schema}");
+}
+
+/// A tool call runs on a server worker's stack, which is 2 MiB whatever
+/// `RUST_MIN_STACK` says (the test jobs set 16 MiB, which hid the overflow):
+/// `health`, which any token may call, used to abort the whole process with a
+/// stack overflow. Every request here runs in a task on a runtime whose
+/// workers have that stack, as the server's do, so an overflow aborts this
+/// test binary.
+#[test]
+fn mcp_tool_calls_fit_a_server_worker_stack() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(2 << 20)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (_temp, app) = static_token_app(omnigraph_server::McpSettings::default()).await;
+        let calls = [
+            ("health", json!({})),
+            ("schema", json!({"graph":"default"})),
+            ("snapshot", json!({"graph":"default"})),
+            (
+                "query",
+                json!({"graph":"default","query":"query adults() { match { $p: Person $p.age >= 30 } return { $p.name } }"}),
+            ),
+            (
+                "mutate",
+                json!({"graph":"default","query":"query add() { insert Person { name: \"Stack\", age: 1 } }"}),
+            ),
+        ];
+        for (tool, arguments) in calls {
+            let app = app.clone();
+            let result = tokio::spawn(async move { call(&app, "secret", tool, arguments).await })
+                .await
+                .unwrap();
+            assert_eq!(result["result"]["isError"], false, "{tool}: {result}");
+        }
+        for uri in [
+            "omnigraph://graphs/default/schema",
+            "omnigraph://graphs/default/branches",
+        ] {
+            let app = app.clone();
+            let (status, body) = tokio::spawn(async move {
+                json_response(&app, rpc(Some("secret"), "resources/read", json!({"uri":uri})))
+                    .await
+            })
+            .await
+            .unwrap();
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert!(body["result"]["contents"][0]["text"].is_string(), "{uri}: {body}");
+        }
+    });
 }
 
 async fn http_get(app: &Router, uri: &str, token: &str) -> Value {

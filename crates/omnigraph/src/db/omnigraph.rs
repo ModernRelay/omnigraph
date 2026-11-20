@@ -38,7 +38,7 @@ mod export;
 pub(crate) mod optimize;
 mod prepared_create;
 pub(crate) mod promotion;
-mod repair;
+mod resolution;
 pub(crate) mod schema_apply;
 pub(crate) mod system_column_upgrade;
 pub(crate) mod table_ops;
@@ -53,12 +53,16 @@ pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub(crate) use export::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
-pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
+pub use optimize::{
+    ArtifactRefresh, ArtifactSkip, AuthorityCapture, CleanupPolicyOptions, ConfigurationClear,
+    DatasetCleanupStats, DatasetOptimizeStats, DeferReason, OptimizeBeforePublish,
+    OptimizeCancellation, OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport,
+    OptimizeRequest, ResourceExceeded, ResourceMeasure, RunCancellation, TableCeilings,
+    TableOptimizeOutcome,
+};
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
-pub use repair::{
-    DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
-};
+pub use resolution::PublicationLookup;
 pub use schema_apply::{
     PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplyReconciliation,
     SchemaApplySettlement, SchemaContractDigest, SchemaNonPublicationProof,
@@ -265,6 +269,15 @@ impl SchemaContractIdentity {
     }
 }
 
+/// A write's freshness probe of the bound branch's `__manifest`, taken beside
+/// its staging puts instead of under its gates: the incarnation the handle
+/// held when the probe left and the one the store answered.
+#[derive(Debug, Clone)]
+pub(crate) struct EarlyRevalidation {
+    held: crate::db::manifest::ManifestIncarnation,
+    latest: crate::db::manifest::ManifestIncarnation,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WriteTxn {
     /// The resolved branch (`None` = main).
@@ -293,10 +306,38 @@ pub(crate) struct WriteTxn {
     /// current and fall back to a full coherent capture on mismatch. The
     /// publisher still performs its own fresh CAS read.
     pub(crate) manifest_probe: crate::db::manifest::CapturedManifestProbe,
+    /// Whether the open took the version this process holds on record for
+    /// the branch's head in place of a probe.
+    pub(crate) head_on_record: bool,
     /// Set on a child unattached write: `base` is then the base snapshot's
     /// view at its detached version, not the live head, while `authority`
     /// stays the live head the chain's root captured.
     pub(crate) unattached_base: Option<UnattachedTxnBase>,
+}
+
+/// What revalidating a prepared write under its gates found
+/// ([`Omnigraph::revalidate_write_txn_carrying`]).
+pub(crate) enum WriteRevalidation {
+    /// The captured authority is the current one; the snapshot is current.
+    Current(Box<Snapshot>),
+    /// The head moved only through publications that changed no row: `txn`
+    /// is the attempt re-anchored on the current head, schema contract and
+    /// pins (its `base` is the current snapshot), and `tables` holds every
+    /// table whose pin moved.
+    RowPreserving {
+        txn: Box<WriteTxn>,
+        tables: HashMap<String, CarriedTable>,
+    },
+}
+
+/// One table a row-preserving publication moved since a write's capture.
+pub(crate) struct CarriedTable {
+    /// The commits from the captured pin to the current one.
+    pub(crate) chain: crate::table_store::RowPreservingChain,
+    /// The table at its current pin.
+    pub(crate) current: crate::storage_layer::SnapshotHandle,
+    /// The current registration.
+    pub(crate) entry: crate::db::DatasetEntry,
 }
 
 /// The base snapshot a child unattached write extends, as resolved before
@@ -452,9 +493,9 @@ pub struct Omnigraph {
     /// (MR-725), which extends the same trait with a different method.
     /// Don't be tempted to add per-row enforcement here.
     ///
-    /// Set via `with_policy(checker)` after construction. Today only
-    /// `apply_schema_as` consults this field (PR #2 proof-of-concept);
-    /// PR #3 fans the `enforce()` call out to the remaining writers.
+    /// Set via `with_policy(checker)` after construction: the server,
+    /// cluster deployment and the CLI's writable opener of a cluster graph
+    /// install the policy the applied revision binds to the graph.
     policy: Option<Arc<dyn omnigraph_policy::PolicyChecker>>,
     /// Lazily-built, reused-across-queries embedding client. Built on the first
     /// `nearest($v, "string")` that needs server-side embedding (so a graph that
@@ -780,6 +821,20 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
     }
 
+    /// Open a shallow clone of the graph at `base_uri`, rooted at `root_uri`
+    /// (`docs/rfcs/2026-11-10-graph-shallow-clone.md`): the clone starts with
+    /// every branch, version, commit and index of the base, every write lands
+    /// under `root_uri`, and the base is never written. Both are local
+    /// directories or `s3://` prefixes of one endpoint, and `root_uri` is an
+    /// empty root or a clone root a previous open built. A caller that wraps storage builds
+    /// it with [`crate::storage::storage_read_through`] and opens with
+    /// [`Self::open_with_storage`], as the benchmark harness does to count
+    /// store calls.
+    pub async fn open_clone(base_uri: &str, root_uri: &str) -> Result<Self> {
+        let storage = crate::storage::storage_read_through(base_uri, root_uri).await?;
+        Self::open_with_storage_and_mode(root_uri, storage, OpenMode::ReadWrite).await
+    }
+
     /// Open an existing graph for read-only consumers (NDJSON export,
     /// `commit list`, etc.). Performs no open-time writes — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {
@@ -833,7 +888,7 @@ impl Omnigraph {
         let root = normalize_root_uri(uri)?;
         let identity = write_queue_root_identity(&root)?;
         let queues = crate::db::write_queue::WriteQueueManager::for_root(&identity);
-        let _schema_gate = queues.acquire_schema_shared().await;
+        let _schema_gate = queues.acquire_schema_shared().await?;
         crate::db::legacy_sidecars::refuse_pending_recovery(&root, storage.as_ref()).await
     }
 
@@ -891,7 +946,7 @@ impl Omnigraph {
             &control_session,
         )
         .await?;
-        let schema_contract_guard = write_queue.acquire_schema_exclusive().await;
+        let schema_contract_guard = write_queue.acquire_schema_exclusive().await?;
         let (coordinator, contract) =
             GraphCoordinator::open_with_contract(&root, Arc::clone(&storage), prepared).await?;
         crate::db::schema_state::refuse_unsupported_schema_versions(&contract.ir)?;
@@ -1128,11 +1183,10 @@ impl Omnigraph {
     /// Engine-layer policy enforcement gate (MR-722 chassis core).
     ///
     /// * If no policy is installed → no-op (returns `Ok(())`).
-    /// * If policy is installed AND actor is None → denial with a
-    ///   clear "no actor for engine-layer policy check" message.
-    ///   Forces server / CLI / SDK callers to thread an actor through
-    ///   when policy is configured — silent bypass via "I forgot the
-    ///   actor" is exactly the footgun this gate is here to prevent.
+    /// * If policy is installed AND actor is None → denial naming the
+    ///   action. A direct CLI write on a cluster graph with a policy and
+    ///   no `--as` reaches this, as does any embedder that names no
+    ///   actor: no actor is never a bypass.
     /// * If policy is installed AND actor is Some → call
     ///   `PolicyChecker::check(action, scope, actor)`; map denial /
     ///   internal failure to `OmniError::Policy(...)`.
@@ -1154,12 +1208,10 @@ impl Omnigraph {
             return Ok(());
         };
         let Some(actor) = actor else {
-            return Err(OmniError::Policy(
-                "no actor for engine-layer policy check (policy is configured but the call site \
-                 didn't thread an actor through — this is almost certainly a bug, not an \
-                 intended bypass)"
-                    .to_string(),
-            ));
+            return Err(OmniError::Policy(format!(
+                "policy denied action '{action}': a policy is installed and the request names \
+                 no actor"
+            )));
         };
         checker
             .check(action, scope, actor)
@@ -1292,7 +1344,7 @@ impl Omnigraph {
         drop(table_guards);
         let control_catalog = captured_catalog;
         let table_queue_keys = self.table_queue_keys_for_branches(branches, &control_catalog);
-        let table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
+        let table_guards = self.write_queue().acquire_many(&table_queue_keys).await?;
         let held = captured.manifest_incarnation();
         if !captured.probe_latest_incarnation().await?.matches(&held) {
             return Err(OmniError::manifest_read_set_changed(
@@ -1475,6 +1527,12 @@ impl Omnigraph {
         self.storage.as_ref()
     }
 
+    /// A shared handle on the storage adapter, for work that must outlive the
+    /// call that starts it.
+    pub(crate) fn storage_adapter_handle(&self) -> Arc<dyn crate::storage::StorageAdapter> {
+        Arc::clone(&self.storage)
+    }
+
     /// Root-scoped writer queues (schema, branch, and `(table, branch)` gates).
     ///
     /// Engine-internal writers (mutation finalize, schema_apply,
@@ -1597,6 +1655,7 @@ impl Omnigraph {
     pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
         let branch = normalize_branch_name(branch.unwrap_or("main"))?;
 
+        let head_on_record = self.holds_head_of(branch.as_deref());
         let (branch_identifier, graph_head, effective_graph_head, snapshot, manifest_probe) = self
             .write_authority_for_known_branch(branch.as_deref(), true)
             .await?;
@@ -1610,8 +1669,35 @@ impl Omnigraph {
             caller_expected_graph_head: None,
             catalog,
             manifest_probe,
+            head_on_record,
             unattached_base: None,
         })
+    }
+
+    /// Whether `branch` is the handle's bound branch and this process holds
+    /// it with its last publication on record, so a write's open and
+    /// revalidation take that record for the head.
+    fn holds_head_of(&self, branch: Option<&str>) -> bool {
+        let coord = self.coordinator.load_full();
+        branch == coord.current_branch() && coord.held_head().is_some()
+    }
+
+    /// Whether a write that staged nothing may answer from its view. No
+    /// publication checks such a write, so a view its open took on record is
+    /// probed: the head is the view's, or the version on record now.
+    pub(crate) async fn unpublished_view_is_current(&self, txn: &WriteTxn) -> Result<bool> {
+        if !txn.head_on_record {
+            return Ok(true);
+        }
+        let captured = txn.manifest_probe.captured();
+        let latest = txn.manifest_probe.probe_latest_incarnation().await?;
+        if latest.matches(captured) {
+            return Ok(true);
+        }
+        let coord = self.coordinator.load_full();
+        Ok(latest.same_lifetime(captured)
+            && txn.branch.as_deref() == coord.current_branch()
+            && coord.held_head() == Some(latest.version))
     }
 
     /// The write transaction of a child unattached snapshot (RFC "Unattached
@@ -1637,6 +1723,7 @@ impl Omnigraph {
             )));
         }
         base.require_extendable()?;
+        let head_on_record = self.holds_head_of(target.as_deref());
         let (branch_identifier, graph_head, effective_graph_head, live, manifest_probe) = self
             .write_authority_for_known_branch(target.as_deref(), true)
             .await?;
@@ -1672,6 +1759,7 @@ impl Omnigraph {
             caller_expected_graph_head: None,
             catalog,
             manifest_probe,
+            head_on_record,
             unattached_base: Some(UnattachedTxnBase::of(base)),
         })
     }
@@ -1745,6 +1833,7 @@ impl Omnigraph {
                 caller_expected_graph_head: None,
                 catalog: Arc::clone(&catalog),
                 manifest_probe,
+                head_on_record: false,
                 unattached_base: None,
             };
         Ok((
@@ -1889,22 +1978,14 @@ impl Omnigraph {
         let bound = {
             let coord = self.coordinator.load_full();
             let bound = branch == coord.current_branch();
-            if bound {
-                let current = if fresh {
-                    let held = coord.manifest_incarnation();
-                    coord.probe_latest_incarnation().await?.matches(&held)
-                } else {
-                    true
-                };
-                if current {
-                    return Ok((
-                        coord.branch_identifier().await?,
-                        coord.exact_graph_head(),
-                        coord.effective_graph_head().await?,
-                        coord.snapshot(),
-                        coord.captured_manifest_probe(),
-                    ));
-                }
+            if bound && (!fresh || coord.head_is_current().await?) {
+                return Ok((
+                    coord.branch_identifier().await?,
+                    coord.exact_graph_head(),
+                    coord.effective_graph_head().await?,
+                    coord.snapshot(),
+                    coord.captured_manifest_probe(),
+                ));
             }
             bound
         };
@@ -2087,28 +2168,94 @@ impl Omnigraph {
         }))
     }
 
+    /// Probe the bound branch's `__manifest` head for a write before its
+    /// gates are held, beside the staging puts: the answer serves
+    /// [`Self::revalidate_write_txn_with`] under the gates when no publish
+    /// installed on this handle in between. `None` when the write is not on
+    /// the bound branch, when this process holds the branch and owes no
+    /// probe, or when the probe failed, so the revalidation probes itself.
+    pub(crate) async fn early_revalidation(&self, txn: &WriteTxn) -> Option<EarlyRevalidation> {
+        let coord = self.coordinator.load_full();
+        if txn.branch.as_deref() != coord.current_branch() || coord.held_head().is_some() {
+            return None;
+        }
+        let held = coord.manifest_incarnation();
+        let latest = coord.probe_latest_incarnation().await.ok()?;
+        Some(EarlyRevalidation { held, latest })
+    }
+
     /// Revalidate a prepared mutation/load attempt after its branch/table
     /// gates are held and before any table effect.
     pub(crate) async fn revalidate_write_txn(&self, txn: &WriteTxn) -> Result<Snapshot> {
-        let bound = txn.branch.as_deref() == self.coordinator.load_full().current_branch();
-        let (branch_identifier, graph_head, effective_graph_head, snapshot) =
-            if !bound && txn.manifest_probe.is_current().await? {
+        self.revalidate_write_txn_with(txn, None).await
+    }
+
+    /// [`Self::revalidate_write_txn`] with the probe taken beside staging:
+    /// on the bound branch, a head still at the incarnation the probe saw,
+    /// with the handle's installed coordinator unchanged since (a same-process
+    /// publish installs a new incarnation), is current without a second
+    /// probe; a foreign publish after the probe is the manifest CAS's to
+    /// refuse, as one after an under-gate probe always was.
+    pub(crate) async fn revalidate_write_txn_with(
+        &self,
+        txn: &WriteTxn,
+        early: Option<EarlyRevalidation>,
+    ) -> Result<Snapshot> {
+        match self.revalidate_write_txn_inner(txn, early, false).await? {
+            WriteRevalidation::Current(snapshot) => Ok(*snapshot),
+            WriteRevalidation::RowPreserving { .. } => Err(OmniError::manifest_internal(
+                "a revalidation that may not carry the write carried it",
+            )),
+        }
+    }
+
+    /// [`Self::revalidate_write_txn_with`] for a write that can carry its
+    /// staged effects over publications that changed no row: when the branch
+    /// head moved and every publication since the capture left the schema,
+    /// the table set and every table's rows as they were (each moved pin
+    /// reaches the captured one through `Rewrite` and `CreateIndex` commits
+    /// alone, `table_store::row_preserving_chain`), the captured authority is
+    /// still logically current, and the answer is a write transaction
+    /// re-anchored on the current head and pins, with each moved table's chain
+    /// and current handle. Anything else refuses exactly as the strict
+    /// revalidation does. A caller's `--if-commit` head and an unattached base
+    /// stay strict.
+    pub(crate) async fn revalidate_write_txn_carrying(
+        &self,
+        txn: &WriteTxn,
+        early: Option<EarlyRevalidation>,
+    ) -> Result<WriteRevalidation> {
+        self.revalidate_write_txn_inner(txn, early, true).await
+    }
+
+    async fn revalidate_write_txn_inner(
+        &self,
+        txn: &WriteTxn,
+        early: Option<EarlyRevalidation>,
+        carry: bool,
+    ) -> Result<WriteRevalidation> {
+        let installed = self.coordinator.load_full();
+        let bound = txn.branch.as_deref() == installed.current_branch();
+        let probed_current = bound
+            && early.is_some_and(|early| {
+                early.latest.matches(&early.held)
+                    && installed.manifest_incarnation().matches(&early.held)
+            });
+        let (branch_identifier, graph_head, effective_graph_head, snapshot, probe) =
+            if probed_current {
+                self.write_authority_for_known_branch(txn.branch.as_deref(), false)
+                    .await?
+            } else if !bound && txn.manifest_probe.is_current().await? {
                 (
                     txn.authority.branch_identifier.clone(),
                     txn.authority.graph_head.clone(),
                     txn.effective_graph_head.clone(),
                     txn.base.clone(),
+                    txn.manifest_probe.clone(),
                 )
             } else {
-                let (branch_identifier, graph_head, effective_graph_head, snapshot, _) = self
-                    .write_authority_for_known_branch(txn.branch.as_deref(), true)
-                    .await?;
-                (
-                    branch_identifier,
-                    graph_head,
-                    effective_graph_head,
-                    snapshot,
-                )
+                self.write_authority_for_known_branch(txn.branch.as_deref(), true)
+                    .await?
             };
         let (_, live) = self.accepted_catalog_for_snapshot(&snapshot).await?;
         if let Some(expected) = txn.caller_expected_graph_head.as_deref()
@@ -2138,13 +2285,25 @@ impl Omnigraph {
                 })?),
             ));
         }
-        if graph_head != txn.authority.graph_head {
-            return Err(OmniError::manifest_read_set_changed(
+        let carried = if graph_head != txn.authority.graph_head {
+            let moved = OmniError::manifest_read_set_changed(
                 format!("graph_head:{}", txn.branch.as_deref().unwrap_or("main")),
                 txn.authority.graph_head.clone(),
-                graph_head,
-            ));
-        }
+                graph_head.clone(),
+            );
+            let same_schema = live.schema_ir_hash == txn.authority.schema_ir_hash
+                && live.schema_identity_domain == txn.authority.schema_identity_domain
+                && live.schema_identity_version == txn.authority.schema_identity_version;
+            if !carry || !same_schema || txn.unattached_base.is_some() {
+                return Err(moved);
+            }
+            match self.row_preserving_tables(&txn.base, &snapshot).await? {
+                Some(tables) => Some(tables),
+                None => return Err(moved),
+            }
+        } else {
+            None
+        };
         if live.schema_ir_hash != txn.authority.schema_ir_hash {
             return Err(OmniError::manifest_read_set_changed(
                 "schema_ir_hash".to_string(),
@@ -2170,7 +2329,90 @@ impl Omnigraph {
             self.revalidate_unattached_base(pinned).await?;
         }
         validate_bound_catalog_against_snapshot(&txn.catalog, &snapshot)?;
-        Ok(snapshot)
+        let Some(tables) = carried else {
+            return Ok(WriteRevalidation::Current(Box::new(snapshot)));
+        };
+        tracing::debug!(
+            branch = txn.branch.as_deref().unwrap_or("main"),
+            moved_tables = tables.len(),
+            "prepared write carried over publications that changed no row"
+        );
+        let mut carried_txn = txn.clone();
+        carried_txn.base = snapshot;
+        carried_txn.authority.graph_head = graph_head;
+        carried_txn.effective_graph_head = effective_graph_head;
+        carried_txn.manifest_probe = probe;
+        Ok(WriteRevalidation::RowPreserving {
+            txn: Box::new(carried_txn),
+            tables,
+        })
+    }
+
+    /// Every table whose pin differs between the captured and the current
+    /// snapshot, with the row-preserving chain between them and the current
+    /// handle, when each difference is such a chain; `None` when a table was
+    /// added, removed, re-registered, moved to another location or native
+    /// ref, changed its row count, or reached its current pin through any
+    /// other commit.
+    async fn row_preserving_tables(
+        &self,
+        captured: &Snapshot,
+        current: &Snapshot,
+    ) -> Result<Option<HashMap<String, CarriedTable>>> {
+        if captured.datasets().count() != current.datasets().count() {
+            return Ok(None);
+        }
+        let mut moved = Vec::new();
+        for before in captured.datasets() {
+            let Some(after) = current.dataset(&before.type_key) else {
+                return Ok(None);
+            };
+            if after.identity != before.identity
+                || after.dataset_path != before.dataset_path
+                || after.native_dataset_branch != before.native_dataset_branch
+            {
+                return Ok(None);
+            }
+            let pin = |entry: &crate::db::DatasetEntry| {
+                (
+                    entry.published_dataset_version,
+                    entry.version_metadata.staged_version(),
+                )
+            };
+            if pin(after) == pin(before) {
+                continue;
+            }
+            if after.entity_count != before.entity_count
+                || after.published_dataset_version < before.published_dataset_version
+            {
+                return Ok(None);
+            }
+            moved.push((before, after));
+        }
+        let proofs =
+            futures::future::try_join_all(moved.into_iter().map(|(before, after)| async move {
+                let handle = self.storage().open_snapshot_at_entry(after).await?;
+                let captured_version = before
+                    .version_metadata
+                    .staged_version()
+                    .unwrap_or(before.published_dataset_version);
+                let chain = self
+                    .storage()
+                    .row_preserving_chain(&handle, captured_version)
+                    .await?;
+                Ok::<_, OmniError>(chain.map(|chain| {
+                    (
+                        after.type_key.clone(),
+                        CarriedTable {
+                            chain,
+                            current: handle,
+                            entry: after.clone(),
+                        },
+                    )
+                }))
+            }))
+            .await?;
+        Ok(proofs.into_iter().collect::<Option<HashMap<_, _>>>())
     }
 
     /// Re-read a child write's base under the effect gates: a base dropped,
@@ -2223,10 +2465,13 @@ impl Omnigraph {
     /// The re-read goes through this handle's control session, so it observes
     /// the destination the handle is bound to rather than one the ambient
     /// provider configuration selects.
+    ///
+    /// Returns the snapshot with the branch's effective graph head at that
+    /// same `__manifest` version (an unpublished fork's inherited head).
     pub(crate) async fn fresh_snapshot_for_branch_unchecked(
         &self,
         branch: Option<&str>,
-    ) -> Result<Snapshot> {
+    ) -> Result<(Snapshot, String)> {
         let session = self.control_session();
         let manifest = match branch {
             Some(branch) => {
@@ -2242,7 +2487,8 @@ impl Omnigraph {
                     .await?
             }
         };
-        Ok(Snapshot::wrap(manifest.snapshot()))
+        let head = manifest.head().graph_commit_id.clone();
+        Ok((Snapshot::wrap(manifest.snapshot()), head))
     }
 
     #[cfg(test)]
@@ -2305,7 +2551,7 @@ impl Omnigraph {
         // authority window. This also
         // captures the schema contract and target coordinator coherently across
         // a concurrent schema apply. Lock order remains schema -> coordinator.
-        let _schema_permit = self.write_queue().acquire_schema_exclusive().await;
+        let _schema_permit = self.write_queue().acquire_schema_exclusive().await?;
         let branch = normalize_branch_name(branch)?;
         let next = self.open_coordinator_for_branch(branch.as_deref()).await?;
         let next_snapshot = next.snapshot();
@@ -2376,7 +2622,7 @@ impl Omnigraph {
 
     /// Refresh the coordinator and its schema view from the published contract.
     pub async fn refresh(&self) -> Result<()> {
-        let _serial = self.write_queue.acquire_schema_exclusive().await;
+        let _serial = self.write_queue.acquire_schema_exclusive().await?;
         let (installed, mut next) = self.installed_coordinator_copy();
         next.refresh().await?;
         self.install_coordinator(next, &installed);
@@ -2489,7 +2735,7 @@ impl Omnigraph {
         let target = target.into();
         let validate_live_snapshot = matches!(&target, ReadTarget::Branch(_));
         let bind_historical_aliases = matches!(&target, ReadTarget::Snapshot(_));
-        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await?;
         let mut resolved = self.resolve_target_after_schema_validation(target).await?;
         if validate_live_snapshot {
             let (catalog, _) = self
@@ -2510,7 +2756,7 @@ impl Omnigraph {
     }
 
     pub(crate) async fn capture_current_read_view(&self) -> Result<(ResolvedTarget, Arc<Catalog>)> {
-        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await?;
         let current_branch = self
             .coordinator
             .load_full()
@@ -2531,7 +2777,7 @@ impl Omnigraph {
         &self,
         version: u64,
     ) -> Result<(Snapshot, Arc<Catalog>)> {
-        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await?;
         let (catalog, live) = self.load_accepted_view_with_schema_gate_held().await?;
         let branch = self
             .coordinator
@@ -2622,8 +2868,7 @@ impl Omnigraph {
                     }
                     return self.coordinator.load_full().resolve_target(target).await;
                 }
-                let held = coord.manifest_incarnation();
-                if coord.probe_latest_incarnation().await?.matches(&held) {
+                if coord.head_is_current().await? {
                     return warm_resolved_target(&coord, target).await;
                 }
                 let copy = GraphCoordinator::clone(&coord);
@@ -3706,15 +3951,10 @@ impl Omnigraph {
         table_ops::graph_index_for_resolved(self, resolved, edge_types, system_columns).await
     }
 
-    /// [`Self::ensure_indices_on`] on this handle's current branch.
-    pub async fn ensure_indices(&self) -> Result<Vec<PendingIndex>> {
-        Ok(table_ops::ensure_indices(self).await?.pending)
-    }
-
-    /// [`Self::ensure_indices_on_as`] with no actor, returning only what it
-    /// left pending. With a policy installed, use the actor-aware counterpart.
-    pub async fn ensure_indices_on(&self, branch: &str) -> Result<Vec<PendingIndex>> {
-        Ok(self.ensure_indices_on_as(branch, None).await?.pending)
+    /// [`Self::ensure_indices_on_as`] on this handle's current branch,
+    /// returning only what it left pending.
+    pub async fn ensure_indices_as(&self, actor: Option<&str>) -> Result<Vec<PendingIndex>> {
+        Ok(table_ops::ensure_indices_as(self, actor).await?.pending)
     }
 
     /// Bring the selected branch's declared indexes up to its rows: build
@@ -3726,7 +3966,7 @@ impl Omnigraph {
     /// keep their indexes. Idempotent: a branch with nothing to do publishes
     /// nothing.
     ///
-    /// Requires `Change` on the selected branch before any effect and
+    /// Requires `maintain` on the selected branch before any effect and
     /// records the actor in the publication. Plans from one graph-manifest
     /// and schema token and builds the artifacts before taking the schema →
     /// branch → sorted table gates, then revalidates that authority under
@@ -3752,19 +3992,13 @@ impl Omnigraph {
     /// Rebuilt full-text indexes use the engine's default analyzer, including
     /// indexes originally created externally with custom tokenizer settings.
     ///
-    /// Unlike [`Self::ensure_indices_on`], this replaces existing FTS indexes
-    /// even when their row coverage is complete. It establishes the supported
-    /// analyzer generation after an upgrade; it does not rewrite old history.
-    /// With a policy installed, use the actor-aware counterpart.
-    pub async fn rebuild_full_text_indices_on(
-        &self,
-        branch: &str,
-    ) -> Result<FullTextIndexRebuildResult> {
-        self.rebuild_full_text_indices_on_as(branch, None).await
-    }
-
-    /// Actor-aware full-text rebuilding. Requires `Change` on the selected
-    /// branch before any effects and records the actor in the graph publication.
+    /// Unlike [`Self::ensure_indices_on_as`], this replaces existing FTS
+    /// indexes even when their row coverage is complete. It establishes the
+    /// supported analyzer generation after an upgrade; it does not rewrite old
+    /// history.
+    ///
+    /// Requires `maintain` on the selected branch before any effect and
+    /// records the actor in the graph publication.
     pub async fn rebuild_full_text_indices_on_as(
         &self,
         branch: &str,
@@ -3790,27 +4024,28 @@ impl Omnigraph {
         .await
     }
 
-    /// Compact small Lance fragments into fewer larger ones across every
-    /// backing dataset for a node or edge type on `main`. See [`optimize`] for details.
-    pub async fn optimize(&self) -> Result<Vec<optimize::DatasetOptimizeStats>> {
-        optimize::optimize_all_datasets(self).await
-    }
-
-    /// Classify and explicitly repair uncovered graph-manifest/Lance-HEAD drift. See
-    /// [`repair`] for the distinction between safe maintenance drift and
-    /// suspicious/unverifiable drift.
-    pub async fn repair(&self, options: repair::RepairOptions) -> Result<repair::RepairStats> {
-        repair::repair_all_datasets(self, options).await
+    /// Compact small Lance fragments into fewer larger ones across the
+    /// backing datasets `request` selects on `main`, and catch up their
+    /// indexes. See [`optimize`] for details. Requires `maintain` on `main`
+    /// before any effect and records `actor` in the publication.
+    pub async fn optimize_as(
+        &self,
+        actor: Option<&str>,
+        request: optimize::OptimizeRequest,
+    ) -> Result<optimize::OptimizeReport> {
+        optimize::optimize_all_datasets(self, actor, request).await
     }
 
     /// Remove Lance manifests (and the fragments they uniquely own) per the
     /// given [`optimize::CleanupPolicyOptions`]. Destructive to version
-    /// history. See [`optimize`] for details.
-    pub async fn cleanup(
+    /// history. See [`optimize`] for details. Requires `reclaim` before any
+    /// effect; a run covers every branch, so the check names none.
+    pub async fn cleanup_as(
         &self,
         options: optimize::CleanupPolicyOptions,
+        actor: Option<&str>,
     ) -> Result<Vec<optimize::DatasetCleanupStats>> {
-        optimize::cleanup_all_datasets(self, options).await
+        optimize::cleanup_all_datasets(self, options, actor).await
     }
 
     /// The tracing collector's plan for `options`, deleting nothing and taking
@@ -3903,11 +4138,11 @@ impl Omnigraph {
         target
             .branch_delete_captured(branch, &expected_identifier)
             .await?;
-        // The removed coordinator refreshes used to invalidate these caches
-        // before the authority change. Do it explicitly after success instead:
-        // old branch-incarnation handles/topology can never leak into a later
-        // recreation, while a failed control leaves warm state untouched.
-        self.invalidate_read_caches().await;
+        // No read cache is cleared: a branch control changes no cache key.
+        // Graph tables never carry a branch's own ref, and a recreated
+        // branch's writes get new random detached pins, so a dead branch's
+        // handles and topology never match a later key; the LRUs drop them
+        // (docs/dev/execution.md, "Graph index cache").
         Ok(())
     }
 
@@ -3954,11 +4189,11 @@ impl Omnigraph {
             .map_err(OmniError::before_effect)?;
         let source = self.active_branch().await;
         fail(&BRANCH_CONTROL_PRE_GATES).map_err(OmniError::before_effect)?;
-        let _schema_permit = self.write_queue().acquire_schema_exclusive().await;
+        let _schema_permit = self.write_queue().acquire_schema_exclusive().await?;
         let _branch_guards = self
             .write_queue()
             .acquire_branches(&[source.clone(), Some(target.clone())])
-            .await;
+            .await?;
         let branches = [source.clone(), Some(target.clone())];
         let warm_snapshot = self.coordinator.load_full().snapshot();
         let (control_catalog, identity) = self
@@ -3966,7 +4201,7 @@ impl Omnigraph {
             .await
             .map_err(OmniError::before_effect)?;
         let table_queue_keys = self.table_queue_keys_for_branches(&branches, &control_catalog);
-        let table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
+        let table_guards = self.write_queue().acquire_many(&table_queue_keys).await?;
         self.ensure_schema_state_valid()
             .await
             .map_err(OmniError::before_effect)?;
@@ -3985,8 +4220,8 @@ impl Omnigraph {
             )
             .await
             .map_err(OmniError::before_effect)?;
+        // A create changes no read-cache key; see `delete_captured_branch_storage`.
         source_coord.branch_create(&target).await?;
-        self.invalidate_read_caches().await;
         Ok(())
     }
 
@@ -4088,11 +4323,11 @@ impl Omnigraph {
             .await
             .map_err(OmniError::before_effect)?;
         fail(&BRANCH_CONTROL_PRE_GATES).map_err(OmniError::before_effect)?;
-        let _schema_permit = self.write_queue().acquire_schema_exclusive().await;
+        let _schema_permit = self.write_queue().acquire_schema_exclusive().await?;
         let _branch_guards = self
             .write_queue()
             .acquire_branches(&[branch.clone(), Some(target_branch.clone())])
-            .await;
+            .await?;
         let branches = [branch.clone(), Some(target_branch.clone())];
         let warm_snapshot = self.coordinator.load_full().snapshot();
         let (control_catalog, identity) = self
@@ -4100,7 +4335,7 @@ impl Omnigraph {
             .await
             .map_err(OmniError::before_effect)?;
         let table_queue_keys = self.table_queue_keys_for_branches(&branches, &control_catalog);
-        let table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
+        let table_guards = self.write_queue().acquire_many(&table_queue_keys).await?;
         self.ensure_schema_state_valid()
             .await
             .map_err(OmniError::before_effect)?;
@@ -4154,7 +4389,7 @@ impl Omnigraph {
                 unreachable!("a commit start captures the commit's record with its source")
             }
         };
-        self.invalidate_read_caches().await;
+        // A create changes no read-cache key; see `delete_captured_branch_storage`.
         Ok(created)
     }
 
@@ -4348,8 +4583,8 @@ impl Omnigraph {
             .await
             .map_err(OmniError::before_effect)?;
         fail(&BRANCH_CONTROL_PRE_GATES).map_err(OmniError::before_effect)?;
-        let _schema_permit = self.write_queue().acquire_schema_shared().await;
-        let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await?;
+        let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await?;
         let mut cache = self.merge_authority_cache.lock().await;
         let cached_target = if cache
             .as_ref()
@@ -4367,7 +4602,7 @@ impl Omnigraph {
             .await
             .map_err(OmniError::before_effect)?;
         let table_queue_keys = self.table_queue_keys_for_branches(&branches, &control_catalog);
-        let table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
+        let table_guards = self.write_queue().acquire_many(&table_queue_keys).await?;
         fail(&BRANCH_DELETE_POST_TABLE_GATES).map_err(OmniError::before_effect)?;
         self.ensure_schema_state_valid()
             .await
@@ -4765,8 +5000,8 @@ impl Omnigraph {
             actor,
         )?;
         candidate.require_publishable()?;
-        let _schema_permit = self.write_queue().acquire_schema_shared().await;
-        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await?;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await?;
         let candidate = match self.addressed_commit(commit_id).await? {
             AddressedCommit::Proposal(candidate) => *candidate,
             AddressedCommit::Unattached(_) => return Err(changed_kind_under_gate(commit_id)),
@@ -4786,15 +5021,51 @@ impl Omnigraph {
             *self.merge_authority_cache.lock().await = Some((target_name, coordinator));
             published
         };
-        if candidate
-            .record
-            .tables
-            .iter()
-            .any(|table| table.registration.table_key.starts_with("edge:"))
-        {
-            self.invalidate_graph_index().await;
-        }
+        self.invalidate_graph_index_for(
+            candidate
+                .record
+                .tables
+                .iter()
+                .map(|table| table.registration.table_key.as_str())
+                .filter(|table_key| table_key.starts_with("edge:")),
+        )
+        .await;
         Ok(published.commit)
+    }
+
+    /// [`Self::claim_branch_writer_as`] with no actor.
+    pub async fn claim_branch_writer(&self, branch: &str) -> Result<u64> {
+        self.claim_branch_writer_as(branch, None).await
+    }
+
+    /// Claim the writer epoch of `branch` for this process, under
+    /// `branch_claim` on that branch, and answer the epoch the process holds
+    /// from then on. The claim raises the branch's epoch by one in a
+    /// `__manifest` version of its own, moving no head and recording no graph
+    /// commit; from that version on, a publish on the branch by a process
+    /// holding a lower epoch, or none, is refused `WriterFenced`. The process
+    /// that already holds the branch gets its epoch back and nothing is
+    /// written. Every claim is a takeover: the engine does not decide that
+    /// the previous owner is gone.
+    pub async fn claim_branch_writer_as(&self, branch: &str, actor: Option<&str>) -> Result<u64> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::BranchClaim,
+            &omnigraph_policy::ResourceScope::TargetBranch(branch.to_string()),
+            actor,
+        )?;
+        let target = normalize_branch_name(branch)?;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await?;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await?;
+        let installed = self.coordinator.load_full();
+        let mut claimed = self
+            .open_coordinator_for_branch(target.as_deref())
+            .await
+            .map_err(OmniError::before_effect)?;
+        let epoch = claimed.claim_writer_epoch().await;
+        if target.as_deref() == installed.current_branch() {
+            self.install_coordinator(claimed, &installed);
+        }
+        epoch
     }
 
     /// Drop the unpublished commit `commit_id`, under `commit_drop` on its
@@ -4830,8 +5101,8 @@ impl Omnigraph {
             actor,
         )?;
         candidate.require_droppable()?;
-        let _schema_permit = self.write_queue().acquire_schema_shared().await;
-        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await?;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await?;
         let candidate = match self.addressed_commit(commit_id).await? {
             AddressedCommit::Proposal(candidate) => *candidate,
             AddressedCommit::Unattached(_) => return Err(changed_kind_under_gate(commit_id)),
@@ -4863,8 +5134,8 @@ impl Omnigraph {
             actor,
         )?;
         candidate.require_droppable()?;
-        let _schema_permit = self.write_queue().acquire_schema_shared().await;
-        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await?;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await?;
         let candidate = match self.addressed_commit(commit_id).await? {
             AddressedCommit::Unattached(candidate) => *candidate,
             AddressedCommit::Proposal(_) | AddressedCommit::Published(_) => {
@@ -4949,6 +5220,7 @@ impl Omnigraph {
             txn,
             lineage_intent,
             publication,
+            None,
         )
         .await
     }
@@ -4970,9 +5242,15 @@ impl Omnigraph {
         )
     }
 
-    /// Invalidate the cached graph index. Called after edge mutations.
-    pub(crate) async fn invalidate_graph_index(&self) {
-        table_ops::invalidate_graph_index(self).await
+    /// Invalidate the cached graph indexes that cover a written edge table
+    /// (`edge:<Name>`). Called after edge mutations and merges.
+    pub(crate) async fn invalidate_graph_index_for<'a>(
+        &self,
+        edge_table_keys: impl IntoIterator<Item = &'a str>,
+    ) {
+        self.runtime_cache
+            .invalidate_edge_tables(edge_table_keys)
+            .await;
     }
 }
 
@@ -6655,7 +6933,7 @@ edge WorksAt: Person -> Company
         );
 
         // The reconciler materializes it (Person has a row).
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
         let snapshot = db.snapshot().await;
         let ds = db
             .storage()
@@ -6687,7 +6965,7 @@ edge WorksAt: Person -> Company
         db.apply_schema(&desired).await.unwrap();
 
         // After the rewrite the reconciler restores index coverage.
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
         let snapshot = db.snapshot().await;
         let ds = db
             .storage()
