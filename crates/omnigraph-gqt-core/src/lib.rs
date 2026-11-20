@@ -4552,6 +4552,9 @@ async fn run_query_step(
         &outcome,
         matches!(step.expect, QueryExpect::Rows { ordered: true, .. }),
     );
+    // The step's own requests end with the engine's answer; reading the
+    // target's catalog for the checks below is the runner's.
+    host.measure_step_end(step.ordinal as u64);
     let require_expand =
         step.expects_expand && outcome.is_ok() && matches!(step.expect, QueryExpect::Rows { .. });
     if let Some(violation) = check_pin(mode, &counts, require_expand) {
