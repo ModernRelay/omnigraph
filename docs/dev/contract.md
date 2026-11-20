@@ -5,6 +5,9 @@
 differs today; the rules that keep the promises are in
 [invariants](invariants.md), the mechanisms in the area guides, and the work
 the promises serve in [the work](workload.md)
+**Written for:** agents first. Every session loads this page and checks
+designs against it, so precision comes before ease of reading. People start
+at [In plain words](#in-plain-words)
 
 ## Editing this page
 
@@ -17,11 +20,16 @@ from the two and live in the area guides, never here.
 - **Write what a caller can observe.** Two tests for every sentence: could
   a caller tell the difference from outside, and would the sentence still
   be true if the storage engine were replaced? If not, it belongs in a
-  guide.
-- **Use the exact term.** Where the literature names a property, add a
-  *Named* line with the term and its source, and place it in
-  [Position](#position). Use a term only as its source defines it, and say
-  at which scope it holds: one request, one branch, or across branches.
+  guide. An outcome, a refusal and an order are observable; a wait is not,
+  beyond the bounds of `E5`.
+- **Use the exact term, once.** Where the literature names a property, the
+  statement's *Named* line gives the term and its source.
+  [Position](#position) only indexes it. Use a term only as its source
+  defines it, and say at which scope it holds: one request, one branch, or
+  across branches.
+- **Say each thing once.** Before adding a statement, a table or a list,
+  find the one that already owns the subject and change that. A derived
+  view cites the statement and repeats none of it.
 - **This contract is the target, and the code is today's behavior.** A
   statement says what Omnigraph is to guarantee, whether or not the code
   does yet. Where the code differs, a row under [Gaps](#gaps) says what
@@ -33,24 +41,68 @@ from the two and live in the area guides, never here.
 - **Where the target is not yet chosen, say so.** A row under
   [Decisions](#decisions) names the question and what the code does
   meanwhile. Choosing the target means writing it as a statement and, if
-  the code differs, adding its gap. What the work asks for and this
-  contract does not yet state is in [Direction](#direction).
+  the code differs, adding its gap. There is no third list: what the work
+  asks for is a statement with a gap, or a decision marked †.
 - **Claim nothing as verified.** A statement earns `✓` only from a test
   that names it. Check a statement against the code before writing it.
 - **Keep addresses stable.** Other documents cite `E2`, `write:3` or `D5`.
   Add numbers at the end; never reuse or renumber one.
+- **Precision before readability.** A statement is exact and complete even
+  when that makes it harder to read. [In plain words](#in-plain-words) is
+  the only part written for a first reading; keep it in step with the
+  statements, and keep it short.
 - **Keep it short.** Every agent session loads this page. Evidence, history
   and reasoning about the workload go to [the work](workload.md).
 
-Omnigraph is one shared, typed graph that many agents read and change. Every
-change is one commit. Every read sees one commit. Branches are separate
-workspaces joined by merge. History stays until someone removes it on purpose.
+## In plain words
+
+The whole contract, for a person reading it once. It promises nothing by
+itself: where it and a statement below differ, the statement holds.
+
+Omnigraph is one shared graph with a schema, which many agents read and
+change. Every change is a commit, a new version of the whole graph. A branch
+is a line of commits, and history stays until someone removes it on purpose.
+
+Every operation keeps seven rules:
+
+1. It reads one version of the graph, never a mix (`E1`).
+2. It changes everything it meant to, or nothing (`E2`).
+3. It cannot break a rule the schema declares (`E3`).
+4. Its answer is true: success means the change is stored and visible, and a
+   failure says what it left behind (`E4`).
+5. It finishes or refuses. It never hangs, and never passes off part of an
+   answer as the whole (`E5`).
+6. It is checked against who is asking (`E6`).
+7. It changes only what its kind may. Only `cleanup` removes history, and
+   building an index never changes an answer (`E7`).
+
+How strong the promise is depends on how far apart two things are:
+
+- **Inside one request**, nothing else interferes. A request is the only
+  transaction.
+- **On one branch**, requests behave as if they ran one at a time, and a
+  read sees every change acknowledged before it began. Two requests are tied
+  together only if the second says "apply only if the branch has not moved".
+  Without that, a value read and then written back can overwrite someone
+  else's change.
+- **Across branches**, nothing is shared until a merge. A merge compares the
+  two sides entity by entity. It refuses when both changed the same entity
+  differently or when the result would break the schema, and it resolves
+  nothing by itself. It checks what each side wrote, not what it read.
+
+The page also says what one kind of operation promises beyond the seven
+rules, which pairs of operations refuse each other, and what Omnigraph
+assumes of its storage. Two tables keep it honest about today:
+[Gaps](#gaps), where the code does not yet do what a statement says, and
+[Decisions](#decisions), where the target is not yet chosen.
+
+## How this page is organized
 
 This page is organized by operation. Operations fall into seven kinds, and
 the page asks the same questions of each kind. Each statement is in plain
-words, and where the literature has an exact name for it a *Named* line gives the name and its
-source. [Position](#position) places the whole contract against the
-standard anomalies and models. The page says what a caller can observe,
+words, and where the literature has an exact name for it a *Named* line
+gives the name and its source. [Position](#position) places the whole
+contract against the standard anomalies and models. The page says what a caller can observe,
 never how the engine does it.
 
 ## Addresses and marks
@@ -61,11 +113,10 @@ Every statement has an address, so a change can say which one it touches.
 |---|---|---|
 | A rule for every operation | `E` and a number | `E2` |
 | A cell of the table of rules per kind | `kind.column` | `write.sees` |
-| A cell of the concurrency table | `kind+kind`, in table order | `read+forget` |
+| Two kinds of operation running at once | `kind+kind`, in the order of the kinds table | `read+forget` |
 | A detail | `kind:` and a number | `merge:3` |
 | A gap | `G` and a number | `G2` |
 | An open decision | `D` and a number | `D1` |
-| A direction | named in [Direction](#direction) | not cited as kept, only as moved toward or away from |
 
 A mark after a statement says how far to trust it.
 
@@ -79,8 +130,8 @@ A mark after a statement says how far to trust it.
 
 ## Definitions
 
-- **Graph:** nodes and edges under one schema, at one storage root. Every
-  promise on this page is about one graph.
+- **Graph:** a property graph: nodes and edges under one declared schema, at
+  one storage root. Every promise on this page is about one graph.
 - **Entity:** one node or edge, identified by its type and id. A `@key`
   derives the id from the key properties, so the same key is the same entity
   on every branch. An edge is directed from `src` to `dst`, has a type,
@@ -89,13 +140,29 @@ A mark after a statement says how far to trust it.
 - **Schema:** the accepted `.pg`: types, properties and constraints
   (required, `@key`, `@unique`, `@range`, `@check`, enums, edge cardinality).
 - **Commit:** an unchangeable version of the whole graph, with an id, its
-  parent or parents, its branch, and its actor when known.
+  parent or parents, its branch, the time it was committed, its actor when
+  known, and the task and reason its writer gave `G9`. The commit time is
+  information only. When a fact held true in the world is modeled by the
+  schema `D22`.
 - **Branch:** a name for a line of commits. `main` always exists. A deleted
   name that is created again is a different branch.
 - **Head:** the newest commit of a branch.
+  - **Head at start:** the head when a read captures its view, after it is
+    authorized. A commit published before that moment is seen; one published
+    after it is not.
+  - **Head at publish:** the head at the moment a change lands. A change
+    never lands on a head other than the one it was checked against: if the
+    head moved first, it is checked against the new head, or refused.
+  - **Named head:** the caller says "only if the head is still commit X".
 - **Proposal:** a commit stored on no branch (`as commit`), published later
   or dropped. A **snapshot** (`as unattached branch`) is a stored commit that
   is never published.
+- **Request:** one call of one operation. It is the transaction: the only
+  unit that is all-or-nothing and isolated. Nothing joins two requests except
+  a named head (`write:3`).
+- **Scope:** where a statement holds. There are three: within one request;
+  on one branch, across requests; and across branches, where a merge joins
+  them.
 - **Door:** a way in: the embedded engine, the CLI, or the HTTP server with
   its MCP surface.
 - **Physical state:** files, indexes, caches and layout. It is not part of
@@ -103,19 +170,20 @@ A mark after a statement says how far to trust it.
 
 ## Kinds of operation
 
-An operation's kind is what it is allowed to change. Operation names are
-those of the shared inventory in
+An operation's kind is what it is allowed to change, which is the `changes`
+column of [the rules for each kind](#rules-for-each-kind-of-operation).
+Operation names are those of the shared inventory in
 `crates/omnigraph-api-types/src/operations.rs`.
 
-| Kind | May change | Operations |
-|---|---|---|
-| `read` | nothing | `query`, `query invoke` of a stored read, `queries list`, `export`, `blob get`, `blob stat`, `schema show`, `schema plan`, `lint`, `snapshot`, `commit list`, `commit show`, `commit changes`, `diff`, `branch list`, `branch diff`, `branch merge base`, `changes poll`, `changes baseline` |
-| `write` | one commit on one branch | `mutate`, `query invoke` of a stored mutation, `load`, `blob put`, `blob clear`, `commit publish`; a mutation written `as commit` or `as unattached branch` stores its commit on no branch |
-| `merge` | one commit on the target branch | `branch merge` |
-| `schema` | one commit on `main` that changes the schema | `schema apply` |
-| `branch` | a name, never data | `branch create`, `branch delete`, `commit drop`; claiming a branch (embedded engine only) |
-| `maintain` | physical state | `optimize`, `index build`, `index rebuild`, `upgrade`, `schema upgrade-system-columns` |
-| `forget` | removes commits | `cleanup`; removing a graph from a cluster deployment |
+| Kind | Operations |
+|---|---|
+| `read` | `query`, `query invoke` of a stored read, `queries list`, `export`, `blob get`, `blob stat`, `schema show`, `schema plan`, `lint`, `snapshot`, `commit list`, `commit show`, `commit changes`, `diff`, `branch list`, `branch diff`, `branch merge base`, `changes poll`, `changes baseline` |
+| `write` | `mutate`, `query invoke` of a stored mutation, `load`, `blob put`, `blob clear`, `commit publish`; a mutation written `as commit` or `as unattached branch` stores its commit on no branch |
+| `merge` | `branch merge` |
+| `schema` | `schema apply` |
+| `branch` | `branch create`, `branch delete`, `commit drop`; claiming a branch (embedded engine only) |
+| `maintain` | `optimize`, `index build`, `index rebuild`, `upgrade`, `schema upgrade-system-columns` |
+| `forget` | `cleanup`; removing a graph from a cluster deployment |
 
 Two operations are two steps:
 
@@ -134,16 +202,15 @@ operation's change.
 never existed. *Kept by:* invariant 3.
 *Named:* a snapshot read. With `E2`, one branch is a linearizable object
 [HW90]: each read and each write takes effect at one moment between its
-request and its answer. Reads and commits on one branch are therefore
-strictly serializable [P79], where the transaction is one request.
+request and its answer. Requests on one branch are therefore strictly
+serializable [P79].
 
 **E2. It changes all or nothing.** An operation that changes the graph
 publishes one commit or none. No statement, type or table becomes visible on
 its own.
 *Why:* an agent can stop at any point, and half a step misleads every other
 agent. *Kept by:* invariants 2 and 4.
-*Named:* atomicity [K17, ch. 7]: a transaction's writes take effect all
-together or not at all.
+*Named:* atomicity [K17, ch. 7].
 
 **E3. It leaves the graph valid.** Every constraint of the schema holds at
 every commit, whichever door or writer made it. An operation that would break
@@ -159,39 +226,46 @@ hold only for the constraints it is told.
 that nothing was published, and comes only after the commit is stored for good
 and visible to every later read `G1`. A failure says what it left behind:
 nothing, part, or unknown `D12`, and whether sending it again can succeed:
-a moved head or contention may, a broken constraint or a denial cannot. An
-unknown outcome is settled by reading history for a mark the caller put in
-its write (a named head, or a key or unique value it chose), never by
+a moved head or contention may, a broken constraint or a denial cannot. A
+write can carry a request identity its client chose: sent again with the same
+identity, it applies at most once and returns the first answer `G7`. Without
+one, an unknown outcome is settled by reading history for a mark the caller
+put in its write (a named head, or a key or unique value it chose), never by
 sending the request again unseen.
 *Why:* agents act on answers with nobody watching, and they retry.
 *Kept by:* invariants 5 and 11.
 *Named:* durability [K17, ch. 7]: an acknowledged write survives the faults
-in [Scope](#scope).
+in [Boundary](#boundary).
 
 **E5. It is bounded.** It never presents a cut-off answer as complete; that
 holds always. It returns its whole answer within declared limits or refuses,
 and contention ends in a refusal after a bounded number of attempts; these
-hold while the store answers.
+hold while the store answers. When the store cannot be reached, every
+operation is refused: none is served stale or queued.
 *Why:* nobody is watching to notice a hung or shortened answer.
 *Kept by:* invariant 11.
-*Named:* the first part is a safety property (nothing bad happens), the
-second a liveness property (something good eventually happens), which can
-only be promised under a condition [K17, ch. 8].
+*Named:* the first part is a safety property, the second a liveness
+property, which can only be promised under a condition [K17, ch. 8]. The
+last chooses consistency over availability [K17, ch. 9].
 
 **E6. It is checked.** The server resolves the caller from its token; a client
 cannot name itself. The server checks every action against the installed
 policy. The engine checks every write when a policy is installed, before the
 first lasting effect, so a denied write changes nothing. A direct CLI write to
 a cluster graph uses that cluster's policy. Reads through the engine or the
-direct CLI are not checked `D9`. The CLI, HTTP and MCP share one list of
-operations, one set of error codes and one failure shape; the embedded engine
-returns its own error type.
+direct CLI are not checked `D9`, and a direct or embedded caller states its
+own actor. A served graph with no policy denies every authenticated request,
+unless the operator lets static tokens read it. An operator can also start a
+server with no authentication. Both choices are logged at startup. The CLI,
+HTTP and MCP share one list of operations, one set of error codes and one
+failure shape; the embedded engine returns its own error type.
 *Why:* agents of different authority share one graph.
 *Kept by:* invariant 10.
 
 **E7. It stays in its kind.** An operation changes only what its kind may
 change. Only `forget` removes published commits `D1`. Only `maintain`
-rewrites physical state, and it never changes an answer `G3`.
+rewrites physical state, and it never changes an answer `G3`: a read says
+what it wants, never how to find it.
 *Why:* history is the agents' memory, and a search must mean the same
 whatever has been built to speed it up. *Kept by:* invariants 7 and 12.
 *Named:* data independence, in Codd's sense of indexing and ordering
@@ -209,21 +283,12 @@ this page promises.
 | | sees | changes | refuses when | cost grows with |
 |---|---|---|---|---|
 | **read** | head at start, or a named commit | nothing | commit forgotten; search index missing | rows touched |
-| **write** | head at publish; a `.gq` mutation may require a named head `D3` `D4` | one commit, or none `D2` | constraint broken; named head moved | what changed |
+| **write** | head at publish; a `.gq` mutation may require a named head `D3` `D4` | one commit on one branch; none when no value would change `G6` | constraint broken; named head moved | what changed |
 | **merge** | two heads and their ancestor | one commit on the target, or none | sides disagree on an entity `D5`; constraint broken | what both sides changed |
-| **schema** | head of `main` at publish | one commit, or none | stored data breaks a new rule; another branch is live `D6` | types changed |
+| **schema** | head of `main` at publish | one commit on `main` that changes the schema, or none | stored data breaks a new rule; another branch is live `D6` | types changed |
 | **branch** | a commit to start from | a name, never data `D1` | name taken | not the graph's size |
 | **maintain** | all heads | physical state, never an answer `G3` | graph is held; the branch moved since it began | what is out of shape |
 | **forget** | all branches | removes commits | consent missing; graph is held | history removed |
-
-- **Head at start:** the branch head when the read captures its snapshot,
-  after it is authorized and after any wait for a schema change (`D7`). A
-  commit published before that moment is seen; one published after it is
-  not.
-- **Head at publish:** the branch head at the moment the change lands. A
-  write never lands on a head other than the one it was checked against: if
-  the head moved first, it is checked against the new head, or refused.
-- **Named head:** the caller says "only if the head is still commit X".
 
 Not allowed (`E6`) and over a limit (`E5`) apply to every kind and are not
 repeated in the table. The cost column restates invariant 11 for each kind;
@@ -231,68 +296,31 @@ the quantities behind it are in [the work](workload.md).
 
 ## Concurrent operations
 
-What happens when two operations run at the same time. A merge acts as a
-write on its target and reads its source at the start.
+Any two operations that run at the same time both take effect, in some
+order, and each sees the other's change whole or not at all (`E1`, `E2`).
+The exceptions are the pairs below, where one side is refused. A merge acts
+as a write on its target and reads its source at the start.
 
-- `free`: both run, and neither waits for or sees the other.
-- `queue`: both run, one after the other.
-- `one`: one wins and the other is refused.
+One operation may wait for another. How long is not promised beyond `E5`,
+and where a wait is long today is in `D7` and `D8`.
 
-| | read | write | schema | branch | maintain | forget |
-|---|---|---|---|---|---|---|
-| **read** | free | free | read waits for the apply `D7` | read waits for a create, not a delete `D7` | free; waits for `schema upgrade-system-columns` `D7` | free `G5` |
-| **write** | | same branch: queue; other branch: free `G2` | queue; a write that selects rows prepared on the old schema is refused `D8` | create: queue; delete of the same branch: queue, and a write landing after it is refused; delete of another branch: free | `optimize`: a write on `main` waits for the run, then lands unchanged; other branches free. `index build`: free, and the build is refused if a write lands first `D8` | write waits; `cleanup` is refused if `main` moved before it began `D8` |
-| **schema** | | | queue | one: apply is refused while another branch is live `D6`; create: queue | queue; the maintenance may be refused | queue |
-| **branch** | | | | same name: one; creates queue with each other and with deletes; deletes of different names: free | create: queue; delete: free with `optimize`, queue with `cleanup` and with `index build` on that branch | queue |
-| **maintain** | | | | | queue; a second `optimize` or `index build` started without the server is then refused | queue; `cleanup` is refused if `optimize` published first |
-| **forget** | | | | | | `cleanup`: queue; graph removal: one |
+| Pair | One side is refused when |
+|---|---|
+| `read+schema`, `read+branch`, `read+maintain`, `read+forget` | An export or a `changes baseline` runs beside a schema apply, a branch create or delete, `optimize` or `cleanup`: each refuses the other. Two exports refuse each other `D7` |
+| `read+forget` | The read names a commit that `cleanup` removes `G5` |
+| `write+schema` | The write selects rows and was prepared on the old schema `D8` |
+| `write+branch` | The write lands after its branch was deleted |
+| `write+maintain` | A write lands on the branch before an `index build` finishes: the build is refused |
+| `write+forget` | `main` moved before `cleanup` began: the `cleanup` is refused |
+| `schema+branch` | Another branch is live: the apply is refused `D6` |
+| `schema+maintain` | A schema apply lands first: the maintenance may be refused |
+| `branch+branch` | Both create the same name: one wins |
+| `maintain+maintain` | A second `optimize` or `index build` is started without the server |
+| `maintain+forget` | `optimize` published first: the `cleanup` is refused |
+| `forget+forget` | Two removals of one graph: one wins |
 
-The table describes requests to one server, or within one embedding
-program. Across two, a `write`, `merge`, `schema` or `maintain` that loses
-the race for a head is checked against the new head or refused, and every
-pair involving `branch` or `forget` is unsupported `G2`.
-An export or a `changes baseline` is the exception among reads: it and a
-`schema`, `branch` create or delete, `optimize` or `cleanup` refuse each
-other without waiting `D7`.
-
-## Position
-
-Where this contract stands against the standard anomalies and models. The
-answer depends on the scope, so each is given at three: one request; one
-branch, across several requests of a client; and across branches, where a
-merge joins them.
-
-### Anomalies
-
-| Anomaly | What it is | One request | One branch, across requests | Across branches |
-|---|---|---|---|---|
-| Dirty write | Overwriting a change that is not yet committed | prevented | prevented | prevented |
-| Dirty read | Seeing a change that is not yet committed | prevented | prevented | A reader that names another branch sees its unmerged commits; a reader of the target never does |
-| Read skew | Two reads of one transaction see different commits | prevented `E1` | admitted, unless both reads name one commit | does not arise |
-| Lost update | Two writers read a value and both write it back; one change is lost | prevented | admitted without a named head `write:3` | admitted when both sides wrote the same value `merge:7`; different values are a conflict |
-| Write skew | Two writers each read, then write different things, and together break a rule neither broke | prevented | admitted without a named head | admitted, unless the rule is a declared constraint `merge:3` |
-| Phantom | A write changes the result of a search another transaction relied on | prevented | admitted without a named head | admitted, unless a declared constraint catches it |
-| Read-only anomaly | A reader sees a state no serial order of the writers produces | prevented | prevented | admitted: a reader of the target between two merges |
-
-Sources: [BBG95] for the first six, [FLO05] for the last two as they arise
-under snapshot isolation.
-
-### Models
-
-| Concept | What it means | Position | Where |
-|---|---|---|---|
-| Transaction | The unit that is atomic and isolated | One request. There is no transaction across requests except through a named head | `E2`, `write:3` |
-| Isolation | Which interleavings of transactions are admitted | Strictly serializable on one branch [P79]. Across branches, weaker than snapshot isolation [BBG95]: no read set, and identical changes converge | `E1`, `merge:7` |
-| Consistency of reads | Which orders a reader may observe | Linearizable on one branch [HW90]: a read sees every commit acknowledged before it began. No order across branches | `E1`, `read:2` |
-| Session guarantees | What one client sees across its own requests | All four on one branch [TDP94]; none across branches until a merge | `read:2` |
-| Ordering of history | How commits are ordered | A total order on one branch; a partial order across branches, by ancestry, never by a clock | `merge:1`, Scope |
-| Integrity | Which rules always hold | Every declared constraint at every commit; no rule the schema does not declare | `E3` |
-| Durability | What an acknowledged write survives | What the store survives; on a local filesystem, a crash of the process only | `E4`, `G1` |
-| Availability | What is served when the store cannot be reached | Nothing: reads and writes are refused, never served stale or queued. Consistency is chosen over availability [K17, ch. 9] | `E5`, Scope |
-| Time | Which times a fact carries | The time it was committed. When it held true in the world is modeled by the schema | Definitions |
-| Delivery of changes | How often a consumer sees a change | At least once, in commit order, with no gaps; exactly once is the consumer's, by storing the cursor with its effect | `read:5`, `read:7` |
-| Data model | What the state is | A property graph with a declared schema, checked on write | Definitions, `E3` |
-| Queries | How a read is stated | Declarative: a read says what it wants, never how to find it, so results do not depend on what has been built to speed it up | `E7` |
+This holds for requests to one server, or within one embedding program.
+Across two, see `G2`.
 
 ## Rules specific to one kind
 
@@ -304,20 +332,19 @@ the guide has the full rules and this page keeps the promise.
 1. `read:1` A result is a bag of rows, or a set under `return distinct`. Rows
    have no order unless the query gives one with `order` or a ranking. Under
    a sort, ties break by the ids of the query's bindings `D10`.
-2. `read:2` On one branch, a client's requests made one after another always
-   see its own acknowledged writes and never go back in time, whichever
-   process answers. More than that: any client that learns, by any channel,
-   that a commit was acknowledged and then reads that branch sees it. A
-   client that needs a fixed view names a commit. Exception: a process that
-   claimed a branch reads it without checking the head, so once another
-   process replaces it its reads are stale, and a client can see an older
-   state than it saw before.
-   *Named:* the four session guarantees [TDP94]: read-your-writes,
-   monotonic reads, monotonic writes and writes-follow-reads, with no
-   session token; and recency, which linearizability adds [HW90].
+2. `read:2` On one branch, a read sees every commit acknowledged before the
+   read began, whichever process answers and however the caller learned of
+   the commit. So a client's requests see its own writes and never go back
+   in time. A client that needs a fixed view names a commit. Exception: a
+   process that claimed a branch reads it without checking the head, so once
+   another process replaces it its reads are stale, and a client can see an
+   older state than it saw before.
+   *Named:* recency, the real-time part of linearizability [HW90]. It
+   implies the four session guarantees [TDP94] (read-your-writes, monotonic
+   reads, monotonic writes, writes-follow-reads) with no session token.
 3. `read:3` A past state is read by commit id, through today's schema. The
    read is refused when a property it asks for was added, renamed or
-   created again since that commit.
+   created again since that commit `D18`.
 4. `read:4` `nearest` says whether it searched everything (`exhaustive`). A
    full-text search is refused when the property is not yet searchable.
 5. `read:5` The change feed delivers a branch's own commits in order from a
@@ -334,6 +361,13 @@ the guide has the full rules and this page keeps the promise.
 7. `read:7` `changes baseline` returns an exact snapshot of one commit and a
    cursor that resumes the feed with the first commit after it. A consumer
    installs the snapshot before it saves the cursor.
+8. `read:8` A consumer can wait on the feed for the next commit after its
+   cursor that matches a filter: by type, by operation, and by a condition
+   over the changed entities. A read names the commit it saw and a wait
+   starts after it, so the two join without a gap. How soon after its
+   acknowledgement a commit is delivered is timeliness, not a bound `G10`.
+9. `read:9` A read can search the schema: the names and descriptions of its
+   types and properties, by word and by meaning `G12`.
 
 Full rules: [search](../user/search/index.md),
 [changes](../user/branching/changes.md).
@@ -351,14 +385,17 @@ Full rules: [search](../user/search/index.md),
    one entity and inserts another.
 3. `write:3` A write with a named head applies only if that commit is still
    the head; the comparison is made at publication with the current head,
-   never with the snapshot the write was prepared on. Without one, a write
+   never with the view the write was prepared on. Without one, a write
    lands on whatever the head is when it publishes: a value read in one
    request and written back in another can then overwrite a commit made in
    between (a lost update), which cannot happen inside one mutation.
+   `blob put` and `blob clear` can require the cell's ETag instead, and
+   `commit publish` always requires the commit the proposal was built on.
    *Named:* compare-and-set on the branch head [K17, ch. 7]: the caller's
-   read and write become one transaction, or nothing is written. `blob put` and `blob clear` can require the cell's ETag
-   instead, and `commit publish` always requires the commit it was built on. A proposal publishes only while the head is the commit it was
-   built on.
+   read and write become one transaction, or nothing is written.
+4. `write:4` A revert publishes the inverse of one commit or one merge as a
+   new commit, and leaves every other change in place. It is refused where a
+   later commit depends on what it would undo `G8`.
 
 Full rules: [writes](writes.md).
 
@@ -368,7 +405,8 @@ Full rules: [writes](writes.md).
    entity by entity. The source is unchanged, and only the target head moves.
    *Named:* a state-based, keyed three-way merge [KKP07]. Two commits are
    concurrent when neither is an ancestor of the other, so history is a
-   partial order across branches and a total order on one.
+   total order on one branch and a partial order across branches, by
+   ancestry and never by a clock.
 2. `merge:2` The same change on both sides is kept once, deletes included.
    Different changes to one entity are a conflict: `divergent_insert`,
    `divergent_update`, `delete_vs_update`. Changes to different entities
@@ -377,7 +415,7 @@ Full rules: [writes](writes.md).
    `orphan_edge`, `unique_violation`, `cardinality_violation`,
    `value_constraint_violation`. A value is therefore unique on the branch
    that wrote it, and final only once merged: a claim made on a task branch
-   is not exclusive until it reaches the shared branch.
+   is not exclusive until it reaches the shared branch `D19`.
    *Named:* invariant confluence [BFF15] says which constraints a merge of
    two valid branches can break: uniqueness of chosen values, an edge's
    endpoints when a node is deleted, and cardinality bounds. A constraint
@@ -391,12 +429,13 @@ Full rules: [writes](writes.md).
    again.
 6. `merge:6` The common ancestor is picked by a fixed rule, so the same merge
    gives the same result. A merge over its declared size limits is refused.
-7. `merge:7` A merge checks what was written, not what was read. Two branches
-   that each raised a counter from 3 to 4 merge to 4. To count across
-   branches, record each increment as its own entity and count them in a
-   read: both branches' entities survive the merge.
-   *Named:* across branches a merge resembles snapshot isolation [BBG95]
-   and is weaker; [Position](#position) lists what it admits.
+7. `merge:7` A merge checks what was written, not what was read `D20`. Two
+   branches that each raised a counter from 3 to 4 merge to 4. To count
+   across branches, record each increment as its own entity and count them
+   in a read: both branches' entities survive the merge.
+   *Named:* across branches, weaker than snapshot isolation [BBG95]: a merge
+   has no read set, and identical changes converge.
+   [Position](#position) lists what that admits.
 
 Full rules: [merge](../user/branching/merge.md).
 
@@ -414,6 +453,8 @@ Full rules: [merge](../user/branching/merge.md).
 2. `branch:2` A proposal becomes unreadable when it is dropped or when it
    expires. It expires when its target's head moves past the commit it was
    built on, or when its target branch is deleted or created again.
+3. `branch:3` A branch listing says, for each live branch, who owns it, for
+   what task, and which entities it has changed `G11`.
 
 ### maintain
 
@@ -424,9 +465,8 @@ Full rules: [merge](../user/branching/merge.md).
    `index rebuild` and `cleanup` are refused while the server holds the
    cluster, and `upgrade` refuses any graph inside a cluster.
 3. `maintain:3` Between maintenance runs the cost of a read can grow with the
-   writes since the last `optimize`, and storage grows
-   with retained commits until `cleanup`. Neither is bounded by the engine
-   `D17`.
+   writes since the last `optimize`, and storage grows with retained commits
+   until `cleanup`. Neither is bounded by the engine `D17`.
 
 ### forget
 
@@ -443,6 +483,49 @@ Full rules: [merge](../user/branching/merge.md).
    in a live head, a merge ancestor or a tagged commit stays, and so does
    any copy the operator's storage versioning or backups hold.
 
+## Position
+
+Where this contract stands against the standard anomalies and models. Both
+tables are derived: the statements they cite own the promise and its exact
+term, and where a row and a statement disagree, the statement holds.
+
+### Anomalies
+
+Each anomaly at the three scopes. The cells follow from `E1`, `E2`,
+`write:3`, `merge:2`, `merge:3` and `merge:7`.
+
+| Anomaly | What it is | One request | One branch, across requests | Across branches |
+|---|---|---|---|---|
+| Dirty write | Overwriting a change that is not yet committed | prevented | prevented | prevented |
+| Dirty read | Seeing a change that is not yet committed | prevented | prevented | A reader that names another branch sees its unmerged commits; a reader of the target never does |
+| Read skew | Two reads of one transaction see different commits | prevented | admitted, unless both reads name one commit | does not arise |
+| Lost update | Two writers read a value and both write it back; one change is lost | prevented | admitted without a named head | admitted when both sides wrote the same value; different values are a conflict |
+| Write skew | Two writers each read, then write different things, and together break a rule neither broke | prevented | admitted without a named head | admitted, unless the rule is a declared constraint |
+| Phantom | A write changes the result of a search another transaction relied on | prevented | admitted without a named head | admitted, unless a declared constraint catches it |
+| Read-only anomaly | A reader sees a state no serial order of the writers produces | prevented | prevented | admitted: a reader of the target between two merges |
+
+Sources: [BBG95] for the first six, [FLO05] for the last two as they arise
+under snapshot isolation.
+
+### Models
+
+| Concept | Position | Stated in |
+|---|---|---|
+| Data model | A property graph with a declared schema, checked on write | Definitions, `E3` |
+| Queries | Declarative | `E7` |
+| Transaction | One request | Definitions, `write:3` |
+| Atomicity | One commit or none | `E2` |
+| Isolation | Strictly serializable on one branch; weaker than snapshot isolation across branches | `E1`, `merge:7` |
+| Consistency of reads | Linearizable on one branch; no order across branches | `E1`, `read:2` |
+| Session guarantees | All four on one branch; none across branches until a merge | `read:2` |
+| Ordering of history | Total on one branch, partial across branches | `merge:1` |
+| Integrity | Every declared constraint at every commit, and no other rule | `E3`, `merge:3` |
+| Durability | What the store survives | `E4`, `G1` |
+| Availability | Consistency over availability | `E5` |
+| Time | Commit time only | Definitions, `D22` |
+| Delivery of changes | At least once, in commit order, with no gaps | `read:5`, `read:7` |
+| Data independence | Physical state never changes an answer | `E7`, `G3` |
+
 ## Gaps
 
 Where the code differs from this contract. The statement is the target; the
@@ -452,10 +535,18 @@ statement. "See" names the invariant or the design that bears on it.
 | Gap | Where | Today | See |
 |---|---|---|---|
 | `G1` | `E4` | On a local filesystem an acknowledged commit survives a crash of the process, not necessarily a power loss. On an object store it is stored for good at success | Invariants deny-list: no acknowledgement before durable visibility |
-| `G2` | `write+write`, `branch+branch` | One writing server or program per cluster is supported. Branch create and delete, schema apply, dropping a proposal and `cleanup` are safe from one only | [Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md), accepted, in progress |
+| `G2` | Boundary, Processes | One writing server or program per cluster is supported. Across two, a `write`, `merge`, `schema` or `maintain` that loses the race for a head is checked against the new head or refused; branch create and delete, schema apply, dropping a proposal and `cleanup` are safe from one only. A writer that was displaced while it was stalled can no longer publish over a head that moved; it can still delete a branch or finish a `cleanup` | [Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md), accepted, in progress |
 | `G3` | `E7`, `maintain.changes` | Building a full-text index can change `bm25` scores, their order and a limited result | Invariant 7 |
-| `G4` | Scope | Azure writes are a preview, and need a separate guard that admits one writer | [RFC 0029](../rfcs/0029-azure-blob-storage.md), accepted, in progress |
+| `G4` | Boundary, The store | Azure writes are a preview, and need a separate guard that admits one writer | [RFC 0029](../rfcs/0029-azure-blob-storage.md), accepted, in progress |
 | `G5` | `read+forget` | Nothing coordinates `cleanup` with a running read. A read of a commit the keep rule drops is refused as reclaimed if the removal came first, and can fail with an untyped error if the removal lands while it runs. No test covers it | Invariant 3 |
+| `G6` | `write.changes` | A write that changes no value still publishes a commit, and so does a load with no rows | No design yet |
+| `G7` | `E4` | Graph writes carry no request identity. Only a write with a named head or a keyed upsert is safe to send again, the second at the cost of a commit. Recorded operations do carry one | No design yet |
+| `G8` | `write:4` | There is no revert. Undo is a hand-written inverse commit, or a branch started at the earlier commit | No design yet |
+| `G9` | Definitions, Commit | A commit records its actor only | No design yet |
+| `G10` | `read:8` | The feed is polled. It filters by kind, type and operation, with no condition over the changed entities | No design yet |
+| `G11` | `branch:3` | A branch listing shows head, origin and times, not owner, task or changed entities | No design yet |
+| `G12` | `read:9` | Types and properties carry descriptions, and nothing searches them | No design yet |
+| `G13` | Boundary, Processes | One server serves a cluster, and read-only CLI commands may read beside it. There is no read-only serving mode | [Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md) |
 
 ## Decisions
 
@@ -463,132 +554,100 @@ Places where this contract has not yet chosen its target. Each row is the
 question, with what the code does meanwhile. Choosing the target turns the
 row into a statement, with a gap if the code differs.
 
+A row marked † is one [the work](workload.md#what-the-work-requires) asks
+for: the direction is known and its exact statement is not. A design moves
+toward a † row, never away from it, and one that makes it harder to reach
+says so in its contract line.
+
 | Decision | Where | Today | Open question |
 |---|---|---|---|
 | `D1` | `E7`, `branch.changes` | Deleting a branch makes its commits that no live branch reaches through parents or merged parents unreadable by id at once, so a published commit is not final across a delete: a reader that acted on one cannot read it again. `commit show` can still return such a commit's record | Keep them readable by id until `cleanup`, or make delete a `forget`? |
-| `D2` | `write.changes` | A write that changes no value still publishes a commit, and so does a load with no rows | Publish nothing? |
 | `D3` | `write.sees` | Only a `.gq` mutation can require a named head | Every write? |
-| `D4` | `write.sees` | A named head is refused by any commit in between, related or not | A condition as narrow as what the caller read? |
-| `D5` | `merge.refuses` | Two agents that changed different properties of one entity conflict | Merge by property? It can build an entity neither branch wrote, so the merge would have to check per-entity constraints too |
-| `D6` | `schema.refuses`, `schema+branch` | Schema apply runs on `main` only, with no other branch live | A schema change made on a branch and merged? The test would be that each side's schema reads the other's data: additions optional or defaulted, no identity reused |
-| `D7` | `read+schema`, `read+branch` | On one server a read can wait behind schema apply or branch create. On one server an export or `changes baseline` and a branch create or delete, schema apply, `schema upgrade-system-columns`, `optimize` or `cleanup` refuse each other without waiting, and two exports refuse each other; nothing excludes them across servers | Reads never wait or refuse? |
-| `D8` | `write+schema`, `write+maintain`, `write+forget` | Writers wait while schema apply or `cleanup` runs, and writers on `main` wait while `optimize` runs, for a time a run started without the server does not bound | Writes continue? |
+| `D4` † | `write.sees` | A named head is refused by any commit in between, related or not | A condition as narrow as what the caller read, so that an unrelated commit does not refuse a decision. How narrow: an entity, a property, a search? |
+| `D5` † | `merge.refuses` | Two agents that changed different properties of one entity conflict | Merge by property? It can build an entity neither branch wrote, so the merge would have to check per-entity constraints too |
+| `D6` † | `schema.refuses`, `schema+branch` | Schema apply runs on `main` only, with no other branch live | A schema change made on a branch and merged, under the same review as data? The test would be that each side's schema reads the other's data: additions optional or defaulted, no identity reused |
+| `D7` | `read+schema`, `read+branch`, `read+maintain` | On one server a read can wait behind schema apply, branch create or `schema upgrade-system-columns`. The refusals between an export or `changes baseline` and other kinds hold on one server only; nothing excludes them across servers | Reads never wait or refuse? |
+| `D8` † | `write+schema`, `write+maintain`, `write+forget` | Writers wait while schema apply or `cleanup` runs, and writers on `main` wait while `optimize` runs, for a time a run started without the server does not bound | Reads and writes served without pause through maintenance? |
 | `D9` | `E6` | Reads are checked at the server only. Policy scope stops at the branch class | Check reads at every door? Scope by type and property? |
 | `D10` | `read:1` | Groups that tie on the sort keys come back in no stated order | One total order for every sorted read? |
 | `D11` | `forget:4` | `optimize` does not rewrite every file that holds a deleted value | An erasure path? |
 | `D12` | `E4`, Kinds | A stream that fails after its headers ends in a cut-off body. A merge that deletes its source can report success when the delete failed | Every failure typed? |
-| `D13` | Scope | One server serves a cluster. There is no read-only serving mode | Read-only servers? |
 | `D14` | Kinds | A load onto a new branch is two steps | One commit? |
 | `D15` | `E4` | The CLI's direct `schema apply` reports a version number and no commit id; the engine and a served deployment name the commit | Name the commit at every door? |
+| `D16` | `E5` | A served request can raise four resource settings up to the larger of the server's value and the built-in default, so a budget an operator set below the default can be raised back to it | The server's value as the ceiling? |
 | `D17` | `maintain:3` | Maintenance runs only when asked, so at a steady write rate the debt grows until an operator acts, and `optimize` then makes writers on `main` wait | Who runs maintenance when the work never stops: a reconciler started by a threshold, or only the operator? |
 | `D18` | `read:3` | A past read is refused when a property it asks for was added or renamed since | Resolve a past read through identity: a renamed property under its new name, one added since as null, refusing only one created again? |
-| `D16` | `E5` | A served request can raise four resource settings up to the larger of the server's value and the built-in default, so a budget an operator set below the default can be raised back to it | The server's value as the ceiling? |
+| `D19` † | `merge:3`, `write:3` | A claim is a write with a named head, so claimants on a busy branch refuse each other and unrelated writers refuse them | A claim on a task or entity that exactly one of several claimants wins, that tells the others who holds it, and that no unrelated commit refuses? One that expires needs a version its holder's later writes must name, not only an expiry |
+| `D20` † | `merge:7` | A merge records and checks no read dependency, so a conclusion can merge on evidence that changed on the target | A branch that records what its conclusions depend on, and a merge that reports a dependency changed since the fork? |
+| `D21` † | `merge.refuses` | A merge is gated by policy on who may merge, not by a check on what is merged | A check the target names and the branch must pass, run by a party other than its author? |
+| `D22` † | Definitions, Commit | When a fact held true is an ordinary property, and nothing ranks, filters or supersedes by it | Valid time and supersession as a schema convention, or as a construct? |
+| `D23` † | Boundary, Versions | Every process on a graph is upgraded together | Old and new releases serving one graph while one replaces the other? |
+| `D24` † | Boundary, Failures covered | Nothing checks stored state against its history, so storage that lies is not detected | A check an operator can run? |
 
-## Direction
+## Boundary
 
-Where the work asks this contract to go. The work is several agents sharing
-one typed model to retrieve and update context and to coordinate
-([the work](workload.md)), and it asks for more than any statement above
-promises. A row here is not yet part of the contract. It becomes part of it
-when it is written as a statement above, with a gap for what the code does
-not do yet. Until then it is here so that a design can move toward it and
-never away from it, and a design that makes a row harder to reach says so
-in its contract line.
-
-| The work asks for | Because | Related |
-|---|---|---|
-| A condition as narrow as what the caller read | Many agents write shared state, and an unrelated commit should not refuse a decision | `D4` |
-| Exclusive claims with one winner | Agents take tasks from one pool, and an unrelated commit should never make a claim fail. A claim that expires needs a version its holder's later writes must name, not only an expiry | `D4` |
-| Merge by property | Two agents that enriched different properties of one entity did not disagree | `D5` |
-| Declared dependencies, reported at merge when stale | A conclusion should not merge on evidence that changed since the fork | `merge:7` |
-| A check that gates a merge | Unchecked work by parallel agents compounds errors | `merge.refuses` |
-| Schema change on a branch, merged with branches live | The model changes under the same review as the data | `D6` |
-| A request identity on every write | Agents retry after a lost answer, and a retry must apply at most once. The identity must come from the client: one the server assigns does not survive a lost answer | `E4` |
-| Revert as one operation | A wrong but valid change, by an agent, a person or a whole pipeline run, must be undoable without losing the rest | Not promised |
-| Task and reason on a commit | An agent holds no memory of its own: why a change was made is a read | `E6` |
-| A change feed that waits, with a condition | Agents and pipelines react to changes without polling, and wake only for what concerns them. A read names the commit it saw and a wait starts after it, so the two join without a gap | `read:5` |
-| Work in progress visible in the state | Agents avoid duplicate work only if they can see who is working on what | `branch` |
-| Search over the schema | Finding which type or property holds something is among an agent's most frequent reads | `read` |
-| Valid time and supersession | The work asks what was the case, not only what was recorded | Definitions |
-| Any number of reader and writer processes | Read load grows with agents, and writers work on many branches at once. Added readers keep the freshness check: a cached head would bring back lag and break `read:2` | `G2`, `D13` |
-| Service through maintenance and process replacement | The work is continuous, which includes old and new binaries serving one graph during a replacement | `D8`, Scope |
-| A check of stored state against its history | Errors in a shared graph compound, and storage that lies is outside the contract, so it should at least be detectable | Scope |
-| A write that changes nothing publishes nothing | A sync mostly rewrites what did not change | `D2` |
-
-Today's behavior and the full wording of each ask are in
-[the work](workload.md#asked-not-decided).
-
-## Not promised
-
-- One all-or-nothing change across two commits, two branches or two graphs.
-  Work on a branch and merge it.
-- A view across two branches at once. A merge, a two-sided diff and a branch
-  create read each branch on its own.
-- A read "as of" a time, or a stale read that trades freshness for speed.
-- Revert, or restoring a branch to an earlier commit. Undo is a new commit,
-  or a branch started at the earlier commit.
-- Automatic conflict resolution.
-- Order across branches by cause: a commit records no dependency on what its
-  writer read on another branch.
-- A rule the schema does not declare.
-- Per-row policy.
-- A recall figure for a `nearest` that did not search everything.
-- Erasure by delete alone, or by a deadline.
-- A latency bound.
-- A consistent backup from copying a root while writers run.
-
-## Scope
+### Assumptions
 
 - **One graph.** No operation spans two graphs. A shallow clone reads its
   base's files. `init`, which creates a graph, is outside the kinds. Which
   graphs, policies and stored queries a cluster holds is owned by
   [control plane](control-plane.md), and so are server state reads such as
   health, `access` and operation status.
-- **Doors.** The embedded engine, the CLI and the HTTP server with MCP. A
-  process that reads or writes the files directly is outside the contract;
-  keeping it out is the operator's job.
+- **Doors.** A process that reads or writes the files directly is outside
+  the contract; keeping it out is the operator's job.
 - **The store.** A store where creating a name has exactly one winner and a
   read sees every completed write: a local filesystem, S3-compatible object
   storage, or Azure `G4`. That one-winner rule is the one agreement the
   whole contract rests on: it decides which commit is next on a branch. A
   store that lets two creations of one name both succeed, or whose read
   misses a completed write, breaks `E1`, `E2` and `write:3` with nothing to
-  detect it; a shared network filesystem may be such a store. Omnigraph copies nothing to a second place
-  and encrypts nothing at rest.
+  detect it; a shared network filesystem may be such a store. Omnigraph
+  copies nothing to a second place and encrypts nothing at rest.
 - **Failures covered.** A process may stop at any point. A request to the
-  store may fail, land late or answer unclearly. A response may be lost. Storage
-  that lies is not covered. Statements about what is seen and changed hold
-  under any delay or pause; bounds (`E5`) hold only while the store answers.
-  Two faults are not failures of the engine and are met another way. A bug
-  in a release is the same in every process running it. A caller, an agent
-  included, may make a valid but wrong change: it stays recoverable from
-  history, by a new commit or a branch at the earlier commit, until
-  `cleanup` removes it. `cleanup` and removing a graph are the only
-  operations that cannot be undone, and they are guarded by consent.
-- **Time.** Commits are ordered by branch history, never by a clock. Clocks
-  are used for timestamps, which are information only, for `now()` in a
-  query, for `cleanup --older-than` and the seven-day orphan rule, and for
-  a server's hold on its cluster. A skewed clock can make `cleanup --older-than`
-  drop or keep a commit early, never a live head, a merge ancestor or a
-  tagged commit. No promise about what is seen or in what order depends on
-  a clock.
-- **Processes.** One writing server or program per cluster `G2`. One server
-  serves a cluster, and read-only CLI commands may read beside it `D13`. A
-  writer that was displaced while it was stalled can no longer publish a
-  commit over a head that moved; it can still delete a branch or finish a
-  `cleanup`.
+  store may fail, land late or answer unclearly. A response may be lost.
+  Storage that lies is not covered `D24`. Statements about what is seen and
+  changed hold under any delay or pause; bounds (`E5`) hold only while the
+  store answers. Two faults are not failures of the engine and are met
+  another way. A bug in a release is the same in every process running it.
+  A caller, an agent included, may make a valid but wrong change: it stays
+  recoverable from history (`write:4`) until `cleanup` removes it. `cleanup`
+  and removing a graph are the only operations that cannot be undone, and
+  they are guarded by consent.
+- **Time.** No promise about what is seen or in what order depends on a
+  clock. Clocks are used for timestamps, for `now()` in a query, for
+  `cleanup --older-than` and the seven-day orphan rule, and for a server's
+  hold on its cluster. A skewed clock can make `cleanup --older-than` drop
+  or keep a commit early, never a live head, a merge ancestor or a tagged
+  commit.
+- **Processes.** Any number of servers and programs read and write one
+  graph, and every statement on this page holds whichever of them answers
+  `G2` `G13`. A reader added for capacity still reads the head at start: it
+  never answers from a head it has not checked (`read:2`).
 - **Versions.** An older release refuses a graph that a newer release has
   written to, before it reads anything, and never misreads it. So every
-  process on a graph is upgraded together
+  process on a graph is upgraded together `D23`
   ([versioning](versioning.md)).
-- **Trust.** A direct or embedded caller states its own actor. A served
-  graph with no policy denies every authenticated request, unless the
-  operator lets static tokens read it. An operator can also start a server
-  with no authentication. Both choices are logged at startup.
 - **Outside the commit.** Stored vectors are computed by `embed` or by the
   client. A `nearest` given text calls the embedding provider during the
   read. An external Blob names an object outside the root, which a commit
   does not keep.
+
+### Not promised
+
+Deliberately outside the contract. Something wanted and not yet reached is a
+gap or a decision, never a line here.
+
+- One all-or-nothing change across two requests, two branches or two graphs.
+  Work on a branch and merge it.
+- A view across two branches at once. A merge, a two-sided diff and a branch
+  create read each branch on its own.
+- A read "as of" a time, or a stale read that trades freshness for speed.
+- Moving a branch back to an earlier commit. Undo is a new commit
+  (`write:4`), or a branch started at the earlier commit.
+- Per-row policy.
+- A recall figure for a `nearest` that did not search everything.
+- A latency bound.
+- A consistent backup from copying a root while writers run.
 
 ## Citing
 
@@ -602,7 +661,7 @@ Contract: keeps E2, write.changes; closes G2; decides D1
 |---|---|
 | `keeps` | The change touches this statement and it still holds |
 | `closes` | The gap is gone. Delete its row; its number is not used again |
-| `decides` | The target is chosen. The decision row becomes a statement, with a gap if the code differs |
+| `decides` | The target is chosen. The decision row becomes a statement, with a gap if the code differs; its number is not used again |
 | `changes` | A statement changes. Change it on this page in the same pull request, before the code that follows it |
 
 A cost claim also names the activity it is for in [the work](workload.md).
