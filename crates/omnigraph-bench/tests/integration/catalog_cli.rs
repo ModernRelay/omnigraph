@@ -92,7 +92,7 @@ fn shared_catalog_leaves_the_volume_to_the_host() {
             .unwrap()
             .definition;
     assert_eq!(shared.defaults.protocol.reset, None);
-    assert_eq!(shared.scenarios.len(), 79);
+    assert_eq!(shared.scenarios.len(), 80);
     let (filesystem, reset) = if cfg!(target_os = "macos") {
         ("apfs", "local-clonefile")
     } else {
@@ -113,6 +113,55 @@ fn shared_catalog_leaves_the_volume_to_the_host() {
     for suite in ["aws-xfs-process-cold", "aws-xfs-history64"] {
         assert_eq!(shared.suites[suite].len(), 1, "{suite}");
     }
+}
+#[test]
+fn a_swept_scenario_shows_its_block_run_and_every_point() {
+    let shown = run(&root(), &["show", "concurrent-writes", "--json"], true);
+    let value = &shown["value"];
+    assert_eq!(value["measured_step"]["ordinal"], 1);
+    assert!(
+        value["measured_step"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("--- concurrent measured\nwriter x${W}:"),
+        "the entry echoes no step, so the block's text is read off the workload"
+    );
+    assert_eq!(value["repetitions"], 1);
+    assert_eq!(
+        value["block"],
+        serde_json::json!({"warmup_seconds": 5, "duration_seconds": 30})
+    );
+    let points = value["points"].as_array().unwrap();
+    assert_eq!(
+        points
+            .iter()
+            .map(|point| point["sweep"]["W"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 2, 4, 8, 16]
+    );
+    assert_eq!(points[0]["planned_sha256"], value["planned_sha256"]);
+    let distinct: std::collections::BTreeSet<_> = points
+        .iter()
+        .map(|point| point["planned_sha256"].as_str().unwrap())
+        .collect();
+    assert_eq!(distinct.len(), 5, "every swept value is a point of its own");
+
+    let single = run(&root(), &["show", "tiny-read", "--json"], true);
+    assert!(single["value"].get("block").is_none());
+    assert!(single["value"].get("points").is_none());
+    let refused = run(
+        &root(),
+        &["run", "tiny-read", "--duration-seconds", "5", "--json"],
+        false,
+    );
+    assert_eq!(refused["diagnostics"][0]["code"], "invalid_run_input");
+    assert!(
+        refused["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("measures no `--- concurrent measured` block"),
+        "{refused}"
+    );
 }
 #[test]
 fn human_and_machine_help_need_no_catalog_or_cache() {
@@ -234,6 +283,48 @@ fn copy_pair(directory: &Path) {
         directory.join("workloads/tiny_read.gqt"),
     )
     .unwrap();
+}
+#[test]
+fn init_on_a_measured_block_writes_a_scenario_without_a_step() {
+    let directory = tempfile::tempdir().unwrap();
+    for folder in ["fixtures", "workloads"] {
+        fs::create_dir(directory.path().join(folder)).unwrap();
+        fs::copy(
+            root()
+                .join("benchmarks")
+                .join(folder)
+                .join("concurrent_writes.gqt"),
+            directory.path().join(folder).join("concurrent_writes.gqt"),
+        )
+        .unwrap();
+    }
+    run(
+        directory.path(),
+        &[
+            "init",
+            "--fixture",
+            "fixtures/concurrent_writes.gqt",
+            "--workload",
+            "workloads/concurrent_writes.gqt",
+            "--step",
+            "1",
+            "--output",
+            "custom.yaml",
+            "--json",
+        ],
+        true,
+    );
+    let written = fs::read_to_string(directory.path().join("custom.yaml")).unwrap();
+    assert!(!written.contains("measured_step"), "{written}");
+    let show = run(
+        directory.path(),
+        &["show", "custom", "--config", "custom.yaml", "--json"],
+        true,
+    );
+    assert_eq!(show["value"]["measured_step"]["ordinal"], 1);
+    assert_eq!(show["value"]["block"]["duration_seconds"], 30);
+    assert_eq!(show["value"]["repetitions"], 5);
+    assert_eq!(show["value"]["points"].as_array().unwrap().len(), 5);
 }
 #[test]
 fn init_emits_a_valid_exact_selector_and_never_replaces_existing_output() {

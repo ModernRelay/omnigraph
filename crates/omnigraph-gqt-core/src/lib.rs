@@ -33,6 +33,7 @@ use omnigraph_compiler::{
 use omnigraph_planner::{BoundPlan, PhysicalNode};
 use serde_json::Value;
 
+mod bench;
 pub mod concurrent;
 pub mod diagnostic;
 mod generate;
@@ -41,6 +42,7 @@ mod process;
 pub mod runner_config;
 mod served;
 mod yaml;
+pub use bench::{BenchSection, MAX_DURATION_SECONDS, MAX_WARMUP_SECONDS, Sweep};
 pub use concurrent::{
     ConcurrentStep, Dealt, MergeOp, Pass, SessionExpect, SessionKind, SessionOp, Worker,
 };
@@ -55,7 +57,10 @@ pub enum ParamsInput {
     Literal(String),
     Generated(GeneratedParams),
 }
-pub use host::{ExecutionHost, PlainHost, SCRIPTED_HOST_WORKERS, admit_workers};
+pub use host::{
+    ExecutionHost, PlainHost, SCRIPTED_HOST_WORKERS, admit_ungated_case, admit_workers,
+    admit_workers_within, run_block_once,
+};
 use omnigraph::storage::StorageAdapter;
 pub use process::{
     PROCESS_STATS_RECORD, ProcessTarget, admit_process_workload, execute_measured_process,
@@ -113,6 +118,10 @@ pub struct Case {
     /// case, set by [`Case::materialize_csv_fixtures`]: one embedded-only
     /// `file://` base over the materialized sections.
     pub external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+    /// The `--- bench` section: the run of the case's measured block.
+    pub bench: Option<BenchSection>,
+    /// The value this parse bound the section's swept name to.
+    swept: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -153,6 +162,22 @@ impl Case {
 
     fn has_loops(&self) -> bool {
         self.items.iter().any(|i| matches!(i, Item::Loop { .. }))
+    }
+
+    /// The block a measuring host loops for the `--- bench` section's
+    /// duration; every other host runs it as any free-running block.
+    pub fn measured_block(&self) -> Option<&ConcurrentStep> {
+        self.items.iter().find_map(|item| match item {
+            Item::Step(Step::Concurrent(block)) if block.measured => Some(block),
+            _ => None,
+        })
+    }
+
+    /// The name the `--- bench` section sweeps and the value it reads as in
+    /// this parse: the one [`parse_case_at`] was given, else the first.
+    pub fn swept(&self) -> Option<(&str, u64)> {
+        let sweep = self.bench.as_ref()?.sweep.as_ref()?;
+        Some((sweep.name.as_str(), self.swept?))
     }
 
     /// Whether the case needs the DST runner: a seam directive or a
@@ -2224,8 +2249,9 @@ fn complete_decl_step(
 }
 
 /// The section kinds a header may name, for a near miss.
-const SECTION_KINDS: [&str; 17] = [
+const SECTION_KINDS: [&str; 18] = [
     "runner",
+    "bench",
     "schema",
     "seed",
     "branches",
@@ -2606,6 +2632,28 @@ pub fn grammar_text() -> String {
 }
 
 pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
+    parse_case_at(stem, text, None)
+}
+
+/// [`parse_case`] with the name the case's `--- bench` section sweeps bound
+/// to `swept`, one of the sweep's values; `None` binds the first, which is
+/// what a host with a scripted clock runs.
+pub fn parse_case_at(stem: &str, text: &str, swept: Option<u64>) -> Result<Case, CaseErrors> {
+    let bound = if text.contains('\r') {
+        None
+    } else {
+        bench::bind(text, swept).map_err(CaseErrors::one)?
+    };
+    let Some((bound, value)) = bound else {
+        return parse_text(stem, text);
+    };
+    let mut case = parse_text(stem, &bound)?;
+    case.input_text = text.into();
+    case.swept = Some(value);
+    Ok(case)
+}
+
+fn parse_text(stem: &str, text: &str) -> Result<Case, CaseErrors> {
     if text.contains('\r') {
         return Err(CaseErrors::one(
             CaseError::new(
@@ -2674,6 +2722,19 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             (None, &sections[..])
         }
     };
+    let (bench_header, sections) = match sections.first() {
+        Some(first) if first.name == "bench" => (Some(first), &sections[1..]),
+        _ => (None, sections),
+    };
+    let bench = match bench_header.map(|section| bench::parse(&yaml_body(&section.body))) {
+        Some(Ok(bench)) => Some(bench),
+        Some(Err(error)) => {
+            let line = bench_header.map_or(1, |section| section.header_line + 1);
+            errors.push(error.located(line, &lines));
+            None
+        }
+        None => None,
+    };
     let fixture_sections = sections;
     let (fixture, sections) = match parse_fixture(sections) {
         Ok(parts) => parts,
@@ -2714,6 +2775,8 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
         substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
     }
     let mut bound_names: HashSet<String> = HashSet::new();
+    let mut block_refused = false;
+    let mut bench_misplaced = false;
 
     for section in sections {
         let (kind, rest) = match section.name.split_once([' ', '\t']) {
@@ -2799,6 +2862,13 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         "there is no `--- fault` section; a code seam is a `--- seam` with the same `at`, `occurrence` and `scope` and `action: fail` (was `return_error`) or `action: skip`, and a store fault is a `--- seam` naming a store place with `subject:` or a decision seam with a store action",
                     )
                     .fix("write `--- seam` with `at:`, `occurrence:`, `scope:` and `action:` lines"));
+                }
+                "bench" => {
+                    return Err(CaseError::new(
+                        CaseErrorCode::SectionOrder,
+                        "`--- bench` is out of position; it directly follows `--- runner`, once",
+                    )
+                    .fix("move the `--- bench` section directly under the `--- runner` section"));
                 }
                 "runner" | "schema" | "seed" | "branches" => {
                     return Err(CaseError::new(
@@ -3168,16 +3238,18 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                 }
                 "concurrent" => {
                     let line = section.header_line + 1;
-                    let scripted = match rest.trim() {
-                        "" => false,
-                        "scripted" => true,
+                    let (scripted, measured) = match rest.trim() {
+                        "" => (false, false),
+                        "scripted" => (true, false),
+                        "measured" => (false, true),
                         other => {
                             return Err(CaseError::new(
                                 CaseErrorCode::StepKind,
                                 format!(
-                                    "`--- concurrent` is the free-running block and `--- concurrent scripted` the block with an `order:` line, got `--- concurrent {other}`"
+                                    "`--- concurrent` is the free-running block, `--- concurrent measured` the free-running block a bench times and `--- concurrent scripted` the block with an `order:` line, got `--- concurrent {other}`"
                                 ),
-                            ));
+                            )
+                            .fix("write `--- concurrent`, `--- concurrent measured` or `--- concurrent scripted`"));
                         }
                     };
                     if loops.open.is_some() {
@@ -3192,12 +3264,16 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                     if cursor.pending.is_some() {
                         return Err(missing_previous_expect());
                     }
-                    let (lines, order) =
-                        concurrent::parse_block(&section.body, scripted).map_err(|e| {
-                            CaseError::from(e)
-                                .code(CaseErrorCode::BodyShape)
-                                .line_or(line)
-                        })?;
+                    let parsed = if measured {
+                        concurrent::parse_measured_block(&section.body)
+                    } else {
+                        concurrent::parse_block(&section.body, scripted)
+                    };
+                    let (lines, order) = parsed.map_err(|e| {
+                        CaseError::from(e)
+                            .code(CaseErrorCode::BodyShape)
+                            .line_or(line)
+                    })?;
                     substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
                     let sessions = concurrent::build_sessions(lines, &mut needs_indices)?;
                     ordinal += 1;
@@ -3205,6 +3281,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         ordinal,
                         sessions,
                         order,
+                        measured,
                     }));
                 }
                 "params" => {
@@ -3635,6 +3712,8 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             Ok(())
         })();
         if let Err(error) = outcome {
+            block_refused |= kind == "concurrent";
+            bench_misplaced |= kind == "bench";
             errors.push(error.located(section.header_line + 1, &lines));
             substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
             cursor.abandon();
@@ -3682,6 +3761,43 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             .located(loops.header_line, &lines),
         );
     }
+    let measured: Vec<usize> = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Step(Step::Concurrent(block)) if block.measured => Some(block.ordinal),
+            _ => None,
+        })
+        .collect();
+    let block_line = |ordinal: &usize| source_lines.get(ordinal).copied().unwrap_or(last_line);
+    if let Some(second) = measured.get(1) {
+        errors.push(
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "a case holds one `--- concurrent measured` block: one `--- bench` section describes one run",
+            )
+            .fix("keep `measured` on the block the bench times and write the other as `--- concurrent`")
+            .located(block_line(second), &lines),
+        );
+    }
+    match (bench_header, measured.first()) {
+        (Some(section), None) if !block_refused => errors.push(
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "`--- bench` describes the run of a `--- concurrent measured` block and the case holds none",
+            )
+            .fix("mark the block the bench times `--- concurrent measured`, or drop the `--- bench` section")
+            .located(section.header_line + 1, &lines),
+        ),
+        (None, Some(block)) if !bench_misplaced => errors.push(
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "`--- concurrent measured` needs a `--- bench` section, which says how long a measuring host runs it",
+            )
+            .fix("write `--- bench` with `duration_seconds:` directly under `--- runner`")
+            .located(block_line(block), &lines),
+        ),
+        _ => {}
+    }
     for (idx, line) in lines.iter().enumerate() {
         if line.contains("${") && !substitutable_lines.contains(&idx) {
             errors.push(
@@ -3715,6 +3831,8 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
         needs_indices,
         csv_sections,
         external_blob_policy: None,
+        bench,
+        swept: None,
     };
     Ok(case)
 }
@@ -5286,62 +5404,162 @@ pub async fn readback_dealt_rows(
             continue;
         }
         for seq in 0..runs {
-            let index = op.dealt_index(seq);
-            let (table, column, value) = recipe.generated.dealt_key(index)?;
-            let literal = serde_json::to_string(&value).map_err(|e| e.to_string())?;
-            let dealt: Value = serde_json::from_str(&recipe.generated.dealt_row(index)?)
-                .map_err(|e| format!("dealt row {index} is not JSON: {e}"))?;
-            let Some(Value::Object(data)) = dealt.get("data") else {
-                return Err(format!("dealt row {index} carries no `data` object"));
-            };
-            let projection: Vec<String> = data.keys().map(|name| format!("$r.{name}")).collect();
-            let expected = Value::Object(
-                data.iter()
-                    .map(|(name, value)| (format!("r.{name}"), value.clone()))
-                    .collect(),
-            );
-            let source = format!(
-                "query readback() {{ match {{ $r: {table} {{ {column}: {literal} }} }} return {{ {} }} }}",
-                projection.join(", ")
-            );
-            let result = session
-                .query(ReadTarget::branch(&op.branch), &source, "readback", &params)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "readback of the row session `{}` dealt on {}: {e}",
-                        op.label, op.branch
-                    )
-                })?;
-            let rows = result
-                .to_rust_json()
-                .map_err(|e| format!("readback rows failed to render as JSON: {e}"))?;
-            let Value::Array(actual) = rows else {
-                return Err("readback returned a non-array row set".into());
-            };
-            if actual.len() != 1 {
-                return Err(format!(
-                    "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback found {} rows",
-                    op.label,
-                    op.branch,
-                    actual.len()
-                ));
-            }
-            compare_rows(&[expected], &actual, false).map_err(|(message, _)| {
-                format!(
-                    "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback differs: {message}",
-                    op.label, op.branch
-                )
-            })?;
-            host.observe(|| {
-                format!(
-                    "readback: row {index} of session `{}` ({column} = {literal}) is on {} as dealt",
-                    op.label, op.branch
-                )
-            });
+            readback_row(host, session, op, recipe, seq, &params).await?;
         }
     }
     Ok(())
+}
+
+/// The row session `op` dealt on its run `seq`, read by its key and compared
+/// column by column with the row the recipe generated.
+async fn readback_row(
+    host: &impl ExecutionHost,
+    session: &Session,
+    op: &SessionOp,
+    recipe: &Dealt,
+    seq: u64,
+    params: &omnigraph_compiler::ParamMap,
+) -> Result<(), String> {
+    let index = op.dealt_index(seq);
+    let (table, column, value) = recipe.generated.dealt_key(index)?;
+    let literal = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+    let dealt: Value = serde_json::from_str(&recipe.generated.dealt_row(index)?)
+        .map_err(|e| format!("dealt row {index} is not JSON: {e}"))?;
+    let Some(Value::Object(data)) = dealt.get("data") else {
+        return Err(format!("dealt row {index} carries no `data` object"));
+    };
+    let projection: Vec<String> = data.keys().map(|name| format!("$r.{name}")).collect();
+    let expected = Value::Object(
+        data.iter()
+            .map(|(name, value)| (format!("r.{name}"), value.clone()))
+            .collect(),
+    );
+    let source = format!(
+        "query readback() {{ match {{ $r: {table} {{ {column}: {literal} }} }} return {{ {} }} }}",
+        projection.join(", ")
+    );
+    let result = session
+        .query(ReadTarget::branch(&op.branch), &source, "readback", params)
+        .await
+        .map_err(|e| {
+            format!(
+                "readback of the row session `{}` dealt on {}: {e}",
+                op.label, op.branch
+            )
+        })?;
+    let rows = result
+        .to_rust_json()
+        .map_err(|e| format!("readback rows failed to render as JSON: {e}"))?;
+    let Value::Array(actual) = rows else {
+        return Err("readback returned a non-array row set".into());
+    };
+    if actual.len() != 1 {
+        return Err(format!(
+            "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback found {} rows",
+            op.label,
+            op.branch,
+            actual.len()
+        ));
+    }
+    compare_rows(&[expected], &actual, false).map_err(|(message, _)| {
+        format!(
+            "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback differs: {message}",
+            op.label, op.branch
+        )
+    })?;
+    host.observe(|| {
+        format!(
+            "readback: row {index} of session `{}` ({column} = {literal}) is on {} as dealt",
+            op.label, op.branch
+        )
+    });
+    Ok(())
+}
+
+/// How many dealt rows of one session the readback after a measured block
+/// compares column by column; every acknowledged key is looked for.
+pub const READBACK_COMPARED_PER_SESSION: u64 = 8;
+
+/// What the readback after a measured block read: the acknowledged dealt
+/// rows it found by key, and how many of those it compared in full.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Readback {
+    pub rows: u64,
+    pub compared: u64,
+}
+
+/// The readback after a block whose sessions ran many times: `acked[i]` is
+/// how many runs session `i` of the block was acknowledged for. Every dealt
+/// key of those runs must be in one scan of its table's key column, and
+/// [`READBACK_COMPARED_PER_SESSION`] rows spread over each session's runs are
+/// compared column by column, as [`readback_dealt_rows`] compares them all.
+pub async fn readback_acked_rows(
+    host: &impl ExecutionHost,
+    session: &Session,
+    step: &ConcurrentStep,
+    acked: &[u64],
+) -> Result<Readback, String> {
+    let params = build_params(None, &[], None, &Bindings::new())?;
+    let mut scans: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    let mut readback = Readback::default();
+    for (op, &runs) in step.sessions.iter().zip(acked) {
+        let SessionKind::Load(recipe) = &op.kind else {
+            continue;
+        };
+        if runs == 0 || matches!(op.expect, SessionExpect::Error { .. }) {
+            continue;
+        }
+        let (table, column, _) = recipe.generated.dealt_key(op.dealt_index(0))?;
+        let scan = (op.branch.clone(), table.clone());
+        if !scans.contains_key(&scan) {
+            let source = format!(
+                "query readback_keys() {{ match {{ $r: {table} }} return {{ $r.{column} }} }}"
+            );
+            let result = session
+                .query(
+                    ReadTarget::branch(&op.branch),
+                    &source,
+                    "readback_keys",
+                    &params,
+                )
+                .await
+                .map_err(|e| format!("readback of the keys of {table} on {}: {e}", op.branch))?;
+            let Value::Array(rows) = result
+                .to_rust_json()
+                .map_err(|e| format!("readback keys failed to render as JSON: {e}"))?
+            else {
+                return Err("readback returned a non-array row set".into());
+            };
+            let name = format!("r.{column}");
+            let keys = rows
+                .iter()
+                .filter_map(|row| row.get(&name))
+                .map(|key| serde_json::to_string(key).map_err(|e| e.to_string()))
+                .collect::<Result<HashSet<String>, String>>()?;
+            scans.insert(scan.clone(), keys);
+        }
+        let keys = &scans[&scan];
+        for seq in 0..runs {
+            let index = op.dealt_index(seq);
+            let (_, _, value) = recipe.generated.dealt_key(index)?;
+            let literal = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+            if !keys.contains(&literal) {
+                return Err(format!(
+                    "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback found no such row",
+                    op.label, op.branch
+                ));
+            }
+        }
+        readback.rows += runs;
+        let stride = runs.div_ceil(READBACK_COMPARED_PER_SESSION).max(1);
+        let mut seq = 0;
+        while seq < runs {
+            readback_row(host, session, op, recipe, seq, &params).await?;
+            readback.compared += 1;
+            seq += stride;
+        }
+    }
+    Ok(readback)
 }
 
 /// A free-running block under a scripted clock with no gate: every session

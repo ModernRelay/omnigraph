@@ -1,7 +1,10 @@
 //! Scenario-specific GQT authority records; legacy serializers stay unchanged.
 use crate::case::{Backend, ResetMode};
+use crate::concurrent_host::Driver;
 use crate::dataset_cache::{DatasetManifestV1, validate_manifest_evidence};
-use crate::gqt_case::{GqtPointIdentityV1, MAX_EXPANDED_STEPS, Target, validate_point_spec};
+use crate::gqt_case::{
+    BlockRun, GqtPointIdentityV1, MAX_EXPANDED_STEPS, Target, validate_point_spec,
+};
 use crate::gqt_evidence::PreparationProofV2;
 use crate::gqt_runner::{
     GqtRepObservation, RunExecution, sample_evidence_matches, validate_merge_evidence,
@@ -12,8 +15,11 @@ use crate::machine::{MachineIdentityV1, validate_machine_identity};
 use crate::model::{typed_sha256, valid_kebab_id};
 use crate::record::*;
 use crate::store::BaseManifestV1;
-use omnigraph_gqt_core::{Item, Step, StepKind, parse_case};
+use omnigraph_gqt_core::{
+    Case, Item, MAX_DURATION_SECONDS, MAX_WARMUP_SECONDS, Step, StepKind, parse_case,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 const MAX_SERVED_SUT_BYTES: usize = 8 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,7 +287,67 @@ impl GqtRunRecordV1 {
 fn error(message: impl std::fmt::Display) -> RecordError {
     RecordError::new("invalid_gqt_record", "$", message.to_string())
 }
+/// The record of `execution` in the variant its measured step takes: the
+/// concurrent record for a `--- concurrent measured` block, the GQT record
+/// for one operation.
+pub fn build_any(
+    execution: &RunExecution,
+    invocation: InvocationIdentityV1,
+    terminal: Option<AcquisitionTerminalV1>,
+) -> RecordResult<AnyRunRecordV1> {
+    let Some(run) = execution.bound.plan.block else {
+        return build(execution, invocation, terminal).map(AnyRunRecordV1::from);
+    };
+    let record = assemble(execution, invocation, terminal)?;
+    let record = ConcurrentRunRecordV1 {
+        format_version: 1,
+        driver: Driver::ClosedLoop,
+        claim_grade: false,
+        warmup_seconds: run.warmup_seconds,
+        measured_seconds: run.duration_seconds,
+        sweep: execution.bound.identity.sweep.clone(),
+        tokio_unstable: execution
+            .samples
+            .first()
+            .and_then(|sample| sample.concurrent.as_ref())
+            .is_some_and(|observed| observed.tokio_unstable),
+        record,
+    };
+    let proof = validate_concurrent_with_proof(&record)?;
+    validate_parent_samples(execution, &proof)?;
+    Ok(AnyRunRecordV1::Concurrent(Box::new(record)))
+}
+
 pub fn build(
+    execution: &RunExecution,
+    invocation: InvocationIdentityV1,
+    terminal: Option<AcquisitionTerminalV1>,
+) -> RecordResult<GqtRunRecordV1> {
+    let record = assemble(execution, invocation, terminal)?;
+    let proof = validate_with_proof(&record, None)?;
+    validate_parent_samples(execution, &proof)?;
+    Ok(record)
+}
+
+fn validate_parent_samples(
+    execution: &RunExecution,
+    proof: &PreparationProofV2,
+) -> RecordResult<()> {
+    for (index, sample) in execution.samples.iter().enumerate() {
+        validate_sample(
+            sample,
+            &execution.bound,
+            (index + 1) as u32,
+            proof,
+            sample.elapsed_us,
+            true,
+        )
+        .map_err(error)?;
+    }
+    Ok(())
+}
+
+fn assemble(
     execution: &RunExecution,
     invocation: InvocationIdentityV1,
     terminal: Option<AcquisitionTerminalV1>,
@@ -382,7 +448,7 @@ pub fn build(
             _ => return Err(error("inconsistent execution evidence")),
         }
     };
-    let record = GqtRunRecordV1 {
+    Ok(GqtRunRecordV1 {
         format_version: 1,
         invocation,
         run: GqtRunIdentityV1 {
@@ -421,20 +487,7 @@ pub fn build(
                 floor_multiplier_millis: DEFAULT_FLOOR_MULTIPLIER_MILLIS,
             },
         },
-    };
-    let proof = validate_with_proof(&record)?;
-    for (index, sample) in execution.samples.iter().enumerate() {
-        validate_sample(
-            sample,
-            &execution.bound,
-            (index + 1) as u32,
-            &proof,
-            sample.elapsed_us,
-            true,
-        )
-        .map_err(error)?;
-    }
-    Ok(record)
+    })
 }
 fn summarize(samples: &[GqtRepObservation]) -> RecordResult<WallClockSummaryV1> {
     if samples.is_empty() {
@@ -458,9 +511,109 @@ fn summarize(samples: &[GqtRepObservation]) -> RecordResult<WallClockSummaryV1> 
     })
 }
 pub fn validate(r: &GqtRunRecordV1) -> RecordResult<()> {
-    validate_with_proof(r).map(drop)
+    validate_with_proof(r, None).map(drop)
 }
-fn validate_with_proof(r: &GqtRunRecordV1) -> RecordResult<PreparationProofV2> {
+
+/// The record of a run whose measured step is a `--- concurrent measured`
+/// block: the run every repetition was given, over the GQT record's identity
+/// and evidence, whose samples each carry the block's labels. The loop is
+/// closed, so `claim_grade` is false and no field is a throughput or latency
+/// claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConcurrentRunRecordV1 {
+    pub format_version: u32,
+    pub driver: Driver,
+    pub claim_grade: bool,
+    pub warmup_seconds: u32,
+    pub measured_seconds: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sweep: BTreeMap<String, u64>,
+    pub tokio_unstable: bool,
+    pub record: GqtRunRecordV1,
+}
+
+impl ConcurrentRunRecordV1 {
+    /// Whether a comparison may cite this run: a claim-grade driver's record
+    /// only, on the evidence its GQT record needs.
+    pub fn claim_eligible(&self) -> bool {
+        self.claim_grade && self.record.claim_eligible()
+    }
+}
+
+/// The block a concurrent record's samples each observe: its echo parsed at
+/// the record's swept value, and the run the record states.
+struct BlockSpec<'a> {
+    case: Case,
+    run: BlockRun,
+    header: &'a ConcurrentRunRecordV1,
+}
+
+pub fn validate_concurrent(r: &ConcurrentRunRecordV1) -> RecordResult<()> {
+    validate_concurrent_with_proof(r).map(drop)
+}
+
+fn validate_concurrent_with_proof(r: &ConcurrentRunRecordV1) -> RecordResult<PreparationProofV2> {
+    let spec = &r.record.run.run_spec;
+    if r.format_version != 1
+        || r.driver != Driver::ClosedLoop
+        || r.claim_grade
+        || r.sweep != spec.sweep
+        || spec.environment.target != Target::Engine
+        || spec.protocol.reset == ResetMode::Clone
+    {
+        return Err(error(
+            "a concurrent record is a closed-loop run of an embedded point at its swept value, and never claim-grade",
+        ));
+    }
+    let run = BlockRun {
+        warmup_seconds: r.warmup_seconds,
+        duration_seconds: r.measured_seconds,
+    };
+    if !run.in_bounds() {
+        return Err(error(format!(
+            "a concurrent record's warmup is 0 to {MAX_WARMUP_SECONDS} seconds and its measured run 1 to {MAX_DURATION_SECONDS}, got {} and {}",
+            r.warmup_seconds, r.measured_seconds
+        )));
+    }
+    let block = BlockSpec {
+        case: selected_block(spec)?,
+        run,
+        header: r,
+    };
+    validate_with_proof(&r.record, Some(&block))
+}
+
+/// The measured block a point's echo names, parsed alone at the point's
+/// swept value: the labels, kinds and worker counts the samples must show.
+fn selected_block(spec: &GqtPointIdentityV1) -> RecordResult<Case> {
+    let mut text = spec.measured_step.text.trim().to_string();
+    for (name, value) in &spec.sweep {
+        text = text.replace(&format!("${{{name}}}"), &value.to_string());
+    }
+    let body: Vec<(usize, &str)> = text.lines().enumerate().skip(1).collect();
+    let (sessions, _) =
+        omnigraph_gqt_core::concurrent::parse_measured_block(&body).map_err(error)?;
+    let expects: String = sessions
+        .iter()
+        .map(|session| format!("{}: ok\n", session.label))
+        .collect();
+    let input = format!(
+        "# issue: none\n# notes: Durable selected block syntax.\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n--- bench\nduration_seconds: 1\n{text}\n--- expect\n{expects}"
+    );
+    let case = parse_case("record_selected_block", &input).map_err(error)?;
+    if case.measured_block().is_none() || case.steps().len() != 1 {
+        return Err(error(
+            "selected echo is not one `--- concurrent measured` block",
+        ));
+    }
+    Ok(case)
+}
+
+fn validate_with_proof(
+    r: &GqtRunRecordV1,
+    block: Option<&BlockSpec<'_>>,
+) -> RecordResult<PreparationProofV2> {
     validate_invocation(&r.invocation)?;
     let proof = validate_target_evidence(r)?;
     let point = typed_sha256(&r.run.run_spec).map_err(error)?;
@@ -524,7 +677,37 @@ fn validate_with_proof(r: &GqtRunRecordV1) -> RecordResult<PreparationProofV2> {
         if let (Some(logical), Some(control)) = (&s.logical_store_calls, &s.control_store_calls) {
             validate_call_totals(i, logical.manifest, logical.table, control)?;
         }
-        let selected_kind = selected_kind(&spec.measured_step.text)?;
+        let selected_kind = match block {
+            Some(_) => StepKind::Concurrent,
+            None => selected_kind(&spec.measured_step.text)?,
+        };
+        match (block, &s.concurrent) {
+            (None, None) => {}
+            (Some(block), Some(observed)) => {
+                let step = block
+                    .case
+                    .measured_block()
+                    .ok_or_else(|| error("the selected block is missing"))?;
+                if observed.tokio_unstable != block.header.tokio_unstable {
+                    return Err(error(
+                        "a sample ran on another runtime build than the record states",
+                    ));
+                }
+                crate::concurrent_host::validate(
+                    observed,
+                    step,
+                    block.run,
+                    &block.header.sweep,
+                    s.elapsed_us,
+                )
+                .map_err(error)?;
+            }
+            _ => {
+                return Err(error(
+                    "a block observation belongs to a concurrent record, and every sample of one carries it",
+                ));
+            }
+        }
         validate_merge_evidence(s.merge.as_ref(), selected_kind, spec.protocol.attribution)
             .map_err(error)?;
         validate_receipt_treatment(&s.steps, spec.measured_step.ordinal, &spec.cache_condition)
@@ -645,24 +828,28 @@ pub(crate) fn layer_presence(target: Target) -> MeasurementLayerPresenceV1 {
 pub enum AnyRunRecordV1 {
     Legacy(Box<RunRecordV1>),
     Gqt(Box<GqtRunRecordV1>),
+    Concurrent(Box<ConcurrentRunRecordV1>),
 }
 impl AnyRunRecordV1 {
     pub fn invocation(&self) -> &InvocationIdentityV1 {
         match self {
             Self::Legacy(r) => &r.invocation,
             Self::Gqt(r) => &r.invocation,
+            Self::Concurrent(r) => &r.record.invocation,
         }
     }
     pub fn point_id(&self) -> &str {
         match self {
             Self::Legacy(r) => &r.run.point_id,
             Self::Gqt(r) => &r.run.point_id,
+            Self::Concurrent(r) => &r.record.run.point_id,
         }
     }
     pub fn validate(&self) -> RecordResult<()> {
         match self {
             Self::Legacy(r) => validate_run_record(r),
             Self::Gqt(r) => validate(r),
+            Self::Concurrent(r) => validate_concurrent(r),
         }
     }
 }
@@ -684,6 +871,19 @@ impl AuthorityRecord for GqtRunRecordV1 {
     }
     fn validate_authority(&self) -> RecordResult<()> {
         validate(self)
+    }
+}
+impl AuthorityRecord for ConcurrentRunRecordV1 {
+    fn invocation(&self) -> &InvocationIdentityV1 {
+        &self.record.invocation
+    }
+    fn validate_authority(&self) -> RecordResult<()> {
+        validate_concurrent(self)
+    }
+}
+impl From<ConcurrentRunRecordV1> for AnyRunRecordV1 {
+    fn from(r: ConcurrentRunRecordV1) -> Self {
+        Self::Concurrent(Box::new(r))
     }
 }
 impl AuthorityRecord for AnyRunRecordV1 {
