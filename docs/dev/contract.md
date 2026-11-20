@@ -22,18 +22,23 @@ from the two and live in the area guides, never here.
   *Named* line with the term and its source, and place it in
   [Position](#position). Use a term only as its source defines it, and say
   at which scope it holds: one request, one branch, or across branches.
-- **Separate the target from today.** A statement is a target only when an
-  invariant or an accepted RFC decided it; then a row under
-  [Gaps](#gaps) says what happens today. Otherwise the statement is today's
-  behavior, and a row under [Decisions](#decisions) states the open
-  question. What the work asks for and nothing has decided goes in
-  [Direction](#direction).
+- **This contract is the target, and the code is today's behavior.** A
+  statement says what Omnigraph is to guarantee, whether or not the code
+  does yet. Where the code differs, a row under [Gaps](#gaps) says what
+  happens today. To change what Omnigraph does, change the statement here
+  first; the code then follows, and the gap row is removed when it has.
+- **Do not weaken a statement to match the code.** A statement changes
+  because the work is understood differently, never because the engine
+  cannot reach it: an unreached statement is a gap.
+- **Where the target is not yet chosen, say so.** A row under
+  [Decisions](#decisions) names the question and what the code does
+  meanwhile. Choosing the target means writing it as a statement and, if
+  the code differs, adding its gap. What the work asks for and this
+  contract does not yet state is in [Direction](#direction).
 - **Claim nothing as verified.** A statement earns `✓` only from a test
   that names it. Check a statement against the code before writing it.
 - **Keep addresses stable.** Other documents cite `E2`, `write:3` or `D5`.
   Add numbers at the end; never reuse or renumber one.
-- **Change a statement only through an RFC**, and only because the work is
-  understood differently, never because the engine cannot reach it.
 - **Keep it short.** Every agent session loads this page. Evidence, history
   and reasoning about the workload go to [the work](workload.md).
 
@@ -68,8 +73,8 @@ A mark after a statement says how far to trust it.
 |---|---|
 | none | Claimed. No test is named for it yet |
 | `✓` | A named test holds it |
-| `G2` | The target is decided and today differs. The statement is the target; the gap row says what happens today |
-| `D1` | The target is not decided. The statement is today's behavior; the decision row says what is open |
+| `G2` | The code differs from this statement. The statement is the target; the gap row says what happens today |
+| `D1` | The target is not yet chosen. The statement describes what the code does; the decision row says what is open |
 | `?` | Nobody has stated it |
 
 ## Words
@@ -440,10 +445,11 @@ Full rules: [merge](../user/branching/merge.md).
 
 ## Gaps
 
-A gap needs a decided target. "Decided by" names the invariant or accepted
-RFC that set it.
+Where the code differs from this contract. The statement is the target; the
+row says what happens today, and it is removed when the code reaches the
+statement. "See" names the invariant or the design that bears on it.
 
-| Gap | Where | Today | Decided by |
+| Gap | Where | Today | See |
 |---|---|---|---|
 | `G1` | `E4` | On a local filesystem an acknowledged commit survives a crash of the process, not necessarily a power loss. On an object store it is stored for good at success | Invariants deny-list: no acknowledgement before durable visibility |
 | `G2` | `write+write`, `branch+branch` | One writing server or program per cluster is supported. Branch create and delete, schema apply, dropping a proposal and `cleanup` are safe from one only | [Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md), accepted, in progress |
@@ -453,8 +459,9 @@ RFC that set it.
 
 ## Decisions
 
-Each row is a question whose answer would change a statement on this page.
-Until it is decided, the statement is today's behavior.
+Places where this contract has not yet chosen its target. Each row is the
+question, with what the code does meanwhile. Choosing the target turns the
+row into a statement, with a gap if the code differs.
 
 | Decision | Where | Today | Open question |
 |---|---|---|---|
@@ -482,10 +489,11 @@ Until it is decided, the statement is today's behavior.
 Where the work asks this contract to go. The work is several agents sharing
 one typed model to retrieve and update context and to coordinate
 ([the work](workload.md)), and it asks for more than any statement above
-promises. Nothing in this table is promised or decided: each row needs an
-accepted RFC, and until then no statement changes. It is here so that a
-design can move toward it and never away from it. A design that makes a row
-harder to reach says so in its contract line.
+promises. A row here is not yet part of the contract. It becomes part of it
+when it is written as a statement above, with a gap for what the code does
+not do yet. Until then it is here so that a design can move toward it and
+never away from it, and a design that makes a row harder to reach says so
+in its contract line.
 
 | The work asks for | Because | Related |
 |---|---|---|
@@ -594,8 +602,8 @@ Contract: keeps E2, write.changes; closes G2; decides D1
 |---|---|
 | `keeps` | The change touches this statement and it still holds |
 | `closes` | The gap is gone. Delete its row; its number is not used again |
-| `decides` | The decision is settled. It becomes a statement, or a gap with its RFC |
-| `changes` | A statement changes. Write the RFC first |
+| `decides` | The target is chosen. The decision row becomes a statement, with a gap if the code differs |
+| `changes` | A statement changes. Change it on this page in the same pull request, before the code that follows it |
 
 A cost claim also names the activity it is for in [the work](workload.md).
 

@@ -214,8 +214,9 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 
 - Give every design, RFC and non-trivial change its
   [contract line](docs/dev/contract.md#citing): the statements it keeps, the
-  gaps it closes, the decisions it settles and the statements it changes. A
-  changed statement needs an RFC first. A change tuned for a different
+  gaps it closes, the decisions it settles and the statements it changes. The
+  contract is the target and the code is today's behavior: to change what
+  Omnigraph does, change the contract statement in the same pull request. A change tuned for a different
   workload revises [the work](docs/dev/workload.md) in the same pull request.
 - Preserve unrelated work in a dirty tree. Never discard user changes.
 - Make the smallest coherent change that closes the behavior and test surface.

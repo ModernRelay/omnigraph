@@ -156,8 +156,8 @@ not belong there.
 ## Asked, not decided
 
 New capabilities the work asks for. None is a statement in
-[the contract](contract.md) yet, and none becomes one without an accepted
-RFC. The contract's own [open decisions](contract.md#decisions) are questions
+[the contract](contract.md) yet. One becomes part of the contract when it is
+written there as a statement, with a gap for what the code does not do yet. The contract's own [open decisions](contract.md#decisions) are questions
 about statements that already exist; the work asks for several of those too
 (`D2`, `D4` to `D8`, `D13`).
 
