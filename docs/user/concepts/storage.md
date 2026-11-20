@@ -127,6 +127,11 @@ checked against the object generation (`x-goog-if-generation-match`), so
 graph publication keeps the same single-winner guarantee as on S3. Google
 limits writes to one object name to about one per second.
 
+Running one writer process per graph remains the operator's responsibility.
+An embedded program can fence other writers out of a branch with
+`claim_branch_writer`, as on any backend; see
+[writer epoch](../operations/troubleshooting.md#writer-epoch).
+
 For deployment, server boot, and cloud-specific safety requirements, see
 [Deployment](../deployment.md).
 
