@@ -88,15 +88,16 @@ An unbound traversal has set semantics for endpoint pairs. Binding the edge
 returns one result per matching edge, so parallel edges remain distinct. An
 edge-type binding, `$k: Knows`, binds every edge of the type, one row per edge
 with neither end named: `match { $k: Knows } where $k.since > 2020 return {
-$k.@src, $k.@dst }`. Edge
-bindings are available only for a single hop. Alternatives share the same
-deduplication and shortest-distance search across all members. Bound edges are
-identified by canonical type plus ID, so equal IDs in different types remain
-distinct: `count(distinct $k)` counts them apart, and `order { $k }` sorts by
-type, then ID. An undirected self-loop appears once. A bound edge is read
-through its fields (`$k.@id`, `$k.@src`, `$k.@dst`, `$k.@type` and its
-properties); a result has no edge object, so `return { $k }` is not lowered in
-this release (`T86`).
+$k.@src, $k.@dst }`. Edge bindings are available only for a single hop.
+Alternatives share the same deduplication and shortest-distance search across
+all members. Bound edges are identified by canonical type plus ID, so equal
+IDs in different types remain distinct: `count(distinct $k)` counts them
+apart, and `order { $k }` sorts by type, then ID. An undirected self-loop
+appears once. A bound edge is read through its fields (`$k.@id`, `$k.@src`,
+`$k.@dst`, `$k.@type` and its properties), or whole: `return { $k }` gives its
+edge object, `@id`, `@src`, `@dst`, then `@type` when the binding selects more
+than one edge type, then the properties the binding declares other than Blob
+and Vector, a null one left out as in a node object.
 
 A bound edge property must exist on every member with the same base value type.
 Scalar/list shape and Vector dimensions must agree. It is nullable if any
@@ -225,10 +226,8 @@ either end, is `T90`: it would drop every row where the name is null and turn
 the outer join into an inner one. The fix moves the triple inside the
 optional; drop the optional instead where only its matches were meant. A
 later optional, a block, an inline read and a `where` read the name and keep
-the row. A node the optional introduces, returned whole (`return { $c }`), is
-its node object where the optional matched and a null object where it matched
-nothing: JSON leaves the column out of that row, as it leaves out every null
-cell, and the result column is nullable (`c: Company?`).
+the row. A node or edge it introduces, returned whole (`return { $c }`), is a
+null object where it matched nothing, left out of that JSON row like any null.
 
 A read's plan budget bounds the work of compiling and planning it: every
 node of its plan built, every expression typed, each scope's copy of the

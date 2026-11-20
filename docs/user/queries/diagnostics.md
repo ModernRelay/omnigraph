@@ -296,22 +296,20 @@ a later release lowers it.
 | Refused |
 |---|
 | An `rrf` whose arms read a name of the enclosing scope |
-| An edge reference returned whole |
 | A `Blob` read from a row in an assignment (a write group whose selection reads a type an earlier group changes is `T91`: every group selects on the write's snapshot) |
 | A read that calls itself (`Fix`) |
 
 ```text
-query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }
+query reachable($from: String) { match { from union({ match { $p: Person } where $p.handle = $from return { $p as q } }, { match { from reachable($from), $r: Person, $q knows $r } return { $r as q } }) } return distinct { $q } }
 ```
 
 ```text
-error[T86]: type error: T86: `q`: this release does not support an edge reference returned whole (the result has no edge object) yet
-  --> line 1, column 80
+error[T86]: type error: T86: `reachable`: this release does not support a read that calls itself (`Fix`) yet
+  --> line 1, column 42
 ```
 
 `T86` prints a fix only where a form the planner runs has the same rows and
-result columns, and none above has one: returning an edge's fields instead of
-the edge, for example, changes the result columns.
+result columns, and none above has one.
 `P006` is not a refusal: see [Planner codes](#planner-codes).
 
 ## Planner codes

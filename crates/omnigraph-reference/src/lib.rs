@@ -426,10 +426,65 @@ impl<'a> Interpreter<'a> {
                     ty,
                     Ty::Value(p) if matches!(p.scalar, ScalarType::F32 | ScalarType::Vector(_))
                 );
-                out.insert(name.clone(), self.json_as(&value, f32_column));
+                let json = match (ty, &value) {
+                    (Ty::Edge { type_name, .. }, Value::Ref { .. }) => {
+                        self.edge_object(&value, type_name)
+                    }
+                    _ => self.json_as(&value, f32_column),
+                };
+                out.insert(name.clone(), json);
             }
         }
         Json::Object(out)
+    }
+
+    /// An edge returned whole, from a binding over `selection` (its edge
+    /// types joined by `|`): the RFC's edge object, `@id`, `@src` and
+    /// `@dst`, then `@type` where the binding can match more than one edge
+    /// type, then the properties the binding declares (those every selected
+    /// type declares with one scalar type), Blob and Vector left out, a null
+    /// one left out as a node object leaves it.
+    fn edge_object(&self, value: &Value, selection: &str) -> Json {
+        let Value::Ref { type_name, id, .. } = value else {
+            return self.json(value);
+        };
+        let mut types: Vec<&str> = Vec::new();
+        for t in selection.split('|') {
+            if !types.contains(&t) {
+                types.push(t);
+            }
+        }
+        let declared = |property: &str| {
+            let mut kinds = types.iter().map(|t| {
+                self.catalog
+                    .edge_types
+                    .get(*t)
+                    .and_then(|edge| edge.properties.get(property))
+                    .map(|p| (p.scalar, p.list))
+            });
+            let Some(Some(first)) = kinds.next() else {
+                return false;
+            };
+            !matches!(first.0, ScalarType::Vector(_) | ScalarType::Blob)
+                && kinds.all(|k| k == Some(first))
+        };
+        let mut obj = Map::new();
+        obj.insert("@id".into(), Json::String(id.clone()));
+        if types.len() > 1 {
+            obj.insert("@type".into(), Json::String(type_name.clone()));
+        }
+        if let Some(edge) = self.graph.edge(type_name, id) {
+            if let Some((src, dst)) = &edge.ends {
+                obj.insert("@src".into(), Json::String(src.clone()));
+                obj.insert("@dst".into(), Json::String(dst.clone()));
+            }
+            for (k, v) in &edge.props {
+                if !v.is_null() && declared(k) {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        Json::Object(obj)
     }
 
     /// A value as JSON; an `F32` column's numbers at their shortest `F32`

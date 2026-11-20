@@ -23,8 +23,8 @@ pub fn result_schema(catalog: &Catalog, read: &CoreRead) -> Result<SchemaRef> {
     Ok(Arc::new(Schema::new(fields)))
 }
 
-/// One result field of type `ty`: a value's Arrow type, or a node's object
-/// of its members.
+/// One result field of type `ty`: a value's Arrow type, or a node's or an
+/// edge's object of its members.
 pub fn projection_field(catalog: &Catalog, name: &str, ty: &ExprType) -> Result<Field> {
     let (data_type, nullable) = match ty {
         ExprType::Value { nullable, .. } => (
@@ -37,10 +37,14 @@ pub fn projection_field(catalog: &Catalog, name: &str, ty: &ExprType) -> Result<
                 "internal exact integer cannot be a result column".into(),
             ));
         }
-        ExprType::Edge { type_name, .. } => {
-            return Err(CompilerError::Plan(format!(
-                "edge reference `{type_name}` cannot be a result column"
-            )));
+        ExprType::Edge {
+            type_name,
+            nullable,
+        } => {
+            let fields = catalog.edge_object_fields(type_name).ok_or_else(|| {
+                CompilerError::typed(T51, format!("edge `{type_name}` not found in catalog"))
+            })?;
+            (DataType::Struct(fields), *nullable)
         }
         ExprType::Node {
             type_name,

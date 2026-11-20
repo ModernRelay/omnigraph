@@ -65,11 +65,6 @@ const B_IN_PROGRESS: &[InProgress] = &[
         text: "query q($s: String, $v: Vector(3)) { match { $p: Person, let $pop = { match { $d: Doc, $p authored $d } return { $d } }, from rrf(bm25($pop, $d.body, $s), nearest($pop, $d.embedding, $v, k: 3)) as $f } return { $p.name, $d.title, $f } }",
     },
     // `ReadShape`: return items and order keys.
-    InProgress {
-        construct: "an edge reference returned whole",
-        site: "an edge reference returned whole (the result has no edge object)",
-        text: "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }",
-    },
     // `WriteShape`.
     InProgress {
         construct: "an assignment reading a Blob from a row",
@@ -157,10 +152,10 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name } }",
                 Lowers,
             ),
-            // "an edge reference returned whole"
+            // An edge reference returned whole: its edge object.
             (
                 "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }",
-                Refused("B"),
+                Lowers,
             ),
             (
                 "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $k.@id, $k.@src, $k.@dst } order { $k } }",
@@ -823,11 +818,12 @@ fn every_refusal_of_the_shapers_is_pinned() {
 #[test]
 fn t86_is_at_the_construct() {
     let refused = |text: &str| outcome(text).expect_err("refused");
-    // An edge reference returned whole is refused at its return item.
+    // A list of references, a later stage's, is refused at its return
+    // item.
     let text =
-        "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }";
+        "query q() { match { $p: Person, $p knows $f } return { $p.name, collect($f) as fs } }";
     let d = refused(text);
-    let item = u32::try_from(text.rfind("$k").unwrap() + 1).unwrap();
+    let item = u32::try_from(text.rfind("collect").unwrap() + 1).unwrap();
     assert_eq!(d.position.map(|p| p.column), Some(item), "{d}");
 }
 

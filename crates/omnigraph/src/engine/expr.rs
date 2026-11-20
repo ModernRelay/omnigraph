@@ -102,9 +102,15 @@ impl ProjectionContext {
             ExprType::ExactInteger { .. } => Err(OmniError::manifest_internal(
                 "internal exact integer cannot be a public result field",
             )),
-            ExprType::Edge { .. } => Err(OmniError::manifest_internal(
-                "an edge reference cannot be a public result field",
-            )),
+            ExprType::Edge {
+                type_name,
+                nullable,
+            } => {
+                let fields = self.catalog.edge_object_fields(type_name).ok_or_else(|| {
+                    OmniError::manifest_internal(format!("edge type {type_name} is absent"))
+                })?;
+                Ok(Field::new(name, DataType::Struct(fields), *nullable))
+            }
             ExprType::Node {
                 type_name,
                 nullable,
@@ -717,6 +723,19 @@ pub(super) fn evaluate_projection(
             let arr = typed_literal_to_array(lit, ty, wide_batch.num_rows())?;
             Ok((name.clone(), arr))
         }
+        IRExpr::Variable(
+            name,
+            omnigraph_compiler::types::ExprType::Edge {
+                type_name,
+                nullable,
+            },
+        ) => {
+            let members = ctx.catalog.edge_object_members(type_name).ok_or_else(|| {
+                OmniError::manifest_internal(format!("edge type {type_name} is absent"))
+            })?;
+            let node = result_object(wide_batch, name, &members, *nullable)?;
+            Ok((name.clone(), node))
+        }
         IRExpr::Variable(name, ty) => {
             let node_type = ctx.node_type(name).ok_or_else(|| {
                 OmniError::manifest(format!("variable '{}' is not a node binding", name))
@@ -735,43 +754,12 @@ pub(super) fn evaluate_projection(
                     "node variable type disagrees with its binding",
                 ));
             }
-            let wide_schema = wide_batch.schema();
-            let mut fields: Vec<Field> = Vec::new();
-            let mut columns: Vec<ArrayRef> = Vec::new();
-            // A node an `optional` introduces is null where its identity is:
-            // the rows the `optional` kept without a match.
-            let mut absent = None;
-            for (member, field) in node_type.node_object_members() {
-                let col_name = format!("{}.{}", name, field.name());
-                let (idx, _wide_field) =
-                    wide_schema.column_with_name(&col_name).ok_or_else(|| {
-                        OmniError::manifest(format!(
-                            "column '{}' not found in wide batch",
-                            col_name
-                        ))
-                    })?;
-                let col = wide_batch.column(idx).clone();
-                if *nullable && member == "@id" {
-                    absent = col.logical_nulls();
-                }
-                if col.data_type() != field.data_type()
-                    || !field.is_nullable() && !*nullable && col.null_count() != 0
-                {
-                    return Err(OmniError::manifest_internal(format!(
-                        "node member {col_name} violates its declared field"
-                    )));
-                }
-                fields.push(Field::new(
-                    member,
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                ));
-                columns.push(col);
-            }
-            // A null row of a non-null member outside `absent` fails here.
-            let node = StructArray::try_new(Fields::from(fields), columns, absent)
-                .map_err(OmniError::arrow_internal)?;
-            Ok((name.clone(), Arc::new(node) as ArrayRef))
+            let members: Vec<(String, Field)> = node_type
+                .node_object_members()
+                .map(|(member, field)| (member.to_string(), field.as_ref().clone()))
+                .collect();
+            let node = result_object(wide_batch, name, &members, *nullable)?;
+            Ok((name.clone(), node))
         }
         IRExpr::Binary { .. }
         | IRExpr::Not(_, _)
@@ -785,6 +773,47 @@ pub(super) fn evaluate_projection(
             expr
         ))),
     }
+}
+
+/// A reference's object: one member per `(member, field)` of `members`, read
+/// from the binding's column `<variable>.<field>`. A reference an `optional`
+/// introduces (`nullable`) is a null object where its identity is null, the
+/// rows the `optional` kept without a match; a null in a member the field
+/// declares non-null anywhere else fails.
+fn result_object(
+    wide_batch: &RecordBatch,
+    variable: &str,
+    members: &[(String, Field)],
+    nullable: bool,
+) -> Result<ArrayRef> {
+    let mut fields = Vec::with_capacity(members.len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(members.len());
+    let mut absent = None;
+    for (member, field) in members {
+        let col_name = format!("{variable}.{}", field.name());
+        let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
+            OmniError::manifest(format!("column '{col_name}' not found in wide batch"))
+        })?;
+        if nullable && member == "@id" {
+            absent = col.logical_nulls();
+        }
+        if col.data_type() != field.data_type()
+            || !field.is_nullable() && !nullable && col.null_count() != 0
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "object member {col_name} violates its declared field"
+            )));
+        }
+        fields.push(Field::new(
+            member,
+            field.data_type().clone(),
+            field.is_nullable(),
+        ));
+        columns.push(col.clone());
+    }
+    let object = StructArray::try_new(Fields::from(fields), columns, absent)
+        .map_err(OmniError::arrow_internal)?;
+    Ok(Arc::new(object))
 }
 
 /// What `count($var)` counts: the binding's identity column, one per row and

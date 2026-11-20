@@ -306,6 +306,16 @@ pub trait PlanSource {
         })
     }
 
+    /// The object fields `return { $k }` projects for an edge binding of
+    /// `type_name` (its selection's types joined by `|`):
+    /// `Catalog::edge_object_fields`. A source that serves no queries keeps
+    /// the default.
+    fn edge_object_fields(&self, type_name: &str) -> Result<arrow_schema::Fields, PlanError> {
+        Err(PlanError::Unresolved {
+            detail: format!("this plan source serves no edge object (asked for `{type_name}`)"),
+        })
+    }
+
     /// Whether the source's scanner can evaluate this GQ conjunct itself, so
     /// the placement pass may move it out of the in-memory arm. The engine
     /// answers from its lowering; a test source pushes everything.

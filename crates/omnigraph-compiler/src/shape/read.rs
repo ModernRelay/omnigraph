@@ -1648,15 +1648,6 @@ impl<'a> Shaper<'a> {
                     "result column `{column}` is not a column of the extended rows, which the type checker's final projection always reads"
                 )));
             };
-            // The public result has a node object and no edge object: an
-            // edge reference is read through its fields (`$k.@id`, `$k.@src`,
-            // `$k.@dst`, `$k.@type`, its properties).
-            if let Some(IRExpr::Variable(_, ExprType::Edge { .. })) = items.get(hidden) {
-                return Err(self.refuse_at(
-                    "an edge reference returned whole (the result has no edge object)",
-                    Construct::ReturnItem(i),
-                ));
-            }
             let item = match (items.get(hidden), aggs.get(hidden)) {
                 (Some(e), _) => self
                     .item(e, &aggs, ranking.as_ref())

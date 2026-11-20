@@ -253,8 +253,8 @@ Rules: composes with the undirected form (`$a $w:<related> $b`) and inside
 parallel edges between the same endpoints appear individually (unbound
 traversals keep set-of-pairs semantics). Rejected with `T23`: binding a
 `{min,max}` multi-hop, or rebinding a taken variable name (inside a block, an
-`optional` or an inline read that is `T68`). Returning bare `$w` is `T86`:
-return its fields (`$w.@id`, `$w.@src`, a property) instead.
+`optional` or an inline read that is `T68`). Returning bare `$w` gives its
+edge object (below).
 
 Composes with hop bounds (`$a <knows>{1,3} $b`) and `not exists { }` ("no edge in
 either direction"). Asymmetric edges (e.g. `Comment -> Issue`) are rejected at
@@ -330,9 +330,12 @@ means a declared user property named `id`; it is not an identity shorthand.
 `return { $p }` returns one column named `p` containing the node object:
 `{"@id":"alice","name":"Alice"}`. It includes declared properties except
 Blob and Vector properties. Project `$p.@id` for just the identity or
-`$p.embedding` for a vector; Blob values require the Blob API. Bare edge
-bindings cannot be projected (`T86`); return their fields (`$k.@id`, `$k.@src`,
-`$k.@dst`, `$k.@type`, properties).
+`$p.embedding` for a vector; Blob values require the Blob API. `return { $k }`
+over an edge binding returns its edge object:
+`{"@id":"e1","@src":"alice","@dst":"bob","since":2020}`, with `@type` after
+`@dst` when the binding selects several edge types (`$k:(knows | likes)`), then
+the properties every selected type declares, Blob and Vector left out. A node
+or edge an `optional` introduces is left out of a row it did not match.
 
 Each projection needs a distinct result column name (`T25`): use aliases when
 expressions would collide. Aliases can be used in `order`, including after a
@@ -772,7 +775,7 @@ Rewrite what it leaves from the fix and this map:
 Moved codes: `T2` (unknown property in a read) and `T11` in a write's `where`
 are `T6`; list equality in braces `T3` is `T7`; an aggregate call in a filter
 (`T7`, `T44`) is `T8`; a block compared with a value of another type (`T40`)
-is `T7`; a bare edge binding returned (`T23`) is `T86`, and a full-text call
+is `T7`; a bare edge binding returned (`T23`) runs as its edge object, and a full-text call
 in `return` (`T35`) runs as a Boolean; `T32`/`T33`/`T54` are `T65`; `T58` is `T9`;
 `T59` is `T75`; a bare name (`T45`, `T36`) is `Q018`; `lint` parse refusals
 carry their own `Q…` code instead of `Q000`. A read named after a function

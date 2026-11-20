@@ -1,4 +1,4 @@
-//! Declared result columns and the named node objects they contain.
+//! Declared result columns and the named node and edge objects they contain.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -9,31 +9,48 @@ use omnigraph_compiler::types::{ExprType, ScalarType};
 
 use crate::{PhysicalNode, PhysicalPlan, PlanError, PlanSource};
 
-/// A named node object's complete member type, captured from the compiler
-/// catalog when a result node is planned. Saved plans retain the declaration.
+/// A named result object's complete member type, captured from the compiler
+/// catalog when a result node is planned: a node's, named by its type, or an
+/// edge's, named `edge` and its selection's types (`edge Knows|Likes`).
+/// Saved plans retain the declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeObjectType {
     pub type_name: String,
     pub fields: Fields,
 }
 
+/// The name of the object declaration a reference result column reads.
+fn object_name(ty: &ExprType) -> Option<String> {
+    match ty {
+        ExprType::Node { type_name, .. } => Some(type_name.clone()),
+        ExprType::Edge { type_name, .. } => Some(format!("edge {type_name}")),
+        ExprType::Value { .. } | ExprType::ExactInteger { .. } => None,
+    }
+}
+
 pub(crate) fn node_object_types(
     returns: &[IRProjection],
     source: &dyn PlanSource,
 ) -> Result<Vec<NodeObjectType>, PlanError> {
-    let names: BTreeSet<&str> = returns
+    let objects: BTreeMap<String, &ExprType> = returns
         .iter()
-        .filter_map(|projection| match &projection.ty {
-            ExprType::Node { type_name, .. } => Some(type_name.as_str()),
-            ExprType::Value { .. } | ExprType::Edge { .. } | ExprType::ExactInteger { .. } => None,
-        })
+        .filter_map(|projection| Some((object_name(&projection.ty)?, &projection.ty)))
         .collect();
-    names
+    objects
         .into_iter()
-        .map(|type_name| {
+        .map(|(name, ty)| {
+            let fields = match ty {
+                ExprType::Edge { type_name, .. } => source.edge_object_fields(type_name)?,
+                ExprType::Node { type_name, .. } => source.node_type(type_name)?.object_fields,
+                ExprType::Value { .. } | ExprType::ExactInteger { .. } => {
+                    return Err(PlanError::Internal(format!(
+                        "result object `{name}` is not a reference"
+                    )));
+                }
+            };
             Ok(NodeObjectType {
-                type_name: type_name.to_string(),
-                fields: source.node_type(type_name)?.object_fields,
+                type_name: name,
+                fields,
             })
         })
         .collect()
@@ -52,7 +69,7 @@ pub(crate) fn return_schema(
             .is_some()
         {
             return Err(PlanError::Internal(format!(
-                "duplicate node object declaration `{}`",
+                "duplicate result object declaration `{}`",
                 object.type_name
             )));
         }
@@ -78,16 +95,14 @@ pub(crate) fn return_schema(
             ExprType::ExactInteger { .. } => {
                 return Err(PlanError::Internal("exact_integer is not a public result type".into()));
             }
-            ExprType::Edge { .. } => {
-                return Err(PlanError::Internal("an edge reference is not a public result type".into()));
-            }
-            // A node an `optional` introduces is a null object on a row the
-            // `optional` kept without a match.
-            ExprType::Node { type_name, nullable } => {
-                let fields = objects.get(type_name.as_str()).ok_or_else(|| {
-                    PlanError::Internal(format!("missing node object declaration `{type_name}`"))
+            // A reference an `optional` introduces is a null object on a
+            // row the `optional` kept without a match.
+            ExprType::Node { nullable, .. } | ExprType::Edge { nullable, .. } => {
+                let name = object_name(&projection.ty).unwrap_or_default();
+                let (name, fields) = objects.get_key_value(name.as_str()).ok_or_else(|| {
+                    PlanError::Internal(format!("missing result object declaration `{name}`"))
                 })?;
-                used.insert(type_name.as_str());
+                used.insert(*name);
                 (DataType::Struct((*fields).clone()), *nullable)
             }
         };
@@ -95,7 +110,7 @@ pub(crate) fn return_schema(
     }).collect::<Result<Vec<_>, PlanError>>()?;
     if used.len() != objects.len() {
         return Err(PlanError::Internal(
-            "unused node object declaration in result node".into(),
+            "unused result object declaration in result node".into(),
         ));
     }
     Ok(Arc::new(Schema::new(fields)))

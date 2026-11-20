@@ -368,6 +368,17 @@ impl PlanSource for QuerySource<'_> {
             .copied()
     }
 
+    fn edge_object_fields(
+        &self,
+        type_name: &str,
+    ) -> std::result::Result<arrow_schema::Fields, PlanError> {
+        self.catalog
+            .edge_object_fields(type_name)
+            .ok_or_else(|| PlanError::Unresolved {
+                detail: format!("unknown edge type `{type_name}`"),
+            })
+    }
+
     /// The scan keeps the catalog's key (`node:<type_name>`), never the
     /// entry's own: a historical read view binds a renamed type's old dataset
     /// under its current name, and the old name is unknown to the catalog.

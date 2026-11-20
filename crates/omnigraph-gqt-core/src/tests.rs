@@ -2326,6 +2326,11 @@ mod shape_section {
         assert!(
             matches!(&lines("p: Person?")[0].shape_type, ShapeType::Node { type_name, nullable: true } if type_name == "Person")
         );
+        // An edge returned whole: `edge` and the binding's types.
+        assert!(
+            matches!(&lines("k: edge Knows|Likes?")[0].shape_type, ShapeType::Node { type_name, nullable: true } if type_name == "edge Knows|Likes")
+        );
+        assert!(shape_refusal("k: edge knows").contains("unknown type"));
         let (field, column) = person_struct();
         let executed = result(vec![field], vec![column]);
         assert_eq!(mismatch(&lines("p: Person"), &executed), None);

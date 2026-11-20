@@ -72,7 +72,12 @@ A query runs against one resolved `ReadTarget`:
    (`ExprType::Node`'s `nullable`, the type checker's own column type) whose
    object the projection marks null where its identity is null; the plan's
    result columns, the executed schema and the compiler's inferred schema
-   agree on the flag. A `from union(…)` whose arms read no outer name is a
+   agree on the flag. An edge returned whole is the RFC's edge object,
+   `Catalog::edge_object_members` (`@id`, `@src`, `@dst`, `@type` where
+   the binding selects several types, then the properties every selected
+   type declares, Blob and Vector left out), read from the binding's own
+   columns; the plan's result node declares it under `edge <types>` beside
+   the node objects. A `from union(…)` whose arms read no outer name is a
    `PatternStep::Union` placed first, each arm its own pipeline from nothing
    with its unreturned names renamed apart, and the logical and physical
    `Union` (a new node kind: no existing one emits the rows of two

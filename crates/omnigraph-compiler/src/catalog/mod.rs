@@ -288,6 +288,75 @@ impl Catalog {
         None
     }
 
+    /// The members of the object `return { $k }` projects for an edge
+    /// binding of `type_name` (its selection's types joined by `|`), each
+    /// with the column of the binding's rows it reads: `@id`, `@src` and
+    /// `@dst`, then `@type` where the binding can match more than one edge
+    /// type, then the properties every selected type declares with one type,
+    /// except `Blob` and `Vector`, in the first type's declared order. `None`
+    /// names an unknown edge type.
+    pub fn edge_object_members(&self, type_name: &str) -> Option<Vec<(String, Field)>> {
+        let mut names: Vec<String> = Vec::new();
+        for name in type_name.split('|') {
+            let edge = self.lookup_edge_by_name(name)?;
+            if !names.contains(&edge.name) {
+                names.push(edge.name.clone());
+            }
+        }
+        let first = self.lookup_edge_by_name(names.first()?)?;
+        let columns = self.system_columns;
+        let mut members = vec![
+            (
+                "@id".to_string(),
+                Field::new(columns.id, DataType::Utf8, false),
+            ),
+            (
+                "@src".to_string(),
+                Field::new(columns.src, DataType::Utf8, false),
+            ),
+            (
+                "@dst".to_string(),
+                Field::new(columns.dst, DataType::Utf8, false),
+            ),
+        ];
+        if names.len() > 1 {
+            members.push((
+                crate::traversal::EDGE_TYPE_META.to_string(),
+                Field::new(crate::traversal::EDGE_TYPE_COLUMN, DataType::Utf8, false),
+            ));
+        }
+        for field in first.arrow_schema.fields() {
+            let name = field.name();
+            if !first.properties.contains_key(name) {
+                continue;
+            }
+            let Some(prop) = crate::traversal::common_edge_property(self, &names, name) else {
+                continue;
+            };
+            if matches!(prop.scalar, ScalarType::Blob | ScalarType::Vector(_)) {
+                continue;
+            }
+            members.push((
+                name.clone(),
+                Field::new(name, prop.to_arrow(), prop.nullable),
+            ));
+        }
+        Some(members)
+    }
+
+    /// The Arrow fields of [`Self::edge_object_members`]' object, each under
+    /// its member name.
+    pub fn edge_object_fields(&self, type_name: &str) -> Option<arrow_schema::Fields> {
+        Some(
+            self.edge_object_members(type_name)?
+                .into_iter()
+                .map(|(member, field)| {
+                    Field::new(member, field.data_type().clone(), field.is_nullable())
+                })
+                .collect(),
+        )
+    }
+
     pub fn is_identity_bound(&self) -> bool {
         matches!(self.identity, CatalogIdentity::Bound(_))
     }

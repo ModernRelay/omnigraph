@@ -10,9 +10,10 @@ use omnigraph_compiler::{PropType, QueryResult, ScalarType};
 
 use crate::BodySpan;
 
-/// A shape line's type: a `.pg` property type, or a node type name for a
-/// bare node projection (`p: Person`), whose column is the node object, with
-/// `?` where an `optional` introduced the node (`c: Company?`).
+/// A shape line's type: a `.pg` property type, or a reference returned whole,
+/// whose column is its object: a node type name (`p: Person`), or `edge` and
+/// the binding's edge types (`k: edge Knows`, `k: edge Knows|Likes`), with
+/// `?` where an `optional` introduced the reference (`c: Company?`).
 #[derive(Debug, Clone)]
 pub(crate) enum ShapeType {
     Scalar(PropType),
@@ -80,14 +81,11 @@ pub(crate) fn parse_shape_body(body: &[(usize, &str)]) -> Result<Vec<ShapeLine>,
                 }
                 ShapeType::Scalar(prop_type)
             }
-            None if is_type_name(type_text) => ShapeType::Node {
-                type_name: type_text.to_string(),
-                nullable: false,
-            },
-            None if type_text.ends_with('?') && is_type_name(&type_text[..type_text.len() - 1]) => {
+            None if is_reference_type(type_text.strip_suffix('?').unwrap_or(type_text)) => {
+                let base = type_text.strip_suffix('?');
                 ShapeType::Node {
-                    type_name: type_text[..type_text.len() - 1].to_string(),
-                    nullable: true,
+                    type_name: base.unwrap_or(type_text).to_string(),
+                    nullable: base.is_some(),
                 }
             }
             None => return Err(format!("line {line_no}: unknown type `{type_text}`")),
@@ -124,8 +122,24 @@ pub(crate) fn is_type_name(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The field names of `type_name`'s node object, or why the catalog has none.
+/// A node type name, or `edge` and one or more edge type names joined by
+/// `|`.
+fn is_reference_type(text: &str) -> bool {
+    match text.strip_prefix("edge ") {
+        Some(types) => types.split('|').all(is_type_name),
+        None => is_type_name(text),
+    }
+}
+
+/// The field names of `type_name`'s node object (an edge's for
+/// `edge <types>`), or why the catalog has none.
 fn node_object_names(catalog: &Catalog, type_name: &str) -> Result<Vec<String>, String> {
+    if let Some(types) = type_name.strip_prefix("edge ") {
+        return catalog
+            .edge_object_fields(types)
+            .map(|fields| fields.iter().map(|f| f.name().clone()).collect())
+            .ok_or_else(|| format!("`{types}` is not an edge type of this schema"));
+    }
     let node_type = catalog
         .query_node_type(type_name)
         .ok_or_else(|| format!("`{type_name}` is not a node type of this schema"))?;
@@ -310,7 +324,19 @@ pub(crate) fn bless_shape_lines(
                 .map(|(name, _)| name)
                 .collect();
             type_names.sort();
-            let Some(type_name) = type_names.first() else {
+            // An edge object, of the one edge type whose object it is.
+            let mut edge_names: Vec<String> = catalog
+                .edge_types
+                .keys()
+                .filter(|name| {
+                    catalog.edge_object_fields(name).is_some_and(|fields| {
+                        fields.iter().map(|f| f.name().clone()).collect::<Vec<_>>() == names
+                    })
+                })
+                .map(|name| format!("edge {name}"))
+                .collect();
+            edge_names.sort();
+            let Some(type_name) = type_names.first().copied().or(edge_names.first()) else {
                 return Err(format!(
                     "column `{}` is a struct that is no node type's object; the shape is not rewritten",
                     field.name()

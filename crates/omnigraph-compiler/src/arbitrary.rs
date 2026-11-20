@@ -1653,12 +1653,11 @@ impl ReadGen<'_, '_, '_> {
                 // A full-text call read as a value.
                 call
             } else if self.c.flag(15) {
-                // A node reference, a null object where an `optional`
-                // introduced it and matched nothing; an edge returned whole
-                // is refused (`T86`).
+                // A node or edge reference, its object, a null object where
+                // an `optional` introduced it and matched nothing.
                 let refs: Vec<&Var> = scope
                     .iter()
-                    .filter(|v| matches!(v.kind, VarKind::Node(_)))
+                    .filter(|v| matches!(v.kind, VarKind::Node(_) | VarKind::Edge(_)))
                     .collect();
                 if refs.is_empty() {
                     self.any_expr(scope, 1)

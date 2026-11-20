@@ -168,6 +168,12 @@ impl PlanSource for Recorded<'_> {
         Ok(spec)
     }
 
+    // An edge object's declaration reads no table: its rows are the
+    // expansion's or the edge scan's, which record their own reads.
+    fn edge_object_fields(&self, type_name: &str) -> Result<arrow_schema::Fields, PlanError> {
+        self.source.edge_object_fields(type_name)
+    }
+
     fn catalogue_fingerprint(&self, type_key: &str) -> Option<String> {
         self.source.catalogue_fingerprint(type_key)
     }

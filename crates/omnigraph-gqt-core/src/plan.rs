@@ -866,7 +866,10 @@ pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Re
                     if let crate::shape::ShapeType::Node {
                         type_name: name, ..
                     } = field.shape_type
-                        && catalog.query_node_type(&name).is_none()
+                        && match name.strip_prefix("edge ") {
+                            Some(types) => catalog.edge_object_fields(types).is_none(),
+                            None => catalog.query_node_type(&name).is_none(),
+                        }
                     {
                         return Err(format!("expect plan: unknown node type `{name}`"));
                     }
