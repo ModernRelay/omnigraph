@@ -176,9 +176,9 @@ impl CapturedStorageBinding {
             }
             (StorageKind::Gcs, _) => {
                 // No captured GCS destination exists yet: `gs://` roots open
-                // unbound, with the native environment chain.
+                // unbound, with the process-captured GOOGLE_* configuration.
                 return Err(binding_error(
-                    "a captured storage destination does not support gs:// roots; open the graph by its gs:// URI",
+                    "gs:// roots are a preview reached only through the embedded Rust API; CLI targets and servers do not support them yet",
                 ));
             }
             _ => {

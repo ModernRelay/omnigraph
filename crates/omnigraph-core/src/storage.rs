@@ -437,16 +437,21 @@ pub fn lance_store_params_for_session(
 /// Azure's public URI deliberately omits the storage account. Passing the
 /// canonical, process-captured selection explicitly keeps Lance's dataset
 /// client on the same account and endpoint as the control-object adapter.
-/// Local, S3 and Google Cloud Storage retain Lance's existing provider
-/// defaults, which read the same environment as their control-object adapters.
+/// Google Cloud Storage passes the process-captured `GOOGLE_*` options the
+/// control-object client is built from, so both clients sign in and connect
+/// alike. Local and S3 retain Lance's existing provider defaults.
 pub fn lance_store_params_for_uri(uri: &str) -> Result<lance::io::ObjectStoreParams> {
     let mut params = lance::io::ObjectStoreParams::default();
-    if storage_kind_for_uri(uri)? == StorageKind::Azure {
-        let azure_root = omnigraph_storage::CanonicalAzureRoot::from_env(uri)?;
+    let options = match storage_kind_for_uri(uri)? {
+        StorageKind::Azure => {
+            Some(omnigraph_storage::CanonicalAzureRoot::from_env(uri)?.lance_storage_options()?)
+        }
+        StorageKind::Gcs => Some(omnigraph_storage::gcs_lance_storage_options()?),
+        StorageKind::Local | StorageKind::S3 => None,
+    };
+    if let Some(options) = options {
         params.storage_options_accessor = Some(Arc::new(
-            lance::io::StorageOptionsAccessor::with_static_options(
-                azure_root.lance_storage_options()?,
-            ),
+            lance::io::StorageOptionsAccessor::with_static_options(options),
         ));
     }
     Ok(params)

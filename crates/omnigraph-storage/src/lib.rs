@@ -22,6 +22,9 @@ use thiserror::Error;
 mod binding;
 pub use binding::{CapturedStorageBinding, StorageDestination, storage_handle_for_binding};
 
+mod gcs;
+pub use gcs::gcs_lance_storage_options;
+
 mod scoped;
 pub use scoped::{OWNED_STORE_NAME, StorageIoScope};
 
@@ -1545,10 +1548,11 @@ impl ObjectStorageAdapter {
         ))
     }
 
-    /// Google Cloud Storage backend scoped to the bucket named in `root_uri`.
-    /// Credentials come from the standard `GOOGLE_*` environment and Google's
-    /// application-default chain (a credentials file, then the metadata
-    /// server), the same configuration Lance reads for its `gs://` datasets.
+    /// Google Cloud Storage backend scoped to the bucket named in `root_uri`,
+    /// built from the process's captured `GOOGLE_*` configuration, the same
+    /// options Lance's `gs://` datasets receive (`gcs_lance_storage_options`).
+    /// Without explicit credentials, Google's application-default chain
+    /// applies: a credentials file, then the instance metadata server.
     pub fn gcs_from_root_uri(root_uri: &str) -> Result<Self> {
         Self::gcs_from_root_uri_with_scope(root_uri, None)
     }
@@ -1560,9 +1564,11 @@ impl ObjectStorageAdapter {
     }
 
     fn gcs_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
+        // URI validity is independent of environment and is checked first.
         let location = parse_gcs_uri(root_uri)?;
+        let environment = gcs::gcs_environment()?;
         let (store, retrying) = remote_clients(
-            gcs_bucket_builder(&location.bucket),
+            gcs::gcs_bucket_builder(&location.bucket, &environment),
             scope.is_some(),
             GoogleCloudStorageBuilder::with_retry,
             |builder| build_gcs_store(builder, root_uri),
@@ -3314,16 +3320,6 @@ fn parse_s3_uri(uri: &str) -> Result<S3Location> {
     })
 }
 
-/// The client builder for one `gs://` bucket. Credentials and service
-/// selection come from `GoogleCloudStorageBuilder::from_env` (the `GOOGLE_*`
-/// variables) and, when none is named there, Google's application-default
-/// chain: `GOOGLE_APPLICATION_CREDENTIALS` or the gcloud ADC file, then the
-/// instance metadata server. Lance's `gs://` provider reads the same
-/// variables, so control objects and datasets reach one service.
-fn gcs_bucket_builder(bucket: &str) -> GoogleCloudStorageBuilder {
-    GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket)
-}
-
 fn build_gcs_store(
     builder: GoogleCloudStorageBuilder,
     root_uri: &str,
@@ -3424,6 +3420,17 @@ fn validate_gcs_bucket_name(bucket: &str, diagnostic_uri: &str) -> Result<()> {
             .any(|component| component.is_empty() || component.len() > 63)
     {
         return Err(invalid());
+    }
+    // Names Google reserves: the `goog` prefix, `google` anywhere, and the
+    // dotted-decimal form of an IP address.
+    if bucket.starts_with("goog")
+        || bucket.contains("google")
+        || bucket.parse::<std::net::Ipv4Addr>().is_ok()
+    {
+        return Err(gcs_configuration_error(format!(
+            "invalid gcs bucket name in '{diagnostic_uri}': Google reserves names that \
+             begin with 'goog', contain 'google' or form an IP address"
+        )));
     }
     Ok(())
 }
@@ -6431,6 +6438,9 @@ mod tests {
             "gs://-bucket/prefix",
             "gs://bucket./prefix",
             "gs://bucket..name/prefix",
+            "gs://goog-bucket/prefix",
+            "gs://my-google-bucket/prefix",
+            "gs://192.168.5.4/prefix",
             "gs://bucket/prefix?token=secret",
             "gs://bucket/prefix#fragment",
             "gs://bucket/a//b",
