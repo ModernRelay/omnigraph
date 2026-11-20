@@ -8769,13 +8769,18 @@ async fn removed_routes_and_legacy_query_fields_refuse_without_graph_effects() {
 #[tokio::test(flavor = "multi_thread")]
 async fn request_dtos_reject_unknown_fields_issue_528() {
     let (_temp, app) = app_for_loaded_graph().await;
+    let before = main_head_commit_id(&app).await;
 
-    // 1. BranchMergeRequest: camelCase "dryRun" or extra field must return 400 Bad Request
+    // 1. BranchMergeRequest: camelCase "dryRun" or extra field must return 400 Bad Request.
+    // Prepare a feature branch that is ahead of main so a merge would advance main if executed.
+    branch_one_commit_ahead(&app, "feature", "Fay").await;
+    assert_eq!(main_head_commit_id(&app).await, before);
+
     let (status, body) = json_response(
         &app,
         json_post(
             "/branches/merge",
-            &json!({"source": "main", "dryRun": true}),
+            &json!({"source": "feature", "dryRun": true}),
         ),
     )
     .await;
@@ -8786,6 +8791,11 @@ async fn request_dtos_reject_unknown_fields_issue_528() {
             .unwrap_or_default()
             .contains("unknown field `dryRun`"),
         "body: {body}"
+    );
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        before,
+        "main must not advance on rejected merge request"
     );
 
     // 2. BranchCreateRequest: unknown field must return 400 Bad Request
@@ -8804,6 +8814,14 @@ async fn request_dtos_reject_unknown_fields_issue_528() {
             .unwrap_or_default()
             .contains("unknown field `unexpected`"),
         "body: {body}"
+    );
+    let (_, branches) = get_json(&app, g("/branches")).await;
+    assert!(
+        !branches["branches"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("new_branch")),
+        "rejected branch must not be present in catalog branches"
     );
 
     // 3. IngestRequest: unknown field must return 400 Bad Request
@@ -8826,6 +8844,11 @@ async fn request_dtos_reject_unknown_fields_issue_528() {
             .contains("unknown field `unexpected`"),
         "body: {body}"
     );
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        before,
+        "main must not advance on rejected ingest request"
+    );
 
     // 4. ChangeBaselineRequest: unknown field must return 400 Bad Request
     let (status, body) = json_response(
@@ -8843,5 +8866,10 @@ async fn request_dtos_reject_unknown_fields_issue_528() {
             .unwrap_or_default()
             .contains("unknown field `unexpected`"),
         "body: {body}"
+    );
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        before,
+        "main must not advance on rejected change baseline request"
     );
 }
