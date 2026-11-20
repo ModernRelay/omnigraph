@@ -18,6 +18,7 @@ use proptest::prelude::*;
 
 use crate::query::value::Literal;
 
+pub mod misprint;
 pub mod search;
 
 /// The strategy of one choice stream of at most `max_len` entries.
