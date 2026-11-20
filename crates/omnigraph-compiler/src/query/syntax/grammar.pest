@@ -271,7 +271,7 @@ from_clause    = { kw_from ~ &("{" | "$" | call_name ~ "(") ~ relation_expr ~ (k
 relation_expr  = { inline_read | call | variable }
 from_paren_rec = { kw_from ~ "(" ~ relation_expr ~ ")" }
 inline_read    = { "{" ~ (read_body ~ &"}" | matchless_read_rec) ~ "}" }
-matchless_read_rec = { (!kw_return ~ element ~ ","?)+ ~ return_clause ~ read_tail* }
+matchless_read_rec = { !kw_match ~ (!kw_return ~ element ~ ","?)+ ~ return_clause ~ read_tail* }
 optional_block = { kw_optional ~ "{" ~ block_body ~ "}" }
 binding = { variable ~ ":" ~ type_name ~ !"{" }                                   // a node or an edge type
 // `$a knows* $b` or `$a knows*{1,3} $b`: Cypher's star on a hop range.
