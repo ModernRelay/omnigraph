@@ -1,0 +1,1 @@
+- A read, diff or change page pinned to a graph commit opens that version directly instead of finding the latest first: one GET fewer on local disk, and one LIST fewer on object stores (inferred).

@@ -1,0 +1,1 @@
+- Embedded hosts can open a clone (`Omnigraph::open_clone`) that reads an unchanging base graph in place and writes only to its own root, on local disk or `s3://`; `omnigraph-gqt --base` opens one.

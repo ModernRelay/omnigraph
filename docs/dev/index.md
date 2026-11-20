@@ -7,15 +7,18 @@ change boundaries, and test ownership. Design history and proposals belong in
 ## Before every change
 
 1. Read [Architectural invariants](invariants.md).
-2. Use the domain map in [Lance alignment](lance.md), then read the complete
-   upstream pages relevant to the task.
-3. Use [Testing](testing.md) to find existing coverage and establish a focused
-   baseline before adding or changing tests.
+2. Use the domain map in [Lance alignment](lance.md), read the complete
+   upstream pages relevant to the task, then read the matching
+   [compatibility fences](lance-fences.md).
+3. Use [Testing](testing.md) and [test ownership](test-ownership.md) to find
+   existing coverage and establish a focused baseline before adding or
+   changing tests.
 
 ## Understand the system
 
 | Topic | Guide |
 |---|---|
+| How to reason about a data system: contract, mechanism, distribution of work | [First principles of data systems](systems.md) |
 | Components, authority, and read/write/control flows | [Architecture](architecture.md) |
 | Non-negotiable guarantees and deny-list | [Architectural invariants](invariants.md) |
 | Query planning, traversal, search, and mutation orchestration | [Execution](execution.md) |
@@ -26,12 +29,14 @@ change boundaries, and test ownership. Design history and proposals belong in
 | Cluster apply, serving snapshots, and writer ownership | [Control plane](control-plane.md) |
 | Bounded graph-batch ingestion | [Ingestion](ingestion.md) |
 | Release, wire, storage, and dependency compatibility | [Versioning](versioning.md) |
+| Lance behaviors Omnigraph depends on, works around or forbids | [Lance compatibility fences](lance-fences.md) |
 
 ## Change and verify it
 
 | Task | Guide |
 |---|---|
-| Find the owning suite, helpers, failpoints, and cloud gates | [Testing](testing.md) |
+| Apply the testing rules and find where a test goes | [Testing](testing.md) |
+| Find the owning suite, helpers, failpoints, commands and cloud gates | [Test ownership](test-ownership.md) |
 | Keep local builds warm across features and worktrees | [Local builds](local-builds.md) |
 | Maintain HTTP naming, OpenAPI coverage, and compatibility | [HTTP API conventions](http-api.md) |
 | Understand PR and release workflows | [CI and releases](ci.md) |

@@ -60,10 +60,16 @@ pub(crate) struct UpgradeArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct OptimizeArgs {
-    /// Only these tables, in this order: `node:<Type>` or `edge:<Type>`,
+    /// Only these datasets, in this order: `node:<Type>` or `edge:<Type>`,
     /// comma-separated or repeated. Default: every table on main.
     #[arg(long, value_delimiter = ',')]
-    pub(crate) tables: Vec<String>,
+    pub(crate) datasets: Vec<String>,
+    /// Direct targets: start a full-catalog run at this table (`node:<Type>`
+    /// or `edge:<Type>`) and wrap around, so every table is still visited
+    /// once. Pass the `resume_at` a bounded run reported to continue where
+    /// it stopped; a server keeps that position itself.
+    #[arg(long, value_name = "TABLE")]
+    pub(crate) start_at: Option<String>,
     /// Stop starting tables once the run has held main's writer gates this
     /// long, and report the rest deferred. The first table always runs.
     /// Accepts Go-style durations: `30s`, `5m`.
@@ -74,7 +80,8 @@ pub(crate) struct OptimizeArgs {
     #[arg(long)]
     pub(crate) no_wait: bool,
     /// Server targets: observe the operation with this id instead of
-    /// submitting a new one.
+    /// submitting a new one. It ran with what it was submitted with, so
+    /// `--datasets` and `--max-gate-hold` are refused beside it.
     #[arg(long, value_name = "ID")]
     pub(crate) operation: Option<String>,
     /// Server targets: stop waiting after this long (`10m`); the operation
@@ -90,12 +97,6 @@ pub(crate) struct RebuildFullTextIndexesArgs {
     /// Branch to rebuild; other branches and historical snapshots are unchanged
     #[arg(long, default_value = "main")]
     pub(crate) branch: String,
-    #[arg(long)]
-    pub(crate) json: bool,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct RepairArgs {
     #[arg(long)]
     pub(crate) json: bool,
 }

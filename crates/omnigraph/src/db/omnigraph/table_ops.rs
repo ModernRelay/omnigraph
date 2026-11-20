@@ -3,6 +3,7 @@ use crate::dataset_index::is_full_text_index;
 use crate::error::{ManifestConflictDetails, ManifestError, missing_graph_type_at_snapshot};
 use crate::seams::{decide_seam, fail};
 use crate::table_store::{RefreshedIndex, TableStore};
+use futures::{StreamExt, TryStreamExt};
 use lance::index::DatasetIndexExt;
 use omnigraph_compiler::types::PropIndexKind;
 
@@ -297,6 +298,12 @@ struct IndexTarget {
     table_branch: Option<String>,
 }
 
+/// One table's staged index work, before it is sorted into the pass.
+enum StagedTarget {
+    Ensure(crate::storage_layer::IndexReconciliation),
+    Rebuilt(crate::storage_layer::StagedHandle),
+}
+
 async fn maintain_indices_for_branch(
     db: &Omnigraph,
     branch: Option<&str>,
@@ -426,24 +433,53 @@ async fn maintain_indices_for_branch(
     // it never becomes a publication target beside productive siblings.
     let mut refreshed_by_table = HashMap::<String, Vec<RefreshedIndex>>::new();
     let mut staged_targets = Vec::with_capacity(targets.len());
-    for target in targets {
-        let Some(ds) = existing_targets.get(&target.table_key) else {
-            continue;
-        };
+    // #1385: tables stage concurrently and share one build budget, so at most
+    // `INDEX_BUILD_CONCURRENCY` BTREE builds run across the whole pass and a
+    // full-text or vector build runs alone. Results are taken in target order,
+    // so pending reports, the failpoint and the publication match a serial
+    // pass.
+    let limit = crate::table_store::MaintenanceBudget::default();
+    let staging = targets.iter().map(|target| {
+        let ds = existing_targets.get(&target.table_key);
         let work = &work_by_table[&target.table_key];
-        let context = |error: OmniError| {
-            error.with_context(format!(
-                "stage index batch on {} ({:?})",
-                target.table_key, work.specs
-            ))
-        };
-        let staged = match mode {
-            IndexMaintenanceMode::Ensure => {
-                let reconciliation = db
+        let limit = &limit;
+        async move {
+            let Some(ds) = ds else {
+                return Ok(None);
+            };
+            let context = |error: OmniError| {
+                error.with_context(format!(
+                    "stage index batch on {} ({:?})",
+                    target.table_key, work.specs
+                ))
+            };
+            match mode {
+                IndexMaintenanceMode::Ensure => db
                     .storage()
-                    .stage_index_reconciliation(ds, &work.specs)
+                    .stage_index_reconciliation(ds, &work.specs, limit)
                     .await
-                    .map_err(context)?;
+                    .map(|reconciliation| Some(StagedTarget::Ensure(reconciliation)))
+                    .map_err(context),
+                IndexMaintenanceMode::RebuildFullText => db
+                    .storage()
+                    .stage_create_indices(ds, &work.specs, limit)
+                    .await
+                    .map(|staged| Some(StagedTarget::Rebuilt(staged)))
+                    .map_err(context),
+            }
+        }
+    });
+    // Observe failures in target order. Dropping the stream on error cancels
+    // outstanding staging; no target has published.
+    let staged_by_target: Vec<Option<StagedTarget>> =
+        futures::stream::iter(staging.collect::<Vec<_>>())
+            .buffered(limit.width())
+            .try_collect()
+            .await?;
+    for (target, staged) in targets.into_iter().zip(staged_by_target) {
+        let staged = match staged {
+            None => continue,
+            Some(StagedTarget::Ensure(reconciliation)) => {
                 for (column, reason) in reconciliation.skipped {
                     pending_by_table
                         .entry(target.table_key.clone())
@@ -459,12 +495,7 @@ async fn maintain_indices_for_branch(
                 refreshed_by_table.insert(target.table_key.clone(), reconciliation.refreshed);
                 reconciliation.staged
             }
-            IndexMaintenanceMode::RebuildFullText => Some(
-                db.storage()
-                    .stage_create_indices(ds, &work.specs)
-                    .await
-                    .map_err(context)?,
-            ),
+            Some(StagedTarget::Rebuilt(staged)) => Some(staged),
         };
         let Some(staged) = staged else {
             existing_targets.remove(&target.table_key);
@@ -719,6 +750,11 @@ fn full_text_columns(specs: &[crate::storage_layer::IndexBuildSpec]) -> Vec<&str
         .collect()
 }
 
+decide_seam! {
+    /// The metadata read used to report pending full-text coverage.
+    pub static FULL_TEXT_COVERAGE_READ = ("index.full_text_coverage_read", Unreachable, [Fail]);
+}
+
 /// Full-text coverage index maintenance leaves to the explicit rebuild: a
 /// full-text index whose segments leave a current fragment uncovered, or
 /// whose coverage is unknown. It is observable status, never folded
@@ -736,6 +772,7 @@ pub(super) async fn append_deferred_full_text_indexes(
 ) -> Result<()> {
     use lance::index::DatasetIndexInternalExt;
 
+    fail(&FULL_TEXT_COVERAGE_READ)?;
     let ds = snapshot.dataset();
     let indices = ds.load_indices().await.map_err(OmniError::storage)?;
     let full_text: std::collections::BTreeMap<_, _> = indices
@@ -1310,9 +1347,14 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
         return Ok(work.pending);
     }
 
+    // A legacy single-table call: it owns its own budget.
     let staged = db
         .storage()
-        .stage_create_indices(ds, &work.specs)
+        .stage_create_indices(
+            ds,
+            &work.specs,
+            &crate::table_store::MaintenanceBudget::default(),
+        )
         .await
         .map_err(|error| {
             error.with_context(format!(

@@ -716,9 +716,12 @@ mod tests {
 
     #[test]
     fn a_block_splits_sessions_and_the_script() {
-        let (sessions, order) = parse_block(&body(
-            "w1: query add() {\n    insert Person { name: \"bob\" }\n}\nr1 on feature: query all() { match { $p: Person } return { $p.name } }\norder: w1 park put _versions/, r1, w1 put _versions/\n",
-        ))
+        let (sessions, order) = parse_block(
+            &body(
+                "w1: query add() {\n    insert Person { name: \"bob\" }\n}\nr1 on feature: query all() { match { $p: Person } return { $p.name } }\norder: w1 park put _versions/, r1, w1 put _versions/\n",
+            ),
+            true,
+        )
         .unwrap();
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].label, "w1");
@@ -740,10 +743,55 @@ mod tests {
     }
 
     #[test]
+    fn a_block_without_a_script_or_with_worker_counts_parses_free_running() {
+        let (sessions, order) =
+            parse_block(&body("w1: query a() {}\nw2: query b() {}\n"), false).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(order.is_empty());
+        assert_eq!(sessions[0].workers, 1);
+        let (sessions, order) =
+            parse_block(&body("writer x8 on w${worker}: query a() {}\n"), false).unwrap();
+        assert!(order.is_empty());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].workers, 8);
+        assert_eq!(sessions[0].branch, "w${worker}");
+        use omnigraph_gqt_core::concurrent::resolve_worker;
+        assert_eq!(resolve_worker("w${worker}", 3).unwrap(), "w3");
+        assert_eq!(resolve_worker("main", 3).unwrap(), "main");
+        assert!(
+            resolve_worker("w${i}", 3)
+                .unwrap_err()
+                .contains("only `${worker}`")
+        );
+    }
+
+    #[test]
     fn a_block_refuses_the_shapes_it_cannot_run() {
-        let refused = |text: &str| parse_block(&body(text)).unwrap_err();
+        let refused = |text: &str| {
+            let scripted = text.contains("order:") || text.contains("Order:");
+            parse_block(&body(text), scripted).unwrap_err()
+        };
         assert!(refused("w1: query a() {}\norder: w1\n").contains("at least two sessions"));
-        assert!(refused("w1: query a() {}\nw2: query b() {}\n").contains("needs an `order:` line"));
+        assert!(refused("w1 x1: query a() {}\n").contains("at least two sessions"));
+        assert!(refused("w1 x0: query a() {}\nw2: query b() {}\n").contains("not a worker count"));
+        assert!(parse_block(&body("w1 x9: query a() {}\n"), false).is_ok());
+        assert!(
+            refused("w1 x2: query a() {}\nw2: query b() {}\norder: w2, w1\n")
+                .contains("belongs to a free-running `--- concurrent` block")
+        );
+        assert!(
+            parse_block(
+                &body("w1: query a() {}\nw2: query b() {}\norder: w1\n"),
+                false
+            )
+            .unwrap_err()
+            .contains("takes no `order:` line")
+        );
+        assert!(
+            parse_block(&body("w1: query a() {}\nw2: query b() {}\n"), true)
+                .unwrap_err()
+                .contains("ends with its `order:` line")
+        );
         assert!(
             refused("w1: query a() {}\nw1: query b() {}\norder: w1\n").contains("declared twice")
         );
@@ -824,6 +872,35 @@ mod tests {
                 .unwrap_err()
                 .contains("`ok` or `error:")
         );
+    }
+
+    #[test]
+    fn the_plain_host_runs_every_session_order_once() {
+        use omnigraph_gqt_core::concurrent::{PLAIN_PASSES, Pass, passes, permutation};
+        assert_eq!(passes(2), 2);
+        assert_eq!(passes(3), 6);
+        assert_eq!(passes(4), PLAIN_PASSES);
+        assert_eq!(permutation(3, Pass(0)), [0, 1, 2]);
+        let mut all: Vec<Vec<usize>> = (0..passes(3)).map(|i| permutation(3, Pass(i))).collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 6);
+        assert_eq!(permutation(5, Pass(0)), [0, 1, 2, 3, 4]);
+        for i in 1..passes(5) {
+            let mut shuffled = permutation(5, Pass(i));
+            assert_eq!(
+                shuffled,
+                permutation(5, Pass(i)),
+                "pass {i} is not deterministic"
+            );
+            assert_ne!(
+                shuffled,
+                [0, 1, 2, 3, 4],
+                "pass {i} repeats the declaration order"
+            );
+            shuffled.sort();
+            assert_eq!(shuffled, [0, 1, 2, 3, 4]);
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Lance stores of a local root that is read through a frozen directory.
+//! Lance stores of a root that is read through a frozen directory: a local
+//! directory or an `s3://` prefix.
 
 use std::sync::Arc;
 
@@ -10,9 +11,13 @@ use object_store::path::Path;
 use omnigraph_storage::{ReadThroughMount, StorageIoScope};
 use url::Url;
 
-/// The mount under every local store; when `scope` is given it sits above
-/// the mount, as it sits above a plain local store, so a scoped clone and a
-/// scoped local root differ in the mount alone.
+/// The mount under every local store and under the `s3` store; when `scope`
+/// is given it sits above the mount, as it sits above a plain store, so a
+/// scoped clone and a scoped plain root differ in the mount alone. `s3+ddb`
+/// is not wrapped: its root URIs are refused before a mount is built, since
+/// the storage layer admits `s3://` roots alone. The registry carries the
+/// destination marker, so an external source (an external Blob in any
+/// bucket) is opened through the process registry, never through the mount.
 pub(super) fn registry(
     mount: ReadThroughMount,
     scope: Option<StorageIoScope>,
@@ -20,15 +25,14 @@ pub(super) fn registry(
     let registry = ObjectStoreRegistry::default();
     #[cfg(feature = "dst")]
     super::object_store_seam::hook(&registry);
-    for scheme in ["file", "file-object-store"] {
+    for scheme in ["file", "file-object-store", "s3"] {
         if let Some(inner) = registry.get_provider(scheme) {
-            registry.insert(
-                scheme,
-                Arc::new(MountedProvider {
-                    inner,
-                    mount: mount.clone(),
-                }),
-            );
+            let provider = Arc::new(MountedProvider {
+                inner,
+                mount: mount.clone(),
+            });
+            registry.insert(scheme, provider.clone());
+            registry.insert(super::bound::MARKER, provider);
         }
     }
     if let Some(scope) = scope {
@@ -37,9 +41,9 @@ pub(super) fn registry(
     Arc::new(registry)
 }
 
-/// Builds every local store as `file-object-store`, whose reads and writes
-/// all pass through the object store, with the mount under it: a `file`
-/// store reads data files by direct local path, below any mount.
+/// Builds every local store as `file-object-store` (a `file` store reads data
+/// files by direct local path, below any mount) and the `s3` store of the
+/// mount's bucket as Lance builds it, each with the mount under it.
 #[derive(Debug)]
 struct MountedProvider {
     inner: Arc<dyn ObjectStoreProvider>,
@@ -53,6 +57,11 @@ impl ObjectStoreProvider for MountedProvider {
         mut base_path: Url,
         params: &ObjectStoreParams,
     ) -> lance_core::Result<ObjectStore> {
+        if let Some(bucket) = self.mount.bucket()
+            && base_path.host_str() != Some(bucket)
+        {
+            return self.inner.new_store(base_path, params).await;
+        }
         if base_path.scheme() == "file" {
             base_path = Url::parse(
                 &base_path
@@ -243,6 +252,75 @@ mod tests {
             ),
             "a base-only key is not there on the bare root"
         );
+    }
+
+    /// An external source is opened through the process registry, not the
+    /// clone's: a key under the clone root's prefix that the clone root does
+    /// not hold is not found there, where the mount would have read the base.
+    #[tokio::test]
+    async fn an_external_source_is_not_read_through_the_mount() {
+        let directory = tempfile::tempdir().unwrap();
+        let (base_uri, root_uri) = fixture(directory.path());
+        let storage = storage_read_through(&base_uri, &root_uri).await.unwrap();
+        let context = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
+        let session = context.data_session();
+        let external = crate::lance_access::external_source_registry(&session);
+        assert!(Arc::ptr_eq(
+            &external,
+            &crate::lance_access::store_registry()
+        ));
+        let table = format!("{root_uri}/table");
+        for (registry, through_the_mount) in [(session.store_registry(), true), (external, false)] {
+            let (lance, table_path) =
+                ObjectStore::from_uri_and_params(registry, &table, &ObjectStoreParams::default())
+                    .await
+                    .unwrap();
+            let read = lance.inner.get(&table_path.clone().join("a")).await;
+            assert_eq!(read.is_ok(), through_the_mount, "{table}/a: {read:?}");
+        }
+    }
+
+    /// The mount of a clone root in bucket `dst` is under the `s3` store of
+    /// that bucket alone: the store of `src` for the same key prefix is
+    /// Lance's bare store, so nothing it misses is read from the base.
+    #[tokio::test]
+    async fn a_store_of_another_bucket_is_not_mounted() {
+        let directory = tempfile::tempdir().unwrap();
+        let (base_uri, root_uri) = fixture(directory.path());
+        let storage = storage_read_through(&base_uri, &root_uri).await.unwrap();
+        let mount = storage.read_through_mount().unwrap().in_bucket("dst");
+        let registry = registry(mount, None);
+        let options: std::collections::HashMap<String, String> = [
+            ("aws_endpoint", "http://127.0.0.1:1"),
+            ("aws_region", "us-east-1"),
+            ("aws_access_key_id", "unused"),
+            ("aws_secret_access_key", "unused"),
+            ("aws_allow_http", "true"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(options),
+            )),
+            ..ObjectStoreParams::default()
+        };
+        for (table, mounted) in [
+            ("s3://dst/clone/table", true),
+            ("s3://src/clone/table", false),
+        ] {
+            let (lance, _) =
+                ObjectStore::from_uri_and_params(Arc::clone(&registry), table, &params)
+                    .await
+                    .unwrap();
+            let store = format!("{:?}", lance.inner);
+            assert_eq!(
+                store.contains("ReadThroughStore"),
+                mounted,
+                "{table}: {store}"
+            );
+        }
     }
 
     #[tokio::test]

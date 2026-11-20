@@ -22,7 +22,7 @@ Graph-scoped actions:
 | `branch_claim` | Claim of a branch's [writer epoch](troubleshooting.md#writer-epoch) |
 | `commit_publish` | Publication of an unpublished commit onto its recorded target branch |
 | `commit_drop` | Drop of an unpublished commit |
-| `maintain` | Content-preserving maintenance: optimize, index builds, the full-text rebuild and the repair report |
+| `maintain` | Content-preserving maintenance: optimize, index builds and the full-text rebuild |
 | `reclaim` | Cleanup, which permanently removes table versions and files no retained commit needs |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved graph administration |
@@ -48,12 +48,12 @@ requires `invoke_query` and `read`.
 `maintain` and `reclaim` are separate from `change`, so an automation account
 can compact a graph without the right to write data, and can hold `maintain`
 without the right to delete history. `maintain` is judged on the branch the
-operation maintains (`main` for optimize and the repair report) and takes
+operation maintains (`main` for optimize) and takes
 `branch_scope`; `reclaim` covers every branch's history and takes no branch
 scope. `change` admits no maintenance: index builds and the full-text rebuild
 need `maintain` on their branch. The engine checks these actions whenever a policy is installed on the
-graph handle; the direct maintenance commands load no policy (see
-[maintenance](maintenance.md)).
+graph handle, which a direct command on a cluster graph does (see
+[direct writes](#actor-identity)).
 
 ## Bind a policy
 
@@ -69,7 +69,10 @@ policies:
 ```
 
 A bundle may target graph IDs or the `cluster` scope, but not both. Only one
-bundle may bind a given scope. The target `og_catalog` binds the
+bundle may bind a given scope. `cluster validate` refuses a configuration that
+breaks either rule, and the server, direct writes, `access` and the `policy`
+commands refuse an applied state that breaks one, so they always select the
+same bundle for a graph. The target `og_catalog` binds the
 [engine catalogue](../queries/catalogue.md), which every server serves and no
 `graphs:` entry declares: its `read` rule decides catalogue reads with the
 resource `og_catalog` and no branch, and the bundle is applied and activated
@@ -234,6 +237,9 @@ decide; a server without
 authentication allows every graph action and reports `actor_id: null`. The MCP
 `access` tool returns the same body, and `omnigraph access` prints it for a
 server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
+For a direct cluster target it evaluates the policy the cluster applied to the
+graph, which also judges the CLI's direct writes and maintenance there. Direct
+reads are not judged: storage access is their trust boundary.
 
 It reports policy actions, not actor views, so a view can still refuse a
 `change` the policy allows. It does not report `reclaim`, since no server
@@ -254,9 +260,17 @@ For direct CLI writes, actor resolution is:
 
 The version-1 operator document has no actor field.
 
-When a policy is installed, a missing actor is denied. Only the server
-resolves a served write's actor; there `--as` is an assertion the server checks
-against the token ([Assert the actor](server.md#assert-the-actor)).
+A direct write to a cluster graph, through its root target with `--graph`
+or through its own store, installs the policy the cluster applied to that
+graph, the policy `omnigraph access` reports for that target. Every write and
+maintenance command is then judged by it before any effect, and a missing actor is
+denied. A standalone graph has no policy. A direct actor is self-declared, so
+this keeps a storage owner within the policy rather than authenticating them:
+storage permissions remain the trust boundary. A refused direct write, like
+every direct writer, keeps the cluster's admission lock
+([S3 cluster roots](s3-cluster-roots.md)). Only the server resolves a
+served write's actor; there `--as` is an assertion the server checks against
+the token ([Assert the actor](server.md#assert-the-actor)).
 
 Successful graph commits record the actor for the whole atomic change. Inspect
 the audit trail with:
@@ -273,7 +287,7 @@ For static token authentication:
 | Tokens | Policy | Startup and authorization |
 |---|---|---|
 | none | none | Requires explicit `--unauthenticated`; otherwise startup fails |
-| configured | none | Only the `read` action is allowed; all other actions are denied |
+| configured | none | Every action is denied, reads included; `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` lets static tokens `read` ([authentication](server.md#authentication)) |
 | configured | configured | The policy decides each action |
 | none | configured | Startup fails because no request could establish an actor |
 

@@ -47,6 +47,13 @@ edits.
 > `write_max_bytes` setting (default 32 MiB). Raise it for a direct load with
 > `--set write_max_bytes=<bytes>` or `OMNIGRAPH_WRITE_MAX_BYTES`; a served JSONL
 > load uses the server's value and refuses `--set`.
+> These bounds apply per commit. A later `branch merge` validates every commit
+> since its merge base together and keeps their keys (ids, `@key`/`@unique`
+> values, checked edge endpoints, removed ids, not other property values) under
+> a fixed 32 MiB limit that no setting raises: past it the merge fails with
+> `branch-merge retained validation key bytes` and publishes nothing. Merge such a
+> branch in stages: `branch create <stage> --from-commit <id>` at a commit partway
+> along the source, merge `<stage>`, then merge the source.
 > Against a non-local
 > target, `--mode overwrite` (like `cleanup` and `branch delete`) requires
 > explicit `--yes` consent in non-interactive runs.
@@ -267,4 +274,6 @@ omnigraph commit list --target $REPO --branch main --json        # history
 > `lock_id` from `cluster status --target ROOT --json`, then
 > `cluster force-unlock <LOCK_ID> --target ROOT`. Data commands refuse an
 > inline cloud URI; an `s3://` root reaches only cluster and maintenance
-> commands.
+> commands, except a graph shallow clone: `--base s3://BASE` with an inline
+> `s3://` clone root reaches graph reads and writes, and every reopen of the
+> clone passes the same `--base`.

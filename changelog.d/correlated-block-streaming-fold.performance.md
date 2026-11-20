@@ -1,0 +1,1 @@
+- A correlated block that reads the outer row, such as `max($b.x) { … } > 0`, no longer runs out of `query_memory_bytes` on a large fan-out: it folds inner matches batch by batch. Results are unchanged.

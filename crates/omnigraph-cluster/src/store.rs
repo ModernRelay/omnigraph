@@ -1274,13 +1274,7 @@ impl ClusterStore {
                 }
                 None => omnigraph_storage::storage_handle_for_uri_scoped(&self.root, scope.clone()),
             }
-            .map_err(|error| {
-                Diagnostic::error(
-                    "cluster_admission_release_failed",
-                    CLUSTER_LOCK_FILE,
-                    error.to_string(),
-                )
-            })?
+            .map_err(|error| release_unconfirmed(lock_id, error))?
             .adapter()
         } else {
             self.adapter.clone()
@@ -1292,20 +1286,13 @@ impl ClusterStore {
             lock_id,
         )
         .await
-        .map_err(|error| {
-            Diagnostic::error(
-                "cluster_admission_release_failed",
-                CLUSTER_LOCK_FILE,
-                format!("exact settled lock release was not confirmed: {error}"),
-            )
-        });
+        .map_err(|error| release_unconfirmed(lock_id, error));
         if let Some(scope) = release_scope {
             scope.close();
             scope.wait_idle().await;
             if scope.is_uncertain() {
-                return Err(Diagnostic::error(
-                    "cluster_admission_release_failed",
-                    CLUSTER_LOCK_FILE,
+                return Err(release_unconfirmed(
+                    lock_id,
                     "final lock release acknowledgement is uncertain; do not replay it",
                 ));
             }
@@ -1525,4 +1512,18 @@ pub(crate) fn state_lock_held_message(observations: &StateObservations) -> Strin
         ),
         None => "cluster state lock already exists; remove it only after confirming no cluster operation is active".to_string(),
     }
+}
+
+/// The one description of an exact release whose outcome is unknown: the
+/// backend may hold the release or the lock, so the message states neither and
+/// names the admission to compare with `cluster status --json`. Every release
+/// caller (bootstrap, apply, ledger upgrade, server shutdown) passes it through.
+fn release_unconfirmed(lock_id: &str, cause: impl std::fmt::Display) -> Diagnostic {
+    Diagnostic::error(
+        "cluster_admission_release_failed",
+        CLUSTER_LOCK_FILE,
+        format!(
+            "could not confirm release of admission {lock_id}; compare this ID with lock_id in cluster status --json: {cause}"
+        ),
+    )
 }

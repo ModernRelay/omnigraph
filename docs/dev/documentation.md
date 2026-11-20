@@ -1,6 +1,6 @@
 # Documentation guide
 
-Documentation is part of OmniGraph's public contract. Keep each fact in one
+Documentation is part of Omnigraph's public contract. Keep each fact in one
 place, at the narrowest audience that needs it.
 
 ## Content ownership
@@ -65,7 +65,7 @@ but keep day-to-day instructions in user or developer docs.
 
 ## Documentation tools
 
-Use Python 3.10 or newer. From the repository root, create and activate a local
+Use Python 3.11 or newer. From the repository root, create and activate a local
 environment before running the documentation checker or release-note commands:
 
 ```bash
@@ -239,15 +239,12 @@ and an explicit date:
 python3 scripts/release_notes.py snapshot --target HEAD --date 2026-10-01
 ```
 
-Replace the example date with the intended release date. A release that still
-carries a hand-written document names it with `legacy` in `release.json`, a
-durable, already-landed ancestor containing that exact document, and passes
-`--replace-legacy` for its first snapshot. `--replace` regenerates an existing
+Replace the example date with the intended release date. `--replace` regenerates an existing
 generated snapshot before its tag exists. Nothing moves, deletes or stages
 fragments. Preview accepts `--base REF`, `--version vX.Y.Z` and
-`--initial-release` for comparison runs. A snapshot must agree with the version,
-base and legacy source in `release.json`, including `base: null` for an initial
-release. Configuration itself remains part of the recorded inputs.
+`--initial-release` for comparison runs. A snapshot must agree with the version
+and base in `release.json`, including `base: null` for an initial release.
+`legacy` stays `null`. Configuration itself remains part of the recorded inputs.
 
 The snapshot records the selected target SHA, base SHA and note digests. The
 target SHA documents where generation ran; squash merging may remove that
@@ -288,13 +285,10 @@ keep `"format": 2`.
 Advance the workspace package version too: edge builds are refused while it is
 not above the latest stable release ([release workflows](ci.md#release-workflows)).
 
-v0.12.0 through v0.14.0 are format 1, and each snapshot records its format, so
-their snapshots keep that shape. v0.14.0's GitHub release body was replaced
-by hand after publication with a format-2 page; its snapshot is unchanged. v0.12.0's hand-written document was converted
-into two notes, `changelog.d/a-release-highlights.added.md` and
-`changelog.d/a-compatibility-and-behavior-changes.changed.md`. The v0.15.0
-cycle is the first in format 2; a format-2 GitHub release body is the snapshot
-without its heading, status line and provenance comment. The length caps and
+Each snapshot records its format. The snapshots of v0.12.0 through v0.14.0 are
+format 1 and keep that shape; every later cycle is format 2. A format-2 GitHub
+release body is the snapshot without its heading, status line and provenance
+comment. The length caps and
 the release file apply only to a format-2 cycle. Generated snapshots require
 exact verification, and existing published documents and URLs stay unchanged.
 

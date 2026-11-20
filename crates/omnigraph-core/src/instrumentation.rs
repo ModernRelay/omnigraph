@@ -31,6 +31,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::io::WrappingObjectStore;
 
 use crate::error::{OmniError, Result};
+pub use crate::logical_calls::{LogicalCallCounter, LogicalCallCounts};
 use crate::storage::{ListDirBounds, StorageAdapter};
 
 #[macro_export]
@@ -195,10 +196,6 @@ pub struct QueryIoProbes {
     /// always-full-scan regression is structurally visible.
     pub projection_incremental_refreshes: Arc<AtomicU64>,
     pub projection_full_refreshes: Arc<AtomicU64>,
-    /// Physical manifest rows hydrated to classify deletion-vector deltas.
-    /// This must equal the newly deleted offset count; a fragment scan would
-    /// make it grow with the compacted catalog's history instead.
-    pub projection_identity_rows: Arc<AtomicU64>,
     /// Pre-effect reprepares a mutation, a load or a Blob write took after a
     /// `ReadSetChanged` (bounded by `MAX_PRE_EFFECT_REPREPARES`); each such
     /// attempt prepares under the branch's writer gates. The caller sees only
@@ -771,6 +768,11 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    static INDEX_BUILD_PROBES: IndexBuildProbes;
+    static OPTIMIZE_STEP_PROBES: OptimizeStepProbes;
+}
+
+tokio::task_local! {
     static EXTERNAL_PAYLOAD_READ_STALL: ();
 }
 
@@ -906,10 +908,11 @@ where
 /// Deterministic probe for the number of table-fragment staging futures that
 /// are inside their storage call at once.
 ///
-/// `release_after` is a test rendezvous: the first staged tables wait until
-/// that many participants have entered. A concurrency regression therefore
-/// times out instead of passing from result equivalence alone. Production
-/// leaves this task-local unset, so staging only pays the unset lookup.
+/// `release_after` is a test rendezvous: the first `release_after` staged
+/// tables wait until that many participants have entered; later ones pass
+/// straight through. A concurrency regression therefore times out instead of
+/// passing from result equivalence alone. Production leaves this task-local
+/// unset, so staging only pays the unset lookup.
 #[derive(Clone)]
 pub struct StageWriteProbes {
     state: Arc<StageWriteProbeState>,
@@ -919,12 +922,13 @@ struct StageWriteProbeState {
     active: AtomicU64,
     entered: AtomicU64,
     peak: AtomicU64,
+    release_after: u64,
     rendezvous: tokio::sync::Barrier,
 }
 
 impl StageWriteProbes {
-    /// Create a probe that releases each group after `release_after` staged
-    /// tables have entered the storage-call boundary.
+    /// Release the first `release_after` staged tables together once they
+    /// enter the storage-call boundary. Later calls pass through.
     pub fn rendezvous(release_after: usize) -> Self {
         assert!(release_after > 0, "stage-write rendezvous must be non-zero");
         Self {
@@ -932,6 +936,7 @@ impl StageWriteProbes {
                 active: AtomicU64::new(0),
                 entered: AtomicU64::new(0),
                 peak: AtomicU64::new(0),
+                release_after: release_after as u64,
                 rendezvous: tokio::sync::Barrier::new(release_after),
             }),
         }
@@ -970,17 +975,101 @@ pub async fn enter_stage_write_probe() -> Option<StageWriteProbeGuard> {
     let state = STAGE_WRITE_PROBES
         .try_with(|probes| probes.state.clone())
         .ok()?;
-    state.entered.fetch_add(1, Ordering::Relaxed);
+    Some(enter_probe(state).await)
+}
+
+/// The same rendezvous probe around each BTREE index build (#1385): how many
+/// builds of one index pass are inside Lance's builder at once. Full-text and
+/// vector builds run alone and are not counted.
+#[derive(Clone)]
+pub struct IndexBuildProbes(StageWriteProbes);
+
+impl IndexBuildProbes {
+    /// Create a probe whose first `release_after` BTREE builds wait until
+    /// that many have entered.
+    pub fn rendezvous(release_after: usize) -> Self {
+        Self(StageWriteProbes::rendezvous(release_after))
+    }
+
+    /// Number of BTREE builds that entered the probe.
+    pub fn entered(&self) -> u64 {
+        self.0.entered()
+    }
+
+    /// Maximum BTREE builds simultaneously inside the probe.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.0.peak_in_flight()
+    }
+}
+
+/// Run `fut` with the index-build probe installed.
+pub async fn with_index_build_probes<F>(probes: IndexBuildProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    INDEX_BUILD_PROBES.scope(probes, fut).await
+}
+
+pub async fn enter_index_build_probe() -> Option<StageWriteProbeGuard> {
+    let state = INDEX_BUILD_PROBES
+        .try_with(|probes| probes.0.state.clone())
+        .ok()?;
+    Some(enter_probe(state).await)
+}
+
+async fn enter_probe(state: Arc<StageWriteProbeState>) -> StageWriteProbeGuard {
+    let prior = state.entered.fetch_add(1, Ordering::Relaxed);
     // Count only after every participant is released. The first staging call
     // must then remain pending in its real storage future for a second call to
-    // raise the peak above one; parked rendezvous waiters do not count.
-    state.rendezvous.wait().await;
+    // raise the peak above one; parked rendezvous waiters do not count. Only
+    // the first group waits, so a call count that is not a multiple of the
+    // group never leaves a last participant parked.
+    if prior < state.release_after {
+        state.rendezvous.wait().await;
+    }
     let active = state.active.fetch_add(1, Ordering::Relaxed) + 1;
     state.peak.fetch_max(active, Ordering::Relaxed);
-    let guard = StageWriteProbeGuard {
-        state: state.clone(),
-    };
-    Some(guard)
+    StageWriteProbeGuard { state }
+}
+
+/// The same rendezvous probe around each heavy step that holds permits of a
+/// `MaintenanceBudget` (#1384, #1385): a compaction task or one index build.
+/// It counts how many of the run's steps are executing at once, across every
+/// table the run stages.
+#[derive(Clone)]
+pub struct OptimizeStepProbes(StageWriteProbes);
+
+impl OptimizeStepProbes {
+    /// Create a probe whose first `release_after` steps wait until that many
+    /// have entered.
+    pub fn rendezvous(release_after: usize) -> Self {
+        Self(StageWriteProbes::rendezvous(release_after))
+    }
+
+    /// Number of steps that entered the probe.
+    pub fn entered(&self) -> u64 {
+        self.0.entered()
+    }
+
+    /// Maximum steps simultaneously inside the probe.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.0.peak_in_flight()
+    }
+}
+
+/// Run `fut` with the optimize-step probe installed.
+pub async fn with_optimize_step_probes<F>(probes: OptimizeStepProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    OPTIMIZE_STEP_PROBES.scope(probes, fut).await
+}
+
+pub async fn enter_optimize_step_probe() -> Option<StageWriteProbeGuard> {
+    let state = OPTIMIZE_STEP_PROBES
+        .try_with(|probes| probes.0.state.clone())
+        .ok()?;
+    Some(enter_probe(state).await)
 }
 
 pub fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
@@ -1094,15 +1183,6 @@ pub fn record_projection_incremental_refresh() {
 pub fn record_projection_full_refresh() {
     let _ = current(|p| {
         p.projection_full_refreshes.fetch_add(1, Ordering::Relaxed);
-    });
-}
-
-/// Record rows returned by the physical-address take used to classify newly
-/// deleted manifest rows. No-op unless a cost probe is active.
-pub fn record_projection_identity_rows(rows: usize) {
-    let _ = current(|p| {
-        p.projection_identity_rows
-            .fetch_add(rows as u64, Ordering::Relaxed);
     });
 }
 
@@ -1937,8 +2017,9 @@ pub fn record_ordered_cursor_hydration(rows: usize, bytes: u64) {
     });
 }
 
-/// Record one projected scalar validation batch before it is charged to the
-/// operation-wide retention budget. No-op when no test probe is installed.
+/// Record one projected scalar batch merge validation sweeps, by its Arrow
+/// allocation; the sweep keeps only its key columns. No-op when no test probe
+/// is installed.
 pub fn record_merge_validation_batch(projected_bytes: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.validation_scan_batches.fetch_add(1, Ordering::Relaxed);
@@ -2126,42 +2207,53 @@ pub async fn open_dataset(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    let builder = dataset_builder(uri, version, session, &wrapper).await?;
-    let dataset = builder.load().await.map_err(|error| match error {
-        // Only the two shapes cleanup/drop legitimately leaves behind for a
-        // pinned historical read count as reclaimed history:
-        //   - VersionNotFound: the dataset exists, that version was GC'd.
-        //   - DatasetNotFound: the whole dataset directory is gone (a dropped
-        //     table's history fully GC'd).
-        // A bare NotFound is NOT a cleanup shape: it is a live manifest
-        // referencing a missing object — corruption or an object-store
-        // inconsistency — so it must stay loud rather than be masked as a benign
-        // retention gap (which the change feed would surface as a 410 "reset via
-        // baseline"). Residual: this cannot tell a corrupt CURRENT table's
-        // DatasetNotFound from a legitimately dropped historical table's; that
-        // needs caller context (whether the version is the table's current one),
-        // and the baseline handshake the gap points to still fails loudly on
-        // genuine current-state loss.
-        lance::Error::VersionNotFound { .. } | lance::Error::DatasetNotFound { .. }
-            if matches!(version, VersionResolution::At(_)) =>
-        {
-            OmniError::HistoricalVersionReclaimed {
-                published_dataset_version: match version {
-                    VersionResolution::At(version) => version,
-                    VersionResolution::Latest => 0,
-                },
+    load_recorded(uri, version, session, wrapper)
+        .await?
+        .map_err(|error| match error {
+            // Only the two shapes cleanup/drop legitimately leaves behind for a
+            // pinned historical read count as reclaimed history:
+            //   - VersionNotFound: the dataset exists, that version was GC'd.
+            //   - DatasetNotFound: the whole dataset directory is gone (a dropped
+            //     table's history fully GC'd).
+            // A bare NotFound is NOT a cleanup shape: it is a live manifest
+            // referencing a missing object — corruption or an object-store
+            // inconsistency — so it must stay loud rather than be masked as a benign
+            // retention gap (which the change feed would surface as a 410 "reset via
+            // baseline"). Residual: this cannot tell a corrupt CURRENT table's
+            // DatasetNotFound from a legitimately dropped historical table's; that
+            // needs caller context (whether the version is the table's current one),
+            // and the baseline handshake the gap points to still fails loudly on
+            // genuine current-state loss.
+            lance::Error::VersionNotFound { .. } | lance::Error::DatasetNotFound { .. }
+                if matches!(version, VersionResolution::At(_)) =>
+            {
+                OmniError::HistoricalVersionReclaimed {
+                    published_dataset_version: match version {
+                        VersionResolution::At(version) => version,
+                        VersionResolution::Latest => 0,
+                    },
+                }
             }
-        }
-        error => OmniError::storage(error),
-    })?;
-    if let Some(wrapper) = &wrapper {
-        let store = dataset
-            .object_store(None)
-            .await
-            .map_err(OmniError::storage)?;
-        record_probed_store(wrapper, store);
-    }
-    Ok(dataset)
+            error => OmniError::storage(error),
+        })
+}
+
+/// [`open_dataset`] at exactly `version`, resolving only that version (no
+/// listing of `_versions/` for the latest), with every Lance failure reported
+/// as the storage error it is. Unlike `open_dataset(.., At(version), ..)`, a
+/// missing version or dataset is not classified as reclaimed history: for a
+/// control dataset such as `__manifest` the caller already holds the version
+/// from a read, so a miss keeps the classification a latest open followed by
+/// `checkout_version` gives it.
+pub async fn open_dataset_at_version(
+    uri: &str,
+    version: u64,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    load_recorded(uri, VersionResolution::At(version), session, wrapper)
+        .await?
+        .map_err(OmniError::storage)
 }
 
 /// [`open_dataset`] at the latest version of a dataset that may not exist:
@@ -2171,11 +2263,27 @@ pub async fn open_dataset_if_present(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Option<Dataset>> {
-    let builder = dataset_builder(uri, VersionResolution::Latest, session, &wrapper).await?;
+    match load_recorded(uri, VersionResolution::Latest, session, wrapper).await? {
+        Ok(dataset) => Ok(Some(dataset)),
+        Err(lance::Error::DatasetNotFound { .. }) => Ok(None),
+        Err(error) => Err(OmniError::storage(error)),
+    }
+}
+
+/// The one body of every open above: the recorded, wrapped builder, its load,
+/// and the probed store of a loaded dataset. The inner result is Lance's own
+/// load failure, which each caller reports in its own terms; the outer one is
+/// a failure to build the open or to probe the loaded store.
+async fn load_recorded(
+    uri: &str,
+    version: VersionResolution,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<std::result::Result<Dataset, lance::Error>> {
+    let builder = dataset_builder(uri, version, session, &wrapper).await?;
     let dataset = match builder.load().await {
         Ok(dataset) => dataset,
-        Err(lance::Error::DatasetNotFound { .. }) => return Ok(None),
-        Err(error) => return Err(OmniError::storage(error)),
+        Err(error) => return Ok(Err(error)),
     };
     if let Some(wrapper) = &wrapper {
         let store = dataset
@@ -2184,7 +2292,7 @@ pub async fn open_dataset_if_present(
             .map_err(OmniError::storage)?;
         record_probed_store(wrapper, store);
     }
-    Ok(Some(dataset))
+    Ok(Ok(dataset))
 }
 
 /// The builder of [`open_dataset`]: the open is recorded, and the session, the

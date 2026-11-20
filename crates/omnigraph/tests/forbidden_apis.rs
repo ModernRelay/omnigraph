@@ -164,13 +164,9 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "engine/plan_source/scan_access/planning_cost.rs",
 ];
 
-/// Out-of-line modules are parsed as standalone files, so the walker cannot see
-/// their parent's `mod` gate: `#[cfg(test)]` for each entry but
-/// `omnigraph-catalog/namespace.rs`, gated `#[cfg(any(test, feature = "test-util"))]`.
-/// Production gateway and primitive-definition files are deliberately *not*
-/// excluded: their current durable calls are exact-registered below, so adding
-/// a new call inside a trusted implementation still requires an explicit
-/// protocol disposition.
+/// Out-of-line modules are parsed standalone, so the walker cannot see their parent's
+/// `mod` gate: `cfg(test)`, or `any(test, feature = "test-util")` for `namespace.rs` and
+/// `read_through_contract.rs`; gateway and primitive files stay in, exact-registered below.
 const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
     "engine/plan_source/key_tests.rs",
     "engine/plan_source/scan_access/tests.rs",
@@ -178,6 +174,7 @@ const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
     "table_store/staged_tests.rs",
     "omnigraph-catalog/namespace.rs",
     "omnigraph-catalog/tests.rs",
+    "omnigraph-storage/read_through_contract.rs",
     "db/upgrade/tests.rs",
     "db/catalog_tests.rs",
     "core_tests.rs",
@@ -297,9 +294,6 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "refresh"),
     ("db/omnigraph.rs", "cleanup_plan"),
-    // The repair report: it publishes nothing, but `maintain` gates it like
-    // the maintenance writers (`maintenance_entry_points_take_an_actor`).
-    ("db/omnigraph.rs", "repair_report_as"),
     ("db/omnigraph.rs", "cleanup_plan_missing_paths"),
     ("db/omnigraph.rs", "cleanup_plan_path_snapshot"),
     ("db/omnigraph.rs", "open_read_only_with_storage"),
@@ -1006,9 +1000,11 @@ gateway_surfaces! {
     ],
     "omnigraph-core/dataset_index.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "validate_full_text_scan", "validate_full_text_demand", "is_full_text_index",
-        "is_untrained_full_text", "key_column_index_coverage", "has_unindexed_fragments", "user_indices_for_column",
+        "covers_no_fragment", "is_untrained_full_text", "key_column_index_coverage", "has_unindexed_fragments",
+        "user_indices_for_column",
         "has_btree_index_on", "has_fts_index_on", "has_fts_postings_on", "has_vector_index_on",
         "current_fragments", "is_btree_index", "key_column_coverage", "key_column_uncovered_tail",
+        "key_column_covered_fragments",
     ],
     "omnigraph-core/staging.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "is_detached_version",
@@ -1095,6 +1091,10 @@ durable_calls! {
     ("omnigraph-core/instrumentation.rs", ".rename_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/instrumentation.rs", ".delete(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/instrumentation.rs", ".delete_prefix(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
+    ("omnigraph-core/logical_calls.rs", ".put_opts(", 1, WriteProtocol::Composed("logical call counter forwards its caller's put; the counter wraps an object store to count requests by verb and every write it forwards is registered at the caller's site")),
+    ("omnigraph-core/logical_calls.rs", ".put_part(", 1, WriteProtocol::Composed("logical call counter forwards its caller's multipart part")),
+    ("omnigraph-core/logical_calls.rs", ".complete(", 1, WriteProtocol::Composed("logical call counter forwards its caller's multipart completion")),
+    ("omnigraph-core/logical_calls.rs", ".abort(", 1, WriteProtocol::Composed("logical call counter forwards its caller's multipart abort")),
     ("omnigraph-core/lance_access.rs", ".put_opts(", 1, WriteProtocol::Composed("Lance-realm object-store seam forwarding (dst only)")),
     ("omnigraph-core/read_memo.rs", ".put_opts(", 1, WriteProtocol::Composed("statement read-memo forwarding: the memo intercepts immutable-path reads only and passes the caller's put untouched to the wrapped store")),
     ("omnigraph-core/storage.rs", ".write_bytes(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
@@ -1203,6 +1203,9 @@ durable_calls! {
     // fork before the incarnation refusal; read-only access to the handle.
     ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("exec/blob_write.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
+    // A delete cascade plans its edge-table reads from the edge table's index
+    // coverage (`validate::RemovalEdgeReads`); read-only metadata access.
+    ("exec/mutation.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     // Commit-change enumeration: pinned parent/child handles for the ordered
     // merge's typed row comparison. Read-only by construction — the enumerator
     // stages no transaction and publishes nothing.
@@ -1214,8 +1217,6 @@ durable_calls! {
     ("db/omnigraph/collector.rs", ".dataset()", 17, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".delete(", 1, WriteProtocol::Composed("detached-only sweep through the table's own Lance store: freed files, then the published manifests no retained `__manifest` version pins (links before tips) and the dead stagings; an interrupted pass is re-swept by the next")),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
-    // The repair report reads raw transaction history; it publishes nothing.
-    ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
     ("db/omnigraph/optimize.rs", ".dataset()", 11, WriteProtocol::Composed("Optimize planning, including each plan's measure against its table ceilings, + read-only coverage and native-fork inventory + the configuration clear's read-back after a failed removal + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
@@ -1227,7 +1228,7 @@ durable_calls! {
     // rebuilt in memory, so this write can never change a query's result. It
     // runs in a task the run awaits, so a dropped run cannot drop it.
     ("db/omnigraph/optimize.rs", ".write_bytes(", 1, WriteProtocol::PhysicalOnly),
-    ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V9),
+    ("exec/merge.rs", "SnapshotHandle::new(", 3, MERGE_V9),
 }
 
 const DURABLE_PRIMITIVES: &[&str] = &[
@@ -1905,7 +1906,11 @@ fn call_inventory(ast: &syn::File) -> CallInventory {
 
 fn durable_protocol_scan_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
     let mut files = labeled_scan_files(engine_src, true);
-    files.extend(sibling_crate_files(engine_src, STORAGE_CRATE));
+    files.extend(
+        sibling_crate_files(engine_src, STORAGE_CRATE)
+            .into_iter()
+            .filter(|(relative, _)| !PROTOCOL_SCAN_EXCLUDED_FILES.contains(&relative.as_str())),
+    );
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
 }
@@ -2246,15 +2251,13 @@ fn graph_write_surfaces_are_registered() {
 }
 
 /// The public surfaces of maintenance: the graph writers registered under
-/// these protocols, plus the read-only repair report the same gate covers.
+/// these protocols.
 fn is_maintenance_protocol(protocol: WriteProtocol) -> bool {
     protocol == INDICES_V9 || protocol == OPTIMIZE_V9 || protocol == WriteProtocol::PhysicalOnly
 }
 
-const READ_ONLY_MAINTENANCE_SURFACES: &[(&str, &str)] = &[("db/omnigraph.rs", "repair_report_as")];
-
 /// Maintenance has no actor-less public form (invariant 10). Every public
-/// optimize, cleanup, index or repair entry point is an `_as` method taking the
+/// optimize, cleanup or index entry point is an `_as` method taking the
 /// `actor: Option<&str>` its policy check judges, so neither an embedded nor a
 /// direct caller reaches maintenance around the gate; with a policy installed,
 /// a `None` actor is refused. `policy_engine_chassis.rs` owns which action and
@@ -2262,18 +2265,10 @@ const READ_ONLY_MAINTENANCE_SURFACES: &[(&str, &str)] = &[("db/omnigraph.rs", "r
 #[test]
 fn maintenance_entry_points_take_an_actor() {
     let src = engine_src_root();
-    let read_only = READ_ONLY_SURFACES.iter().copied().collect::<BTreeSet<_>>();
-    for surface in READ_ONLY_MAINTENANCE_SURFACES {
-        assert!(
-            read_only.contains(surface),
-            "{surface:?} must stay a registered read-only surface"
-        );
-    }
     let surfaces = WRITE_SURFACES
         .iter()
         .filter(|surface| is_maintenance_protocol(surface.protocol))
         .map(|surface| (surface.file, surface.function))
-        .chain(READ_ONLY_MAINTENANCE_SURFACES.iter().copied())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         surfaces,
@@ -2283,7 +2278,6 @@ fn maintenance_entry_points_take_an_actor() {
             ("db/omnigraph.rs", "ensure_indices_on_as"),
             ("db/omnigraph.rs", "optimize_as"),
             ("db/omnigraph.rs", "rebuild_full_text_indices_on_as"),
-            ("db/omnigraph.rs", "repair_report_as"),
         ]),
         "a maintenance surface was added or removed; give it an actor and a policy case"
     );
@@ -3580,6 +3574,9 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::capture_query_io_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::CountingStorageAdapter",
     "instrumentation.rs: omnigraph_core::instrumentation::ExternalPayloadReadHold",
+    "instrumentation.rs: omnigraph_core::instrumentation::IndexBuildProbes",
+    "instrumentation.rs: omnigraph_core::instrumentation::LogicalCallCounter",
+    "instrumentation.rs: omnigraph_core::instrumentation::LogicalCallCounts",
     "instrumentation.rs: omnigraph_core::instrumentation::MergeTimingReading",
     "instrumentation.rs: omnigraph_core::instrumentation::MergeWriteProbes",
     "instrumentation.rs: omnigraph_core::instrumentation::ProbedStores",
@@ -3596,6 +3593,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::with_csv_slice_bytes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_external_payload_read_held",
     "instrumentation.rs: omnigraph_core::instrumentation::with_external_payload_read_stalled",
+    "instrumentation.rs: omnigraph_core::instrumentation::with_index_build_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_merge_write_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_overwrite_chunk_rows",
     "instrumentation.rs: omnigraph_core::instrumentation::with_query_io_probes",
@@ -3608,6 +3606,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "lib.rs: omnigraph_core::dst_clock",
     "lib.rs: omnigraph_core::dst_gate",
     "lib.rs: omnigraph_core::dst_ids",
+    "lib.rs: omnigraph_core::fts_compat::ANALYZER_GENERATION as FTS_ANALYZER_GENERATION",
     "seams.rs: omnigraph_core::seams::Behavior",
     "seams.rs: omnigraph_core::seams::Counted",
     "seams.rs: omnigraph_core::seams::Decide",

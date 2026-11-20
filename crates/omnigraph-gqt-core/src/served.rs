@@ -51,6 +51,22 @@ impl std::fmt::Debug for ServerTarget {
 /// Refuses, before any request, every section the server has no door for,
 /// naming each so the author sees what keeps the case in-process only.
 pub fn admit_served(case: &Case) -> Result<(), String> {
+    served_refusals(case, None)
+}
+
+/// [`admit_served`] for a measured workload: a `--- restart` after the
+/// measured step at `measured` is admitted as the long-running lifecycle's
+/// no-op, since the verification it precedes reads the same server; one
+/// before it stays refused, as it would claim a reopened engine.
+pub fn admit_served_workload(case: &Case, measured: usize) -> Result<(), String> {
+    served_refusals(case, Some(measured))
+}
+
+fn no_op_restart(step: &Step, measured: Option<usize>) -> bool {
+    matches!(step, Step::Restart { .. }) && measured.is_some_and(|m| step.ordinal() > m)
+}
+
+fn served_refusals(case: &Case, measured: Option<usize>) -> Result<(), String> {
     let mut refused = Vec::new();
     if !case.csv_sections.is_empty() {
         refused.push("`--- csv` fixtures (engine execution only)".to_string());
@@ -85,6 +101,7 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
     }) {
         let ordinal = step.ordinal();
         match step {
+            Step::Restart { .. } if no_op_restart(step, measured) => {}
             Step::Restart { .. } | Step::Settings(_) | Step::Concurrent(_) => {
                 refused.push(format!("step {ordinal} ({})", step_kind(step)));
             }
@@ -141,16 +158,29 @@ pub fn execute_steps_served<'a, H: ExecutionHost>(
     target: &'a ServerTarget,
     host: &'a H,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    execute_served_inner(case, target, host).boxed()
+    execute_served_inner(case, target, host, None).boxed()
+}
+
+/// [`execute_steps_served`] for a measured workload, admitted by
+/// [`admit_served_workload`]: a restart after the measured step runs as
+/// the lifecycle's no-op and is reported like every other step.
+pub fn execute_measured_served<'a, H: ExecutionHost>(
+    case: &'a Case,
+    target: &'a ServerTarget,
+    host: &'a H,
+    measured: usize,
+) -> futures::future::BoxFuture<'a, Result<(), String>> {
+    execute_served_inner(case, target, host, Some(measured)).boxed()
 }
 
 async fn execute_served_inner<H: ExecutionHost>(
     case: &Case,
     target: &ServerTarget,
     host: &H,
+    measured: Option<usize>,
 ) -> Result<(), String> {
     host.admit_case(case)?;
-    admit_served(case)?;
+    served_refusals(case, measured)?;
     let client = ServerClient::new(target, Duration::from_millis(case.runner.timeout_ms))?;
     host.observe(|| format!("lifetime: served by {} graph {}", target.url, target.graph));
     if let Some(fixture) = &case.fixture {
@@ -214,6 +244,13 @@ async fn execute_served_inner<H: ExecutionHost>(
                     Step::List(l) => list(host, &client, l, binding).await,
                     Step::Show(s) => show(host, &client, s, binding).await,
                     Step::BranchRead(r) => branch_read(host, &client, r, binding, &bindings).await,
+                    Step::Restart { .. } if no_op_restart(step, measured) => {
+                        host.observe(|| {
+                            "restart: the server's lifecycle is long-running; no door opened"
+                                .to_string()
+                        });
+                        Ok(())
+                    }
                     Step::Settings(_) | Step::Restart { .. } | Step::Concurrent(_) => {
                         Err(StepFail::new(
                             step_label(ordinal, step_kind(step), binding),
@@ -441,8 +478,9 @@ fn normalized_schema(text: &str) -> String {
         .join("\n")
 }
 
-/// The fixture's seed through `/load`, as `Seed::load` sends it to a
-/// session: the inline rows overwrite on `main`, generated batches append.
+/// The fixture as `seed_case` applies it to a session: the seed through
+/// `/load` (inline rows overwrite `main`, generated batches append), then
+/// each declared branch as a `branch create` at `/mutate` plus its recipe.
 async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
     match &fixture.seed {
         Seed::Inline(text) if text.trim().is_empty() => Ok(()),
@@ -455,7 +493,39 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
                 .load_generated(generated, MAIN_BRANCH, LoadMode::Append)
                 .await
         }
+    }?;
+    let Some(branches) = &fixture.branches else {
+        return Ok(());
+    };
+    for name in branches.names() {
+        let request = ChangeRequest {
+            query: format!(
+                "branch create {} from {}",
+                branch_name(&name),
+                branch_name(branches.from())
+            ),
+            name: None,
+            params: None,
+            branch: None,
+            settings: None,
+        };
+        client
+            .post::<_, ChangeOutput>("/mutate", &request)
+            .await?
+            .map_err(|error| {
+                format!(
+                    "branches fixture: branch create {name} from {}: {error}",
+                    branches.from()
+                )
+            })?;
+        if let Some(generated) = branches.recipe(&name)? {
+            client
+                .load_generated(&generated, &name, LoadMode::Append)
+                .await
+                .map_err(|error| format!("branches fixture: load {name}: {error}"))?;
+        }
     }
+    Ok(())
 }
 
 /// The `--- params` as they go on the wire: the JSON the case spells,
@@ -463,7 +533,7 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
 /// against the declaration, so a parameter error is the server's answer, never
 /// a local verdict. A generated value travels in the request body, under the
 /// server's request limits.
-fn wire_params(
+pub(crate) fn wire_params(
     params: Option<&ParamsInput>,
     binding: Option<(&str, &str)>,
     bindings: &Bindings,
@@ -490,7 +560,7 @@ fn rows_of(output: &ReadOutput) -> Result<Vec<Value>, String> {
 /// Holds a read expect against the rows a route answered; the shape
 /// section is the executor's Arrow schema against the compiler's, which
 /// no wire answer carries, so it is not judged here.
-fn check_read_expect(
+pub(crate) fn check_read_expect(
     host: &impl ExecutionHost,
     label: &str,
     expect: &QueryExpect,
@@ -726,7 +796,10 @@ fn string_literal(text: &str) -> String {
 /// The control write as the corpus spells it, a bound commit id resolved, so
 /// the served path exercises the statement parser a user's text meets at
 /// `/mutate`.
-fn control_statement(write: &ControlWrite, bindings: &Bindings) -> Result<String, String> {
+pub(crate) fn control_statement(
+    write: &ControlWrite,
+    bindings: &Bindings,
+) -> Result<String, String> {
     Ok(match write {
         ControlWrite::Create {
             name,

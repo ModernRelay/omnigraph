@@ -56,9 +56,9 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, OverwriteChunk, RefreshedIndex,
-    StagedTransactionIdentity, StagedWrite, TableState, TableStore, UpdateMatchRequest,
-    UpdateMatches,
+    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, MaintenanceBudget,
+    OverwriteChunk, RefreshedIndex, StagedTransactionIdentity, StagedWrite, TableState, TableStore,
+    UpdateMatchRequest, UpdateMatches,
 };
 
 /// One fenced merge chunk is bounded in both rows and materialized Arrow
@@ -245,6 +245,26 @@ pub enum IndexBuildSpec {
     Vector {
         column: String,
     },
+}
+
+impl IndexBuildSpec {
+    /// The column the index covers and the kind's display name.
+    pub(crate) fn column_and_kind(&self) -> (&str, &'static str) {
+        match self {
+            Self::BTree { column, .. } => (column, "BTREE"),
+            Self::FullText { column } => (column, "FTS"),
+            Self::Vector { column } => (column, "Vector"),
+        }
+    }
+
+    /// The Lance index kind this specification builds.
+    pub(crate) fn index_type(&self) -> lance_index::IndexType {
+        match self {
+            Self::BTree { .. } => lance_index::IndexType::BTree,
+            Self::FullText { .. } => lance_index::IndexType::Inverted,
+            Self::Vector { .. } => lance_index::IndexType::Vector,
+        }
+    }
 }
 
 /// A staged index reconciliation
@@ -591,12 +611,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// [`Self::scan_filtered`] with Lance's `_rowaddr` as the last output
     /// column: the exact rows a later [`Self::stage_delete_rows`] on the same
-    /// snapshot removes.
+    /// snapshot removes. `None` filter reads every row; `fragments` limits
+    /// the scan to those fragments (`None`: the whole table).
     async fn scan_filtered_row_addrs(
         &self,
         snapshot: &SnapshotHandle,
         projection: &[&str],
-        filter: Expr,
+        filter: Option<Expr>,
+        fragments: Option<Vec<lance_table::format::Fragment>>,
     ) -> Result<DatasetRecordBatchStream>;
 
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>>;
@@ -680,11 +702,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedHandle>;
 
     /// RFC 0067: stage one detached-ready compaction rewrite of the pinned
-    /// base, or `None` when there is nothing to compact.
+    /// base from `plan`, the plan `TableStore::plan_table_compaction` made
+    /// for that base, or `None` when it has no task. Its tasks run within
+    /// `limit`, the run's shared budget of heavy steps.
     async fn stage_compaction(
         &self,
         snapshot: &SnapshotHandle,
-        options: &lance::dataset::optimize::CompactionOptions,
+        plan: lance::dataset::optimize::CompactionPlan,
+        limit: &crate::table_store::MaintenanceBudget,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>>;
 
     /// #721: stage one detached-ready rewrite of exactly the named
@@ -699,10 +724,12 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// RFC 0067: stage one detached-ready fold of every foldable index whose
     /// coverage lags the fragments, each rebuilt whole under its name; `None`
     /// when every index is current. The second value names the vector
-    /// columns whose index could not be trained.
+    /// columns whose index could not be trained. The builds count against
+    /// `limit`, which the maintenance pass owns.
     async fn stage_index_fold(
         &self,
         snapshot: &SnapshotHandle,
+        limit: &MaintenanceBudget,
     ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)>;
 
     /// Stage, as one detached-ready `CreateIndex`, the declared indexes the
@@ -712,6 +739,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<IndexReconciliation>;
 
     /// Atomically create version 1 from a staged read-version-0 transaction.
@@ -974,11 +1002,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// Stage every requested full-table index in one Lance transaction.
     /// Building the index files does not advance HEAD; the returned handle is
-    /// committed through `commit_staged` or `commit_staged_exact`.
+    /// committed through `commit_staged` or `commit_staged_exact`. The builds
+    /// count against `limit`, which the maintenance pass owns and shares
+    /// across the tables it stages.
     async fn stage_create_indices(
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<StagedHandle>;
 
     // ── Index presence (reads, no HEAD advance) ──────────────────────
@@ -1150,7 +1181,8 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         projection: &[&str],
-        filter: Expr,
+        filter: Option<Expr>,
+        fragments: Option<Vec<lance_table::format::Fragment>>,
     ) -> Result<DatasetRecordBatchStream> {
         TableStore::scan_stream_with(
             snapshot.dataset(),
@@ -1159,7 +1191,12 @@ impl TableStorage for TableStore {
             None,
             false,
             |scanner| {
-                scanner.filter_expr(filter);
+                if let Some(filter) = filter {
+                    scanner.filter_expr(filter);
+                }
+                if let Some(fragments) = fragments {
+                    scanner.with_fragments(fragments);
+                }
                 scanner.with_row_address();
                 scanner.batch_size(ID_SCAN_BATCH_ROWS);
                 scanner.batch_size_bytes(ID_SCAN_BATCH_BYTES);
@@ -1290,10 +1327,11 @@ impl TableStorage for TableStore {
     async fn stage_compaction(
         &self,
         snapshot: &SnapshotHandle,
-        options: &lance::dataset::optimize::CompactionOptions,
+        plan: lance::dataset::optimize::CompactionPlan,
+        limit: &crate::table_store::MaintenanceBudget,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>> {
         Ok(
-            TableStore::stage_compaction(self, snapshot.dataset(), options)
+            TableStore::stage_compaction(self, snapshot.dataset(), plan, limit)
                 .await?
                 .map(|compaction| (StagedHandle::new(compaction.staged), compaction.metrics)),
         )
@@ -1314,8 +1352,9 @@ impl TableStorage for TableStore {
     async fn stage_index_fold(
         &self,
         snapshot: &SnapshotHandle,
+        limit: &MaintenanceBudget,
     ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)> {
-        let fold = TableStore::stage_index_fold(self, snapshot.dataset()).await?;
+        let fold = TableStore::stage_index_fold(self, snapshot.dataset(), limit).await?;
         Ok((fold.staged.map(StagedHandle::new), fold.skipped))
     }
 
@@ -1323,8 +1362,10 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<IndexReconciliation> {
-        let work = TableStore::stage_index_reconciliation(self, snapshot.dataset(), specs).await?;
+        let work =
+            TableStore::stage_index_reconciliation(self, snapshot.dataset(), specs, limit).await?;
         Ok(IndexReconciliation {
             staged: work.staged.map(StagedHandle::new),
             refreshed: work.refreshed,
@@ -1682,8 +1723,9 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<StagedHandle> {
-        TableStore::stage_create_indices(self, snapshot.dataset(), specs)
+        TableStore::stage_create_indices(self, snapshot.dataset(), specs, limit)
             .await
             .map(StagedHandle::new)
     }

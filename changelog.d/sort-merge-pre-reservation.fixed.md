@@ -1,0 +1,1 @@
+- A query whose sort spills no longer fails at one memory budget yet passes at smaller and larger ones: the merge reserves less up front (9.4 MiB, not 40, by default) and stays within half the budget.

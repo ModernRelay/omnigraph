@@ -38,7 +38,6 @@ mod export;
 pub(crate) mod optimize;
 mod prepared_create;
 pub(crate) mod promotion;
-mod repair;
 mod resolution;
 pub(crate) mod schema_apply;
 pub(crate) mod system_column_upgrade;
@@ -58,12 +57,11 @@ pub use optimize::{
     ArtifactRefresh, ArtifactSkip, AuthorityCapture, CleanupPolicyOptions, ConfigurationClear,
     DatasetCleanupStats, DatasetOptimizeStats, DeferReason, OptimizeBeforePublish,
     OptimizeCancellation, OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport,
-    OptimizeRequest, ResourceExceeded, ResourceMeasure, RunCancellation, SkipReason, TableCeilings,
+    OptimizeRequest, ResourceExceeded, ResourceMeasure, RunCancellation, TableCeilings,
     TableOptimizeOutcome,
 };
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
-pub use repair::{DatasetRepairStats, RepairAction, RepairClassification, RepairStats};
 pub use resolution::PublicationLookup;
 pub use schema_apply::{
     PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplyReconciliation,
@@ -495,9 +493,9 @@ pub struct Omnigraph {
     /// (MR-725), which extends the same trait with a different method.
     /// Don't be tempted to add per-row enforcement here.
     ///
-    /// Set via `with_policy(checker)` after construction. Today only
-    /// `apply_schema_as` consults this field (PR #2 proof-of-concept);
-    /// PR #3 fans the `enforce()` call out to the remaining writers.
+    /// Set via `with_policy(checker)` after construction: the server,
+    /// cluster deployment and the CLI's writable opener of a cluster graph
+    /// install the policy the applied revision binds to the graph.
     policy: Option<Arc<dyn omnigraph_policy::PolicyChecker>>,
     /// Lazily-built, reused-across-queries embedding client. Built on the first
     /// `nearest($v, "string")` that needs server-side embedding (so a graph that
@@ -827,8 +825,8 @@ impl Omnigraph {
     /// (`docs/rfcs/2026-11-10-graph-shallow-clone.md`): the clone starts with
     /// every branch, version, commit and index of the base, every write lands
     /// under `root_uri`, and the base is never written. Both are local
-    /// directories in this phase, and `root_uri` is an empty directory or a
-    /// clone root a previous open built. A caller that wraps storage builds
+    /// directories or `s3://` prefixes of one endpoint, and `root_uri` is an
+    /// empty root or a clone root a previous open built. A caller that wraps storage builds
     /// it with [`crate::storage::storage_read_through`] and opens with
     /// [`Self::open_with_storage`], as the benchmark harness does to count
     /// store calls.
@@ -1185,11 +1183,10 @@ impl Omnigraph {
     /// Engine-layer policy enforcement gate (MR-722 chassis core).
     ///
     /// * If no policy is installed → no-op (returns `Ok(())`).
-    /// * If policy is installed AND actor is None → denial with a
-    ///   clear "no actor for engine-layer policy check" message.
-    ///   Forces server / CLI / SDK callers to thread an actor through
-    ///   when policy is configured — silent bypass via "I forgot the
-    ///   actor" is exactly the footgun this gate is here to prevent.
+    /// * If policy is installed AND actor is None → denial naming the
+    ///   action. A direct CLI write on a cluster graph with a policy and
+    ///   no `--as` reaches this, as does any embedder that names no
+    ///   actor: no actor is never a bypass.
     /// * If policy is installed AND actor is Some → call
     ///   `PolicyChecker::check(action, scope, actor)`; map denial /
     ///   internal failure to `OmniError::Policy(...)`.
@@ -1211,12 +1208,10 @@ impl Omnigraph {
             return Ok(());
         };
         let Some(actor) = actor else {
-            return Err(OmniError::Policy(
-                "no actor for engine-layer policy check (policy is configured but the call site \
-                 didn't thread an actor through — this is almost certainly a bug, not an \
-                 intended bypass)"
-                    .to_string(),
-            ));
+            return Err(OmniError::Policy(format!(
+                "policy denied action '{action}': a policy is installed and the request names \
+                 no actor"
+            )));
         };
         checker
             .check(action, scope, actor)
@@ -2470,10 +2465,13 @@ impl Omnigraph {
     /// The re-read goes through this handle's control session, so it observes
     /// the destination the handle is bound to rather than one the ambient
     /// provider configuration selects.
+    ///
+    /// Returns the snapshot with the branch's effective graph head at that
+    /// same `__manifest` version (an unpublished fork's inherited head).
     pub(crate) async fn fresh_snapshot_for_branch_unchecked(
         &self,
         branch: Option<&str>,
-    ) -> Result<Snapshot> {
+    ) -> Result<(Snapshot, String)> {
         let session = self.control_session();
         let manifest = match branch {
             Some(branch) => {
@@ -2489,7 +2487,8 @@ impl Omnigraph {
                     .await?
             }
         };
-        Ok(Snapshot::wrap(manifest.snapshot()))
+        let head = manifest.head().graph_commit_id.clone();
+        Ok((Snapshot::wrap(manifest.snapshot()), head))
     }
 
     #[cfg(test)]
@@ -3998,8 +3997,8 @@ impl Omnigraph {
     /// supported analyzer generation after an upgrade; it does not rewrite old
     /// history.
     ///
-    /// Requires `maintain` or `change` on the selected branch before any
-    /// effect and records the actor in the graph publication.
+    /// Requires `maintain` on the selected branch before any effect and
+    /// records the actor in the graph publication.
     pub async fn rebuild_full_text_indices_on_as(
         &self,
         branch: &str,
@@ -4035,14 +4034,6 @@ impl Omnigraph {
         request: optimize::OptimizeRequest,
     ) -> Result<optimize::OptimizeReport> {
         optimize::optimize_all_datasets(self, actor, request).await
-    }
-
-    /// Report, per table on `main`, how its Lance linear history stands
-    /// against its registration. See [`repair`] for the classifications. The
-    /// report publishes nothing and adopts no drift. Requires `maintain` on
-    /// `main`.
-    pub async fn repair_report_as(&self, actor: Option<&str>) -> Result<repair::RepairStats> {
-        repair::repair_report(self, actor).await
     }
 
     /// Remove Lance manifests (and the fragments they uniquely own) per the

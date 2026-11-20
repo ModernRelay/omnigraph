@@ -1,11 +1,10 @@
 # Maintenance
 
-OmniGraph provides five direct-storage maintenance commands:
+OmniGraph provides four direct-storage maintenance commands:
 
 - `optimize` compacts data and reconciles declared indexes on `main`.
 - `index build` brings one branch's declared indexes up to its rows.
 - `index rebuild --kind full-text` replaces full-text indexes on one branch.
-- `repair` diagnoses foreign storage drift without adopting it.
 - `cleanup` permanently removes unretained table versions and unused table
   forks left by branches created before storage format v11.
 
@@ -22,13 +21,13 @@ targets accept local files only; an inline [S3 cluster root](s3-cluster-roots.md
 is the one cloud-direct exception. See
 [operator configuration](../cli/targets.md#transport-and-capability-boundaries).
 
-Each command acts as the operator configuration's `operator.actor`, and the
-commit it publishes records that actor; `index build` and `index rebuild` also
-accept `--as` in its place. Direct CLI access, including `--target`, does not
-load the server's Cedar policy; storage permissions are its trust boundary. An
-embedded host that installs a policy checker enforces the
+Each command acts as its `--as` actor, and the commit it publishes records
+that actor. On a cluster graph the CLI installs the policy the cluster applied
+to it, and an embedded host may install its own; either checks the
 [policy actions](policy.md#actions) before any effect: `maintain` for optimize,
-index builds, the full-text rebuild and repair, and `reclaim` for cleanup.
+index builds and the full-text rebuild, and `reclaim` for cleanup. A standalone
+graph has no policy. The actor is self-declared, so storage permissions remain
+the trust boundary.
 
 ## Optimize
 
@@ -68,26 +67,39 @@ moved; none reports a conflict for it. Lance compacts neighbouring fragments onl
 same indexes cover them, so a table whose index coverage was uneven before a run
 may coalesce fully only on the next run, after the rebuilt coverage is in place.
 
-Compacting a table with Blob properties reads each managed Blob value into
-memory. Optimize sizes each compaction batch from its largest row, whatever
-`LANCE_DEFAULT_BATCH_SIZE` says, so one batch holds at most 32 MiB of managed
-Blob payload; a larger row is read whole, external references are not read,
-and the writer's own copies come on top. A Blob descriptor the decoder rejects
-refuses the compaction before that table is rewritten. Optimize plans up to
-`OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables ahead (default 8) and rewrites up to
-that many at once, so budget for that many Blob tables compacting together.
+Optimize sizes each Blob batch from the table task's largest row, overriding
+`LANCE_DEFAULT_BATCH_SIZE`. A batch holds up to 32 MiB of managed payload or one larger row, plus writer copies.
+External Blobs stay unread. An invalid descriptor stops the rewrite of its table.
+
+Direct optimize plans and rewrites up to `OMNIGRAPH_MAINTENANCE_CONCURRENCY`
+tables at once (default 8). The run shares that many slots. Each compaction task
+uses one slot, with one task at a time per Blob table. Each BTREE build uses a
+quarter of the slots rounded up (four builds at width 8, two at width 5).
+Full-text and vector builds use all slots. Served optimize uses one slot.
 
 ### Bounding a run
 
-Writes to `main` wait while optimize holds its writer gates. A run given
-`--max-gate-hold 30s` starts no table after that long except the first: the
-rest are `deferred`, finished tables publish, and a writer waits at most the
-bound plus one rewrite. Tables run in type-key order; `resume_at` names the
-first deferred one, and `--tables` runs only the listed tables, in order. Each
-table's `outcome` is `optimized`, `unchanged`, `deferred`, `skipped` or
-`failed` (with its `error`; the other tables still publish). The report adds
+With `--max-gate-hold 30s`, the first table always runs. After the deadline, writers
+wait for tables already started, graph publication and configuration clear.
+Remaining tables are deferred. Direct runs visit tables in type-key order. Copy
+the printed `--start-at` argument to resume there and wrap around. JSON returns
+that key in `resume_at`. A [server](recorded-operations.md) remembers its position.
+Use `--datasets` to visit only the listed tables, in order.
+
+Check each table's `outcome` even on exit 0. It can be `optimized`, `unchanged`,
+`deferred` or `failed`. A failed table includes its `error`. Other tables still publish.
+If index maintenance or its coverage check fails after a rewrite or index build,
+completed work publishes as `optimized` with `reason: index_failed` and the error.
+The direct report keeps any indexes already identified as pending in `pending_indexes`.
+The next run checks coverage and plans remaining work. The report includes
 `input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
-and `artifact` outcomes, which never fail a published run.
+and `artifact` outcomes. Neither of those last two can fail a published run.
+
+A served run also applies the server's
+[table ceilings and byte budget](recorded-operations.md#table-ceilings-and-the-byte-budget).
+A table over a ceiling is `deferred` with reason `resource_limit` on every run
+until a ceiling is raised or a direct run optimizes it, and does not set
+`resume_at`.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
@@ -113,6 +125,7 @@ omnigraph index build --target ./cluster-root --graph knowledge \
   --branch review --json
 ```
 
+Up to four BTREEs build together across tables. A full-text or vector build runs alone.
 On any branch, `index build` builds every declared index a table lacks, such as
 those of a type whose first rows were loaded there, and rebuilds whole each
 BTREE or vector index that leaves rows uncovered. Every table publishes in one
@@ -122,7 +135,9 @@ As with optimize, a write that lands on a table while its batch is staged fails
 the run with a read-set conflict; run the command again. A vector property with
 no vectors yet and full-text coverage stay pending: only `index rebuild --kind
 full-text` refreshes a full-text index's coverage, and queries match uncovered
-rows with the index's analyzer meanwhile.
+rows with the index's analyzer meanwhile. Pending covers only a vector
+property with nothing to train on; a rebuild that fails for any other reason,
+a storage failure for one, fails the command.
 
 JSON reports `branch`, `graph_commit_id` (null for a no-op), `indexes` with each
 `type_key`, `property` (the indexed column, `__id` for the identity index),
@@ -161,36 +176,6 @@ values. Stop overlapping writers and preserve a backup before an upgrade; see
 [full-text upgrades](upgrade.md#full-text-index-upgrade).
 Unknown legacy or external index kinds require a controlled migration, not a
 guessed replacement; see [unsupported inventory](upgrade.md#unsupported-index-inventory).
-
-## Repair
-
-Repair reports, per node or edge type, how the backing dataset's Lance linear
-history stands against the graph's registration. Preview:
-
-```bash
-omnigraph repair --target ./graph.omni --json
-```
-
-Every OmniGraph table write is a detached Lance commit that a graph commit
-pins, so a table's linear history ends where it was created, and the
-registration records that point as its last linear version
-(`omnigraph.last_linear_version`; `1` for a table created under storage
-format v11). A graph table is classified `no_drift` when its linear HEAD
-equals that version and `foreign_drift` when linear commits sit above it. A
-foreign commit came from something other than OmniGraph writing the table
-directory; no read or write of the graph resolves the linear HEAD, so
-foreign drift changes no query result and blocks no writer. For a
-`foreign_drift` table `repair` prints the last linear version, the HEAD and
-the number of foreign versions in `operations`, takes no action (`no_op`)
-and exits 0. It never adopts the foreign commit. `cleanup` leaves foreign versions and their files in
-place and lists them per table under `foreign_versions`. A HEAD below the
-recorded last linear version is reported as an internal manifest error.
-Each `repair --json` row carries `type_key`, `published_dataset_version`,
-`lance_head_version`, `classification`, `action`, `operations` and `error`.
-
-The removed `--confirm` and `--force` options are rejected. To discard foreign commits,
-export the graph and load it into a new one; see
-[Troubleshooting](troubleshooting.md#foreign-drift).
 
 ## Cleanup
 
@@ -336,12 +321,28 @@ Exit 0 means every table was visited and that nothing a retained graph
 commit pins, and no file such a commit references, was removed. It does not mean every table was collected: read the result rows
 for tables with an `error`.
 
+### Foreign versions
+
+Every Omnigraph table write is a detached Lance commit that a graph commit
+pins, so a table's linear Lance history ends where the table was created. The
+registration records that point as its last linear version
+(`omnigraph.last_linear_version`). A linear commit above it came from
+something other than Omnigraph writing the table directory, such as a Lance
+client pointed at it. No read or write of the graph resolves the linear
+HEAD, so a foreign version changes no query result and blocks no writer, and
+no command adopts it. A confirmed cleanup run (`cleanup --keep N --confirm`,
+which also removes what its policy does not retain) lists these versions per
+table, under `foreign_versions` with `--json` and by name in the human report,
+and leaves them and their files in place. The preview without `--confirm`
+does not open the graph and lists nothing. Embedded hosts can read the same
+list from the read-only `Omnigraph::cleanup_plan`. To discard them,
+export the graph and load it into a new one; see
+[Troubleshooting](troubleshooting.md#foreign-versions).
+
 ## Suggested cadence
 
 - Run `optimize` after large loads or on a regular cadence for write-heavy
   graphs.
-- Run `repair` when you want to know whether something outside OmniGraph
-  committed to a table's Lance history.
 - Run `cleanup` from an explicit retention policy after backups and rollback
   requirements have been reviewed.
 

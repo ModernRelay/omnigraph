@@ -46,6 +46,7 @@ pub mod reset;
 pub mod runner;
 #[doc(hidden)]
 pub mod source_provenance;
+pub mod store;
 pub mod suite;
 #[cfg(test)]
 mod supervisor;

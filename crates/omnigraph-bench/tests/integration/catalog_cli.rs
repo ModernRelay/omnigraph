@@ -61,7 +61,7 @@ fn public_inventory_is_sorted_complete_and_stable() {
                 expected
             );
             assert_eq!(
-                first["value"]["groups"]["search"].as_array().unwrap().len(),
+                first["value"]["suites"]["search"].as_array().unwrap().len(),
                 2
             );
         }
@@ -91,29 +91,27 @@ fn shared_catalog_leaves_the_volume_to_the_host() {
         omnigraph_bench::catalog::Catalog::load(&root().join("benchmarks/benchmarks.yaml"))
             .unwrap()
             .definition;
-    assert_eq!(shared.defaults.environment, None);
     assert_eq!(shared.defaults.protocol.reset, None);
+    assert_eq!(shared.scenarios.len(), 79);
     let (filesystem, reset) = if cfg!(target_os = "macos") {
         ("apfs", "local-clonefile")
     } else {
         ("xfs", "plain-copy")
     };
-    let shown = run(&root(), &["show", "tiny-read", "--json"], true);
-    assert_eq!(
-        shown["value"]["environment"]["backend"]["filesystem"],
-        filesystem
-    );
-    assert_eq!(shown["value"]["protocol"]["reset"], reset);
-    for pinned in [
-        "branch-merge-d50-process-cold-xfs",
-        "branch-merge-d50-history64-xfs",
+    for id in [
+        "tiny-read",
+        "branch-merge-d50-process-cold",
+        "branch-merge-d50-history64",
     ] {
-        let shown = run(&root(), &["show", pinned, "--json"], true);
+        let shown = run(&root(), &["show", id, "--json"], true);
         assert_eq!(
-            shown["value"]["environment"]["backend"]["filesystem"],
-            "xfs"
+            shown["value"]["environment"]["backend"]["filesystem"], filesystem,
+            "{id}"
         );
-        assert_eq!(shown["value"]["protocol"]["reset"], "plain-copy");
+        assert_eq!(shown["value"]["protocol"]["reset"], reset, "{id}");
+    }
+    for suite in ["aws-xfs-process-cold", "aws-xfs-history64"] {
+        assert_eq!(shared.suites[suite].len(), 1, "{suite}");
     }
 }
 #[test]
@@ -496,15 +494,14 @@ fn served_preflight_rejects_incompatible_selection_before_acquisition() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let config = root().join("benchmarks/benchmarks.yaml");
     let catalog = omnigraph_bench::catalog::Catalog::load(&config).unwrap();
-    let group = catalog
-        .resolve(Some("query-shapes-served"), Some(1))
-        .unwrap();
-    let first = group.runs[0].case.gqt().unwrap();
-    assert!(
-        group.runs[1..]
-            .iter()
-            .any(|run| { run.case.gqt().unwrap().recipe_sha256 != first.recipe_sha256 })
+    let served = omnigraph_bench::catalog::served_environment(
+        omnigraph_bench::case::Backend::LocalFs {
+            filesystem: omnigraph_bench::case::LocalFilesystem::Apfs,
+            storage_class: omnigraph_bench::case::LocalStorageClass::NvmeSsd,
+        },
+        omnigraph_bench::case::NetworkPosition::SameHost,
     );
+    let first = &catalog.plan_in("e2e-query-count", &served).unwrap();
     let receipt = ServerDeploymentReceiptV1 {
         format_version: 1,
         endpoint_sha256: omnigraph_bench::gqt_case::sha256_bytes(
@@ -542,16 +539,22 @@ fn served_preflight_rejects_incompatible_selection_before_acquisition() {
 
     for (selector, token_env, code, detail) in [
         (
-            "query-shapes-served",
+            "query-shapes",
             None,
-            "invalid_run_input",
-            "dataset recipe",
+            "invalid_scenario",
+            "matching admitted local-filesystem environment",
         ),
         (
             "tiny-read",
             None,
+            "invalid_scenario",
+            "matching admitted local-filesystem environment",
+        ),
+        (
+            "e2e-query-count-bare",
+            None,
             "invalid_run_input",
-            "embedded scenarios refuse",
+            "dataset recipe",
         ),
         (
             first.definition.id.as_str(),
@@ -627,7 +630,7 @@ fn served_preflight_rejects_incompatible_selection_before_acquisition() {
         .timeout(std::time::Duration::from_secs(10))
         .args([
             "run",
-            "query-shapes-served",
+            "e2e-query-count",
             "--config",
             config.to_str().unwrap(),
             "--server",
@@ -667,78 +670,207 @@ fn served_preflight_rejects_incompatible_selection_before_acquisition() {
 }
 
 #[test]
-fn cache_status_of_a_served_scenario_is_not_applicable() {
+fn the_catalog_names_no_environment_and_no_twin() {
+    let catalog =
+        omnigraph_bench::catalog::Catalog::load(&root().join("benchmarks/benchmarks.yaml"))
+            .unwrap();
+    let source = fs::read_to_string(&catalog.path).unwrap();
+    assert!(!source.contains("environment:"), "the run names where");
+    for scenario in &catalog.definition.scenarios {
+        assert!(
+            !scenario.id.ends_with("-served") && !scenario.id.ends_with("-xfs"),
+            "{} pins an environment in its name",
+            scenario.id
+        );
+    }
+    for suite in catalog.definition.suites.keys() {
+        assert!(!suite.ends_with("-served"), "{suite}");
+    }
+    let workloads: Vec<_> = fs::read_dir(catalog.root.join("workloads"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with("_served.gqt"))
+        .collect();
+    assert!(workloads.is_empty(), "{workloads:?}");
+}
+
+/// Two catalogs on one call: a name resolves in the first that declares it,
+/// `show` names that catalog, `list --json` answers one inventory per catalog.
+#[test]
+fn several_catalogs_resolve_a_name_in_the_first_that_declares_it() {
     let directory = tempfile::tempdir().unwrap();
-    let config = root().join("benchmarks/benchmarks.yaml");
-    let result = run(
+    copy_pair(directory.path());
+    run(
         directory.path(),
         &[
-            "cache",
-            "status",
-            "e2e-query-count-served",
-            "--config",
-            config.to_str().unwrap(),
-            "--dataset-cache",
-            "cache",
+            "init",
+            "--fixture",
+            "fixtures/tiny_graph.gqt",
+            "--workload",
+            "workloads/tiny_read.gqt",
+            "--step",
+            "1",
+            "--output",
+            "custom.yaml",
             "--json",
         ],
         true,
     );
-    assert_eq!(result["ok"], true, "{result}");
-    assert_eq!(result["value"]["source"], "not_applicable");
-    assert_eq!(result["value"]["cache"], "unknown");
-    assert_eq!(
-        result["diagnostics"][0]["code"],
-        "served_scenario_has_no_dataset_cache"
+    let custom = directory.path().canonicalize().unwrap().join("custom.yaml");
+    let custom = custom.to_str().unwrap();
+    let public = root()
+        .join("benchmarks/benchmarks.yaml")
+        .canonicalize()
+        .unwrap();
+    let public = public.to_str().unwrap();
+    let listed = run(
+        &root(),
+        &[
+            "list",
+            "scenarios",
+            "--catalog",
+            "benchmarks",
+            "--catalog",
+            custom,
+            "--json",
+        ],
+        true,
     );
-    assert!(!directory.path().join("cache").exists());
+    let catalogs = listed["value"]["catalogs"].as_array().unwrap();
+    assert_eq!(catalogs.len(), 2, "{listed}");
+    assert_eq!(catalogs[0]["config"], public, "{listed}");
+    assert_eq!(catalogs[1]["config"], custom, "{listed}");
+    assert_eq!(catalogs[1]["entries"][0]["id"], "custom", "{listed}");
+    let shown = run(
+        &root(),
+        &[
+            "show",
+            "custom",
+            "--catalog",
+            "benchmarks",
+            "--catalog",
+            custom,
+            "--json",
+        ],
+        true,
+    );
+    assert_eq!(shown["value"]["config"], custom, "{shown}");
+    let shown = run(
+        &root(),
+        &[
+            "show",
+            "tiny-read",
+            "--catalog",
+            custom,
+            "--catalog",
+            "benchmarks",
+            "--json",
+        ],
+        true,
+    );
+    assert_eq!(shown["value"]["config"], public, "{shown}");
+    let missing = run(
+        &root(),
+        &[
+            "show",
+            "missing",
+            "--catalog",
+            "benchmarks",
+            "--catalog",
+            custom,
+            "--json",
+        ],
+        false,
+    );
+    assert_eq!(
+        missing["diagnostics"][0]["code"], "unknown_selection",
+        "{missing}"
+    );
+    let message = missing["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains(custom) && message.contains(public),
+        "{missing}"
+    );
 }
 
+/// `--config` beside `--catalog` is a usage error; a catalog missing later in
+/// the list fails naming its path; `--catalog` takes the catalog route past a
+/// local file named like the scenario.
 #[test]
-fn served_groups_pin_their_scenarios_and_twin_measured_text() {
-    let catalog =
-        omnigraph_bench::catalog::Catalog::load(&root().join("benchmarks/benchmarks.yaml"))
-            .unwrap();
-    let query_shapes = [
-        "e2e-query-scan",
-        "e2e-query-wide-scan",
-        "e2e-query-filter",
-        "e2e-query-lookup",
-        "e2e-query-count",
-        "e2e-query-grouped",
-        "e2e-query-top-people",
-        "e2e-query-friends",
-        "e2e-query-filtered-friends",
-        "e2e-query-no-friends",
-        "e2e-query-count-bare",
-        "e2e-query-destination-projection",
-        "e2e-query-grouped-fanout",
-    ];
-    let traversals = [
-        "e2e-traversal-hop1",
-        "e2e-traversal-hop2",
-        "e2e-traversal-hop3",
-    ];
-    for (group, twins) in [
-        ("query-shapes-served", &query_shapes[..]),
-        ("traversal-served", &traversals[..]),
+fn catalog_flags_refuse_the_conflict_a_missing_catalog_and_the_legacy_route() {
+    let public = root().join("benchmarks");
+    let public = public.to_str().unwrap();
+    let config = root().join("benchmarks/benchmarks.yaml");
+    let config = config.to_str().unwrap();
+    for args in [
+        [
+            "list",
+            "scenarios",
+            "--config",
+            config,
+            "--catalog",
+            public,
+            "--json",
+        ],
+        [
+            "run",
+            "tiny-read",
+            "--config",
+            config,
+            "--catalog",
+            public,
+            "--json",
+        ],
     ] {
-        let suite = catalog.resolve(Some(group), None).unwrap();
-        let ids: Vec<_> = suite
-            .runs
-            .iter()
-            .map(|run| run.case.id().to_owned())
-            .collect();
-        let expected: Vec<_> = twins.iter().map(|twin| format!("{twin}-served")).collect();
-        assert_eq!(ids, expected, "{group}");
-        for twin in twins {
-            let served = catalog.plan(&format!("{twin}-served")).unwrap();
-            let embedded = catalog.plan(twin).unwrap();
-            assert_eq!(
-                served.definition.workload.measured_step.text,
-                embedded.definition.workload.measured_step.text,
-                "{twin}"
-            );
-        }
+        let conflict = run(&root(), &args, false);
+        assert_eq!(
+            conflict["diagnostics"][0]["code"], "invalid_arguments",
+            "{conflict}"
+        );
     }
+    let directory = tempfile::tempdir().unwrap();
+    let empty = directory.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    let missing = run(
+        &root(),
+        &[
+            "show",
+            "tiny-read",
+            "--catalog",
+            public,
+            "--catalog",
+            empty.to_str().unwrap(),
+            "--json",
+        ],
+        false,
+    );
+    assert_eq!(
+        missing["diagnostics"][0]["code"], "config_read_error",
+        "{missing}"
+    );
+    let message = missing["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains(empty.join("benchmarks.yaml").to_str().unwrap()),
+        "{missing}"
+    );
+    fs::write(directory.path().join("tiny-read"), "not a case\n").unwrap();
+    fs::write(
+        directory.path().join("benchmarks.yaml"),
+        "version: 2\nscenarios:\n- id: tiny-read\n  fixture: fixtures/absent.gqt\n  workload: workloads/absent.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- query branch: main\n      query items() { match { $i: Item } return { $i.key as key } }\n",
+    )
+    .unwrap();
+    let legacy = run(directory.path(), &["run", "tiny-read", "--json"], false);
+    assert_eq!(
+        legacy["diagnostics"][0]["code"], "invalid_case_yaml",
+        "{legacy}"
+    );
+    let catalog = run(
+        directory.path(),
+        &["run", "tiny-read", "--catalog", ".", "--json"],
+        false,
+    );
+    assert_eq!(
+        catalog["diagnostics"][0]["code"], "invalid_scenario",
+        "{catalog}"
+    );
 }

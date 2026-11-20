@@ -1,0 +1,1 @@
+- `omnigraph-bench run --store … --at <a> --at <b>` measures each scenario once per ref before the next scenario, so the refs share machine state; records and outputs keep their shape.

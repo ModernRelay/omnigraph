@@ -1,0 +1,1 @@
+- `benchmarks.yaml` scenarios name no environment: `omnigraph-bench run` supplies it (`--server`, else the host's local default); the 18 `-served` twins are gone and the two `-xfs` ids drop the suffix.

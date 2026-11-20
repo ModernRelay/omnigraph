@@ -460,7 +460,7 @@ async fn nested_hydration_uses_the_query_pool_and_releases_on_refusal() {
 }
 
 /// Two projected batches fit together; concatenating them exceeds the pool.
-/// GQT cannot select the pool or observe the collector's reservation owner.
+/// GQT cannot observe the collector's reservation owner.
 #[tokio::test]
 #[serial]
 async fn result_collection_refuses_its_own_concatenation_and_releases() {
@@ -2188,6 +2188,57 @@ async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251
     assert_released(&probes);
 }
 
+/// A correlated block on the per-row path folds each inner batch as the
+/// stream yields it (#1338), so it never holds the hub's whole fan-out: 16 MiB
+/// of inner payload runs under a 12 MiB pool. Holding the inner output first
+/// was refused even under 24 MiB. The conjunct that reads the outer row keeps
+/// the block off the key-set path, and `max` keeps it off the bulk row count.
+/// `issue_1338_correlated_block_folds_inner_batches.gqt` guards the rows and the
+/// refusal; this test adds what GQT cannot assert, that the run releases every
+/// reservation it took.
+#[tokio::test]
+#[serial]
+async fn correlated_block_folds_inner_batches_as_they_stream_issue_1338() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = graph_fixture(&dir, 16_384, 1024).await;
+    let query = r#"query hubs() {
+        match {
+            $a: Person { name: "hub" }
+            max($b.payload) { $a knows $b  $a.name = $a.name } > ""
+        }
+        return { $a.name }
+    }"#;
+    let limit = 12 * MIB;
+    let explain =
+        with_query_memory_limit(limit, v2.explain_query("main", query, "hubs", &params(&[])))
+            .await
+            .unwrap();
+    let mut pending = vec![&explain["physical_plan"]];
+    let mut strategy = None;
+    while let Some(node) = pending.pop() {
+        if node["node"] == "AntiJoin" {
+            strategy = node["strategy"].as_str();
+        }
+        pending.extend(node["inputs"].as_array().into_iter().flatten());
+    }
+    assert_eq!(strategy, Some("correlated"), "{explain}");
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(limit, query_main(&v2, query, "hubs", &params(&[]))),
+    )
+    .await
+    .unwrap();
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.iter().collect::<Vec<_>>(), [Some("hub")]);
+    assert_released(&probes);
+}
+
 /// A run that fits a query memory budget fits every larger budget. The
 /// fixture is the bound-edge sort of #1339: 4,096 `Knows` edges from one
 /// person, each with a 1 KiB pseudo-random payload, aggregated under budgets
@@ -2269,4 +2320,127 @@ query pairs() {
             outcomes[first_fit].0
         );
     }
+}
+
+/// A traversal step consumes its edge probe one batch at a time (issue
+/// #1459). Lance answers a BTREE-covered `key IN (…)` probe with one batch
+/// per contiguous row range, each a slice of a decode buffer whose capacity
+/// the pool charges, and an unindexed probe past 1,024 keys arrives as slices
+/// of large parent buffers too. A step that held its whole probe was charged
+/// that capacity once per batch: on this graph, the issue's synthetic code
+/// graph at 20,000 nodes, the hub read needed 512 MiB once the edge table was
+/// indexed and 64 MiB before. Held one batch at a time, the read fits the same
+/// 32 MiB pool on both sides of `ensure_indices`, with the same rows. Main
+/// is refused the indexed read even at 128 MiB, so a small charge change
+/// cannot make this pass on the defect; 16 MiB refuses the unindexed read
+/// here, so 32 MiB is the floor. Scale twin:
+/// `crates/omnigraph-gqt/cases_slow/v2/issue_1459_indexed_hop_streams_its_edge_probe.gqt`.
+#[tokio::test]
+#[serial]
+async fn hub_traversal_fits_one_pool_before_and_after_indexing_issue_1459() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), GRAPH_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(&layered_reference_graph(20_000), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let db = with_setting(&db, "engine", "v2");
+    let query = r#"set traversal_work_limit = 1000000000000;
+query impact() {
+    match { $t: Person { name: "n0" } $c (knows | knows){1,16} $t }
+    return distinct { $c.name }
+    order { $c.name asc }
+    limit 5000
+}"#;
+    let limit = 32 * MIB;
+    let mut answers = Vec::new();
+    for indexed in [false, true] {
+        if indexed {
+            db.ensure_indices_as(None).await.unwrap();
+        }
+        let probes = QueryMemoryProbes::default();
+        let result = with_query_memory_probes(
+            probes.clone(),
+            with_query_memory_limit(limit, query_main(&db, query, "impact", &params(&[]))),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("indexed={indexed}: the hub read must fit {limit} bytes: {error}")
+        });
+        assert_released(&probes);
+        let names = result.concat_batches().unwrap();
+        let names = names
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        answers.push(
+            (0..names.len())
+                .map(|row| names.value(row).to_owned())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(answers[0].len(), 5000);
+    assert_eq!(answers[0], answers[1], "indexing must not change the rows");
+}
+
+/// The issue's `gen.py` shape, deterministic: `n0` alone in layer 0, layers
+/// growing geometrically to `nodes` over six layers, each node referencing
+/// one to six nodes of the layer below and three of its own.
+fn layered_reference_graph(nodes: usize) -> String {
+    let mut state = 7u64;
+    let mut next = move |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    let layers = 6;
+    let growth = (nodes as f64).powf(1.0 / (layers - 1) as f64);
+    let mut sizes = vec![1usize];
+    let mut total = 1;
+    for k in 1..layers {
+        let size = if k < layers - 1 {
+            ((growth.powi(k as i32)) as usize).max(2)
+        } else {
+            nodes - total
+        };
+        sizes.push(size);
+        total += size;
+    }
+    let mut lines = Vec::new();
+    let mut starts = Vec::new();
+    let mut id = 0;
+    for &size in &sizes {
+        starts.push(id);
+        for node in id..id + size {
+            lines.push(
+                serde_json::json!({"type":"Person", "data":{"name":format!("n{node}"), "payload":""}})
+                    .to_string(),
+            );
+        }
+        id += size;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for k in 1..layers {
+        for node in starts[k]..starts[k] + sizes[k] {
+            let fan_out = 1 + next(6);
+            let mut targets: Vec<usize> = (0..fan_out)
+                .map(|_| starts[k - 1] + next(sizes[k - 1]))
+                .collect();
+            targets.extend((0..3).map(|_| starts[k] + next(sizes[k])));
+            for target in targets {
+                if target != node && seen.insert((node, target)) {
+                    lines.push(
+                        serde_json::json!({"edge":"Knows", "from":format!("n{node}"), "to":format!("n{target}")})
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    lines.join("\n")
 }

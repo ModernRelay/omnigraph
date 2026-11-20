@@ -440,19 +440,6 @@ impl MutationStaging {
         Ok(())
     }
 
-    /// Delete predicates already recorded for `table_key` by earlier delete
-    /// statements in this query. Read before recording the current statement's
-    /// predicate so its `affected_*` count can exclude rows a prior statement
-    /// already scheduled for deletion (deletes stage, so the committed snapshot
-    /// is unchanged across statements — without this, overlapping predicates
-    /// would double-count). `&[]` if none.
-    pub(crate) fn recorded_delete_predicates(&self, table_key: &str) -> &[Expr] {
-        self.delete_predicates
-            .get(table_key)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
     /// Read-your-writes accessor: the accumulated pending batches for
     /// `table_key`, or `&[]` if none.
     pub(crate) fn pending_batches(&self, table_key: &str) -> &[RecordBatch] {
@@ -493,13 +480,6 @@ impl MutationStaging {
     /// the query made no observable writes.
     pub(crate) fn is_empty(&self) -> bool {
         self.pending.is_empty() && self.delete_predicates.is_empty()
-    }
-
-    /// Total count of pending rows across all tables. Used by tests and
-    /// (eventually) memory-budget enforcement.
-    #[allow(dead_code)]
-    pub(crate) fn pending_row_count(&self) -> usize {
-        self.pending.values().map(|p| p.total_rows()).sum()
     }
 
     /// End-of-query: for each pending table, concat batches and stage

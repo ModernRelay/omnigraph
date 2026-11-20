@@ -318,6 +318,9 @@ pub(crate) enum TargetProvenance {
 pub(crate) struct ResolvedTarget {
     pub(crate) binding: TargetBinding,
     pub(crate) provenance: TargetProvenance,
+    /// The base of a graph shallow clone (`--base`): the direct target is
+    /// opened reading through this graph's root.
+    pub(crate) base: Option<String>,
     storage: std::sync::OnceLock<
         std::result::Result<omnigraph::storage::CapturedStorageBinding, String>,
     >,
@@ -327,6 +330,7 @@ impl ResolvedTarget {
         Self {
             binding,
             provenance,
+            base: None,
             storage: std::sync::OnceLock::new(),
         }
     }
@@ -740,9 +744,36 @@ impl OperatorConfig {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ReplacementSyncFailed(std::io::Error);
+
+impl std::fmt::Display for ReplacementSyncFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "file was replaced, but directory durability could not be confirmed: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ReplacementSyncFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// Replace the file by writing a sibling and renaming it over, keeping its
 /// permissions.
 pub(crate) fn replace_file(path: &Path, text: &str) -> Result<()> {
+    replace_file_with_dir_sync(path, text, crate::sync_dir)
+}
+
+fn replace_file_with_dir_sync(
+    path: &Path,
+    text: &str,
+    sync_dir: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
     if text.len() > crate::operator::OPERATOR_FILE_MAX_BYTES {
         return Err(refusal(
             "target_config_invalid",
@@ -761,7 +792,7 @@ pub(crate) fn replace_file(path: &Path, text: &str) -> Result<()> {
     file.as_file().sync_all()?;
     file.persist(path)
         .map_err(|error| eyre!("could not replace operator config: {}", error.error))?;
-    crate::sync_dir(parent)?;
+    sync_dir(parent).map_err(ReplacementSyncFailed)?;
     Ok(())
 }
 

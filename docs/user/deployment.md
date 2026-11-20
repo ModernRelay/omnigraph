@@ -291,16 +291,16 @@ cluster, supported servers and direct CLI writers acquire the same exclusive
 cluster admission before writable graph work and recheck the applied inventory.
 CLI queries, exports, schema inspection/planning, lint and stored-query
 validation check the applied identity without acquiring or changing that lock;
-they refuse outstanding deployments or schema drift. Native maintenance,
-including `repair` preview, uses writer admission. An outstanding deployment
+they refuse outstanding deployments or schema drift. Native maintenance
+uses writer admission. An outstanding deployment
 admits only reconciliation of its exact original ID.
 Keep older binaries, raw storage tools and embedded writers outside this
 cooperating boundary stopped; the lock cannot fence their native storage I/O.
 
-Admission remains held after an ordinary direct write command succeeds or a
-deployment completes. A clean server shutdown follows the bounded release
-described above; ending work without that proof retains admission. A completed read-only
-preflight refusal during new deployment, conversion or admission construction
+Ordinary direct writes retain admission. A converged local or S3 direct `cluster apply` closes its storage scope
+and waits for accepted writes to settle before releasing admission. A clean server shutdown bounds that wait by its deadline.
+For an unconfirmed release, see [direct apply recovery](clusters/index.md#bootstrap-a-cluster). Writable Azure operations retain admission.
+A completed read-only preflight refusal during new deployment, conversion or admission construction
 releases its admission. Recovery of accepted work, cancellation and uncertain
 effects retain it. A finished response, zero active HTTP
 requests, lock age or a stopped PID alone does not prove that previously
