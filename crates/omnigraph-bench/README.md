@@ -735,12 +735,15 @@ discards what its store-call counters saw of the warmup. The two counts
 split a statement at the flip differently: one in flight across it is a
 warmup acknowledgement, the store calls it issues after the flip are the
 window's, and a call in progress at that instant lands on either side. A
-label keeps up to 2^20 service times, an even share per worker; a worker
-past its share keeps every second one, then every fourth, each kept sample
-weighted by its stride in the nearest-rank p50 and p99. `max` is exact. A
-failed statement stops every worker and fails the repetition with no
-`Settled`. The readback after `Settled` opens a fresh handle on the same
-root.
+run with no warmup has no such statement: its window opens, and the
+counters start, before the first worker does. A label counts the service
+time of every window statement in buckets: a time under 256 µs has a bucket
+of its own, and above that a bucket is narrower than 1/128 of its times.
+The nearest-rank p50 and p99 are the top of the bucket their statement is
+counted in, so each is less than 1/128 over that statement's own time and
+never over `max`, which is exact. A failed statement stops every worker and
+fails the repetition with no `Settled`. The readback after `Settled` opens a
+fresh handle on the same root.
 
 `GqtRepObservation.concurrent` is the observation: `driver`, `claim_grade`,
 `warmup_seconds`, `measured_seconds`, `sweep`, `window_us`, `drain_us`,

@@ -791,12 +791,13 @@ into a passing sample.
 index preparation, and mixed archive/projection coverage. `gqt_served_tests.rs`
 owns served admission, client/server evidence separation, protocol containment
 and measured HTTP callback ordering. `gqt_concurrent_tests.rs` owns the
-measured block: one point per swept value, the looped block's observation,
-the concurrent record, the run settings, the block's failure routes (a
-failed statement, a dealt stream that runs out, an acknowledged row missing
-at the readback), a free-running block beside the measured one, and the
-one-point routes' refusal of a sweep; `concurrent_host` owns the driver's
-counting, sample budget and percentile arithmetic, and `projection` the
+measured block: one point per swept value, the looped block's observation
+with and without a warmup, the concurrent record, the run settings, the
+readback of two labels by their own key columns, the block's failure routes
+(a failed statement, a dealt stream that runs out, an acknowledged row
+missing at the readback), a free-running block beside the measured one, and
+the one-point routes' refusal of a sweep; `concurrent_host` owns the driver's
+counting, service-time buckets and percentile arithmetic, and `projection` the
 claim eligibility of a concurrent record. `dataset_identity`,
 `dataset_cache`, and `dataset_worker` own logical history, cache integrity,
 and contained building; `gqt_runner`, `gqt_supervisor`, and `gqt_protocol` own

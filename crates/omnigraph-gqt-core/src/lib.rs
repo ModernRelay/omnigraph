@@ -5490,7 +5490,7 @@ pub struct Readback {
 
 /// The readback after a block whose sessions ran many times: `acked[i]` is
 /// how many runs session `i` of the block was acknowledged for. Every dealt
-/// key of those runs must be in one scan of its table's key column, and
+/// key of those runs must be in one scan of its recipe's key column, and
 /// [`READBACK_COMPARED_PER_SESSION`] rows spread over each session's runs are
 /// compared column by column, as [`readback_dealt_rows`] compares them all.
 pub async fn readback_acked_rows(
@@ -5500,7 +5500,7 @@ pub async fn readback_acked_rows(
     acked: &[u64],
 ) -> Result<Readback, String> {
     let params = build_params(None, &[], None, &Bindings::new())?;
-    let mut scans: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    let mut scans: HashMap<(String, String, String), HashSet<String>> = HashMap::new();
     let mut readback = Readback::default();
     for (op, &runs) in step.sessions.iter().zip(acked) {
         let SessionKind::Load(recipe) = &op.kind else {
@@ -5510,7 +5510,7 @@ pub async fn readback_acked_rows(
             continue;
         }
         let (table, column, _) = recipe.generated.dealt_key(op.dealt_index(0))?;
-        let scan = (op.branch.clone(), table.clone());
+        let scan = (op.branch.clone(), table.clone(), column.clone());
         if !scans.contains_key(&scan) {
             let source = format!(
                 "query readback_keys() {{ match {{ $r: {table} }} return {{ $r.{column} }} }}"

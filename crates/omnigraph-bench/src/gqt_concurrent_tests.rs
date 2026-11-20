@@ -75,10 +75,14 @@ fn short_catalog(directory: &Path) -> crate::catalog::Catalog {
 /// The catalog of one scenario, `writers`, over the sixteen-row fixture and
 /// `workload`.
 fn catalog_of(directory: &Path, workload: &str) -> crate::catalog::Catalog {
+    catalog_over(directory, FIXTURE, workload)
+}
+
+fn catalog_over(directory: &Path, fixture: &str, workload: &str) -> crate::catalog::Catalog {
     for child in ["fixtures", "workloads"] {
         std::fs::create_dir_all(directory.join(child)).unwrap();
     }
-    std::fs::write(directory.join("fixtures/chunks.gqt"), FIXTURE).unwrap();
+    std::fs::write(directory.join("fixtures/chunks.gqt"), fixture).unwrap();
     std::fs::write(directory.join("workloads/writers.gqt"), workload).unwrap();
     std::fs::write(directory.join("benchmarks.yaml"), CONFIG).unwrap();
     crate::catalog::Catalog::load(&directory.join("benchmarks.yaml")).unwrap()
@@ -124,6 +128,15 @@ fn number(value: &Value, path: &str) -> u64 {
         .fold(value, |value, key| &value[key])
         .as_u64()
         .unwrap_or_else(|| panic!("`{path}` is not a number in {value}"))
+}
+
+/// The statements the labels of `block` were acknowledged for in its warmup.
+fn warmup_acked(block: &Value) -> u64 {
+    let labels = block["labels"].as_array().unwrap();
+    labels
+        .iter()
+        .map(|label| number(label, "warmup_acked"))
+        .sum()
 }
 
 /// What every label of a measured block reports, whatever its statement.
@@ -178,10 +191,11 @@ async fn measured_block_loops_every_worker_for_its_duration_and_reports_each_lab
         .unwrap();
     assert_eq!(suite.runs.len(), 2, "one run per swept worker count");
     let mut points = std::collections::BTreeSet::new();
-    for (run, workers) in suite.runs.iter().zip([1u64, 3]) {
+    for (run, (workers, warmup)) in suite.runs.iter().zip([(1u64, 0u32), (3, 1)]) {
         let plan = run.case.gqt().unwrap();
         assert!(points.insert(plan.planned_sha256.clone()));
-        let (sample, _) = run_sample(plan)
+        let plan = plan.clone().with_block_run(Some(warmup), None).unwrap();
+        let (sample, _) = run_sample(&plan)
             .await
             .unwrap_or_else(|error| panic!("W = {workers}: {error}"));
         assert_eq!(sample.outcome, "expectations-passed");
@@ -189,7 +203,7 @@ async fn measured_block_loops_every_worker_for_its_duration_and_reports_each_lab
         let block = &sample["concurrent"];
         assert_eq!(block["driver"], "closed-loop");
         assert_eq!(block["claim_grade"], false);
-        assert_eq!(number(block, "warmup_seconds"), 0);
+        assert_eq!(number(block, "warmup_seconds"), u64::from(warmup));
         assert_eq!(number(block, "measured_seconds"), 2);
         assert_eq!(number(block, "sweep.W"), workers);
         let window_us = number(block, "window_us");
@@ -197,7 +211,15 @@ async fn measured_block_loops_every_worker_for_its_duration_and_reports_each_lab
             window_us >= 2_000_000,
             "the window is the declared duration"
         );
-        assert!(number(&sample, "elapsed_us") >= window_us + number(block, "drain_us"));
+        assert!(
+            number(&sample, "elapsed_us")
+                >= u64::from(warmup) * 1_000_000 + window_us + number(block, "drain_us")
+        );
+        assert_eq!(
+            warmup_acked(block) > 0,
+            warmup > 0,
+            "W = {workers}: a statement is a warmup's only under a declared warmup"
+        );
         let labels = block["labels"].as_array().unwrap();
         assert_eq!(labels.len(), 2, "one row per label, in declaration order");
         let written = assert_label(&labels[0], "writer", "load", workers, window_us);
@@ -266,6 +288,10 @@ async fn concurrent_record_round_trips_and_refuses_what_its_samples_do_not_show(
         }),
         ("a missing observation", |r| {
             r.record.measurements.raw_samples[0].concurrent = None;
+        }),
+        ("a warmup count under no warmup", |r| {
+            let sample = &mut r.record.measurements.raw_samples[0];
+            sample.concurrent.as_mut().unwrap().labels[1].warmup_acked = 1;
         }),
     ];
     for (name, mutate) in mutations {
@@ -398,6 +424,11 @@ async fn concurrent_writes_runs_at_its_first_and_last_swept_worker_count() {
         let block = &sample["concurrent"];
         assert_eq!(number(block, "sweep.W"), workers);
         assert_eq!(number(block, "measured_seconds"), 2);
+        assert_eq!(
+            warmup_acked(block),
+            0,
+            "W = {workers}: the run was given no warmup"
+        );
         let window_us = number(block, "window_us");
         let labels = block["labels"].as_array().unwrap();
         assert_eq!(labels.len(), 2, "W = {workers}");
@@ -493,6 +524,55 @@ eraser: ok
         .as_ref()
         .expect("the block settled before its readback");
     assert_eq!(sample.outcome, "verification-failed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_readback_looks_for_each_labels_rows_in_that_labels_key_column() {
+    let block = r#"--- concurrent measured
+slugged: load generate: v1 seed: 42 mode: append
+  tables:
+    - kind: node
+      name: Chunk
+      rows: 40960
+      commits: 10
+      columns:
+        slug: {kind: key, prefix: cw-, width: 5}
+        n: {kind: ordinal, start: 1000, step: 1}
+coded: load generate: v1 seed: 43 mode: append
+  tables:
+    - kind: node
+      name: Chunk
+      rows: 40960
+      commits: 10
+      columns:
+        code: {kind: key, prefix: cc-, width: 5}
+        slug: {kind: key, prefix: cs-, width: 5}
+        n: {kind: ordinal, start: 50000, step: 1}
+--- expect
+slugged: ok
+coded: ok
+"#;
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FIXTURE.replace("n: I64 }", "n: I64 code: String? }");
+    let workload = block_workload(2, block, SEEDED_ROW);
+    let plan = catalog_over(directory.path(), &fixture, &workload)
+        .plan_in("writers", &recorded_environment())
+        .unwrap();
+    let (sample, _) = run_sample(&plan)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(sample.outcome, "expectations-passed");
+    let sample = serde_json::to_value(&sample).unwrap();
+    let block = &sample["concurrent"];
+    let window_us = number(block, "window_us");
+    let labels = block["labels"].as_array().unwrap();
+    let written = assert_label(&labels[0], "slugged", "load", 1, window_us)
+        + assert_label(&labels[1], "coded", "load", 1, window_us);
+    assert_eq!(
+        number(block, "readback.rows"),
+        written,
+        "`slugged` is read back by `slug` and `coded` by `code`, the first key column of each recipe"
+    );
 }
 
 const BESIDE: &str = r#"

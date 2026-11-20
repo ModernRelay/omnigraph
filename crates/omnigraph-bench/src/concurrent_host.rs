@@ -18,7 +18,7 @@ use omnigraph_gqt_core::{ConcurrentStep, PlainHost, SessionOp, run_session};
 use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, JoinSet};
 
-use crate::gqt_case::{BlockRun, MEASURED_BLOCK_WORKERS};
+use crate::gqt_case::BlockRun;
 
 /// How the workers of a measured block issue statements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,8 +113,10 @@ pub struct PerWorker {
     pub max: u64,
 }
 
-/// Nearest-rank service times of the label's window statements, from a
-/// statement's start on its worker to its acknowledgement.
+/// Service times of the label's window statements, from a statement's start
+/// on its worker to its acknowledgement. `p50` and `p99` are nearest-rank
+/// over every statement: exact under 256 µs, and above that less than 1/128
+/// over the time of the statement at that rank. `max` is exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceTime {
@@ -137,14 +139,30 @@ const WARMUP: u8 = 0;
 const MEASURED: u8 = 1;
 const STOP: u8 = 2;
 
-/// The service times one label keeps exactly, an even share per worker. A
-/// worker past its share keeps every second sample, then every fourth, each
-/// standing for its stride.
-const SAMPLES_PER_LABEL: usize = 1 << 20;
-const _: () = assert!(sample_share(MEASURED_BLOCK_WORKERS) >= 2);
+/// A service time under `FINE` µs has a bucket of its own, and every power
+/// of two from there up is cut into `FINE` equal buckets: exact under
+/// 256 µs, and above that narrower than 1/128 of the times it counts.
+const FINE_BITS: u32 = 7;
+const FINE: usize = 1 << FINE_BITS;
+const BUCKETS: usize = (u64::BITS - FINE_BITS + 1) as usize * FINE;
 
-const fn sample_share(workers: usize) -> usize {
-    SAMPLES_PER_LABEL / workers
+fn bucket(micros: u64) -> usize {
+    let coarse = micros
+        .checked_ilog2()
+        .and_then(|log| log.checked_sub(FINE_BITS));
+    match coarse {
+        None => micros as usize,
+        Some(shift) => (shift as usize + 1) * FINE + ((micros >> shift) as usize - FINE),
+    }
+}
+
+/// The longest service time bucket `index` counts.
+fn bucket_top(index: usize) -> u64 {
+    let (group, step) = (index / FINE, (index % FINE) as u64);
+    match group.checked_sub(1) {
+        None => step,
+        Some(shift) => ((FINE as u64 + step) << shift) | ((1u64 << shift) - 1),
+    }
 }
 
 struct Clock {
@@ -152,39 +170,46 @@ struct Clock {
     measured_at: OnceLock<Instant>,
 }
 
-struct Samples {
-    kept: Vec<u64>,
-    share: usize,
-    stride: u64,
-    seen: u64,
+/// The service times of window statements as a count per bucket: every
+/// statement is counted, and the longest is kept as measured.
+struct ServiceTimes {
+    counts: Vec<u64>,
     longest: u64,
 }
 
-impl Samples {
-    fn up_to(share: usize) -> Self {
+impl ServiceTimes {
+    fn new() -> Self {
         Self {
-            kept: Vec::new(),
-            share,
-            stride: 1,
-            seen: 0,
+            counts: vec![0; BUCKETS],
             longest: 0,
         }
     }
 
     fn record(&mut self, micros: u64) {
         self.longest = self.longest.max(micros);
-        if self.seen.is_multiple_of(self.stride) {
-            self.kept.push(micros);
-            if self.kept.len() == self.share {
-                let mut position = 0usize;
-                self.kept.retain(|_| {
-                    position += 1;
-                    position % 2 == 1
-                });
-                self.stride *= 2;
+        self.counts[bucket(micros)] += 1;
+    }
+
+    fn absorb(&mut self, other: &Self) {
+        self.longest = self.longest.max(other.longest);
+        for (count, more) in self.counts.iter_mut().zip(&other.counts) {
+            *count += more;
+        }
+    }
+
+    /// The nearest-rank `percent` time: the top of the bucket the statement
+    /// of that rank is counted in, or the longest time when that is less.
+    fn nearest_rank(&self, percent: u64) -> u64 {
+        let total: u128 = self.counts.iter().map(|count| u128::from(*count)).sum();
+        let rank = (u128::from(percent) * total).div_ceil(100).max(1);
+        let mut below = 0u128;
+        for (index, count) in self.counts.iter().enumerate() {
+            below += u128::from(*count);
+            if below >= rank {
+                return bucket_top(index).min(self.longest);
             }
         }
-        self.seen += 1;
+        0
     }
 }
 
@@ -194,7 +219,7 @@ struct Tally {
     in_drain: u64,
     conflicts: u64,
     by_second: Vec<u64>,
-    samples: Samples,
+    times: ServiceTimes,
 }
 
 fn micros(duration: Duration) -> u64 {
@@ -208,7 +233,6 @@ async fn work(
     op: SessionOp,
     clock: Arc<Clock>,
     seconds: u32,
-    share: usize,
 ) -> Result<Tally, String> {
     let mut tally = Tally {
         warmup_acked: 0,
@@ -216,7 +240,7 @@ async fn work(
         in_drain: 0,
         conflicts: 0,
         by_second: vec![0; seconds as usize],
-        samples: Samples::up_to(share),
+        times: ServiceTimes::new(),
     };
     let mut seq = 0u64;
     loop {
@@ -244,7 +268,7 @@ async fn work(
         }
         tally.acked += 1;
         tally.conflicts += u64::from(report.conflicts);
-        tally.samples.record(micros(ended.duration_since(begun)));
+        tally.times.record(micros(ended.duration_since(begun)));
         let second = clock
             .measured_at
             .get()
@@ -271,21 +295,6 @@ async fn hold(
     }
 }
 
-/// The rank-`percent` value of `weighted` samples sorted by value, each
-/// standing for `weight` statements.
-fn nearest_rank(weighted: &[(u64, u64)], percent: u64) -> u64 {
-    let total: u128 = weighted.iter().map(|(_, weight)| u128::from(*weight)).sum();
-    let rank = (u128::from(percent) * total).div_ceil(100).max(1);
-    let mut below = 0u128;
-    for (value, weight) in weighted {
-        below += u128::from(*weight);
-        if below >= rank {
-            return *value;
-        }
-    }
-    weighted.last().map_or(0, |(value, _)| *value)
-}
-
 /// `acked` statements over `window_us`, per second, in thousandths.
 pub(crate) fn rate_millis(acked: u64, window_us: u64) -> u64 {
     if window_us == 0 {
@@ -294,23 +303,31 @@ pub(crate) fn rate_millis(acked: u64, window_us: u64) -> u64 {
     u64::try_from(u128::from(acked) * 1_000_000_000 / u128::from(window_us)).unwrap_or(u64::MAX)
 }
 
+/// Opens the measured window: `flip`, then the instant the rates count from.
+fn open_window(clock: &Clock, flip: &impl Fn() -> Result<(), String>) -> Result<(), String> {
+    flip()?;
+    let _ = clock.measured_at.set(Instant::now());
+    clock.phase.store(MEASURED, Ordering::Release);
+    Ok(())
+}
+
 /// Runs the block for `run`: every session of `step` on a task over a clone
-/// of `session`, `flip` called once between warmup and the window so the
-/// host can discard what its counters saw of the warmup.
+/// of `session`. `flip` is called where the window opens, so the host can
+/// discard what its counters saw of a warmup; with none, no worker has run.
 pub(crate) async fn drive(
     session: &Session,
     step: &ConcurrentStep,
     run: BlockRun,
-    flip: impl FnOnce() -> Result<(), String>,
+    flip: impl Fn() -> Result<(), String>,
 ) -> Result<Driven, String> {
     let clock = Arc::new(Clock {
         phase: AtomicU8::new(WARMUP),
         measured_at: OnceLock::new(),
     });
     let probes = capture_query_io_probes();
-    let mut label_workers: BTreeMap<&str, usize> = BTreeMap::new();
-    for op in &step.sessions {
-        *label_workers.entry(op.group.as_str()).or_default() += 1;
+    let warmup = Duration::from_secs(u64::from(run.warmup_seconds));
+    if warmup.is_zero() {
+        open_window(&clock, &flip)?;
     }
     let mut workers = JoinSet::new();
     for (index, op) in step.sessions.iter().enumerate() {
@@ -319,7 +336,6 @@ pub(crate) async fn drive(
             op.clone(),
             Arc::clone(&clock),
             run.duration_seconds,
-            sample_share(label_workers[op.group.as_str()]),
         );
         let probes = probes.clone();
         workers.spawn(async move {
@@ -332,22 +348,15 @@ pub(crate) async fn drive(
     }
     let mut ended: Vec<Ended> = Vec::new();
     let mut refusal = None;
-    match hold(
-        &mut workers,
-        Duration::from_secs(u64::from(run.warmup_seconds)),
-    )
-    .await
-    {
-        Some(early) => ended.push(early),
-        None => match flip() {
-            Err(message) => refusal = Some(message),
-            Ok(()) => {
-                let _ = clock.measured_at.set(Instant::now());
-                clock.phase.store(MEASURED, Ordering::Release);
-                let window = Duration::from_secs(u64::from(run.duration_seconds));
-                ended.extend(hold(&mut workers, window).await);
-            }
-        },
+    if !warmup.is_zero() {
+        match hold(&mut workers, warmup).await {
+            Some(early) => ended.push(early),
+            None => refusal = open_window(&clock, &flip).err(),
+        }
+    }
+    if ended.is_empty() && refusal.is_none() {
+        let window = Duration::from_secs(u64::from(run.duration_seconds));
+        ended.extend(hold(&mut workers, window).await);
     }
     let stopped = Instant::now();
     clock.phase.store(STOP, Ordering::Release);
@@ -373,7 +382,7 @@ pub(crate) async fn drive(
         .get()
         .ok_or("the measured window never opened")?;
     let window_us = micros(stopped.duration_since(*measured_at));
-    let mut labels: Vec<(LabelObservation, Vec<(u64, u64)>)> = Vec::new();
+    let mut labels: Vec<(LabelObservation, ServiceTimes)> = Vec::new();
     let mut acked_runs = Vec::with_capacity(step.sessions.len());
     for (op, tally) in step.sessions.iter().zip(tallies) {
         let tally = tally.ok_or_else(|| format!("session `{}` returned no tally", op.label))?;
@@ -400,10 +409,10 @@ pub(crate) async fn drive(
                     authority_conflicts: 0,
                     acked_by_second: vec![0; run.duration_seconds as usize],
                 },
-                Vec::new(),
+                ServiceTimes::new(),
             ));
         }
-        let (label, weighted) = labels.last_mut().ok_or("the block declares no label")?;
+        let (label, times) = labels.last_mut().ok_or("the block declares no label")?;
         label.workers += 1;
         label.acked += tally.acked;
         label.warmup_acked += tally.warmup_acked;
@@ -411,28 +420,20 @@ pub(crate) async fn drive(
         label.authority_conflicts += tally.conflicts;
         label.per_worker.min = label.per_worker.min.min(tally.acked);
         label.per_worker.max = label.per_worker.max.max(tally.acked);
-        label.service_time_us.max = label.service_time_us.max.max(tally.samples.longest);
         for (second, count) in label.acked_by_second.iter_mut().zip(&tally.by_second) {
             *second += count;
         }
-        let stride = tally.samples.stride;
-        weighted.extend(
-            tally
-                .samples
-                .kept
-                .into_iter()
-                .map(|micros| (micros, stride)),
-        );
+        times.absorb(&tally.times);
     }
     let labels = labels
         .into_iter()
-        .map(|(mut label, mut weighted)| {
-            weighted.sort_unstable();
+        .map(|(mut label, times)| {
             label.acked_per_second_millis = rate_millis(label.acked, window_us);
-            if !weighted.is_empty() {
-                label.service_time_us.p50 = nearest_rank(&weighted, 50);
-                label.service_time_us.p99 = nearest_rank(&weighted, 99);
-            }
+            label.service_time_us = ServiceTime {
+                p50: times.nearest_rank(50),
+                p99: times.nearest_rank(99),
+                max: times.longest,
+            };
             label
         })
         .collect();
@@ -512,6 +513,7 @@ pub(crate) fn validate(
             || times.p50 > times.p99
             || times.p99 > times.max
             || label.acked_per_second_millis != rate_millis(label.acked, observed.window_us)
+            || (run.warmup_seconds == 0 && label.warmup_acked != 0)
         {
             return Err(format!(
                 "the row of label `{}` disagrees with the block or with itself",
@@ -585,46 +587,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nearest_rank_weighs_a_thinned_worker_by_its_stride() {
-        let exact: Vec<(u64, u64)> = (1..=100).map(|value| (value, 1)).collect();
-        assert_eq!(nearest_rank(&exact, 50), 50);
-        assert_eq!(nearest_rank(&exact, 99), 99);
-        assert_eq!(nearest_rank(&[(7, 1)], 99), 7);
-        let mut mixed = vec![(10, 1), (20, 1), (1000, 8)];
-        mixed.sort_unstable();
+    fn nearest_rank_counts_every_statement_of_every_worker() {
+        let mut label = ServiceTimes::new();
+        assert_eq!(label.nearest_rank(99), 0, "no statement, no time");
+        let (mut odd, mut even) = (ServiceTimes::new(), ServiceTimes::new());
+        for micros in 1..=100u64 {
+            let worker = if micros % 2 == 1 { &mut odd } else { &mut even };
+            worker.record(micros);
+        }
+        label.absorb(&odd);
+        label.absorb(&even);
+        assert_eq!(label.nearest_rank(50), 50);
+        assert_eq!(label.nearest_rank(99), 99);
+        assert_eq!(label.longest, 100);
+        let mut coarse = ServiceTimes::new();
+        coarse.record(1000);
+        coarse.record(5000);
         assert_eq!(
-            nearest_rank(&mixed, 50),
-            1000,
-            "eight of ten statements took 1000"
+            coarse.nearest_rank(50),
+            1003,
+            "the top of the bucket that counts 1000"
         );
-        assert_eq!(nearest_rank(&mixed, 10), 10);
+        assert_eq!(coarse.nearest_rank(99), 5000, "never over the longest");
     }
 
     #[test]
-    fn a_full_worker_keeps_every_second_sample_and_the_longest() {
-        let share = sample_share(MEASURED_BLOCK_WORKERS);
-        let mut samples = Samples::up_to(share);
-        let total = share as u64 + 4;
-        for micros in 0..total {
-            samples.record(micros);
+    fn a_bucket_is_exact_under_256_micros_and_narrower_than_a_128th_above() {
+        let times = [
+            0,
+            1,
+            127,
+            128,
+            255,
+            256,
+            257,
+            1000,
+            65_535,
+            65_536,
+            3_600_000_000,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let mut last = 0;
+        for micros in times {
+            let index = bucket(micros);
+            assert!(last <= index && index < BUCKETS, "{micros}");
+            last = index;
+            let top = bucket_top(index);
+            assert!(
+                micros <= top && top - micros <= micros >> FINE_BITS,
+                "{micros} is counted in a bucket up to {top}"
+            );
+            assert!(micros >= 256 || top == micros, "{micros}");
         }
-        assert_eq!(samples.stride, 2);
-        assert_eq!(samples.longest, total - 1);
-        assert_eq!(samples.kept.len(), share / 2 + 2);
-        assert!(samples.kept.iter().all(|micros| micros % 2 == 0));
+        assert_eq!(bucket(u64::MAX), BUCKETS - 1);
     }
 
     #[test]
-    fn a_label_keeps_at_most_its_budget_however_many_workers_share_it() {
-        for workers in [1, 3, MEASURED_BLOCK_WORKERS] {
-            let share = sample_share(workers);
-            assert!(share * workers <= SAMPLES_PER_LABEL, "{workers} workers");
-            let mut samples = Samples::up_to(share);
-            for micros in 0..3 * share as u64 {
-                samples.record(micros);
-            }
-            assert!(samples.kept.len() < share, "{workers} workers");
+    fn a_slow_statement_on_every_second_run_is_in_the_p99() {
+        let mut times = ServiceTimes::new();
+        for run in 0..8192u64 {
+            times.record(if run % 2 == 0 { 10 } else { 1000 });
         }
+        assert_eq!((times.nearest_rank(50), times.nearest_rank(99)), (10, 1000));
     }
 
     #[test]
