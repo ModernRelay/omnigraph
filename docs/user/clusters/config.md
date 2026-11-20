@@ -85,7 +85,10 @@ startup every ID outside the character, length and reserved-name rules, and the
 cluster's recorded state requires the leading letter, so `cluster validate`,
 `plan` and `apply` refuse any other ID with `invalid_resource_id` before
 anything is written. An underscore is refused in a graph ID; policy bundle,
-query and embedding provider names may contain one.
+query and embedding provider names may contain one. If a cluster already
+declares a graph whose ID breaks this rule, no other change applies until you
+rename or remove that graph in `cluster.yaml`. Renaming or removing it deletes
+the old graph root and its history.
 
 Optional fields:
 
