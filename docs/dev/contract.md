@@ -138,7 +138,7 @@ Every statement has an address, so a change can say which one it touches.
 |---|---|---|
 | A rule for every operation | `E` and a number | `E2` |
 | A cell of the table of rules per kind | `kind.column` | `write.sees` |
-| Two kinds of operation running at once | `kind+kind`, in the order of the kinds table | `read+forget` |
+| Two kinds of operation running at once | `kind+kind`, in the order of the kinds table | `read+reclaim` |
 | A detail | `kind:` and a number | `merge:3` |
 | A gap | `G` and a number | `G2` |
 | An open decision | `D` and a number | `D1` |
@@ -217,7 +217,7 @@ Operation names are those of the shared inventory in
 | `schema` | `schema apply` |
 | `branch` | `branch create`, `branch delete`, `commit drop`; claiming a branch (embedded engine only) |
 | `maintain` | `optimize`, `index build`, `index rebuild`, `upgrade`, `schema upgrade-system-columns` |
-| `forget` | `cleanup`; removing a graph from a cluster deployment |
+| `reclaim` | `cleanup`; removing a graph from a cluster deployment |
 
 Two operations are two steps:
 
@@ -301,7 +301,7 @@ failure shape; the embedded engine returns its own error type.
 *Kept by:* invariant 10.
 
 **E7. It stays in its kind.** An operation changes only what its kind may
-change. Only `forget` removes published commits `D1`. Only `maintain`
+change. Only `reclaim` removes published commits `D1`. Only `maintain`
 rewrites physical state, and it never changes an answer `G3`: a read says
 what it wants, never how to find it.
 *Why:* history is the agents' memory, and a search must mean the same
@@ -320,13 +320,13 @@ this page promises.
 
 | | sees | changes | refuses when | cost grows with |
 |---|---|---|---|---|
-| **read** | head at start, or a named commit | nothing | commit forgotten; a property that did not exist at the named commit `G15` | rows touched |
+| **read** | head at start, or a named commit | nothing | commit reclaimed; a property that did not exist at the named commit `G15` | rows touched |
 | **write** | head at publish; a `.gq` mutation may require a named head `D3` `D4` | one commit on one branch; none when no value would change `G6` | constraint broken; named head moved | what changed |
 | **merge** | two heads and their ancestor | one commit on the target, or none | sides disagree on an entity `D5`; constraint broken | what both sides changed |
 | **schema** | head of `main` at publish | one commit on `main` that changes the schema, or none | stored data breaks a new rule; another branch is live `D6` | types changed |
 | **branch** | a commit to start from | a name, never data `D1` | name taken | not the graph's size |
 | **maintain** | all heads | physical state, never an answer `G3` | graph is held; the branch moved since it began | what is out of shape |
-| **forget** | all branches | removes commits | consent missing; graph is held | history removed |
+| **reclaim** | all branches | removes commits | consent missing; graph is held | history removed |
 
 Not allowed (`E6`) and over a limit (`E5`) apply to every kind and are not
 repeated in the table. The cost column restates invariant 11 for each kind;
@@ -344,18 +344,18 @@ and where a wait is long today is in `D7` and `D8`.
 
 | Pair | One side is refused when |
 |---|---|
-| `read+schema`, `read+branch`, `read+maintain`, `read+forget` | An export or a `changes baseline` runs beside a schema apply, a branch create or delete, `optimize` or `cleanup`: each refuses the other. Two exports refuse each other `D7` |
-| `read+forget` | The read names a commit that `cleanup` removes `G5` |
+| `read+schema`, `read+branch`, `read+maintain`, `read+reclaim` | An export or a `changes baseline` runs beside a schema apply, a branch create or delete, `optimize` or `cleanup`: each refuses the other. Two exports refuse each other `D7` |
+| `read+reclaim` | The read names a commit that `cleanup` removes `G5` |
 | `write+schema` | The write selects rows and was prepared on the old schema `D8` |
 | `write+branch` | The write lands after its branch was deleted |
 | `write+maintain` | A write lands on the branch before an `index build` finishes: the build is refused |
-| `write+forget` | `main` moved before `cleanup` began: the `cleanup` is refused |
+| `write+reclaim` | `main` moved before `cleanup` began: the `cleanup` is refused |
 | `schema+branch` | Another branch is live: the apply is refused `D6` |
 | `schema+maintain` | A schema apply lands first: the maintenance may be refused |
 | `branch+branch` | Both create the same name: one wins |
 | `maintain+maintain` | A second `optimize` or `index build` is started without the server |
-| `maintain+forget` | `optimize` published first: the `cleanup` is refused |
-| `forget+forget` | Two removals of one graph: one wins |
+| `maintain+reclaim` | `optimize` published first: the `cleanup` is refused |
+| `reclaim+reclaim` | Two removals of one graph: one wins |
 
 This holds for requests to one server, or within one embedding program.
 Across two, see `G2`.
@@ -410,7 +410,7 @@ the guide has the full rules and this page keeps the promise.
    at least once, and a commit delivered again is the same block with the
    same commit id, so a consumer that stores the commit id or the cursor
    with its effect applies each commit once. Two branches' feeds have no
-   order between them. Forgotten history, a schema change and a cursor from
+   order between them. Reclaimed history, a schema change and a cursor from
    an earlier branch of the same name are refusals, never silent gaps. A
    change is the net change of its commit against its first parent: the
    entity after an insert, before and after an update, before a delete.
@@ -442,7 +442,7 @@ the guide has the full rules and this page keeps the promise.
     computes during the read.
 12. `read:12` A listing or comparison returned in pages answers every page
     from the view its first page fixed, whatever its branches did since. A
-    page whose history was forgotten is refused, never answered from
+    page whose history was reclaimed is refused, never answered from
     another view.
 
 Full rules: [queries](../user/queries/index.md),
@@ -582,16 +582,16 @@ Full rules: [schema](../user/schema/index.md).
    writes since the last `optimize`, and storage grows with retained commits
    until `cleanup`. Neither is bounded by the engine `D17`.
 
-### forget
+### reclaim
 
-1. `forget:1` `cleanup` removes commits outside the keep rule (`--keep`,
+1. `reclaim:1` `cleanup` removes commits outside the keep rule (`--keep`,
    `--older-than`). It never removes a live head, a commit needed as a merge
    ancestor, or a proposal or snapshot that has not expired. A change-feed cursor retains nothing: a
    consumer behind the keep rule is refused and installs a new baseline.
-2. `forget:2` `cleanup` asks for consent in the CLI only.
-3. `forget:3` Removing a graph from a cluster deployment deletes its whole
+2. `reclaim:2` `cleanup` asks for consent in the CLI only.
+3. `reclaim:3` Removing a graph from a cluster deployment deletes its whole
    root.
-4. `forget:4` A deleted value's bytes are gone only after `cleanup` and a
+4. `reclaim:4` A deleted value's bytes are gone only after `cleanup` and a
    maintenance run that rewrites them `D11`. There is no way to remove one
    value from retained history: `cleanup` removes whole commits, so a value
    in a live head, a merge ancestor or a live proposal stays, and so does
@@ -652,7 +652,7 @@ statement. "See" names the invariant or the design that bears on it.
 | `G2` | Boundary, Processes | One writing server or program per cluster is supported. Across two, a `write`, `merge`, `schema` or `maintain` that loses the race for a head is checked against the new head or refused; branch create and delete, schema apply, dropping a proposal and `cleanup` are safe from one only. Writers through one server are served in arrival order; across two, a writer that keeps losing the race is refused after five attempts and nothing keeps it from starving. A writer that was displaced while it was stalled can no longer publish over a head that moved; it can still delete a branch or finish a `cleanup` | [Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md), accepted, in progress |
 | `G3` | `E7`, `maintain.changes`, `read:4` | Building a full-text index can change `bm25` scores, their order and a limited result | Invariant 7; [GQ 3](https://github.com/ModernRelay/omnigraph/pull/1302), accepted with this page's statements; implemented by [#1316](https://github.com/ModernRelay/omnigraph/pull/1316), draft: `bm25` exact under every index state |
 | `G4` | Boundary, The store | Azure writes are a preview, and need a separate guard that admits one writer | [RFC 0029](../rfcs/0029-azure-blob-storage.md), accepted, in progress |
-| `G5` | `read+forget` | Nothing coordinates `cleanup` with a running read. A read of a commit the keep rule drops is refused as reclaimed if the removal came first, and can fail with an untyped error if the removal lands while it runs. No test covers it | Invariant 3 |
+| `G5` | `read+reclaim` | Nothing coordinates `cleanup` with a running read. A read of a commit the keep rule drops is refused as reclaimed if the removal came first, and can fail with an untyped error if the removal lands while it runs. No test covers it | Invariant 3 |
 | `G6` | `write.changes` | A write that selects nothing publishes nothing, but a write that changes no value still publishes a commit, and so does a load with no rows. After GQ 3 only a repeated `upsert`, `replace` or load row does: proving one unchanged costs reads on every run | [GQ 3](https://github.com/ModernRelay/omnigraph/pull/1302), accepted with this page's statements; implemented by [#1316](https://github.com/ModernRelay/omnigraph/pull/1316), draft |
 | `G7` | `E4` | Graph writes carry no request identity. Only a write with a named head or a keyed upsert is safe to send again, the second at the cost of a commit. Recorded operations do carry one | No design yet |
 | `G8` | `write:4` | There is no revert. Undo is a hand-written inverse commit, or a branch started at the earlier commit | No design yet |
@@ -677,15 +677,15 @@ says so in its contract line.
 
 | Decision | Where | Today | Open question |
 |---|---|---|---|
-| `D1` | `E7`, `branch.changes` | Deleting a branch makes its commits that no live branch reaches through parents or merged parents unreadable by id at once, so a published commit is not final across a delete: a reader that acted on one cannot read it again. `commit show` can still return such a commit's record | Keep them readable by id until `cleanup`, or make delete a `forget`? |
+| `D1` | `E7`, `branch.changes` | Deleting a branch makes its commits that no live branch reaches through parents or merged parents unreadable by id at once, so a published commit is not final across a delete: a reader that acted on one cannot read it again. `commit show` can still return such a commit's record | Keep them readable by id until `cleanup`, or make delete a `reclaim`? |
 | `D3` | `write.sees` | Only a `.gq` mutation can require a named head | Every write? |
 | `D4` † | `write.sees` | A named head is refused by any commit in between, related or not | A condition as narrow as what the caller read, so that an unrelated commit does not refuse a decision. How narrow: an entity, a property, a search? |
 | `D5` † | `merge.refuses` | Two agents that changed different properties of one entity conflict | Merge by property? It can build an entity neither branch wrote, so the merge would have to check per-entity constraints too |
 | `D6` † | `schema.refuses`, `schema+branch` | Schema apply runs on `main` only, with no other branch live | A schema change made on a branch and merged, under the same review as data? The test would be that each side's schema reads the other's data: additions optional or defaulted, no identity reused |
 | `D7` | `read+schema`, `read+branch`, `read+maintain` | On one server a read can wait behind schema apply, branch create or `schema upgrade-system-columns`. The refusals between an export or `changes baseline` and other kinds hold on one server only; nothing excludes them across servers | Reads never wait or refuse? |
-| `D8` † | `write+schema`, `write+maintain`, `write+forget` | Writers wait while schema apply or `cleanup` runs, and writers on `main` wait while `optimize` runs, for a time a run started without the server does not bound | Reads and writes served without pause through maintenance? |
+| `D8` † | `write+schema`, `write+maintain`, `write+reclaim` | Writers wait while schema apply or `cleanup` runs, and writers on `main` wait while `optimize` runs, for a time a run started without the server does not bound | Reads and writes served without pause through maintenance? |
 | `D9` | `E6` | Reads are checked at the server only. Policy scope stops at the branch class. A write with no `match` needs no permission to read, so a refusal such as `key_conflict` can name an entity on a branch its caller cannot read. A denial is recorded in server logs only | Check reads at every door? Scope by type and property? Require read for a write with no `match` that can still reveal? Record denials where an operator can read them? |
-| `D11` | `forget:4` | `optimize` does not rewrite every file that holds a deleted value | An erasure path? |
+| `D11` | `reclaim:4` | `optimize` does not rewrite every file that holds a deleted value | An erasure path? |
 | `D12` | `E4`, Kinds | A stream that fails after its headers ends in a cut-off body. A merge that deletes its source can report success when the delete failed | Every failure typed? |
 | `D14` | Kinds | A load onto a new branch is two steps | One commit? |
 | `D15` | `E4` | The CLI's direct `schema apply` reports a version number and no commit id; the engine and a served deployment name the commit | Name the commit at every door? |
