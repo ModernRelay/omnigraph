@@ -1531,6 +1531,10 @@ impl ReadGen<'_, '_, '_> {
             "from {{ match {{ {t} }} return {{ {o} as {}{extra} }} }}",
             &a[1..]
         ));
+        // The alias is the outer node, null where an `optional` left it so.
+        if self.nullable_nodes.contains(&o) {
+            self.nullable_nodes.push(a.clone());
+        }
         scope.push(Var {
             name: a,
             kind: VarKind::Node(ty),

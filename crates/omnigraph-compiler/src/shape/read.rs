@@ -1623,12 +1623,16 @@ impl<'a> Shaper<'a> {
         // the pattern as a `let` would be: the Boolean the call's matches
         // decide for each row, which the projection, the sort and the
         // aggregate then read.
+        // In a fixed order (the hidden names sorted), so the columns a
+        // shaping makes up are the same on every run.
         let mut lexical: Vec<(String, IRExpr)> = Vec::new();
-        for e in items.values_mut() {
-            self.lexical_columns(e, &mut lexical);
-        }
-        for agg in aggs.values_mut() {
-            if let Some(arg) = &mut agg.arg {
+        let mut hidden: Vec<String> = items.keys().chain(aggs.keys()).cloned().collect();
+        hidden.sort();
+        for name in &hidden {
+            if let Some(e) = items.get_mut(name) {
+                self.lexical_columns(e, &mut lexical);
+            }
+            if let Some(arg) = aggs.get_mut(name).and_then(|agg| agg.arg.as_mut()) {
                 self.lexical_columns(arg, &mut lexical);
             }
         }
