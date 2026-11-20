@@ -1,3 +1,3 @@
-- On Unix the server refuses a `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` that other accounts can write, and warns when they can read it. Restrict the file with `chmod 600`. See [token sources][token-file-mode].
+- Another local account that could write `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` could add a token for any actor. On Unix the server now refuses to start when that file is writable by other accounts or is not a regular file, and warns when they can read it. Run `chmod 600` on it. See [token sources][token-file-mode].
 
 [token-file-mode]: ../docs/user/operations/server.md#authentication

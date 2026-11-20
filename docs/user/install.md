@@ -203,7 +203,7 @@ http-contract 0.14
 ```
 
 An edge build reports a SemVer pre-release of the package version, such as
-`0.15.0-edge+9c2b367`. Edge builds are published only while the package version
+`0.16.0-edge+9c2b367`. Edge builds are published only while the package version
 is above the latest stable release, so an edge version sorts after every
 published stable release and before the release it precedes. `channel` is `stable`
 or `edge` for a GitHub release archive and null for any other build. `commit`

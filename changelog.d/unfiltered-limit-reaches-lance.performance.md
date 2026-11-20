@@ -1,0 +1,1 @@
+- A `limit` with no filter or `order` stops Lance reading ahead: `match { $p: Person } return { $p.name } limit 10` reads only the fragments holding those rows (1 of 25 files, not 16, on local disk).

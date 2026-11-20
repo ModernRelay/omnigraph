@@ -47,7 +47,8 @@ pub enum StoreLocation {
 
 impl StoreLocation {
     /// `s3://bucket/prefix` or a local path; a local path is created and made
-    /// canonical, since the key names the place.
+    /// canonical, since the key names the place. A prefix segment may carry a
+    /// colon: an EC2 role's `aws:userid` is `<role id>:<instance id>`.
     pub fn parse(text: &str) -> RunnerResult<Self> {
         if let Some(rest) = text.strip_prefix("s3://") {
             let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
@@ -65,11 +66,11 @@ impl StoreLocation {
                     || segment == ".."
                     || !segment
                         .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
             }) && !prefix.is_empty()
             {
                 return Err(invalid(format!(
-                    "`{text}` has a prefix segment outside [A-Za-z0-9-_.]"
+                    "`{text}` has a prefix segment outside [A-Za-z0-9-_.:]"
                 )));
             }
             return Ok(Self::S3 {
@@ -1018,7 +1019,18 @@ mod tests {
             StoreLocation::parse("s3://bucket-1").unwrap().uri(),
             "s3://bucket-1"
         );
-        for text in ["s3://", "s3://Bucket/x", "s3://b/a//b", "gs://bucket/x"] {
+        let per_machine = StoreLocation::parse("s3://bucket-1/bench-pr/AROA:i-0").unwrap();
+        assert_eq!(per_machine.uri(), "s3://bucket-1/bench-pr/AROA:i-0");
+        for text in [
+            "s3://",
+            "s3://Bucket/x",
+            "s3://b/a//b",
+            "s3://b/a b",
+            "s3://b/a#b",
+            "s3://b/a?b",
+            "s3://b/a%3Ab",
+            "gs://bucket/x",
+        ] {
             assert_eq!(
                 StoreLocation::parse(text).unwrap_err().code,
                 "invalid_store",
@@ -1369,7 +1381,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let location = format!("s3://{bucket}/{prefix}/bench-store/{unique}");
+        let location = format!("s3://{bucket}/{prefix}/bench-store/AROA:i-{unique}");
         exercise(&location);
         runtime().block_on(async {
             storage_for_uri(&location)
