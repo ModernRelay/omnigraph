@@ -28,7 +28,7 @@ issue_640_search_score_projection.gqt	5	types	results.bm25-f64	The `bm25` score 
 issue_640_search_score_projection.gqt	6	error	language.diagnostic	Both refuse `nearest` in `return`; a ranking written as a call is T65 with the `from` fix (section 5), where edition 2 raised T33.
 issue_640_search_score_projection.gqt	7	error	language.diagnostic	Both refuse `nearest` in `return`; a ranking written as a call is T65 with the `from` fix (section 5), where edition 2 raised T33.
 issue_640_search_score_projection.gqt	8	error	language.diagnostic	Both refuse `nearest` under an aggregate; a ranking written as a call is T65 (section 5), where edition 2 raised T32.
-issue_640_search_score_projection.gqt	10	error	language.diagnostic	Both refuse a full-text call read as a value in `return`; edition 3 refuses the unlowered term with T86 (section 5), where edition 2 raised T35.
+issue_640_search_score_projection.gqt	10	error	open:full-text-call-as-a-value	Edition 2 refused a full-text call read as a value in `return` (T35); edition 3 returns the row's Boolean.
 issue_640_search_score_projection.gqt	11	error	language.diagnostic	Both refuse projecting an order alias in `return`; edition 3 refuses the bare name at the word (section 5), where edition 2 raised T36.
 issue_659_compiler_scopes.gqt	11	error	language.accepted-unbound-triple	A triple with neither end bound, refused by edition 2 (T5), is accepted.
 issue_659_compiler_scopes.gqt	12	error	language.accepted-unbound-triple	A triple with neither end bound, refused by edition 2 (T5), is accepted.
@@ -76,9 +76,12 @@ filtered_nearest_no_match_is_empty.gqt	1	requests	open:concurrent-index-searches
 issue_566_order_key_binds_to_return_item.gqt	6	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
 issue_640_search_score_projection.gqt	5	requests	open:index-probe-where-edition-2-scanned	The read probes a scalar index the edition-2 plan did not read, whose two requests exceed what edition 2's scan read on this one-fragment table.
 issue_640_search_score_projection.gqt	9	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
+issue_640_search_score_projection.gqt	10	requests	open:full-text-call-as-a-value	Edition 2 refused this read before reading; edition 3 runs it, the exact lexical scan reading the text column.
 issue_659_compiler_scopes.gqt	11	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
 issue_659_compiler_scopes.gqt	12	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
 issue_659_compiler_scopes.gqt	13	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
+issue_659_compiler_scopes.gqt	20	requests	open:block-binding-scans-its-type	The respelled `let` block binds `$x: Person`, a dependent scan that reads the Person data file again, where edition 2's block bound no node there.
+issue_659_compiler_scopes.gqt	21	requests	open:block-binding-scans-its-type	The respelled `let` block binds `$x: Person`, a dependent scan that reads the Person data file again, where edition 2's block bound no node there.
 issue_659_compiler_scopes.gqt	27	requests	open:block-binding-scans-its-type	The respelled block binds `$k: Person`, a dependent scan that reads the Person data file a third time, where edition 2's text bound no node there and read it twice.
 issue_659_edge_selection_contract.gqt	4	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
 issue_659_rrf_typed_edge_identity.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.

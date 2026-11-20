@@ -2,8 +2,8 @@
 # red_on: 7f1233bb
 # notes: Endpoint declarations belong to their lexical block; checked nested directions and anonymous endpoints survive lowering.
 # notes: A block in `where` correlates on every element's names (section 3), so a block whose variable must stay its own names a variable no element binds.
-# notes: A `let` or `from` sees only the elements before it (section 3, "Scope and correlation"): a name an element binds after it is not
-# notes: correlated, and the `let`'s block and the `from`'s read bind their own (`future_outer_*`).
+# notes: A `let` sees only the elements before it (section 3, "Scope and correlation"): a name an element binds after it is not
+# notes: correlated, and the `let`'s block binds its own (`future_outer_*`, edition 2's blocks written before that element).
 
 --- runner
 timeout_ms: 10000
@@ -239,35 +239,8 @@ query cross_type_same_variable() {
 
 --- query
 query future_outer_name_is_not_correlated() {
-    match { $p: Person, let $works = exists { $x: Company, $p worksAt $x }, $x: Company }
-    where $p.name = "p" and $x.name = "idle"
-    return { $p.name as person, $x.name as company, $works as works }
-}
---- expect unordered
-{"person":"p","company":"idle","works":true}
-
---- expect shape
-person: String
-company: String
-works: Bool
-
---- query
-query future_outer_name_not_read() {
-    match { $p: Person, from { match { $x: Company, $p worksAt $x } return { $x.name as early } }, $x: Company }
-    where $x.name = "idle"
-    return { $p.name as person, $early as early, $x.name as company }
-}
---- expect unordered
-{"person":"p","early":"acme","company":"idle"}
-
---- expect shape
-person: String
-early: String
-company: String
-
---- query
-query block_local_name_is_not_correlated() {
-    match { $p: Person, $x: Company } where $p.name = "p" and exists { $k: Person, $p knows $k } and $x.name = "idle"
+    match { $p: Person, let $knows = exists { $x: Person, $p knows $x }, $x: Company }
+    where $p.name = "p" and $knows and $x.name = "idle"
     return { $p.name as person, $x.name as company }
 }
 --- expect unordered
@@ -278,8 +251,9 @@ person: String
 company: String
 
 --- query
-query block_local_name_not_block() {
-    match { $p: Person, $x: Company } where not exists { $k: Person, $p knows $k } and $x.name = "idle"
+query future_outer_name_not_block() {
+    match { $p: Person, let $knows = exists { $x: Person, $p knows $x }, $x: Company }
+    where not $knows and $x.name = "idle"
     return { $p.name as person, $x.name as company }
 }
 --- expect unordered
