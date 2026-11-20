@@ -35,6 +35,7 @@ pub mod policy;
 pub mod queries;
 pub mod registry;
 pub mod serving;
+mod trust;
 pub mod workload;
 
 pub use graph_id::GraphId;
@@ -88,7 +89,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
-use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -443,7 +443,11 @@ pub struct AppState {
     /// see MR-668 decision Q6.
     workload: Arc<workload::WorkloadController>,
     operations: operations::OperationRuntime,
-    bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
+    /// The static bearer tokens. A request loads one snapshot at admission.
+    static_tokens: Arc<trust::TrustHolder<auth::StaticTokens>>,
+    /// Whether a request needs a credential, fixed at boot from what was
+    /// configured; never re-derived from a snapshot's content.
+    runtime_state: ServerRuntimeState,
     /// Whether a static bearer token may `read` a graph with no applied
     /// policy ([`ServerConfig::allow_reads_without_policy`]).
     allow_reads_without_policy: bool,
@@ -642,7 +646,6 @@ impl AppState {
         policy_engine: Option<PolicyEngine>,
         workload: workload::WorkloadController,
     ) -> Self {
-        let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let per_graph_policy = policy_engine.map(Arc::new);
         Self::build_single_mode(
             uri,
@@ -666,7 +669,6 @@ impl AppState {
         workload: workload::WorkloadController,
         queries: Option<Arc<QueryRegistry>>,
     ) -> Self {
-        let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let per_graph_policy = policy_engine.map(Arc::new);
         Self::build_single_mode(
             uri,
@@ -843,7 +845,7 @@ impl AppState {
     fn build_single_mode(
         uri: String,
         db: Omnigraph,
-        bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
+        bearer_tokens: Vec<(String, String)>,
         policy_engine: Option<Arc<PolicyEngine>>,
         workload: Arc<workload::WorkloadController>,
         queries: Option<Arc<QueryRegistry>>,
@@ -876,6 +878,7 @@ impl AppState {
             GraphRegistry::from_handles(vec![handle])
                 .expect("a single handle never collides on graph id"),
         );
+        let (static_tokens, runtime_state) = embedded_static_tokens(bearer_tokens);
         Self {
             cluster_admission: None,
             deployments: Arc::new(deployment::DeploymentRuntime::default()),
@@ -885,7 +888,8 @@ impl AppState {
                 config_path: None,
             },
             workload,
-            bearer_tokens,
+            static_tokens,
+            runtime_state,
             data_token_trust: None,
             oidc_identity_trust: None,
             allow_reads_without_policy: false,
@@ -929,7 +933,7 @@ impl AppState {
         workload: workload::WorkloadController,
         config_path: Option<PathBuf>,
     ) -> std::result::Result<Self, InsertError> {
-        let bearer_tokens = hash_bearer_tokens(bearer_tokens);
+        let (static_tokens, runtime_state) = embedded_static_tokens(bearer_tokens);
         let registry = Arc::new(GraphRegistry::from_entries(entries)?);
         registry.initialize_server_policy(server_policy.map(Arc::new));
         Ok(Self {
@@ -941,7 +945,8 @@ impl AppState {
                 config_path,
             },
             workload: Arc::new(workload),
-            bearer_tokens,
+            static_tokens,
+            runtime_state,
             data_token_trust: None,
             oidc_identity_trust: None,
             allow_reads_without_policy: false,
@@ -1047,6 +1052,7 @@ impl AppState {
     #[must_use]
     pub fn with_data_token_trust(mut self, trust: data_tokens::DataTokenTrust) -> Self {
         self.data_token_trust = Some(Arc::new(trust));
+        self.runtime_state = credential_required(self.runtime_state);
         self
     }
 
@@ -1057,6 +1063,24 @@ impl AppState {
         trust: Arc<oidc_identity::OidcIdentityTrust>,
     ) -> Self {
         self.oidc_identity_trust = Some(trust);
+        self.runtime_state = credential_required(self.runtime_state);
+        self
+    }
+
+    /// Hold the static tokens in `holder`, which `serve` reads from the
+    /// configured source. Startup only, before a router exists.
+    pub(crate) fn with_static_token_trust(
+        mut self,
+        holder: Arc<trust::TrustHolder<auth::StaticTokens>>,
+    ) -> Self {
+        self.static_tokens = holder;
+        self
+    }
+
+    /// Fix the authentication mode to `serve`'s classification of what was
+    /// configured. Startup only, before a router exists.
+    pub(crate) fn with_runtime_state(mut self, runtime_state: ServerRuntimeState) -> Self {
+        self.runtime_state = runtime_state;
         self
     }
 
@@ -1101,19 +1125,15 @@ impl AppState {
             .map(str::to_owned)
     }
 
-    /// Whether any bearer credential can authenticate a request: static
-    /// tokens, signed data tokens or OIDC. Fixed at construction.
+    /// Whether a bearer credential source is configured: static tokens,
+    /// signed data tokens or OIDC. Read from the boot-fixed mode, so a
+    /// refreshed static set that holds no token still has a source.
     pub(crate) fn has_credential_source(&self) -> bool {
-        !self.bearer_tokens.is_empty()
-            || self.data_token_trust.is_some()
-            || self.oidc_identity_trust.is_some()
+        self.runtime_state.requires_credential()
     }
 
     fn requires_bearer_auth(&self) -> bool {
-        if !self.bearer_tokens.is_empty()
-            || self.data_token_trust.is_some()
-            || self.oidc_identity_trust.is_some()
-        {
+        if self.runtime_state.requires_credential() {
             return true;
         }
         let snapshot = self.routing.registry.snapshot_ref();
@@ -1135,21 +1155,16 @@ impl AppState {
         &self,
         provided_token: &str,
     ) -> std::result::Result<AuthenticatedActor, oidc_identity::OidcRefusal> {
-        // Hash the incoming token and compare against every stored digest in
-        // constant time. Iterate all entries unconditionally so total work —
-        // and therefore response timing — doesn't depend on which slot matches.
-        let provided_hash = hash_bearer_token(provided_token);
-        let mut matched: Option<Arc<str>> = None;
-        for (hash, actor) in self.bearer_tokens.iter() {
-            if bool::from(hash.ct_eq(&provided_hash)) && matched.is_none() {
-                matched = Some(Arc::clone(actor));
-            }
-        }
-        if let Some(actor) = matched {
+        // One static snapshot for the whole request; its constant-time scan
+        // visits every entry whatever matches.
+        let now = std::time::SystemTime::now();
+        if let Some(actor) =
+            trust::TrustSet::admit(&self.static_tokens.load().set, provided_token, now)
+        {
             return Ok(AuthenticatedActor::cluster_static(actor)
                 .with_policy_less_reads(self.allow_reads_without_policy));
         }
-        let Some(now) = std::time::SystemTime::now()
+        let Some(now) = now
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .map(|elapsed| elapsed.as_secs())
@@ -1224,12 +1239,35 @@ pub(crate) fn refuse_raised_budgets(
     Ok(())
 }
 
-fn hash_bearer_tokens(bearer_tokens: Vec<(String, String)>) -> Arc<[(BearerTokenHash, Arc<str>)]> {
-    let tokens: Vec<(BearerTokenHash, Arc<str>)> = bearer_tokens
-        .into_iter()
-        .map(|(actor, token)| (hash_bearer_token(&token), Arc::<str>::from(actor)))
-        .collect();
-    Arc::from(tokens)
+/// The static tokens an embedder passes to a constructor, as a boot-only
+/// set, and the mode they imply: a credential is required when there is one.
+/// `serve` replaces both with the configured source and its classification.
+fn embedded_static_tokens(
+    bearer_tokens: Vec<(String, String)>,
+) -> (
+    Arc<trust::TrustHolder<auth::StaticTokens>>,
+    ServerRuntimeState,
+) {
+    let runtime_state = if bearer_tokens.is_empty() {
+        ServerRuntimeState::Open
+    } else {
+        ServerRuntimeState::DefaultDeny
+    };
+    let holder = trust::TrustHolder::with_boot_set(
+        "embedded",
+        auth::StaticTokens::from_pairs(bearer_tokens),
+        auth::StaticRules::default(),
+    );
+    (holder, runtime_state)
+}
+
+/// An embedder that attaches another credential source requires a
+/// credential from then on.
+fn credential_required(runtime_state: ServerRuntimeState) -> ServerRuntimeState {
+    match runtime_state {
+        ServerRuntimeState::Open => ServerRuntimeState::DefaultDeny,
+        state => state,
+    }
 }
 
 impl ApiError {
@@ -4175,9 +4213,19 @@ async fn serve_config(
         });
     }
 
-    let token_source = resolve_token_source().await?;
-    info!(source = token_source.name(), "loaded bearer token source");
-    let tokens = token_source.load().await?;
+    let static_tokens = auth::static_token_trust().await?;
+    info!(
+        source = static_tokens.holder.source_name(),
+        actors = trust::TrustSet::actors(&static_tokens.holder.load().set).len(),
+        "loaded bearer token source"
+    );
+    if static_tokens.configured && static_tokens.holder.load().set.is_empty() {
+        warn!(
+            source = static_tokens.holder.source_name(),
+            "the static principal set is empty: every static bearer token is refused until \
+             the source names one"
+        );
+    }
     let process_defaults = ProcessDefaults::from_env()
         .map_err(|error| eyre!("session setting refused at startup: {error}"))?;
 
@@ -4197,19 +4245,22 @@ async fn serve_config(
                 || graphs.iter().any(|g| g.policy.is_some())
         }
     };
+    // The mode is classified from what is configured, never from what the
+    // static set holds, so no refresh can change whether a credential is
+    // required.
     let runtime_state = classify_server_runtime_state(
-        !tokens.is_empty() || data_token_trust.is_some() || oidc_identity_trust.is_some(),
+        static_tokens.configured || data_token_trust.is_some() || oidc_identity_trust.is_some(),
         has_policy_configured,
         config.allow_unauthenticated,
     )?;
     match runtime_state {
         ServerRuntimeState::Open => warn!(
-            "running with --unauthenticated: no bearer tokens, no policy file, all \
+            "running with --unauthenticated: no bearer token source, no policy file, all \
              requests permitted. This is for local dev only — do not expose to a \
              network you don't fully trust."
         ),
         ServerRuntimeState::DefaultDeny => warn!(
-            "bearer tokens are configured but no policy file is set — running in \
+            "a bearer token source is configured but no policy file is set — running in \
              default-deny mode: every graph action is refused until a policy permits \
              it. Declare required policy bundles when bootstrapping; this deployment \
              class keeps existing policy bindings fixed."
@@ -4241,7 +4292,7 @@ async fn serve_config(
             );
             let (state, prepared) = prepare_multi_graph_state(
                 graphs,
-                tokens,
+                Vec::new(),
                 server_policy.as_ref(),
                 config_path,
                 config.cluster_admission,
@@ -4263,6 +4314,17 @@ async fn serve_config(
         }
         None => state,
     };
+    if let trust::Freshness::Polled { interval } = static_tokens.holder.freshness() {
+        info!(
+            source = static_tokens.holder.source_name(),
+            interval_seconds = interval.as_secs(),
+            "static credential refresh enabled"
+        );
+    }
+    static_tokens.holder.start_refresh();
+    let state = state
+        .with_static_token_trust(static_tokens.holder)
+        .with_runtime_state(runtime_state);
     let listener = TcpListener::bind(&bind).await?;
     let listen_addr = listener.local_addr()?;
     {

@@ -38,6 +38,7 @@ deployment.
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [Managed organization members and invitations](cli/managed-team.md)
 - [HTTP server](operations/server.md)
+- [Static bearer tokens](operations/bearer-tokens.md): sources, refresh and Kubernetes Secrets
 - [MCP](operations/mcp.md)
 - [Troubleshooting](operations/troubleshooting.md)
 

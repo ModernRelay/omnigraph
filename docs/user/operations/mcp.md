@@ -11,8 +11,8 @@ permission to use it: a call the policy refuses returns the route's refusal.
 
 ## Enable it
 
-`/mcp` is mounted whenever the server has a bearer credential source: static
-tokens, signed data tokens, or an
+`/mcp` is mounted whenever the server has a bearer credential source: a static
+token variable (whatever it holds), signed data tokens, or an
 [OIDC resource identity](server.md#oidc-resource-identities-and-mcp)
 (`--oidc-identity-trust`). A server without credentials has no MCP.
 

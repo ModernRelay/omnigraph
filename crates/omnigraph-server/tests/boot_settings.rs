@@ -1525,33 +1525,53 @@ mod owned_shutdown {
         }
     }
 
+    /// The token mount `token-refresh` serves from: a projected-volume
+    /// layout, `tokens.json` a symlink through `..data`.
+    fn token_mount(root: &Path) -> PathBuf {
+        root.join("tokens")
+    }
+
     fn spawn_owned_child(
         root: &Path,
         mode: &str,
     ) -> (ContainedChild, String, std::thread::JoinHandle<()>) {
-        let mut child = ContainedChild(
-            Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "owned_shutdown::owned_server_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env(ROOT, root)
-                .env(MODE, mode)
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "owned_shutdown::owned_server_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(ROOT, root)
+            .env(MODE, mode)
+            .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON")
+            .env_remove("OMNIGRAPH_SERVER_BEARER_TOKEN")
+            .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE")
+            .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET")
+            .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_REFRESH_SECONDS");
+        // A configured static source requires a credential whatever it holds,
+        // so a journey that runs open configures none.
+        if mode.starts_with("startup-") {
+            command.env(
+                "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+                r#"{"startup-operator":"startup-secret"}"#,
+            );
+        } else if mode == "v2-finish" {
+            command.env(
+                "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+                r#"{"restart-operator":"restart-secret"}"#,
+            );
+        } else if mode == "token-refresh" {
+            command
                 .env(
-                    "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
-                    if mode.starts_with("startup-") {
-                        r#"{"startup-operator":"startup-secret"}"#
-                    } else if mode == "v2-finish" {
-                        r#"{"restart-operator":"restart-secret"}"#
-                    } else {
-                        "{}"
-                    },
+                    "OMNIGRAPH_SERVER_BEARER_TOKENS_FILE",
+                    token_mount(root).join("tokens.json"),
                 )
-                .env_remove("OMNIGRAPH_SERVER_BEARER_TOKEN")
-                .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE")
-                .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET")
+                .env("OMNIGRAPH_SERVER_BEARER_TOKENS_REFRESH_SECONDS", "1");
+        }
+        let mut child = ContainedChild(
+            command
                 // The owned graphs carry no policy; a journey that boots from
                 // the environment reads them through the operator opt-in.
                 .env("OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY", "1")
@@ -1812,6 +1832,16 @@ mod owned_shutdown {
             }
             fs::write(root.join("serve-returned"), b"returned").unwrap();
             std::process::exit(0);
+        }
+        if mode == "token-refresh" {
+            let mut config = server_config(&root, Duration::from_secs(5));
+            config.allow_unauthenticated = false;
+            let result = omnigraph_server::serve(config).await;
+            if let Err(error) = &result {
+                eprintln!("{mode}: production server failed: {error:?}");
+            }
+            fs::write(root.join("serve-returned"), b"returned").unwrap();
+            std::process::exit(i32::from(result.is_err()));
         }
         let cutoff = mode == "cutoff";
         if mode.starts_with("panic-") {
@@ -2409,6 +2439,95 @@ mod owned_shutdown {
     /// goes makes its first data-file write fail, and one planted where the
     /// graph's `__manifest/_transactions/` goes makes the publisher's
     /// transaction-file write fail.
+    /// Replace the token mount's content the way the kubelet does: a complete
+    /// new directory, then one rename of the `..data` symlink.
+    fn project_tokens(mount: &Path, generation: &str, tokens: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = mount.join(generation);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("tokens.json"), tokens).unwrap();
+        fs::set_permissions(dir.join("tokens.json"), fs::Permissions::from_mode(0o400)).unwrap();
+        std::os::unix::fs::symlink(generation, mount.join("..data_tmp")).unwrap();
+        fs::rename(mount.join("..data_tmp"), mount.join("..data")).unwrap();
+    }
+
+    async fn access(client: &reqwest::Client, address: &str, token: &str) -> reqwest::Response {
+        client
+            .get(format!("http://{address}/graphs/owned/access"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The token file refreshes on its interval in a real server: the timer
+    /// starts in `serve`, which in-process tests do not run. A token added to
+    /// the mounted file is admitted, a removed one gets 401, an invalid file
+    /// keeps the last good set, and a valid file after it is installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_token_file_refresh_issue_434() {
+        let temp = init_loaded_graph().await;
+        let root = temp.path();
+        let mount = token_mount(root);
+        fs::create_dir(&mount).unwrap();
+        project_tokens(&mount, "..2026_11_17_1", r#"{"alice":"tok-a"}"#);
+        std::os::unix::fs::symlink("..data/tokens.json", mount.join("tokens.json")).unwrap();
+        let (mut child, address, output_thread) = spawn_owned_child(root, "token-refresh");
+        wait_ready(&address, &mut child.0, "serving").await;
+        let client = reqwest::Client::new();
+        let status = |token: &'static str| {
+            let (client, address) = (client.clone(), address.clone());
+            async move { access(&client, &address, token).await.status() }
+        };
+        let until_admitted = |token: &'static str| async move {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while status(token).await != StatusCode::OK {
+                assert!(Instant::now() < deadline, "{token} was never admitted");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert_eq!(status("tok-a").await, StatusCode::OK);
+        assert_eq!(status("tok-b").await, StatusCode::UNAUTHORIZED);
+
+        project_tokens(&mount, "..2026_11_17_2", r#"{"bob":"tok-b"}"#);
+        until_admitted("tok-b").await;
+        let removed = access(&client, &address, "tok-a").await;
+        assert_eq!(removed.status(), StatusCode::UNAUTHORIZED);
+        let challenge = removed.headers()["www-authenticate"].to_str().unwrap();
+        assert!(
+            challenge.contains(r#"error="invalid_token""#),
+            "{challenge}"
+        );
+
+        // Three intervals over an invalid file: the last good set stays.
+        project_tokens(&mount, "..2026_11_17_3", r#"{"carol":"#);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(status("tok-b").await, StatusCode::OK);
+        assert_eq!(status("tok-a").await, StatusCode::UNAUTHORIZED);
+
+        project_tokens(&mount, "..2026_11_17_4", r#"{"carol":"tok-c"}"#);
+        until_admitted("tok-c").await;
+        assert_eq!(status("tok-b").await, StatusCode::UNAUTHORIZED);
+
+        assert_eq!(
+            unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let exit = loop {
+            if let Some(exit) = child.0.try_wait().unwrap() {
+                break exit;
+            }
+            assert!(Instant::now() < deadline, "clean shutdown timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(exit.code(), Some(0));
+        output_thread.join().unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn definite_write_failure_keeps_serving_and_releases_the_lock_issue_1067() {
         let temp = converged_cluster_dir("").await;

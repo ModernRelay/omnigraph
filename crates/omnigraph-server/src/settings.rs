@@ -3,8 +3,10 @@
 //! modularization).
 
 use super::*;
+use crate::trust::{LoadFailure, MAX_SOURCE_BYTES};
 use std::io::Read;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 /// Build serving settings from a cluster directory's applied revision
 /// (RFC-005 §D2): graphs at derived roots, stored queries from verified
@@ -490,31 +492,43 @@ fn env_flag(name: &str) -> bool {
 }
 
 /// MR-723 server runtime state, classified from the three-state matrix
-/// of (bearer tokens configured) × (policy file configured) at startup.
+/// of (bearer credential source configured) × (policy file configured) at
+/// startup. A static source is configured when
+/// `OMNIGRAPH_SERVER_BEARER_TOKEN`, `_JSON`, `_FILE` or `_AWS_SECRET` is set,
+/// whatever it holds; signed data-token and OIDC identity trust are sources
+/// too. The state is fixed for the process: a refreshed token set changes
+/// which tokens are admitted, never whether one is required.
 ///
-/// * **Open** — neither tokens nor policy; requires explicit
+/// * **Open** — no credential source and no policy; requires explicit
 ///   `allow_unauthenticated`. Effectively a "trust the network" dev
 ///   mode. `serve()` refuses to start in this shape without the flag,
 ///   so the only way to reach this state at runtime is via deliberate
 ///   operator opt-in.
-/// * **DefaultDeny** — tokens configured but no policy file. The
-///   server requires a valid bearer token; once authenticated, every
+/// * **DefaultDeny** — a credential source configured but no policy file.
+///   The server requires a valid bearer token; once authenticated, every
 ///   graph action is denied with 403 (a static token may `read` under the
 ///   `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY` opt-in). Closes the "tokens but
-///   forgot the policy file" trap.
-/// * **PolicyEnabled** — policy file configured and at least one
-///   bearer token configured. Cedar evaluates every authenticated
-///   request. Policy without tokens is rejected at startup —
-///   such a server would 401 every request, which is bug-shaped
-///   rather than feature-shaped (operators wanting "deny all
-///   unauthenticated traffic" should configure tokens plus a
-///   deny-all policy to get meaningful 403s with policy-decision
-///   logging instead).
+///   forgot the policy file" trap. A configured source that holds no token
+///   lands here too, with every token refused until the source names one.
+/// * **PolicyEnabled** — policy file configured and a credential source
+///   configured. Cedar evaluates every authenticated request. Policy
+///   without a source is rejected at startup — such a server would 401
+///   every request, which is bug-shaped rather than feature-shaped
+///   (operators wanting "deny all unauthenticated traffic" should
+///   configure tokens plus a deny-all policy to get meaningful 403s with
+///   policy-decision logging instead).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ServerRuntimeState {
     Open,
     DefaultDeny,
     PolicyEnabled,
+}
+
+impl ServerRuntimeState {
+    /// Whether every protected request must carry an admitted credential.
+    pub fn requires_credential(self) -> bool {
+        !matches!(self, Self::Open)
+    }
 }
 
 /// Compute the [`ServerRuntimeState`] from the configured inputs.
@@ -528,14 +542,14 @@ pub enum ServerRuntimeState {
 /// alternative (per-constructor `bail!`) drifts the moment a third
 /// mode is added.
 pub fn classify_server_runtime_state(
-    has_tokens: bool,
+    has_credential_source: bool,
     has_policy: bool,
     allow_unauthenticated: bool,
 ) -> Result<ServerRuntimeState> {
-    match (has_tokens, has_policy, allow_unauthenticated) {
+    match (has_credential_source, has_policy, allow_unauthenticated) {
         (false, false, false) => bail!(
-            "server has no bearer tokens and no policy file configured. This is a fully \
-             open server — pass `--unauthenticated` (or set OMNIGRAPH_UNAUTHENTICATED=1) \
+            "server has no bearer token source and no policy file configured. This is a \
+             fully open server — pass `--unauthenticated` (or set OMNIGRAPH_UNAUTHENTICATED=1) \
              if you actually want that, otherwise configure bearer tokens (see \
              docs/user/operations/server.md). Declare required graph and cluster \
              policy bundles when bootstrapping; this deployment class keeps existing \
@@ -544,11 +558,12 @@ pub fn classify_server_runtime_state(
         (false, false, true) => Ok(ServerRuntimeState::Open),
         (true, false, _) => Ok(ServerRuntimeState::DefaultDeny),
         (false, true, _) => bail!(
-            "policy file is configured but no bearer tokens — every request would 401 \
-             because no token can ever match. Configure at least one bearer token (see \
-             docs/user/operations/server.md), or remove the policy file. To deny all unauthenticated \
-             traffic deliberately, configure tokens plus a deny-all Cedar rule — that \
-             produces meaningful 403s with policy-decision logging instead of silent 401s."
+            "policy file is configured but no bearer token source is configured — every \
+             request would 401 because no token can ever match. Configure a bearer token \
+             source (see docs/user/operations/server.md), or remove the policy file. To deny \
+             all unauthenticated traffic deliberately, configure tokens plus a deny-all Cedar \
+             rule — that produces meaningful 403s with policy-decision logging instead of \
+             silent 401s."
         ),
         (true, true, _) => Ok(ServerRuntimeState::PolicyEnabled),
     }
@@ -588,73 +603,173 @@ pub(crate) fn parse_bearer_tokens_json(value: &str) -> Result<Vec<(String, Strin
     Ok(entries.into_iter().collect())
 }
 
+/// The bytes of any static source: an actor-to-token JSON object.
+pub(crate) fn parse_bearer_tokens_slice(raw: &[u8]) -> Result<Vec<(String, String)>> {
+    let entries: HashMap<String, String> = serde_json::from_slice(raw)
+        .wrap_err("bearer tokens must be a JSON object of actor->token")?;
+    Ok(entries.into_iter().collect())
+}
+
 pub(crate) fn read_bearer_tokens_file(path: &str) -> Result<Vec<(String, String)>> {
-    check_bearer_tokens_file_permissions(path)?;
-    let contents = fs::read_to_string(path)
-        .wrap_err_with(|| format!("failed to read bearer tokens file at {path}"))?;
-    parse_bearer_tokens_json(&contents)
+    let read = read_bearer_tokens_bytes(path).map_err(|failure| failure.error)?;
+    if let Some(mode) = read.readable_by_others {
+        warn_bearer_tokens_file_readable(mode);
+    }
+    parse_bearer_tokens_slice(&read.bytes)
         .wrap_err_with(|| format!("failed to parse bearer tokens file at {path}"))
 }
 
+/// One read of the bearer tokens file.
+pub(crate) struct BearerTokensFileRead {
+    pub(crate) bytes: Zeroizing<Vec<u8>>,
+    /// The file's mode, when other accounts can read it.
+    pub(crate) readable_by_others: Option<u32>,
+}
+
+/// The one reader of the bearer tokens file, at startup and at every poll.
+/// It opens the path again, so a symlink swap is seen; refuses anything but
+/// a regular file, and a file another account can write; and reads at most
+/// one byte past the size bound. A failure carries a fixed class and no
+/// content.
+pub(crate) fn read_bearer_tokens_bytes(
+    path: &str,
+) -> std::result::Result<BearerTokensFileRead, LoadFailure> {
+    use std::fs::OpenOptions;
+
+    let failed = |class: &'static str, error: std::io::Error| {
+        LoadFailure::new(
+            class,
+            color_eyre::Report::new(error)
+                .wrap_err(format!("failed to read bearer tokens file at {path}")),
+        )
+    };
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // A FIFO at the path opens without waiting for a writer, and is then
+    // refused as not a regular file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        let class = match error.kind() {
+            std::io::ErrorKind::NotFound => "missing",
+            std::io::ErrorKind::PermissionDenied => "permission_denied",
+            _ => "unreadable",
+        };
+        failed(class, error)
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| failed("unreadable", error))?;
+    if !metadata.is_file() {
+        return Err(LoadFailure::new(
+            "not_regular_file",
+            eyre!("bearer tokens file at {path} is not a regular file"),
+        ));
+    }
+    let readable_by_others = check_bearer_tokens_file_mode(path, &metadata)?;
+    // A buffer that never grows, so no reallocation leaves a copy unscrubbed.
+    let mut bytes = Zeroizing::new(vec![0_u8; MAX_SOURCE_BYTES + 1]);
+    let mut len = 0;
+    while len < bytes.len() {
+        match file.read(&mut bytes[len..]) {
+            Ok(0) => break,
+            Ok(read) => len += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(failed("unreadable", error)),
+        }
+    }
+    if len > MAX_SOURCE_BYTES {
+        return Err(LoadFailure::new(
+            "too_large",
+            eyre!(
+                "bearer tokens file at {path} exceeds {} KiB",
+                MAX_SOURCE_BYTES / 1024
+            ),
+        ));
+    }
+    bytes.truncate(len);
+    Ok(BearerTokensFileRead {
+        bytes,
+        readable_by_others,
+    })
+}
+
 /// Refuse a bearer-tokens file another account can write, which could add a
-/// token for any actor, and warn when another account can read it. The mode
-/// is the file's own, after following symlinks: a Kubernetes secret mount is a
-/// symlink whose target carries the volume's `defaultMode` (0644 unless set),
-/// so readable-by-others warns rather than refuses.
+/// token for any actor, and report one another account can read. The mode
+/// is the opened file's own, after following symlinks: a Kubernetes secret
+/// mount is a symlink whose target carries the volume's `defaultMode` (0644
+/// unless set), so readable-by-others warns rather than refuses.
 #[cfg(unix)]
-fn check_bearer_tokens_file_permissions(path: &str) -> Result<()> {
+fn check_bearer_tokens_file_mode(
+    path: &str,
+    metadata: &fs::Metadata,
+) -> std::result::Result<Option<u32>, LoadFailure> {
     use std::os::unix::fs::PermissionsExt;
 
-    let metadata = fs::metadata(path)
-        .wrap_err_with(|| format!("failed to read bearer tokens file at {path}"))?;
-    if !metadata.is_file() {
-        bail!("bearer tokens file at {path} is not a regular file");
-    }
     let mode = metadata.permissions().mode() & 0o777;
     if mode & 0o022 != 0 {
-        bail!(
-            "bearer tokens file at {path} is writable by other accounts (mode {mode:03o}); \
-             restrict it with `chmod 600 {path}`"
-        );
+        return Err(LoadFailure::new(
+            "writable_by_others",
+            eyre!(
+                "bearer tokens file at {path} is writable by other accounts (mode {mode:03o}); \
+                 restrict it with `chmod 600 {path}`"
+            ),
+        ));
     }
-    if mode & 0o044 != 0 {
-        warn!(
-            mode = %format!("{mode:03o}"),
-            "bearer tokens file is readable by other accounts; restrict it with chmod 600 \
-             (or a Kubernetes secret volume's defaultMode: 0400)"
-        );
-    }
-    Ok(())
+    Ok((mode & 0o044 != 0).then_some(mode))
 }
 
 #[cfg(not(unix))]
-fn check_bearer_tokens_file_permissions(_path: &str) -> Result<()> {
-    Ok(())
+fn check_bearer_tokens_file_mode(
+    _path: &str,
+    _metadata: &fs::Metadata,
+) -> std::result::Result<Option<u32>, LoadFailure> {
+    Ok(None)
+}
+
+pub(crate) fn warn_bearer_tokens_file_readable(mode: u32) {
+    warn!(
+        mode = %format!("{mode:03o}"),
+        "bearer tokens file is readable by other accounts; restrict it with chmod 600 \
+         (or a Kubernetes secret volume's defaultMode: 0400)"
+    );
 }
 
 pub(crate) fn validate_bearer_tokens(
     entries: Vec<(String, String)>,
 ) -> Result<Vec<(String, String)>> {
+    let mut entries = crate::auth::PlaintextTokens(entries);
+    check_bearer_tokens(&mut entries.0)?;
+    Ok(std::mem::take(&mut entries.0))
+}
+
+/// The checks every static source shares, in place: trim each actor and
+/// token, refuse a blank one, a reserved actor, a duplicate actor or token
+/// value; then sort by actor. Tokens are trimmed without a copy and compared
+/// by hash, so no plaintext is left outside `entries`.
+pub(crate) fn check_bearer_tokens(entries: &mut [(String, String)]) -> Result<()> {
     let mut seen_actors = HashSet::new();
     let mut seen_tokens = HashSet::new();
-    let mut normalized = Vec::with_capacity(entries.len());
 
-    for (actor, token) in entries {
-        let actor = normalize_bearer_actor(actor)?;
-        let Some(token) = normalize_bearer_token(Some(token)) else {
+    for (actor, token) in entries.iter_mut() {
+        *actor = normalize_bearer_actor(std::mem::take(actor))?;
+        crate::auth::trim_in_place(token);
+        if token.is_empty() {
             bail!("bearer token for actor '{actor}' must not be blank");
-        };
+        }
         if !seen_actors.insert(actor.clone()) {
             bail!("duplicate bearer token actor '{actor}'");
         }
-        if !seen_tokens.insert(token.clone()) {
+        if !seen_tokens.insert(hash_bearer_token(token)) {
             bail!("duplicate bearer token value configured");
         }
-        normalized.push((actor, token));
     }
 
-    normalized.sort_by(|(left, _), (right, _)| left.cmp(right));
-    Ok(normalized)
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Ok(())
 }
 
 pub(crate) fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
@@ -1340,8 +1455,8 @@ mod tests {
             .expect_err("serve should refuse to start in multi mode with policy but no tokens");
         let msg = format!("{:?}", err);
         assert!(
-            msg.contains("policy file is configured but no bearer tokens"),
-            "expected policy-without-tokens rejection in multi mode, got: {msg}",
+            msg.contains("policy file is configured but no bearer token source"),
+            "expected policy-without-source rejection in multi mode, got: {msg}",
         );
     }
 
@@ -1400,7 +1515,7 @@ mod tests {
             result.expect_err("serve should refuse to start in State 1 without --unauthenticated");
         let msg = format!("{:?}", err);
         assert!(
-            msg.contains("no bearer tokens") || msg.contains("policy file"),
+            msg.contains("no bearer token source and no policy file"),
             "expected refusal message naming the misconfiguration, got: {msg}",
         );
     }
@@ -1433,12 +1548,145 @@ mod tests {
                 classify_server_runtime_state(false, true, allow_unauthenticated).unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("policy file is configured but no bearer tokens"),
-                "expected policy-without-tokens rejection message; got: {msg}"
+                msg.contains("policy file is configured but no bearer token source"),
+                "expected policy-without-source rejection message; got: {msg}"
             );
             assert!(
                 msg.contains("every request would 401"),
                 "rejection message must name the failure mode; got: {msg}"
+            );
+        }
+    }
+
+    /// The classifier takes configuration, not content: a configured token
+    /// file holding `{}` is a source, so it boots `DefaultDeny` with or
+    /// without `--unauthenticated`, and `PolicyEnabled` with a policy. With
+    /// no source and no policy, `--unauthenticated` is still required.
+    #[tokio::test]
+    #[serial]
+    async fn classifier_takes_configured_sources_not_their_content_issue_434() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tokens.json");
+        fs::write(&path, "{}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let unset = [
+            ("OMNIGRAPH_SERVER_BEARER_TOKEN", None),
+            ("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", None),
+            ("OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET", None),
+            ("OMNIGRAPH_SERVER_BEARER_TOKENS_REFRESH_SECONDS", None),
+        ];
+        let configured = {
+            let mut vars = unset.to_vec();
+            vars.push((
+                "OMNIGRAPH_SERVER_BEARER_TOKENS_FILE",
+                Some(path.to_str().unwrap()),
+            ));
+            let _guard = EnvGuard::set(&vars);
+            crate::auth::static_token_trust().await.unwrap()
+        };
+        assert!(configured.configured);
+        assert!(configured.holder.load().set.is_empty());
+        for allow_unauthenticated in [false, true] {
+            assert_eq!(
+                classify_server_runtime_state(configured.configured, false, allow_unauthenticated)
+                    .unwrap(),
+                ServerRuntimeState::DefaultDeny
+            );
+            assert_eq!(
+                classify_server_runtime_state(configured.configured, true, allow_unauthenticated)
+                    .unwrap(),
+                ServerRuntimeState::PolicyEnabled
+            );
+        }
+
+        let none = {
+            let mut vars = unset.to_vec();
+            vars.push(("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE", None));
+            let _guard = EnvGuard::set(&vars);
+            crate::auth::static_token_trust().await.unwrap()
+        };
+        assert!(!none.configured);
+        let error = classify_server_runtime_state(none.configured, false, false).unwrap_err();
+        assert!(error.to_string().contains("--unauthenticated"), "{error}");
+        assert_eq!(
+            classify_server_runtime_state(none.configured, false, true).unwrap(),
+            ServerRuntimeState::Open
+        );
+    }
+
+    /// `requires_bearer_auth` and the `/mcp` mount read the boot-fixed mode,
+    /// never the live set: after a refresh installs an empty set on a
+    /// `DefaultDeny` server, an actor-less request is still refused and
+    /// `/mcp` is still mounted.
+    #[tokio::test]
+    async fn an_empty_refreshed_set_keeps_bearer_authentication_issue_434() {
+        use crate::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
+        use crate::trust::{Freshness, Refresh, TrustHolder};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tokens.json");
+        let write = |bytes: &str| {
+            fs::write(&path, bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        };
+        write(r#"{"alice":"tok-a"}"#);
+        let source = crate::auth::FileSource::new(
+            path.to_string_lossy().into_owned(),
+            Freshness::Polled {
+                interval: std::time::Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        let holder =
+            TrustHolder::open(Box::new(source), crate::auth::StaticRules::default()).unwrap();
+        let uri = temp.path().join("graph").to_string_lossy().into_owned();
+        let db = omnigraph::db::Omnigraph::init(&uri, "node Person { name: String @key }\n")
+            .await
+            .unwrap();
+        let state = super::AppState::new_with_bearer_tokens(uri, db, Vec::new())
+            .with_static_token_trust(Arc::clone(&holder))
+            .with_runtime_state(classify_server_runtime_state(true, false, false).unwrap());
+
+        write("{}");
+        assert_eq!(holder.refresh(), Refresh::Installed(2));
+        assert!(holder.load().set.is_empty());
+        // The router is built over the empty set; the mode still mounts `/mcp`.
+        let app = super::build_app(state);
+        let status = |method: &str, path: &str, token: Option<&str>| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let request = request.body(Body::from("{}")).unwrap();
+            let app = app.clone();
+            async move { app.oneshot(request).await.unwrap().status() }
+        };
+        for token in [None, Some("tok-a")] {
+            assert_eq!(
+                status("GET", "/graphs/default/access", token).await,
+                StatusCode::UNAUTHORIZED,
+                "{token:?}"
+            );
+            assert_eq!(
+                status("POST", "/mcp", token).await,
+                StatusCode::UNAUTHORIZED,
+                "{token:?}"
             );
         }
     }
