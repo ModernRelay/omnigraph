@@ -5,6 +5,33 @@
 that work asks of the shared state, and the evidence for and against it; what
 each operation promises is in [the contract](contract.md)
 
+## Editing this page
+
+A database is an observable contract, implemented by physical mechanisms,
+serving a distribution of work ([systems](systems.md)). This page is the
+third of the three: the distribution of work Omnigraph is optimized for.
+[The contract](contract.md) is the first. The mechanisms follow from the two
+and live in the area guides, never here.
+
+- **Describe the work, not the engine.** Derive every row from what agents,
+  people and programs do to a shared model, never from what Omnigraph has
+  or does today. A sentence that names a mechanism belongs in a guide.
+- **It is a hypothesis.** Give a quantity as a range or a percentile, say
+  what would revise it, and replace it with a measurement when one exists.
+  State what the evidence supports, what it argues against, and what nobody
+  has measured.
+- **Say what is optimized for and what is not**, in order, so that a design
+  can tell which cost it may trade away.
+- **Keep the contract out.** A promise, a guarantee or its exact term goes
+  in [the contract](contract.md). Something the work asks for that nothing
+  has decided is listed under [Asked, not decided](#asked-not-decided), and
+  named in the contract's Direction table.
+- **Cite a source for every claim about the world**, and say when a figure
+  comes from a narrow study or from a vendor.
+- **Revise it in the pull request that needs it.** A change tuned for a
+  different workload changes this page in the same pull request, with the
+  measurement that moved it.
+
 A database is an observable contract, implemented by physical mechanisms,
 serving a distribution of work ([systems](systems.md)). This page is the
 distribution of work. [The contract](contract.md) states what that work
@@ -74,9 +101,9 @@ source version.
 | Volume | 10^4 to 10^7 entities per graph, set by the sources; 10 to 100 types; small scalar properties, text bodies, embeddings on a few types, Blobs for documents; agent batches of 10^2 to 10^5 records, whole-source imports and backfills to 10^7 records and 10^4 documents | 10^8 entities or 10^3 types; batches past 10^6; sync as streaming at thousands of events a second |
 | Rate | 10^2 to 10^4 commits a day; two kinds of branch: tens of task branches with hundreds of commits each and one writer, and many more short speculative branches of a few commits, most of them discarded, about ten per database project in one vendor's telemetry, some nested deep [24]; incremental sync every few minutes; an additive schema change about weekly; history retained long and read as often as the present | Commit rate or branch count up an order; several writers on one task branch; conflict retries common; destructive schema changes frequent; history read rarely; branches rarely abandoned |
 | Fan-out | Edges per entity are skewed: most entities have tens, a few hubs have 10^4 to 10^5. A lookup costs what the hubs it touches cost, not the mean degree | Hub degree passes 10^6, or hubs dominate lookups |
-| Maintenance debt | Each small commit adds files, so files per table grow with commits per day until an `optimize` | The slowest reads grow with time since the last `optimize` |
+| Maintenance debt | The cost of a read can grow with the writes since the last maintenance run, and small commits arrive all day | The slowest reads grow with time since the last `optimize` |
 | Reaction | Tens of standing consumers per graph (agents, pipelines, downstream systems), each filtered to a few types; a change reaches its consumers within seconds of its commit; reaction chains a few steps deep | Hundreds of consumers; sub-second delivery needed; reaction storms; re-reading a baseline at every schema change, which each consumer must do today, costs more than delivery |
-| Targets | No latency is measured yet. As a starting hypothesis for a warm handle in the store's region: a retrieve read answers in about 100 ms at the median and under 1 s at the 99th percentile, measured at the client; a step of several reads waits for its slowest one, so the read target is set for a step of five reads to stay under 1 s at its own 99th percentile; (one agent-memory system reports search latencies of 0.15 to 0.5 s [30]); a small commit publishes in under 1 s; creating and discarding a branch costs about what a small commit costs; one branch publishes its commits serially, a few a second at most, which the hypothesized rate needs on average at one every several seconds, with bursts on shared state from merges and syncs | Measured figures replace these; shared state needs sustained tens of commits a second |
+| Targets | No latency is measured yet. As a starting hypothesis for a server already serving the graph, near its store: a retrieve read answers in about 100 ms at the median and under 1 s at the 99th percentile, measured at the client; a step of several reads waits for its slowest one, so the read target is set for a step of five reads to stay under 1 s at its own 99th percentile; (one agent-memory system reports search latencies of 0.15 to 0.5 s [30]); a small commit publishes in under 1 s; creating and discarding a branch costs about what a small commit costs; one branch publishes its commits serially, a few a second at most, which the hypothesized rate needs on average at one every several seconds, with bursts on shared state from merges and syncs | Measured figures replace these; shared state needs sustained tens of commits a second |
 
 ### What we optimize for
 
@@ -88,7 +115,7 @@ then the cost of a small commit and of creating, writing and discarding a
 branch, because authoring, speculation and coordination are the common writes;
 then history, change discovery and delivery of changes to those waiting on
 them; then bulk acquisition and sync, whose cost should follow what changed,
-not what was sent. Read capacity scales out by adding reader processes; write
+not what was sent. Read capacity scales out by adding readers; write
 capacity on one branch does not, and need not at the hypothesized rate. Reads
 that overlap, across agents or across one agent's attempts, should share work.
 An analytical read may cost more than a lookup but not in proportion to
@@ -97,16 +124,16 @@ makes lookups slower to make analytical reads faster. Warehouse-scale scans and
 single-branch write throughput beyond the hypothesized rate are not optimized
 for, and a design may trade them away.
 
-What the hypothesis asks of the mechanisms, each with its cost owner in
-[testing](testing.md#cost-tests-and-benchmarks): a read on a warm handle costs
-a bounded number of storage requests independent of history, the freshness
-check included, and a reader's warm state is disposable, so a new reader is
-useful at once; a commit costs the same whatever the history depth and live
-branch count; a branch is free until written; a keyed upsert of an unchanged
-record costs little and publishes nothing (not so today,
-[`D2`](contract.md#decisions)); change discovery costs the changes, not the
-tables; a search reads the index, not the column. Wall time and memory are
-evidence in the benchmark harness, not contract statements.
+What the work needs to stay cheap, each with its cost owner in
+[testing](testing.md#cost-tests-and-benchmarks): a read costs the same
+however long the history is, and a reader that has just started is useful at
+once; a commit costs the same however deep the history and however many
+branches exist; a branch costs nothing until it is written; an upsert of a
+record that did not change costs little and publishes nothing (not so today,
+[`D2`](contract.md#decisions)); finding what changed costs the changes, not
+the size of the graph; a search costs the matches, not the size of the type.
+Wall time and memory are evidence in the benchmark harness, not contract
+statements.
 
 ## What the work requires
 
@@ -215,96 +242,13 @@ dataflow, with syncs in and a feed out. Use
 a category word only as shorthand for the row it points at; a design argues
 from the contract and the work, never from "it is an HTAP system".
 
-## In the literature's terms
-
-The contract uses plain words. These are the precise terms behind them.
-
-- **`E1` on one branch.** One branch is one linearizable object [1]: every
-  read and every write on a branch is one atomic operation on the branch
-  head. A read takes effect at one point inside its interval, when it
-  resolves the head, and so includes every commit acknowledged before it
-  began; a write takes effect at its publication. This needs the store's
-  read-after-write, and does not hold for a process that claimed the branch
-  (`read:2`). The reads and commits of one branch are therefore strictly
-  serializable in commit order [2]. A write whose outcome is unknown counts
-  as still pending: it is concurrent with everything after it until history
-  shows whether it landed. Each such operation touches one branch, so by
-  locality [1] operations on different branches are linearizable together. A
-  merge, a two-sided diff and a branch create read two branches and are not
-  covered: two branches have no joint view. The transaction is one request:
-  an agent's read and a later write are two transactions unless the write
-  names the head it read (`write:3`). Serial publication per branch is the
-  design the book calls actual serial execution [31], validated across
-  processes by compare-and-swap; it holds while commits on a branch are
-  short and few a second, and a long load or a burst of merges on the shared
-  branch delays every writer of that branch.
-- **History.** History is a partial order: one commit happens before another
-  exactly when it is its ancestor, and two commits are concurrent when
-  neither is. A branch's feed delivers in an order consistent with it. The
-  common ancestor does the work of version vectors and tombstones [31], so a
-  delete on one side is never undone by the other.
-- **`write:3`.** A write with a named head is a compare-and-set on the branch
-  head, so the caller's read and write take effect as one transaction in the
-  serial order, or not at all.
-- **`read:2`.** The four session guarantees [4]: read-your-writes, monotonic
-  reads, monotonic writes and writes-follow-reads, with no session token.
-  They cover acknowledged writes. Across branches none holds until a merge.
-- **`merge`, across branches.** A merge resembles snapshot isolation [3]:
-  each branch reads from its fork point and its own commits, and a merge
-  certifies what was written, entity by entity, with no read set. It is
-  weaker in two ways. An identical change made on both branches converges, so
-  a lost update across branches is admitted (`merge:7`). And a branch's
-  unmerged commits are readable by others, who may act on a state that is
-  never merged. Write skew, write skew through a predicate read (both
-  branches see no matching entity and each inserts one) and the read-only
-  anomaly [5] are admitted unless a declared constraint catches them. Not
-  promised: serializability across branches. The ask for declared
-  dependencies is the read tracking of serializable snapshot isolation, made
-  at merge. This is also the split between integrity at every commit and
-  enforcement across branches deferred to the merge, which is the check
-  before the irreversible step [31].
-- **`merge:1`.** A state-based, keyed three-way merge [8], the contract that
-  data versioning systems share [9].
-- **`merge:3`.** Which constraints a merge of two valid branches can break
-  follows from invariant confluence [6]. While a merge takes each entity
-  whole from one side, it cannot break a per-entity value constraint under
-  one schema. It can break uniqueness of chosen values, edge endpoints when a
-  node is deleted, and cardinality bounds, so those are the checks a merge
-  must run, and refusing the merge is the coordination they require.
-- **`merge:6`.** The merge base is a lowest common ancestor of the two heads,
-  picked by a fixed rule: nearest both heads, then highest generation, then
-  smallest commit id. After criss-cross merges there can be several; the rule
-  makes the result repeatable, not independent of the choice.
-- **`E7`, `maintain`.** Data independence in Codd's sense of indexing and
-  ordering independence [7]: building, dropping or partly covering an index
-  changes cost, never rows, and rows have no order but the one `order` or a
-  ranking states.
-
 ## Sources
 
-Read in full on 2026-11-16 to ground the terms above; the number is the
-citation used in the text. The method's own sources are in
-[systems](systems.md#references-and-source-scope).
+The number is the citation used in the text. Numbers 1 to 8 are no longer
+used here: they were the sources for the contract's terms, which are now
+listed in [the contract](contract.md#sources). The method's own sources are
+in [systems](systems.md#references-and-source-scope).
 
-1. Herlihy and Wing, "Linearizability: A Correctness Condition for
-   Concurrent Objects", TOPLAS 1990: linearizability and locality.
-2. Papadimitriou, "The Serializability of Concurrent Database Updates",
-   JACM 1979: strict serializability.
-3. Berenson et al., "A Critique of ANSI SQL Isolation Levels", SIGMOD 1995:
-   snapshot isolation, lost update, write skew. Also Adya, Liskov and
-   O'Neil, "Generalized Isolation Level Definitions", ICDE 2000.
-4. Terry et al., "Session Guarantees for Weakly Consistent Replicated
-   Data", PDIS 1994.
-5. Fekete et al., "Making Snapshot Isolation Serializable", TODS 2005:
-   predicate write skew and the read-only anomaly, first shown in Fekete,
-   O'Neil and O'Neil, "A Read-Only Transaction Anomaly Under Snapshot
-   Isolation", SIGMOD Record 2004.
-6. Bailis et al., "Coordination Avoidance in Database Systems", PVLDB 2015:
-   invariant confluence and its table of constraints.
-7. Codd, "A Relational Model of Data for Large Shared Data Banks", CACM
-   1970: ordering and indexing dependence.
-8. Khanna, Kunal and Pierce, "A Formal Investigation of Diff3", FSTTCS
-   2007: state-based three-way merge and its properties.
 9. Maddox et al., "Decibel: The Relational Dataset Branching System", PVLDB
    2016; Huang et al., "OrpheusDB", PVLDB 2017; Bhardwaj et al., "DataHub",
    CIDR 2015; and the Dolt and lakeFS merge documentation: version graphs
